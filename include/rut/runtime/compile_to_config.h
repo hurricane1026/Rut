@@ -680,9 +680,20 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
                 mod.exact_strict_local_response_binding_count))
             return false;
     }
-    if (!detail::populate_verified_route_config(cfg, mod)) return false;
-    return !strict_local_response_probe ||
-           cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe);
+    // Public compiler/config publication is one transaction: a later failure
+    // in any unrelated table cannot leave strict-local selectors half-active.
+    static_assert(std::is_trivially_copyable_v<RouteConfig>);
+    std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
+    if (!before) return false;
+    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
+    const bool populated = detail::populate_verified_route_config(cfg, mod);
+    const bool strict_copied =
+        populated &&
+        (!strict_local_response_probe ||
+         cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe));
+    if (!strict_copied)
+        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+    return strict_copied;
 }
 
 inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,

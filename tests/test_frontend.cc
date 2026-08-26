@@ -35928,7 +35928,7 @@ unmatched { return local_response({
     lowered.destroy();
 }
 
-TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_fenced) {
+TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and_public) {
     static_assert(static_cast<u8>(StrictLocalResponseProfile::Invalid) == 0);
     static_assert(static_cast<u8>(StrictLocalResponseProfile::Representation200) == 1);
     static_assert(static_cast<u8>(StrictLocalResponseProfile::LegacyError) == 2);
@@ -36001,14 +36001,14 @@ TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_f
             no_content.body = body;
             CHECK_EQ(strict_local_response_policy_profile(no_content),
                      StrictLocalResponseProfile::NoContent204);
-            CHECK_FALSE(strict_local_response_policy_spec_valid(no_content));
+            CHECK(strict_local_response_policy_spec_valid(no_content));
         }
     }
     no_content.content_type = {};
     no_content.body = {};
 
     CHECK_EQ(strict_local_response_profile(204), StrictLocalResponseProfile::Invalid);
-    CHECK_FALSE(strict_local_response_status_supported(204));
+    CHECK(strict_local_response_status_supported(204));
     StrictLocalResponsePolicySpec status_only{};
     status_only.status_code = 204;
     CHECK_EQ(strict_local_response_policy_profile(status_only),
@@ -36085,13 +36085,13 @@ TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_f
 
     u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
     method_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
-    CHECK_FALSE(strict_local_response_policy_table_valid(
+    CHECK(strict_local_response_policy_table_valid(
         &no_content, 1, method_policy_ids, kStrictLocalResponseMethodSlots));
     u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     unmatched_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
     ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
-    CHECK_FALSE(strict_local_response_source_table_valid(
+    CHECK(strict_local_response_source_table_valid(
         &no_content, 1, pre_route_policy_ids, unmatched_policy_ids, exact_bindings, 0));
 
     const char public_204[] = R"rut(route exact GET "/static" { return local_response({
@@ -36101,7 +36101,7 @@ TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_f
     }) })rut";
     auto public_204_lexed = lex(lit(public_204));
     REQUIRE(public_204_lexed);
-    CHECK_FALSE(parse_file_heap(public_204_lexed.value()).has_value());
+    CHECK(parse_file_heap(public_204_lexed.value()).has_value());
 
     for (const bool first_reserved : {true, false}) {
         auto representation_forged = representation;
@@ -36126,6 +36126,111 @@ TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_f
     }
 }
 
+TEST(frontend, strict_local_response_no_content_public_source_reaches_normal_owned_rir) {
+    std::string source = R"rut(route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
+  date: "current", content_type: "", connection: "request",
+  head_mode: "suppress_body", body: b""
+}) })rut";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 1u);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(ast->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(ast->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+    CHECK((Str{ast->exact_strict_local_response_bindings[0].path,
+               ast->exact_strict_local_response_bindings[0].path_len}
+               .eq({"/static", 7})));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_policy_profile(policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK(policy.reason.eq({"No Content", 10}));
+    CHECK(policy.server.eq({"nginx/1.29.7", 12}));
+    CHECK_EQ(policy.content_type.ptr, nullptr);
+    CHECK_EQ(policy.content_type.len, 0u);
+    CHECK_EQ(policy.body.ptr, nullptr);
+    CHECK_EQ(policy.body.len, 0u);
+
+    ast.reset();
+    hir.reset();
+    mir.reset();
+    source.assign(source.size(), 'x');
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq({"No Content", 10}));
+    CHECK(lowered.module.strict_local_response_policies[0].server.eq({"nginx/1.29.7", 12}));
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_no_content_public_source_rejects_neighbors_and_mutations) {
+    const std::string base =
+        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", "
+        "content_type: \"\", connection: \"request\", head_mode: \"suppress_body\", "
+        "body: b\"\" }) }";
+    auto replace_once = [&](std::string value, const std::string& from, const std::string& to) {
+        const auto pos = value.find(from);
+        CHECK(pos != std::string::npos);
+        if (pos == std::string::npos) return std::string{};
+        value.replace(pos, from.size(), to);
+        return value;
+    };
+    auto parse_rejects = [&](const std::string& source, FrontendError code) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, code);
+        CHECK_GT(ast.error().span.end, ast.error().span.start);
+    };
+
+    for (const char* status : {"199", "201", "205", "206", "304", "100"}) {
+        parse_rejects(replace_once(base, "status: 204", std::string("status: ") + status),
+                      FrontendError::InvalidStatusCode);
+    }
+    const std::string mutations[] = {
+        replace_once(base, "reason: \"No Content\"", "reason: \"Not Content\""),
+        replace_once(base, "reason: \"No Content\", ", ""),
+        replace_once(base, "server: \"nginx/1.29.7\"", "server: \"\""),
+        replace_once(base, "HTTP/1.1", "HTTP/1.0"),
+        replace_once(base, "date: \"current\"", "date: \"static\""),
+        replace_once(base, "content_type: \"\"", "content_type: \"text/plain\""),
+        replace_once(base, "connection: \"request\"", "connection: \"close\""),
+        replace_once(base, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(base, "body: b\"\"", "body: b\"x\""),
+    };
+    for (const auto& mutation : mutations)
+        parse_rejects(mutation, FrontendError::UnsupportedSyntax);
+
+    auto valid_lexed = lex({base.data(), static_cast<u32>(base.size())});
+    REQUIRE(valid_lexed);
+    auto valid_ast = parse_file_heap(valid_lexed.value());
+    REQUIRE(valid_ast);
+    auto forged = valid_ast->strict_local_response_policies[0];
+    forged.content_type = {nullptr, 1};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.body = {nullptr, 1};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.reserved0 = 1;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.reserved1 = 1;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+}
+
 TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_and_owned) {
     std::string reason = "No Content";
     std::string server = "nginx/1.29.7";
@@ -36142,7 +36247,7 @@ TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_a
     policy.body = {&empty_anchor, 0};
 
     auto public_ast = std::make_unique<AstFile>();
-    CHECK_EQ(public_ast->add_strict_local_response_policy(policy), 0u);
+    CHECK_EQ(public_ast->add_strict_local_response_policy(policy), 1u);
 
     auto ast = std::make_unique<AstFile>();
     REQUIRE_EQ(ast->add_strict_local_response_policy_for_internal_propagation(policy), 1u);
@@ -36155,7 +36260,7 @@ TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_a
     REQUIRE(ast->items.push(item));
     REQUIRE_EQ(ast->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
     REQUIRE_EQ(ast->strict_local_response_policies[0].body.ptr, &empty_anchor);
-    CHECK_FALSE(analyze_file_heap(*ast).has_value());
+    CHECK(analyze_file_heap(*ast).has_value());
 
     auto hir = analyze_file_heap_for_internal_propagation(*ast);
     REQUIRE(hir);
@@ -36164,7 +36269,7 @@ TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_a
              StrictLocalResponseProfile::NoContent204);
     CHECK_EQ(hir->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
     CHECK_EQ(hir->strict_local_response_policies[0].body.ptr, &empty_anchor);
-    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    CHECK(build_mir_heap(hir.value()).has_value());
 
     auto mir = build_mir_heap_for_internal_propagation(hir.value());
     REQUIRE(mir);
@@ -36175,7 +36280,8 @@ TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_a
     CHECK_EQ(mir->strict_local_response_policies[0].body.ptr, &empty_anchor);
 
     FrontendRirModule rejected{};
-    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    REQUIRE(lower_to_rir(mir.value(), rejected));
+    CHECK(rir::verify_module(rejected.module).ok);
     rejected.destroy();
     FrontendRirModule lowered{};
     REQUIRE(lower_to_rir_for_internal_propagation(mir.value(), lowered));
@@ -36187,14 +36293,14 @@ TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_a
     CHECK_EQ(rir_policy.content_type.len, 0u);
     CHECK_EQ(rir_policy.body.ptr, nullptr);
     CHECK_EQ(rir_policy.body.len, 0u);
-    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    CHECK(rir::verify_module(lowered.module).ok);
     REQUIRE(rir::verify_module_for_internal_propagation(lowered.module).ok);
 
     char public_text[512]{};
     rir::PrintBuf public_buf{};
     public_buf.init(public_text, sizeof(public_text), -1);
     rir::print_module(public_buf, lowered.module);
-    CHECK(std::string(public_text, public_buf.len).find("<invalid>") != std::string::npos);
+    CHECK(std::string(public_text, public_buf.len).find("status=204") != std::string::npos);
     char internal_text[1024]{};
     rir::PrintBuf internal_buf{};
     internal_buf.init(internal_text, sizeof(internal_text), -1);

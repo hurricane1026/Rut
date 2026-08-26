@@ -110,25 +110,59 @@ TEST(serve_loader, status_routes_load) {
     program.destroy();
 }
 
-TEST(serve_loader, public_no_content_strict_source_and_default_activation_stay_fenced) {
+TEST(serve_loader, public_no_content_strict_source_and_default_activation_are_owned) {
     static constexpr char kSource[] = R"rut(
-unmatched { return local_response({
+pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 204, reason: "No Content", server: "pre",
+  date: "current", content_type: "", connection: "request",
+  head_mode: "suppress_body", body: b""
+}) }
+route exact GET "/static" { return local_response({
   version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
+  date: "current", content_type: "", connection: "request",
+  head_mode: "suppress_body", body: b""
+}) }
+unmatched POST { return local_response({
+  version: "HTTP/1.1", status: 204, reason: "No Content", server: "unmatched",
   date: "current", content_type: "", connection: "request",
   head_mode: "suppress_body", body: b""
 }) }
 )rut";
     const std::string path =
-        write_file("/tmp/rut_serve_loader_internal_no_content_fence", "app.rut", kSource);
+        write_file("/tmp/rut_serve_loader_public_no_content", "app.rut", kSource);
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Parse);
-    CHECK(err.has_diag);
-    CHECK_EQ(err.diag.code, FrontendError::InvalidStatusCode);
-    CHECK_EQ(err.diag.span.line, 3u);
-    CHECK_EQ(program.config.strict_local_response_policy_count, 0u);
-    CHECK_FALSE(program.config.has_strict_local_response_table_inventory());
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(rir::verify_module(program.rir.module).ok);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 3u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 3u);
+    CHECK_EQ(program.config.pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK_EQ(program.config.unmatched_policy_ids[kRouteMethodPost], 3u);
+    CHECK(program.config.has_exact_strict_local_response_inventory());
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 2u);
+    for (u32 i = 0; i < 3; i++) {
+        const auto& loaded = program.config.strict_local_response_policies[i];
+        CHECK_EQ(strict_local_response_policy_profile(loaded),
+                 StrictLocalResponseProfile::NoContent204);
+        CHECK(loaded.content_type.ptr != nullptr);
+        CHECK(loaded.body.ptr != nullptr);
+        CHECK_EQ(loaded.content_type.len, 0u);
+        CHECK_EQ(loaded.body.len, 0u);
+        CHECK(program.config.strict_local_response_bytes_owned(loaded.content_type));
+        CHECK(program.config.strict_local_response_bytes_owned(loaded.body));
+    }
+    program.rir.destroy();
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK(program.config.strict_local_response_policies[0].server.eq({"pre", 3}));
+    CHECK(program.config.strict_local_response_policies[1].server.eq({"nginx/1.29.7", 12}));
+    CHECK(program.config.strict_local_response_policies[2].server.eq({"unmatched", 9}));
+    for (u32 i = 0; i < 3; i++) {
+        CHECK(program.config.strict_local_response_bytes_owned(
+            program.config.strict_local_response_policies[i].content_type));
+        CHECK(program.config.strict_local_response_bytes_owned(
+            program.config.strict_local_response_policies[i].body));
+    }
     program.destroy();
     std::filesystem::remove(path);
 
@@ -137,13 +171,14 @@ unmatched { return local_response({
     mod.strict_local_response_policy_count = 1;
     mod.unmatched_policy_ids[kRouteMethodAny] = 1;
     REQUIRE(rir::verify_module_for_internal_propagation(mod).ok);
-    CHECK_FALSE(rir::verify_module(mod).ok);
+    REQUIRE(rir::verify_module(mod).ok);
 
     auto public_cfg = std::make_unique<RouteConfig>();
-    std::vector<u8> public_before(sizeof(RouteConfig));
-    __builtin_memcpy(public_before.data(), public_cfg.get(), sizeof(RouteConfig));
-    CHECK_FALSE(populate_route_config(*public_cfg, mod));
-    CHECK_EQ(__builtin_memcmp(public_before.data(), public_cfg.get(), sizeof(RouteConfig)), 0);
+    REQUIRE(populate_route_config(*public_cfg, mod));
+    REQUIRE(public_cfg->strict_local_response_table_is_valid());
+    REQUIRE_EQ(public_cfg->strict_local_response_policy_count, 1u);
+    CHECK(public_cfg->strict_local_response_policies[0].content_type.ptr != nullptr);
+    CHECK(public_cfg->strict_local_response_policies[0].body.ptr != nullptr);
 
     auto internal_cfg = std::make_unique<RouteConfig>();
     REQUIRE(populate_route_config_for_internal_propagation(*internal_cfg, mod));
@@ -158,7 +193,8 @@ unmatched { return local_response({
     CHECK_EQ(internal_cfg->strict_local_response_bytes_used, 22u);
 
     jit::JitEngine engine;
-    CHECK_FALSE(register_jit_routes(*internal_cfg, mod, engine));
+    REQUIRE(register_jit_routes(*public_cfg, mod, engine));
+    REQUIRE(register_jit_routes(*internal_cfg, mod, engine));
     REQUIRE(register_jit_routes_for_internal_propagation(*internal_cfg, mod, engine));
     CHECK_EQ(internal_cfg->route_count, 0u);
     CHECK_EQ(internal_cfg->timer_count, 0u);
@@ -184,7 +220,60 @@ unmatched { return local_response({
     CHECK_EQ(__builtin_memcmp(rejected_before.data(), rejected.get(), sizeof(RouteConfig)), 0);
 }
 
-TEST(serve_loader, internal_population_rolls_back_late_response_body_pool_failure) {
+TEST(serve_loader, public_no_content_source_rejections_leave_runtime_config_unmodified) {
+    const std::string base =
+        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", "
+        "content_type: \"\", connection: \"request\", head_mode: \"suppress_body\", "
+        "body: b\"\" }) }";
+    auto replace_once = [&](std::string value, const std::string& from, const std::string& to) {
+        const auto pos = value.find(from);
+        CHECK(pos != std::string::npos);
+        if (pos == std::string::npos) return std::string{};
+        value.replace(pos, from.size(), to);
+        return value;
+    };
+    struct Rejection {
+        std::string source;
+        FrontendError code;
+    };
+    std::vector<Rejection> rejected;
+    for (const char* status : {"199", "201", "205", "206", "304", "100"})
+        rejected.push_back({replace_once(base, "status: 204", std::string("status: ") + status),
+                            FrontendError::InvalidStatusCode});
+    const std::string mutations[] = {
+        replace_once(base, "reason: \"No Content\"", "reason: \"Not Content\""),
+        replace_once(base, "reason: \"No Content\", ", ""),
+        replace_once(base, "server: \"nginx/1.29.7\"", "server: \"\""),
+        replace_once(base, "HTTP/1.1", "HTTP/1.0"),
+        replace_once(base, "date: \"current\"", "date: \"static\""),
+        replace_once(base, "content_type: \"\"", "content_type: \"text/plain\""),
+        replace_once(base, "connection: \"request\"", "connection: \"close\""),
+        replace_once(base, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(base, "body: b\"\"", "body: b\"x\""),
+    };
+    for (const auto& mutation : mutations)
+        rejected.push_back({mutation, FrontendError::UnsupportedSyntax});
+
+    const std::string dir = "/tmp/rut_serve_loader_public_no_content_rejections";
+    for (const auto& test : rejected) {
+        const std::string path = write_file(dir, "app.rut", test.source.c_str());
+        LoadedProgram program;
+        LoadError err;
+        CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+        CHECK_EQ(err.stage, LoadStage::Parse);
+        CHECK(err.has_diag);
+        CHECK_EQ(err.diag.code, test.code);
+        CHECK_GT(err.diag.span.end, err.diag.span.start);
+        CHECK_EQ(program.config.route_count, 0u);
+        CHECK_EQ(program.config.strict_local_response_policy_count, 0u);
+        CHECK_FALSE(program.config.has_strict_local_response_table_inventory());
+        program.destroy();
+    }
+    std::filesystem::remove(dir + "/app.rut");
+}
+
+TEST(serve_loader, public_and_internal_no_content_population_roll_back_late_pool_failure) {
     std::string first_body(RouteConfig::kResponseBodyPoolBytes / 2 + 1, 'a');
     std::string second_body(RouteConfig::kResponseBodyPoolBytes / 2 + 1, 'b');
     rir::Module mod{};
@@ -197,37 +286,45 @@ TEST(serve_loader, internal_population_rolls_back_late_response_body_pool_failur
     mod.upstreams[0].name = {"sentinel", 8};
     mod.upstream_count = 1;
     REQUIRE(rir::verify_module_for_internal_propagation(mod).ok);
-    CHECK_FALSE(rir::verify_module(mod).ok);
+    REQUIRE(rir::verify_module(mod).ok);
 
-    auto destination = std::make_unique<RouteConfig>();
-    REQUIRE(destination->add_upstream("sentinel", 0x7f000001u, 9000).has_value());
-    REQUIRE(destination->add_timer("kept", 4, 1000, sentinel_timer_handler));
-    destination->firewall_default_allow = false;
-    destination->firewall_allow_ips[0] = 0x01020304u;
-    destination->firewall_allow_count = 1;
-    destination->body_pool[RouteConfig::kResponseBodyPoolBytes - 1] = 'z';
-    destination->response_bodies[RouteConfig::kMaxResponseBodies - 1] = {
-        destination->body_pool + RouteConfig::kResponseBodyPoolBytes - 1, 1};
-    destination->strict_local_response_bytes[RouteConfig::kStrictLocalResponseBytesPoolBytes - 1] =
-        'q';
+    auto rejects_atomically = [&](bool internal_propagation) {
+        auto destination = std::make_unique<RouteConfig>();
+        REQUIRE(destination->add_upstream("sentinel", 0x7f000001u, 9000).has_value());
+        REQUIRE(destination->add_timer("kept", 4, 1000, sentinel_timer_handler));
+        destination->firewall_default_allow = false;
+        destination->firewall_allow_ips[0] = 0x01020304u;
+        destination->firewall_allow_count = 1;
+        destination->body_pool[RouteConfig::kResponseBodyPoolBytes - 1] = 'z';
+        destination->response_bodies[RouteConfig::kMaxResponseBodies - 1] = {
+            destination->body_pool + RouteConfig::kResponseBodyPoolBytes - 1, 1};
+        destination
+            ->strict_local_response_bytes[RouteConfig::kStrictLocalResponseBytesPoolBytes - 1] =
+            'q';
 
-    std::vector<u8> before(sizeof(RouteConfig));
-    __builtin_memcpy(before.data(), destination.get(), sizeof(RouteConfig));
-    CHECK_FALSE(populate_route_config_for_internal_propagation(*destination, mod));
-    CHECK_EQ(__builtin_memcmp(before.data(), destination.get(), sizeof(RouteConfig)), 0);
-    CHECK_EQ(destination->upstream_count, 1u);
-    CHECK_EQ(destination->route_count, 0u);
-    CHECK_EQ(destination->timer_count, 1u);
-    CHECK_EQ(destination->response_body_count, 0u);
-    CHECK_EQ(destination->body_pool_used, 0u);
-    CHECK_EQ(destination->response_policy_count, 0u);
-    CHECK_EQ(destination->failure_policy_count, 0u);
-    CHECK_EQ(destination->policy_bundle_count, 0u);
-    CHECK_EQ(destination->strict_local_response_policy_count, 0u);
-    CHECK_EQ(destination->strict_local_response_bytes_used, 0u);
-    CHECK_EQ(destination->exact_strict_local_response_binding_count, 0u);
-    CHECK_EQ(destination->firewall_allow_count, 1u);
-    CHECK_FALSE(destination->firewall_default_allow);
+        std::vector<u8> before(sizeof(RouteConfig));
+        __builtin_memcpy(before.data(), destination.get(), sizeof(RouteConfig));
+        const bool populated =
+            internal_propagation ? populate_route_config_for_internal_propagation(*destination, mod)
+                                 : populate_route_config(*destination, mod);
+        CHECK_FALSE(populated);
+        CHECK_EQ(__builtin_memcmp(before.data(), destination.get(), sizeof(RouteConfig)), 0);
+        CHECK_EQ(destination->upstream_count, 1u);
+        CHECK_EQ(destination->route_count, 0u);
+        CHECK_EQ(destination->timer_count, 1u);
+        CHECK_EQ(destination->response_body_count, 0u);
+        CHECK_EQ(destination->body_pool_used, 0u);
+        CHECK_EQ(destination->response_policy_count, 0u);
+        CHECK_EQ(destination->failure_policy_count, 0u);
+        CHECK_EQ(destination->policy_bundle_count, 0u);
+        CHECK_EQ(destination->strict_local_response_policy_count, 0u);
+        CHECK_EQ(destination->strict_local_response_bytes_used, 0u);
+        CHECK_EQ(destination->exact_strict_local_response_binding_count, 0u);
+        CHECK_EQ(destination->firewall_allow_count, 1u);
+        CHECK_FALSE(destination->firewall_default_allow);
+    };
+    rejects_atomically(false);
+    rejects_atomically(true);
 }
 
 TEST(serve_loader, forward_preflight_mode_reaches_owned_routes_and_deferred_publication_rejects) {

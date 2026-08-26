@@ -7868,37 +7868,17 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
     return true;
 }
 
-// Generic strict local response materializer. This API intentionally carries
-// no forwarding/failure vocabulary; the older failure-policy entry point below
-// delegates to the same proven byte serializer and remains byte-identical.
-inline bool build_strict_local_response(const Connection& conn,
-                                        const StrictLocalResponsePolicySpec& policy,
-                                        bool suppress_body,
-                                        u8* out,
-                                        u32 out_cap,
-                                        u32* out_len) {
-    if (out_len != nullptr) *out_len = 0;
-    if (!strict_local_response_policy_spec_valid(policy) ||
-        suppress_body != (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
-        (suppress_body && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
-        (!suppress_body && conn.req_method == static_cast<u8>(LogHttpMethod::Head)))
-        return false;
-    return build_bounded_local_response_bytes(conn, policy, suppress_body, out, out_cap, out_len);
-}
-
 namespace detail {
 
-// Closed Stage-3b1 serializer proof for the internally derived NoContent204
-// tuple.  This is deliberately not selected by status alone and is not wired
-// into request dispatch: public validation and the runtime execution fence stay
-// closed until the later atomic activation increment.
-inline bool build_no_content204_response_for_internal_serialization(
-    const Connection& conn,
-    const StrictLocalResponsePolicySpec& policy,
-    bool suppress_body,
-    u8* out,
-    u32 out_cap,
-    u32* out_len) {
+// Dedicated serializer for the complete derived NoContent204 tuple. Selection
+// is by complete profile only; numeric status 204 never reaches this builder by
+// itself.
+inline bool build_no_content204_response_bytes(const Connection& conn,
+                                               const StrictLocalResponsePolicySpec& policy,
+                                               bool suppress_body,
+                                               u8* out,
+                                               u32 out_cap,
+                                               u32* out_len) {
     if (out_len == nullptr) return false;
     *out_len = 0;
     if (strict_local_response_policy_profile(policy) != StrictLocalResponseProfile::NoContent204 ||
@@ -7939,6 +7919,27 @@ inline bool build_no_content204_response_for_internal_serialization(
 
 }  // namespace detail
 
+// Generic strict local response materializer. This API intentionally carries
+// no forwarding/failure vocabulary; the older failure-policy entry point below
+// delegates to the representation serializer and remains byte-identical.
+inline bool build_strict_local_response(const Connection& conn,
+                                        const StrictLocalResponsePolicySpec& policy,
+                                        bool suppress_body,
+                                        u8* out,
+                                        u32 out_cap,
+                                        u32* out_len) {
+    if (out_len != nullptr) *out_len = 0;
+    if (!strict_local_response_policy_spec_valid(policy) ||
+        suppress_body != (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
+        (suppress_body && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
+        (!suppress_body && conn.req_method == static_cast<u8>(LogHttpMethod::Head)))
+        return false;
+    if (strict_local_response_policy_profile(policy) == StrictLocalResponseProfile::NoContent204)
+        return detail::build_no_content204_response_bytes(
+            conn, policy, suppress_body, out, out_cap, out_len);
+    return build_bounded_local_response_bytes(conn, policy, suppress_body, out, out_cap, out_len);
+}
+
 inline bool build_failure_policy_response_from_spec(const Connection& conn,
                                                     const ForwardFailurePolicySpec& policy,
                                                     bool suppress_body,
@@ -7972,13 +7973,6 @@ bool handle_configured_strict_local_response(Loop* loop,
         return fail_closed();
 
     const auto& policy = config->strict_local_response_policies[policy_id - 1];
-    // Stage-2 execution fence: config/compiler ownership may propagate the
-    // exact internal 204 tuple, but no serializer or success lifecycle exists
-    // yet. Close before mutating persistence, response buffers/accounting, or
-    // submitting any bytes. Stage 3 removes this fence atomically with public
-    // activation and the dedicated serializer.
-    if (strict_local_response_policy_profile(policy) == StrictLocalResponseProfile::NoContent204)
-        return fail_closed();
     const bool is_head = method == LogHttpMethod::Head;
     if ((is_head && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
         (!is_head && policy.head_mode != StrictLocalResponseHeadMode::Reject &&

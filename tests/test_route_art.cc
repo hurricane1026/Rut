@@ -1223,31 +1223,25 @@ TEST(route_config, no_content204_owned_install_normalizes_empty_views_and_dedupl
     exact[0] = exact_local_binding("/distinct", kRouteMethodGet, 4);
 
     auto public_add = std::make_unique<RouteConfig>();
-    std::vector<u8> public_add_before(sizeof(RouteConfig));
-    __builtin_memcpy(public_add_before.data(), public_add.get(), sizeof(RouteConfig));
-    CHECK_EQ(public_add->add_strict_local_response_policy(policies[0]), 0u);
-    CHECK_EQ(__builtin_memcmp(public_add_before.data(), public_add.get(), sizeof(RouteConfig)), 0);
+    REQUIRE_EQ(public_add->add_strict_local_response_policy(policies[0]), 1u);
     REQUIRE_EQ(public_add->add_strict_local_response_policy_for_internal_propagation(policies[0]),
                1u);
+    CHECK(public_add->strict_local_response_policy_id_is_owned(1));
 
     auto public_install = std::make_unique<RouteConfig>();
-    std::vector<u8> public_install_before(sizeof(RouteConfig));
-    __builtin_memcpy(public_install_before.data(), public_install.get(), sizeof(RouteConfig));
-    CHECK_FALSE(public_install->install_strict_local_response_table_with_pre_route(
+    REQUIRE(public_install->install_strict_local_response_table_with_pre_route(
         policies, 4, pre_route, unmatched, exact, 1));
-    CHECK_EQ(
-        __builtin_memcmp(public_install_before.data(), public_install.get(), sizeof(RouteConfig)),
-        0);
+    REQUIRE(public_install->strict_local_response_table_is_valid());
+    CHECK_EQ(public_install->strict_local_response_policy_count, 2u);
 
     u16 public_unmatched[kStrictLocalResponseMethodSlots]{};
     public_unmatched[kRouteMethodAny] = 1;
     ExactStrictLocalResponseBinding public_exact[kMaxExactStrictLocalResponseBindings]{};
-    CHECK_FALSE(public_install->install_strict_local_response_table(
+    auto public_unmatched_config = std::make_unique<RouteConfig>();
+    REQUIRE(public_unmatched_config->install_strict_local_response_table(
         policies, 1, public_unmatched, public_exact, 0));
-    CHECK_FALSE(public_install->install_unmatched_policy_table(policies, 1, public_unmatched));
-    CHECK_EQ(
-        __builtin_memcmp(public_install_before.data(), public_install.get(), sizeof(RouteConfig)),
-        0);
+    auto public_unmatched_alias = std::make_unique<RouteConfig>();
+    REQUIRE(public_unmatched_alias->install_unmatched_policy_table(policies, 1, public_unmatched));
 
     auto installed = std::make_unique<RouteConfig>();
     REQUIRE(installed->install_strict_local_response_table_with_pre_route_for_internal_propagation(
@@ -1272,18 +1266,18 @@ TEST(route_config, no_content204_owned_install_normalizes_empty_views_and_dedupl
     }
 
     auto copied = std::make_unique<RouteConfig>();
-    std::vector<u8> public_copy_before(sizeof(RouteConfig));
-    __builtin_memcpy(public_copy_before.data(), copied.get(), sizeof(RouteConfig));
-    CHECK_FALSE(copied->copy_strict_local_response_table_from_owned(*installed));
-    CHECK_EQ(__builtin_memcmp(public_copy_before.data(), copied.get(), sizeof(RouteConfig)), 0);
-    REQUIRE(
-        copied->copy_strict_local_response_table_from_owned_for_internal_propagation(*installed));
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*installed));
     REQUIRE(copied->strict_local_response_table_is_valid());
     CHECK_EQ(copied->strict_local_response_bytes_used, 35u);
     CHECK(copied->strict_local_response_policies[0].reason.ptr !=
           installed->strict_local_response_policies[0].reason.ptr);
     CHECK(copied->strict_local_response_policies[0].content_type.ptr != nullptr);
     CHECK(copied->strict_local_response_policies[0].body.ptr != nullptr);
+
+    auto internal_copy = std::make_unique<RouteConfig>();
+    REQUIRE(internal_copy->copy_strict_local_response_table_from_owned_for_internal_propagation(
+        *installed));
+    REQUIRE(internal_copy->strict_local_response_table_is_valid());
 
     for (auto& reason : reasons) reason.assign(reason.size(), 'x');
     for (auto& server : servers) server.assign(server.size(), 'x');

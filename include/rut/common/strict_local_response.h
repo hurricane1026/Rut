@@ -160,11 +160,13 @@ constexpr StrictLocalResponseProfile strict_local_response_profile(u16 status_co
 }
 
 constexpr bool strict_local_response_status_supported(u16 status_code) {
-    return strict_local_response_profile(status_code) != StrictLocalResponseProfile::Invalid;
+    return status_code == 204 ||
+           strict_local_response_profile(status_code) != StrictLocalResponseProfile::Invalid;
 }
 
-// Closed internal vocabulary derived from the complete semantic tuple. Public
-// source acceptance deliberately remains fenced by the status-only helper.
+// Closed vocabulary derived from the complete semantic tuple. Status 204 is
+// never sufficient by itself: every public trust boundary validates the full
+// tuple below before admitting the derived no-content profile.
 inline StrictLocalResponseProfile strict_local_response_policy_profile(
     const StrictLocalResponsePolicySpec& policy) {
     const auto profile = strict_local_response_profile(policy.status_code);
@@ -198,12 +200,13 @@ inline StrictLocalResponseProfile strict_local_response_policy_profile(
 inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePolicySpec& policy) {
     const auto profile = strict_local_response_policy_profile(policy);
     return profile == StrictLocalResponseProfile::Representation200 ||
-           profile == StrictLocalResponseProfile::LegacyError;
+           profile == StrictLocalResponseProfile::LegacyError ||
+           profile == StrictLocalResponseProfile::NoContent204;
 }
 
-// Trusted compiler/config propagation accepts the closed internal vocabulary.
-// Public source validation must continue to use
-// strict_local_response_policy_spec_valid(), which deliberately excludes 204.
+// Retained explicit entry point for the staged compiler/config propagation
+// contract. Public validation now accepts the same closed vocabulary, while
+// this name remains source-compatible with the reviewed internal pipeline.
 inline bool strict_local_response_policy_spec_valid_for_internal_propagation(
     const StrictLocalResponsePolicySpec& policy) {
     return strict_local_response_policy_profile(policy) != StrictLocalResponseProfile::Invalid;

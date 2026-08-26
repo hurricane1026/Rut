@@ -838,7 +838,6 @@ private:
 
 public:
     // Incremental public builder. Dedup is semantic and stable (first insertion wins).
-    // The default surface deliberately excludes the compiler-only 204 vocabulary.
     u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
         if (!strict_local_response_policy_spec_valid(policy)) return 0;
         return add_validated_strict_local_response_policy(policy);

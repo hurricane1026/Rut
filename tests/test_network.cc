@@ -10179,8 +10179,8 @@ static StrictLocalResponsePolicySpec make_representation200_policy() {
     return policy;
 }
 
-static StrictLocalResponsePolicySpec make_no_content204_internal_policy(Str content_type = {},
-                                                                        Str body = {}) {
+static StrictLocalResponsePolicySpec make_no_content204_policy(Str content_type = {},
+                                                               Str body = {}) {
     StrictLocalResponsePolicySpec policy{};
     policy.version = StrictLocalResponseVersion::Http11;
     policy.status_code = 204;
@@ -10225,7 +10225,7 @@ static bool normalize_strict_local_response_date(u8* wire, u32 wire_len) {
     return true;
 }
 
-static std::string expected_no_content204_internal_wire(Str server, bool keep_alive) {
+static std::string expected_no_content204_wire(Str server, bool keep_alive) {
     std::string wire = "HTTP/1.1 204 No Content\r\nServer: ";
     wire.append(server.ptr, server.len);
     wire += "\r\nDate: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nConnection: ";
@@ -12904,7 +12904,8 @@ bool configure_strict_local_send_failure_loop(StrictLocalSendFailureLoop& loop,
                                               CaptureRing& capture,
                                               ShardEpoch& epoch,
                                               const RouteConfig*& active,
-                                              RouteConfig& config) {
+                                              RouteConfig& config,
+                                              bool no_content204 = false) {
     loop.setup();
     metrics.init();
     access.init();
@@ -12913,7 +12914,8 @@ bool configure_strict_local_send_failure_loop(StrictLocalSendFailureLoop& loop,
     loop.access_log = &access;
     loop.epoch = &epoch;
     if (!loop.set_capture(&capture)) return false;
-    const auto policy = make_representation200_policy();
+    const auto policy =
+        no_content204 ? make_no_content204_policy() : make_representation200_policy();
     if (config.add_strict_local_response_policy(policy) != 1u ||
         !config.set_unmatched_policy_id(kRouteMethodAny, 1) ||
         !config.unmatched_policy_table_is_valid())
@@ -12923,6 +12925,78 @@ bool configure_strict_local_send_failure_loop(StrictLocalSendFailureLoop& loop,
     return true;
 }
 }  // namespace
+
+TEST(unmatched_local_response,
+     no_content204_synchronous_initial_and_partial_resubmit_failures_publish_no_success) {
+    auto run = [&](bool fail_resubmit) {
+        StrictLocalSendFailureLoop loop;
+        ShardMetrics metrics{};
+        AccessLogRing access{};
+        CaptureRing capture{};
+        ShardEpoch epoch{};
+        RouteConfig config{};
+        const RouteConfig* active = nullptr;
+        REQUIRE(configure_strict_local_send_failure_loop(
+            loop, metrics, access, capture, epoch, active, config, true));
+        REQUIRE_EQ(strict_local_response_policy_profile(config.strict_local_response_policies[0]),
+                   StrictLocalResponseProfile::NoContent204);
+
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = fail_resubmit ? 47 : 46;
+        metrics.on_accept();
+        static constexpr char kRequest[] = "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+            sizeof(kRequest) - 1);
+        const u32 conn_id = conn->id;
+        const u32 free_before = loop.free_top;
+        loop.backend.clear_ops();
+        loop.backend.fail_send = !fail_resubmit;
+        on_header_received<StrictLocalSendFailureLoop>(
+            &loop,
+            *conn,
+            make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+
+        if (fail_resubmit) {
+            REQUIRE_EQ(loop.close_calls, 0u);
+            REQUIRE_EQ(conn->resp_status, 204u);
+            const u32 wire_len = conn->send_buf.len();
+            REQUIRE_GT(wire_len, 7u);
+            u8 normalized[SmallLoop::kBufSize]{};
+            __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+            REQUIRE(normalize_strict_local_response_date(normalized, wire_len));
+            const auto expected =
+                expected_no_content204_wire(config.strict_local_response_policies[0].server, true);
+            REQUIRE_EQ(wire_len, expected.size());
+            CHECK_EQ(__builtin_memcmp(normalized, expected.data(), wire_len), 0);
+            loop.backend.clear_ops();
+            loop.backend.fail_send = true;
+            on_response_sent<StrictLocalSendFailureLoop>(
+                &loop, *conn, make_ev(conn_id, IoEventType::Send, 7));
+        }
+
+        CHECK_EQ(loop.close_calls, 1u);
+        CHECK(loop.close_saw_request_inflight);
+        CHECK(loop.close_saw_request_config == &config);
+        CHECK_EQ(loop.close_saw_state, ConnState::Sending);
+        CHECK_GT(loop.close_saw_send_len, 0u);
+        CHECK_EQ(loop.close_saw_send_progress, fail_resubmit ? 7u : 0u);
+        CHECK_EQ(loop.free_top, free_before + 1u);
+        CHECK_EQ(loop.conns[conn_id].fd, -1);
+        CHECK_EQ(loop.conns[conn_id].request_config, nullptr);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(metrics.requests_total, 0u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(access.available(), 0u);
+        CHECK_EQ(capture.available(), 0u);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    };
+    run(false);
+    run(true);
+}
 
 TEST(unmatched_local_response,
      synchronous_initial_send_failure_closes_without_success_publication_or_stale_ownership) {
@@ -13216,11 +13290,10 @@ TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire)
     CHECK_EQ(__builtin_memcmp(generic_wire, failure_wire, generic_len), 0);
 }
 
-TEST(unmatched_local_response,
-     no_content204_internal_serializer_exact_bytes_capacity_and_empty_views) {
+TEST(unmatched_local_response, no_content204_serializer_exact_bytes_capacity_and_empty_views) {
     Connection conn{};
     conn.req_method = static_cast<u8>(LogHttpMethod::Get);
-    const auto policy = make_no_content204_internal_policy();
+    const auto policy = make_no_content204_policy();
     REQUIRE_EQ(strict_local_response_policy_profile(policy),
                StrictLocalResponseProfile::NoContent204);
 
@@ -13238,7 +13311,7 @@ TEST(unmatched_local_response,
         __builtin_memset(wire, 0xa5, sizeof(wire));
         u32 wire_len = 777;
         const u32 expected_len = (test.expected_keep_alive ? 98u : 93u) + policy.server.len;
-        REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        REQUIRE(detail::build_no_content204_response_bytes(
             conn, policy, false, wire, sizeof(wire), &wire_len));
         CHECK_EQ(wire_len, expected_len);
         CHECK_EQ(wire[wire_len], 0xa5u);
@@ -13249,7 +13322,7 @@ TEST(unmatched_local_response,
         CHECK_FALSE(buf_has(wire, wire_len, "Transfer-Encoding"));
         REQUIRE(normalize_strict_local_response_date(wire, wire_len));
         const std::string expected =
-            expected_no_content204_internal_wire(policy.server, test.expected_keep_alive);
+            expected_no_content204_wire(policy.server, test.expected_keep_alive);
         REQUIRE_EQ(expected.size(), wire_len);
         CHECK_EQ(__builtin_memcmp(wire, expected.data(), wire_len), 0);
     }
@@ -13260,7 +13333,7 @@ TEST(unmatched_local_response,
     u8 exact[256];
     __builtin_memset(exact, 0xa5, sizeof(exact));
     u32 exact_output_len = 99;
-    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+    REQUIRE(detail::build_no_content204_response_bytes(
         conn, policy, false, exact, exact_len, &exact_output_len));
     CHECK_EQ(exact_output_len, exact_len);
     CHECK_EQ(exact[exact_len], 0xa5u);
@@ -13270,21 +13343,21 @@ TEST(unmatched_local_response,
     __builtin_memset(too_small, 0xa5, sizeof(too_small));
     __builtin_memcpy(untouched, too_small, sizeof(too_small));
     u32 failed_len = 99;
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+    CHECK_FALSE(detail::build_no_content204_response_bytes(
         conn, policy, false, too_small, exact_len - 1u, &failed_len));
     CHECK_EQ(failed_len, 0u);
     CHECK_EQ(__builtin_memcmp(too_small, untouched, sizeof(too_small)), 0);
 
     failed_len = 99;
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
-        conn, policy, false, too_small, 0, &failed_len));
+    CHECK_FALSE(
+        detail::build_no_content204_response_bytes(conn, policy, false, too_small, 0, &failed_len));
     CHECK_EQ(failed_len, 0u);
     CHECK_EQ(__builtin_memcmp(too_small, untouched, sizeof(too_small)), 0);
     failed_len = 99;
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+    CHECK_FALSE(detail::build_no_content204_response_bytes(
         conn, policy, false, nullptr, exact_len, &failed_len));
     CHECK_EQ(failed_len, 0u);
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+    CHECK_FALSE(detail::build_no_content204_response_bytes(
         conn, policy, false, too_small, exact_len, nullptr));
 
     char empty_anchor = 0;
@@ -13292,10 +13365,10 @@ TEST(unmatched_local_response,
     std::string canonical;
     for (const Str content_type : empty_views) {
         for (const Str body : empty_views) {
-            const auto view_policy = make_no_content204_internal_policy(content_type, body);
+            const auto view_policy = make_no_content204_policy(content_type, body);
             u8 wire[256];
             u32 wire_len = 0;
-            REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+            REQUIRE(detail::build_no_content204_response_bytes(
                 conn, view_policy, false, wire, sizeof(wire), &wire_len));
             REQUIRE(normalize_strict_local_response_date(wire, wire_len));
             const std::string rendered(reinterpret_cast<const char*>(wire), wire_len);
@@ -13311,44 +13384,44 @@ TEST(unmatched_local_response,
     __builtin_memset(method_wire, 0xa5, sizeof(method_wire));
     __builtin_memcpy(method_untouched, method_wire, sizeof(method_wire));
     u32 method_len = 99;
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+    CHECK_FALSE(detail::build_no_content204_response_bytes(
         conn, policy, true, method_wire, sizeof(method_wire), &method_len));
     CHECK_EQ(method_len, 0u);
     CHECK_EQ(__builtin_memcmp(method_wire, method_untouched, sizeof(method_wire)), 0);
 
     conn.req_method = static_cast<u8>(LogHttpMethod::Options);
     method_len = 0;
-    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+    REQUIRE(detail::build_no_content204_response_bytes(
         conn, policy, false, method_wire, sizeof(method_wire), &method_len));
     REQUIRE(normalize_strict_local_response_date(method_wire, method_len));
     CHECK_EQ(std::string(reinterpret_cast<const char*>(method_wire), method_len), canonical);
 
     conn.req_method = static_cast<u8>(LogHttpMethod::Head);
     method_len = 0;
-    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+    REQUIRE(detail::build_no_content204_response_bytes(
         conn, policy, true, method_wire, sizeof(method_wire), &method_len));
     REQUIRE(normalize_strict_local_response_date(method_wire, method_len));
     CHECK_EQ(std::string(reinterpret_cast<const char*>(method_wire), method_len), canonical);
     __builtin_memset(method_wire, 0xa5, sizeof(method_wire));
     method_len = 99;
-    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+    CHECK_FALSE(detail::build_no_content204_response_bytes(
         conn, policy, false, method_wire, sizeof(method_wire), &method_len));
     CHECK_EQ(method_len, 0u);
     CHECK_EQ(__builtin_memcmp(method_wire, method_untouched, sizeof(method_wire)), 0);
 }
 
 TEST(unmatched_local_response,
-     no_content204_internal_serializer_rejects_mutations_and_honors_server_boundaries) {
+     no_content204_serializer_rejects_mutations_and_honors_server_boundaries) {
     Connection conn{};
     conn.req_method = static_cast<u8>(LogHttpMethod::Get);
-    auto policy = make_no_content204_internal_policy();
+    auto policy = make_no_content204_policy();
     u8 output[256];
     u8 untouched[256];
     __builtin_memset(untouched, 0xa5, sizeof(untouched));
     auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
         __builtin_memcpy(output, untouched, sizeof(output));
         u32 output_len = 99;
-        CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        CHECK_FALSE(detail::build_no_content204_response_bytes(
             conn, forged, false, output, sizeof(output), &output_len));
         CHECK_EQ(output_len, 0u);
         CHECK_EQ(__builtin_memcmp(output, untouched, sizeof(output)), 0);
@@ -13432,18 +13505,18 @@ TEST(unmatched_local_response,
         const u32 expected_len = 93u + boundary.server.len;
         __builtin_memset(output, 0xa5, sizeof(output));
         u32 output_len = 99;
-        REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        REQUIRE(detail::build_no_content204_response_bytes(
             conn, boundary, false, output, expected_len, &output_len));
         CHECK_EQ(output_len, expected_len);
         CHECK_EQ(output[expected_len], 0xa5u);
         REQUIRE(normalize_strict_local_response_date(output, output_len));
-        const auto expected = expected_no_content204_internal_wire(boundary.server, false);
+        const auto expected = expected_no_content204_wire(boundary.server, false);
         REQUIRE_EQ(expected.size(), output_len);
         CHECK_EQ(__builtin_memcmp(output, expected.data(), output_len), 0);
 
         __builtin_memcpy(output, untouched, sizeof(output));
         output_len = 99;
-        CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        CHECK_FALSE(detail::build_no_content204_response_bytes(
             conn, boundary, false, output, expected_len - 1u, &output_len));
         CHECK_EQ(output_len, 0u);
         CHECK_EQ(__builtin_memcmp(output, untouched, sizeof(output)), 0);
@@ -13510,7 +13583,8 @@ TEST(unmatched_local_response,
              0);
 }
 
-TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_before_any_publication) {
+TEST(unmatched_local_response,
+     no_content204_public_profile_close_partial_and_full_lifecycle_are_exact) {
     SmallLoop loop;
     loop.setup();
     ShardMetrics metrics{};
@@ -13525,19 +13599,9 @@ TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_befor
     loop.epoch = &epoch;
     REQUIRE(loop.set_capture(&capture));
 
-    StrictLocalResponsePolicySpec policy{};
-    policy.version = StrictLocalResponseVersion::Http11;
-    policy.status_code = 204;
-    policy.date = StrictLocalResponseDate::Current;
-    policy.connection = StrictLocalResponseConnection::Request;
-    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
-    policy.reason = {"No Content", 10};
-    policy.content_type = {nullptr, 0};
-    policy.server = {"nginx/1.29.7", 12};
-    policy.body = {nullptr, 0};
+    const auto policy = make_no_content204_policy();
     RouteConfig config{};
-    CHECK_EQ(config.add_strict_local_response_policy(policy), 0u);
-    REQUIRE_EQ(config.add_strict_local_response_policy_for_internal_propagation(policy), 1u);
+    REQUIRE_EQ(config.add_strict_local_response_policy(policy), 1u);
     REQUIRE(config.set_unmatched_policy_id(kRouteMethodAny, 1));
     REQUIRE(config.unmatched_policy_table_is_valid());
 
@@ -13550,38 +13614,207 @@ TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_befor
     serializer_conn.req_method = static_cast<u8>(LogHttpMethod::Get);
     u8 output[256];
     __builtin_memset(output, 0xa5, sizeof(output));
-    u32 internal_output_len = 0;
-    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
-        serializer_conn, policy, false, output, sizeof(output), &internal_output_len));
-    CHECK_EQ(internal_output_len, 93u + policy.server.len);
-    REQUIRE(normalize_strict_local_response_date(output, internal_output_len));
-    const auto internal_expected = expected_no_content204_internal_wire(policy.server, false);
-    REQUIRE_EQ(internal_expected.size(), internal_output_len);
-    CHECK_EQ(__builtin_memcmp(output, internal_expected.data(), internal_output_len), 0);
+    u32 direct_output_len = 0;
+    REQUIRE(detail::build_no_content204_response_bytes(
+        serializer_conn, policy, false, output, sizeof(output), &direct_output_len));
+    CHECK_EQ(direct_output_len, 93u + policy.server.len);
+    REQUIRE(normalize_strict_local_response_date(output, direct_output_len));
+    const auto direct_expected = expected_no_content204_wire(policy.server, false);
+    REQUIRE_EQ(direct_expected.size(), direct_output_len);
+    CHECK_EQ(__builtin_memcmp(output, direct_expected.data(), direct_output_len), 0);
 
-    // A proven internal materializer does not activate either public building
-    // or dispatch: the Stage-2 execution fence below still owns this request.
-    __builtin_memset(output, 0xa5, sizeof(output));
-    u32 output_len = 99;
-    CHECK_FALSE(build_strict_local_response(
-        serializer_conn, policy, false, output, sizeof(output), &output_len));
-    CHECK_EQ(output_len, 0u);
-    for (u8 byte : output) CHECK_EQ(byte, 0xa5u);
+    u32 public_output_len = 0;
+    REQUIRE(build_strict_local_response(
+        serializer_conn, policy, false, output, sizeof(output), &public_output_len));
+    CHECK_EQ(public_output_len, direct_output_len);
 
     loop.backend.clear_ops();
-    const u32 free_before = loop.free_top;
-    Connection* closed = dispatch_unmatched_request(
+    Connection* conn = dispatch_unmatched_request(
         loop, config, "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    REQUIRE(closed != nullptr);
-    CHECK_EQ(loop.free_top, free_before);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    REQUIRE_EQ(conn->resp_status, 204u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
     CHECK_EQ(metrics.requests_total, 0u);
-    CHECK_EQ(metrics.requests_active, 0u);
     CHECK_EQ(access.available(), 0u);
     CHECK_EQ(capture.available(), 0u);
-    CHECK_EQ(closed->send_buf.len(), 0u);
-    CHECK_EQ(closed->resp_status, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    u8 normalized[SmallLoop::kBufSize]{};
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE_LE(wire_len, sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+    REQUIRE(normalize_strict_local_response_date(normalized, wire_len));
+    const auto expected = expected_no_content204_wire(policy.server, false);
+    REQUIRE_EQ(wire_len, expected.size());
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), wire_len), 0);
+    CHECK_FALSE(buf_has(normalized, wire_len, "Content-Type"));
+    CHECK_FALSE(buf_has(normalized, wire_len, "Content-Length"));
+    CHECK_FALSE(buf_has(normalized, wire_len, "Transfer-Encoding"));
+    CHECK_EQ(normalized[wire_len - 4u], '\r');
+    CHECK_EQ(normalized[wire_len - 1u], '\n');
+
+    static constexpr u32 kPartial = 7;
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, kPartial));
+    CHECK_EQ(conn->send_progress, kPartial);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, conn->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(wire_len - kPartial)));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    AccessLogEntry access_entry{};
+    REQUIRE(access.pop(access_entry));
+    CHECK_EQ(access_entry.status, 204u);
+    CHECK_EQ(access_entry.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access_entry.resp_size, wire_len);
+    CHECK_EQ(access_entry.upstream_us, 0u);
+    CaptureEntry capture_entry{};
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.resp_status, 204u);
+    CHECK_EQ(capture_entry.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(capture_entry.resp_content_length, wire_len);
+}
+
+TEST(unmatched_local_response,
+     no_content204_public_profile_keepalive_completes_once_and_rearms_read) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    const auto policy = make_no_content204_policy();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_strict_local_response_policy(policy), 1u);
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodAny, 1));
+    REQUIRE(config.unmatched_policy_table_is_valid());
+
+    loop.backend.clear_ops();
+    Connection* conn =
+        dispatch_unmatched_request(loop, config, "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    REQUIRE_EQ(conn->resp_status, 204u);
+    REQUIRE(conn->keep_alive);
+    const u32 wire_len = conn->send_buf.len();
+    u8 normalized[SmallLoop::kBufSize]{};
+    REQUIRE_LE(wire_len, sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+    REQUIRE(normalize_strict_local_response_date(normalized, wire_len));
+    const auto expected = expected_no_content204_wire(policy.server, true);
+    REQUIRE_EQ(wire_len, expected.size());
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), wire_len), 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(wire_len)));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    // The established keep-alive boundary leaves the last request's inert
+    // diagnostic fields in place until the next header capture; epoch 2 below
+    // is the authoritative proof that the config pin itself was released.
+    CHECK_EQ(conn->request_config, &config);
+    CHECK_EQ(conn->resp_status, 204u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns - 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    loop.close_conn(*conn);
+}
+
+TEST(strict_local_response,
+     no_content204_complete_tuple_uses_existing_pre_exact_unmatched_selector_scope) {
+    StrictLocalResponsePolicySpec policies[3] = {
+        make_no_content204_policy(), make_no_content204_policy(), make_no_content204_policy()};
+    policies[0].server = {"pre", 3};
+    policies[1].server = {"exact", 5};
+    policies[2].server = {"unmatched", 9};
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    pre_route[kRouteMethodTrace] = 1;
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodGet] = 3;
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding("/static", kRouteMethodGet, 2);
+    RouteConfig config{};
+    REQUIRE(config.add_static("/ordinary", kRouteMethodGet, 204));
+    REQUIRE(config.install_strict_local_response_table_with_pre_route(
+        policies, 3, pre_route, unmatched, exact, 1));
+
+    SmallLoop loop;
+    loop.setup();
+    auto dispatch_strict = [&](const char* request, Str server) {
+        loop.backend.clear_ops();
+        Connection* conn = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->resp_status, 204u);
+        REQUIRE_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        u8 normalized[SmallLoop::kBufSize]{};
+        const u32 wire_len = conn->send_buf.len();
+        REQUIRE_LE(wire_len, sizeof(normalized));
+        __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+        REQUIRE(normalize_strict_local_response_date(normalized, wire_len));
+        const auto expected = expected_no_content204_wire(server, false);
+        REQUIRE_EQ(wire_len, expected.size());
+        CHECK_EQ(__builtin_memcmp(normalized, expected.data(), wire_len), 0);
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));
+    };
+    dispatch_strict("TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", {"pre", 3});
+    dispatch_strict("GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", {"exact", 5});
+    dispatch_strict("GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", {"unmatched", 9});
+
+    loop.backend.clear_ops();
+    Connection* ordinary = dispatch_unmatched_request(
+        loop, config, "GET /ordinary HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(ordinary != nullptr);
+    CHECK_EQ(ordinary->resp_status, 204u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    static constexpr char kOrdinary204[] =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(ordinary->send_buf.len(), sizeof(kOrdinary204) - 1u);
+    CHECK_EQ(__builtin_memcmp(ordinary->send_buf.data(), kOrdinary204, sizeof(kOrdinary204) - 1u),
+             0);
+    const u32 ordinary_len = ordinary->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(ordinary->id, IoEventType::Send, static_cast<i32>(ordinary_len)));
 }
 
 TEST(unmatched_local_response, reload_publication_is_consumed_and_inflight_request_stays_pinned) {

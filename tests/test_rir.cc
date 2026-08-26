@@ -2122,7 +2122,7 @@ TEST(RirVerifier, StrictLocalResponseRepresentation200RejectsEveryForgedProfileF
     rejects(forged);
 }
 
-TEST(RirVerifier, NoContent204RequiresExplicitInternalVerificationAndExactTuple) {
+TEST(RirVerifier, NoContent204PublicAndInternalVerificationRequireExactTuple) {
     char empty_anchor = 0;
     StrictLocalResponsePolicySpec policy{};
     policy.version = StrictLocalResponseVersion::Http11;
@@ -2142,13 +2142,15 @@ TEST(RirVerifier, NoContent204RequiresExplicitInternalVerificationAndExactTuple)
         mod.unmatched_policy_ids[kRouteMethodAny] = 1;
         return mod;
     };
-    CHECK_FALSE(verify_module(module_with(policy)).ok);
+    CHECK(verify_module(module_with(policy)).ok);
     REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
     policy.content_type = {nullptr, 0};
     policy.body = {&empty_anchor, 0};
+    REQUIRE(verify_module(module_with(policy)).ok);
     REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
 
     auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_FALSE(verify_module(module_with(forged)).ok);
         CHECK_FALSE(verify_module_for_internal_propagation(module_with(forged)).ok);
     };
     auto forged = policy;
@@ -2187,12 +2189,15 @@ TEST(RirVerifier, NoContent204RequiresExplicitInternalVerificationAndExactTuple)
 
     auto bad_id = module_with(policy);
     bad_id.unmatched_policy_ids[kRouteMethodAny] = 2;
+    CHECK_FALSE(verify_module(bad_id).ok);
     CHECK_FALSE(verify_module_for_internal_propagation(bad_id).ok);
     auto bad_count = module_with(policy);
     bad_count.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    CHECK_FALSE(verify_module(bad_count).ok);
     CHECK_FALSE(verify_module_for_internal_propagation(bad_count).ok);
     auto bad_reference = module_with(policy);
     bad_reference.unmatched_policy_ids[kRouteMethodGet] = 1;
+    CHECK_FALSE(verify_module(bad_reference).ok);
     CHECK_FALSE(verify_module_for_internal_propagation(bad_reference).ok);
 }
 
