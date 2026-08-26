@@ -1,6 +1,7 @@
 #include "rut/compiler/mir_build.h"
 
 #include "rut/runtime/route_method.h"
+#include <memory>
 #include <vector>
 
 namespace rut {
@@ -970,7 +971,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                                   module.exact_strict_local_response_bindings.len,
                                                   kMaxExactStrictLocalResponseBindings))
         return frontend_error(FrontendError::UnsupportedSyntax, {});
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
 
     for (u32 i = 0; i < module.response_policies.len; i++) {
         if (!mir->response_policies.push(module.response_policies[i]))
@@ -1842,7 +1843,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
 
             if (!forward_preflight_metadata_valid(*mir, fn)) {
-                delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
             if (!mir->functions.push(fn))
@@ -2730,7 +2730,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
 
             if (!forward_preflight_metadata_valid(*mir, fn)) {
-                delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
             if (!mir->functions.push(fn))
@@ -2795,7 +2794,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
             if (!forward_preflight_metadata_valid(*mir, fn)) {
-                delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
             if (!mir->functions.push(fn))
@@ -3328,14 +3326,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
         if (!forward_preflight_metadata_valid(*mir, fn)) {
-            delete mir;
             return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
     if (invalid_redirect_policy) return frontend_error(FrontendError::UnsupportedSyntax);
-    return mir;
+    return mir.release();
 }
 
 }  // namespace rut

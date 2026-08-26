@@ -34858,6 +34858,67 @@ TEST(frontend, fixed_redirect_source_is_complete_and_reaches_rir) {
     rir.destroy();
 }
 
+TEST(frontend, build_mir_releases_provisional_module_on_post_allocation_errors) {
+    const char source[] =
+        "route GET \"/old\" {\n"
+        "  let observed = req.path\n"
+        "  return redirect({"
+        "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
+        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
+        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
+        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
+        "path: \"static\", authority: \"static\"})\n"
+        "}\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    REQUIRE(redirect_policy_spec_valid(hir->redirect_policies[0]));
+
+    {
+        auto forged = std::make_unique<HirModule>(hir.value());
+        forged->redirect_policies[0].status_code = 302;
+        REQUIRE_FALSE(redirect_policy_spec_valid(forged->redirect_policies[0]));
+        auto rejected = build_mir(*forged);
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rejected.error().span.start, 0u);
+        CHECK_EQ(rejected.error().span.end, 0u);
+        CHECK_EQ(rejected.error().span.line, 1u);
+        CHECK_EQ(rejected.error().span.col, 1u);
+        CHECK_EQ(rejected.error().detail.ptr, nullptr);
+        CHECK_EQ(rejected.error().detail.len, 0u);
+    }
+
+    {
+        auto forged = std::make_unique<HirModule>(hir.value());
+        auto& init = forged->routes[0].locals[0].init;
+        const Span init_span = init.span;
+        init.kind = HirExprKind::ArrayLit;
+        auto rejected = build_mir(*forged);
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rejected.error().span.start, init_span.start);
+        CHECK_EQ(rejected.error().span.end, init_span.end);
+        CHECK_EQ(rejected.error().span.line, init_span.line);
+        CHECK_EQ(rejected.error().span.col, init_span.col);
+        CHECK_EQ(rejected.error().detail.ptr, nullptr);
+        CHECK_EQ(rejected.error().detail.len, 0u);
+    }
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->redirect_policies[0].status_code, 301u);
+}
+
 TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
     const char* sources[] = {
         "route GET \"/\" { return redirect({scheme: \"http\"}) }",
