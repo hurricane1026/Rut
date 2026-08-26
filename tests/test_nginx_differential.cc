@@ -7030,6 +7030,469 @@ static bool run_converter_exact_local_body_space_differential(
     return true;
 }
 
+struct GeneratedExactLocalBodyMultipleSpaceSpec {
+    const char* body_case;
+    const char* body;
+    const char* expected_response;
+    u32 content_length;
+};
+
+static std::string make_exact_local_body_multiple_space_fragment(u16 frontend_port,
+                                                                 u16 backend_port,
+                                                                 const char* body,
+                                                                 bool exact_first) {
+    const std::string exact_location =
+        "  location = /static { return 200 \"" + std::string(body) + "\"; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
+}
+
+static bool capture_generated_exact_local_body_multiple_space_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    const GeneratedExactLocalBodyMultipleSpaceSpec& spec,
+    bool exact_first,
+    ExactLocalBodySpaceOracleObservation& observation,
+    std::string& generated_source,
+    std::string& error) {
+    std::string fragment = make_exact_local_body_multiple_space_fragment(
+        frontend_port, backend_port, spec.body, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#322 accepted real nginx server fragment did not parse for generated RUT";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_local_return;
+    const auto& response = exact.response;
+    const char* root_path = fragment.data() + root.path_span.start;
+    const char* exact_path = fragment.data() + exact.path_span.start;
+    const char* body = fragment.data() + response.body_span.start;
+    if (strlen(spec.body) != spec.content_length || server.span.start != 0 ||
+        server.span.end != fragment.size() - 1u || server.listen.port != frontend_port ||
+        !root.path.eq(rut::lit_str("/")) || root.path.ptr != root_path ||
+        root.path_span.end - root.path_span.start != root.path.len || proxy.has_uri ||
+        proxy.address[0] != 127 || proxy.address[1] != 0 || proxy.address[2] != 0 ||
+        proxy.address[3] != 1 || proxy.port != backend_port || !exact.present ||
+        !exact.path.eq(rut::lit_str("/static")) || exact.path.ptr != exact_path ||
+        exact.path_span.end - exact.path_span.start != exact.path.len ||
+        exact.span.start >= exact.path_span.start || exact.span.end <= response.span.end ||
+        response.status != 200 || response.body.len != spec.content_length ||
+        memcmp(response.body.ptr, spec.body, spec.content_length) != 0 ||
+        response.body.ptr != body ||
+        response.body_span.end - response.body_span.start != response.body.len ||
+        response.span.start >= response.body_span.start ||
+        response.span.end <= response.body_span.end || response.body_span.start == 0 ||
+        response.body_span.end >= fragment.size() ||
+        fragment[response.body_span.start - 1u] != '"' || fragment[response.body_span.end] != '"' ||
+        server.exact_absolute_redirect.present) {
+        error = "#322 nginx text did not retain the exact borrowed body/path/span/source model";
+        return false;
+    }
+
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#322 accepted multiple-space semantic model failed ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    generated_source.assign(generated.ptr, generated.len);
+    const auto count_literal = [&](const std::string& literal) {
+        size_t count = 0;
+        for (size_t offset = 0;;) {
+            offset = generated_source.find(literal, offset);
+            if (offset == std::string::npos) return count;
+            count++;
+            offset += literal.size();
+        }
+    };
+    const std::string expected_literal = "body: b\"" + std::string(spec.body) + "\"";
+    const char* other_body =
+        strcmp(spec.body, "hello  world") == 0 ? "hello world again" : "hello  world";
+    if (count_literal(expected_literal) != 1 ||
+        count_literal("route exact \"/static\" { return local_response({") != 1 ||
+        count_literal("/static") != 1 || count_literal("route exact ") != 1 ||
+        count_literal("route \"/\" {") != 1 ||
+        count_literal("return forward(nginx_upstream") != 3 ||
+        generated_source.find("body: b\"" + std::string(other_body) + "\"") != std::string::npos ||
+        generated_source.find("slash_normalized") != std::string::npos ||
+        generated_source.find("route exact \"/static/") != std::string::npos ||
+        generated_source.find("route \"/static") != std::string::npos ||
+        generated_source.find("req.pathOnly == \"/static") != std::string::npos ||
+        generated_source.find("alias") != std::string::npos ||
+        generated_source.find("proxy_pass") != std::string::npos ||
+        generated_source.find("nginx.conf") != std::string::npos ||
+        generated_source.find("nginx::") != std::string::npos ||
+        generated_source.find("nginx_compat") != std::string::npos ||
+        generated_source.find("workaround") != std::string::npos ||
+        !write_file(temp.source, generated.ptr, generated.len)) {
+        error = "#322 output was not one ordinary Raw /static body plus unchanged root forward";
+        return false;
+    }
+
+    std::fill(fragment.begin(), fragment.end(), '\0');
+    if (!std::all_of(fragment.begin(), fragment.end(), [](char byte) { return byte == '\0'; })) {
+        error = "#322 failed to overwrite the borrowed nginx source after parse/lower";
+        return false;
+    }
+
+    observation = ExactLocalBodySpaceOracleObservation{};
+    observation.order = std::string("generated-") + spec.body_case + "-" +
+                        (exact_first ? "exact-before-root" : "root-before-exact");
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.container_name = "public-rut-cli-" + observation.order;
+
+    const std::string request(kExactLocalBodyMultipleSpaceRequest);
+    const size_t header_end = request.find("\r\n\r\n");
+    if (request.rfind("GET /static HTTP/1.1\r\n", 0) != 0 ||
+        request.find("\r\nHost: multiple-body-space.example\r\n") == std::string::npos ||
+        request.find("\r\nConnection: close\r\n") == std::string::npos ||
+        request.find("\r\nContent-Length:") != std::string::npos ||
+        request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request.find("\r\nTE:") != std::string::npos ||
+        request.find("\r\nExpect:") != std::string::npos ||
+        request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+        header_end + 4u != request.size()) {
+        error = "generated-RUT #322 request escaped the fresh bodyless explicit-close GET";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    Recorder recorder;
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    } recorder_guard{&recorder};
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup(backend_port)) {
+        error = "failed to start generated-RUT #322 zero-upstream recorder";
+        return false;
+    }
+
+    ChildGuard runtime;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "failed to start converter-generated ordinary RUT for #322";
+        return false;
+    }
+    const std::string listener_record =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!recorder_live(recorder) || !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener_record.c_str())) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(runtime.child) || recorder.listener_failed.load(std::memory_order_acquire) ||
+            !recorder.running.load(std::memory_order_acquire)) {
+            error = "generated-RUT #322 runtime or recorder failed before production readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(recorder) || !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener_record.c_str())) {
+        error = "generated-RUT #322 lacked recorder, one-shard listener, or io_uring proof";
+        return false;
+    }
+    static constexpr char kDestroyedSource[] = "destroyed-after-322-public-load\n";
+    if (!write_file(temp.source, kDestroyedSource, sizeof(kDestroyedSource) - 1u)) {
+        error = "failed to overwrite #322 generated source after public CLI load";
+        return false;
+    }
+
+    const auto observe_live_zero = [&](const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child) || !recorder_live(recorder)) {
+                error =
+                    std::string("generated-RUT #322 runtime or recorder failed during ") + phase;
+                return false;
+            }
+            if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+                recorder.requests.load(std::memory_order_acquire) != 0 ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+                error =
+                    std::string("generated-RUT #322 observed upstream activity during ") + phase;
+                return false;
+            }
+            usleep(5000);
+        }
+        return true;
+    };
+    if (!observe_live_zero("pre-request live zero-upstream window")) return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    std::string detail;
+    if (client.fd < 0 ||
+        !send_all(client.fd,
+                  kExactLocalBodyMultipleSpaceRequest,
+                  sizeof(kExactLocalBodyMultipleSpaceRequest) - 1u) ||
+        !read_response(client.fd, observation.wire, detail) || !read_eof(client.fd, detail)) {
+        error = "generated-RUT #322 response/close/EOF/zero-tail failed: " +
+                (detail.empty() ? std::string("connect or send failed") : detail);
+        return false;
+    }
+    if (!validate_exact_normalized_response(observation.wire, spec.expected_response, detail)) {
+        error = std::string("generated-RUT #322 ") + spec.body_case +
+                " exact status/header/CL/body wire mismatch: " + detail;
+        return false;
+    }
+    if (std::string(observation.wire.begin(), observation.wire.end()).find("\r\nLocation:") !=
+        std::string::npos) {
+        error = "generated-RUT #322 response unexpectedly emitted Location";
+        return false;
+    }
+    if (!observe_live_zero("post-request live zero-upstream window")) return false;
+    if (!stop_child(runtime.child)) {
+        error = "failed to stop generated-RUT #322 public CLI cleanly";
+        return false;
+    }
+    recorder.stop();
+    recorder_guard.recorder = nullptr;
+    observation.upstream_accepts = recorder.accepted.load(std::memory_order_acquire);
+    observation.upstream_requests = recorder.requests.load(std::memory_order_acquire);
+    observation.upstream_sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+    if (recorder.thread_alive.load(std::memory_order_acquire) ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.upstream_accepts != 0 || observation.upstream_requests != 0 ||
+        observation.upstream_sends != 0 ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !recorder.history.empty() || !recorder.request.empty()) {
+        error = "generated-RUT #322 recorder did not settle with zero activity/history";
+        return false;
+    }
+
+    u32 total_access = 0;
+    u32 backend_records = 0;
+    u32 listener_records = 0;
+    if (!log_count_line_with(
+            temp.rut_access_log, " GET /static 200 ", " s=0", observation.access_records) ||
+        !log_count_line_with(temp.rut_access_log, " GET ", " s=0", total_access) ||
+        !log_count_line_with(
+            temp.rut_log, "Backend: io_uring", "Backend: io_uring", backend_records) ||
+        !log_count_line_with(
+            temp.rut_log, listener_record.c_str(), listener_record.c_str(), listener_records) ||
+        observation.access_records != 1 || total_access != 1 || backend_records != 1 ||
+        listener_records != 1 || log_contains(temp.rut_log, "Backend: epoll") ||
+        log_contains(temp.rut_log, "failed") || log_contains(temp.rut_log, "Failed") ||
+        log_contains(temp.rut_log, "error") || log_contains(temp.rut_log, "Error") ||
+        log_contains(temp.rut_log, "ERROR") || log_contains(temp.rut_log, "fatal") ||
+        log_contains(temp.rut_log, "FATAL") || log_contains(temp.rut_log, "panic") ||
+        log_contains(temp.rut_log, "PANIC")) {
+        error = "generated-RUT #322 logs were not one clean io_uring startup and raw access";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_exact_local_body_multiple_space_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    ExactLocalBodySpaceOracleObservation (&observations)[8],
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "converter-generated #322 differential requires an executable absolute RUT path";
+        return false;
+    }
+
+    u16 ports[16]{};
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        bool allocated = true;
+        for (u16& port : ports) allocated = allocate_port(port) && allocated;
+        ports_unique = allocated;
+        for (size_t i = 0; i < 16 && ports_unique; i++) {
+            for (size_t j = i + 1u; j < 16; j++) {
+                if (ports[i] == ports[j]) ports_unique = false;
+            }
+        }
+    }
+    if (!ports_unique) {
+        error = "#322 could not allocate 16 distinct eight-side frontend/backend ports";
+        return false;
+    }
+
+    TempDir temps[8];
+    for (TempDir& temp : temps) {
+        if (!temp.create()) {
+            error = "#322 could not create eight independent semantic-side temp trees";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < 8; i++) {
+        for (size_t j = i + 1u; j < 8; j++) {
+            if (strcmp(temps[i].path, temps[j].path) == 0 || temps[i].source == temps[j].source ||
+                temps[i].nginx_config == temps[j].nginx_config ||
+                temps[i].nginx_log == temps[j].nginx_log || temps[i].rut_log == temps[j].rut_log ||
+                temps[i].rut_access_log == temps[j].rut_access_log) {
+                error = "#322 eight sides did not retain distinct temp/config/source/log paths";
+                return false;
+            }
+        }
+    }
+
+    const GeneratedExactLocalBodyMultipleSpaceSpec specs[] = {
+        {"consecutive", "hello  world", kExactLocalBodyConsecutiveSpaceResponseNormalized, 12u},
+        {"consecutive", "hello  world", kExactLocalBodyConsecutiveSpaceResponseNormalized, 12u},
+        {"separated", "hello world again", kExactLocalBodySeparatedSpaceResponseNormalized, 17u},
+        {"separated", "hello world again", kExactLocalBodySeparatedSpaceResponseNormalized, 17u},
+    };
+    const bool exact_first[] = {true, false, true, false};
+    std::string containers[4];
+    for (size_t i = 0; i < 4; i++) {
+        containers[i] = container_prefix + "-nginx-" + specs[i].body_case + "-" +
+                        (exact_first[i] ? "exact-first" : "root-first");
+        for (size_t j = 0; j < i; j++) {
+            if (containers[i] == containers[j]) {
+                error = "#322 four pinned nginx container names were not independent";
+                return false;
+            }
+        }
+        const ExactLocalBodySpaceOracleSpec oracle_spec = {
+            "#322",
+            kExactLocalBodyMultipleSpaceRequest,
+            "multiple-body-space.example",
+            specs[i].body,
+            specs[i].expected_response,
+            strcmp(specs[i].body_case, "consecutive") == 0 ? "rut-nginx-322-converter-consecutive"
+                                                           : "rut-nginx-322-converter-separated",
+            "converter_exact_local_body_multiple_space",
+            specs[i].content_length,
+            true};
+        if (!capture_pinned_exact_local_body_space_order_with_spec(ports[i * 2u],
+                                                                   ports[i * 2u + 1u],
+                                                                   temps[i],
+                                                                   containers[i],
+                                                                   oracle_spec,
+                                                                   exact_first[i],
+                                                                   observations[i],
+                                                                   error)) {
+            dump_log(temps[i].nginx_config, "#322 differential pinned nginx config");
+            dump_log(temps[i].nginx_log, "#322 differential pinned nginx log");
+            return false;
+        }
+    }
+
+    std::string generated_sources[4];
+    for (size_t i = 0; i < 4; i++) {
+        const size_t side = i + 4u;
+        if (!capture_generated_exact_local_body_multiple_space_order(ports[side * 2u],
+                                                                     ports[side * 2u + 1u],
+                                                                     temps[side],
+                                                                     rut_path,
+                                                                     specs[i],
+                                                                     exact_first[i],
+                                                                     observations[side],
+                                                                     generated_sources[i],
+                                                                     error)) {
+            dump_log(temps[side].source, "#322 differential destroyed generated RUT source");
+            dump_log(temps[side].rut_log, "#322 differential generated RUT log");
+            dump_log(temps[side].rut_access_log, "#322 differential generated RUT access log");
+            return false;
+        }
+    }
+
+    const auto replace_once =
+        [](std::string& source, const std::string& needle, const std::string& replacement) {
+            const size_t first = source.find(needle);
+            if (first == std::string::npos ||
+                source.find(needle, first + needle.size()) != std::string::npos)
+                return false;
+            source.replace(first, needle.size(), replacement);
+            return true;
+        };
+    std::string canonical[4];
+    for (size_t i = 0; i < 4; i++) {
+        canonical[i] = generated_sources[i];
+        const size_t side = i + 4u;
+        if (!replace_once(
+                canonical[i], "listen :" + std::to_string(ports[side * 2u]), "listen :FRONTEND") ||
+            !replace_once(canonical[i],
+                          "127.0.0.1:" + std::to_string(ports[side * 2u + 1u]),
+                          "127.0.0.1:BACKEND")) {
+            error = "#322 port normalization was not exact and unique in generated source";
+            return false;
+        }
+    }
+    if (canonical[0] != canonical[1] || canonical[2] != canonical[3]) {
+        error = "#322 declaration order changed generated source beyond exact port bindings";
+        return false;
+    }
+    std::string cross_body_consecutive = canonical[0];
+    std::string cross_body_separated = canonical[2];
+    if (!replace_once(cross_body_consecutive, "body: b\"hello  world\"", "body: b\"BODY\"") ||
+        !replace_once(cross_body_separated, "body: b\"hello world again\"", "body: b\"BODY\"") ||
+        cross_body_consecutive != cross_body_separated) {
+        error = "#322 body variants differed outside their one ordinary byte literal";
+        return false;
+    }
+
+    for (size_t i = 0; i < 8; i++) {
+        const auto& value = observations[i];
+        if (value.wire.empty() || value.upstream_accepts != 0 || value.upstream_requests != 0 ||
+            value.upstream_sends != 0 || value.access_records != 1) {
+            error = "#322 one of eight sides lacked wire/zero-upstream/single-access evidence";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8; j++) {
+            if (value.temp_path == observations[j].temp_path ||
+                value.config_path == observations[j].config_path ||
+                value.log_path == observations[j].log_path ||
+                value.container_name == observations[j].container_name ||
+                value.wire.data() == observations[j].wire.data()) {
+                error = "#322 eight semantic sides did not retain independent state";
+                return false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < 4; i++) {
+        std::vector<char> nginx_wire = observations[i].wire;
+        std::vector<char> rut_wire = observations[i + 4u].wire;
+        const size_t expected_size = specs[i].content_length == 12u ? 155u : 160u;
+        const std::vector<char> expected(specs[i].expected_response,
+                                         specs[i].expected_response + expected_size);
+        if (!normalize_date(nginx_wire) || !normalize_date(rut_wire) ||
+            nginx_wire.size() != expected_size || rut_wire.size() != expected_size ||
+            nginx_wire != expected || rut_wire != expected || nginx_wire != rut_wire) {
+            error = std::string("#322 pinned-nginx/generated-RUT pair mismatch for ") +
+                    specs[i].body_case + "/" + (exact_first[i] ? "exact-first" : "root-first");
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::string make_bounded_exact_local_path_fragment(u16 frontend_port,
                                                           u16 backend_port,
                                                           bool exact_first) {
@@ -14865,6 +15328,9 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--exact-local-body-multiple-space-oracle") == 0;
     const bool converter_exact_local_body_space_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-local-body-space-differential") == 0;
+    const bool converter_exact_local_body_multiple_space_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-exact-local-body-multiple-space-differential") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
@@ -14916,6 +15382,7 @@ int main(int argc, char** argv) {
          !normalized_exact_trailing_slash_oracle && !exact_local_body_space_oracle &&
          !exact_local_body_multiple_space_oracle &&
          !converter_exact_local_body_space_differential &&
+         !converter_exact_local_body_multiple_space_differential &&
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_bounded_exact_local_path_differential &&
@@ -14940,6 +15407,7 @@ int main(int argc, char** argv) {
         (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
         (converter_normalized_exact_trailing_slash_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_space_differential && argv[2][0] != '/') ||
+        (converter_exact_local_body_multiple_space_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
@@ -14972,6 +15440,9 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-body-space-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-local-body-multiple-space-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
@@ -15534,6 +16005,45 @@ int main(int argc, char** argv) {
                "whitespace/non-ASCII, quoting/escapes/variables, other bodies/statuses/paths/"
                "methods/framing, HTTP/1.0, keep-alive/reuse/pipeline, TLS/H2, other location "
                "forms, and multiple servers/listeners)\n";
+        return 0;
+    }
+
+    if (converter_exact_local_body_multiple_space_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-converter-exact-local-body-multiple-space-" + std::to_string(getpid()) +
+            "-" + source_suffix;
+        ExactLocalBodySpaceOracleObservation observations[8];
+        std::string differential_error;
+        if (!run_converter_exact_local_body_multiple_space_differential(
+                container_prefix, argv[2], observations, differential_error)) {
+            std::cerr << "FAIL [converter-generated exact-local multiple-space body differential]: "
+                      << differential_error << "\n";
+            for (size_t i = 0; i < 8; i++) {
+                dump_exact_local_body_multiple_space_oracle_observation(
+                    i % 4u < 2u ? "consecutive" : "separated", observations[i]);
+            }
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of complete bounded exact /static nginx server "
+               "fragments with consecutive hello  world (CL12) and separated hello world "
+               "again (CL17) bodies passed through production parse/borrowed-span validation/"
+               "lowering into canonical ordinary Raw RUT with one exact route, one unique body "
+               "literal, and the unchanged root forward; after exact frontend/backend port "
+               "normalization each order was identical and the body variants differed only at "
+               "that literal. Four pinned nginx 1.29.7 containers and four independently "
+               "generated public one-shard/no-pin/drain-zero io_uring CLIs used 16 unique ports "
+               "and eight isolated temp/config/source/log/access/recorder states. Every direct "
+               "nginx-to-RUT body/order pair matched its complete Date-only-normalized nginx-"
+               "header-order 200 OK/text-plain/exact-CL/full-body/no-newline/no-tail/no-Location/"
+               "close/EOF wire, live pre/post and settled zero upstream, exactly one raw /static "
+               "access record, and clean startup/runtime logs after borrowed nginx text and "
+               "loaded RUT source overwrite (#322 bounded converter equivalence only; excludes "
+               "edge spaces, other whitespace/non-ASCII, quoting/escapes/variables, other "
+               "bodies/statuses/paths/methods/framing, HTTP/1.0, reuse/pipeline, TLS/H2, other "
+               "location forms, and multiple servers/listeners)\n";
         return 0;
     }
 
