@@ -7886,6 +7886,59 @@ inline bool build_strict_local_response(const Connection& conn,
     return build_bounded_local_response_bytes(conn, policy, suppress_body, out, out_cap, out_len);
 }
 
+namespace detail {
+
+// Closed Stage-3b1 serializer proof for the internally derived NoContent204
+// tuple.  This is deliberately not selected by status alone and is not wired
+// into request dispatch: public validation and the runtime execution fence stay
+// closed until the later atomic activation increment.
+inline bool build_no_content204_response_for_internal_serialization(
+    const Connection& conn,
+    const StrictLocalResponsePolicySpec& policy,
+    bool suppress_body,
+    u8* out,
+    u32 out_cap,
+    u32* out_len) {
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (strict_local_response_policy_profile(policy) != StrictLocalResponseProfile::NoContent204 ||
+        suppress_body != (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
+        out == nullptr)
+        return false;
+
+    const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    // The fixed portion includes the 29-byte RFC-style Date produced below.
+    // Complete-tuple validation caps server.len at 64, so this addition cannot
+    // overflow u32.
+    const u32 required = (keep_alive ? 98u : 93u) + policy.server.len;
+    if (out_cap < required) return false;
+
+    char date[32];
+    const u32 date_len = strict_response_date(date, realtime_us());
+    if (date_len != 29u) return false;
+
+    u32 pos = 0;
+    auto put = [&](const void* data, u32 len) {
+        if ((data == nullptr && len != 0) || pos > required || len > required - pos) return false;
+        const auto* bytes = static_cast<const u8*>(data);
+        for (u32 i = 0; i < len; i++) out[pos + i] = bytes[i];
+        pos += len;
+        return true;
+    };
+    auto put_lit = [&](const char* text) {
+        return put(text, static_cast<u32>(__builtin_strlen(text)));
+    };
+    if (!put_lit("HTTP/1.1 204 No Content\r\nServer: ") ||
+        !put(policy.server.ptr, policy.server.len) || !put_lit("\r\nDate: ") ||
+        !put(date, date_len) || !put_lit("\r\nConnection: ") ||
+        !put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") || pos != required)
+        return false;
+    *out_len = pos;
+    return true;
+}
+
+}  // namespace detail
+
 inline bool build_failure_policy_response_from_spec(const Connection& conn,
                                                     const ForwardFailurePolicySpec& policy,
                                                     bool suppress_body,

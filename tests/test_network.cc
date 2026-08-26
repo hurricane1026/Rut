@@ -10179,6 +10179,60 @@ static StrictLocalResponsePolicySpec make_representation200_policy() {
     return policy;
 }
 
+static StrictLocalResponsePolicySpec make_no_content204_internal_policy(Str content_type = {},
+                                                                        Str body = {}) {
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"No Content", 10};
+    policy.content_type = content_type;
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = body;
+    return policy;
+}
+
+static bool normalize_strict_local_response_date(u8* wire, u32 wire_len) {
+    static constexpr char kDatePrefix[] = "\r\nDate: ";
+    if (wire == nullptr || count_occurrences(wire, wire_len, "Date: ") != 1) return false;
+    u32 date_start = 0;
+    bool found = false;
+    for (u32 i = 0; i + sizeof(kDatePrefix) - 1u <= wire_len; i++) {
+        if (__builtin_memcmp(wire + i, kDatePrefix, sizeof(kDatePrefix) - 1u) == 0) {
+            date_start = i + sizeof(kDatePrefix) - 1u;
+            found = true;
+            break;
+        }
+    }
+    if (!found || date_start + 31u > wire_len || wire[date_start + 29u] != '\r' ||
+        wire[date_start + 30u] != '\n')
+        return false;
+
+    const auto alpha = [](u8 c) { return c >= 'A' && c <= 'z' && !(c > 'Z' && c < 'a'); };
+    const auto digit = [](u8 c) { return c >= '0' && c <= '9'; };
+    const u8* date = wire + date_start;
+    if (!alpha(date[0]) || !alpha(date[1]) || !alpha(date[2]) || date[3] != ',' || date[4] != ' ' ||
+        !digit(date[5]) || !digit(date[6]) || date[7] != ' ' || !alpha(date[8]) ||
+        !alpha(date[9]) || !alpha(date[10]) || date[11] != ' ' || !digit(date[12]) ||
+        !digit(date[13]) || !digit(date[14]) || !digit(date[15]) || date[16] != ' ' ||
+        !digit(date[17]) || !digit(date[18]) || date[19] != ':' || !digit(date[20]) ||
+        !digit(date[21]) || date[22] != ':' || !digit(date[23]) || !digit(date[24]) ||
+        date[25] != ' ' || date[26] != 'G' || date[27] != 'M' || date[28] != 'T')
+        return false;
+    for (u32 i = 0; i < 29; i++) wire[date_start + i] = 'X';
+    return true;
+}
+
+static std::string expected_no_content204_internal_wire(Str server, bool keep_alive) {
+    std::string wire = "HTTP/1.1 204 No Content\r\nServer: ";
+    wire.append(server.ptr, server.len);
+    wire += "\r\nDate: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nConnection: ";
+    wire += keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n";
+    return wire;
+}
+
 static ExactStrictLocalResponseBinding make_exact_local_binding(
     const char* path, u8 method, u16 policy_id, ExactPathView path_view = ExactPathView::Raw) {
     ExactStrictLocalResponseBinding binding{};
@@ -13162,6 +13216,300 @@ TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire)
     CHECK_EQ(__builtin_memcmp(generic_wire, failure_wire, generic_len), 0);
 }
 
+TEST(unmatched_local_response,
+     no_content204_internal_serializer_exact_bytes_capacity_and_empty_views) {
+    Connection conn{};
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    const auto policy = make_no_content204_internal_policy();
+    REQUIRE_EQ(strict_local_response_policy_profile(policy),
+               StrictLocalResponseProfile::NoContent204);
+
+    struct PersistenceCase {
+        bool keep_alive;
+        bool request_keep_alive;
+        bool expected_keep_alive;
+    };
+    const PersistenceCase persistence[] = {
+        {false, false, false}, {false, true, false}, {true, false, false}, {true, true, true}};
+    for (const auto& test : persistence) {
+        conn.keep_alive = test.keep_alive;
+        conn.req_client_keep_alive = test.request_keep_alive;
+        u8 wire[256];
+        __builtin_memset(wire, 0xa5, sizeof(wire));
+        u32 wire_len = 777;
+        const u32 expected_len = (test.expected_keep_alive ? 98u : 93u) + policy.server.len;
+        REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+            conn, policy, false, wire, sizeof(wire), &wire_len));
+        CHECK_EQ(wire_len, expected_len);
+        CHECK_EQ(wire[wire_len], 0xa5u);
+        REQUIRE_GE(wire_len, 4u);
+        CHECK_EQ(__builtin_memcmp(wire + wire_len - 4u, "\r\n\r\n", 4), 0);
+        CHECK_FALSE(buf_has(wire, wire_len, "Content-Type"));
+        CHECK_FALSE(buf_has(wire, wire_len, "Content-Length"));
+        CHECK_FALSE(buf_has(wire, wire_len, "Transfer-Encoding"));
+        REQUIRE(normalize_strict_local_response_date(wire, wire_len));
+        const std::string expected =
+            expected_no_content204_internal_wire(policy.server, test.expected_keep_alive);
+        REQUIRE_EQ(expected.size(), wire_len);
+        CHECK_EQ(__builtin_memcmp(wire, expected.data(), wire_len), 0);
+    }
+
+    conn.keep_alive = false;
+    conn.req_client_keep_alive = false;
+    const u32 exact_len = 93u + policy.server.len;
+    u8 exact[256];
+    __builtin_memset(exact, 0xa5, sizeof(exact));
+    u32 exact_output_len = 99;
+    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, exact, exact_len, &exact_output_len));
+    CHECK_EQ(exact_output_len, exact_len);
+    CHECK_EQ(exact[exact_len], 0xa5u);
+
+    u8 too_small[256];
+    u8 untouched[256];
+    __builtin_memset(too_small, 0xa5, sizeof(too_small));
+    __builtin_memcpy(untouched, too_small, sizeof(too_small));
+    u32 failed_len = 99;
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, too_small, exact_len - 1u, &failed_len));
+    CHECK_EQ(failed_len, 0u);
+    CHECK_EQ(__builtin_memcmp(too_small, untouched, sizeof(too_small)), 0);
+
+    failed_len = 99;
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, too_small, 0, &failed_len));
+    CHECK_EQ(failed_len, 0u);
+    CHECK_EQ(__builtin_memcmp(too_small, untouched, sizeof(too_small)), 0);
+    failed_len = 99;
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, nullptr, exact_len, &failed_len));
+    CHECK_EQ(failed_len, 0u);
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, too_small, exact_len, nullptr));
+
+    char empty_anchor = 0;
+    const Str empty_views[] = {{nullptr, 0}, {&empty_anchor + 1, 0}};
+    std::string canonical;
+    for (const Str content_type : empty_views) {
+        for (const Str body : empty_views) {
+            const auto view_policy = make_no_content204_internal_policy(content_type, body);
+            u8 wire[256];
+            u32 wire_len = 0;
+            REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+                conn, view_policy, false, wire, sizeof(wire), &wire_len));
+            REQUIRE(normalize_strict_local_response_date(wire, wire_len));
+            const std::string rendered(reinterpret_cast<const char*>(wire), wire_len);
+            if (canonical.empty())
+                canonical = rendered;
+            else
+                CHECK_EQ(rendered, canonical);
+        }
+    }
+
+    u8 method_wire[256];
+    u8 method_untouched[256];
+    __builtin_memset(method_wire, 0xa5, sizeof(method_wire));
+    __builtin_memcpy(method_untouched, method_wire, sizeof(method_wire));
+    u32 method_len = 99;
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, true, method_wire, sizeof(method_wire), &method_len));
+    CHECK_EQ(method_len, 0u);
+    CHECK_EQ(__builtin_memcmp(method_wire, method_untouched, sizeof(method_wire)), 0);
+
+    conn.req_method = static_cast<u8>(LogHttpMethod::Options);
+    method_len = 0;
+    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, method_wire, sizeof(method_wire), &method_len));
+    REQUIRE(normalize_strict_local_response_date(method_wire, method_len));
+    CHECK_EQ(std::string(reinterpret_cast<const char*>(method_wire), method_len), canonical);
+
+    conn.req_method = static_cast<u8>(LogHttpMethod::Head);
+    method_len = 0;
+    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, true, method_wire, sizeof(method_wire), &method_len));
+    REQUIRE(normalize_strict_local_response_date(method_wire, method_len));
+    CHECK_EQ(std::string(reinterpret_cast<const char*>(method_wire), method_len), canonical);
+    __builtin_memset(method_wire, 0xa5, sizeof(method_wire));
+    method_len = 99;
+    CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+        conn, policy, false, method_wire, sizeof(method_wire), &method_len));
+    CHECK_EQ(method_len, 0u);
+    CHECK_EQ(__builtin_memcmp(method_wire, method_untouched, sizeof(method_wire)), 0);
+}
+
+TEST(unmatched_local_response,
+     no_content204_internal_serializer_rejects_mutations_and_honors_server_boundaries) {
+    Connection conn{};
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    auto policy = make_no_content204_internal_policy();
+    u8 output[256];
+    u8 untouched[256];
+    __builtin_memset(untouched, 0xa5, sizeof(untouched));
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        __builtin_memcpy(output, untouched, sizeof(output));
+        u32 output_len = 99;
+        CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+            conn, forged, false, output, sizeof(output), &output_len));
+        CHECK_EQ(output_len, 0u);
+        CHECK_EQ(__builtin_memcmp(output, untouched, sizeof(output)), 0);
+    };
+
+    auto forged = policy;
+    forged.version = StrictLocalResponseVersion::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.reserved0 = 1;
+    rejects(forged);
+    forged = policy;
+    forged.status_code = 200;
+    rejects(forged);
+    forged = policy;
+    forged.status_code = 205;
+    rejects(forged);
+    forged = policy;
+    forged.date = StrictLocalResponseDate::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.connection = StrictLocalResponseConnection::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = policy;
+    forged.reserved1 = 1;
+    rejects(forged);
+    forged = policy;
+    forged.reason = {"Not Content", 11};
+    rejects(forged);
+    forged = policy;
+    forged.reason = {nullptr, 10};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {"x", 1};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.body = {"x", 1};
+    rejects(forged);
+    forged = policy;
+    forged.body = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.server = {};
+    rejects(forged);
+    forged = policy;
+    forged.server = {nullptr, 1};
+    rejects(forged);
+
+    char low_control = 0x1f;
+    forged = policy;
+    forged.server = {&low_control, 1};
+    rejects(forged);
+    char del = 0x7f;
+    forged = policy;
+    forged.server = {&del, 1};
+    rejects(forged);
+    std::string too_long(kMaxStrictLocalResponseServerLen + 1u, '~');
+    forged = policy;
+    forged.server = {too_long.data(), static_cast<u32>(too_long.size())};
+    rejects(forged);
+
+    const std::string minimum_space(1, ' ');
+    const std::string minimum_tilde(1, '~');
+    std::string obs_text_boundaries;
+    obs_text_boundaries.push_back(static_cast<char>(0x80));
+    obs_text_boundaries.push_back(static_cast<char>(0xff));
+    std::string maximum(kMaxStrictLocalResponseServerLen, ' ');
+    for (u32 i = 1; i < maximum.size(); i += 2) maximum[i] = '~';
+    const std::string servers[] = {minimum_space, minimum_tilde, obs_text_boundaries, maximum};
+    for (const auto& server : servers) {
+        auto boundary = policy;
+        boundary.server = {server.data(), static_cast<u32>(server.size())};
+        REQUIRE_EQ(strict_local_response_policy_profile(boundary),
+                   StrictLocalResponseProfile::NoContent204);
+        const u32 expected_len = 93u + boundary.server.len;
+        __builtin_memset(output, 0xa5, sizeof(output));
+        u32 output_len = 99;
+        REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+            conn, boundary, false, output, expected_len, &output_len));
+        CHECK_EQ(output_len, expected_len);
+        CHECK_EQ(output[expected_len], 0xa5u);
+        REQUIRE(normalize_strict_local_response_date(output, output_len));
+        const auto expected = expected_no_content204_internal_wire(boundary.server, false);
+        REQUIRE_EQ(expected.size(), output_len);
+        CHECK_EQ(__builtin_memcmp(output, expected.data(), output_len), 0);
+
+        __builtin_memcpy(output, untouched, sizeof(output));
+        output_len = 99;
+        CHECK_FALSE(detail::build_no_content204_response_for_internal_serialization(
+            conn, boundary, false, output, expected_len - 1u, &output_len));
+        CHECK_EQ(output_len, 0u);
+        CHECK_EQ(__builtin_memcmp(output, untouched, sizeof(output)), 0);
+    }
+}
+
+TEST(unmatched_local_response,
+     no_content204_serializer_addition_preserves_strict_failure_and_ordinary_204_wires) {
+    Connection conn{};
+    conn.req_method = static_cast<u8>(LogHttpMethod::Options);
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+
+    const StrictLocalResponsePolicySpec policies[] = {make_representation200_policy(),
+                                                      make_unmatched_policy(400, "Bad", "bad"),
+                                                      make_unmatched_policy(599, "Edge", "edge")};
+    const char* expected[] = {
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 16\r\nConnection: keep-alive\r\n\r\nsuccessor-static",
+        "HTTP/1.1 400 Bad\r\nServer: rut\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 3\r\nConnection: keep-alive\r\n\r\nbad",
+        "HTTP/1.1 599 Edge\r\nServer: rut\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 4\r\nConnection: keep-alive\r\n\r\nedge"};
+    for (u32 i = 0; i < 3; i++) {
+        u8 strict_wire[512];
+        u32 strict_len = 0;
+        REQUIRE(build_strict_local_response(
+            conn, policies[i], false, strict_wire, sizeof(strict_wire), &strict_len));
+        REQUIRE(normalize_strict_local_response_date(strict_wire, strict_len));
+        REQUIRE_EQ(strict_len, strlen(expected[i]));
+        CHECK_EQ(__builtin_memcmp(strict_wire, expected[i], strict_len), 0);
+        if (i != 0) {
+            ForwardFailurePolicySpec failure{};
+            failure.version = ForwardFailurePolicyVersion::Http11;
+            failure.status_code = policies[i].status_code;
+            failure.date = ForwardFailurePolicyDate::Current;
+            failure.connection = ForwardFailurePolicyConnection::Request;
+            failure.head_mode = FailurePolicyHeadMode::Reject;
+            failure.reason = policies[i].reason;
+            failure.content_type = policies[i].content_type;
+            failure.server = policies[i].server;
+            failure.body = policies[i].body;
+            u8 failure_wire[512];
+            u32 failure_len = 0;
+            REQUIRE(build_failure_policy_response_from_spec(
+                conn, failure, false, failure_wire, sizeof(failure_wire), &failure_len));
+            REQUIRE(normalize_strict_local_response_date(failure_wire, failure_len));
+            CHECK_EQ(failure_len, strict_len);
+            CHECK_EQ(__builtin_memcmp(failure_wire, strict_wire, strict_len), 0);
+        }
+    }
+
+    Connection ordinary{};
+    u8 ordinary_storage[256];
+    ordinary.send_buf.bind(ordinary_storage, sizeof(ordinary_storage));
+    format_static_response(ordinary, 204, false);
+    static constexpr char kOrdinary204[] =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(ordinary.send_buf.len(), sizeof(kOrdinary204) - 1u);
+    CHECK_EQ(__builtin_memcmp(ordinary.send_buf.data(), kOrdinary204, sizeof(kOrdinary204) - 1u),
+             0);
+}
+
 TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_before_any_publication) {
     SmallLoop loop;
     loop.setup();
@@ -13201,6 +13549,18 @@ TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_befor
     serializer_conn.send_buf.bind(send, sizeof(send));
     serializer_conn.req_method = static_cast<u8>(LogHttpMethod::Get);
     u8 output[256];
+    __builtin_memset(output, 0xa5, sizeof(output));
+    u32 internal_output_len = 0;
+    REQUIRE(detail::build_no_content204_response_for_internal_serialization(
+        serializer_conn, policy, false, output, sizeof(output), &internal_output_len));
+    CHECK_EQ(internal_output_len, 93u + policy.server.len);
+    REQUIRE(normalize_strict_local_response_date(output, internal_output_len));
+    const auto internal_expected = expected_no_content204_internal_wire(policy.server, false);
+    REQUIRE_EQ(internal_expected.size(), internal_output_len);
+    CHECK_EQ(__builtin_memcmp(output, internal_expected.data(), internal_output_len), 0);
+
+    // A proven internal materializer does not activate either public building
+    // or dispatch: the Stage-2 execution fence below still owns this request.
     __builtin_memset(output, 0xa5, sizeof(output));
     u32 output_len = 99;
     CHECK_FALSE(build_strict_local_response(
