@@ -62,6 +62,12 @@ struct LocalReturn {
     Span span{};
 };
 
+// Exact local-return paths use the ordinary RUT exact-selector capacity.  This
+// parser slice is deliberately narrower than the runtime byte grammar: only
+// clean absolute ASCII-unreserved paths are admitted, and exact `/` remains
+// outside the proven nginx-compatibility profile.
+static constexpr u32 kMaxExactLocalReturnPathLen = 62;
+
 struct ExactLocalReturnLocation {
     bool present = false;
     Str path{};

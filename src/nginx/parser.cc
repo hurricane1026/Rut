@@ -1,6 +1,7 @@
 #include "rut/nginx/parser.h"
 
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/strict_local_response.h"
 
 namespace rut::nginx {
 namespace {
@@ -87,6 +88,7 @@ constexpr bool contains(Str a, char needle) {
 
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
+static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
 
 constexpr bool clean_path_segment_byte_is_unreserved(char value) {
     const u8 byte = static_cast<u8>(value);
@@ -140,6 +142,35 @@ bool proxy_location_path_is_clean(Str path) {
     return true;
 }
 
+bool exact_local_return_path_is_clean(Str path) {
+    if (path.ptr == nullptr || path.len < 2 || path.len > kMaxExactLocalReturnPathLen ||
+        path.ptr[0] != '/')
+        return false;
+
+    u32 segment_start = 1;
+    for (u32 i = 1; i < path.len; i++) {
+        if (path.ptr[i] != '/') {
+            if (!clean_path_segment_byte_is_unreserved(path.ptr[i])) return false;
+            continue;
+        }
+
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0 || (segment_len == 1 && path.ptr[segment_start] == '.') ||
+            (segment_len == 2 && path.ptr[segment_start] == '.' &&
+             path.ptr[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+
+    // A single trailing slash is part of the clean bounded profile. Otherwise
+    // the final segment must be non-empty and cannot be a dot segment.
+    if (segment_start == path.len) return true;
+    const u32 segment_len = path.len - segment_start;
+    return !(
+        (segment_len == 1 && path.ptr[segment_start] == '.') ||
+        (segment_len == 2 && path.ptr[segment_start] == '.' && path.ptr[segment_start + 1] == '.'));
+}
+
 auto invalid(Span span, Str detail) {
     return frontend_error(FrontendError::UnexpectedToken, span, detail);
 }
@@ -165,7 +196,7 @@ struct ParsedLocation {
 
 class Parser {
 public:
-    explicit Parser(Str source) : lexer_(source) { advance(); }
+    explicit Parser(Str source) : source_(source), lexer_(source) { advance(); }
 
     FrontendResult<Server> run() {
         if (cur_.kind == TokenKind::End)
@@ -378,11 +409,17 @@ private:
         const Token path = cur_;
         if (contains(path.text, '$'))
             return unsupported(path.span, lit_str("variables are unsupported"));
-        const bool is_local_return = eq(path.text, "/static", 7);
+        const bool adjacent_comment =
+            path.span.end < source_.len && source_.ptr[path.span.end] == '#';
+        if (adjacent_comment)
+            return unsupported(
+                path.span, lit_str("exact local return path is outside the bounded clean profile"));
         const bool is_absolute_redirect = eq(path.text, "/old", 4);
+        const bool is_local_return =
+            !is_absolute_redirect && exact_local_return_path_is_clean(path.text);
         if (!is_local_return && !is_absolute_redirect)
-            return unsupported(path.span,
-                               lit_str("only exact location = /static or /old is supported"));
+            return unsupported(
+                path.span, lit_str("exact local return path is outside the bounded clean profile"));
         advance();
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after exact location path")))
             return core::make_unexpected(error_);
@@ -704,6 +741,7 @@ private:
         return UrlParseStatus::Ok;
     }
 
+    Str source_{};
     Lexer lexer_;
     Token cur_{};
     Diagnostic error_{};
