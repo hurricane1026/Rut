@@ -256,6 +256,159 @@ TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
     check(exact_first, sizeof(exact_first) - 1u, 4u, 3u);
 }
 
+TEST(nginx_parser, models_multiple_internal_exact_local_body_spaces_in_either_order) {
+    const char adjacent_root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static { return 200 \"hello  world\"; }\n"
+        "}\n";
+    const char adjacent_exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /static { return 200 \"hello  world\"; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+    const char separated_root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static { return 200 \"hello world again\"; }\n"
+        "}\n";
+    const char separated_exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /static { return 200 \"hello world again\"; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+    struct Vector {
+        const char* source;
+        u32 source_len;
+        const char* expected_body;
+        u32 expected_body_len;
+        u32 root_line;
+        u32 exact_line;
+    };
+    const Vector vectors[] = {
+        {adjacent_root_first,
+         sizeof(adjacent_root_first) - 1u,
+         "hello  world",
+         sizeof("hello  world") - 1u,
+         3u,
+         4u},
+        {adjacent_exact_first,
+         sizeof(adjacent_exact_first) - 1u,
+         "hello  world",
+         sizeof("hello  world") - 1u,
+         4u,
+         3u},
+        {separated_root_first,
+         sizeof(separated_root_first) - 1u,
+         "hello world again",
+         sizeof("hello world again") - 1u,
+         3u,
+         4u},
+        {separated_exact_first,
+         sizeof(separated_exact_first) - 1u,
+         "hello world again",
+         sizeof("hello world again") - 1u,
+         4u,
+         3u},
+    };
+
+    for (const auto& vector : vectors) {
+        const auto parsed = nginx::parse({vector.source, vector.source_len});
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        const auto& root = server.location;
+        const auto& exact = server.exact_local_return;
+        const auto& response = exact.response;
+
+        const char* server_start = strstr(vector.source, "server {");
+        const char* server_end = strrchr(vector.source, '}');
+        const char* root_start = strstr(vector.source, "location / {");
+        const char* root_end = strchr(root_start, '}');
+        const char* root_path = strchr(root_start, '/');
+        const char* exact_start = strstr(vector.source, "location = /static");
+        const char* exact_end = strchr(exact_start, '}');
+        const char* exact_path = strstr(exact_start, "/static");
+        const char* response_start = strstr(exact_start, "return 200");
+        const char* response_end = strchr(response_start, ';');
+        const char* opening_quote = strchr(response_start, '"');
+        REQUIRE(server_start != nullptr);
+        REQUIRE(server_end != nullptr);
+        REQUIRE(root_start != nullptr);
+        REQUIRE(root_end != nullptr);
+        REQUIRE(root_path != nullptr);
+        REQUIRE(exact_start != nullptr);
+        REQUIRE(exact_end != nullptr);
+        REQUIRE(exact_path != nullptr);
+        REQUIRE(response_start != nullptr);
+        REQUIRE(response_end != nullptr);
+        REQUIRE(opening_quote != nullptr);
+        const char* body = opening_quote + 1;
+        REQUIRE_EQ(body[vector.expected_body_len], '"');
+        const auto offset = [&](const char* ptr) { return static_cast<u32>(ptr - vector.source); };
+        const auto column = [&](const char* ptr) {
+            const char* line_start = ptr;
+            while (line_start != vector.source && line_start[-1] != '\n') --line_start;
+            return static_cast<u32>(ptr - line_start + 1);
+        };
+
+        CHECK_EQ(server.span.start, offset(server_start));
+        CHECK_EQ(server.span.end, offset(server_end + 1));
+        CHECK_EQ(server.span.line, 1u);
+        CHECK_EQ(server.span.col, 1u);
+        CHECK(root.path.eq(lit_str("/")));
+        CHECK_EQ(root.path.ptr, root_path);
+        CHECK_EQ(root.path_span.start, offset(root_path));
+        CHECK_EQ(root.path_span.end, offset(root_path + 1));
+        CHECK_EQ(root.path_span.line, vector.root_line);
+        CHECK_EQ(root.path_span.col, column(root_path));
+        CHECK_EQ(root.span.start, offset(root_start));
+        CHECK_EQ(root.span.end, offset(root_end + 1));
+        CHECK_EQ(root.span.line, vector.root_line);
+        CHECK_EQ(root.span.col, column(root_start));
+        REQUIRE(exact.present);
+        CHECK(exact.path.eq(lit_str("/static")));
+        CHECK_EQ(exact.path.ptr, exact_path);
+        CHECK_EQ(exact.path_span.start, offset(exact_path));
+        CHECK_EQ(exact.path_span.end, offset(exact_path + sizeof("/static") - 1u));
+        CHECK_EQ(exact.path_span.line, vector.exact_line);
+        CHECK_EQ(exact.path_span.col, column(exact_path));
+        CHECK_EQ(exact.span.start, offset(exact_start));
+        CHECK_EQ(exact.span.end, offset(exact_end + 1));
+        CHECK_EQ(exact.span.line, vector.exact_line);
+        CHECK_EQ(exact.span.col, column(exact_start));
+        CHECK_EQ(response.status, 200u);
+        CHECK_EQ(response.span.start, offset(response_start));
+        CHECK_EQ(response.span.end, offset(response_end + 1));
+        CHECK_EQ(response.span.line, vector.exact_line);
+        CHECK_EQ(response.span.col, column(response_start));
+        CHECK(response.body.eq({vector.expected_body, vector.expected_body_len}));
+        CHECK_EQ(response.body.ptr, body);
+        CHECK_EQ(response.body_span.start, offset(body));
+        CHECK_EQ(response.body_span.end, offset(body + vector.expected_body_len));
+        CHECK_EQ(response.body_span.line, vector.exact_line);
+        CHECK_EQ(response.body_span.col, column(body));
+        CHECK_EQ(reinterpret_cast<uintptr_t>(root.path.ptr) - root.path_span.start,
+                 reinterpret_cast<uintptr_t>(vector.source));
+        CHECK_EQ(reinterpret_cast<uintptr_t>(exact.path.ptr) - exact.path_span.start,
+                 reinterpret_cast<uintptr_t>(vector.source));
+        CHECK_EQ(reinterpret_cast<uintptr_t>(response.body.ptr) - response.body_span.start,
+                 reinterpret_cast<uintptr_t>(vector.source));
+
+        const auto lowered = nginx::lower_to_rut(server);
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(lit_str("invalid exact local return body")));
+        CHECK_EQ(lowered.error().span.start, response.body_span.start);
+        CHECK_EQ(lowered.error().span.end, response.body_span.end);
+        CHECK_EQ(lowered.error().span.line, response.body_span.line);
+        CHECK_EQ(lowered.error().span.col, response.body_span.col);
+    }
+}
+
 TEST(nginx_parser, bounds_one_internal_exact_local_body_space_at_64_raw_bytes) {
     char accepted_body[nginx::kMaxLocalReturnBodyLen + 1u]{};
     memset(accepted_body, 'a', 31u);
@@ -298,7 +451,62 @@ TEST(nginx_parser, bounds_one_internal_exact_local_body_space_at_64_raw_bytes) {
     REQUIRE_FALSE(rejected);
     CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
     CHECK(rejected.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
+    const char* return_directive = strstr(rejected_source, "return 200");
+    REQUIRE(return_directive != nullptr);
+    const char* opening_quote = strchr(return_directive, '"');
+    REQUIRE(opening_quote != nullptr);
+    CHECK_EQ(rejected.error().span.start, static_cast<u32>(opening_quote - rejected_source));
+    CHECK_EQ(
+        rejected.error().span.end,
+        static_cast<u32>(opening_quote - rejected_source) + nginx::kMaxLocalReturnBodyLen + 3u);
+}
+
+TEST(nginx_parser, bounds_multiple_internal_exact_local_body_spaces_at_64_raw_bytes) {
+    char accepted_body[nginx::kMaxLocalReturnBodyLen + 1u]{};
+    memset(accepted_body, 'a', nginx::kMaxLocalReturnBodyLen);
+    for (u32 i = 1; i + 1u < nginx::kMaxLocalReturnBodyLen; i += 2u) accepted_body[i] = ' ';
+    accepted_body[2] = ' ';
+    accepted_body[32] = ' ';
+    accepted_body[nginx::kMaxLocalReturnBodyLen] = '\0';
+
+    char accepted_source[512]{};
+    const int accepted_len =
+        snprintf(accepted_source,
+                 sizeof(accepted_source),
+                 "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                 "location = /static { return 200 \"%s\"; } }",
+                 accepted_body);
+    REQUIRE_GT(accepted_len, 0);
+    REQUIRE_LT(static_cast<u32>(accepted_len), static_cast<u32>(sizeof(accepted_source)));
+    const auto accepted = nginx::parse({accepted_source, static_cast<u32>(accepted_len)});
+    REQUIRE(accepted);
+    const auto& accepted_response = accepted.value().exact_local_return.response;
+    CHECK_EQ(accepted_response.body.len, nginx::kMaxLocalReturnBodyLen);
+    CHECK(accepted_response.body.eq({accepted_body, nginx::kMaxLocalReturnBodyLen}));
+    CHECK_EQ(accepted_response.body_span.end - accepted_response.body_span.start,
+             nginx::kMaxLocalReturnBodyLen);
+
+    char rejected_body[nginx::kMaxLocalReturnBodyLen + 2u]{};
+    memset(rejected_body, 'b', nginx::kMaxLocalReturnBodyLen + 1u);
+    for (u32 i = 1; i < nginx::kMaxLocalReturnBodyLen; i += 2u) rejected_body[i] = ' ';
+    rejected_body[2] = ' ';
+    rejected_body[32] = ' ';
+    rejected_body[nginx::kMaxLocalReturnBodyLen + 1u] = '\0';
+    char rejected_source[512]{};
+    const int rejected_len =
+        snprintf(rejected_source,
+                 sizeof(rejected_source),
+                 "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                 "location = /static { return 200 \"%s\"; } }",
+                 rejected_body);
+    REQUIRE_GT(rejected_len, 0);
+    REQUIRE_LT(static_cast<u32>(rejected_len), static_cast<u32>(sizeof(rejected_source)));
+    const auto rejected = nginx::parse({rejected_source, static_cast<u32>(rejected_len)});
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
     const char* return_directive = strstr(rejected_source, "return 200");
     REQUIRE(return_directive != nullptr);
     const char* opening_quote = strchr(return_directive, '"');
@@ -315,6 +523,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
         "location = /static { return 200 ";
     static constexpr char kSuffix[] = "; } }";
     static constexpr char kControl[] = {'a', '\x01', 'b'};
+    static constexpr char kNul[] = {'a', '\0', 'b'};
     static constexpr char kNonAscii[] = {'a', static_cast<char>(0x80), 'b'};
     struct Vector {
         const char* body;
@@ -323,13 +532,13 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     const Vector vectors[] = {
         {" hello", sizeof(" hello") - 1u},
         {"hello ", sizeof("hello ") - 1u},
-        {"hello  world", sizeof("hello  world") - 1u},
         {"hello\tworld", sizeof("hello\tworld") - 1u},
         {"hello\rworld", sizeof("hello\rworld") - 1u},
         {"hello\nworld", sizeof("hello\nworld") - 1u},
         {"hello\fworld", sizeof("hello\fworld") - 1u},
         {"hello\vworld", sizeof("hello\vworld") - 1u},
         {kControl, sizeof(kControl)},
+        {kNul, sizeof(kNul)},
         {kNonAscii, sizeof(kNonAscii)},
         {"hello\\\"world", sizeof("hello\\\"world") - 1u},
         {"hello\\\\world", sizeof("hello\\\\world") - 1u},
@@ -359,7 +568,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
         REQUIRE_FALSE(rejected);
         CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
         CHECK(rejected.error().detail.eq(
-            lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+            lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
         CHECK_EQ(rejected.error().span.start, opening_quote);
         CHECK_EQ(rejected.error().span.end, quoted_end);
         CHECK_EQ(rejected.error().span.line, 1u);
@@ -378,7 +587,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(missing_quote);
     CHECK_EQ(missing_quote.error().code, FrontendError::UnsupportedSyntax);
     CHECK(missing_quote.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
     CHECK_EQ(missing_quote.error().span.start, unterminated_start);
     CHECK_EQ(missing_quote.error().span.end, unterminated_len);
 
@@ -398,7 +607,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(final_backslash_result);
     CHECK_EQ(final_backslash_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(final_backslash_result.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
     CHECK_EQ(final_backslash_result.error().span.start, final_backslash_start);
     CHECK_EQ(final_backslash_result.error().span.end, final_backslash_len);
 
@@ -422,7 +631,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(escaped_quote_eof_result);
     CHECK_EQ(escaped_quote_eof_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(escaped_quote_eof_result.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
     CHECK_EQ(escaped_quote_eof_result.error().span.start, escaped_quote_eof_start);
     CHECK_EQ(escaped_quote_eof_result.error().span.end, escaped_quote_eof_len);
 
@@ -433,7 +642,7 @@ TEST(nginx_parser, rejects_excluded_contextual_exact_local_body_forms_at_complet
     REQUIRE_FALSE(unquoted_result);
     CHECK_EQ(unquoted_result.error().code, FrontendError::UnsupportedSyntax);
     CHECK(unquoted_result.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
     const char* unquoted_body = strstr(unquoted, "hello world");
     REQUIRE(unquoted_body != nullptr);
     CHECK_EQ(unquoted_result.error().span.start, static_cast<u32>(unquoted_body - unquoted));
@@ -1804,19 +2013,15 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 $body; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+         lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 \"$body\"; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+         lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 successor-static; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
-        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
-         "/static { return 200 \"two  words\"; } }",
-         FrontendError::UnsupportedSyntax,
-         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+         lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/static { return 200 \"x\"; return 200 \"y\"; } }",
          FrontendError::UnsupportedSyntax,
@@ -1843,7 +2048,7 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
     REQUIRE_FALSE(too_long);
     CHECK_EQ(too_long.error().code, FrontendError::UnsupportedSyntax);
     CHECK(too_long.error().detail.eq(
-        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+        lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
 }
 
 TEST(nginx_parser, rejects_broader_exact_absolute_redirect_shapes) {

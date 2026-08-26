@@ -51,9 +51,10 @@ struct Location {
 };
 
 // This bounded local-response slice borrows one non-empty raw quoted body of at
-// most 64 bytes from source. It accepts the original token-safe printable ASCII
-// grammar plus exactly one non-edge ASCII space; escapes, variables, controls,
-// and broader nginx quoted-string semantics remain outside the model.
+// most 64 bytes from source. It accepts safe printable ASCII bytes plus any
+// number of internal ASCII spaces between non-space endpoints; escapes,
+// variables, controls, and broader nginx quoted-string semantics remain outside
+// the model.
 static constexpr u32 kMaxLocalReturnBodyLen = 64;
 
 struct LocalReturn {

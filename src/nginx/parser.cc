@@ -578,8 +578,9 @@ private:
             return invalid(cur_.span, lit_str("return requires a literal body"));
         const Token body = cur_;
         if (!local_return_body_valid(body.text))
-            return unsupported(body.span,
-                               lit_str("return body must be 1..64 token-safe quoted ASCII bytes"));
+            return unsupported(
+                body.span,
+                lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar"));
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("expected ';' after return"));
@@ -601,11 +602,10 @@ private:
         if (text.len < 3 || text.ptr[0] != '"' || text.ptr[text.len - 1] != '"') return false;
         const u32 body_len = text.len - 2;
         if (body_len == 0 || body_len > kMaxLocalReturnBodyLen) return false;
-        u32 space_count = 0;
         for (u32 i = 1; i + 1 < text.len; i++) {
             const u8 value = static_cast<u8>(text.ptr[i]);
             if (value == 0x20) {
-                if (i == 1 || i + 2 == text.len || ++space_count > 1) return false;
+                if (i == 1 || i + 2 == text.len) return false;
                 continue;
             }
             if (value < 0x21 || value > 0x7e || text.ptr[i] == '"' || text.ptr[i] == '\\' ||
