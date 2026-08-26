@@ -58,10 +58,12 @@ struct ExactLocalReturnLocation {
 };
 
 // A distinct semantic action for the first bounded absolute redirect slice.
-// The complete target and its authority/path decomposition borrow directly
-// from the nginx source so later lowering never needs to reinterpret URL text.
+// The status lexeme, complete target, and its authority/path decomposition
+// borrow directly from the nginx source so later lowering never needs to
+// reinterpret source text.
 struct AbsoluteRedirect {
     u16 status = 0;
+    Str status_lexeme{};
     Span status_span{};
     Str target{};
     Span target_span{};

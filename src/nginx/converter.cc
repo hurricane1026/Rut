@@ -71,7 +71,8 @@ bool has_exact_absolute_redirect_inventory(const ExactAbsoluteRedirectLocation& 
     const AbsoluteRedirect& response = location.response;
     return location.present || location.path.ptr != nullptr || location.path.len != 0 ||
            !is_default_span(location.path_span) || !is_default_span(location.span) ||
-           response.status != 0 || !is_default_span(response.status_span) ||
+           response.status != 0 || response.status_lexeme.ptr != nullptr ||
+           response.status_lexeme.len != 0 || !is_default_span(response.status_span) ||
            response.target.ptr != nullptr || response.target.len != 0 ||
            !is_default_span(response.target_span) || response.authority.ptr != nullptr ||
            response.authority.len != 0 || !is_default_span(response.authority_span) ||
@@ -84,16 +85,11 @@ Span exact_absolute_redirect_span(const Server& server) {
     if (is_valid_span(location.span)) return location.span;
     if (is_valid_span(location.path_span)) return location.path_span;
     if (is_valid_span(location.response.span)) return location.response.span;
+    if (is_valid_span(location.response.status_span)) return location.response.status_span;
     if (is_valid_span(location.response.target_span)) return location.response.target_span;
+    if (is_valid_span(location.response.authority_span)) return location.response.authority_span;
+    if (is_valid_span(location.response.path_span)) return location.response.path_span;
     return server.span;
-}
-
-FrontendResult<bool> reject_exact_absolute_redirect(const Server& server) {
-    const auto& location = server.exact_absolute_redirect;
-    if (!has_exact_absolute_redirect_inventory(location)) return false;
-    return unsupported(exact_absolute_redirect_span(server),
-                       location.present ? lit_str("exact absolute redirect lowering is unsupported")
-                                        : lit_str("invalid absent exact absolute redirect model"));
 }
 
 constexpr bool span_position_is_coherent(const Span& outer, const Span& inner) {
@@ -103,6 +99,123 @@ constexpr bool span_position_is_coherent(const Span& outer, const Span& inner) {
     if (inner.line != outer.line) return true;
     const u32 offset = inner.start - outer.start;
     return offset <= 0xFFFFFFFFu - outer.col && inner.col == outer.col + offset;
+}
+
+bool source_borrow_is_coherent(Str text, const Span& span, uintptr_t source_base) {
+    if (text.ptr == nullptr || !is_valid_span(span) || span.end - span.start != text.len ||
+        source_base > UINTPTR_MAX - span.start)
+        return false;
+    return reinterpret_cast<uintptr_t>(text.ptr) == source_base + span.start;
+}
+
+FrontendResult<bool> validate_exact_absolute_redirect(const Server& server) {
+    constexpr u32 kAuthorityOffset = 7;
+    constexpr u32 kAuthorityLen = 16;
+    constexpr u32 kPathOffset = kAuthorityOffset + kAuthorityLen;
+    const ExactAbsoluteRedirectLocation& location = server.exact_absolute_redirect;
+    const AbsoluteRedirect& response = location.response;
+    if (!location.present) {
+        if (has_exact_absolute_redirect_inventory(location))
+            return unsupported(exact_absolute_redirect_span(server),
+                               lit_str("invalid absent exact absolute redirect model"));
+        return false;
+    }
+
+    if (has_exact_local_return_inventory(server.exact_local_return))
+        return unsupported(exact_local_return_span(server),
+                           lit_str("multiple exact semantic actions are unsupported"));
+
+    if (!span_position_is_coherent(server.span, location.span))
+        return unsupported(is_valid_span(location.span) ? location.span : server.span,
+                           lit_str("invalid exact absolute redirect location span"));
+    if (!span_position_is_coherent(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != 4)
+        return unsupported(is_valid_span(location.path_span) ? location.path_span : location.span,
+                           lit_str("invalid exact absolute redirect location path span"));
+    if (!span_position_is_coherent(location.span, response.span) ||
+        location.path_span.end >= response.span.start)
+        return unsupported(is_valid_span(response.span) ? response.span : location.span,
+                           lit_str("invalid exact absolute redirect response span"));
+    if (!span_position_is_coherent(response.span, response.status_span) ||
+        response.status_span.end - response.status_span.start != 3 ||
+        response.span.start >= response.status_span.start)
+        return unsupported(
+            is_valid_span(response.status_span) ? response.status_span : response.span,
+            lit_str("invalid exact absolute redirect status span"));
+    if (!span_position_is_coherent(response.span, response.target_span) ||
+        response.target_span.end - response.target_span.start != 27 ||
+        response.status_span.end >= response.target_span.start ||
+        response.target_span.end >= response.span.end)
+        return unsupported(
+            is_valid_span(response.target_span) ? response.target_span : response.span,
+            lit_str("invalid exact absolute redirect target span"));
+    if (!span_position_is_coherent(response.target_span, response.authority_span) ||
+        response.authority_span.start != response.target_span.start + kAuthorityOffset ||
+        response.authority_span.end != response.target_span.start + kPathOffset ||
+        response.authority_span.end - response.authority_span.start != kAuthorityLen ||
+        response.authority_span.line != response.target_span.line ||
+        response.authority_span.col != response.target_span.col + kAuthorityOffset)
+        return unsupported(
+            is_valid_span(response.authority_span) ? response.authority_span : response.target_span,
+            lit_str("invalid exact absolute redirect authority span"));
+    if (!span_position_is_coherent(response.target_span, response.path_span) ||
+        response.path_span.start != response.target_span.start + kPathOffset ||
+        response.path_span.end != response.target_span.end ||
+        response.path_span.end - response.path_span.start != 4 ||
+        response.path_span.line != response.target_span.line ||
+        response.path_span.col != response.target_span.col + kPathOffset)
+        return unsupported(
+            is_valid_span(response.path_span) ? response.path_span : response.target_span,
+            lit_str("invalid exact absolute redirect target path span"));
+
+    const Location& fallback = server.location;
+    const uintptr_t fallback_path_address = reinterpret_cast<uintptr_t>(fallback.path.ptr);
+    if (!span_position_is_coherent(server.span, fallback.span) ||
+        !span_position_is_coherent(fallback.span, fallback.path_span) ||
+        fallback.path.ptr == nullptr || fallback_path_address < fallback.path_span.start ||
+        fallback.path_span.end - fallback.path_span.start != fallback.path.len)
+        return unsupported(is_valid_span(fallback.path_span) ? fallback.path_span : server.span,
+                           lit_str("invalid exact absolute redirect fallback provenance"));
+    const uintptr_t source_base = fallback_path_address - fallback.path_span.start;
+
+    if (!source_borrow_is_coherent(location.path, location.path_span, source_base))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact absolute redirect location path provenance"));
+    if (!source_borrow_is_coherent(response.target, response.target_span, source_base))
+        return unsupported(response.target_span,
+                           lit_str("invalid exact absolute redirect target provenance"));
+    if (!source_borrow_is_coherent(response.authority, response.authority_span, source_base))
+        return unsupported(response.authority_span,
+                           lit_str("invalid exact absolute redirect authority provenance"));
+    if (!source_borrow_is_coherent(response.path, response.path_span, source_base))
+        return unsupported(response.path_span,
+                           lit_str("invalid exact absolute redirect target path provenance"));
+    if (!source_borrow_is_coherent(response.status_lexeme, response.status_span, source_base))
+        return unsupported(response.status_span,
+                           lit_str("invalid exact absolute redirect status provenance"));
+
+    if (!eq(location.path, "/old", 4))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact absolute redirect location path"));
+    if (response.status != 301)
+        return unsupported(response.status_span, lit_str("invalid exact absolute redirect status"));
+    if (!eq(response.status_lexeme, "301", 3))
+        return unsupported(response.status_span,
+                           lit_str("invalid exact absolute redirect status lexeme"));
+    if (!eq(response.target, "http://redirect.example/new", 27))
+        return unsupported(response.target_span, lit_str("invalid exact absolute redirect target"));
+    if (reinterpret_cast<uintptr_t>(response.authority.ptr) !=
+            reinterpret_cast<uintptr_t>(response.target.ptr) + kAuthorityOffset ||
+        response.authority.len != kAuthorityLen ||
+        !eq(response.authority, "redirect.example", kAuthorityLen))
+        return unsupported(response.authority_span,
+                           lit_str("invalid exact absolute redirect authority"));
+    if (reinterpret_cast<uintptr_t>(response.path.ptr) !=
+            reinterpret_cast<uintptr_t>(response.target.ptr) + kPathOffset ||
+        response.path.len != 4 || !eq(response.path, "/new", 4))
+        return unsupported(response.path_span,
+                           lit_str("invalid exact absolute redirect target path"));
+    return true;
 }
 
 bool local_return_body_byte_is_safe(char value) {
@@ -225,7 +338,7 @@ public:
     explicit Writer(RutSource& output) : output_(output) {}
 
     bool put(Str text) {
-        if (text.len > RutSource::kCapacity - output_.len) return false;
+        if (text.len >= RutSource::kCapacity - output_.len) return false;
         for (u32 i = 0; i < text.len; i++) output_.data[output_.len + i] = text.ptr[i];
         output_.len += text.len;
         return true;
@@ -244,7 +357,7 @@ public:
             digits[count++] = static_cast<char>('0' + (value % 10));
             value = static_cast<u16>(value / 10);
         } while (value != 0);
-        if (count > RutSource::kCapacity - output_.len) return false;
+        if (count >= RutSource::kCapacity - output_.len) return false;
         for (u32 i = 0; i < count; i++) output_.data[output_.len + i] = digits[count - i - 1];
         output_.len += count;
         return true;
@@ -266,7 +379,7 @@ private:
             digits[count++] = static_cast<char>('0' + (value % 10));
             value = static_cast<u8>(value / 10);
         } while (value != 0);
-        if (count > RutSource::kCapacity - output_.len) return false;
+        if (count >= RutSource::kCapacity - output_.len) return false;
         for (u32 i = 0; i < count; i++) output_.data[output_.len + i] = digits[count - i - 1];
         output_.len += count;
         return true;
@@ -303,6 +416,15 @@ static constexpr char kGatewayTimeoutBody[] =
     "<html>\\r\\n<head><title>504 Gateway Time-out</title></head>\\r\\n"
     "<body>\\r\\n<center><h1>504 Gateway Time-out</h1></center>\\r\\n"
     "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
+    "</html>\\r\\n";
+
+static constexpr char kRedirectBody[] =
+    "<html>\\r\\n"
+    "<head><title>301 Moved Permanently</title></head>\\r\\n"
+    "<body>\\r\\n"
+    "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n"
     "</html>\\r\\n";
 
 bool put_unmatched(Writer& writer,
@@ -417,6 +539,43 @@ bool put_root_forward(
            writer.put_cstr("    )\n}\n");
 }
 
+bool put_root_forward_action(Writer& writer, bool suppress_body, bool buffered, Str indent) {
+    return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
+           put_request_policy(writer) && put_response_policy(writer, suppress_body) &&
+           put_failure_policy(writer, suppress_body, buffered) &&
+           (buffered ? put_timeout_failure_policy(writer) : true) &&
+           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
+                     : true) &&
+           writer.put_cstr("    )\n");
+}
+
+bool put_exact_absolute_redirect(Writer& writer,
+                                 Str location_path,
+                                 Str static_authority,
+                                 Str target_path) {
+    return writer.put_cstr("route GET \"/\" {\n") && writer.put_cstr("    if req.pathOnly == \"") &&
+           writer.put(location_path) && writer.put_cstr("\" {\n") &&
+           writer.put_cstr(
+               "        return redirect({scheme: \"http\", authority: \"static\", "
+               "static_authority: \"") &&
+           writer.put(static_authority) && writer.put_cstr("\", port: \"omit\",\n") &&
+           writer.put_cstr(
+               "            path: \"static\", query: \"discard\", date: \"current\", "
+               "connection: \"close\",\n") &&
+           writer.put_cstr(
+               "            header_order: \"connection_then_location\", status: 301, reason: "
+               "\"Moved Permanently\",\n") &&
+           writer.put_cstr(
+               "            server: \"nginx/1.29.7\", content_type: \"text/html\", "
+               "target_path: \"") &&
+           writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
+           writer.put_lit(kRedirectBody, sizeof(kRedirectBody) - 1u) && writer.put_cstr("\"})\n") &&
+           writer.put_cstr("    } else {\n") &&
+           put_root_forward_action(writer, false, true, lit_str("        ")) &&
+           writer.put_cstr("    }\n}\n");
+}
+
 bool put_exact_local_return(Writer& writer, Str body) {
     return writer.put_cstr("route exact \"/static\" { return local_response({\n") &&
            writer.put_cstr(
@@ -431,7 +590,7 @@ bool put_exact_local_return(Writer& writer, Str body) {
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
-    auto exact_absolute_redirect = reject_exact_absolute_redirect(server);
+    auto exact_absolute_redirect = validate_exact_absolute_redirect(server);
     if (!exact_absolute_redirect) return core::make_unexpected(exact_absolute_redirect.error());
     auto exact_local_return = validate_exact_local_return(server);
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
@@ -449,6 +608,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_local_return.value() && !is_root)
         return unsupported(server.exact_local_return.span,
                            lit_str("exact local return requires location / fallback"));
+    if (exact_absolute_redirect.value() && !is_root)
+        return unsupported(server.exact_absolute_redirect.span,
+                           lit_str("exact absolute redirect requires location / fallback"));
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)
         return invalid_integer(server.location.proxy_pass.span,
@@ -515,7 +677,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
 
     if (is_root) {
         if (!put_root_forward(writer, "HEAD", 4, true, false) ||
-            !put_root_forward(writer, "GET", 3, false, true) ||
+            (exact_absolute_redirect.value()
+                 ? !put_exact_absolute_redirect(writer,
+                                                server.exact_absolute_redirect.path,
+                                                server.exact_absolute_redirect.response.authority,
+                                                server.exact_absolute_redirect.response.path)
+                 : !put_root_forward(writer, "GET", 3, false, true)) ||
             !put_root_forward(writer, "", 0, false, false) ||
             (exact_local_return.value() &&
              !put_exact_local_return(writer, server.exact_local_return.response.body)))
@@ -523,14 +690,6 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return output;
     }
 
-    static constexpr char kRedirectBody[] =
-        "<html>\\r\\n"
-        "<head><title>301 Moved Permanently</title></head>\\r\\n"
-        "<body>\\r\\n"
-        "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
-        "<hr><center>nginx/1.29.7</center>\\r\\n"
-        "</body>\\r\\n"
-        "</html>\\r\\n";
     if (!put("route \"/api\" {\n") ||
         !put("    if req.method == GET && req.pathOnly == \"/api\" {\n") ||
         !put("        return redirect({scheme: \"http\", authority: \"request_host\", port: "

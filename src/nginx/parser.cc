@@ -418,6 +418,7 @@ private:
         advance();
         return AbsoluteRedirect{
             301,
+            status.text,
             status.span,
             target.text,
             target.span,

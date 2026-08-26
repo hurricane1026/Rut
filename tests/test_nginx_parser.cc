@@ -41,6 +41,13 @@ static bool find_const_i32(const rir::Function& function, rir::ValueId value, i3
     return false;
 }
 
+static bool str_is_in_owned_pool(Str value, const char* pool, u32 used) {
+    if (value.ptr == nullptr || value.len == 0 || pool == nullptr || value.len > used) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+    return ptr >= begin && ptr - begin < used && value.len <= used - (ptr - begin);
+}
+
 struct RirGuard {
     FrontendRirModule& module;
     ~RirGuard() { module.destroy(); }
@@ -88,6 +95,8 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().exact_absolute_redirect.path.ptr, nullptr);
     CHECK_EQ(result.value().exact_absolute_redirect.path.len, 0u);
     CHECK_EQ(result.value().exact_absolute_redirect.response.status, 0u);
+    CHECK_EQ(result.value().exact_absolute_redirect.response.status_lexeme.ptr, nullptr);
+    CHECK_EQ(result.value().exact_absolute_redirect.response.status_lexeme.len, 0u);
     CHECK(result.value().pre_route_trace.profile ==
           nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
     CHECK_EQ(result.value().pre_route_trace.span.start, result.value().span.start);
@@ -185,6 +194,7 @@ TEST(nginx_parser, parses_bounded_exact_absolute_redirect_in_either_order) {
         CHECK_EQ(location.path_span.line, exact_line);
         CHECK_EQ(location.span.line, exact_line);
         CHECK_EQ(response.status, 301u);
+        CHECK(response.status_lexeme.eq(lit_str("301")));
         CHECK_EQ(response.status_span.line, exact_line);
         CHECK(response.target.eq(lit_str("http://redirect.example/new")));
         CHECK(response.authority.eq(lit_str("redirect.example")));
@@ -196,6 +206,9 @@ TEST(nginx_parser, parses_bounded_exact_absolute_redirect_in_either_order) {
         CHECK_LT(location.path.ptr, source + len);
         CHECK_GE(response.target.ptr, source);
         CHECK_LT(response.target.ptr, source + len);
+        CHECK_GE(response.status_lexeme.ptr, source);
+        CHECK_LT(response.status_lexeme.ptr, source + len);
+        CHECK_EQ(response.status_lexeme.ptr, source + response.status_span.start);
         CHECK_EQ(response.authority.ptr, response.target.ptr + 7);
         CHECK_EQ(response.path.ptr, response.authority.ptr + response.authority.len);
         CHECK_EQ(response.target_span.end - response.target_span.start, response.target.len);
@@ -1136,7 +1149,7 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5609u);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5610u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -1264,29 +1277,78 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
     expect_rejected(api_absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
 }
 
-TEST(nginx_converter, rejects_exact_absolute_redirect_before_emitting_output) {
+TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_rut) {
     static constexpr char kRootFirst[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
         "/old { return 301 http://redirect.example/new; } }";
     static constexpr char kExactFirst[] =
         "server { listen 8080; location = /old { return 301 http://redirect.example/new; } "
         "location / { proxy_pass http://127.0.0.1:9000; } }";
-    const auto check = [&](Str source) {
-        const auto parsed = nginx::parse(source);
-        REQUIRE(parsed);
-        const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(
-            lowered.error().detail.eq(lit_str("exact absolute redirect lowering is unsupported")));
-        CHECK_EQ(lowered.error().span.start, parsed.value().exact_absolute_redirect.span.start);
-        CHECK_EQ(lowered.error().span.end, parsed.value().exact_absolute_redirect.span.end);
-    };
-    check({kRootFirst, sizeof(kRootFirst) - 1u});
-    check({kExactFirst, sizeof(kExactFirst) - 1u});
+    const auto root_parsed = nginx::parse({kRootFirst, sizeof(kRootFirst) - 1u});
+    const auto exact_parsed = nginx::parse({kExactFirst, sizeof(kExactFirst) - 1u});
+    REQUIRE(root_parsed);
+    REQUIRE(exact_parsed);
+    const auto root_lowered = nginx::lower_to_rut(root_parsed.value());
+    const auto exact_lowered = nginx::lower_to_rut(exact_parsed.value());
+    const auto legacy = nginx::lower_to_rut(canonical_server());
+    REQUIRE(root_lowered);
+    REQUIRE(exact_lowered);
+    REQUIRE(legacy);
+    CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
 
-    // lower_to_rut owns output inside its success alternative, so this error
-    // result publishes no partial generated source to the caller.
+    static constexpr char kRedirectPrefix[] =
+        "route GET \"/\" {\n"
+        "    if req.pathOnly == \"/old\" {\n"
+        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
+        "\"redirect.example\", port: \"omit\",\n"
+        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
+        "\"close\",\n"
+        "            header_order: \"connection_then_location\", status: 301, reason: \"Moved "
+        "Permanently\",\n"
+        "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
+        "\"/new\", body: b\"<html>\\r\\n"
+        "<head><title>301 Moved Permanently</title></head>\\r\\n"
+        "<body>\\r\\n"
+        "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n"
+        "</body>\\r\\n"
+        "</html>\\r\\n\"})\n"
+        "    } else {\n"
+        "        return ";
+    const char* redirect_route = strstr(root_lowered.value().data, "route GET \"/\" {");
+    REQUIRE(redirect_route != nullptr);
+    CHECK((Str{redirect_route, sizeof(kRedirectPrefix) - 1u}.eq(
+        {kRedirectPrefix, sizeof(kRedirectPrefix) - 1u})));
+    CHECK_EQ(strstr(root_lowered.value().data, "authority: \"request_host\""), nullptr);
+    CHECK_EQ(strstr(root_lowered.value().data, "port: \"actual_listener\""), nullptr);
+    CHECK_EQ(strstr(root_lowered.value().data, "query: \"preserve_raw\""), nullptr);
+
+    const char* generated_forward = strstr(redirect_route, "forward(nginx_upstream");
+    const char* generated_any = strstr(redirect_route, "route \"/\" {");
+    const char* legacy_get = strstr(legacy.value().data, "route GET \"/\" {");
+    REQUIRE(generated_forward != nullptr);
+    REQUIRE(generated_any != nullptr);
+    REQUIRE(legacy_get != nullptr);
+    const char* legacy_forward = strstr(legacy_get, "forward(nginx_upstream");
+    const char* legacy_any = strstr(legacy_get, "route \"/\" {");
+    REQUIRE(legacy_forward != nullptr);
+    REQUIRE(legacy_any != nullptr);
+    const u32 canonical_forward_len = static_cast<u32>(legacy_any - legacy_forward - 2);
+    CHECK((
+        Str{generated_forward, canonical_forward_len}.eq({legacy_forward, canonical_forward_len})));
+    const u32 generated_suffix_len =
+        static_cast<u32>(root_lowered.value().data + root_lowered.value().len - generated_any);
+    const u32 legacy_suffix_len =
+        static_cast<u32>(legacy.value().data + legacy.value().len - legacy_any);
+    REQUIRE_EQ(generated_suffix_len, legacy_suffix_len);
+    CHECK((Str{generated_any, generated_suffix_len}.eq({legacy_any, legacy_suffix_len})));
+
+    const u32 generated_prefix_len = static_cast<u32>(redirect_route - root_lowered.value().data);
+    const u32 legacy_prefix_len = static_cast<u32>(legacy_get - legacy.value().data);
+    REQUIRE_EQ(generated_prefix_len, legacy_prefix_len);
+    CHECK((Str{root_lowered.value().data, generated_prefix_len}.eq(
+        {legacy.value().data, legacy_prefix_len})));
+    CHECK_EQ(root_lowered.value().len, 5928u);
 }
 
 TEST(nginx_converter, rejects_forged_exact_absolute_redirect_inventory) {
@@ -1300,40 +1362,289 @@ TEST(nginx_converter, rejects_forged_exact_absolute_redirect_inventory) {
     const auto local = nginx::parse({kLocalSource, sizeof(kLocalSource) - 1u});
     REQUIRE(redirect);
     REQUIRE(local);
-    const auto expect_rejected = [&](const nginx::Server& model, Str detail) {
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span span = {}) {
         const auto result = nginx::lower_to_rut(model);
         REQUIRE_FALSE(result);
         CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
         CHECK(result.error().detail.eq(detail));
+        if (span.start < span.end) {
+            CHECK_EQ(result.error().span.start, span.start);
+            CHECK_EQ(result.error().span.end, span.end);
+        }
     };
 
     auto missing_presence = redirect.value();
     missing_presence.exact_absolute_redirect.present = false;
-    expect_rejected(missing_presence, lit_str("invalid absent exact absolute redirect model"));
+    expect_rejected(missing_presence,
+                    lit_str("invalid absent exact absolute redirect model"),
+                    redirect.value().exact_absolute_redirect.span);
 
-    auto absent_status = canonical_server();
-    absent_status.exact_absolute_redirect.response.status = 301;
-    expect_rejected(absent_status, lit_str("invalid absent exact absolute redirect model"));
-    auto absent_target = canonical_server();
-    absent_target.exact_absolute_redirect.response.target = lit_str("http://redirect.example/new");
-    expect_rejected(absent_target, lit_str("invalid absent exact absolute redirect model"));
-    auto absent_authority = canonical_server();
-    absent_authority.exact_absolute_redirect.response.authority = lit_str("redirect.example");
-    expect_rejected(absent_authority, lit_str("invalid absent exact absolute redirect model"));
-    auto absent_path = canonical_server();
-    absent_path.exact_absolute_redirect.path = lit_str("/old");
-    expect_rejected(absent_path, lit_str("invalid absent exact absolute redirect model"));
-    auto absent_span = canonical_server();
-    absent_span.exact_absolute_redirect.response.target_span = Span{1, 2, 1, 2};
-    expect_rejected(absent_span, lit_str("invalid absent exact absolute redirect model"));
+    const auto expect_absent_dirty = [&](const nginx::Server& model, Span span = {}) {
+        expect_rejected(model, lit_str("invalid absent exact absolute redirect model"), span);
+    };
+    auto dirty = canonical_server();
+    dirty.exact_absolute_redirect.path.ptr = "/old";
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.path.len = 4;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.path_span = Span{1, 5, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.path_span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.span = Span{1, 5, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.status = 301;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.status_lexeme.ptr = "301";
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.status_lexeme.len = 3;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.status_span = Span{1, 4, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.response.status_span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.target.ptr = "http://redirect.example/new";
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.target.len = 27;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.target_span = Span{1, 28, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.response.target_span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.authority.ptr = "redirect.example";
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.authority.len = 16;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.authority_span = Span{1, 17, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.response.authority_span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.path.ptr = "/new";
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.path.len = 4;
+    expect_absent_dirty(dirty);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.path_span = Span{1, 5, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.response.path_span);
+    dirty = canonical_server();
+    dirty.exact_absolute_redirect.response.span = Span{1, 5, 1, 2};
+    expect_absent_dirty(dirty, dirty.exact_absolute_redirect.response.span);
 
     auto present_only = canonical_server();
     present_only.exact_absolute_redirect.present = true;
-    expect_rejected(present_only, lit_str("exact absolute redirect lowering is unsupported"));
+    expect_rejected(present_only, lit_str("invalid exact absolute redirect location span"));
 
     auto both_actions = redirect.value();
     both_actions.exact_local_return = local.value().exact_local_return;
-    expect_rejected(both_actions, lit_str("exact absolute redirect lowering is unsupported"));
+    expect_rejected(both_actions,
+                    lit_str("multiple exact semantic actions are unsupported"),
+                    both_actions.exact_local_return.span);
+    auto dirty_second_action = redirect.value();
+    dirty_second_action.exact_local_return.response.status = 200;
+    expect_rejected(dirty_second_action,
+                    lit_str("multiple exact semantic actions are unsupported"));
+
+    const auto& accepted = redirect.value();
+    auto forged = accepted;
+    forged.exact_absolute_redirect.path = lit_str("/bad");
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect location path provenance"),
+                    accepted.exact_absolute_redirect.path_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.path = {nullptr, 4};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect location path provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status = 302;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect status"),
+                    accepted.exact_absolute_redirect.response.status_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_lexeme = lit_str("301");
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect status provenance"),
+                    accepted.exact_absolute_redirect.response.status_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_lexeme.ptr =
+        accepted.exact_absolute_redirect.response.target.ptr;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect status provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_lexeme.len--;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect status provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_lexeme = {nullptr, 3};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect status provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target = lit_str("http://redirect.example/bad");
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect target provenance"),
+                    accepted.exact_absolute_redirect.response.target_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target.len--;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target = {nullptr, 27};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target provenance"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority = lit_str("redirect.example");
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect authority provenance"),
+                    accepted.exact_absolute_redirect.response.authority_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority.ptr =
+        accepted.exact_absolute_redirect.response.target.ptr + 8;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority.len--;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority = {nullptr, 16};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path = lit_str("/new");
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect target path provenance"),
+                    accepted.exact_absolute_redirect.response.path_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path.ptr =
+        accepted.exact_absolute_redirect.response.target.ptr + 22;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path.len--;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path provenance"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path = {nullptr, 4};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path provenance"));
+
+    forged = accepted;
+    forged.span = {};
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect location span"),
+                    accepted.exact_absolute_redirect.span);
+    forged = accepted;
+    forged.exact_absolute_redirect.span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect location span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.span.end = forged.span.end + 1u;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect location span"),
+                    forged.exact_absolute_redirect.span);
+    forged = accepted;
+    forged.exact_absolute_redirect.span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect location span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.path_span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect location path span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.path_span.end++;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect location path span"),
+                    forged.exact_absolute_redirect.path_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.path_span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect location path span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect response span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.span.end = forged.exact_absolute_redirect.span.end + 1u;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect response span"),
+                    forged.exact_absolute_redirect.response.span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect response span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect status span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_span.end++;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect status span"),
+                    forged.exact_absolute_redirect.response.status_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.status_span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect status span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target_span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target_span.end--;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect target span"),
+                    forged.exact_absolute_redirect.response.target_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target_span.start =
+        forged.exact_absolute_redirect.response.status_span.end;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.target_span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority_span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority_span.start++;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect authority span"),
+                    forged.exact_absolute_redirect.response.authority_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority_span.end++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority_span.line++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.authority_span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect authority span"));
+
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path_span = {};
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path_span.start--;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect target path span"),
+                    forged.exact_absolute_redirect.response.path_span);
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path_span.end--;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path_span.line++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path span"));
+    forged = accepted;
+    forged.exact_absolute_redirect.response.path_span.col++;
+    expect_rejected(forged, lit_str("invalid exact absolute redirect target path span"));
+
+    forged = accepted;
+    forged.location = api_server().location;
+    expect_rejected(forged,
+                    lit_str("invalid exact absolute redirect fallback provenance"),
+                    forged.location.path_span);
+
+    char mutable_source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/old { return 301 http://redirect.example/new; } }";
+    const auto mutable_parsed = nginx::parse({mutable_source, sizeof(mutable_source) - 1u});
+    REQUIRE(mutable_parsed);
+    char* status_byte = strstr(mutable_source, "301");
+    REQUIRE(status_byte != nullptr);
+    status_byte[2] = '2';
+    expect_rejected(mutable_parsed.value(),
+                    lit_str("invalid exact absolute redirect status lexeme"),
+                    mutable_parsed.value().exact_absolute_redirect.response.status_span);
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
@@ -1640,6 +1951,27 @@ TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
     CHECK_GT(lexed.value().tokens.len, 530u);
 }
 
+TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) {
+    char source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/old { return 301 http://redirect.example/new; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    auto model = parsed.value();
+    model.listen.port = 65535;
+    model.location.proxy_pass.address[0] = 255;
+    model.location.proxy_pass.address[1] = 255;
+    model.location.proxy_pass.address[2] = 255;
+    model.location.proxy_pass.address[3] = 255;
+    model.location.proxy_pass.port = 65535;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 5936u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+}
+
 TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
     auto model = api_server();
     model.listen.port = 65535;
@@ -1782,6 +2114,347 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
     CHECK(owned_policy.body.eq(lit_str("successor-static")));
     CHECK(owned_policy.server.eq(lit_str("nginx/1.29.7")));
+}
+
+TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
+    static constexpr char kDecodedRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>301 Moved Permanently</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>301 Moved Permanently</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kDecodedRedirectBody) - 1u == 169u);
+    static constexpr char kDecodedBadGatewayBody[] =
+        "<html>\r\n"
+        "<head><title>502 Bad Gateway</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kDecodedGatewayTimeoutBody[] =
+        "<html>\r\n"
+        "<head><title>504 Gateway Time-out</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>504 Gateway Time-out</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kDecodedTraceBody[] =
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kDecodedBadRequestBody[] =
+        "<html>\r\n"
+        "<head><title>400 Bad Request</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>400 Bad Request</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kDecodedBadGatewayBody) - 1u == 157u);
+    static_assert(sizeof(kDecodedGatewayTimeoutBody) - 1u == 167u);
+    static_assert(sizeof(kDecodedTraceBody) - 1u == 157u);
+    static_assert(sizeof(kDecodedBadRequestBody) - 1u == 157u);
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        nginx::RutSource lowered_source{};
+        {
+            char nginx_source[] =
+                "server { listen 8080; location = /old { return 301 "
+                "http://redirect.example/new; } location / { proxy_pass "
+                "http://127.0.0.1:9000; } }";
+            auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+            REQUIRE(parsed);
+            auto lowered = nginx::lower_to_rut(parsed.value());
+            REQUIRE(lowered);
+            lowered_source = lowered.value();
+        }
+        auto lexed = lex(lowered_source.view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 9u);
+        REQUIRE_EQ(ast_owned->redirect_policies.len, 1u);
+        const auto& ast_redirect = ast_owned->redirect_policies[0];
+        CHECK(ast_redirect.authority == RedirectPolicyAuthority::Static);
+        CHECK(ast_redirect.port == RedirectPolicyPort::Omit);
+        CHECK(ast_redirect.path == RedirectPolicyPath::Static);
+        CHECK(ast_redirect.query == RedirectPolicyQuery::Discard);
+        CHECK(ast_redirect.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation);
+        CHECK(ast_redirect.static_authority.eq(lit_str("redirect.example")));
+        CHECK(ast_redirect.target_path.eq(lit_str("/new")));
+        CHECK(ast_redirect.body.eq({kDecodedRedirectBody, sizeof(kDecodedRedirectBody) - 1u}));
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        CHECK_EQ(hir_owned->routes[0].method, kRouteMethodHead);
+        CHECK_EQ(hir_owned->routes[1].method, kRouteMethodGet);
+        CHECK_EQ(hir_owned->routes[2].method, kRouteMethodAny);
+        const auto& get = hir_owned->routes[1];
+        CHECK(get.path.eq(lit_str("/")));
+        CHECK(get.forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection);
+        REQUIRE(get.control.kind == HirControlKind::If);
+        REQUIRE(get.control.cond.kind == HirExprKind::Eq);
+        REQUIRE(get.control.cond.lhs != nullptr);
+        REQUIRE(get.control.cond.rhs != nullptr);
+        CHECK(get.control.cond.lhs->kind == HirExprKind::ReqPathOnly);
+        CHECK(get.control.cond.rhs->kind == HirExprKind::StrLit);
+        CHECK(get.control.cond.rhs->str_value.eq(lit_str("/old")));
+        CHECK(get.control.then_term.kind == HirTerminatorKind::Redirect);
+        CHECK_EQ(get.control.then_term.redirect_policy_id, 1u);
+        CHECK(get.control.else_term.kind == HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(get.control.else_term.forward_request_policy_id, 1u);
+        CHECK_EQ(get.control.else_term.forward_response_policy_id, 2u);
+        CHECK_EQ(get.control.else_term.forward_failure_policy_id, 2u);
+        CHECK_EQ(get.control.else_term.forward_timeout_failure_policy_id, 3u);
+        CHECK_EQ(get.control.else_term.forward_response_read_timeout_seconds, 60u);
+        CHECK(get.control.else_term.forward_response_buffering ==
+              ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        CHECK_EQ(mir_owned->functions[1].method, kRouteMethodGet);
+        CHECK(mir_owned->functions[1].path.eq(lit_str("/")));
+        CHECK(mir_owned->functions[1].forward_preflight_mode ==
+              ForwardPreflightMode::AfterCanonicalSelection);
+        bool mir_redirect = false;
+        bool mir_forward = false;
+        for (u32 bi = 0; bi < mir_owned->functions[1].blocks.len; bi++) {
+            const auto& term = mir_owned->functions[1].blocks[bi].term;
+            if (term.kind == MirTerminatorKind::Redirect) {
+                mir_redirect = true;
+                CHECK_EQ(term.redirect_policy_id, 1u);
+            }
+            if (term.kind == MirTerminatorKind::ForwardUpstream) {
+                mir_forward = true;
+                CHECK_EQ(term.forward_request_policy_id, 1u);
+                CHECK_EQ(term.forward_response_policy_id, 2u);
+                CHECK_EQ(term.forward_failure_policy_id, 2u);
+                CHECK_EQ(term.forward_timeout_failure_policy_id, 3u);
+                CHECK_EQ(term.forward_response_read_timeout_seconds, 60u);
+                CHECK(term.forward_response_buffering ==
+                      ForwardResponseBufferingMode::CompleteContentLength);
+            }
+        }
+        CHECK(mir_redirect);
+        CHECK(mir_forward);
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+        const auto& rir_redirect = rir.module.redirect_policies[0];
+        CHECK(rir_redirect.authority == RedirectPolicyAuthority::Static);
+        CHECK(rir_redirect.port == RedirectPolicyPort::Omit);
+        CHECK(rir_redirect.query == RedirectPolicyQuery::Discard);
+        CHECK(rir_redirect.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation);
+        CHECK(rir_redirect.static_authority.eq(lit_str("redirect.example")));
+        CHECK(rir_redirect.target_path.eq(lit_str("/new")));
+        CHECK(rir_redirect.body.eq({kDecodedRedirectBody, sizeof(kDecodedRedirectBody) - 1u}));
+        REQUIRE_EQ(rir.module.response_policy_count, 2u);
+        REQUIRE_EQ(rir.module.failure_policy_count, 3u);
+        REQUIRE_EQ(rir.module.policy_bundle_count, 3u);
+        const auto& get_bundle = rir.module.policy_bundles[1];
+        CHECK_EQ(get_bundle.response_policy_id, 2u);
+        CHECK_EQ(get_bundle.failure_policy_id, 2u);
+        CHECK_EQ(get_bundle.timeout_failure_policy_id, 3u);
+        CHECK_EQ(get_bundle.response_read_timeout_seconds, 60u);
+        CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        const auto& function = rir.module.functions[1];
+        CHECK_EQ(function.http_method, kRouteMethodGet);
+        CHECK(function.route_pattern.eq(lit_str("/")));
+        CHECK(function.forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection);
+        CHECK_EQ(function.preflight_forward_policy_bundle_id, 2u);
+        REQUIRE_EQ(function.block_count, 3u);
+        REQUIRE_EQ(function.blocks[0].inst_count, 4u);
+        CHECK_EQ(function.blocks[0].insts[0].op, rir::Opcode::ReqPathOnly);
+        CHECK_EQ(function.blocks[0].insts[1].op, rir::Opcode::ConstStr);
+        CHECK(function.blocks[0].insts[1].imm.str_val.eq(lit_str("/old")));
+        CHECK_EQ(function.blocks[0].insts[2].op, rir::Opcode::CmpEq);
+        CHECK_EQ(function.blocks[0].insts[3].op, rir::Opcode::Br);
+        REQUIRE_EQ(function.blocks[1].inst_count, 1u);
+        CHECK_EQ(function.blocks[1].insts[0].op, rir::Opcode::RetRedirect);
+        CHECK_EQ(function.blocks[1].insts[0].imm.i32_val, 1);
+        REQUIRE_EQ(function.blocks[2].inst_count, 4u);
+        CHECK_EQ(function.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+        bool saw_path_only = false;
+        bool saw_old = false;
+        bool saw_branch = false;
+        bool saw_redirect = false;
+        bool saw_forward = false;
+        for (u32 bi = 0; bi < function.block_count; bi++) {
+            const auto& block = function.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& instruction = block.insts[ii];
+                if (instruction.op == rir::Opcode::ReqPathOnly) saw_path_only = true;
+                if (instruction.op == rir::Opcode::ConstStr &&
+                    instruction.imm.str_val.eq(lit_str("/old")))
+                    saw_old = true;
+                if (instruction.op == rir::Opcode::Br) saw_branch = true;
+                if (instruction.op == rir::Opcode::RetRedirect) {
+                    saw_redirect = true;
+                    CHECK_EQ(instruction.imm.i32_val, 1);
+                }
+                if (instruction.op == rir::Opcode::RetForwardBundle) {
+                    saw_forward = true;
+                    REQUIRE_EQ(instruction.operand_count, 3u);
+                    i32 upstream_id = -1;
+                    i32 request_policy_id = -1;
+                    i32 bundle_id = -1;
+                    REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
+                    REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
+                    REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
+                    CHECK_EQ(upstream_id, 0);
+                    CHECK_EQ(request_policy_id, 1);
+                    CHECK_EQ(bundle_id, 2);
+                }
+            }
+        }
+        CHECK(saw_path_only);
+        CHECK(saw_old);
+        CHECK(saw_branch);
+        CHECK(saw_redirect);
+        CHECK(saw_forward);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered_source.data, 'y', lowered_source.len);
+    }
+
+    REQUIRE_EQ(populated->redirect_policy_count, 1u);
+    REQUIRE(populated->redirect_policy_id_is_valid(1u));
+    const auto& owned = populated->redirect_policies[0];
+    CHECK(populated->redirect_policy_strings_are_owned(owned));
+    CHECK(owned.authority == RedirectPolicyAuthority::Static);
+    CHECK(owned.port == RedirectPolicyPort::Omit);
+    CHECK(owned.path == RedirectPolicyPath::Static);
+    CHECK(owned.query == RedirectPolicyQuery::Discard);
+    CHECK(owned.date == RedirectPolicyDate::Current);
+    CHECK(owned.connection == RedirectPolicyConnection::Close);
+    CHECK(owned.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK_EQ(owned.status_code, 301u);
+    CHECK(owned.reason.eq(lit_str("Moved Permanently")));
+    CHECK(owned.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(owned.content_type.eq(lit_str("text/html")));
+    CHECK(owned.static_authority.eq(lit_str("redirect.example")));
+    CHECK(owned.target_path.eq(lit_str("/new")));
+    CHECK(owned.body.eq({kDecodedRedirectBody, sizeof(kDecodedRedirectBody) - 1u}));
+    const Str redirect_fields[] = {owned.reason,
+                                   owned.server,
+                                   owned.content_type,
+                                   owned.static_authority,
+                                   owned.target_path,
+                                   owned.body};
+    for (Str field : redirect_fields)
+        CHECK(str_is_in_owned_pool(
+            field, populated->redirect_policy_bytes, populated->redirect_policy_bytes_used));
+
+    REQUIRE_EQ(populated->response_policy_count, 2u);
+    static constexpr Str kHiddenHeaders[] = {lit_str("Date"), lit_str("Server"), lit_str("X-Pad")};
+    for (u32 i = 0; i < populated->response_policy_count; i++) {
+        REQUIRE(populated->response_policy_id_is_valid(static_cast<u16>(i + 1u)));
+        const auto& policy = populated->response_policies[i];
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(str_is_in_owned_pool(policy.server,
+                                   populated->response_policy_bytes,
+                                   populated->response_policy_bytes_used));
+        REQUIRE_EQ(policy.hide_header_count, 3u);
+        for (u32 header = 0; header < policy.hide_header_count; header++) {
+            CHECK(policy.hide_headers[header].eq(kHiddenHeaders[header]));
+            CHECK(str_is_in_owned_pool(policy.hide_headers[header],
+                                       populated->response_policy_bytes,
+                                       populated->response_policy_bytes_used));
+        }
+    }
+
+    REQUIRE_EQ(populated->failure_policy_count, 3u);
+    for (u32 i = 0; i < populated->failure_policy_count; i++) {
+        if (i == 2)
+            REQUIRE(populated->timeout_failure_policy_id_is_valid(static_cast<u16>(i + 1u)));
+        else
+            REQUIRE(populated->failure_policy_id_is_valid(static_cast<u16>(i + 1u)));
+        const auto& policy = populated->failure_policies[i];
+        const bool timeout = i == 2;
+        CHECK_EQ(policy.status_code, timeout ? 504u : 502u);
+        CHECK(policy.reason.eq(timeout ? lit_str("Gateway Time-out") : lit_str("Bad Gateway")));
+        CHECK(policy.content_type.eq(lit_str("text/html")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.body.eq(
+            timeout ? Str{kDecodedGatewayTimeoutBody, sizeof(kDecodedGatewayTimeoutBody) - 1u}
+                    : Str{kDecodedBadGatewayBody, sizeof(kDecodedBadGatewayBody) - 1u}));
+        const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
+        for (Str field : fields)
+            CHECK(str_is_in_owned_pool(
+                field, populated->failure_policy_bytes, populated->failure_policy_bytes_used));
+    }
+
+    REQUIRE_EQ(populated->policy_bundle_count, 3u);
+    for (u16 id = 1; id <= 3; id++) REQUIRE(populated->policy_bundle_id_is_valid(id));
+    const auto& head_bundle = populated->policy_bundles[0];
+    CHECK_EQ(head_bundle.response_policy_id, 1u);
+    CHECK_EQ(head_bundle.failure_policy_id, 1u);
+    CHECK_EQ(head_bundle.timeout_failure_policy_id, 0u);
+    CHECK_EQ(head_bundle.response_read_timeout_seconds, 0u);
+    CHECK(head_bundle.response_buffering == ForwardResponseBufferingMode::None);
+    const auto& get_bundle = populated->policy_bundles[1];
+    CHECK_EQ(get_bundle.response_policy_id, 2u);
+    CHECK_EQ(get_bundle.failure_policy_id, 2u);
+    CHECK_EQ(get_bundle.timeout_failure_policy_id, 3u);
+    CHECK_EQ(get_bundle.response_read_timeout_seconds, 60u);
+    CHECK(get_bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength);
+    const auto& any_bundle = populated->policy_bundles[2];
+    CHECK_EQ(any_bundle.response_policy_id, 2u);
+    CHECK_EQ(any_bundle.failure_policy_id, 2u);
+    CHECK_EQ(any_bundle.timeout_failure_policy_id, 0u);
+    CHECK_EQ(any_bundle.response_read_timeout_seconds, 0u);
+    CHECK(any_bundle.response_buffering == ForwardResponseBufferingMode::None);
+
+    REQUIRE_EQ(populated->strict_local_response_policy_count, 3u);
+    CHECK_EQ(populated->pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodConnect], 1u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodAny], 3u);
+    CHECK(populated->strict_local_response_table_is_valid());
+    for (u16 id = 1; id <= populated->strict_local_response_policy_count; id++) {
+        REQUIRE(populated->strict_local_response_policy_id_is_owned(id));
+        const auto& policy = populated->strict_local_response_policies[id - 1];
+        const bool bad_request = policy.status_code == 400;
+        CHECK(policy.reason.eq(bad_request ? lit_str("Bad Request") : lit_str("Not Allowed")));
+        CHECK(policy.content_type.eq(lit_str("text/html")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.body.eq(bad_request
+                                 ? Str{kDecodedBadRequestBody, sizeof(kDecodedBadRequestBody) - 1u}
+                                 : Str{kDecodedTraceBody, sizeof(kDecodedTraceBody) - 1u}));
+        const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
+        for (Str field : fields)
+            CHECK(str_is_in_owned_pool(field,
+                                       populated->strict_local_response_bytes,
+                                       populated->strict_local_response_bytes_used));
+    }
+
+    REQUIRE_EQ(populated->upstream_count, 1u);
+    const auto& upstream = populated->upstreams[0];
+    CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+    CHECK_EQ(upstream.addr_count, 1u);
+    CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(upstream.addrs[0].sin_port), 9000u);
+    // Ordinary route handlers remain JIT functions; populate_route_config
+    // owns their policy inventory without publishing a competing static route.
+    // Route paths and upstream names are inline arrays rather than borrowed
+    // Str fields; request-policy 1 is an enum-only fixed strip profile.
+    CHECK_EQ(populated->route_count, 0u);
 }
 
 // These checks prove only converter golden output and compiler/config ownership.
