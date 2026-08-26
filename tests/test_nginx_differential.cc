@@ -5242,6 +5242,389 @@ static bool run_pinned_api_non_root_proxy_uri_oracle(
                                              error);
 }
 
+struct BoundedExactLocalPathOracleObservation {
+    std::string order;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> forward_history;
+    u32 access_records[5]{};
+    u32 local_accepts = 0;
+    u32 local_requests = 0;
+    u32 local_sends = 0;
+    u32 forward_accepts = 0;
+    u32 forward_requests = 0;
+    u32 forward_sends = 0;
+};
+
+static void dump_bounded_exact_local_path_oracle_observation(
+    const BoundedExactLocalPathOracleObservation& observation) {
+    std::cerr << "bounded-exact-local-path order=" << observation.order
+              << " access=" << observation.access_records[0] << "/" << observation.access_records[1]
+              << "/" << observation.access_records[2] << "/" << observation.access_records[3] << "/"
+              << observation.access_records[4] << " upstream=" << observation.local_requests << "+"
+              << observation.forward_requests << "\n";
+    static constexpr const char* kLabels[] = {
+        "GET /healthz", "GET /healthz?x=1", "GET /healthz/", "GET /health", "GET /"};
+    for (size_t i = 0; i < observation.wires.size(); i++) {
+        const char* label = i < sizeof(kLabels) / sizeof(kLabels[0]) ? kLabels[i] : "extra vector";
+        dump_wire(label, observation.wires[i]);
+    }
+    for (size_t i = 0; i < observation.forward_history.size(); i++) {
+        const std::string label = "healthz oracle upstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.forward_history[i]);
+    }
+}
+
+static bool capture_pinned_bounded_exact_local_path_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    BoundedExactLocalPathOracleObservation& observation,
+    std::string& error) {
+    static constexpr const char* kTargets[] = {
+        "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
+    static constexpr bool kLocal[] = {true, true, false, false, false};
+    static_assert(sizeof(kTargets) / sizeof(kTargets[0]) == sizeof(kLocal) / sizeof(kLocal[0]));
+
+    const auto make_request = [](const char* target) {
+        return std::string("GET ") + target +
+               " HTTP/1.1\r\nHost: healthz.example\r\nConnection: close\r\n\r\n";
+    };
+    for (const char* target : kTargets) {
+        const std::string request = make_request(target);
+        const size_t header_end = request.find("\r\n\r\n");
+        if (request.rfind(std::string("GET ") + target + " HTTP/1.1\r\n", 0) != 0 ||
+            request.find('#') != std::string::npos ||
+            request.find("\r\nHost: healthz.example\r\n") == std::string::npos ||
+            request.find("\r\nConnection: close\r\n") == std::string::npos ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.find("\r\nTE:") != std::string::npos ||
+            request.find("\r\nExpect:") != std::string::npos ||
+            request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+            header_end + 4u != request.size() || request.rfind("\r\n\r\n") != header_end) {
+            error =
+                std::string("#318 oracle vector escaped the fresh bodyless GET domain: ") + target;
+            return false;
+        }
+    }
+
+    observation = BoundedExactLocalPathOracleObservation{};
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.wires.resize(5);
+    const std::string access_prefix =
+        "rut-nginx-318-healthz-" + observation.order + "-" + std::to_string(getpid()) + "-scoped";
+    const std::string exact_location =
+        "    location = /healthz { return 200 \"successor-static\"; }\n";
+    const std::string root_location =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format bounded_exact_local_path '" +
+        access_prefix +
+        " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
+        "host=\"$host\"';\n"
+        "  access_log /dev/stderr bounded_exact_local_path;\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n"
+        "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write #318 bounded exact-local pinned nginx config";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, Child& nginx, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx)) {
+                error =
+                    std::string("pinned nginx exited before #318 ") + phase + " recorder readiness";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = std::string("#318 ") + phase + " recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#318 ") + phase + " recorder readiness timed out";
+        return false;
+    };
+    const auto send_vector = [&](Child& nginx, size_t index, const char* expected) {
+        const std::string request = make_request(kTargets[index]);
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::vector<char> wire;
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, request.data(), request.size()) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string("#318 vector ") + kTargets[index] +
+                    " response/EOF/zero-tail failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, expected, detail)) {
+            error = std::string("#318 vector ") + kTargets[index] +
+                    " exact status/reason/headers/body wire mismatch: " + detail;
+            return false;
+        }
+        if (poll_child(nginx)) {
+            error = std::string("pinned nginx exited after #318 vector ") + kTargets[index];
+            return false;
+        }
+        observation.wires[index] = std::move(wire);
+        return true;
+    };
+    const auto observe_exact_count =
+        [&](Recorder& recorder, Child& nginx, u32 expected, const char* phase) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(nginx) || !recorder_live(recorder)) {
+                    error = std::string("#318 pinned nginx or recorder failed during ") + phase;
+                    return false;
+                }
+                if (recorder.accepted.load(std::memory_order_acquire) != expected ||
+                    recorder.requests.load(std::memory_order_acquire) != expected ||
+                    recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                    error = std::string("#318 unexpected upstream count during ") + phase;
+                    return false;
+                }
+                usleep(5000);
+            }
+            return true;
+        };
+    const auto wait_exact_count = [&](Recorder& recorder, Child& nginx, u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx) || !recorder_live(recorder)) {
+                error = "#318 pinned nginx or forward recorder failed while waiting for count";
+                return false;
+            }
+            const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) {
+                error = "#318 forward recorder exceeded its exact upstream count";
+                return false;
+            }
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        error = "timed out waiting for #318 exact forward upstream count";
+        return false;
+    };
+
+    Recorder local_recorder;
+    local_recorder.observe_extra_requests_until_stop = true;
+    if (!local_recorder.setup(backend_port)) {
+        error = "failed to start #318 local zero-upstream recorder";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for #318 oracle";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error) ||
+        !wait_recorder_live(local_recorder, nginx.child, "local"))
+        return false;
+
+    for (size_t i = 0; i < 2; i++) {
+        if (!kLocal[i] || !send_vector(nginx.child, i, kExactLocalCloseResponseNormalized))
+            return false;
+        if (local_recorder.accepted.load(std::memory_order_acquire) != 0 ||
+            local_recorder.requests.load(std::memory_order_acquire) != 0 ||
+            local_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+            error = std::string("#318 exact local vector unexpectedly reached upstream: ") +
+                    kTargets[i];
+            return false;
+        }
+    }
+    if (!observe_exact_count(local_recorder, nginx.child, 0, "live local zero-upstream window"))
+        return false;
+    local_recorder.stop();
+    observation.local_accepts = local_recorder.accepted.load(std::memory_order_acquire);
+    observation.local_requests = local_recorder.requests.load(std::memory_order_acquire);
+    observation.local_sends =
+        local_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    if (local_recorder.thread_alive.load(std::memory_order_acquire) ||
+        local_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.local_accepts != 0 || observation.local_requests != 0 ||
+        observation.local_sends != 0 ||
+        local_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !local_recorder.history.empty() || !local_recorder.request.empty()) {
+        error = "#318 local recorder did not settle with zero upstream activity";
+        return false;
+    }
+
+    Recorder forward_recorder;
+    forward_recorder.observe_extra_requests_until_stop = true;
+    if (!forward_recorder.setup(backend_port, 3, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
+        !wait_recorder_live(forward_recorder, nginx.child, "forward")) {
+        if (error.empty()) error = "failed to start #318 forward recorder";
+        return false;
+    }
+    for (size_t i = 2; i < 5; i++) {
+        if (kLocal[i] || !send_vector(nginx.child, i, kSuccessResponseNormalized) ||
+            !wait_exact_count(forward_recorder, nginx.child, static_cast<u32>(i - 1u)))
+            return false;
+    }
+    if (!observe_exact_count(forward_recorder, nginx.child, 3, "live no-fourth-forward window"))
+        return false;
+
+    if (!stop_child(nginx.child)) {
+        error = "failed to stop pinned nginx after #318 oracle";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after #318 oracle";
+        return false;
+    }
+    forward_recorder.stop();
+    observation.forward_accepts = forward_recorder.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = forward_recorder.requests.load(std::memory_order_acquire);
+    observation.forward_sends =
+        forward_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = forward_recorder.history;
+    if (forward_recorder.thread_alive.load(std::memory_order_acquire) ||
+        forward_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3 || observation.forward_requests != 3 ||
+        observation.forward_sends != 3 ||
+        !forward_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !forward_recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !forward_recorder.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 3) {
+        error = "#318 forward recorder did not settle at exactly three upstream episodes";
+        return false;
+    }
+
+    std::vector<std::vector<char>> expected_history;
+    expected_history.reserve(3);
+    for (size_t i = 2; i < 5; i++) {
+        const std::string request = std::string("GET ") + kTargets[i] + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error =
+            "#318 root neighbors did not preserve exact method/request-target/headers/body "
+            "histories";
+        return false;
+    }
+
+    bool logs_readable = true;
+    for (size_t i = 0; i < 5; i++) {
+        const std::string marker = std::string("\"GET ") + kTargets[i] + " HTTP/1.1\" 200 " +
+                                   (i < 2 ? "16" : "2") + " host=\"healthz.example\"";
+        logs_readable = logs_readable && log_count_line_with(temp.nginx_log,
+                                                             marker.c_str(),
+                                                             access_prefix.c_str(),
+                                                             observation.access_records[i]);
+    }
+    u32 local_access = 0;
+    u32 forward_access = 0;
+    u32 total_access = 0;
+    u32 connect_failures = 0;
+    u32 upstream_failures = 0;
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    logs_readable =
+        logs_readable &&
+        log_count_line_with(temp.nginx_log, "200 16 host=", access_prefix.c_str(), local_access) &&
+        log_count_line_with(temp.nginx_log, "200 2 host=", access_prefix.c_str(), forward_access) &&
+        log_count_line_with(
+            temp.nginx_log, access_prefix.c_str(), access_prefix.c_str(), total_access) &&
+        log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), connect_failures) &&
+        log_count_line_with(
+            temp.nginx_log, "upstream", upstream_context.c_str(), upstream_failures);
+    if (!logs_readable || observation.access_records[0] != 1 ||
+        observation.access_records[1] != 1 || observation.access_records[2] != 1 ||
+        observation.access_records[3] != 1 || observation.access_records[4] != 1 ||
+        local_access != 2 || forward_access != 3 || total_access != 5 || connect_failures != 0 ||
+        upstream_failures != 0) {
+        error =
+            "#318 scoped access/error logs did not prove two local 200/16 records, three "
+            "forward 200/2 records, five total records, and zero connect/upstream failures";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_bounded_exact_local_path_oracle(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_prefix,
+    BoundedExactLocalPathOracleObservation& exact_first,
+    BoundedExactLocalPathOracleObservation& root_first,
+    std::string& error) {
+    if (!capture_pinned_bounded_exact_local_path_order(frontend_port,
+                                                       backend_port,
+                                                       temp,
+                                                       container_prefix + "-exact-first",
+                                                       true,
+                                                       exact_first,
+                                                       error) ||
+        !capture_pinned_bounded_exact_local_path_order(frontend_port,
+                                                       backend_port,
+                                                       temp,
+                                                       container_prefix + "-root-first",
+                                                       false,
+                                                       root_first,
+                                                       error))
+        return false;
+    if (exact_first.wires.size() != 5 || root_first.wires.size() != 5) {
+        error = "#318 oracle did not complete the exact five-vector matrix for both orders";
+        return false;
+    }
+    for (size_t i = 0; i < 5; i++) {
+        std::vector<char> exact_wire = exact_first.wires[i];
+        std::vector<char> root_wire = root_first.wires[i];
+        if (!normalize_date(exact_wire) || !normalize_date(root_wire) || exact_wire != root_wire) {
+            error = "#318 location declaration order changed normalized vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    if (exact_first.forward_history != root_first.forward_history) {
+        error = "#318 location declaration order changed exact forward upstream history";
+        return false;
+    }
+    return true;
+}
+
 static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
                                                u16 backend_port,
                                                TempDir& temp,
@@ -11970,6 +12353,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--api-non-root-proxy-uri-oracle") == 0;
     const bool service_root_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--service-root-proxy-uri-oracle") == 0;
+    const bool bounded_exact_local_path_oracle =
+        argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
@@ -12010,7 +12395,8 @@ int main(int argc, char** argv) {
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !converter_api_non_root_proxy_uri_differential &&
+         !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
+         !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential && !strict_local_response_differential &&
          !converter_root_proxy_trace_differential && !converter_api_proxy_trace_differential &&
          !converter_exact_absolute_redirect_differential &&
@@ -12053,6 +12439,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
                      "   or: test_nginx_differential --api-non-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
+                     "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
                      "<absolute-rut-executable>\n"
@@ -12431,6 +12818,43 @@ int main(int argc, char** argv) {
                "equivalence claim; excludes wider prefixes, normalization-sensitive targets, "
                "other methods, framing/body, reuse/pipeline, TLS/H2, and multiple locations or "
                "servers)\n";
+        return 0;
+    }
+
+    if (bounded_exact_local_path_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-bounded-exact-local-path-" + std::to_string(getpid()) + "-" + source_suffix;
+        BoundedExactLocalPathOracleObservation exact_first;
+        BoundedExactLocalPathOracleObservation root_first;
+        std::string oracle_error;
+        if (!run_pinned_bounded_exact_local_path_oracle(frontend_port,
+                                                        backend_port,
+                                                        temp,
+                                                        container_prefix,
+                                                        exact_first,
+                                                        root_first,
+                                                        oracle_error)) {
+            std::cerr << "FAIL [pinned bounded exact-local /healthz oracle]: " << oracle_error
+                      << "\n";
+            dump_bounded_exact_local_path_oracle_observation(exact_first);
+            dump_bounded_exact_local_path_oracle_observation(root_first);
+            dump_log(temp.nginx_config, "#318 bounded exact-local pinned nginx config");
+            dump_log(temp.nginx_log, "#318 bounded exact-local pinned nginx log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 exact /healthz local return is declaration-order "
+               "independent across five fresh bodyless explicit-close H1.1 GET vectors; /healthz "
+               "and /healthz?x=1 emit the exact Date-normalized 200 OK/text-plain/CL16/full-"
+               "successor-static/close/EOF/zero-tail wire with live and settled zero upstream, "
+               "while /healthz/, /health, and / reach the root proxy in exact order with exact "
+               "method/request-target/headers/empty-body histories and a live no-fourth window; "
+               "each declaration order has exactly five uniquely scoped access records and zero "
+               "connect/upstream failures (nginx-only #318 oracle; no parser/converter/RUT "
+               "equivalence claim; excludes other exact paths, statuses, bodies, headers, "
+               "methods, framing, reuse/pipeline, location kinds, TLS/H2, and multiple servers)\n";
         return 0;
     }
 
