@@ -434,6 +434,20 @@ static constexpr char kExactLocalCloseResponseNormalized[] =
     "Connection: close\r\n"
     "\r\n"
     "successor-static";
+static constexpr char kExactLocalBodySpaceRequest[] =
+    "GET /static HTTP/1.1\r\n"
+    "Host: body-space.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalBodySpaceResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 11\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "hello world";
+static_assert(sizeof(kExactLocalBodySpaceResponseNormalized) - 1u == 154u);
 static constexpr char kExactLocalHeadCloseResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -6080,6 +6094,312 @@ static bool run_pinned_normalized_exact_trailing_slash_oracle(
             error = "#320 declaration order changed ordered upstream request targets";
             return false;
         }
+    }
+    return true;
+}
+
+struct ExactLocalBodySpaceOracleObservation {
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string container_name;
+    std::vector<char> wire;
+    u32 upstream_accepts = 0;
+    u32 upstream_requests = 0;
+    u32 upstream_sends = 0;
+    u32 access_records = 0;
+};
+
+static void dump_exact_local_body_space_oracle_observation(
+    const ExactLocalBodySpaceOracleObservation& observation) {
+    std::cerr << "exact-local-body-space order=" << observation.order
+              << " temp=" << observation.temp_path << " config=" << observation.config_path
+              << " log=" << observation.log_path << " container=" << observation.container_name
+              << " access=" << observation.access_records
+              << " upstream=" << observation.upstream_accepts << "/"
+              << observation.upstream_requests << "/" << observation.upstream_sends << "\n";
+    dump_wire("GET /static body-space oracle", observation.wire);
+}
+
+static bool capture_pinned_exact_local_body_space_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    ExactLocalBodySpaceOracleObservation& observation,
+    std::string& error) {
+    const std::string request(kExactLocalBodySpaceRequest);
+    const size_t header_end = request.find("\r\n\r\n");
+    if (request.rfind("GET /static HTTP/1.1\r\n", 0) != 0 ||
+        request.find("\r\nHost: body-space.example\r\n") == std::string::npos ||
+        request.find("\r\nConnection: close\r\n") == std::string::npos ||
+        request.find("\r\nContent-Length:") != std::string::npos ||
+        request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request.find("\r\nTE:") != std::string::npos ||
+        request.find("\r\nExpect:") != std::string::npos ||
+        request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+        header_end + 4u != request.size()) {
+        error =
+            "#321 oracle request escaped the one fresh bodyless origin-form explicit-close "
+            "H1.1 GET domain";
+        return false;
+    }
+
+    observation = ExactLocalBodySpaceOracleObservation{};
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.container_name = container_name;
+    const std::string access_prefix = "rut-nginx-321-body-space-" + observation.order + "-" +
+                                      std::to_string(getpid()) + "-scoped";
+    const std::string exact_location = "    location = /static { return 200 \"hello world\"; }\n";
+    const std::string root_location =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format exact_local_body_space '" +
+        access_prefix +
+        " raw=\"$request\" status=$status bytes=$body_bytes_sent host=\"$host\"';\n"
+        "  access_log /dev/stderr exact_local_body_space;\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n"
+        "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write #321 exact local body-space pinned nginx config";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, Child& nginx) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx)) {
+                error = "pinned nginx exited before #321 recorder readiness";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = "#321 recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = "#321 recorder readiness timed out";
+        return false;
+    };
+    const auto observe_live_zero = [&](Recorder& recorder, Child& nginx, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx) || !recorder_live(recorder)) {
+                error = std::string("#321 pinned nginx or recorder failed during ") + phase;
+                return false;
+            }
+            if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+                recorder.requests.load(std::memory_order_acquire) != 0 ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+                error = std::string("#321 observed upstream activity during ") + phase;
+                return false;
+            }
+            usleep(5000);
+        }
+        return true;
+    };
+
+    Recorder recorder;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup(backend_port)) {
+        error = "failed to start #321 zero-upstream recorder";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for #321 oracle";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error) ||
+        !wait_recorder_live(recorder, nginx.child) ||
+        !observe_live_zero(recorder, nginx.child, "pre-request live zero-upstream window"))
+        return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    std::string detail;
+    if (client.fd < 0 ||
+        !send_all(
+            client.fd, kExactLocalBodySpaceRequest, sizeof(kExactLocalBodySpaceRequest) - 1u) ||
+        !read_response(client.fd, observation.wire, detail) || !read_eof(client.fd, detail)) {
+        error = "#321 response/EOF/zero-tail failed: " +
+                (detail.empty() ? std::string("connect or send failed") : detail);
+        return false;
+    }
+    if (!validate_exact_normalized_response(
+            observation.wire, kExactLocalBodySpaceResponseNormalized, detail)) {
+        error = "#321 exact status/reason/header-order/body wire mismatch: " + detail;
+        return false;
+    }
+    const std::string wire_text(observation.wire.begin(), observation.wire.end());
+    if (wire_text.find("\r\nLocation:") != std::string::npos) {
+        error = "#321 exact local body-space response unexpectedly emitted Location";
+        return false;
+    }
+    if (!observe_live_zero(recorder, nginx.child, "post-request live zero-upstream window"))
+        return false;
+
+    if (!stop_child(nginx.child)) {
+        error = "failed to stop pinned nginx after #321 oracle";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after #321 oracle";
+        return false;
+    }
+    recorder.stop();
+    observation.upstream_accepts = recorder.accepted.load(std::memory_order_acquire);
+    observation.upstream_requests = recorder.requests.load(std::memory_order_acquire);
+    observation.upstream_sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+    if (recorder.thread_alive.load(std::memory_order_acquire) ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.upstream_accepts != 0 || observation.upstream_requests != 0 ||
+        observation.upstream_sends != 0 ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !recorder.history.empty() || !recorder.request.empty()) {
+        error = "#321 recorder did not settle with zero accepts/requests/sends/history";
+        return false;
+    }
+
+    const std::string marker =
+        "raw=\"GET /static HTTP/1.1\" status=200 bytes=11 host=\"body-space.example\"";
+    u32 total_access = 0;
+    u32 connect_failures = 0;
+    u32 upstream_failures = 0;
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    if (!log_count_line_with(
+            temp.nginx_log, marker.c_str(), access_prefix.c_str(), observation.access_records) ||
+        !log_count_line_with(
+            temp.nginx_log, access_prefix.c_str(), access_prefix.c_str(), total_access) ||
+        !log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), connect_failures) ||
+        !log_count_line_with(
+            temp.nginx_log, "upstream", upstream_context.c_str(), upstream_failures) ||
+        observation.access_records != 1 || total_access != 1 || connect_failures != 0 ||
+        upstream_failures != 0) {
+        error =
+            "#321 scoped logs did not prove one boundary-safe raw /static 200/11 record and "
+            "zero connect/upstream failures";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_exact_local_body_space_oracle(
+    const std::string& container_prefix,
+    ExactLocalBodySpaceOracleObservation& exact_first,
+    ExactLocalBodySpaceOracleObservation& root_first,
+    std::string& error) {
+    u16 exact_frontend_port = 0;
+    u16 exact_backend_port = 0;
+    u16 root_frontend_port = 0;
+    u16 root_backend_port = 0;
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        if (!allocate_port(exact_frontend_port) || !allocate_port(exact_backend_port) ||
+            !allocate_port(root_frontend_port) || !allocate_port(root_backend_port))
+            continue;
+        ports_unique =
+            exact_frontend_port != exact_backend_port &&
+            exact_frontend_port != root_frontend_port && exact_frontend_port != root_backend_port &&
+            exact_backend_port != root_frontend_port && exact_backend_port != root_backend_port &&
+            root_frontend_port != root_backend_port;
+    }
+    if (!ports_unique) {
+        error = "#321 could not allocate four distinct declaration-order ports";
+        return false;
+    }
+
+    TempDir exact_temp;
+    TempDir root_temp;
+    if (!exact_temp.create() || !root_temp.create() ||
+        strcmp(exact_temp.path, root_temp.path) == 0 ||
+        exact_temp.nginx_config == root_temp.nginx_config ||
+        exact_temp.nginx_log == root_temp.nginx_log) {
+        error = "#321 could not create independent declaration-order temp/config/log paths";
+        return false;
+    }
+    const std::string exact_container = container_prefix + "-exact-first";
+    const std::string root_container = container_prefix + "-root-first";
+    if (exact_container == root_container) {
+        error = "#321 declaration-order container names were not independent";
+        return false;
+    }
+    if (!capture_pinned_exact_local_body_space_order(exact_frontend_port,
+                                                     exact_backend_port,
+                                                     exact_temp,
+                                                     exact_container,
+                                                     true,
+                                                     exact_first,
+                                                     error)) {
+        dump_log(exact_temp.nginx_config, "#321 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#321 exact-first pinned nginx log");
+        return false;
+    }
+    if (!capture_pinned_exact_local_body_space_order(root_frontend_port,
+                                                     root_backend_port,
+                                                     root_temp,
+                                                     root_container,
+                                                     false,
+                                                     root_first,
+                                                     error)) {
+        dump_log(root_temp.nginx_config, "#321 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#321 root-first pinned nginx log");
+        return false;
+    }
+    if (exact_first.temp_path == root_first.temp_path ||
+        exact_first.config_path == root_first.config_path ||
+        exact_first.log_path == root_first.log_path ||
+        exact_first.container_name == root_first.container_name || exact_first.wire.empty() ||
+        root_first.wire.empty() || exact_first.wire.data() == root_first.wire.data()) {
+        error =
+            "#321 declaration orders did not retain independent resources and response "
+            "buffers";
+        return false;
+    }
+    std::vector<char> exact_wire(exact_first.wire.begin(), exact_first.wire.end());
+    std::vector<char> root_wire(root_first.wire.begin(), root_first.wire.end());
+    if (!normalize_date(exact_wire) || !normalize_date(root_wire) || exact_wire != root_wire) {
+        error = "#321 location declaration order changed the exact Date-normalized response";
+        return false;
     }
     return true;
 }
@@ -13913,6 +14233,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool normalized_exact_trailing_slash_oracle =
         argc == 2 && strcmp(argv[1], "--normalized-exact-trailing-slash-oracle") == 0;
+    const bool exact_local_body_space_oracle =
+        argc == 2 && strcmp(argv[1], "--exact-local-body-space-oracle") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
@@ -13961,7 +14283,7 @@ int main(int argc, char** argv) {
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
-         !normalized_exact_trailing_slash_oracle &&
+         !normalized_exact_trailing_slash_oracle && !exact_local_body_space_oracle &&
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_bounded_exact_local_path_differential &&
@@ -14013,6 +14335,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
+                     "   or: test_nginx_differential --exact-local-body-space-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
                      "<absolute-rut-executable>\n"
@@ -14498,6 +14821,37 @@ int main(int argc, char** argv) {
                "parser/converter/RUT equivalence claim; excludes other methods, bodies/framing, "
                "HTTP/1.0, keep-alive/reuse, TLS/H2, percent/dot normalization, arbitrary slash "
                "runs, variables, merge_slashes off, other location forms, and multiple servers)\n";
+        return 0;
+    }
+
+    if (exact_local_body_space_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-exact-local-body-space-" + std::to_string(getpid()) + "-" + source_suffix;
+        ExactLocalBodySpaceOracleObservation exact_first;
+        ExactLocalBodySpaceOracleObservation root_first;
+        std::string oracle_error;
+        if (!run_pinned_exact_local_body_space_oracle(
+                container_prefix, exact_first, root_first, oracle_error)) {
+            std::cerr << "FAIL [pinned exact-local one-space body oracle]: " << oracle_error
+                      << "\n";
+            dump_exact_local_body_space_oracle_observation(exact_first);
+            dump_exact_local_body_space_oracle_observation(root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 exact /static local return with body exactly 11 bytes "
+               "hello world is declaration-order independent across two isolated fresh bodyless "
+               "origin-form explicit-close H1.1 GET observations; each emits the exact Date-only "
+               "normalized nginx-header-order 200 OK/text-plain/CL11/no-Location/full-body-with-"
+               "no-newline/close/zero-tail/EOF wire, retains live pre/post-request and settled "
+               "zero-upstream evidence, and has exactly one boundary-safe raw /static access "
+               "record with zero connect/upstream failures (nginx-only #321 oracle; no parser/"
+               "converter/RUT support or equivalence claim; excludes multiple, leading, or "
+               "trailing spaces, tabs, escapes, variables, controls, other bodies/statuses/"
+               "paths/methods/framing, HTTP/1.0, keep-alive/reuse/pipeline, TLS/H2, other "
+               "location forms, and multiple servers/listeners)\n";
         return 0;
     }
 
