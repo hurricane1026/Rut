@@ -499,6 +499,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_normalized_exact_trailing_slash_oracle
+        COMMAND test_nginx_differential --normalized-exact-trailing-slash-oracle
+    )
+    set_tests_properties(test_nginx_normalized_exact_trailing_slash_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 75
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_bounded_exact_local_path_differential
         COMMAND test_nginx_differential --converter-bounded-exact-local-path-differential
                 $<TARGET_FILE:rut>
