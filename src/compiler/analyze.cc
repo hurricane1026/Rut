@@ -14762,7 +14762,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 k = 0; path_equal && k < sizeof(expected.path); k++)
             path_equal = expected.path[k] == actual.path[k];
         if (!path_equal || expected.method != actual.method ||
-            expected.policy_id != actual.policy_id || expected.reserved0 != actual.reserved0 ||
+            expected.policy_id != actual.policy_id || expected.path_view != actual.path_view ||
             expected.reserved1 != actual.reserved1 ||
             item.exact_strict_local_response.method_is_any !=
                 (actual.method == kStrictLocalResponseAnyMethodSlot) ||

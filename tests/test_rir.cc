@@ -1973,7 +1973,8 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
     mod.exact_strict_local_response_bindings[0].policy_id = 0;
     rejects(mod);
     mod = valid_module();
-    mod.exact_strict_local_response_bindings[0].reserved0 = 1;
+    mod.exact_strict_local_response_bindings[0].path_view =
+        static_cast<ExactPathView>(255);
     rejects(mod);
     mod = valid_module();
     mod.exact_strict_local_response_bindings[0].reserved1 = 1;
@@ -1995,6 +1996,38 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
     mod.exact_strict_local_response_bindings[1].path[6] = 'x';
     REQUIRE(verify_module(mod).ok);
     mod.unmatched_policy_ids[kRouteMethodOptions] = 2;
+    rejects(mod);
+
+    mod = valid_module();
+    mod.strict_local_response_policies[1] = policy;
+    mod.strict_local_response_policy_count = 2;
+    mod.exact_strict_local_response_bindings[1] =
+        mod.exact_strict_local_response_bindings[0];
+    mod.exact_strict_local_response_bindings[1].path_view =
+        ExactPathView::SlashNormalized;
+    mod.exact_strict_local_response_bindings[1].policy_id = 2;
+    mod.exact_strict_local_response_binding_count = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    Module non_fixed = mod;
+    non_fixed.exact_strict_local_response_bindings[1].path[2] = '/';
+    non_fixed.exact_strict_local_response_bindings[1].path[3] = '/';
+    rejects(non_fixed);
+    non_fixed = mod;
+    non_fixed.exact_strict_local_response_bindings[1].path[1] = '/';
+    rejects(non_fixed);
+    non_fixed = mod;
+    for (u32 i = 1; i < sizeof(non_fixed.exact_strict_local_response_bindings[1].path); i++)
+        non_fixed.exact_strict_local_response_bindings[1].path[i] = 0;
+    non_fixed.exact_strict_local_response_bindings[1].path_len = 1;
+    rejects(non_fixed);
+
+    mod.strict_local_response_policies[2] = policy;
+    mod.strict_local_response_policy_count = 3;
+    mod.exact_strict_local_response_bindings[2] =
+        mod.exact_strict_local_response_bindings[1];
+    mod.exact_strict_local_response_bindings[2].policy_id = 3;
+    mod.exact_strict_local_response_binding_count = 3;
     rejects(mod);
 }
 
@@ -2148,6 +2181,10 @@ TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     check_marker(*empty_forgery);
     empty_forgery = std::make_unique<Module>();
     empty_forgery->exact_strict_local_response_bindings[3].reserved1 = 1;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->exact_strict_local_response_bindings[3].path_view =
+        static_cast<ExactPathView>(255);
     check_marker(*empty_forgery);
     empty_forgery = std::make_unique<Module>();
     empty_forgery->pre_route_policy_ids[kRouteMethodAny] = 0xffffu;

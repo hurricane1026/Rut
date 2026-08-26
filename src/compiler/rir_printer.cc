@@ -1191,6 +1191,8 @@ void print_module(PrintBuf& buf, const Module& mod) {
                     buf.put_cstr("  ");
                     buf.put_cstr(unmatched_method_name(binding.method));
                     buf.put_cstr(" ");
+                    if (binding.path_view == ExactPathView::SlashNormalized)
+                        buf.put_cstr("slash_normalized ");
                     print_quoted_str(buf, Str{binding.path, binding.path_len});
                     buf.put_cstr(" -> local_response#");
                     buf.put_u32(binding.policy_id);

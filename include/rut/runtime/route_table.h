@@ -625,6 +625,7 @@ struct RouteConfig {
                 continue;
             }
             if (!exact_strict_local_response_binding_shape_valid(binding) ||
+                binding.path_view != ExactPathView::Raw ||
                 binding.policy_id > strict_local_response_policy_count)
                 return false;
             const u32 slot = route_method_slot_from_key(binding.method);
@@ -766,7 +767,8 @@ struct RouteConfig {
     bool append_exact_strict_local_response_binding(const ExactStrictLocalResponseBinding& source,
                                                     u16 owned_policy_id) {
         if (exact_strict_local_response_binding_count >= kMaxExactStrictLocalResponseBindings ||
-            !exact_strict_local_response_binding_shape_valid(source) || owned_policy_id == 0 ||
+            !exact_strict_local_response_binding_shape_valid(source) ||
+            source.path_view != ExactPathView::Raw || owned_policy_id == 0 ||
             !strict_local_response_policy_id_is_owned(owned_policy_id))
             return false;
         const u32 slot = route_method_slot_from_key(source.method);
@@ -777,7 +779,8 @@ struct RouteConfig {
             return false;
         for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
             const auto& prior = exact_strict_local_response_bindings[i];
-            if (prior.method == source.method && prior.path_len == source.path_len &&
+            if (prior.method == source.method && prior.path_view == source.path_view &&
+                prior.path_len == source.path_len &&
                 __builtin_memcmp(prior.path, source.path, source.path_len) == 0)
                 return false;
         }
@@ -786,7 +789,7 @@ struct RouteConfig {
         for (u32 i = 0; i < sizeof(destination.path); i++) destination.path[i] = source.path[i];
         destination.path_len = source.path_len;
         destination.method = source.method;
-        destination.reserved0 = source.reserved0;
+        destination.path_view = source.path_view;
         destination.policy_id = owned_policy_id;
         destination.reserved1 = source.reserved1;
         ++exact_strict_local_response_binding_count;
@@ -861,7 +864,7 @@ struct RouteConfig {
             for (u32 byte = 0; byte < sizeof(dst.path); byte++) dst.path[byte] = src.path[byte];
             dst.path_len = src.path_len;
             dst.method = src.method;
-            dst.reserved0 = src.reserved0;
+            dst.path_view = src.path_view;
             dst.policy_id = src.policy_id;
             dst.reserved1 = src.reserved1;
         }

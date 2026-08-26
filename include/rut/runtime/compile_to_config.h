@@ -132,6 +132,19 @@ inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     return cfg.use_art();
 }
 
+// Call only after rir::verify_module has accepted the module: verification
+// proves the fixed-table count before this helper indexes the binding inventory.
+// Slash-normalized exact selectors remain compiler metadata in stage 2; every
+// public config-activation entry must reject them until runtime storage and
+// selection are introduced by the next capability increment.
+inline bool verified_exact_path_views_are_runtime_supported(const rir::Module& mod) {
+    for (u32 i = 0; i < mod.exact_strict_local_response_binding_count; i++) {
+        if (mod.exact_strict_local_response_bindings[i].path_view != ExactPathView::Raw)
+            return false;
+    }
+    return true;
+}
+
 inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
     // Guard on BOTH tables: a timer-only module never bumps route_count, so a
     // route_count-only precondition would let a second call re-append the same
@@ -139,6 +152,10 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
     if (cfg.route_count != 0 || cfg.timer_count != 0 || !rir::verify_module(mod).ok ||
         mod.func_count > RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers)
         return false;
+    // This public activation entry can be called without populate_route_config.
+    // Reject stage-2-only metadata before symbol lookup, replay, policy ownership,
+    // dispatcher selection, or any other destination mutation.
+    if (!verified_exact_path_views_are_runtime_supported(mod)) return false;
     if (cfg.policy_bundle_count != mod.policy_bundle_count) return false;
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& expected = mod.policy_bundles[i];
@@ -286,6 +303,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
 
     if (!redirect_references_valid(mod)) return false;
+
+    if (!verified_exact_path_views_are_runtime_supported(mod)) return false;
 
     // Upstreams admit one of two shapes (see file docstring):
     //   - Fully empty: helper adds every upstream itself.

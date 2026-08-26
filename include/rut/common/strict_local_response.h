@@ -27,7 +27,7 @@ struct ExactStrictLocalResponseBinding {
     char path[kMaxExactStrictLocalResponsePathLen + 1]{};
     u8 path_len = 0;
     u8 method = 0;
-    u8 reserved0 = 0;
+    ExactPathView path_view = ExactPathView::Raw;
     u16 policy_id = 0;
     u32 reserved1 = 0;
 };
@@ -36,7 +36,7 @@ static_assert(sizeof(ExactStrictLocalResponseBinding) == 72);
 static_assert(offsetof(ExactStrictLocalResponseBinding, path) == 0);
 static_assert(offsetof(ExactStrictLocalResponseBinding, path_len) == 63);
 static_assert(offsetof(ExactStrictLocalResponseBinding, method) == 64);
-static_assert(offsetof(ExactStrictLocalResponseBinding, reserved0) == 65);
+static_assert(offsetof(ExactStrictLocalResponseBinding, path_view) == 65);
 static_assert(offsetof(ExactStrictLocalResponseBinding, policy_id) == 66);
 static_assert(offsetof(ExactStrictLocalResponseBinding, reserved1) == 68);
 
@@ -44,7 +44,8 @@ inline bool exact_strict_local_response_binding_is_neutral(
     const ExactStrictLocalResponseBinding& binding) {
     for (u32 i = 0; i < sizeof(binding.path); i++)
         if (binding.path[i] != 0) return false;
-    return binding.path_len == 0 && binding.method == 0 && binding.reserved0 == 0 &&
+    return binding.path_len == 0 && binding.method == 0 &&
+           binding.path_view == ExactPathView::Raw &&
            binding.policy_id == 0 && binding.reserved1 == 0;
 }
 
@@ -58,12 +59,28 @@ inline bool exact_strict_local_response_binding_shape_valid(
     const ExactStrictLocalResponseBinding& binding) {
     if (binding.path_len == 0 || binding.path_len > kMaxExactStrictLocalResponsePathLen ||
         binding.path[0] != '/' || binding.method >= kStrictLocalResponseMethodSlots ||
-        binding.reserved0 != 0 || binding.policy_id == 0 || binding.reserved1 != 0)
+        (binding.path_view != ExactPathView::Raw &&
+         binding.path_view != ExactPathView::SlashNormalized) ||
+        binding.policy_id == 0 || binding.reserved1 != 0)
         return false;
     for (u32 i = 0; i < binding.path_len; i++)
         if (!exact_strict_local_response_path_byte_valid(binding.path[i])) return false;
     for (u32 i = binding.path_len; i < sizeof(binding.path); i++)
         if (binding.path[i] != 0) return false;
+    if (binding.path_view == ExactPathView::SlashNormalized) {
+        if (binding.path_len == 1) return false;
+        char normalized[kMaxExactPathViewLen]{};
+        u32 normalized_len = 0;
+        if (normalize_exact_path_slashes({binding.path, binding.path_len},
+                                         normalized,
+                                         sizeof(normalized),
+                                         &normalized_len) !=
+                ExactPathNormalizationResult::Success ||
+            normalized_len != binding.path_len)
+            return false;
+        for (u32 i = 0; i < normalized_len; i++)
+            if (normalized[i] != binding.path[i]) return false;
+    }
     return true;
 }
 
@@ -264,7 +281,9 @@ inline bool strict_local_response_source_table_valid(
             return false;
         for (u32 prior = 0; prior < i; prior++) {
             const auto& earlier = exact_bindings[prior];
-            if (earlier.method != binding.method || earlier.path_len != binding.path_len) continue;
+            if (earlier.method != binding.method || earlier.path_view != binding.path_view ||
+                earlier.path_len != binding.path_len)
+                continue;
             bool equal = true;
             for (u32 byte = 0; byte < binding.path_len; byte++)
                 equal &= earlier.path[byte] == binding.path[byte];

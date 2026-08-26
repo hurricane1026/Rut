@@ -796,6 +796,28 @@ TEST(route_config, exact_strict_table_dedups_remaps_owns_copies_and_rolls_back_a
     CHECK_FALSE(source_contract_rejected->install_strict_local_response_table(
         policies, 3, unmatched, reused_source_id, 2));
     CHECK_FALSE(source_contract_rejected->has_strict_local_response_table_inventory());
+
+    StrictLocalResponsePolicySpec normalized_policies[2] = {policies[0], policies[0]};
+    u16 normalized_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding normalized_source[kMaxExactStrictLocalResponseBindings]{};
+    normalized_source[0] = exact_local_binding("/normalized", kRouteMethodGet, 1);
+    normalized_source[1] = exact_local_binding("/normalized", kRouteMethodGet, 2);
+    normalized_source[1].path_view = ExactPathView::SlashNormalized;
+    REQUIRE(strict_local_response_source_table_valid(normalized_policies,
+                                                     2,
+                                                     normalized_unmatched,
+                                                     normalized_source,
+                                                     2));
+    auto normalized_rejected = std::make_unique<RouteConfig>();
+    REQUIRE(normalized_rejected->add_static("/kept-normalized", kRouteMethodGet, 208));
+    std::vector<u8> normalized_before(sizeof(RouteConfig));
+    __builtin_memcpy(
+        normalized_before.data(), normalized_rejected.get(), sizeof(RouteConfig));
+    CHECK_FALSE(normalized_rejected->install_strict_local_response_table(
+        normalized_policies, 2, normalized_unmatched, normalized_source, 2));
+    CHECK_EQ(__builtin_memcmp(
+                 normalized_before.data(), normalized_rejected.get(), sizeof(RouteConfig)),
+             0);
 }
 
 TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_class) {
@@ -824,7 +846,14 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[1] = '#'; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[7] = 'x'; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].method = 10; });
-    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].reserved0 = 1; });
+    rejects([](RouteConfig& c) {
+        c.exact_strict_local_response_bindings[0].path_view =
+            static_cast<ExactPathView>(255);
+    });
+    rejects([](RouteConfig& c) {
+        c.exact_strict_local_response_bindings[0].path_view =
+            ExactPathView::SlashNormalized;
+    });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].reserved1 = 1; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].policy_id = 0; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].policy_id = 2; });

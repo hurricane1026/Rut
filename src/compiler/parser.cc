@@ -4941,6 +4941,11 @@ struct Parser {
         const Token start = kw_route;
         AstItem item{};
         item.kind = AstItemKind::ExactStrictLocalResponse;
+        ExactPathView path_view = ExactPathView::Raw;
+        if (cur().type == TokenType::Ident && cur().text.eq({"slash_normalized", 16})) {
+            path_view = ExactPathView::SlashNormalized;
+            pos++;
+        }
         u32 method_slot = kRouteMethodAny;
         item.exact_strict_local_response.method_is_any = cur().type == TokenType::StringLit;
         if (!item.exact_strict_local_response.method_is_any) {
@@ -4994,6 +4999,7 @@ struct Parser {
         ExactStrictLocalResponseBinding binding{};
         binding.path_len = static_cast<u8>(path.value()->text.len);
         binding.method = static_cast<u8>(method_slot);
+        binding.path_view = path_view;
         if (path.value()->text.len == 0 ||
             path.value()->text.len > kMaxExactStrictLocalResponsePathLen)
             return frontend_error(
@@ -5007,9 +5013,30 @@ struct Parser {
         if (binding.path[0] != '/')
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
+        if (binding.path_view == ExactPathView::SlashNormalized) {
+            char normalized[kMaxExactPathViewLen]{};
+            u32 normalized_len = 0;
+            if (binding.path_len == 1 ||
+                normalize_exact_path_slashes({binding.path, binding.path_len},
+                                             normalized,
+                                             sizeof(normalized),
+                                             &normalized_len) !=
+                    ExactPathNormalizationResult::Success ||
+                normalized_len != binding.path_len)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*path.value()),
+                                      path.value()->text);
+            for (u32 i = 0; i < normalized_len; i++) {
+                if (normalized[i] != binding.path[i])
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*path.value()),
+                                          path.value()->text);
+            }
+        }
         for (u32 i = 0; i < file->exact_strict_local_response_bindings.len; i++) {
             const auto& existing = file->exact_strict_local_response_bindings[i];
-            if (existing.method != binding.method || existing.path_len != binding.path_len)
+            if (existing.method != binding.method || existing.path_view != binding.path_view ||
+                existing.path_len != binding.path_len)
                 continue;
             bool same = true;
             for (u32 k = 0; k < binding.path_len; k++)

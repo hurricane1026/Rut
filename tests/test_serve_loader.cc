@@ -876,6 +876,105 @@ TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
     CHECK_FALSE(populate_route_config(*hidden_cfg, hidden));
     CHECK_EQ(hidden_cfg->upstream_count, 0u);
     CHECK_EQ(hidden_cfg->route_count, 0u);
+
+    rir::Module normalized = mod;
+    normalized.strict_local_response_policies[1] = policy;
+    normalized.strict_local_response_policy_count = 2;
+    normalized.exact_strict_local_response_bindings[1] = binding;
+    normalized.exact_strict_local_response_bindings[1].path_view =
+        ExactPathView::SlashNormalized;
+    normalized.exact_strict_local_response_bindings[1].policy_id = 2;
+    normalized.exact_strict_local_response_binding_count = 2;
+    REQUIRE(rir::verify_module(normalized).ok);
+    auto normalized_cfg = std::make_unique<RouteConfig>();
+    std::vector<u8> normalized_before(sizeof(RouteConfig));
+    __builtin_memcpy(normalized_before.data(), normalized_cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(populate_route_config(*normalized_cfg, normalized));
+    CHECK_EQ(__builtin_memcmp(
+                 normalized_before.data(), normalized_cfg.get(), sizeof(RouteConfig)),
+             0);
+}
+
+TEST(serve_loader, slash_normalized_exact_source_reaches_verified_rir_but_not_activation) {
+    static constexpr char kSource[] = R"rut(
+route exact slash_normalized GET "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"get"
+}) }
+route exact slash_normalized "/health/any" { return local_response({
+  version: "HTTP/1.1", status: 401, reason: "Unauthorized", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"any"
+}) }
+)rut";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_slash_normalized_stage2", "app.rut", kSource);
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Register);
+    REQUIRE(rir::verify_module(program.rir.module).ok);
+    REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 2u);
+    const auto& get = program.rir.module.exact_strict_local_response_bindings[0];
+    const auto& any = program.rir.module.exact_strict_local_response_bindings[1];
+    CHECK_EQ(get.path_view, ExactPathView::SlashNormalized);
+    CHECK_EQ(get.method, kRouteMethodGet);
+    CHECK((Str{get.path, get.path_len}.eq({"/health/check", 13})));
+    CHECK_EQ(any.path_view, ExactPathView::SlashNormalized);
+    CHECK_EQ(any.method, kRouteMethodAny);
+    CHECK((Str{any.path, any.path_len}.eq({"/health/any", 11})));
+    CHECK_EQ(program.config.route_count, 0u);
+    CHECK_EQ(program.config.upstream_count, 0u);
+    CHECK_FALSE(program.config.has_strict_local_response_table_inventory());
+
+    // Direct activation is public and must enforce the same stage-2 boundary as
+    // population. This module has no JIT functions: before the early gate it
+    // could return success after mutating the destination dispatcher.
+    REQUIRE_EQ(program.rir.module.func_count, 0u);
+    auto direct_cfg = std::make_unique<RouteConfig>();
+    std::vector<u8> direct_before(sizeof(RouteConfig));
+    __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
+    CHECK_EQ(__builtin_memcmp(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig)), 0);
+    program.destroy();
+}
+
+TEST(serve_loader, slash_normalized_exact_rejects_direct_jit_route_activation_atomically) {
+    static constexpr char kSource[] = R"rut(
+route exact slash_normalized GET "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"get"
+}) }
+route GET "/sentinel" { return 204 }
+)rut";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_slash_normalized_direct_jit_stage2",
+                   "app.rut",
+                   kSource);
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Register);
+    REQUIRE(rir::verify_module(program.rir.module).ok);
+    REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 1u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    CHECK_EQ(program.rir.module.exact_strict_local_response_bindings[0].path_view,
+             ExactPathView::SlashNormalized);
+    CHECK((program.rir.module.functions[0].route_pattern.eq({"/sentinel", 9})));
+    REQUIRE(program.engine.lookup("handler_route_0") != nullptr);
+
+    // Without an entry gate, this valid compiled handler is looked up and its
+    // ordinary route is installed despite the unsupported exact-path view.
+    auto direct_cfg = std::make_unique<RouteConfig>();
+    std::vector<u8> direct_before(sizeof(RouteConfig));
+    __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
+    CHECK_EQ(__builtin_memcmp(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig)), 0);
+    CHECK_EQ(direct_cfg->route_count, 0u);
+    CHECK_EQ(direct_cfg->timer_count, 0u);
+    program.destroy();
 }
 
 TEST(serve_loader, exact_strict_local_response_source_reaches_runtime_config) {
@@ -896,6 +995,16 @@ TEST(serve_loader, exact_strict_local_response_source_reaches_runtime_config) {
     REQUIRE(program.config.strict_local_response_table_is_valid());
     CHECK(program.config.has_exact_strict_local_response_inventory());
     CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 1u);
+
+    // Raw exact metadata remains admissible through both public activation
+    // steps, including a direct register_jit_routes call on an independently
+    // populated destination.
+    auto direct_cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*direct_cfg, program.rir.module));
+    REQUIRE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
+    CHECK_EQ(direct_cfg->route_count, 1u);
+    CHECK_EQ(direct_cfg->timer_count, 0u);
+    CHECK_EQ(direct_cfg->match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 1u);
     program.destroy();
 }
 
