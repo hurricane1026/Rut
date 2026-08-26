@@ -697,21 +697,23 @@ TEST(nginx_parser, rejects_non_clean_proxy_location_shapes) {
     REQUIRE(nginx::parse({all_unreserved, sizeof(all_unreserved) - 1u}));
 }
 
-TEST(nginx_parser, parsed_generic_proxy_location_remains_converter_fail_closed) {
+TEST(nginx_parser, parsed_generic_proxy_location_reaches_ordinary_rut_lowering) {
     const char service[] =
         "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000/; } }";
     const auto parsed = nginx::parse({service, sizeof(service) - 1u});
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(lowered);
-    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lowered.error().detail.eq(lit_str("converter requires location / or /api/")));
+    REQUIRE(lowered);
+    CHECK(strstr(lowered.value().data, "route \"/service\" {") != nullptr);
+    CHECK(strstr(lowered.value().data, "if req.method == GET && req.pathOnly == \"/service\"") !=
+          nullptr);
+    CHECK(strstr(lowered.value().data, "target_path: \"/service/\"") != nullptr);
+    CHECK(strstr(lowered.value().data, "strip_prefix: \"/service/\"") != nullptr);
+    CHECK(strstr(lowered.value().data, "replace_prefix: \"/\"") != nullptr);
     const char* path = strstr(service, "/service/");
     REQUIRE(path != nullptr);
-    CHECK_EQ(lowered.error().span.start, static_cast<u32>(path - service));
-    CHECK_EQ(lowered.error().span.end - lowered.error().span.start, 9u);
-    CHECK_EQ(lowered.error().span.start, parsed.value().location.path_span.start);
-    CHECK_EQ(lowered.error().span.end, parsed.value().location.path_span.end);
+    CHECK_EQ(parsed.value().location.path_span.start, static_cast<u32>(path - service));
+    CHECK_EQ(parsed.value().location.path_span.end - parsed.value().location.path_span.start, 9u);
 
     const char service_without_uri[] =
         "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000; } }";
@@ -2524,6 +2526,113 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
     CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
 }
 
+TEST(nginx_converter, lowers_service_root_replacement_to_full_byte_stable_source) {
+    const char source[] =
+        "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto result = nginx::lower_to_rut(parsed.value());
+    REQUIRE(result);
+    static constexpr char kExpected[] =
+        "listen :8080\n"
+        "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "pre_route TRACE { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched OPTIONS { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched CONNECT { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "route \"/service\" {\n"
+        "    if req.method == GET && req.pathOnly == \"/service\" {\n"
+        "        return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\",\n"
+        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: "
+        "\"close\",\n"
+        "            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n"
+        "            content_type: \"text/html\", target_path: \"/service/\", body: b\"<html>\\r\\n"
+        "<head><title>301 Moved Permanently</title></head>\\r\\n"
+        "<body>\\r\\n"
+        "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n"
+        "</body>\\r\\n"
+        "</html>\\r\\n\"})\n"
+        "    } else {\n"
+        "        return forward(nginx_upstream, target_transform: {\n"
+        "            strip_prefix: \"/service/\",\n"
+        "            replace_prefix: \"/\"\n"
+        "        }, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        }, response_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            framing: \"content_length\",\n"
+        "            connection: \"request\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "        }, failure_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            status: 502,\n"
+        "            reason: \"Bad Gateway\",\n"
+        "            content_type: \"text/html\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            connection: \"request\",\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
+        "        })\n"
+        "    }\n"
+        "}\n";
+    CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1u));
+    CHECK_EQ(result.value().len, 3349u);
+    CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1u}));
+
+    const char replacement_source[] =
+        "server { listen 8080; location /service/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    const auto replacement_parsed =
+        nginx::parse({replacement_source, sizeof(replacement_source) - 1u});
+    REQUIRE(replacement_parsed);
+    const auto replacement = nginx::lower_to_rut(replacement_parsed.value());
+    REQUIRE(replacement);
+    CHECK(strstr(replacement.value().data, "route \"/service\" {") != nullptr);
+    CHECK(strstr(replacement.value().data, "target_path: \"/service/\"") != nullptr);
+    CHECK(strstr(replacement.value().data, "strip_prefix: \"/service/\"") != nullptr);
+    CHECK(strstr(replacement.value().data, "replace_prefix: \"/v1/\"") != nullptr);
+    CHECK_EQ(replacement.value().len, result.value().len + 3u);
+}
+
 TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
     const char compact[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
@@ -2694,6 +2803,46 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
     const auto lowered = nginx::lower_to_rut(model);
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 3468u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
+}
+
+TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_capacity) {
+    static_assert(nginx::kMaxProxyLocationPathLen == 63u);
+    static_assert(nginx::kMaxProxyPassUriLen == 128u);
+    static_assert(nginx::RutSource::kCapacity == 5937u);
+    char path[nginx::kMaxProxyLocationPathLen + 1u]{};
+    path[0] = '/';
+    for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) path[i] = 'a';
+    path[nginx::kMaxProxyLocationPathLen - 1u] = '/';
+    char uri[nginx::kMaxProxyPassUriLen + 1u]{};
+    uri[0] = '/';
+    for (u32 i = 1; i + 1u < nginx::kMaxProxyPassUriLen; i++) uri[i] = 'b';
+    uri[nginx::kMaxProxyPassUriLen - 1u] = '/';
+
+    char source[1024]{};
+    const int source_len = snprintf(source,
+                                    sizeof(source),
+                                    "server { listen 8080; location %s { proxy_pass "
+                                    "http://127.0.0.1:9000%s; } }",
+                                    path,
+                                    uri);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(static_cast<u32>(source_len), static_cast<u32>(sizeof(source)));
+    const auto parsed = nginx::parse({source, static_cast<u32>(source_len)});
+    REQUIRE(parsed);
+    auto model = parsed.value();
+    model.listen.port = 65535;
+    for (u32 i = 0; i < 4; i++) model.location.proxy_pass.address[i] = 255;
+    model.location.proxy_pass.port = 65535;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 3700u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
     const auto lexed = lex(lowered.value().view());
@@ -3954,11 +4103,11 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     CHECK(populated.policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
 }
 
-TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config) {
+TEST(nginx_converter, emitted_generic_non_root_replacement_reaches_owned_runtime_config) {
     auto populated = std::make_unique<RouteConfig>();
     {
         char nginx_source[] =
-            "server { listen 8080; location /api/ { proxy_pass "
+            "server { listen 8080; location /service/ { proxy_pass "
             "http://127.0.0.1:9000/v1/; } }";
         auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
         REQUIRE(parsed);
@@ -3973,6 +4122,7 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         std::unique_ptr<AstFile> ast_owned(ast.value());
         REQUIRE_EQ(ast_owned->items.len, 7u);
         REQUIRE(ast_owned->items[6].kind == AstItemKind::Route);
+        CHECK(ast_owned->items[6].route.path.eq(lit_str("/service")));
         REQUIRE_EQ(ast_owned->items[6].route.statements.len, 1u);
         const AstStatement* ast_if = ast_owned->items[6].route.statements[0];
         REQUIRE(ast_if != nullptr);
@@ -3986,13 +4136,14 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         REQUIRE(ast_forward != nullptr);
         REQUIRE(ast_forward->kind == AstStmtKind::ForwardUpstream);
         REQUIRE(ast_forward->has_forward_target_transform);
-        CHECK(ast_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(ast_forward->forward_target_transform.strip_prefix.eq(lit_str("/service/")));
         CHECK(ast_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
 
         auto hir = analyze_file(*ast_owned);
         REQUIRE(hir);
         std::unique_ptr<HirModule> hir_owned(hir.value());
         REQUIRE_EQ(hir_owned->routes.len, 1u);
+        CHECK(hir_owned->routes[0].path.eq(lit_str("/service")));
         REQUIRE(hir_owned->routes[0].control.kind == HirControlKind::If);
         const auto& hir_redirect = hir_owned->routes[0].control.then_term;
         const auto& hir_forward = hir_owned->routes[0].control.else_term;
@@ -4000,7 +4151,7 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         CHECK_EQ(hir_redirect.redirect_policy_id, 1u);
         REQUIRE(hir_forward.kind == HirTerminatorKind::ForwardUpstream);
         REQUIRE(hir_forward.has_forward_target_transform);
-        CHECK(hir_forward.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(hir_forward.forward_target_transform.strip_prefix.eq(lit_str("/service/")));
         CHECK(hir_forward.forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
         CHECK_EQ(hir_forward.forward_request_policy_id, 1u);
         CHECK_EQ(hir_forward.forward_response_policy_id, 1u);
@@ -4013,7 +4164,7 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         REQUIRE(mir);
         std::unique_ptr<MirModule> mir_owned(mir.value());
         REQUIRE_EQ(mir_owned->functions.len, 1u);
-        CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
+        CHECK(mir_owned->functions[0].path.eq(lit_str("/service")));
         const MirTerminator* mir_redirect = nullptr;
         const MirTerminator* mir_forward = nullptr;
         for (u32 bi = 0; bi < mir_owned->functions[0].blocks.len; bi++) {
@@ -4025,7 +4176,7 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         REQUIRE(mir_forward != nullptr);
         CHECK_EQ(mir_redirect->redirect_policy_id, 1u);
         REQUIRE(mir_forward->has_forward_target_transform);
-        CHECK(mir_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(mir_forward->forward_target_transform.strip_prefix.eq(lit_str("/service/")));
         CHECK(mir_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
         CHECK_EQ(mir_forward->forward_request_policy_id, 1u);
         CHECK_EQ(mir_forward->forward_response_policy_id, 1u);
@@ -4039,7 +4190,7 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         REQUIRE(lower_to_rir(*mir_owned, rir));
         REQUIRE(rir::verify_module(rir.module).ok);
         REQUIRE_EQ(rir.module.target_transform_count, 1u);
-        CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
+        CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/service/")));
         CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/v1/")));
         REQUIRE_EQ(rir.module.response_policy_count, 1u);
         REQUIRE_EQ(rir.module.failure_policy_count, 1u);
@@ -4051,11 +4202,12 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
         CHECK(rir.module.policy_bundles[0].response_buffering ==
               ForwardResponseBufferingMode::None);
         REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
-        CHECK(rir.module.redirect_policies[0].target_path.eq(lit_str("/api/")));
+        CHECK(rir.module.redirect_policies[0].target_path.eq(lit_str("/service/")));
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        CHECK(rir.module.functions[0].route_pattern.eq(lit_str("/service")));
 
         bool saw_redirect = false;
         bool saw_transform_before_forward = false;
-        REQUIRE_EQ(rir.module.func_count, 1u);
         for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
             const auto& block = rir.module.functions[0].blocks[bi];
             for (u32 ii = 0; ii < block.inst_count; ii++) {
@@ -4074,10 +4226,14 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
     }
 
     // nginx source, generated source, and AST/HIR/MIR/RIR storage are gone.
+    // Route registration is the later JIT-engine stage; populate_route_config owns
+    // the policy tables and leaves route_count empty by design. The route path was
+    // asserted at every frontend/RIR stage above.
+    REQUIRE_EQ(populated->route_count, 0u);
     REQUIRE_EQ(populated->target_transform_count, 1u);
-    REQUIRE_EQ(populated->target_transform_bytes_used, 9u);
+    REQUIRE_EQ(populated->target_transform_bytes_used, 13u);
     const auto& transform = populated->target_transforms[0];
-    CHECK(transform.strip_prefix.eq(lit_str("/api/")));
+    CHECK(transform.strip_prefix.eq(lit_str("/service/")));
     CHECK(transform.replace_prefix.eq(lit_str("/v1/")));
     CHECK(str_is_in_owned_pool(transform.strip_prefix,
                                populated->target_transform_bytes,
@@ -4094,7 +4250,9 @@ TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config)
     CHECK_EQ(populated->policy_bundles[0].response_read_timeout_seconds, 0u);
     CHECK(populated->policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
     REQUIRE_EQ(populated->redirect_policy_count, 1u);
-    CHECK(populated->redirect_policies[0].target_path.eq(lit_str("/api/")));
+    CHECK(populated->redirect_policies[0].target_path.eq(lit_str("/service/")));
+    CHECK(populated->redirect_policy_strings_are_owned(populated->redirect_policies[0]));
+    CHECK(populated->redirect_policy_string_is_owned(populated->redirect_policies[0].target_path));
 }
 
 TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
@@ -4204,7 +4362,8 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     REQUIRE_FALSE(bad_api_present);
     CHECK_EQ(bad_api_present.error().code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(bad_api_present.error().span.start, 22u);
-    CHECK(bad_api_present.error().detail.eq(lit_str("location /api/ requires a proxy_pass URI")));
+    CHECK(
+        bad_api_present.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
 
     auto other_present = valid_present;
     other_present.listen.port = 8080;
@@ -4214,7 +4373,8 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     REQUIRE_FALSE(bad_other_present);
     CHECK_EQ(bad_other_present.error().code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(bad_other_present.error().span.start, 22u);
-    CHECK(bad_other_present.error().detail.eq(lit_str("converter requires location / or /api/")));
+    CHECK(bad_other_present.error().detail.eq(
+        lit_str("non-root location requires a proxy_pass URI")));
 
     auto null_present = valid_present;
     null_present.listen.port = 8080;
@@ -4405,7 +4565,7 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
 
     forged = accepted;
     forged.location.proxy_pass.uri.len--;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     forged = accepted;
     forged.location.proxy_pass.uri.len = nginx::kMaxProxyPassUriLen + 1u;
@@ -4419,35 +4579,35 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
 
     forged = accepted;
     forged.location.proxy_pass.uri_span.end--;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     forged = accepted;
     forged.location.proxy_pass.uri_span.start = forged.location.proxy_pass.span.start - 1u;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     forged = accepted;
     forged.location.proxy_pass.uri_span.line++;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location source positions"));
 
     forged = accepted;
     forged.location.proxy_pass.uri_span.col++;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     forged = accepted;
     forged.location.proxy_pass.span.line++;
     forged.location.proxy_pass.uri_span.line++;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location source positions"));
 
     forged = accepted;
     forged.location.span.line++;
     forged.location.path_span.line++;
     forged.location.proxy_pass.span.line++;
     forged.location.proxy_pass.uri_span.line++;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location source positions"));
 
     forged = accepted;
     forged.location.proxy_pass.span.end = accepted_uri_span.end;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     static constexpr char kExternalLocation[] = "/api/";
     forged = accepted;
@@ -4457,7 +4617,7 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
     forged = accepted;
     forged.span.end = forged.location.proxy_pass.span.start;
     forged.pre_route_trace.span.end = forged.span.end;
-    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+    expect_rejected(forged, lit_str("invalid proxy location spans"));
 
     auto legacy_slash = api_server();
     const Span legacy_uri_span = legacy_slash.location.proxy_pass.uri_span;
@@ -4472,6 +4632,214 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
     uri[1] = 'v';
     uri[3] = 'x';
     expect_rejected(accepted, lit_str("invalid bounded proxy_pass URI model"));
+}
+
+TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_timeout) {
+    char source[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /service/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/;\n"
+        "  }\n"
+        "}\n";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const nginx::Server accepted = parsed.value();
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span span = {}) {
+        const auto result = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+        if (span.start < span.end) {
+            CHECK_EQ(result.error().span.start, span.start);
+            CHECK_EQ(result.error().span.end, span.end);
+            CHECK_EQ(result.error().span.line, span.line);
+            CHECK_EQ(result.error().span.col, span.col);
+        }
+    };
+    const auto with_timeout = [&](nginx::Server model) {
+        model.location.proxy_read_timeout.present = true;
+        model.location.proxy_read_timeout.milliseconds = 1000;
+        model.location.proxy_read_timeout.span = model.location.proxy_pass.span;
+        model.location.proxy_read_timeout.value_span = model.location.proxy_pass.uri_span;
+        return model;
+    };
+
+    auto forged = accepted;
+    forged.location.path.ptr = nullptr;
+    expect_rejected(
+        forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
+
+    forged = with_timeout(accepted);
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.listen.port = 0;
+    forged.location.proxy_pass.port = 0;
+    expect_rejected(
+        forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
+
+    forged = accepted;
+    forged.location.path.ptr = reinterpret_cast<const char*>(UINTPTR_MAX);
+    expect_rejected(
+        forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri.ptr = nullptr;
+    expect_rejected(forged,
+                    lit_str("invalid bounded proxy_pass URI model"),
+                    accepted.location.proxy_pass.uri_span);
+
+    forged = with_timeout(accepted);
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.listen.port = 0;
+    forged.location.proxy_pass.port = 0;
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass URI provenance"),
+                    accepted.location.proxy_pass.uri_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(UINTPTR_MAX);
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass URI provenance"),
+                    accepted.location.proxy_pass.uri_span);
+
+    forged = accepted;
+    forged.location.span.end = forged.span.end + 1u;
+    expect_rejected(forged, lit_str("invalid proxy location spans"), forged.location.span);
+
+    forged = accepted;
+    forged.location.path_span.end--;
+    expect_rejected(forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+
+    forged = accepted;
+    forged.location.path_span.start = forged.location.span.start - 1u;
+    expect_rejected(forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+
+    forged = accepted;
+    forged.location.path_span.end = forged.location.proxy_pass.span.start;
+    forged.location.path.len = forged.location.path_span.end - forged.location.path_span.start;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.span);
+
+    forged = accepted;
+    forged.location.proxy_pass.span.start = forged.location.span.start - 1u;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.start = forged.location.proxy_pass.span.start - 1u;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.uri_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.end--;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.uri_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span = {};
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.span);
+
+    forged = accepted;
+    forged.location.span.line++;
+    forged.location.path_span.line++;
+    forged.location.proxy_pass.span.line++;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(
+        forged, lit_str("invalid proxy location source positions"), forged.location.span);
+
+    forged = accepted;
+    forged.location.path_span.line++;
+    expect_rejected(
+        forged, lit_str("invalid proxy location source positions"), forged.location.path_span);
+
+    forged = accepted;
+    forged.location.path_span.col++;
+    expect_rejected(forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.span.line++;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid proxy location source positions"),
+                    forged.location.proxy_pass.span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid proxy location source positions"),
+                    forged.location.proxy_pass.uri_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.col++;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.uri_span);
+
+    static constexpr char kExternalPath[] = "/service/";
+    forged = accepted;
+    forged.location.path = {kExternalPath, sizeof(kExternalPath) - 1u};
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass URI provenance"),
+                    accepted.location.proxy_pass.uri_span);
+
+    static constexpr char kExternalUri[] = "/v1/";
+    forged = accepted;
+    forged.location.proxy_pass.uri = {kExternalUri, sizeof(kExternalUri) - 1u};
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass URI provenance"),
+                    accepted.location.proxy_pass.uri_span);
+
+    forged = with_timeout(accepted);
+    forged.location.path.len = nginx::kMaxProxyLocationPathLen + 1u;
+    expect_rejected(forged, lit_str("invalid bounded proxy location path model"));
+
+    forged = accepted;
+    forged.location.proxy_pass.has_uri = false;
+    forged.location.proxy_pass.uri = {};
+    forged.location.proxy_pass.uri_span = {};
+    expect_rejected(forged,
+                    lit_str("non-root location requires a proxy_pass URI"),
+                    accepted.location.path_span);
+
+    auto legacy_generic = api_server();
+    static constexpr char kFiveByteGeneric[] = "/abc/";
+    legacy_generic.location.path = {kFiveByteGeneric, sizeof(kFiveByteGeneric) - 1u};
+    expect_rejected(legacy_generic, lit_str("invalid historical /api/ proxy model"));
+
+    const char five_byte[] =
+        "server { listen 8080; location /abc/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const auto five_byte_parsed = nginx::parse({five_byte, sizeof(five_byte) - 1u});
+    REQUIRE(five_byte_parsed);
+    REQUIRE(nginx::lower_to_rut(five_byte_parsed.value()));
+    forged = five_byte_parsed.value();
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass source provenance"),
+                    five_byte_parsed.value().location.path_span);
+
+    char parsed_api_source[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const auto parsed_api = nginx::parse({parsed_api_source, sizeof(parsed_api_source) - 1u});
+    REQUIRE(parsed_api);
+    REQUIRE(nginx::lower_to_rut(parsed_api.value()));
+    forged = parsed_api.value();
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass source provenance"),
+                    parsed_api.value().location.path_span);
+    forged = parsed_api.value();
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    expect_rejected(forged,
+                    lit_str("invalid proxy_pass URI provenance"),
+                    parsed_api.value().location.proxy_pass.uri_span);
+
+    char* path = source + accepted.location.path_span.start;
+    REQUIRE((Str{path, accepted.location.path.len}.eq(lit_str("/service/"))));
+    path[1] = '%';
+    expect_rejected(accepted, lit_str("invalid bounded proxy location path model"));
+    path[1] = 's';
+    path[accepted.location.path.len - 1u] = 'x';
+    expect_rejected(accepted, lit_str("invalid bounded proxy location path model"));
 }
 
 TEST(nginx_converter, lowers_clean_non_root_proxy_uri_to_full_byte_stable_source) {

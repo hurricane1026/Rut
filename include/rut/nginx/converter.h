@@ -15,8 +15,9 @@ struct RutSource {
     // model additionally emits the implicit pre-route TRACE policy. The
     // exact-redirect measured maximum uses listen and upstream port 65535 and
     // IPv4 255.255.255.255: 5936 bytes for 301 and 5912 bytes for 302. The
-    // exact-local-return maximum is 5609 bytes; the 128-byte clean `/api/`
-    // replacement maximum is 3468 bytes. Writer completion remains strict
+    // exact-local-return maximum is 5609 bytes. The bounded transformed-location
+    // maximum uses a 63-byte path, 128-byte replacement URI, maximum ports and
+    // IPv4 address and measures 3700 bytes. Writer completion remains strict
     // (`len < kCapacity`), so the largest 301 shape fixes the bound.
     static constexpr u32 kCapacity = 5937;
     char data[kCapacity]{};

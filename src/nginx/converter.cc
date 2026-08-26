@@ -132,6 +132,7 @@ bool source_position_is_coherent(uintptr_t source_base,
 }
 
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
+static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 
 constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
     const u8 byte = static_cast<u8>(value);
@@ -161,7 +162,29 @@ bool proxy_pass_uri_is_clean(Str uri) {
     return true;
 }
 
-enum class ProxyLocationProfile : u8 { RootWithoutUri, ApiWithUri };
+bool proxy_location_path_is_clean(Str path) {
+    if (path.ptr == nullptr || path.len == 0 || path.len > kMaxProxyLocationPathLen ||
+        path.ptr[0] != '/' || (path.len > 1 && path.ptr[path.len - 1] != '/'))
+        return false;
+    if (path.len == 1) return true;
+
+    u32 segment_start = 1;
+    for (u32 i = 1; i < path.len; i++) {
+        if (path.ptr[i] != '/') {
+            if (!proxy_pass_uri_segment_byte_is_clean(path.ptr[i])) return false;
+            continue;
+        }
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0 || (segment_len == 1 && path.ptr[segment_start] == '.') ||
+            (segment_len == 2 && path.ptr[segment_start] == '.' &&
+             path.ptr[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+    return true;
+}
+
+enum class ProxyLocationProfile : u8 { RootWithoutUri, PrefixWithUri };
 
 bool basic_borrow_address_is_safe(Str text, const Span& span) {
     if (text.ptr == nullptr || !is_valid_span(span) || span.end - span.start != text.len)
@@ -173,76 +196,94 @@ bool basic_borrow_address_is_safe(Str text, const Span& span) {
 FrontendResult<ProxyLocationProfile> validate_proxy_location(const Server& server) {
     const Location& location = server.location;
     const ProxyPass& proxy = location.proxy_pass;
-    if (location.path.len != 1 && location.path.len != 5)
-        return unsupported(location.path_span, lit_str("converter requires location / or /api/"));
+    if (location.path.len == 0 || location.path.len > kMaxProxyLocationPathLen)
+        return unsupported(location.path_span,
+                           lit_str("invalid bounded proxy location path model"));
     if (proxy.has_uri &&
         (proxy.uri.ptr == nullptr || proxy.uri.len == 0 || proxy.uri.len > kMaxProxyPassUriLen))
         return unsupported(proxy.uri_span, lit_str("invalid bounded proxy_pass URI model"));
 
-    if (proxy.has_uri && proxy.uri.len > 1) {
-        // The dynamic replacement path and URI must prove their complete common-source
-        // provenance before either borrowed string is inspected.
-        if (!span_position_is_coherent(server.span, location.span) ||
-            !span_position_is_coherent(location.span, location.path_span) ||
-            location.path_span.line != location.span.line ||
-            location.path_span.end - location.path_span.start != location.path.len ||
-            !span_position_is_coherent(location.span, proxy.span) ||
-            !span_position_is_coherent(proxy.span, proxy.uri_span) ||
-            proxy.uri_span.line != proxy.span.line ||
-            proxy.uri_span.end - proxy.uri_span.start != proxy.uri.len ||
-            location.path_span.end >= proxy.span.start || proxy.uri_span.end >= proxy.span.end)
-            return unsupported(is_valid_span(proxy.uri_span) ? proxy.uri_span : proxy.span,
-                               lit_str("invalid proxy_pass URI spans"));
-
-        const uintptr_t path_address = reinterpret_cast<uintptr_t>(location.path.ptr);
-        if (location.path.ptr == nullptr || path_address < location.path_span.start)
+    if (location.path.len == 1) {
+        // Existing hand-built root fixtures use an independent static string.
+        if (!basic_borrow_address_is_safe(location.path, location.path_span))
             return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
-        const uintptr_t source_base = path_address - location.path_span.start;
-        if (!source_borrow_is_coherent(location.path, location.path_span, source_base))
-            return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
-        if (!source_borrow_is_coherent(proxy.uri, proxy.uri_span, source_base))
-            return unsupported(proxy.uri_span, lit_str("invalid proxy_pass URI provenance"));
-        if (!source_position_is_coherent(source_base, server.span, location.span) ||
-            !source_position_is_coherent(source_base, server.span, location.path_span) ||
-            !source_position_is_coherent(source_base, server.span, proxy.span) ||
-            !source_position_is_coherent(source_base, server.span, proxy.uri_span))
-            return unsupported(proxy.uri_span, lit_str("invalid proxy_pass URI spans"));
-        if (!eq(location.path, "/api/", 5))
+        if (!eq(location.path, "/", 1))
             return unsupported(location.path_span,
-                               eq(location.path, "/", 1)
-                                   ? lit_str("location / cannot use a proxy_pass URI")
-                                   : lit_str("converter requires location / or /api/"));
-        if (!proxy_pass_uri_is_clean(proxy.uri))
-            return unsupported(proxy.uri_span, lit_str("invalid bounded proxy_pass URI model"));
-        return ProxyLocationProfile::ApiWithUri;
-    }
-
-    // Existing hand-built converter fixtures use independent static strings for the
-    // canonical root and `/api/ -> /` models. Preserve those exact fixtures, but reject
-    // null/underflow/overflow addresses before the legacy single-byte reads.
-    if (!basic_borrow_address_is_safe(location.path, location.path_span))
-        return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
-    const bool is_root = eq(location.path, "/", 1);
-    const bool is_api = eq(location.path, "/api/", 5);
-    if (!is_root && !is_api)
-        return unsupported(location.path_span, lit_str("converter requires location / or /api/"));
-
-    if (!proxy.has_uri) {
+                               lit_str("invalid bounded proxy location path model"));
         if (proxy.uri.ptr != nullptr || proxy.uri.len != 0 || !is_default_span(proxy.uri_span))
             return unsupported(proxy.span, lit_str("invalid proxy_pass URI state"));
-        if (!is_root)
-            return unsupported(location.path_span,
-                               lit_str("location /api/ requires a proxy_pass URI"));
+        if (proxy.has_uri)
+            return unsupported(proxy.uri_span, lit_str("location / cannot use a proxy_pass URI"));
         return ProxyLocationProfile::RootWithoutUri;
     }
 
-    if (!is_api)
-        return unsupported(proxy.uri_span, lit_str("location / cannot use a proxy_pass URI"));
-    if (!basic_borrow_address_is_safe(proxy.uri, proxy.uri_span))
+    if (!proxy.has_uri)
+        return unsupported(location.path_span,
+                           lit_str("non-root location requires a proxy_pass URI"));
+
+    // Preserve only the historical hand-built canonical `/api/ -> /` fixture. Its
+    // intentionally synthetic spans predate source provenance. All parser-produced
+    // and all other non-root models must pass the complete common-source gate below.
+    const bool legacy_api_shape =
+        location.path.len == 5 && proxy.uri.len == 1 && location.path_span.start == 22 &&
+        location.path_span.end == 27 && location.path_span.line == 1 &&
+        location.path_span.col == 23 && location.span.start == 22 && location.span.end == 23 &&
+        location.span.line == 1 && location.span.col == 23 && proxy.span.start == 26 &&
+        proxy.span.end == 52 && proxy.span.line == 1 && proxy.span.col == 26 &&
+        proxy.uri_span.start == 53 && proxy.uri_span.end == 54 && proxy.uri_span.line == 1 &&
+        proxy.uri_span.col == 54;
+    if (legacy_api_shape) {
+        if (!basic_borrow_address_is_safe(location.path, location.path_span))
+            return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
+        if (!basic_borrow_address_is_safe(proxy.uri, proxy.uri_span))
+            return unsupported(proxy.uri_span, lit_str("invalid proxy_pass URI provenance"));
+        if (!eq(location.path, "/api/", 5) || !eq(proxy.uri, "/", 1))
+            return unsupported(location.path_span, lit_str("invalid historical /api/ proxy model"));
+        return ProxyLocationProfile::PrefixWithUri;
+    }
+
+    // Dynamic path and URI bytes are not read until their complete spans, arithmetic,
+    // common-source borrow, and source positions have all been established.
+    if (!span_position_is_coherent(server.span, location.span))
+        return unsupported(is_valid_span(location.span) ? location.span : model_span(server),
+                           lit_str("invalid proxy location spans"));
+    if (!span_position_is_coherent(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != location.path.len)
+        return unsupported(is_valid_span(location.path_span) ? location.path_span : location.span,
+                           lit_str("invalid proxy location spans"));
+    if (!span_position_is_coherent(location.span, proxy.span) ||
+        location.path_span.end >= proxy.span.start)
+        return unsupported(is_valid_span(proxy.span) ? proxy.span : location.span,
+                           lit_str("invalid proxy location spans"));
+    if (!span_position_is_coherent(proxy.span, proxy.uri_span) ||
+        proxy.uri_span.end - proxy.uri_span.start != proxy.uri.len ||
+        proxy.uri_span.end >= proxy.span.end)
+        return unsupported(is_valid_span(proxy.uri_span) ? proxy.uri_span : proxy.span,
+                           lit_str("invalid proxy location spans"));
+
+    const uintptr_t path_address = reinterpret_cast<uintptr_t>(location.path.ptr);
+    if (location.path.ptr == nullptr || path_address < location.path_span.start)
+        return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
+    const uintptr_t source_base = path_address - location.path_span.start;
+    if (source_base > UINTPTR_MAX - server.span.end ||
+        !source_borrow_is_coherent(location.path, location.path_span, source_base))
+        return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
+    if (!source_borrow_is_coherent(proxy.uri, proxy.uri_span, source_base))
         return unsupported(proxy.uri_span, lit_str("invalid proxy_pass URI provenance"));
-    if (proxy.uri.ptr[0] != '/')
+    if (!source_position_is_coherent(source_base, server.span, location.span))
+        return unsupported(location.span, lit_str("invalid proxy location source positions"));
+    if (!source_position_is_coherent(source_base, server.span, location.path_span))
+        return unsupported(location.path_span, lit_str("invalid proxy location source positions"));
+    if (!source_position_is_coherent(source_base, server.span, proxy.span))
+        return unsupported(proxy.span, lit_str("invalid proxy location source positions"));
+    if (!source_position_is_coherent(source_base, server.span, proxy.uri_span))
+        return unsupported(proxy.uri_span, lit_str("invalid proxy location source positions"));
+    if (!proxy_location_path_is_clean(location.path))
+        return unsupported(location.path_span,
+                           lit_str("invalid bounded proxy location path model"));
+    if (!proxy_pass_uri_is_clean(proxy.uri))
         return unsupported(proxy.uri_span, lit_str("invalid bounded proxy_pass URI model"));
-    return ProxyLocationProfile::ApiWithUri;
+    return ProxyLocationProfile::PrefixWithUri;
 }
 
 FrontendResult<bool> validate_exact_absolute_redirect(const Server& server) {
@@ -845,22 +886,26 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return output;
     }
 
-    if (!put("route \"/api\" {\n") ||
-        !put("    if req.method == GET && req.pathOnly == \"/api\" {\n") ||
+    const Str location_path = server.location.path;
+    const Str route_path = location_path.slice(0, location_path.len - 1u);
+    if (!put("route \"") || !writer.put(route_path) || !put("\" {\n") ||
+        !put("    if req.method == GET && req.pathOnly == \"") || !writer.put(route_path) ||
+        !put("\" {\n") ||
         !put("        return redirect({scheme: \"http\", authority: \"request_host\", port: "
              "\"actual_listener\",\n") ||
         !put("            path: \"static\", query: \"preserve_raw\", date: \"current\", "
              "connection: \"close\",\n") ||
         !put("            status: 301, reason: \"Moved Permanently\", server: "
              "\"nginx/1.29.7\",\n") ||
-        !put("            content_type: \"text/html\", target_path: \"/api/\", body: b\"") ||
+        !put("            content_type: \"text/html\", target_path: \"") ||
+        !writer.put(location_path) || !put("\", body: b\"") ||
         !writer.put_lit(kRedirect301Body, static_cast<u32>(__builtin_strlen(kRedirect301Body))) ||
         !put("\"})\n") || !put("    } else {\n") ||
         !put("        return forward(nginx_upstream, target_transform: {\n") ||
-        !put("            strip_prefix: \"/api/\",\n") || !put("            replace_prefix: \"") ||
-        !writer.put(proxy.uri) || !put("\"\n") || !put("        }, request_policy: {\n") ||
-        !put("            version: \"HTTP/1.1\",\n") || !put("            host: \"upstream\",\n") ||
-        !put("            connection: \"omit\",\n") ||
+        !put("            strip_prefix: \"") || !writer.put(location_path) || !put("\",\n") ||
+        !put("            replace_prefix: \"") || !writer.put(proxy.uri) || !put("\"\n") ||
+        !put("        }, request_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
+        !put("            host: \"upstream\",\n") || !put("            connection: \"omit\",\n") ||
         !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
              "\"Upgrade\"]\n") ||
         !put("        }, response_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
