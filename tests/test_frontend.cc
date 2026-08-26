@@ -34882,7 +34882,7 @@ TEST(frontend, build_mir_releases_provisional_module_on_post_allocation_errors) 
 
     {
         auto forged = std::make_unique<HirModule>(hir.value());
-        forged->redirect_policies[0].status_code = 302;
+        forged->redirect_policies[0].status_code = 303;
         REQUIRE_FALSE(redirect_policy_spec_valid(forged->redirect_policies[0]));
         auto rejected = build_mir(*forged);
         REQUIRE_FALSE(rejected.has_value());
@@ -34917,6 +34917,102 @@ TEST(frontend, build_mir_releases_provisional_module_on_post_allocation_errors) 
     REQUIRE_EQ(mir->functions[0].locals.len, 1u);
     REQUIRE_EQ(mir->redirect_policies.len, 1u);
     CHECK_EQ(mir->redirect_policies[0].status_code, 301u);
+}
+
+TEST(frontend, fixed_302_redirect_crosses_all_frontend_boundaries_and_forgery_fails_closed) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 302,
+      reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
+      target_path: "/new", body: b"fixed-302"})
+  } else { return forward(backend) }
+}
+)rut";
+
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].status_code, 302u);
+    CHECK(ast->redirect_policies[0].reason.eq(lit_str("Moved Temporarily")));
+    CHECK_EQ(ast->redirect_policies[0].authority, RedirectPolicyAuthority::Static);
+
+    auto forged_ast = parse_file_heap(lexed.value());
+    REQUIRE(forged_ast);
+    forged_ast->redirect_policies[0].status_code = 303;
+    CHECK_FALSE(analyze_file_heap(forged_ast.value()).has_value());
+    forged_ast->redirect_policies[0].status_code = 302;
+    forged_ast->redirect_policies[0].port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(analyze_file_heap(forged_ast.value()).has_value());
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    CHECK_EQ(hir->redirect_policies[0].status_code, 302u);
+    CHECK_EQ(hir->routes[0].control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto forged_hir = analyze_file_heap(ast.value());
+    REQUIRE(forged_hir);
+    forged_hir->redirect_policies[0].status_code = 303;
+    CHECK_FALSE(build_mir_heap(forged_hir.value()).has_value());
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->redirect_policies[0].status_code, 302u);
+
+    auto forged_mir = build_mir_heap(hir.value());
+    REQUIRE(forged_mir);
+    forged_mir->redirect_policies[0].status_code = 303;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(forged_mir.value(), rejected).has_value());
+    CHECK_EQ(rejected.module.redirect_policy_count, 0u);
+    rejected.destroy();
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    const auto& policy = rir.module.redirect_policies[0];
+    CHECK_EQ(policy.status_code, 302u);
+    CHECK_EQ(policy.scheme, RedirectPolicyScheme::Http);
+    CHECK_EQ(policy.authority, RedirectPolicyAuthority::Static);
+    CHECK_EQ(policy.port, RedirectPolicyPort::Omit);
+    CHECK_EQ(policy.path, RedirectPolicyPath::Static);
+    CHECK_EQ(policy.query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(policy.date, RedirectPolicyDate::Current);
+    CHECK_EQ(policy.connection, RedirectPolicyConnection::Close);
+    CHECK_EQ(policy.header_order, RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK(policy.static_authority.eq(lit_str("redirect.example")));
+    CHECK(policy.reason.eq(lit_str("Moved Temporarily")));
+    CHECK(policy.body.eq(lit_str("fixed-302")));
+
+    char printed_bytes[4096];
+    rir::PrintBuf printed;
+    printed.init(printed_bytes, sizeof(printed_bytes), -1);
+    rir::Module printed_module{};
+    printed_module.redirect_policy_count = 1;
+    printed_module.redirect_policies[0] = policy;
+    rir::print_module(printed, printed_module);
+    REQUIRE_FALSE(printed.overflow);
+    const std::string text(printed.data, printed.len);
+    CHECK(text.find("header_order=connection_then_location, status=302") != std::string::npos);
+    CHECK(text.find("reason=\"Moved Temporarily\"") != std::string::npos);
+    CHECK(text.find("static_authority=\"redirect.example\"") != std::string::npos);
+
+    rir.module.redirect_policies[0].status_code = 303;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.redirect_policies[0].status_code = 302;
+    rir.module.redirect_policies[0].port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 
 TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
@@ -34975,7 +35071,7 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
         "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
         "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
         "query: \"discard\", date: \"current\", connection: \"close\", header_order: "
-        "\"connection_then_location\", status: 302, reason: \"Found\", server: \"s\", "
+        "\"connection_then_location\", status: 303, reason: \"See Other\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
         "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
         "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "

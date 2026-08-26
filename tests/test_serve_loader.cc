@@ -1067,6 +1067,62 @@ TEST(serve_loader, verified_deferred_preflight_route_owns_identity_after_compile
     program.destroy();
 }
 
+TEST(serve_loader, fixed_302_source_deletion_preserves_owned_policy_and_jit_route) {
+    const char source[] = R"rut(
+route GET "/old" { return redirect({scheme: "http", authority: "static",
+  static_authority: "redirect.example", port: "omit", path: "static",
+  query: "discard", date: "current", connection: "close",
+  header_order: "connection_then_location", status: 302,
+  reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
+  target_path: "/new", body: b"fixed-302"}) }
+)rut";
+    const std::string path = write_file("/tmp/rut_serve_loader_fixed_302", "app.rut", source);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(std::filesystem::remove(path));
+    CHECK_FALSE(std::filesystem::exists(path));
+    REQUIRE_EQ(program.rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE(program.config.redirect_policy_id_is_valid(1));
+    const auto& lowered = program.rir.module.redirect_policies[0];
+    const auto& owned = program.config.redirect_policies[0];
+    CHECK_EQ(owned.status_code, 302u);
+    CHECK(owned.reason.eq({"Moved Temporarily", 17}));
+    CHECK(owned.static_authority.eq({"redirect.example", 16}));
+    CHECK(owned.body.eq({"fixed-302", 9}));
+    CHECK_NE(owned.reason.ptr, lowered.reason.ptr);
+    CHECK_NE(owned.static_authority.ptr, lowered.static_authority.ptr);
+    CHECK_NE(owned.body.ptr, lowered.body.ptr);
+    REQUIRE_EQ(program.config.routes[0].action, RouteAction::JitHandler);
+    REQUIRE(program.config.routes[0].fn != nullptr);
+    program.rir.destroy();
+    REQUIRE(program.config.redirect_policy_id_is_valid(1));
+    CHECK(program.config.redirect_policies[0].reason.eq({"Moved Temporarily", 17}));
+    CHECK(program.config.redirect_policies[0].body.eq({"fixed-302", 9}));
+    program.destroy();
+
+    const char invalid_source[] = R"rut(
+route GET "/old" { return redirect({scheme: "http", authority: "static",
+  static_authority: "redirect.example", port: "omit", path: "static",
+  query: "discard", date: "current", connection: "close",
+  header_order: "connection_then_location", status: 303,
+  reason: "See Other", server: "wire-test", content_type: "text/html",
+  target_path: "/new", body: b"fixed-303"}) }
+)rut";
+    const std::string invalid_path =
+        write_file("/tmp/rut_serve_loader_fixed_303", "app.rut", invalid_source);
+    LoadedProgram rejected;
+    LoadError rejected_error;
+    CHECK_FALSE(load_rut_program(invalid_path.c_str(), rejected, rejected_error));
+    CHECK_EQ(rejected.config.redirect_policy_count, 0u);
+    CHECK_EQ(rejected.config.route_count, 0u);
+    CHECK_FALSE(rejected.jit_inited);
+    CHECK_EQ(rejected.rir.module.redirect_policy_count, 0u);
+    rejected.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

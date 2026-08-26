@@ -25021,6 +25021,322 @@ route GET "/" {
 #endif
 }
 
+TEST(route, fixed_302_ordinary_source_reaches_exact_h1_and_zero_upstream_iouring) {
+#if !RUT_ENABLE_JIT_TESTS
+    return;
+#else
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>302 Found</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>302 Found</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedRedirect[] =
+        "HTTP/1.1 302 Moved Temporarily\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 145\r\n"
+        "Connection: close\r\n"
+        "Location: http://redirect.example/new\r\n\r\n"
+        "<html>\r\n"
+        "<head><title>302 Found</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>302 Found</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kOriginResponse[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n"
+        "ok";
+    static constexpr char kExpectedForward[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n"
+        "ok";
+    static_assert(sizeof(kRedirectBody) - 1u == 145u);
+    static_assert(sizeof(kExpectedRedirect) - 1u == 342u);
+
+    RecordingUpstream redirect_epoch;
+    RecordingUpstream neighbor_epoch;
+    neighbor_epoch.response = kOriginResponse;
+    neighbor_epoch.response_len = sizeof(kOriginResponse) - 1u;
+    REQUIRE(redirect_epoch.setup());
+    const u16 upstream_port = redirect_epoch.port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 302,
+      reason: "Moved Temporarily", server: "nginx/1.29.7",
+      content_type: "text/html", target_path: "/new",
+      body: b"<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
+  } else {
+    return forward(backend,
+      request_policy: {version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]},
+      response_policy: {version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "Connection"]},
+      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "nginx/1.29.7", date: "current",
+        connection: "request", body: b"unavailable"})
+  }
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_fixed_302_wire_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    source.fd = mkstemp(source.path);
+    REQUIRE_GE(source.fd, 0);
+    source.present = true;
+    u32 source_written = 0;
+    while (source_written < source_text.size()) {
+        const ssize_t written = write(
+            source.fd, source_text.data() + source_written, source_text.size() - source_written);
+        if (written < 0 && errno == EINTR) continue;
+        REQUIRE_GT(written, 0);
+        source_written += static_cast<u32>(written);
+    }
+    REQUIRE_EQ(close(source.fd), 0);
+    source.fd = -1;
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE(program.config.redirect_policy_id_is_valid(1));
+    REQUIRE(program.config.policy_bundle_id_is_valid(1));
+    const auto& policy = program.config.redirect_policies[0];
+    CHECK_EQ(policy.status_code, 302u);
+    CHECK(policy.reason.eq({"Moved Temporarily", 17}));
+    CHECK(policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u}));
+    CHECK(policy.static_authority.eq({"redirect.example", 16}));
+    CHECK_EQ(program.config.routes[0].action, RouteAction::JitHandler);
+    CHECK_NE(program.config.routes[0].fn, nullptr);
+    REQUIRE_EQ(unlink(source.path), 0);
+    source.present = false;
+    CHECK_EQ(access(source.path, F_OK), -1);
+    CHECK_EQ(errno, ENOENT);
+    std::string{}.swap(source_text);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    struct ClientFdGuard {
+        i32 fd = -1;
+        ~ClientFdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    auto request = [&](const char* target,
+                       const char* host,
+                       const char* marker,
+                       const char* expected,
+                       u32 expected_len,
+                       u32 body_len) {
+        ClientFdGuard client{connect_to(frontend_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 5);
+        char bytes[256]{};
+        const int len = snprintf(bytes,
+                                 sizeof(bytes),
+                                 "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                                 "Connection: close\r\nX-Case: %s\r\n\r\n",
+                                 target,
+                                 host,
+                                 marker);
+        if (len <= 0 || len >= static_cast<int>(sizeof(bytes)) ||
+            !send_all(client.fd, bytes, static_cast<u32>(len)))
+            return false;
+        char response[512]{};
+        u32 response_len = 0;
+        if (!read_public_close_response(
+                client.fd, body_len, response, sizeof(response), response_len))
+            return false;
+        if (response_len != expected_len || !normalize_public_date(response, response_len) ||
+            memcmp(response, expected, expected_len) != 0)
+            return false;
+        bool zero_tail = true;
+        for (u32 i = response_len; i < sizeof(response); i++) zero_tail &= response[i] == '\0';
+        CHECK(zero_tail);
+        return zero_tail;
+    };
+
+    REQUIRE(request("/old",
+                    "redirect-source.example",
+                    "plain",
+                    kExpectedRedirect,
+                    sizeof(kExpectedRedirect) - 1u,
+                    sizeof(kRedirectBody) - 1u));
+    REQUIRE(request("/old",
+                    "alternate.example:65534",
+                    "alternate",
+                    kExpectedRedirect,
+                    sizeof(kExpectedRedirect) - 1u,
+                    sizeof(kRedirectBody) - 1u));
+    REQUIRE(request("/old?x=1",
+                    "query-source.example",
+                    "query",
+                    kExpectedRedirect,
+                    sizeof(kExpectedRedirect) - 1u,
+                    sizeof(kRedirectBody) - 1u));
+
+    bool live_zero_upstream = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        live_zero_upstream &= redirect_epoch.accepted_count.load(std::memory_order_acquire) == 0u;
+        live_zero_upstream &= redirect_epoch.request_count.load(std::memory_order_acquire) == 0u;
+        live_zero_upstream &= redirect_epoch.running.load(std::memory_order_acquire);
+        live_zero_upstream &= redirect_epoch.thread_alive.load(std::memory_order_acquire);
+        live_zero_upstream &= !redirect_epoch.listener_failed.load(std::memory_order_acquire);
+        live_zero_upstream &= shard.loop->is_running();
+        live_zero_upstream &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(live_zero_upstream);
+    redirect_epoch.teardown();
+    REQUIRE_EQ(redirect_epoch.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(redirect_epoch.request_count.load(std::memory_order_acquire), 0u);
+    for (u32 slot = 0; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(redirect_epoch.request_history_len[slot], 0u);
+        CHECK_EQ(redirect_epoch.request_history_header_len[slot], 0u);
+        bool empty = true;
+        for (u32 byte = 0; empty && byte < RecordingUpstream::kRequestCapacity; byte++)
+            empty = redirect_epoch.request_history[slot][byte] == '\0';
+        CHECK(empty);
+    }
+
+    REQUIRE(neighbor_epoch.setup(upstream_port));
+    REQUIRE(request(
+        "/old/", "client.example", "slash", kExpectedForward, sizeof(kExpectedForward) - 1u, 2u));
+    REQUIRE(request(
+        "/", "client.example", "root", kExpectedForward, sizeof(kExpectedForward) - 1u, 2u));
+    for (u32 waited = 0;
+         waited < 400 && neighbor_epoch.request_count.load(std::memory_order_acquire) < 2u;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(neighbor_epoch.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(neighbor_epoch.request_count.load(std::memory_order_acquire), 2u);
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    neighbor_epoch.teardown();
+    const char* targets[] = {"/old/", "/"};
+    const char* markers[] = {"slash", "root"};
+    for (u32 i = 0; i < 2; i++) {
+        char expected_request[256]{};
+        const int expected_len = snprintf(expected_request,
+                                          sizeof(expected_request),
+                                          "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Case: %s\r\n\r\n",
+                                          targets[i],
+                                          upstream_port,
+                                          markers[i]);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_EQ(neighbor_epoch.request_history_len[i], static_cast<u32>(expected_len));
+        REQUIRE_EQ(neighbor_epoch.request_history_header_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(neighbor_epoch.request_history[i], expected_request, expected_len), 0);
+    }
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(neighbor_epoch.request_history_len[slot], 0u);
+        CHECK_EQ(neighbor_epoch.request_history_header_len[slot], 0u);
+    }
+
+    CHECK_EQ(shard.shard_metrics.connections_total, 5u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 5u);
+    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 10u);
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+#endif
+}
+
 TEST(route, canonical_conditional_complete_content_length_reaches_production_h1_iouring) {
 #if !RUT_ENABLE_JIT_TESTS
     return;

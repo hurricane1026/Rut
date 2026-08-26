@@ -125,6 +125,10 @@ inline bool redirect_policy_safe_body(Str value) {
     return (value.ptr != nullptr || value.len == 0) && value.len <= kMaxRedirectBodyLen;
 }
 
+inline bool redirect_policy_fixed_status_supported(u16 status_code) {
+    return status_code == 301 || status_code == 302;
+}
+
 inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
     const bool legacy_profile =
         policy.authority == RedirectPolicyAuthority::RequestHost &&
@@ -136,7 +140,8 @@ inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
         policy.authority == RedirectPolicyAuthority::Static &&
         policy.port == RedirectPolicyPort::Omit && policy.query == RedirectPolicyQuery::Discard &&
         policy.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation &&
-        policy.status_code == 301 && redirect_policy_safe_static_authority(policy.static_authority);
+        redirect_policy_fixed_status_supported(policy.status_code) &&
+        redirect_policy_safe_static_authority(policy.static_authority);
     if (policy.scheme != RedirectPolicyScheme::Http || policy.path != RedirectPolicyPath::Static ||
         policy.date != RedirectPolicyDate::Current ||
         policy.connection != RedirectPolicyConnection::Close ||

@@ -190,8 +190,20 @@ TEST(redirect_policy, rejects_invalid_enum_status_text_path_and_body_forms) {
 }
 
 TEST(redirect_policy, fixed_profile_is_closed_and_cross_products_fail) {
+    CHECK_FALSE(redirect_policy_fixed_status_supported(300));
+    CHECK(redirect_policy_fixed_status_supported(301));
+    CHECK(redirect_policy_fixed_status_supported(302));
+    CHECK_FALSE(redirect_policy_fixed_status_supported(303));
+    CHECK_FALSE(redirect_policy_fixed_status_supported(307));
+    CHECK_FALSE(redirect_policy_fixed_status_supported(308));
+    CHECK_FALSE(redirect_policy_fixed_status_supported(399));
+
     const auto fixed = fixed_policy();
     CHECK(redirect_policy_spec_valid(fixed));
+    auto fixed_302 = fixed;
+    fixed_302.status_code = 302;
+    fixed_302.reason = lit_str("Moved Temporarily");
+    CHECK(redirect_policy_spec_valid(fixed_302));
 
     auto invalid = fixed;
     invalid.authority = RedirectPolicyAuthority::RequestHost;
@@ -212,12 +224,80 @@ TEST(redirect_policy, fixed_profile_is_closed_and_cross_products_fail) {
     invalid.static_authority = lit_str("user@redirect.example");
     CHECK_FALSE(redirect_policy_spec_valid(invalid));
     invalid = fixed;
+    for (u16 status : {static_cast<u16>(300),
+                       static_cast<u16>(303),
+                       static_cast<u16>(307),
+                       static_cast<u16>(308),
+                       static_cast<u16>(399)}) {
+        invalid = fixed;
+        invalid.status_code = status;
+        CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    }
+
+    invalid = policy();
     invalid.status_code = 302;
+    CHECK(redirect_policy_spec_valid(invalid));
+    invalid.status_code = 399;
+    CHECK(redirect_policy_spec_valid(invalid));
+
+    invalid = fixed_302;
+    invalid.authority = RedirectPolicyAuthority::RequestHost;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed_302;
+    invalid.port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed_302;
+    invalid.query = RedirectPolicyQuery::PreserveRaw;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed_302;
+    invalid.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed_302;
+    invalid.static_authority = {};
     CHECK_FALSE(redirect_policy_spec_valid(invalid));
 
     invalid = policy();
     invalid.status_code = 399;
     CHECK(redirect_policy_spec_valid(invalid));
+}
+
+TEST(redirect_policy, fixed_302_dedup_ownership_and_forged_303_publication_are_transactional) {
+    char reason[] = "Moved Temporarily";
+    char body[] = "fixed-302";
+    auto fixed_301 = fixed_policy();
+    auto fixed_302 = fixed_policy({body, sizeof(body) - 1});
+    fixed_302.status_code = 302;
+    fixed_302.reason = {reason, sizeof(reason) - 1};
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_redirect_policy(fixed_301), 1u);
+    REQUIRE_EQ(cfg.add_redirect_policy(fixed_302), 2u);
+    CHECK_EQ(cfg.add_redirect_policy(fixed_302), 2u);
+    REQUIRE(cfg.redirect_policy_id_is_valid(1));
+    REQUIRE(cfg.redirect_policy_id_is_valid(2));
+    CHECK_NE(cfg.redirect_policies[0].status_code, cfg.redirect_policies[1].status_code);
+    CHECK_NE(cfg.redirect_policies[1].reason.ptr, reason);
+    CHECK_NE(cfg.redirect_policies[1].body.ptr, body);
+    reason[0] = 'X';
+    body[0] = 'X';
+    CHECK(cfg.redirect_policies[1].reason.eq(lit_str("Moved Temporarily")));
+    CHECK(cfg.redirect_policies[1].body.eq(lit_str("fixed-302")));
+
+    const auto before = snapshot_redirect_inventory(cfg);
+    auto fixed_303 = fixed_302;
+    fixed_303.status_code = 303;
+    CHECK_EQ(cfg.add_redirect_policy(fixed_303), 0u);
+    CHECK(redirect_inventory_matches(cfg, before));
+
+    rir::Module forged{};
+    forged.redirect_policy_count = 1;
+    forged.redirect_policies[0] = fixed_303;
+    RouteConfig destination{};
+    destination.redirect_policies[0].status_code = 777;
+    destination.redirect_policy_bytes[0] = 'S';
+    const auto destination_before = snapshot_redirect_inventory(destination);
+    CHECK_FALSE(populate_route_config(destination, forged));
+    CHECK(redirect_inventory_matches(destination, destination_before));
 }
 
 TEST(redirect_policy, static_authority_foundation_accepts_only_bounded_dns_ipv4_shape) {
@@ -639,6 +719,41 @@ TEST(redirect_policy, fixed_source_reaches_rir_and_owned_route_config) {
     CHECK(owned.static_authority.eq(lit_str("redirect.example")));
     CHECK(owned.target_path.eq(lit_str("/new")));
     CHECK(owned.body.eq(lit_str("fixed")));
+    rir.destroy();
+}
+
+TEST(redirect_policy, fixed_302_source_reaches_rir_and_owned_route_config) {
+    const char source[] =
+        "route GET \"/old\" { return redirect({"
+        "scheme: \"http\", authority: \"static\", static_authority: \"redirect.example\", "
+        "port: \"omit\", path: \"static\", query: \"discard\", date: \"current\", "
+        "connection: \"close\", header_order: \"connection_then_location\", status: 302, "
+        "reason: \"Moved Temporarily\", server: \"nginx/1.29.7\", "
+        "content_type: \"text/html\", target_path: \"/new\", body: b\"fixed-302\"}) }\n";
+    auto lexed = lex(source_lit(source));
+    REQUIRE(lexed);
+    auto ast_result = parse_file(lexed.value());
+    REQUIRE(ast_result);
+    std::unique_ptr<AstFile> ast(ast_result.value());
+    auto hir_result = analyze_file(*ast);
+    REQUIRE(hir_result);
+    std::unique_ptr<HirModule> hir(hir_result.value());
+    auto mir_result = build_mir(*hir);
+    REQUIRE(mir_result);
+    std::unique_ptr<MirModule> mir(mir_result.value());
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir, rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    CHECK_EQ(rir.module.redirect_policies[0].status_code, 302u);
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(cfg.redirect_policy_id_is_valid(1));
+    CHECK_EQ(cfg.redirect_policies[0].status_code, 302u);
+    CHECK(cfg.redirect_policies[0].reason.eq(lit_str("Moved Temporarily")));
+    CHECK(cfg.redirect_policies[0].body.eq(lit_str("fixed-302")));
+    CHECK_NE(cfg.redirect_policies[0].reason.ptr, rir.module.redirect_policies[0].reason.ptr);
     rir.destroy();
 }
 

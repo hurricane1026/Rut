@@ -425,6 +425,16 @@ static constexpr char kRedirectBody[] =
     "</body>\r\n"
     "</html>\r\n";
 
+static constexpr char kFixed302RedirectBody[] =
+    "<html>\r\n"
+    "<head><title>302 Found</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>302 Found</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
+static_assert(sizeof(kFixed302RedirectBody) - 1u == 145u);
+
 static RedirectPolicySpec make_test_redirect_policy() {
     RedirectPolicySpec policy{};
     policy.scheme = RedirectPolicyScheme::Http;
@@ -452,6 +462,14 @@ static RedirectPolicySpec make_test_fixed_redirect_policy() {
     policy.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
     policy.static_authority = {"redirect.example", 16};
     policy.target_path = {"/new", 4};
+    return policy;
+}
+
+static RedirectPolicySpec make_test_fixed_302_redirect_policy() {
+    RedirectPolicySpec policy = make_test_fixed_redirect_policy();
+    policy.status_code = 302;
+    policy.reason = {"Moved Temporarily", 17};
+    policy.body = {kFixed302RedirectBody, sizeof(kFixed302RedirectBody) - 1};
     return policy;
 }
 
@@ -528,6 +546,17 @@ static std::string expected_fixed_redirect_wire() {
            "Connection: close\r\n"
            "Location: http://redirect.example/new\r\n\r\n" +
            kRedirectBody;
+}
+
+static std::string expected_fixed_302_redirect_wire() {
+    return std::string("HTTP/1.1 302 Moved Temporarily\r\n") +
+           "Server: nginx/1.29.7\r\n"
+           "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+           "Content-Type: text/html\r\n"
+           "Content-Length: 145\r\n"
+           "Connection: close\r\n"
+           "Location: http://redirect.example/new\r\n\r\n" +
+           kFixed302RedirectBody;
 }
 
 static u32 count_upstream_send_ops(const SmallLoop& loop, const Connection& conn) {
@@ -2598,6 +2627,133 @@ TEST(redirect, h1_fixed_serializer_owns_authority_discards_query_and_orders_head
         CHECK_EQ(short_len, 0u);
         CHECK_EQ(conn->send_buf.len(), static_cast<u32>(sizeof(sentinel) - 1));
         CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), sentinel, sizeof(sentinel) - 1), 0);
+        loop.free_conn(*conn);
+    }
+}
+
+TEST(redirect, h1_fixed_302_wire_dispatch_errors_and_h2_rejection_are_bounded) {
+    const std::string expected = expected_fixed_302_redirect_wire();
+    REQUIRE_EQ(expected.size(), 342u);
+    {
+        SmallLoop loop;
+        loop.setup();
+        loop.listener_context = {
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        RouteConfig cfg{};
+        REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_302_redirect_policy()), 1u);
+        const char* requests[] = {
+            "GET /old HTTP/1.1\r\nHost: first.example\r\nConnection: close\r\n\r\n",
+            "GET /old?x=1 HTTP/1.1\r\nHost: alternate.example\r\nConnection: close\r\n\r\n",
+            "GET /old?discard=1 HTTP/1.1\r\nHost: port.example:8081\r\nConnection: close\r\n\r\n",
+        };
+        for (const char* request : requests) {
+            auto* conn = loop.alloc_conn();
+            REQUIRE(conn != nullptr);
+            const u32 request_len = static_cast<u32>(strlen(request));
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                       request_len);
+            capture_request_metadata(*conn);
+            const char sentinel[] = "unchanged send state";
+            REQUIRE_EQ(
+                conn->send_buf.write(reinterpret_cast<const u8*>(sentinel), sizeof(sentinel) - 1),
+                sizeof(sentinel) - 1);
+            u8 output[4096]{};
+            u32 output_len = 0;
+            REQUIRE(build_redirect_response(*conn, cfg, 1, output, sizeof(output), &output_len));
+            REQUIRE(normalize_redirect_date(output, output_len));
+            CHECK_EQ(output_len, 342u);
+            CHECK_EQ(__builtin_memcmp(output, expected.data(), expected.size()), 0);
+            CHECK_FALSE(buf_has(output, output_len, "first.example"));
+            CHECK_FALSE(buf_has(output, output_len, "alternate.example"));
+            CHECK_FALSE(buf_has(output, output_len, "?x=1"));
+            CHECK(buf_has(output, output_len, "Content-Length: 145\r\n"));
+            CHECK(buf_has(output,
+                          output_len,
+                          "Connection: close\r\nLocation: http://redirect.example/new\r\n"));
+
+            u32 short_len = 999;
+            CHECK_FALSE(build_redirect_response(*conn, cfg, 1, output, output_len - 1, &short_len));
+            CHECK_EQ(short_len, 0u);
+            CHECK_EQ(conn->send_buf.len(), static_cast<u32>(sizeof(sentinel) - 1));
+            CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), sentinel, sizeof(sentinel) - 1), 0);
+            loop.free_conn(*conn);
+        }
+
+        const char request[] =
+            "GET /old?x=1 HTTP/1.1\r\nHost: alternate.example\r\nConnection: close\r\n\r\n";
+        auto dispatch = [&](Connection& conn) {
+            REQUIRE_EQ(
+                conn.recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                sizeof(request) - 1);
+            capture_request_metadata(conn);
+            conn.request_config = &cfg;
+            loop.backend.clear_ops();
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::Redirect;
+            outcome.redirect_policy_id = 1;
+            handle_jit_outcome<SmallLoop>(&loop, conn, outcome, nullptr, true);
+            CHECK_EQ(conn.resp_status, 302u);
+            CHECK_EQ(conn.state, ConnState::Sending);
+            CHECK_EQ(conn.upstream_fd, -1);
+            CHECK_FALSE(conn.upstream_slot_held);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(count_upstream_send_ops(loop, conn), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+            u8 normalized[SmallLoop::kBufSize]{};
+            REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+            __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+            REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+            CHECK_EQ(conn.send_buf.len(), 342u);
+            CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+        };
+
+        auto* completed = loop.alloc_conn();
+        REQUIRE(completed != nullptr);
+        const u32 completed_id = completed->id;
+        dispatch(*completed);
+        static constexpr u32 kPartial = 13;
+        loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, kPartial));
+        CHECK_EQ(completed->send_progress, kPartial);
+        const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+        REQUIRE(remainder != nullptr);
+        CHECK_EQ(remainder->send_len, 342u - kPartial);
+        loop.inject_and_dispatch(
+            make_ev(completed_id, IoEventType::Send, static_cast<i32>(342u - kPartial)));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+
+        auto* failed = loop.alloc_conn();
+        REQUIRE(failed != nullptr);
+        const u32 failed_id = failed->id;
+        dispatch(*failed);
+        loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    }
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        RouteConfig cfg{};
+        REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_302_redirect_policy()), 1u);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        RouteEntry route{};
+        route.fn = &h2_immediate_redirect_handler;
+        const u8 synth[] = "GET /old HTTP/1.1\r\nHost: alternate\r\n\r\n";
+        u8 response[8192]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        loop.backend.clear_ops();
+        h2_invoke_emit(
+            dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true);
+        CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 400u);
+        CHECK_EQ(h2.async_stream, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
         loop.free_conn(*conn);
     }
 }

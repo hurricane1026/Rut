@@ -20021,6 +20021,79 @@ TEST(jit, deferred_preflight_selector_returns_only_exact_redirect_or_bundle_iden
     rir.destroy();
 }
 
+TEST(jit, fixed_302_conditional_returns_redirect_identity_and_neighbor_bundle) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 302,
+      reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
+      target_path: "/new", body: b"fixed-302"})
+  } else {
+    return forward(backend,
+      response_policy: {version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "rut", date: "current", hide_headers: []},
+      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", body: b"bad"})
+  }
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(rir.module.redirect_policies[0].status_code, 302u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    const auto redirect = HandlerResult::unpack(
+        handler(nullptr,
+                nullptr,
+                reinterpret_cast<const u8*>("GET /old?x=1 HTTP/1.1\r\nHost: alternate\r\n\r\n"),
+                sizeof("GET /old?x=1 HTTP/1.1\r\nHost: alternate\r\n\r\n") - 1,
+                nullptr));
+    CHECK_EQ(redirect.action, HandlerAction::Redirect);
+    CHECK(HandlerResult::redirect_fields_valid(redirect));
+    CHECK_EQ(redirect.upstream_id, 1u);
+    CHECK_EQ(redirect.status_code, 0u);
+    CHECK_EQ(redirect.next_state, 0u);
+    CHECK_EQ(redirect.yield_kind, YieldKind::HttpGet);
+
+    const auto forward = HandlerResult::unpack(
+        handler(nullptr,
+                nullptr,
+                reinterpret_cast<const u8*>("GET /old/ HTTP/1.1\r\nHost: alternate\r\n\r\n"),
+                sizeof("GET /old/ HTTP/1.1\r\nHost: alternate\r\n\r\n") - 1,
+                nullptr));
+    CHECK_EQ(forward.action, HandlerAction::ForwardBundle);
+    CHECK_EQ(forward.status_code, 0u);
+    CHECK_EQ(forward.upstream_id, 0u);
+    CHECK_EQ(forward.next_state, 1u);
+    CHECK_EQ(forward.yield_kind, YieldKind::HttpGet);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {
     const auto src = R"rut(
 route GET "/sleep" { wait(1500) return 200 }
