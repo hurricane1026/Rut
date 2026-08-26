@@ -7917,6 +7917,13 @@ bool handle_configured_strict_local_response(Loop* loop,
         return fail_closed();
 
     const auto& policy = config->strict_local_response_policies[policy_id - 1];
+    // Stage-2 execution fence: config/compiler ownership may propagate the
+    // exact internal 204 tuple, but no serializer or success lifecycle exists
+    // yet. Close before mutating persistence, response buffers/accounting, or
+    // submitting any bytes. Stage 3 removes this fence atomically with public
+    // activation and the dedicated serializer.
+    if (strict_local_response_policy_profile(policy) == StrictLocalResponseProfile::NoContent204)
+        return fail_closed();
     const bool is_head = method == LogHttpMethod::Head;
     if ((is_head && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
         (!is_head && policy.head_mode != StrictLocalResponseHeadMode::Reject &&

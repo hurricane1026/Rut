@@ -1008,7 +1008,11 @@ inline VerifyResult verify_function(const Function* fn,
     return result;
 }
 
-inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {}) {
+namespace detail {
+
+inline VerifyResult verify_module_impl(const Module& mod,
+                                       VerifyOptions options,
+                                       bool internal_strict_local_response_propagation) {
     VerifySummary summary{};
     summary.function_count = mod.func_count;
 
@@ -1032,10 +1036,17 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
             return verify_fail(summary, VerifyIssueCode::InvalidPreRoutePolicyId, 0);
         pre_route_referenced[id - 1] = true;
     }
+    const bool unmatched_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_policy_table_valid_for_internal_propagation(
+                  mod.strict_local_response_policies,
+                  mod.strict_local_response_policy_count,
+                  mod.unmatched_policy_ids)
+            : strict_local_response_policy_table_valid(mod.strict_local_response_policies,
+                                                       mod.strict_local_response_policy_count,
+                                                       mod.unmatched_policy_ids);
     if (!has_pre_route_metadata && !has_exact_strict_local_response_inventory &&
-        (!strict_local_response_policy_table_valid(mod.strict_local_response_policies,
-                                                   mod.strict_local_response_policy_count,
-                                                   mod.unmatched_policy_ids) ||
+        (!unmatched_table_valid ||
          (mod.unmatched_policy_ids[kRouteMethodAny] != 0 &&
           mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodAny] - 1]
                   .head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
@@ -1043,13 +1054,25 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
           mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodHead] - 1]
                   .head_mode != StrictLocalResponseHeadMode::SuppressBody)))
         return verify_fail(summary, VerifyIssueCode::InvalidUnmatchedPolicyId, 0);
-    if (!strict_local_response_source_table_valid(mod.strict_local_response_policies,
-                                                  mod.strict_local_response_policy_count,
-                                                  mod.pre_route_policy_ids,
-                                                  mod.unmatched_policy_ids,
-                                                  mod.exact_strict_local_response_bindings,
-                                                  mod.exact_strict_local_response_binding_count,
-                                                  kMaxExactStrictLocalResponseBindings))
+    const bool source_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  mod.strict_local_response_policies,
+                  mod.strict_local_response_policy_count,
+                  mod.pre_route_policy_ids,
+                  mod.unmatched_policy_ids,
+                  mod.exact_strict_local_response_bindings,
+                  mod.exact_strict_local_response_binding_count,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  mod.strict_local_response_policies,
+                  mod.strict_local_response_policy_count,
+                  mod.pre_route_policy_ids,
+                  mod.unmatched_policy_ids,
+                  mod.exact_strict_local_response_bindings,
+                  mod.exact_strict_local_response_binding_count,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!source_table_valid)
         return verify_fail(summary, VerifyIssueCode::InvalidExactStrictLocalResponseBinding, 0);
 
     if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
@@ -1316,6 +1339,17 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
     result.ok = true;
     result.summary = summary;
     return result;
+}
+
+}  // namespace detail
+
+inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {}) {
+    return detail::verify_module_impl(mod, options, false);
+}
+
+inline VerifyResult verify_module_for_internal_propagation(const Module& mod,
+                                                           VerifyOptions options = {}) {
+    return detail::verify_module_impl(mod, options, true);
 }
 
 inline const char* verify_issue_code_name(VerifyIssueCode code) {

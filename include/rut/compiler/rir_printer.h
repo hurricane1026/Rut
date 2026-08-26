@@ -74,6 +74,7 @@ void print_function(PrintBuf& buf, const Function& fn);
 
 // Print the entire module.
 void print_module(PrintBuf& buf, const Module& mod);
+void print_module_for_internal_propagation(PrintBuf& buf, const Module& mod);
 
 }  // namespace rir
 }  // namespace rut

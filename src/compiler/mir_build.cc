@@ -962,15 +962,27 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 
 }  // namespace
 
-FrontendResult<MirModule*> build_mir(const HirModule& module) {
-    if (!strict_local_response_source_table_valid(module.strict_local_response_policies.data,
-                                                  module.strict_local_response_policies.len,
-                                                  module.pre_route_policy_ids,
-                                                  module.unmatched_policy_ids,
-                                                  module.exact_strict_local_response_bindings.data,
-                                                  module.exact_strict_local_response_bindings.len,
-                                                  kMaxExactStrictLocalResponseBindings))
-        return frontend_error(FrontendError::UnsupportedSyntax, {});
+static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
+                                                 bool internal_strict_local_response_propagation) {
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  module.strict_local_response_policies.data,
+                  module.strict_local_response_policies.len,
+                  module.pre_route_policy_ids,
+                  module.unmatched_policy_ids,
+                  module.exact_strict_local_response_bindings.data,
+                  module.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  module.strict_local_response_policies.data,
+                  module.strict_local_response_policies.len,
+                  module.pre_route_policy_ids,
+                  module.unmatched_policy_ids,
+                  module.exact_strict_local_response_bindings.data,
+                  module.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax, {});
     auto mir = std::make_unique<MirModule>();
 
     for (u32 i = 0; i < module.response_policies.len; i++) {
@@ -3333,6 +3345,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
     if (invalid_redirect_policy) return frontend_error(FrontendError::UnsupportedSyntax);
     return mir.release();
+}
+
+FrontendResult<MirModule*> build_mir(const HirModule& module) {
+    return build_mir_impl(module, false);
+}
+
+FrontendResult<MirModule*> build_mir_for_internal_propagation(const HirModule& module) {
+    return build_mir_impl(module, true);
 }
 
 }  // namespace rut

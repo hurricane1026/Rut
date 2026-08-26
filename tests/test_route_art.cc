@@ -1193,6 +1193,130 @@ TEST(route_config, pre_route_strict_table_is_concrete_owned_transactional_and_co
     CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);
 }
 
+TEST(route_config, no_content204_owned_install_normalizes_empty_views_and_deduplicates) {
+    std::string reasons[4] = {"No Content", "No Content", "No Content", "No Content"};
+    std::string servers[4] = {"nginx/1.29.7", "nginx/1.29.7", "nginx/1.29.7", "rut"};
+    char empty_a = 0;
+    char empty_b = 0;
+    const Str empty_views[4] = {{nullptr, 0}, {&empty_a, 0}, {&empty_b + 1, 0}, {nullptr, 0}};
+    StrictLocalResponsePolicySpec policies[4]{};
+    for (u32 i = 0; i < 4; i++) {
+        policies[i] = local_policy({reasons[i].data(), static_cast<u32>(reasons[i].size())},
+                                   empty_views[i],
+                                   {servers[i].data(), static_cast<u32>(servers[i].size())},
+                                   empty_views[3 - i],
+                                   204,
+                                   StrictLocalResponseHeadMode::SuppressBody);
+        REQUIRE_EQ(strict_local_response_policy_profile(policies[i]),
+                   StrictLocalResponseProfile::NoContent204);
+    }
+    CHECK(strict_local_response_policy_spec_equal(policies[0], policies[1]));
+    CHECK(strict_local_response_policy_spec_equal(policies[1], policies[2]));
+    CHECK_FALSE(strict_local_response_policy_spec_equal(policies[2], policies[3]));
+
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    pre_route[kRouteMethodTrace] = 1;
+    pre_route[kRouteMethodOptions] = 2;
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodAny] = 3;
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = exact_local_binding("/distinct", kRouteMethodGet, 4);
+
+    auto public_add = std::make_unique<RouteConfig>();
+    std::vector<u8> public_add_before(sizeof(RouteConfig));
+    __builtin_memcpy(public_add_before.data(), public_add.get(), sizeof(RouteConfig));
+    CHECK_EQ(public_add->add_strict_local_response_policy(policies[0]), 0u);
+    CHECK_EQ(__builtin_memcmp(public_add_before.data(), public_add.get(), sizeof(RouteConfig)), 0);
+    REQUIRE_EQ(public_add->add_strict_local_response_policy_for_internal_propagation(policies[0]),
+               1u);
+
+    auto public_install = std::make_unique<RouteConfig>();
+    std::vector<u8> public_install_before(sizeof(RouteConfig));
+    __builtin_memcpy(public_install_before.data(), public_install.get(), sizeof(RouteConfig));
+    CHECK_FALSE(public_install->install_strict_local_response_table_with_pre_route(
+        policies, 4, pre_route, unmatched, exact, 1));
+    CHECK_EQ(
+        __builtin_memcmp(public_install_before.data(), public_install.get(), sizeof(RouteConfig)),
+        0);
+
+    u16 public_unmatched[kStrictLocalResponseMethodSlots]{};
+    public_unmatched[kRouteMethodAny] = 1;
+    ExactStrictLocalResponseBinding public_exact[kMaxExactStrictLocalResponseBindings]{};
+    CHECK_FALSE(public_install->install_strict_local_response_table(
+        policies, 1, public_unmatched, public_exact, 0));
+    CHECK_FALSE(public_install->install_unmatched_policy_table(policies, 1, public_unmatched));
+    CHECK_EQ(
+        __builtin_memcmp(public_install_before.data(), public_install.get(), sizeof(RouteConfig)),
+        0);
+
+    auto installed = std::make_unique<RouteConfig>();
+    REQUIRE(installed->install_strict_local_response_table_with_pre_route_for_internal_propagation(
+        policies, 4, pre_route, unmatched, exact, 1));
+    REQUIRE(installed->strict_local_response_table_is_valid());
+    REQUIRE_EQ(installed->strict_local_response_policy_count, 2u);
+    CHECK_EQ(installed->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(installed->pre_route_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(installed->unmatched_policy_ids[kRouteMethodAny], 1u);
+    CHECK_EQ(installed->exact_strict_local_response_bindings[0].policy_id, 2u);
+    CHECK_EQ(installed->strict_local_response_bytes_used, 35u);
+    for (u32 i = 0; i < installed->strict_local_response_policy_count; i++) {
+        const auto& owned = installed->strict_local_response_policies[i];
+        CHECK_EQ(strict_local_response_policy_profile(owned),
+                 StrictLocalResponseProfile::NoContent204);
+        CHECK(owned.content_type.ptr != nullptr);
+        CHECK(owned.body.ptr != nullptr);
+        CHECK_EQ(owned.content_type.len, 0u);
+        CHECK_EQ(owned.body.len, 0u);
+        CHECK(installed->strict_local_response_bytes_owned(owned.content_type));
+        CHECK(installed->strict_local_response_bytes_owned(owned.body));
+    }
+
+    auto copied = std::make_unique<RouteConfig>();
+    std::vector<u8> public_copy_before(sizeof(RouteConfig));
+    __builtin_memcpy(public_copy_before.data(), copied.get(), sizeof(RouteConfig));
+    CHECK_FALSE(copied->copy_strict_local_response_table_from_owned(*installed));
+    CHECK_EQ(__builtin_memcmp(public_copy_before.data(), copied.get(), sizeof(RouteConfig)), 0);
+    REQUIRE(
+        copied->copy_strict_local_response_table_from_owned_for_internal_propagation(*installed));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK_EQ(copied->strict_local_response_bytes_used, 35u);
+    CHECK(copied->strict_local_response_policies[0].reason.ptr !=
+          installed->strict_local_response_policies[0].reason.ptr);
+    CHECK(copied->strict_local_response_policies[0].content_type.ptr != nullptr);
+    CHECK(copied->strict_local_response_policies[0].body.ptr != nullptr);
+
+    for (auto& reason : reasons) reason.assign(reason.size(), 'x');
+    for (auto& server : servers) server.assign(server.size(), 'x');
+    REQUIRE(installed->strict_local_response_table_is_valid());
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK(installed->strict_local_response_policies[0].reason.eq({"No Content", 10}));
+    CHECK(copied->strict_local_response_policies[1].server.eq({"rut", 3}));
+
+    auto rejected = std::make_unique<RouteConfig>();
+    REQUIRE(rejected->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), rejected.get(), sizeof(RouteConfig));
+    auto forged = policies[0];
+    forged.reason = {"No Content", 10};
+    forged.server = {"nginx/1.29.7", 12};
+    forged.content_type = {nullptr, 1};
+    u16 forged_unmatched[kStrictLocalResponseMethodSlots]{};
+    forged_unmatched[kRouteMethodAny] = 1;
+    u16 empty_pre_route[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding neutral[kMaxExactStrictLocalResponseBindings]{};
+    CHECK_FALSE(rejected->install_strict_local_response_table_with_pre_route(
+        &forged, 1, empty_pre_route, forged_unmatched, neutral, 0));
+    CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);
+
+    forged = policies[0];
+    forged.reason = {"No Content", 10};
+    forged.server = {"nginx/1.29.7", 12};
+    forged.reserved1 = 1;
+    CHECK_FALSE(rejected->install_strict_local_response_table_with_pre_route(
+        &forged, 1, empty_pre_route, forged_unmatched, neutral, 0));
+    CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

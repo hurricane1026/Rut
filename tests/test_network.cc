@@ -12842,6 +12842,68 @@ TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire)
     CHECK_EQ(__builtin_memcmp(generic_wire, failure_wire, generic_len), 0);
 }
 
+TEST(unmatched_local_response, no_content204_internal_profile_fence_closes_before_any_publication) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"No Content", 10};
+    policy.content_type = {nullptr, 0};
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = {nullptr, 0};
+    RouteConfig config{};
+    CHECK_EQ(config.add_strict_local_response_policy(policy), 0u);
+    REQUIRE_EQ(config.add_strict_local_response_policy_for_internal_propagation(policy), 1u);
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodAny, 1));
+    REQUIRE(config.unmatched_policy_table_is_valid());
+
+    Connection serializer_conn{};
+    u8 recv[64]{}, send[256]{};
+    serializer_conn.recv_slice = recv;
+    serializer_conn.send_slice = send;
+    serializer_conn.recv_buf.bind(recv, sizeof(recv));
+    serializer_conn.send_buf.bind(send, sizeof(send));
+    serializer_conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    u8 output[256];
+    __builtin_memset(output, 0xa5, sizeof(output));
+    u32 output_len = 99;
+    CHECK_FALSE(build_strict_local_response(
+        serializer_conn, policy, false, output, sizeof(output), &output_len));
+    CHECK_EQ(output_len, 0u);
+    for (u8 byte : output) CHECK_EQ(byte, 0xa5u);
+
+    loop.backend.clear_ops();
+    const u32 free_before = loop.free_top;
+    Connection* closed = dispatch_unmatched_request(
+        loop, config, "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(closed != nullptr);
+    CHECK_EQ(loop.free_top, free_before);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(closed->send_buf.len(), 0u);
+    CHECK_EQ(closed->resp_status, 0u);
+}
+
 TEST(unmatched_local_response, reload_publication_is_consumed_and_inflight_request_stays_pinned) {
     SmallLoop loop;
     loop.setup();

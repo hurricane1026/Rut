@@ -802,10 +802,9 @@ struct AstFile {
         return true;
     }
 
-    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
-        if (!strict_local_response_policy_spec_valid(policy) ||
-            strict_local_response_policies.len >= kMaxStrictLocalResponsePolicies)
-            return 0;
+private:
+    u16 add_validated_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (strict_local_response_policies.len >= kMaxStrictLocalResponsePolicies) return 0;
         u32 total = 0;
         for (u32 i = 0; i < strict_local_response_policies.len; i++) {
             const auto& p = strict_local_response_policies[i];
@@ -822,6 +821,18 @@ struct AstFile {
         }
         if (!strict_local_response_policies.push(policy)) return 0;
         return static_cast<u16>(strict_local_response_policies.len);
+    }
+
+public:
+    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
+    }
+
+    u16 add_strict_local_response_policy_for_internal_propagation(
+        const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid_for_internal_propagation(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
     }
 
     bool add_redirect_policy_body(const u8* bytes, u32 len, Str& out) {

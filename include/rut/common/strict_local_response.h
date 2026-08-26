@@ -201,6 +201,14 @@ inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePol
            profile == StrictLocalResponseProfile::LegacyError;
 }
 
+// Trusted compiler/config propagation accepts the closed internal vocabulary.
+// Public source validation must continue to use
+// strict_local_response_policy_spec_valid(), which deliberately excludes 204.
+inline bool strict_local_response_policy_spec_valid_for_internal_propagation(
+    const StrictLocalResponsePolicySpec& policy) {
+    return strict_local_response_policy_profile(policy) != StrictLocalResponseProfile::Invalid;
+}
+
 inline bool strict_local_response_policy_spec_equal(const StrictLocalResponsePolicySpec& a,
                                                     const StrictLocalResponsePolicySpec& b) {
     if (a.reserved0 != 0 || a.reserved1 != 0 || b.reserved0 != 0 || b.reserved1 != 0) return false;
@@ -209,11 +217,14 @@ inline bool strict_local_response_policy_spec_equal(const StrictLocalResponsePol
            a.content_type.eq(b.content_type) && a.server.eq(b.server) && a.body.eq(b.body);
 }
 
-inline bool strict_local_response_policy_table_valid(
+namespace detail {
+
+inline bool strict_local_response_policy_table_valid_impl(
     const StrictLocalResponsePolicySpec* policies,
     u32 policy_count,
     const u16* method_policy_ids,
-    u32 method_slot_count = kStrictLocalResponseMethodSlots) {
+    u32 method_slot_count,
+    bool internal_propagation) {
     if (policy_count > kMaxStrictLocalResponsePolicies ||
         method_slot_count != kStrictLocalResponseMethodSlots || policies == nullptr ||
         method_policy_ids == nullptr)
@@ -222,7 +233,10 @@ inline bool strict_local_response_policy_table_valid(
     u32 total_bytes = 0;
     for (u32 i = 0; i < policy_count; i++) {
         const auto& policy = policies[i];
-        if (!strict_local_response_policy_spec_valid(policy)) return false;
+        if (internal_propagation
+                ? !strict_local_response_policy_spec_valid_for_internal_propagation(policy)
+                : !strict_local_response_policy_spec_valid(policy))
+            return false;
         const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
         for (const Str field : fields) {
             if (field.len > kMaxStrictLocalResponsePolicyBytes - total_bytes) return false;
@@ -245,18 +259,41 @@ inline bool strict_local_response_policy_table_valid(
     return true;
 }
 
+}  // namespace detail
+
+inline bool strict_local_response_policy_table_valid(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* method_policy_ids,
+    u32 method_slot_count = kStrictLocalResponseMethodSlots) {
+    return detail::strict_local_response_policy_table_valid_impl(
+        policies, policy_count, method_policy_ids, method_slot_count, false);
+}
+
+inline bool strict_local_response_policy_table_valid_for_internal_propagation(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* method_policy_ids,
+    u32 method_slot_count = kStrictLocalResponseMethodSlots) {
+    return detail::strict_local_response_policy_table_valid_impl(
+        policies, policy_count, method_policy_ids, method_slot_count, true);
+}
+
 // Compiler-source ownership validator for the combined pre-route + unmatched + exact
 // metadata contract.  Source IDs are intentionally single-use; a later
 // RouteConfig installer may semantically deduplicate equal policy specs while
 // remapping those independent source IDs.
-inline bool strict_local_response_source_table_valid(
+namespace detail {
+
+inline bool strict_local_response_source_table_valid_impl(
     const StrictLocalResponsePolicySpec* policies,
     u32 policy_count,
     const u16* pre_route_policy_ids,
     const u16* unmatched_policy_ids,
     const ExactStrictLocalResponseBinding* exact_bindings,
     u32 exact_binding_count,
-    u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
+    u32 exact_binding_capacity,
+    bool internal_propagation) {
     if (policy_count > kMaxStrictLocalResponsePolicies || policies == nullptr ||
         pre_route_policy_ids == nullptr || unmatched_policy_ids == nullptr ||
         exact_bindings == nullptr ||
@@ -267,7 +304,10 @@ inline bool strict_local_response_source_table_valid(
     u32 total_bytes = 0;
     for (u32 i = 0; i < policy_count; i++) {
         const auto& policy = policies[i];
-        if (!strict_local_response_policy_spec_valid(policy)) return false;
+        if (internal_propagation
+                ? !strict_local_response_policy_spec_valid_for_internal_propagation(policy)
+                : !strict_local_response_policy_spec_valid(policy))
+            return false;
         const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
         for (const Str field : fields) {
             if (field.len > kMaxStrictLocalResponsePolicyBytes - total_bytes) return false;
@@ -326,6 +366,62 @@ inline bool strict_local_response_source_table_valid(
         }
     }
     return reference_count == policy_count;
+}
+
+}  // namespace detail
+
+inline bool strict_local_response_source_table_valid(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* pre_route_policy_ids,
+    const u16* unmatched_policy_ids,
+    const ExactStrictLocalResponseBinding* exact_bindings,
+    u32 exact_binding_count,
+    u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
+    return detail::strict_local_response_source_table_valid_impl(policies,
+                                                                 policy_count,
+                                                                 pre_route_policy_ids,
+                                                                 unmatched_policy_ids,
+                                                                 exact_bindings,
+                                                                 exact_binding_count,
+                                                                 exact_binding_capacity,
+                                                                 false);
+}
+
+inline bool strict_local_response_source_table_valid_for_internal_propagation(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* pre_route_policy_ids,
+    const u16* unmatched_policy_ids,
+    const ExactStrictLocalResponseBinding* exact_bindings,
+    u32 exact_binding_count,
+    u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
+    return detail::strict_local_response_source_table_valid_impl(policies,
+                                                                 policy_count,
+                                                                 pre_route_policy_ids,
+                                                                 unmatched_policy_ids,
+                                                                 exact_bindings,
+                                                                 exact_binding_count,
+                                                                 exact_binding_capacity,
+                                                                 true);
+}
+
+inline bool strict_local_response_source_table_valid_for_internal_propagation(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* unmatched_policy_ids,
+    const ExactStrictLocalResponseBinding* exact_bindings,
+    u32 exact_binding_count,
+    u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
+    const u16 empty_pre_route[kStrictLocalResponseMethodSlots]{};
+    return strict_local_response_source_table_valid_for_internal_propagation(
+        policies,
+        policy_count,
+        empty_pre_route,
+        unmatched_policy_ids,
+        exact_bindings,
+        exact_binding_count,
+        exact_binding_capacity);
 }
 
 // Compatibility overload for compiler/runtime callers that intentionally have

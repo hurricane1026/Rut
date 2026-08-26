@@ -1078,7 +1078,16 @@ static bool has_strict_local_response_metadata(const Module& mod) {
         mod.exact_strict_local_response_bindings, mod.exact_strict_local_response_binding_count);
 }
 
-static bool printable_strict_local_response_table(const Module& mod) {
+static bool printable_strict_local_response_table(const Module& mod, bool internal_propagation) {
+    if (internal_propagation)
+        return strict_local_response_source_table_valid_for_internal_propagation(
+            mod.strict_local_response_policies,
+            mod.strict_local_response_policy_count,
+            mod.pre_route_policy_ids,
+            mod.unmatched_policy_ids,
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count,
+            kMaxExactStrictLocalResponseBindings);
     return strict_local_response_source_table_valid(mod.strict_local_response_policies,
                                                     mod.strict_local_response_policy_count,
                                                     mod.pre_route_policy_ids,
@@ -1088,7 +1097,7 @@ static bool printable_strict_local_response_table(const Module& mod) {
                                                     kMaxExactStrictLocalResponseBindings);
 }
 
-void print_module(PrintBuf& buf, const Module& mod) {
+static void print_module_impl(PrintBuf& buf, const Module& mod, bool internal_propagation) {
     const bool has_unmatched_metadata = has_strict_local_response_metadata(mod);
     for (u32 i = 0; i < mod.func_count; i++) {
         if (i > 0) buf.newline();
@@ -1125,7 +1134,7 @@ void print_module(PrintBuf& buf, const Module& mod) {
     if (has_unmatched_metadata) {
         if (mod.func_count != 0 || mod.response_policy_count != 0 || mod.failure_policy_count != 0)
             buf.newline();
-        if (!printable_strict_local_response_table(mod)) {
+        if (!printable_strict_local_response_table(mod, internal_propagation)) {
             // Forged metadata must remain visible without using its count as an
             // array bound or touching any possibly-null string storage.
             buf.put_cstr("strict_local_response_table: <invalid>");
@@ -1246,6 +1255,14 @@ void print_module(PrintBuf& buf, const Module& mod) {
         }
     }
     buf.flush();
+}
+
+void print_module(PrintBuf& buf, const Module& mod) {
+    print_module_impl(buf, mod, false);
+}
+
+void print_module_for_internal_propagation(PrintBuf& buf, const Module& mod) {
+    print_module_impl(buf, mod, true);
 }
 
 }  // namespace rir

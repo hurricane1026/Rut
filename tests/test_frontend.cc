@@ -135,6 +135,12 @@ static HeapFrontendResult<HirModule> analyze_file_heap(const AstFile& file) {
     if (!hir) return {core::make_unexpected(hir.error())};
     return {hir.value()};
 }
+static HeapFrontendResult<HirModule> analyze_file_heap_for_internal_propagation(
+    const AstFile& file) {
+    auto hir = analyze_file_for_internal_propagation(file);
+    if (!hir) return {core::make_unexpected(hir.error())};
+    return {hir.value()};
+}
 static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file,
                                                                  const std::string& source_path) {
     Str path{source_path.c_str(), static_cast<u32>(source_path.size())};
@@ -144,6 +150,12 @@ static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& 
 }
 static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     auto mir = build_mir(module);
+    if (!mir) return {core::make_unexpected(mir.error())};
+    return {mir.value()};
+}
+static HeapFrontendResult<MirModule> build_mir_heap_for_internal_propagation(
+    const HirModule& module) {
+    auto mir = build_mir_for_internal_propagation(module);
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
 }
@@ -36112,6 +36124,94 @@ TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_f
         CHECK_FALSE(strict_local_response_policy_spec_equal(legacy, legacy_forged));
         CHECK_FALSE(strict_local_response_policy_spec_equal(legacy_forged, legacy_forged));
     }
+}
+
+TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_and_owned) {
+    std::string reason = "No Content";
+    std::string server = "nginx/1.29.7";
+    char empty_anchor = 0;
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {&empty_anchor, 0};
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {&empty_anchor, 0};
+
+    auto public_ast = std::make_unique<AstFile>();
+    CHECK_EQ(public_ast->add_strict_local_response_policy(policy), 0u);
+
+    auto ast = std::make_unique<AstFile>();
+    REQUIRE_EQ(ast->add_strict_local_response_policy_for_internal_propagation(policy), 1u);
+    ast->unmatched_policy_ids[kRouteMethodAny] = 1;
+    AstItem item{};
+    item.kind = AstItemKind::Unmatched;
+    item.unmatched.method_is_any = true;
+    item.unmatched.method_slot = kRouteMethodAny;
+    item.unmatched.policy_id = 1;
+    REQUIRE(ast->items.push(item));
+    REQUIRE_EQ(ast->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    REQUIRE_EQ(ast->strict_local_response_policies[0].body.ptr, &empty_anchor);
+    CHECK_FALSE(analyze_file_heap(*ast).has_value());
+
+    auto hir = analyze_file_heap_for_internal_propagation(*ast);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(hir->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(hir->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    CHECK_EQ(hir->strict_local_response_policies[0].body.ptr, &empty_anchor);
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+
+    auto mir = build_mir_heap_for_internal_propagation(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(mir->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(mir->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    CHECK_EQ(mir->strict_local_response_policies[0].body.ptr, &empty_anchor);
+
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    rejected.destroy();
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir_for_internal_propagation(mir.value(), lowered));
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& rir_policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_policy_profile(rir_policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(rir_policy.content_type.ptr, nullptr);
+    CHECK_EQ(rir_policy.content_type.len, 0u);
+    CHECK_EQ(rir_policy.body.ptr, nullptr);
+    CHECK_EQ(rir_policy.body.len, 0u);
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    REQUIRE(rir::verify_module_for_internal_propagation(lowered.module).ok);
+
+    char public_text[512]{};
+    rir::PrintBuf public_buf{};
+    public_buf.init(public_text, sizeof(public_text), -1);
+    rir::print_module(public_buf, lowered.module);
+    CHECK(std::string(public_text, public_buf.len).find("<invalid>") != std::string::npos);
+    char internal_text[1024]{};
+    rir::PrintBuf internal_buf{};
+    internal_buf.init(internal_text, sizeof(internal_text), -1);
+    rir::print_module_for_internal_propagation(internal_buf, lowered.module);
+    const std::string printed(internal_text, internal_buf.len);
+    CHECK(printed.find("status=204") != std::string::npos);
+    CHECK(printed.find("reason=\"No Content\"") != std::string::npos);
+    CHECK(printed.find("content_type=\"\"") != std::string::npos);
+    CHECK(printed.find("body=b\"\"") != std::string::npos);
+
+    ast.reset();
+    reason.assign(reason.size(), 'x');
+    server.assign(server.size(), 'x');
+    REQUIRE(rir::verify_module_for_internal_propagation(lowered.module).ok);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq(lit("No Content")));
+    CHECK(lowered.module.strict_local_response_policies[0].server.eq(lit("nginx/1.29.7")));
+    lowered.destroy();
 }
 
 TEST(frontend, strict_local_response_representation200_rejection_matrix_is_central) {

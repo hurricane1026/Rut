@@ -3394,7 +3394,9 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            policy_bundle_valid;
 }
 
-FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) {
+static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
+                                              FrontendRirModule& out,
+                                              bool internal_strict_local_response_propagation) {
     if (!out.init(mir.functions.len == 0 ? 1 : mir.functions.len,
                   mir.variants.len * 2 + mir.structs.len + 8))
         return frontend_error(FrontendError::OutOfMemory);
@@ -3514,14 +3516,25 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
     out.module.failure_policy_count = mir.failure_policies.len;
 
-    if (!strict_local_response_source_table_valid(mir.strict_local_response_policies.data,
-                                                  mir.strict_local_response_policies.len,
-                                                  mir.pre_route_policy_ids,
-                                                  mir.unmatched_policy_ids,
-                                                  mir.exact_strict_local_response_bindings.data,
-                                                  mir.exact_strict_local_response_bindings.len,
-                                                  kMaxExactStrictLocalResponseBindings))
-        return frontend_error(FrontendError::UnsupportedSyntax);
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  mir.strict_local_response_policies.data,
+                  mir.strict_local_response_policies.len,
+                  mir.pre_route_policy_ids,
+                  mir.unmatched_policy_ids,
+                  mir.exact_strict_local_response_bindings.data,
+                  mir.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  mir.strict_local_response_policies.data,
+                  mir.strict_local_response_policies.len,
+                  mir.pre_route_policy_ids,
+                  mir.unmatched_policy_ids,
+                  mir.exact_strict_local_response_bindings.data,
+                  mir.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax);
     for (u32 i = 0; i < mir.strict_local_response_policies.len; i++) {
         const auto& src = mir.strict_local_response_policies[i];
         auto& dst = out.module.strict_local_response_policies[i];
@@ -5002,6 +5015,15 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     return {};
+}
+
+FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) {
+    return lower_to_rir_impl(mir, out, false);
+}
+
+FrontendResult<void> lower_to_rir_for_internal_propagation(const MirModule& mir,
+                                                           FrontendRirModule& out) {
+    return lower_to_rir_impl(mir, out, true);
 }
 
 }  // namespace rut

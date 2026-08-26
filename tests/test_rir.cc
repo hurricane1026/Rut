@@ -2122,6 +2122,80 @@ TEST(RirVerifier, StrictLocalResponseRepresentation200RejectsEveryForgedProfileF
     rejects(forged);
 }
 
+TEST(RirVerifier, NoContent204RequiresExplicitInternalVerificationAndExactTuple) {
+    char empty_anchor = 0;
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"No Content", 10};
+    policy.content_type = {&empty_anchor, 0};
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = {nullptr, 0};
+
+    auto module_with = [](const StrictLocalResponsePolicySpec& candidate) {
+        Module mod{};
+        mod.strict_local_response_policies[0] = candidate;
+        mod.strict_local_response_policy_count = 1;
+        mod.unmatched_policy_ids[kRouteMethodAny] = 1;
+        return mod;
+    };
+    CHECK_FALSE(verify_module(module_with(policy)).ok);
+    REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
+    policy.content_type = {nullptr, 0};
+    policy.body = {&empty_anchor, 0};
+    REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
+
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_FALSE(verify_module_for_internal_propagation(module_with(forged)).ok);
+    };
+    auto forged = policy;
+    forged.version = StrictLocalResponseVersion::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.status_code = 205;
+    rejects(forged);
+    forged = policy;
+    forged.date = StrictLocalResponseDate::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.connection = StrictLocalResponseConnection::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = policy;
+    forged.reason = {"No content", 10};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {"x", 1};
+    rejects(forged);
+    forged = policy;
+    forged.server = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.body = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.reserved0 = 1;
+    rejects(forged);
+    forged = policy;
+    forged.reserved1 = 1;
+    rejects(forged);
+
+    auto bad_id = module_with(policy);
+    bad_id.unmatched_policy_ids[kRouteMethodAny] = 2;
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_id).ok);
+    auto bad_count = module_with(policy);
+    bad_count.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_count).ok);
+    auto bad_reference = module_with(policy);
+    bad_reference.unmatched_policy_ids[kRouteMethodGet] = 1;
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_reference).ok);
+}
+
 TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     static constexpr char kReason[] = "Bad Request";
     static constexpr char kType[] = "text/plain";

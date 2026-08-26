@@ -11704,7 +11704,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
     const std::vector<Str>& external_decorator_names,
-    SourceBudget* source_budget);
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation);
 
 static bool contains_str(const std::vector<Str>& names, Str needle) {
     for (const auto& name : names) {
@@ -12761,7 +12762,8 @@ static FrontendResult<void> load_imported_modules(
     std::vector<std::string>& import_stack,
     std::vector<std::unique_ptr<HirModule>>& imported_storage,
     const std::vector<Str>& route_decorator_names,
-    SourceBudget* source_budget) {
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation) {
     if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
     auto collect_imported_decorator_names =
@@ -12872,7 +12874,8 @@ static FrontendResult<void> load_imported_modules(
                                               import_stack,
                                               &owned_strings,
                                               imported_decorator_names,
-                                              source_budget);
+                                              source_budget,
+                                              internal_strict_local_response_propagation);
         if (!imported) return core::make_unexpected(imported.error());
         std::unique_ptr<HirModule> imported_module(imported.value());
         if (imported_module->has_listener)
@@ -14659,7 +14662,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
     const std::vector<Str>& external_decorator_names,
-    SourceBudget* source_budget) {
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
     mod.has_package_decl = file.has_package_decl;
@@ -14680,14 +14684,25 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, {});
     }
     static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
-    if (!strict_local_response_source_table_valid(file.strict_local_response_policies.data,
-                                                  file.strict_local_response_policies.len,
-                                                  file.pre_route_policy_ids,
-                                                  file.unmatched_policy_ids,
-                                                  file.exact_strict_local_response_bindings.data,
-                                                  file.exact_strict_local_response_bindings.len,
-                                                  kMaxExactStrictLocalResponseBindings))
-        return frontend_error(FrontendError::UnsupportedSyntax, {});
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  file.strict_local_response_policies.data,
+                  file.strict_local_response_policies.len,
+                  file.pre_route_policy_ids,
+                  file.unmatched_policy_ids,
+                  file.exact_strict_local_response_bindings.data,
+                  file.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  file.strict_local_response_policies.data,
+                  file.strict_local_response_policies.len,
+                  file.pre_route_policy_ids,
+                  file.unmatched_policy_ids,
+                  file.exact_strict_local_response_bindings.data,
+                  file.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax, {});
     auto concrete_ast_method_matches = [](u8 method, u8 slot) {
         const TokenType token = static_cast<TokenType>(method);
         if (token == TokenType::KwGet) return slot == kRouteMethodGet;
@@ -15060,7 +15075,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                 import_stack,
                                                 imported_storage,
                                                 route_decorator_names,
-                                                source_budget);
+                                                source_budget,
+                                                internal_strict_local_response_propagation);
     if (!loaded_imports) return core::make_unexpected(loaded_imports.error());
     auto validated_namespaces = validate_import_namespaces(imported_modules);
     if (!validated_namespaces) return core::make_unexpected(validated_namespaces.error());
@@ -19884,11 +19900,18 @@ FrontendResult<HirModule*> analyze_file(const AstFile& file,
     std::vector<std::string> import_stack;
     const std::vector<Str> external_decorator_names;
     return analyze_file_internal(
-        file, source_path, import_stack, nullptr, external_decorator_names, source_budget);
+        file, source_path, import_stack, nullptr, external_decorator_names, source_budget, false);
 }
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file) {
     return analyze_file(file, {});
+}
+
+FrontendResult<HirModule*> analyze_file_for_internal_propagation(const AstFile& file) {
+    std::vector<std::string> import_stack;
+    const std::vector<Str> external_decorator_names;
+    return analyze_file_internal(
+        file, {}, import_stack, nullptr, external_decorator_names, nullptr, true);
 }
 
 void reset_import_analysis_counter() {

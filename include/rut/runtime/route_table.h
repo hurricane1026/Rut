@@ -31,6 +31,12 @@ struct Module;
 
 struct RouteConfig;
 bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
+bool register_jit_routes_for_internal_propagation(RouteConfig& cfg,
+                                                  const rir::Module& mod,
+                                                  jit::JitEngine& engine);
+namespace detail {
+bool register_verified_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
+}
 
 enum class ExactStrictLocalResponseMatchState : u8 {
     InvalidInput = 0,
@@ -611,7 +617,8 @@ struct RouteConfig {
                 !strict_local_response_bytes_owned(policy.server) ||
                 !strict_local_response_bytes_owned(policy.body))
                 return false;
-            if (!strict_local_response_policy_spec_valid(policy)) return false;
+            if (!strict_local_response_policy_spec_valid_for_internal_propagation(policy))
+                return false;
             for (u32 prior = 0; prior < i; prior++)
                 if (strict_local_response_policy_spec_equal(strict_local_response_policies[prior],
                                                             policy))
@@ -787,15 +794,12 @@ struct RouteConfig {
                strict_local_response_bytes_owned(policy.content_type) &&
                strict_local_response_bytes_owned(policy.server) &&
                strict_local_response_bytes_owned(policy.body) &&
-               strict_local_response_policy_spec_valid(policy);
+               strict_local_response_policy_spec_valid_for_internal_propagation(policy);
     }
 
-    // Incremental builder.  Dedup is semantic and stable (first insertion wins).
-    // A policy without a mapping is intentionally incomplete activation metadata
-    // and therefore fails closed on a miss until the table is completed.
-    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
-        if (!strict_local_response_policy_spec_valid(policy) ||
-            strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+private:
+    u16 add_validated_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
             return 0;
         for (u32 i = 0; i < strict_local_response_policy_count; i++) {
@@ -830,6 +834,20 @@ struct RouteConfig {
         copy(policy.server, dst.server);
         copy(policy.body, dst.body);
         return static_cast<u16>(++strict_local_response_policy_count);
+    }
+
+public:
+    // Incremental public builder. Dedup is semantic and stable (first insertion wins).
+    // The default surface deliberately excludes the compiler-only 204 vocabulary.
+    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
+    }
+
+    u16 add_strict_local_response_policy_for_internal_propagation(
+        const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid_for_internal_propagation(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
     }
 
     bool set_unmatched_policy_id(u8 method_key, u16 policy_id) {
@@ -888,12 +906,9 @@ struct RouteConfig {
         return true;
     }
 
-    // Copy a complete already-owned table without allocation. Every check and
-    // every possible false return precedes the first destination write; once
-    // commit starts it only copies bounded arrays and rebases proven pool views.
-    bool copy_strict_local_response_table_from_owned(const RouteConfig& source) {
+private:
+    bool copy_validated_strict_local_response_table_from_owned(const RouteConfig& source) {
         if (has_strict_local_response_table_inventory()) return false;
-        if (!source.strict_local_response_table_is_valid()) return false;
 
         // Convert every source view to a checked integer offset before the
         // first destination write.  Public/forged views can carry an address
@@ -967,92 +982,51 @@ struct RouteConfig {
         return true;
     }
 
+public:
+    // Copy a complete already-owned public table without allocation. Every check and
+    // every possible false return precedes the first destination write; once
+    // commit starts it only copies bounded arrays and rebases proven pool views.
+    bool copy_strict_local_response_table_from_owned(const RouteConfig& source) {
+        if (!source.strict_local_response_table_is_valid()) return false;
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++)
+            if (!strict_local_response_policy_spec_valid(source.strict_local_response_policies[i]))
+                return false;
+        return copy_validated_strict_local_response_table_from_owned(source);
+    }
+
+    bool copy_strict_local_response_table_from_owned_for_internal_propagation(
+        const RouteConfig& source) {
+        if (!source.strict_local_response_table_is_valid()) return false;
+        return copy_validated_strict_local_response_table_from_owned(source);
+    }
+
     bool copy_unmatched_policy_table_from_owned(const RouteConfig& source) {
         if (source.has_pre_route_metadata() || source.has_exact_strict_local_response_inventory())
             return false;
         return copy_strict_local_response_table_from_owned(source);
     }
 
-    // Internal runtime/config transaction. Phase 1 deliberately has no
-    // compiler/source representation; callers must provide a complete concrete
-    // pre-route table and the existing unmatched/exact inventory together.
-    bool install_strict_local_response_table_with_pre_route(
+    bool copy_unmatched_policy_table_from_owned_for_internal_propagation(
+        const RouteConfig& source) {
+        if (source.has_pre_route_metadata() || source.has_exact_strict_local_response_inventory())
+            return false;
+        return copy_strict_local_response_table_from_owned_for_internal_propagation(source);
+    }
+
+private:
+    bool install_validated_strict_local_response_table_with_pre_route(
         const StrictLocalResponsePolicySpec* policies,
         u32 policy_count,
         const u16* pre_route_ids,
         const u16* method_policy_ids,
         const ExactStrictLocalResponseBinding* exact_bindings,
         u32 exact_binding_count) {
-        if (has_strict_local_response_table_inventory() || policies == nullptr ||
-            pre_route_ids == nullptr || method_policy_ids == nullptr || exact_bindings == nullptr ||
-            policy_count > kMaxStrictLocalResponsePolicies ||
-            exact_binding_count > kMaxExactStrictLocalResponseBindings ||
-            pre_route_ids[kRouteMethodAny] != 0)
-            return false;
-
-        bool referenced[kMaxStrictLocalResponsePolicies]{};
-        u32 reference_count = 0;
-        auto add_reference = [&](u16 id) {
-            if (id == 0 || id > policy_count || referenced[id - 1]) return false;
-            referenced[id - 1] = true;
-            ++reference_count;
-            return true;
-        };
-        u32 total_bytes = 0;
-        for (u32 i = 0; i < policy_count; i++) {
-            if (!strict_local_response_policy_spec_valid(policies[i])) return false;
-            const Str fields[] = {
-                policies[i].reason, policies[i].content_type, policies[i].server, policies[i].body};
-            for (Str field : fields) {
-                if (field.len > kStrictLocalResponseBytesPoolBytes - total_bytes) return false;
-                total_bytes += field.len;
-            }
-        }
-        for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
-            const u16 id = pre_route_ids[slot];
-            if (id == 0) continue;
-            if (!add_reference(id) ||
-                (slot == kRouteMethodHead &&
-                 policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody))
-                return false;
-        }
-        for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
-            const u16 id = method_policy_ids[slot];
-            if (id == 0) continue;
-            if (!add_reference(id) ||
-                ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-                 policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody))
-                return false;
-        }
-        for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
-            const auto& binding = exact_bindings[i];
-            if (i >= exact_binding_count) {
-                if (!exact_strict_local_response_binding_is_neutral(binding)) return false;
-                continue;
-            }
-            if (!exact_strict_local_response_binding_shape_valid(binding) ||
-                !add_reference(binding.policy_id))
-                return false;
-            const u32 slot = route_method_slot_from_key(binding.method);
-            if (slot == kRouteMethodSlotInvalid ||
-                ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-                 policies[binding.policy_id - 1].head_mode !=
-                     StrictLocalResponseHeadMode::SuppressBody))
-                return false;
-            for (u32 prior = 0; prior < i; prior++) {
-                const auto& earlier = exact_bindings[prior];
-                if (earlier.method == binding.method && earlier.path_view == binding.path_view &&
-                    earlier.path_len == binding.path_len &&
-                    __builtin_memcmp(earlier.path, binding.path, binding.path_len) == 0)
-                    return false;
-            }
-        }
-        if (reference_count != policy_count) return false;
+        if (has_strict_local_response_table_inventory()) return false;
 
         auto replay = [&](RouteConfig& target) {
             u16 remap[kMaxStrictLocalResponsePolicies]{};
             for (u32 i = 0; i < policy_count; i++) {
-                remap[i] = target.add_strict_local_response_policy(policies[i]);
+                remap[i] = target.add_validated_strict_local_response_policy(policies[i]);
                 if (remap[i] == 0) return false;
             }
             for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
@@ -1082,9 +1056,54 @@ struct RouteConfig {
             delete probe;
             return false;
         }
-        const bool committed = copy_strict_local_response_table_from_owned(*probe);
+        const bool committed = copy_validated_strict_local_response_table_from_owned(*probe);
         delete probe;
         return committed;
+    }
+
+public:
+    bool install_strict_local_response_table_with_pre_route(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (!strict_local_response_source_table_valid(policies,
+                                                      policy_count,
+                                                      pre_route_ids,
+                                                      method_policy_ids,
+                                                      exact_bindings,
+                                                      exact_binding_count))
+            return false;
+        return install_validated_strict_local_response_table_with_pre_route(policies,
+                                                                            policy_count,
+                                                                            pre_route_ids,
+                                                                            method_policy_ids,
+                                                                            exact_bindings,
+                                                                            exact_binding_count);
+    }
+
+    bool install_strict_local_response_table_with_pre_route_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (!strict_local_response_source_table_valid_for_internal_propagation(policies,
+                                                                               policy_count,
+                                                                               pre_route_ids,
+                                                                               method_policy_ids,
+                                                                               exact_bindings,
+                                                                               exact_binding_count))
+            return false;
+        return install_validated_strict_local_response_table_with_pre_route(policies,
+                                                                            policy_count,
+                                                                            pre_route_ids,
+                                                                            method_policy_ids,
+                                                                            exact_bindings,
+                                                                            exact_binding_count);
     }
 
     // Install one complete table transactionally. A fresh RouteConfig probes
@@ -1102,7 +1121,7 @@ struct RouteConfig {
         auto replay = [&](RouteConfig& target) {
             u16 remap[kMaxStrictLocalResponsePolicies]{};
             for (u32 i = 0; i < policy_count; i++) {
-                remap[i] = target.add_strict_local_response_policy(policies[i]);
+                remap[i] = target.add_validated_strict_local_response_policy(policies[i]);
                 if (remap[i] == 0) return false;
             }
             for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
@@ -1127,9 +1146,25 @@ struct RouteConfig {
             return false;
         }
 
-        const bool committed = copy_strict_local_response_table_from_owned(*probe);
+        const bool committed = copy_validated_strict_local_response_table_from_owned(*probe);
         delete probe;
         return committed;
+    }
+
+    bool install_strict_local_response_table_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        const u16 empty_pre_route[kStrictLocalResponseMethodSlots]{};
+        return install_strict_local_response_table_with_pre_route_for_internal_propagation(
+            policies,
+            policy_count,
+            empty_pre_route,
+            method_policy_ids,
+            exact_bindings,
+            exact_binding_count);
     }
 
     bool install_unmatched_policy_table(const StrictLocalResponsePolicySpec* policies,
@@ -1137,6 +1172,15 @@ struct RouteConfig {
                                         const u16* method_policy_ids) {
         const ExactStrictLocalResponseBinding empty[kMaxExactStrictLocalResponseBindings]{};
         return install_strict_local_response_table(
+            policies, policy_count, method_policy_ids, empty, 0);
+    }
+
+    bool install_unmatched_policy_table_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* method_policy_ids) {
+        const ExactStrictLocalResponseBinding empty[kMaxExactStrictLocalResponseBindings]{};
+        return install_strict_local_response_table_for_internal_propagation(
             policies, policy_count, method_policy_ids, empty, 0);
     }
 
@@ -1374,6 +1418,12 @@ private:
     friend bool register_jit_routes(RouteConfig& cfg,
                                     const rir::Module& mod,
                                     jit::JitEngine& engine);
+    friend bool register_jit_routes_for_internal_propagation(RouteConfig& cfg,
+                                                             const rir::Module& mod,
+                                                             jit::JitEngine& engine);
+    friend bool detail::register_verified_jit_routes(RouteConfig& cfg,
+                                                     const rir::Module& mod,
+                                                     jit::JitEngine& engine);
 
     // Verified-RIR publication entry. Deferred mode is inaccessible to native
     // callers and admitted only after register_jit_routes verifies the module.
