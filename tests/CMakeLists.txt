@@ -467,6 +467,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_converter_api_non_root_proxy_uri_differential
+        COMMAND test_nginx_differential --converter-api-non-root-proxy-uri-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_converter_api_non_root_proxy_uri_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_exact_absolute_redirect_differential
         COMMAND test_nginx_differential --converter-exact-absolute-redirect-differential
                 $<TARGET_FILE:rut>
