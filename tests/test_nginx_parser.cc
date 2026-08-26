@@ -2332,6 +2332,26 @@ TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
     REQUIRE(api_compact_lowered);
     REQUIRE(api_formatted_lowered);
     CHECK(api_compact_lowered.value().view().eq(api_formatted_lowered.value().view()));
+
+    const char v1_compact[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/v1/; } }";
+    const char v1_formatted[] =
+        "# same non-root transformed model\n"
+        "server {\n"
+        "  listen 8080;\n"
+        "  location\t/api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/; # clean replacement URI\n"
+        "  }\n"
+        "}\n";
+    auto v1_compact_parsed = nginx::parse({v1_compact, sizeof(v1_compact) - 1u});
+    auto v1_formatted_parsed = nginx::parse({v1_formatted, sizeof(v1_formatted) - 1u});
+    REQUIRE(v1_compact_parsed);
+    REQUIRE(v1_formatted_parsed);
+    auto v1_compact_lowered = nginx::lower_to_rut(v1_compact_parsed.value());
+    auto v1_formatted_lowered = nginx::lower_to_rut(v1_formatted_parsed.value());
+    REQUIRE(v1_compact_lowered);
+    REQUIRE(v1_formatted_lowered);
+    CHECK(v1_compact_lowered.value().view().eq(v1_formatted_lowered.value().view()));
 }
 
 TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
@@ -2413,6 +2433,42 @@ TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
+}
+
+TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capacity) {
+    static_assert(nginx::kMaxProxyPassUriLen == 128u);
+    static_assert(nginx::RutSource::kCapacity == 5937u);
+    char uri[nginx::kMaxProxyPassUriLen + 1u]{};
+    uri[0] = '/';
+    for (u32 i = 1; i + 1u < nginx::kMaxProxyPassUriLen; i++) uri[i] = 'a';
+    uri[nginx::kMaxProxyPassUriLen - 1u] = '/';
+
+    char source[512]{};
+    const int source_len = snprintf(source,
+                                    sizeof(source),
+                                    "server { listen 8080; location /api/ { proxy_pass "
+                                    "http://127.0.0.1:9000%s; } }",
+                                    uri);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(static_cast<u32>(source_len), static_cast<u32>(sizeof(source)));
+    const auto parsed = nginx::parse({source, static_cast<u32>(source_len)});
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().location.proxy_pass.uri.len, nginx::kMaxProxyPassUriLen);
+
+    auto model = parsed.value();
+    model.listen.port = 65535;
+    for (u32 i = 0; i < 4; i++) model.location.proxy_pass.address[i] = 255;
+    model.location.proxy_pass.port = 65535;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 3468u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
 }
 
 TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
@@ -3666,6 +3722,149 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     CHECK(populated.policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
 }
 
+TEST(nginx_converter, emitted_non_root_replacement_reaches_owned_runtime_config) {
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        char nginx_source[] =
+            "server { listen 8080; location /api/ { proxy_pass "
+            "http://127.0.0.1:9000/v1/; } }";
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 7u);
+        REQUIRE(ast_owned->items[6].kind == AstItemKind::Route);
+        REQUIRE_EQ(ast_owned->items[6].route.statements.len, 1u);
+        const AstStatement* ast_if = ast_owned->items[6].route.statements[0];
+        REQUIRE(ast_if != nullptr);
+        REQUIRE(ast_if->kind == AstStmtKind::If);
+        const AstStatement* ast_forward = ast_if->else_stmt;
+        REQUIRE(ast_forward != nullptr);
+        if (ast_forward->kind == AstStmtKind::Block) {
+            REQUIRE_EQ(ast_forward->block_stmts.len, 1u);
+            ast_forward = ast_forward->block_stmts[0];
+        }
+        REQUIRE(ast_forward != nullptr);
+        REQUIRE(ast_forward->kind == AstStmtKind::ForwardUpstream);
+        REQUIRE(ast_forward->has_forward_target_transform);
+        CHECK(ast_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(ast_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 1u);
+        REQUIRE(hir_owned->routes[0].control.kind == HirControlKind::If);
+        const auto& hir_redirect = hir_owned->routes[0].control.then_term;
+        const auto& hir_forward = hir_owned->routes[0].control.else_term;
+        CHECK(hir_redirect.kind == HirTerminatorKind::Redirect);
+        CHECK_EQ(hir_redirect.redirect_policy_id, 1u);
+        REQUIRE(hir_forward.kind == HirTerminatorKind::ForwardUpstream);
+        REQUIRE(hir_forward.has_forward_target_transform);
+        CHECK(hir_forward.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(hir_forward.forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
+        CHECK_EQ(hir_forward.forward_request_policy_id, 1u);
+        CHECK_EQ(hir_forward.forward_response_policy_id, 1u);
+        CHECK_EQ(hir_forward.forward_failure_policy_id, 1u);
+        CHECK_EQ(hir_forward.forward_timeout_failure_policy_id, 0u);
+        CHECK_EQ(hir_forward.forward_response_read_timeout_seconds, 0u);
+        CHECK(hir_forward.forward_response_buffering == ForwardResponseBufferingMode::None);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 1u);
+        CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
+        const MirTerminator* mir_redirect = nullptr;
+        const MirTerminator* mir_forward = nullptr;
+        for (u32 bi = 0; bi < mir_owned->functions[0].blocks.len; bi++) {
+            const auto& term = mir_owned->functions[0].blocks[bi].term;
+            if (term.kind == MirTerminatorKind::Redirect) mir_redirect = &term;
+            if (term.kind == MirTerminatorKind::ForwardUpstream) mir_forward = &term;
+        }
+        REQUIRE(mir_redirect != nullptr);
+        REQUIRE(mir_forward != nullptr);
+        CHECK_EQ(mir_redirect->redirect_policy_id, 1u);
+        REQUIRE(mir_forward->has_forward_target_transform);
+        CHECK(mir_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(mir_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/")));
+        CHECK_EQ(mir_forward->forward_request_policy_id, 1u);
+        CHECK_EQ(mir_forward->forward_response_policy_id, 1u);
+        CHECK_EQ(mir_forward->forward_failure_policy_id, 1u);
+        CHECK_EQ(mir_forward->forward_timeout_failure_policy_id, 0u);
+        CHECK_EQ(mir_forward->forward_response_read_timeout_seconds, 0u);
+        CHECK(mir_forward->forward_response_buffering == ForwardResponseBufferingMode::None);
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.target_transform_count, 1u);
+        CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
+        CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/v1/")));
+        REQUIRE_EQ(rir.module.response_policy_count, 1u);
+        REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+        REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+        CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+        CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+        CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
+        CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 0u);
+        CHECK(rir.module.policy_bundles[0].response_buffering ==
+              ForwardResponseBufferingMode::None);
+        REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+        CHECK(rir.module.redirect_policies[0].target_path.eq(lit_str("/api/")));
+
+        bool saw_redirect = false;
+        bool saw_transform_before_forward = false;
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+            const auto& block = rir.module.functions[0].blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op == rir::Opcode::RetRedirect) saw_redirect = true;
+                if (block.insts[ii].op != rir::Opcode::RetForwardBundle) continue;
+                REQUIRE(ii > 0);
+                CHECK_EQ(block.insts[ii - 1].op, rir::Opcode::ReqSetTargetTransform);
+                CHECK_EQ(block.insts[ii - 1].imm.i32_val, 1);
+                saw_transform_before_forward = true;
+            }
+        }
+        CHECK(saw_redirect);
+        CHECK(saw_transform_before_forward);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    // nginx source, generated source, and AST/HIR/MIR/RIR storage are gone.
+    REQUIRE_EQ(populated->target_transform_count, 1u);
+    REQUIRE_EQ(populated->target_transform_bytes_used, 9u);
+    const auto& transform = populated->target_transforms[0];
+    CHECK(transform.strip_prefix.eq(lit_str("/api/")));
+    CHECK(transform.replace_prefix.eq(lit_str("/v1/")));
+    CHECK(str_is_in_owned_pool(transform.strip_prefix,
+                               populated->target_transform_bytes,
+                               populated->target_transform_bytes_used));
+    CHECK(str_is_in_owned_pool(transform.replace_prefix,
+                               populated->target_transform_bytes,
+                               populated->target_transform_bytes_used));
+    REQUIRE_EQ(populated->response_policy_count, 1u);
+    REQUIRE_EQ(populated->failure_policy_count, 1u);
+    REQUIRE_EQ(populated->policy_bundle_count, 1u);
+    CHECK_EQ(populated->policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(populated->policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(populated->policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(populated->policy_bundles[0].response_read_timeout_seconds, 0u);
+    CHECK(populated->policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
+    REQUIRE_EQ(populated->redirect_policy_count, 1u);
+    CHECK(populated->redirect_policies[0].target_path.eq(lit_str("/api/")));
+}
+
 TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
     auto populated = std::make_unique<RouteConfig>();
     {
@@ -3773,7 +3972,7 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     REQUIRE_FALSE(bad_api_present);
     CHECK_EQ(bad_api_present.error().code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(bad_api_present.error().span.start, 22u);
-    CHECK(bad_api_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+    CHECK(bad_api_present.error().detail.eq(lit_str("location /api/ requires a proxy_pass URI")));
 
     auto other_present = valid_present;
     other_present.listen.port = 8080;
@@ -3783,8 +3982,7 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     REQUIRE_FALSE(bad_other_present);
     CHECK_EQ(bad_other_present.error().code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(bad_other_present.error().span.start, 22u);
-    CHECK(
-        bad_other_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+    CHECK(bad_other_present.error().detail.eq(lit_str("converter requires location / or /api/")));
 
     auto null_present = valid_present;
     null_present.listen.port = 8080;
@@ -3793,7 +3991,7 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     REQUIRE_FALSE(bad_null_present);
     CHECK_EQ(bad_null_present.error().code, FrontendError::UnsupportedSyntax);
     CHECK_EQ(bad_null_present.error().span.start, 22u);
-    CHECK(bad_null_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+    CHECK(bad_null_present.error().detail.eq(lit_str("invalid proxy_pass source provenance")));
 
     const u32 invalid_milliseconds[] = {0, 999, 1500, 64000};
     for (const u32 milliseconds : invalid_milliseconds) {
@@ -3913,8 +4111,8 @@ TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
         CHECK_EQ(bad_stale_uri_view.error().code, FrontendError::UnsupportedSyntax);
 }
 
-TEST(nginx_converter, parsed_non_root_proxy_uri_remains_explicitly_unsupported) {
-    const char source[] =
+TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted_bytes) {
+    char source[] =
         "server {\n"
         "  listen 8080;\n"
         "  location /api/ {\n"
@@ -3923,17 +4121,178 @@ TEST(nginx_converter, parsed_non_root_proxy_uri_remains_explicitly_unsupported) 
         "}\n";
     const auto parsed = nginx::parse({source, sizeof(source) - 1u});
     REQUIRE(parsed);
-    const Span uri_span = parsed.value().location.proxy_pass.uri_span;
-    REQUIRE(parsed.value().location.proxy_pass.uri.eq(lit_str("/v1/")));
+    const nginx::Server accepted = parsed.value();
+    const Span accepted_uri_span = accepted.location.proxy_pass.uri_span;
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span span = {}) {
+        const auto result = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+        if (span.start < span.end) {
+            CHECK_EQ(result.error().span.start, span.start);
+            CHECK_EQ(result.error().span.end, span.end);
+            CHECK_EQ(result.error().span.line, span.line);
+            CHECK_EQ(result.error().span.col, span.col);
+        }
+    };
 
-    const auto lowered = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(lowered);
-    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lowered.error().detail.eq(lit_str("converter requires proxy_pass URI /")));
-    CHECK_EQ(lowered.error().span.start, uri_span.start);
-    CHECK_EQ(lowered.error().span.end, uri_span.end);
-    CHECK_EQ(lowered.error().span.line, uri_span.line);
-    CHECK_EQ(lowered.error().span.col, uri_span.col);
+    auto forged = accepted;
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    expect_rejected(
+        forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
+
+    forged = accepted;
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_read_timeout.present = true;
+    forged.location.proxy_read_timeout.milliseconds = 1000;
+    forged.location.proxy_read_timeout.span = accepted.location.proxy_pass.span;
+    forged.location.proxy_read_timeout.value_span = accepted.location.proxy_pass.uri_span;
+    expect_rejected(
+        forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri = lit_str("/v1/");
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"));
+
+    char reconstructed[] = "/v1/";
+    forged = accepted;
+    forged.location.proxy_pass.uri = {reconstructed, sizeof(reconstructed) - 1u};
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri = {nullptr, 4};
+    expect_rejected(forged, lit_str("invalid bounded proxy_pass URI model"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri = {reinterpret_cast<const char*>(static_cast<uintptr_t>(1)), 4};
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), accepted_uri_span);
+
+    forged = accepted;
+    forged.location.proxy_pass.uri.ptr++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri.len--;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri.len = nginx::kMaxProxyPassUriLen + 1u;
+    expect_rejected(forged, lit_str("invalid bounded proxy_pass URI model"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.start--;
+    forged.location.proxy_pass.uri_span.end--;
+    forged.location.proxy_pass.uri_span.col--;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.end--;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.start = forged.location.proxy_pass.span.start - 1u;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.col++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.span.line++;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.span.line++;
+    forged.location.path_span.line++;
+    forged.location.proxy_pass.span.line++;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    forged = accepted;
+    forged.location.proxy_pass.span.end = accepted_uri_span.end;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    static constexpr char kExternalLocation[] = "/api/";
+    forged = accepted;
+    forged.location.path = {kExternalLocation, sizeof(kExternalLocation) - 1u};
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"));
+
+    forged = accepted;
+    forged.span.end = forged.location.proxy_pass.span.start;
+    forged.pre_route_trace.span.end = forged.span.end;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI spans"));
+
+    auto legacy_slash = api_server();
+    const Span legacy_uri_span = legacy_slash.location.proxy_pass.uri_span;
+    legacy_slash.location.proxy_pass.uri.ptr =
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    expect_rejected(legacy_slash, lit_str("invalid proxy_pass URI provenance"), legacy_uri_span);
+
+    char* uri = source + accepted_uri_span.start;
+    REQUIRE((Str{uri, 4}.eq(lit_str("/v1/"))));
+    uri[1] = '%';
+    expect_rejected(accepted, lit_str("invalid bounded proxy_pass URI model"));
+    uri[1] = 'v';
+    uri[3] = 'x';
+    expect_rejected(accepted, lit_str("invalid bounded proxy_pass URI model"));
+}
+
+TEST(nginx_converter, lowers_clean_non_root_proxy_uri_to_full_byte_stable_source) {
+    const char formatted[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/;\n"
+        "  }\n"
+        "}\n";
+    const char compact[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/v1/; } }";
+    const auto formatted_parsed = nginx::parse({formatted, sizeof(formatted) - 1u});
+    const auto compact_parsed = nginx::parse({compact, sizeof(compact) - 1u});
+    REQUIRE(formatted_parsed);
+    REQUIRE(compact_parsed);
+    REQUIRE(formatted_parsed.value().location.proxy_pass.uri.eq(lit_str("/v1/")));
+
+    const auto formatted_lowered = nginx::lower_to_rut(formatted_parsed.value());
+    const auto compact_lowered = nginx::lower_to_rut(compact_parsed.value());
+    const auto slash_lowered = nginx::lower_to_rut(api_server());
+    REQUIRE(formatted_lowered);
+    REQUIRE(compact_lowered);
+    REQUIRE(slash_lowered);
+    CHECK(formatted_lowered.value().view().eq(compact_lowered.value().view()));
+
+    // The existing `/api/ -> /` hard-coded golden proves the complete baseline.
+    // These adjacent prefix/replacement/suffix partitions cover every output byte
+    // and prove that this increment changes only the ordinary-RUT replacement value.
+    static constexpr char kMarker[] = "            replace_prefix: \"";
+    const char* slash_marker = strstr(slash_lowered.value().data, kMarker);
+    const char* v1_marker = strstr(formatted_lowered.value().data, kMarker);
+    REQUIRE(slash_marker != nullptr);
+    REQUIRE(v1_marker != nullptr);
+    const char* slash_replacement = slash_marker + sizeof(kMarker) - 1u;
+    const char* v1_replacement = v1_marker + sizeof(kMarker) - 1u;
+    const u32 prefix_len = static_cast<u32>(slash_replacement - slash_lowered.value().data);
+    CHECK_EQ(prefix_len, static_cast<u32>(v1_replacement - formatted_lowered.value().data));
+    CHECK((Str{formatted_lowered.value().data, prefix_len}.eq(
+        {slash_lowered.value().data, prefix_len})));
+    CHECK((Str{v1_replacement, 4}.eq(lit_str("/v1/"))));
+    REQUIRE_EQ(slash_replacement[0], '/');
+    const char* slash_suffix = slash_replacement + 1;
+    const char* v1_suffix = v1_replacement + 4;
+    const u32 slash_suffix_len =
+        static_cast<u32>(slash_lowered.value().data + slash_lowered.value().len - slash_suffix);
+    const u32 v1_suffix_len = static_cast<u32>(formatted_lowered.value().data +
+                                               formatted_lowered.value().len - v1_suffix);
+    REQUIRE_EQ(v1_suffix_len, slash_suffix_len);
+    CHECK((Str{v1_suffix, v1_suffix_len}.eq({slash_suffix, slash_suffix_len})));
+    CHECK_EQ(formatted_lowered.value().len, slash_lowered.value().len + 3u);
+    CHECK_EQ(formatted_lowered.value().len, 3336u);
+    CHECK_LT(formatted_lowered.value().len, nginx::RutSource::kCapacity);
 }
 
 int main(int argc, char** argv) {
