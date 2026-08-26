@@ -35876,6 +35876,8 @@ unmatched { return local_response({
     const auto& ast_policy = ast->strict_local_response_policies[0];
     CHECK_EQ(strict_local_response_profile(ast_policy.status_code),
              StrictLocalResponseProfile::Representation200);
+    CHECK_EQ(ast_policy.reserved0, 0u);
+    CHECK_EQ(ast_policy.reserved1, 0u);
     CHECK(ast_policy.reason.eq(lit("OK")));
     CHECK(ast_policy.content_type.eq(lit("text/plain")));
     CHECK(ast_policy.server.eq(lit("nginx/1.29.7")));
@@ -35888,14 +35890,20 @@ unmatched { return local_response({
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(hir->strict_local_response_policies[0].reserved0, 0u);
+    CHECK_EQ(hir->strict_local_response_policies[0].reserved1, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(mir->strict_local_response_policies[0].reserved0, 0u);
+    CHECK_EQ(mir->strict_local_response_policies[0].reserved1, 0u);
     FrontendRirModule lowered{};
     REQUIRE(lower_to_rir(mir.value(), lowered));
     REQUIRE(rir::verify_module(lowered.module).ok);
     REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
     const auto& rir_policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(rir_policy.reserved0, 0u);
+    CHECK_EQ(rir_policy.reserved1, 0u);
     CHECK(strict_local_response_policy_spec_valid(rir_policy));
     CHECK(rir_policy.reason.eq(lit("OK")));
     CHECK(rir_policy.content_type.eq(lit("text/plain")));
@@ -35906,6 +35914,204 @@ unmatched { return local_response({
     CHECK(rir_policy.server.ptr != ast_policy.server.ptr);
     CHECK(rir_policy.body.ptr != ast_policy.body.ptr);
     lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_internal_profile_contract_is_complete_and_fenced) {
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::Invalid) == 0);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::Representation200) == 1);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::LegacyError) == 2);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::NoContent204) == 3);
+    static_assert(sizeof(StrictLocalResponsePolicySpec) == 72);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, version) == 0);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reserved0) == 1);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, status_code) == 2);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, date) == 4);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, connection) == 5);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, head_mode) == 6);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reserved1) == 7);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reason) == 8);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, content_type) == 24);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, server) == 40);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, body) == 56);
+
+    StrictLocalResponsePolicySpec representation{};
+    CHECK_EQ(representation.reserved0, 0u);
+    CHECK_EQ(representation.reserved1, 0u);
+    representation.version = StrictLocalResponseVersion::Http11;
+    representation.status_code = 200;
+    representation.date = StrictLocalResponseDate::Current;
+    representation.connection = StrictLocalResponseConnection::Request;
+    representation.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    representation.reason = {"OK", 2};
+    representation.content_type = {"text/plain", 10};
+    representation.server = {"rut", 3};
+    representation.body = {"body", 4};
+    REQUIRE_EQ(strict_local_response_policy_profile(representation),
+               StrictLocalResponseProfile::Representation200);
+    REQUIRE(strict_local_response_policy_spec_valid(representation));
+
+    StrictLocalResponsePolicySpec legacy = representation;
+    legacy.status_code = 400;
+    legacy.reason = {"Bad Request", 11};
+    legacy.content_type = {"text/html", 9};
+    legacy.head_mode = StrictLocalResponseHeadMode::Reject;
+    legacy.body = {};
+    CHECK_EQ(strict_local_response_policy_profile(legacy), StrictLocalResponseProfile::LegacyError);
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+
+    std::string max_reason(kMaxStrictLocalResponseReasonLen, 'r');
+    std::string max_content_type(kMaxStrictLocalResponseContentTypeLen, 't');
+    std::string max_server(kMaxStrictLocalResponseServerLen, 's');
+    std::string max_body(kMaxStrictLocalResponseBodyLen, '\0');
+    StrictLocalResponsePolicySpec boundary = legacy;
+    boundary.status_code = 599;
+    boundary.reason = {max_reason.data(), static_cast<u32>(max_reason.size())};
+    boundary.content_type = {max_content_type.data(), static_cast<u32>(max_content_type.size())};
+    boundary.server = {max_server.data(), static_cast<u32>(max_server.size())};
+    boundary.body = {max_body.data(), static_cast<u32>(max_body.size())};
+    CHECK_EQ(strict_local_response_policy_profile(boundary),
+             StrictLocalResponseProfile::LegacyError);
+    CHECK(strict_local_response_policy_spec_valid(boundary));
+
+    StrictLocalResponsePolicySpec no_content{};
+    no_content.version = StrictLocalResponseVersion::Http11;
+    no_content.status_code = 204;
+    no_content.date = StrictLocalResponseDate::Current;
+    no_content.connection = StrictLocalResponseConnection::Request;
+    no_content.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    no_content.reason = {"No Content", 10};
+    no_content.server = {"nginx/1.29.7", 12};
+    char empty_anchor = 0;
+    const Str empty_views[] = {{nullptr, 0}, {&empty_anchor + 1, 0}};
+    for (const Str content_type : empty_views) {
+        for (const Str body : empty_views) {
+            no_content.content_type = content_type;
+            no_content.body = body;
+            CHECK_EQ(strict_local_response_policy_profile(no_content),
+                     StrictLocalResponseProfile::NoContent204);
+            CHECK_FALSE(strict_local_response_policy_spec_valid(no_content));
+        }
+    }
+    no_content.content_type = {};
+    no_content.body = {};
+
+    CHECK_EQ(strict_local_response_profile(204), StrictLocalResponseProfile::Invalid);
+    CHECK_FALSE(strict_local_response_status_supported(204));
+    StrictLocalResponsePolicySpec status_only{};
+    status_only.status_code = 204;
+    CHECK_EQ(strict_local_response_policy_profile(status_only),
+             StrictLocalResponseProfile::Invalid);
+
+    auto rejects_derivation = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_EQ(strict_local_response_policy_profile(forged), StrictLocalResponseProfile::Invalid);
+    };
+    auto forged = no_content;
+    forged.version = StrictLocalResponseVersion::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.date = StrictLocalResponseDate::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.connection = StrictLocalResponseConnection::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reason = {"Not Content", 11};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.content_type = {"text/plain", 10};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.body = {"x", 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reserved0 = 1;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reserved1 = 1;
+    rejects_derivation(forged);
+
+    char control[] = {'x', '\r'};
+    forged = no_content;
+    forged.reason = {control, 2};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {control, 2};
+    rejects_derivation(forged);
+    max_reason.push_back('r');
+    forged = no_content;
+    forged.reason = {max_reason.data(), static_cast<u32>(max_reason.size())};
+    rejects_derivation(forged);
+    max_server.push_back('s');
+    forged = no_content;
+    forged.server = {max_server.data(), static_cast<u32>(max_server.size())};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reason = {nullptr, 10};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.content_type = {nullptr, 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {nullptr, 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.body = {nullptr, 1};
+    rejects_derivation(forged);
+
+    for (const u16 status :
+         {100u, 199u, 201u, 202u, 203u, 205u, 206u, 299u, 304u, 399u, 600u, 65535u}) {
+        forged = no_content;
+        forged.status_code = status;
+        rejects_derivation(forged);
+    }
+
+    u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
+    method_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
+    CHECK_FALSE(strict_local_response_policy_table_valid(
+        &no_content, 1, method_policy_ids, kStrictLocalResponseMethodSlots));
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    unmatched_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
+    ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
+    CHECK_FALSE(strict_local_response_source_table_valid(
+        &no_content, 1, pre_route_policy_ids, unmatched_policy_ids, exact_bindings, 0));
+
+    const char public_204[] = R"rut(route exact GET "/static" { return local_response({
+      version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
+      date: "current", content_type: "", connection: "request",
+      head_mode: "suppress_body", body: b""
+    }) })rut";
+    auto public_204_lexed = lex(lit(public_204));
+    REQUIRE(public_204_lexed);
+    CHECK_FALSE(parse_file_heap(public_204_lexed.value()).has_value());
+
+    for (const bool first_reserved : {true, false}) {
+        auto representation_forged = representation;
+        auto legacy_forged = legacy;
+        if (first_reserved) {
+            representation_forged.reserved0 = 1;
+            legacy_forged.reserved0 = 1;
+        } else {
+            representation_forged.reserved1 = 1;
+            legacy_forged.reserved1 = 1;
+        }
+        const auto copied_forgery = representation_forged;
+        CHECK_EQ(copied_forgery.reserved0, representation_forged.reserved0);
+        CHECK_EQ(copied_forgery.reserved1, representation_forged.reserved1);
+        CHECK_FALSE(strict_local_response_policy_spec_valid(representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_valid(legacy_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(representation, representation_forged));
+        CHECK_FALSE(
+            strict_local_response_policy_spec_equal(representation_forged, representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(legacy, legacy_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(legacy_forged, legacy_forged));
+    }
 }
 
 TEST(frontend, strict_local_response_representation200_rejection_matrix_is_central) {

@@ -819,10 +819,12 @@ struct RouteConfig {
         };
         auto& dst = strict_local_response_policies[strict_local_response_policy_count];
         dst.version = policy.version;
+        dst.reserved0 = policy.reserved0;
         dst.status_code = policy.status_code;
         dst.date = policy.date;
         dst.connection = policy.connection;
         dst.head_mode = policy.head_mode;
+        dst.reserved1 = policy.reserved1;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);
@@ -933,10 +935,12 @@ struct RouteConfig {
             const auto& src = source.strict_local_response_policies[i];
             auto& dst = strict_local_response_policies[i];
             dst.version = src.version;
+            dst.reserved0 = src.reserved0;
             dst.status_code = src.status_code;
             dst.date = src.date;
             dst.connection = src.connection;
             dst.head_mode = src.head_mode;
+            dst.reserved1 = src.reserved1;
             dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
             dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
             dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};

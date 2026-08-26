@@ -103,19 +103,35 @@ enum class StrictLocalResponseProfile : u8 {
     Invalid = 0,
     Representation200 = 1,
     LegacyError = 2,
+    NoContent204 = 3,
 };
 
 struct StrictLocalResponsePolicySpec {
     StrictLocalResponseVersion version = StrictLocalResponseVersion::Invalid;
+    u8 reserved0 = 0;
     u16 status_code = 0;
     StrictLocalResponseDate date = StrictLocalResponseDate::Invalid;
     StrictLocalResponseConnection connection = StrictLocalResponseConnection::Invalid;
     StrictLocalResponseHeadMode head_mode = StrictLocalResponseHeadMode::Invalid;
+    u8 reserved1 = 0;
     Str reason{};
     Str content_type{};
     Str server{};
     Str body{};
 };
+
+static_assert(sizeof(StrictLocalResponsePolicySpec) == 72);
+static_assert(offsetof(StrictLocalResponsePolicySpec, version) == 0);
+static_assert(offsetof(StrictLocalResponsePolicySpec, reserved0) == 1);
+static_assert(offsetof(StrictLocalResponsePolicySpec, status_code) == 2);
+static_assert(offsetof(StrictLocalResponsePolicySpec, date) == 4);
+static_assert(offsetof(StrictLocalResponsePolicySpec, connection) == 5);
+static_assert(offsetof(StrictLocalResponsePolicySpec, head_mode) == 6);
+static_assert(offsetof(StrictLocalResponsePolicySpec, reserved1) == 7);
+static_assert(offsetof(StrictLocalResponsePolicySpec, reason) == 8);
+static_assert(offsetof(StrictLocalResponsePolicySpec, content_type) == 24);
+static_assert(offsetof(StrictLocalResponsePolicySpec, server) == 40);
+static_assert(offsetof(StrictLocalResponsePolicySpec, body) == 56);
 
 inline bool strict_local_response_safe_text(Str value, u32 cap) {
     if (value.ptr == nullptr || value.len == 0 || value.len > cap) return false;
@@ -147,28 +163,47 @@ constexpr bool strict_local_response_status_supported(u16 status_code) {
     return strict_local_response_profile(status_code) != StrictLocalResponseProfile::Invalid;
 }
 
-inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePolicySpec& policy) {
+// Closed internal vocabulary derived from the complete semantic tuple. Public
+// source acceptance deliberately remains fenced by the status-only helper.
+inline StrictLocalResponseProfile strict_local_response_policy_profile(
+    const StrictLocalResponsePolicySpec& policy) {
     const auto profile = strict_local_response_profile(policy.status_code);
-    if (profile == StrictLocalResponseProfile::Invalid ||
+    if (policy.reserved0 != 0 || policy.reserved1 != 0 ||
         policy.version != StrictLocalResponseVersion::Http11 ||
         policy.date != StrictLocalResponseDate::Current ||
         policy.connection != StrictLocalResponseConnection::Request ||
         (policy.head_mode != StrictLocalResponseHeadMode::Reject &&
          policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
         !strict_local_response_safe_text(policy.reason, kMaxStrictLocalResponseReasonLen) ||
+        !strict_local_response_safe_text(policy.server, kMaxStrictLocalResponseServerLen))
+        return StrictLocalResponseProfile::Invalid;
+    if (policy.status_code == 204) {
+        if (!policy.reason.eq(lit_str("No Content")) ||
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody ||
+            policy.content_type.len != 0 || policy.body.len != 0)
+            return StrictLocalResponseProfile::Invalid;
+        return StrictLocalResponseProfile::NoContent204;
+    }
+    if (profile == StrictLocalResponseProfile::Invalid ||
         !strict_local_response_content_type_valid(policy.content_type) ||
-        !strict_local_response_safe_text(policy.server, kMaxStrictLocalResponseServerLen) ||
         !strict_local_response_body_valid(policy.body))
-        return false;
+        return StrictLocalResponseProfile::Invalid;
     if (profile == StrictLocalResponseProfile::Representation200 &&
         (!policy.reason.eq(lit_str("OK")) || !policy.content_type.eq(lit_str("text/plain")) ||
          policy.head_mode != StrictLocalResponseHeadMode::SuppressBody || policy.body.len == 0))
-        return false;
-    return true;
+        return StrictLocalResponseProfile::Invalid;
+    return profile;
+}
+
+inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePolicySpec& policy) {
+    const auto profile = strict_local_response_policy_profile(policy);
+    return profile == StrictLocalResponseProfile::Representation200 ||
+           profile == StrictLocalResponseProfile::LegacyError;
 }
 
 inline bool strict_local_response_policy_spec_equal(const StrictLocalResponsePolicySpec& a,
                                                     const StrictLocalResponsePolicySpec& b) {
+    if (a.reserved0 != 0 || a.reserved1 != 0 || b.reserved0 != 0 || b.reserved1 != 0) return false;
     return a.version == b.version && a.status_code == b.status_code && a.date == b.date &&
            a.connection == b.connection && a.head_mode == b.head_mode && a.reason.eq(b.reason) &&
            a.content_type.eq(b.content_type) && a.server.eq(b.server) && a.body.eq(b.body);

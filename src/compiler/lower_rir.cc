@@ -3526,10 +3526,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         const auto& src = mir.strict_local_response_policies[i];
         auto& dst = out.module.strict_local_response_policies[i];
         dst.version = src.version;
+        dst.reserved0 = src.reserved0;
         dst.status_code = src.status_code;
         dst.date = src.date;
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
+        dst.reserved1 = src.reserved1;
         if (!copy_policy_str(src.reason, dst.reason) ||
             !copy_policy_str(src.content_type, dst.content_type) ||
             !copy_policy_str(src.server, dst.server) || !copy_policy_str(src.body, dst.body))
