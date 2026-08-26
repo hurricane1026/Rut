@@ -50,9 +50,10 @@ struct Location {
     ProxyReadTimeout proxy_read_timeout{};
 };
 
-// The nginx lexer currently has no quoted-string escape mode. Keep this first
-// local-response slice honest and lossless: one non-empty, quote-delimited,
-// token-safe printable ASCII body of at most 64 bytes, borrowed from source.
+// This bounded local-response slice borrows one non-empty raw quoted body of at
+// most 64 bytes from source. It accepts the original token-safe printable ASCII
+// grammar plus exactly one non-edge ASCII space; escapes, variables, controls,
+// and broader nginx quoted-string semantics remain outside the model.
 static constexpr u32 kMaxLocalReturnBodyLen = 64;
 
 struct LocalReturn {

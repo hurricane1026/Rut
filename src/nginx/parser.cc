@@ -20,6 +20,36 @@ public:
 
     Token next() {
         skip_space_and_comments();
+        return next_unskipped();
+    }
+
+    // nginx quote handling is deliberately not part of the general lexer in
+    // this bounded frontend. Only an accepted `return 200` asks for one raw
+    // quoted lexeme so its complete source range can be validated without
+    // decoding or normalizing it.
+    Token next_local_return_body() {
+        skip_space_and_comments();
+        if (pos_ >= source_.len || source_.ptr[pos_] != '"') return next_unskipped();
+
+        const u32 start = pos_;
+        const u32 line = line_;
+        const u32 col = col_;
+        advance();
+        while (pos_ < source_.len) {
+            const char ch = source_.ptr[pos_];
+            if (ch == '\\') {
+                advance();
+                if (pos_ < source_.len) advance();
+                continue;
+            }
+            advance();
+            if (ch == '"') break;
+        }
+        return {TokenKind::Word, source_.slice(start, pos_), Span{start, pos_, line, col}};
+    }
+
+private:
+    Token next_unskipped() {
         if (pos_ >= source_.len) return {TokenKind::End, {}, Span{pos_, pos_, line_, col_}};
 
         const u32 start = pos_;
@@ -41,8 +71,6 @@ public:
         }
         return {TokenKind::Word, source_.slice(start, pos_), Span{start, pos_, line, col}};
     }
-
-private:
     static bool is_space(char c) {
         return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
     }
@@ -543,7 +571,7 @@ private:
         const Token status = cur_;
         if (!eq(status.text, "200", 3))
             return unsupported(status.span, lit_str("only return status 200 is supported"));
-        advance();
+        cur_ = lexer_.next_local_return_body();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("return requires a literal body"));
         if (cur_.kind != TokenKind::Word)
@@ -573,8 +601,13 @@ private:
         if (text.len < 3 || text.ptr[0] != '"' || text.ptr[text.len - 1] != '"') return false;
         const u32 body_len = text.len - 2;
         if (body_len == 0 || body_len > kMaxLocalReturnBodyLen) return false;
+        u32 space_count = 0;
         for (u32 i = 1; i + 1 < text.len; i++) {
             const u8 value = static_cast<u8>(text.ptr[i]);
+            if (value == 0x20) {
+                if (i == 1 || i + 2 == text.len || ++space_count > 1) return false;
+                continue;
+            }
             if (value < 0x21 || value > 0x7e || text.ptr[i] == '"' || text.ptr[i] == '\\' ||
                 text.ptr[i] == '$' || text.ptr[i] == '#' || text.ptr[i] == '{' ||
                 text.ptr[i] == '}' || text.ptr[i] == ';')
