@@ -2815,7 +2815,7 @@ static nginx::Server api_server() {
     return server;
 }
 
-TEST(nginx_converter, keeps_exact_no_content_return_lowering_closed_before_dynamic_reads) {
+TEST(nginx_converter, validates_exact_no_content_return_before_dynamic_reads) {
     static constexpr char kRootFirst[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /static { return 204; } }";
@@ -2837,12 +2837,11 @@ TEST(nginx_converter, keeps_exact_no_content_return_lowering_closed_before_dynam
     REQUIRE(local);
     REQUIRE(redirect);
 
-    const auto expect_closed = [&](const nginx::Server& model, Span expected_span) {
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span expected_span) {
         const auto lowered = nginx::lower_to_rut(model);
         REQUIRE_FALSE(lowered);
         CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(
-            lit_str("exact no-content return lowering is not implemented")));
+        CHECK(lowered.error().detail.eq(detail));
         CHECK_EQ(lowered.error().span.start, expected_span.start);
         CHECK_EQ(lowered.error().span.end, expected_span.end);
         CHECK_EQ(lowered.error().span.line, expected_span.line);
@@ -2850,74 +2849,215 @@ TEST(nginx_converter, keeps_exact_no_content_return_lowering_closed_before_dynam
     };
 
     for (const nginx::Server* model : {&root_first.value(), &exact_first.value()}) {
-        const Span action_span = model->exact_no_content_return.response.span;
-        expect_closed(*model, action_span);
+        REQUIRE(nginx::lower_to_rut(*model));
 
         auto forged = *model;
         forged.exact_no_content_return.present = false;
-        expect_closed(forged, action_span);
+        expect_rejected(forged,
+                        lit_str("invalid absent exact no-content return model"),
+                        model->exact_no_content_return.response.span);
 
         for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
             forged = *model;
             forged.exact_no_content_return.path.ptr = reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(forged,
+                            lit_str("invalid exact no-content return path provenance"),
+                            forged.exact_no_content_return.path_span);
 
-            // Each later/legacy model is forged independently. The no-content
-            // inventory fence must win before any one of these pointers could
-            // be inspected by its normal validator.
             forged = *model;
             forged.location.path.ptr = reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(forged,
+                            lit_str("invalid exact no-content return fallback provenance"),
+                            forged.location.path_span);
 
             forged = *model;
             forged.exact_local_return.path.ptr = reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(
+                forged, lit_str("multiple exact semantic actions are unsupported"), model->span);
 
             forged = *model;
             forged.exact_local_return.response.body.ptr = reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(
+                forged, lit_str("multiple exact semantic actions are unsupported"), model->span);
 
             forged = *model;
             forged.exact_absolute_redirect.response.status_lexeme.ptr =
                 reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(
+                forged, lit_str("multiple exact semantic actions are unsupported"), model->span);
 
             forged = *model;
             forged.exact_absolute_redirect.response.target.ptr =
                 reinterpret_cast<const char*>(address);
-            expect_closed(forged, action_span);
+            expect_rejected(
+                forged, lit_str("multiple exact semantic actions are unsupported"), model->span);
         }
 
         forged = *model;
+        forged.exact_no_content_return.path.len = 0;
+        expect_rejected(forged,
+                        lit_str("invalid bounded exact no-content return path model"),
+                        forged.exact_no_content_return.path_span);
+        forged.exact_no_content_return.path.len = UINT32_MAX;
+        expect_rejected(forged,
+                        lit_str("invalid bounded exact no-content return path model"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status = 205;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status"),
+                        forged.exact_no_content_return.response.status_span);
+
+        forged = *model;
+        forged.exact_no_content_return.span = {};
+        expect_rejected(
+            forged, lit_str("invalid exact no-content return location span"), model->span);
+
+        forged = *model;
+        forged.exact_no_content_return.path_span = {};
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path span"),
+                        forged.exact_no_content_return.span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.span = {};
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return directive span"),
+                        forged.exact_no_content_return.span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status_span = {};
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status span"),
+                        forged.exact_no_content_return.response.span);
+
+        forged = *model;
+        forged.exact_no_content_return.path_span.end--;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path span"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status_span.end++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status span"),
+                        forged.exact_no_content_return.response.status_span);
+
+        forged = *model;
+        forged.span.start++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return location span"),
+                        forged.exact_no_content_return.span);
+
+        forged = *model;
+        forged.span.end = forged.exact_no_content_return.span.end - 1u;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return location span"),
+                        forged.exact_no_content_return.span);
+
+        forged = *model;
+        forged.exact_no_content_return.span.end =
+            forged.exact_no_content_return.response.span.end - 1u;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return directive span"),
+                        forged.exact_no_content_return.response.span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.span.start =
+            forged.exact_no_content_return.path_span.end;
+        forged.exact_no_content_return.response.span.col =
+            forged.exact_no_content_return.path_span.col + forged.exact_no_content_return.path.len;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return directive span"),
+                        forged.exact_no_content_return.response.span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status_span.end =
+            forged.exact_no_content_return.response.span.end;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status span"),
+                        forged.exact_no_content_return.response.status_span);
+
+        forged = *model;
+        forged.location.path.len = 2u;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return fallback provenance"),
+                        forged.location.path_span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status_span.start =
+            forged.exact_no_content_return.response.span.start;
+        forged.exact_no_content_return.response.status_span.end =
+            forged.exact_no_content_return.response.span.start + 3u;
+        forged.exact_no_content_return.response.status_span.line =
+            forged.exact_no_content_return.response.span.line;
+        forged.exact_no_content_return.response.status_span.col =
+            forged.exact_no_content_return.response.span.col;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status span"),
+                        forged.exact_no_content_return.response.status_span);
+
+        forged = *model;
+        forged.exact_no_content_return.span.line++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path span"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_no_content_return.path_span.col++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path span"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.span.col++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return directive span"),
+                        forged.exact_no_content_return.response.span);
+
+        forged = *model;
+        forged.exact_no_content_return.response.status_span.col++;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return status span"),
+                        forged.exact_no_content_return.response.status_span);
+
+        char independent_source[sizeof(kRootFirst)]{};
+        memcpy(independent_source, kRootFirst, sizeof(kRootFirst));
+        forged = *model;
+        forged.exact_no_content_return.path.ptr =
+            independent_source + forged.exact_no_content_return.path_span.start;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path provenance"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.location.path.ptr = independent_source + forged.location.path_span.start;
+        expect_rejected(forged,
+                        lit_str("invalid exact no-content return path provenance"),
+                        forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_local_return = local.value().exact_local_return;
+        expect_rejected(forged,
+                        lit_str("multiple exact semantic actions are unsupported"),
+                        forged.exact_local_return.span);
+
+        forged = *model;
+        forged.exact_absolute_redirect = redirect.value().exact_absolute_redirect;
+        expect_rejected(forged,
+                        lit_str("multiple exact semantic actions are unsupported"),
+                        forged.exact_absolute_redirect.span);
+
+        forged = *model;
         forged.pre_route_trace.profile = static_cast<nginx::ImplicitPreRouteProfile>(0xff);
-        expect_closed(forged, action_span);
+        expect_rejected(
+            forged, lit_str("invalid pre-route TRACE profile model"), forged.pre_route_trace.span);
 
         forged = *model;
         forged.location.proxy_read_timeout.present = true;
         forged.location.proxy_read_timeout.milliseconds = 1;
-        expect_closed(forged, action_span);
-
-        forged = *model;
-        forged.listen.port = 0;
-        expect_closed(forged, action_span);
-
-        forged = *model;
-        forged.exact_no_content_return.path_span = {};
-        forged.exact_no_content_return.response.status_span = {};
-        expect_closed(forged, action_span);
-
-        forged = *model;
-        forged.exact_no_content_return.span = {};
-        forged.exact_no_content_return.response.span = {};
-        expect_closed(forged, forged.exact_no_content_return.path_span);
-
-        forged = *model;
-        forged.exact_local_return = local.value().exact_local_return;
-        expect_closed(forged, action_span);
-
-        forged = *model;
-        forged.exact_absolute_redirect = redirect.value().exact_absolute_redirect;
-        expect_closed(forged, action_span);
+        expect_rejected(forged, lit_str("invalid proxy_read_timeout spans"), model->location.span);
     }
 
     // A completely absent/default action has no inventory and leaves every
@@ -2927,29 +3067,185 @@ TEST(nginx_converter, keeps_exact_no_content_return_lowering_closed_before_dynam
 
     auto present_only = canonical_server();
     present_only.exact_no_content_return.present = true;
-    expect_closed(present_only, present_only.span);
+    expect_rejected(present_only,
+                    lit_str("invalid bounded exact no-content return path model"),
+                    present_only.span);
+
+    const auto expect_absent_dirty = [&](const nginx::Server& dirty, Span expected_span) {
+        expect_rejected(
+            dirty, lit_str("invalid absent exact no-content return model"), expected_span);
+    };
 
     auto dirty = canonical_server();
     dirty.exact_no_content_return.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
-    expect_closed(dirty, dirty.span);
+    expect_absent_dirty(dirty, dirty.span);
     dirty = canonical_server();
     dirty.exact_no_content_return.path.len = 7;
-    expect_closed(dirty, dirty.span);
+    expect_absent_dirty(dirty, dirty.span);
     dirty = canonical_server();
     dirty.exact_no_content_return.path_span = Span{4, 11, 1, 5};
-    expect_closed(dirty, dirty.exact_no_content_return.path_span);
+    expect_absent_dirty(dirty, dirty.exact_no_content_return.path_span);
     dirty = canonical_server();
     dirty.exact_no_content_return.span = Span{4, 20, 1, 5};
-    expect_closed(dirty, dirty.exact_no_content_return.span);
+    expect_absent_dirty(dirty, dirty.exact_no_content_return.span);
     dirty = canonical_server();
     dirty.exact_no_content_return.response.status = 204;
-    expect_closed(dirty, dirty.span);
+    expect_absent_dirty(dirty, dirty.span);
     dirty = canonical_server();
     dirty.exact_no_content_return.response.status_span = Span{12, 15, 1, 13};
-    expect_closed(dirty, dirty.exact_no_content_return.response.status_span);
+    expect_absent_dirty(dirty, dirty.exact_no_content_return.response.status_span);
     dirty = canonical_server();
     dirty.exact_no_content_return.response.span = Span{5, 16, 1, 6};
-    expect_closed(dirty, dirty.exact_no_content_return.response.span);
+    expect_absent_dirty(dirty, dirty.exact_no_content_return.response.span);
+}
+
+TEST(nginx_converter, exact_no_content_return_rejects_mutated_source_literals_and_delimiters) {
+    static constexpr char kCanonical[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    struct Mutation {
+        const char* needle;
+        u32 offset;
+        char replacement;
+        Str detail;
+        u8 span_kind;
+    };
+    const Mutation mutations[] = {
+        {"/static", 1u, 'x', lit_str("invalid exact no-content return location path"), 0u},
+        {"location / {", 9u, 'x', lit_str("invalid exact no-content return fallback path"), 3u},
+        {"204", 2u, '5', lit_str("invalid exact no-content return status literal"), 1u},
+        {"return", 0u, 'x', lit_str("invalid exact no-content return directive delimiter"), 2u},
+        {"return 204", 6u, 'x', lit_str("invalid exact no-content return directive delimiter"), 2u},
+        {"204;", 3u, ':', lit_str("invalid exact no-content return directive delimiter"), 2u},
+    };
+    for (const auto& mutation : mutations) {
+        char source[sizeof(kCanonical)]{};
+        memcpy(source, kCanonical, sizeof(kCanonical));
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        char* byte = strstr(source, mutation.needle);
+        REQUIRE(byte != nullptr);
+        byte[mutation.offset] = mutation.replacement;
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(mutation.detail));
+        const auto& action = parsed.value().exact_no_content_return;
+        const Span expected = mutation.span_kind == 0u   ? action.path_span
+                              : mutation.span_kind == 1u ? action.response.status_span
+                              : mutation.span_kind == 2u ? action.response.span
+                                                         : parsed.value().location.path_span;
+        CHECK_EQ(lowered.error().span.start, expected.start);
+        CHECK_EQ(lowered.error().span.end, expected.end);
+    }
+
+    static constexpr char kSeparated[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204  # separated comment\n ; } }";
+    for (const char replacement : {'#', 'x'}) {
+        char source[sizeof(kSeparated)]{};
+        memcpy(source, kSeparated, sizeof(kSeparated));
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        char* status = strstr(source, "204  #");
+        REQUIRE(status != nullptr);
+        status[3] = replacement;
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(
+            lit_str("invalid exact no-content return directive delimiter")));
+        CHECK_EQ(lowered.error().span.start,
+                 parsed.value().exact_no_content_return.response.span.start);
+        CHECK_EQ(lowered.error().span.end,
+                 parsed.value().exact_no_content_return.response.span.end);
+    }
+}
+
+TEST(nginx_converter, exact_no_content_return_rejects_forged_location_shell) {
+    static constexpr char kCanonical[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    struct Mutation {
+        u32 offset;
+        char replacement;
+        u8 span_kind;
+    };
+    // Offsets are relative to the exact location's complete semantic span:
+    // `location = /static { return 204; }`.
+    const Mutation mutations[] = {
+        {1u, 'x', 0u},   // location keyword
+        {8u, 'x', 0u},   // keyword lexer delimiter
+        {8u, '#', 0u},   // unterminated pre-`=` comment
+        {9u, 'x', 0u},   // exact `=` token
+        {10u, '=', 0u},  // second `=` instead of the required gap
+        {10u, '#', 0u},  // unterminated pre-path comment
+        {18u, '#', 2u},  // Stage 2 excluded adjacent-path comment
+        {19u, '#', 0u},  // reviewer reproducer: `return 204;` becomes comment text
+        {20u, '#', 1u},  // unterminated comment in the pre-response gap
+        {32u, '#', 0u},  // unterminated post-response comment
+        {33u, 'x', 0u},  // exact closing `}`
+    };
+    for (const auto& mutation : mutations) {
+        char source[sizeof(kCanonical)]{};
+        memcpy(source, kCanonical, sizeof(kCanonical));
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        const auto& action = parsed.value().exact_no_content_return;
+        REQUIRE_LT(mutation.offset, action.span.end - action.span.start);
+        source[action.span.start + mutation.offset] = mutation.replacement;
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        const Str expected_detail =
+            mutation.span_kind == 1u ? lit_str("invalid exact no-content return pre-response gap")
+            : mutation.span_kind == 2u
+                ? lit_str("exact local return path is outside the bounded clean profile")
+                : lit_str("invalid exact no-content return location shell");
+        CHECK(lowered.error().detail.eq(expected_detail));
+        const Span expected = mutation.span_kind == 1u   ? action.response.span
+                              : mutation.span_kind == 2u ? action.path_span
+                                                         : action.span;
+        CHECK_EQ(lowered.error().span.start, expected.start);
+        CHECK_EQ(lowered.error().span.end, expected.end);
+        CHECK_EQ(lowered.error().span.line, expected.line);
+        CHECK_EQ(lowered.error().span.col, expected.col);
+    }
+
+    const auto parsed = nginx::parse({kCanonical, sizeof(kCanonical) - 1u});
+    REQUIRE(parsed);
+    auto forged = parsed.value();
+    forged.exact_no_content_return.span.start++;
+    forged.exact_no_content_return.span.col++;
+    auto lowered = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().detail.eq(lit_str("invalid exact no-content return location shell")));
+    CHECK_EQ(lowered.error().span.start, forged.exact_no_content_return.span.start);
+    CHECK_EQ(lowered.error().span.end, forged.exact_no_content_return.span.end);
+
+    forged = parsed.value();
+    forged.exact_no_content_return.span.end--;
+    lowered = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().detail.eq(lit_str("invalid exact no-content return location shell")));
+    CHECK_EQ(lowered.error().span.start, forged.exact_no_content_return.span.start);
+    CHECK_EQ(lowered.error().span.end, forged.exact_no_content_return.span.end);
+
+    char adjacent_source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static \n { return 204; } }";
+    const auto adjacent_model = nginx::parse({adjacent_source, sizeof(adjacent_source) - 1u});
+    REQUIRE(adjacent_model);
+    const Span adjacent_path = adjacent_model.value().exact_no_content_return.path_span;
+    REQUIRE_EQ(adjacent_source[adjacent_path.end], ' ');
+    adjacent_source[adjacent_path.end] = '#';
+    const auto adjacent_lowered = nginx::lower_to_rut(adjacent_model.value());
+    REQUIRE_FALSE(adjacent_lowered);
+    CHECK_EQ(adjacent_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(adjacent_lowered.error().detail.eq(
+        lit_str("exact local return path is outside the bounded clean profile")));
+    CHECK_EQ(adjacent_lowered.error().span.start, adjacent_path.start);
+    CHECK_EQ(adjacent_lowered.error().span.end, adjacent_path.end);
+    CHECK_EQ(adjacent_lowered.error().span.line, adjacent_path.line);
+    CHECK_EQ(adjacent_lowered.error().span.col, adjacent_path.col);
 }
 
 TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
@@ -4452,6 +4748,98 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     CHECK_LT(result.value().len, nginx::RutSource::kCapacity);
     CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
 
+    // The bounded no-content action is one fixed GET-only strict route appended
+    // to the independently fixed root program above. Both nginx declaration
+    // orders must equal this complete source byte-for-byte.
+    static constexpr char kNoContentExactGolden[] =
+        "route exact GET \"/static\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    nginx::RutSource no_content_golden{};
+    memcpy(no_content_golden.data, kExpected, sizeof(kExpected) - 1u);
+    memcpy(no_content_golden.data + sizeof(kExpected) - 1u,
+           kNoContentExactGolden,
+           sizeof(kNoContentExactGolden) - 1u);
+    no_content_golden.len =
+        static_cast<u32>(sizeof(kExpected) + sizeof(kNoContentExactGolden) - 2u);
+    const char no_content_root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    const char no_content_exact_first[] =
+        "server { listen 8080; location = /static { return 204; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const char no_content_root_first_multiline[] =
+        "server {\n  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static {\n    return\n      204 # separated\n      ;\n  }\n}\n";
+    const char no_content_exact_first_multiline[] =
+        "server {\n  listen 8080;\n"
+        "  location = /static { return # separated\n 204\n # terminator\n ; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n}\n";
+    const char* const no_content_lexer_whitespace[] = {
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return\f204; } }",
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return\v204; } }",
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204\f; } }",
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204\v; } }",
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location\f=\v/static\f{\vreturn\f204\v;\f} }",
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "location # keyword gap\n = # equals gap\n /static # path gap\n "
+        "{ # response gap\n return 204; # closing gap\n } }",
+    };
+    const auto no_content_root_model =
+        nginx::parse({no_content_root_first, sizeof(no_content_root_first) - 1u});
+    const auto no_content_exact_model =
+        nginx::parse({no_content_exact_first, sizeof(no_content_exact_first) - 1u});
+    const auto no_content_root_multiline_model = nginx::parse(
+        {no_content_root_first_multiline, sizeof(no_content_root_first_multiline) - 1u});
+    const auto no_content_exact_multiline_model = nginx::parse(
+        {no_content_exact_first_multiline, sizeof(no_content_exact_first_multiline) - 1u});
+    REQUIRE(no_content_root_model);
+    REQUIRE(no_content_exact_model);
+    REQUIRE(no_content_root_multiline_model);
+    REQUIRE(no_content_exact_multiline_model);
+    const auto no_content_root = nginx::lower_to_rut(no_content_root_model.value());
+    const auto no_content_exact = nginx::lower_to_rut(no_content_exact_model.value());
+    const auto no_content_root_multiline =
+        nginx::lower_to_rut(no_content_root_multiline_model.value());
+    const auto no_content_exact_multiline =
+        nginx::lower_to_rut(no_content_exact_multiline_model.value());
+    REQUIRE(no_content_root);
+    REQUIRE(no_content_exact);
+    REQUIRE(no_content_root_multiline);
+    REQUIRE(no_content_exact_multiline);
+    CHECK(no_content_root.value().view().eq(no_content_golden.view()));
+    CHECK(no_content_exact.value().view().eq(no_content_golden.view()));
+    CHECK(no_content_root_multiline.value().view().eq(no_content_golden.view()));
+    CHECK(no_content_exact_multiline.value().view().eq(no_content_golden.view()));
+    for (const char* source : no_content_lexer_whitespace) {
+        const auto model = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(model);
+        const auto lowered = nginx::lower_to_rut(model.value());
+        REQUIRE(lowered);
+        CHECK(lowered.value().view().eq(no_content_golden.view()));
+    }
+    CHECK(no_content_root.value().view().eq(no_content_exact.value().view()));
+    CHECK_EQ(no_content_root.value().len, 5539u);
+    const char* exact_route = strstr(no_content_root.value().data, "route exact GET \"/static\"");
+    REQUIRE(exact_route != nullptr);
+    CHECK(strstr(exact_route + 1, "route exact GET \"/static\"") == nullptr);
+    const char* root_route = strstr(no_content_root.value().data, "route GET \"/\"");
+    REQUIRE(root_route != nullptr);
+    CHECK(strstr(root_route + 1, "route GET \"/\"") == nullptr);
+    CHECK(strstr(no_content_root.value().data, "route exact \"/static\"") == nullptr);
+    CHECK(strstr(no_content_root.value().data, "return 204") == nullptr);
+    CHECK(strstr(no_content_root.value().data, "nginx.conf") == nullptr);
+    CHECK(strstr(no_content_root.value().data, "proxy_pass") == nullptr);
+
     // The complete /healthz source is a fixed root-program golden plus this
     // independently fixed exact binding. Both declaration orders must match
     // every byte, not merely the exact-route suffix.
@@ -4891,6 +5279,29 @@ TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
     CHECK_GT(lexed.value().tokens.len, 530u);
 }
 
+TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacity) {
+    static constexpr char kSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    const auto parsed = nginx::parse({kSource, sizeof(kSource) - 1u});
+    REQUIRE(parsed);
+    auto model = parsed.value();
+    model.listen.port = 65535;
+    model.location.proxy_pass.port = 65535;
+    for (u32 i = 0; i < 4; i++) model.location.proxy_pass.address[i] = 255;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 5547u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 390u);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
+}
+
 TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) {
     char source[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
@@ -5029,6 +5440,155 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
     const auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     delete ast.value();
+}
+
+TEST(nginx_converter, emitted_no_content_source_reaches_independent_owned_runtime_config) {
+    auto populated = std::make_unique<RouteConfig>();
+    uintptr_t nginx_begin = 0;
+    uintptr_t nginx_end = 0;
+    uintptr_t rut_begin = 0;
+    uintptr_t rut_end = 0;
+    {
+        char nginx_source[] =
+            "server { listen 8080; location = /static { return 204; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        nginx_begin = reinterpret_cast<uintptr_t>(nginx_source);
+        nginx_end = nginx_begin + sizeof(nginx_source);
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        rut_begin = reinterpret_cast<uintptr_t>(lowered.value().data);
+        rut_end = rut_begin + lowered.value().len;
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 10u);
+        CHECK(ast_owned->items[9].kind == AstItemKind::ExactStrictLocalResponse);
+        REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 5u);
+        const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(ast_binding.method, kRouteMethodGet);
+        CHECK_EQ(ast_binding.path_view, ExactPathView::Raw);
+        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/static"))));
+        CHECK_EQ(ast_binding.policy_id, 5u);
+        const auto& ast_policy = ast_owned->strict_local_response_policies[4];
+        CHECK_EQ(strict_local_response_policy_profile(ast_policy),
+                 StrictLocalResponseProfile::NoContent204);
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        CHECK_EQ(strict_local_response_policy_profile(hir_owned->strict_local_response_policies[4]),
+                 StrictLocalResponseProfile::NoContent204);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        for (u32 i = 0; i < mir_owned->functions.len; i++)
+            CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        REQUIRE_EQ(rir.module.upstream_count, 1u);
+        REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
+        REQUIRE_EQ(rir.module.strict_local_response_policy_count, 5u);
+        CHECK_EQ(rir.module.exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        CHECK_EQ(strict_local_response_policy_profile(rir.module.strict_local_response_policies[4]),
+                 StrictLocalResponseProfile::NoContent204);
+        char printed_storage[65536]{};
+        rir::PrintBuf printed;
+        printed.init(printed_storage, sizeof(printed_storage), -1);
+        rir::print_module(printed, rir.module);
+        REQUIRE_FALSE(printed.overflow);
+        const std::string printed_text(printed.data, printed.len);
+        CHECK_NE(printed_text.find("local_response#5: version=HTTP/1.1, status=204, "
+                                   "reason=\"No Content\", server=\"nginx/1.29.7\", "
+                                   "content_type=\"\", date=current, connection=request, "
+                                   "head_mode=suppress_body, body=b\"\" (len=0)"),
+                 std::string::npos);
+        CHECK_NE(printed_text.find("exact:\n  GET \"/static\" -> local_response#5"),
+                 std::string::npos);
+        u32 root_route_count = 0;
+        size_t root_route_pos = 0;
+        while ((root_route_pos = printed_text.find("  route: /\n", root_route_pos)) !=
+               std::string::npos) {
+            root_route_count++;
+            root_route_pos++;
+        }
+        CHECK_EQ(root_route_count, 3u);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    REQUIRE(populated->strict_local_response_table_is_valid());
+    REQUIRE_EQ(populated->strict_local_response_policy_count, 4u);
+    REQUIRE_EQ(populated->route_count, 0u);
+    REQUIRE_EQ(populated->upstream_count, 1u);
+    REQUIRE_EQ(populated->upstreams[0].addr_count, 1u);
+    CHECK((Str{populated->upstreams[0].name, populated->upstreams[0].name_len}.eq(
+        lit_str("nginx_upstream"))));
+    CHECK_EQ(ntohs(populated->upstreams[0].addrs[0].sin_port), 9000u);
+    CHECK_EQ(ntohl(populated->upstreams[0].addrs[0].sin_addr.s_addr), 0x7f000001u);
+    REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+    const auto& binding = populated->exact_strict_local_response_bindings[0];
+    CHECK_EQ(binding.method, kRouteMethodGet);
+    CHECK_EQ(binding.path_view, ExactPathView::Raw);
+    CHECK((Str{binding.path, binding.path_len}.eq(lit_str("/static"))));
+    const u16 policy_id =
+        populated->match_exact_strict_local_response(lit_str("/static"), kRouteMethodGet);
+    REQUIRE_EQ(policy_id, 4u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static"), kRouteMethodHead),
+             0u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static/"), kRouteMethodGet),
+             0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(policy_id));
+    const auto& policy = populated->strict_local_response_policies[policy_id - 1u];
+    CHECK_EQ(strict_local_response_policy_profile(policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK(policy.version == StrictLocalResponseVersion::Http11);
+    CHECK_EQ(policy.status_code, 204u);
+    CHECK(policy.reason.eq(lit_str("No Content")));
+    CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(policy.date == StrictLocalResponseDate::Current);
+    CHECK(policy.connection == StrictLocalResponseConnection::Request);
+    CHECK(policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
+    CHECK_EQ(policy.content_type.len, 0u);
+    CHECK_EQ(policy.body.len, 0u);
+    CHECK(populated->strict_local_response_bytes_owned(policy.content_type));
+    CHECK(populated->strict_local_response_bytes_owned(policy.body));
+
+    const auto outside_destroyed_sources = [&](Str value) {
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr < nginx_begin || ptr >= nginx_end;
+    };
+    const auto outside_generated_source = [&](Str value) {
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr < rut_begin || ptr >= rut_end;
+    };
+    CHECK(outside_destroyed_sources({binding.path, binding.path_len}));
+    CHECK(outside_generated_source({binding.path, binding.path_len}));
+    CHECK(outside_destroyed_sources(policy.reason));
+    CHECK(outside_generated_source(policy.reason));
+    CHECK(outside_destroyed_sources(policy.server));
+    CHECK(outside_generated_source(policy.server));
+    CHECK(outside_destroyed_sources(policy.content_type));
+    CHECK(outside_generated_source(policy.content_type));
+    CHECK(outside_destroyed_sources(policy.body));
+    CHECK(outside_generated_source(policy.body));
 }
 
 TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {

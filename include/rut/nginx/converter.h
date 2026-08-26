@@ -18,7 +18,8 @@ struct RutSource {
     // exact-local-return maximum is 5681 bytes for a 62-byte trailing-slash
     // path, a 64-byte body containing internal ASCII spaces, and the
     // slash_normalized exact-path view keyword. The equivalent raw exact shape
-    // remains 5664 bytes. The bounded
+    // remains 5664 bytes. The fixed `/static` no-content action measures 5547
+    // bytes at maximum ports/address. The bounded
     // transformed-location maximum uses a 63-byte path, 128-byte replacement
     // URI, maximum ports and IPv4 address and measures 3700 bytes. Writer
     // completion remains strict

@@ -149,6 +149,28 @@ bool source_position_is_coherent(uintptr_t source_base,
     return line == inner_span.line && col == inner_span.col;
 }
 
+constexpr bool source_byte_is_lexer_space(char value) {
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f' ||
+           value == '\v';
+}
+
+bool advance_trusted_source_gap(uintptr_t source_base, u32& pos, u32 end) {
+    while (pos < end) {
+        while (pos < end &&
+               source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + pos)))
+            pos++;
+        if (pos == end || *reinterpret_cast<const char*>(source_base + pos) != '#') return true;
+        while (pos < end && *reinterpret_cast<const char*>(source_base + pos) != '\n') pos++;
+        if (pos == end) return false;
+    }
+    return true;
+}
+
+bool trusted_source_gap_is_exact(uintptr_t source_base, u32 start, u32 end) {
+    u32 pos = start;
+    return advance_trusted_source_gap(source_base, pos, end) && pos == end;
+}
+
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
@@ -414,6 +436,211 @@ FrontendResult<bool> validate_exact_absolute_redirect(const Server& server) {
         response.path.len != 4 || !eq(response.path, "/new", 4))
         return unsupported(response.path_span,
                            lit_str("invalid exact absolute redirect target path"));
+    return true;
+}
+
+FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
+    const ExactNoContentReturnLocation& location = server.exact_no_content_return;
+    const NoContentReturn& response = location.response;
+    if (!location.present) {
+        if (has_exact_no_content_return_inventory(location))
+            return unsupported(exact_no_content_return_span(server),
+                               lit_str("invalid absent exact no-content return model"));
+        return false;
+    }
+
+    // This validator is the first dynamic-borrow boundary in lower_to_rut. All
+    // scalar bounds, nested structure, source arithmetic, and cross-action
+    // inventory are therefore checked before any model byte is inspected.
+    if (location.path.len != 7u || location.path.len > kMaxExactLocalReturnPathLen)
+        return unsupported(is_valid_span(location.path_span) ? location.path_span
+                                                             : exact_no_content_return_span(server),
+                           lit_str("invalid bounded exact no-content return path model"));
+    if (response.status != 204u)
+        return unsupported(is_valid_span(response.status_span)
+                               ? response.status_span
+                               : exact_no_content_return_span(server),
+                           lit_str("invalid exact no-content return status"));
+    if (!span_position_is_coherent(server.span, location.span))
+        return unsupported(is_valid_span(location.span) ? location.span : server.span,
+                           lit_str("invalid exact no-content return location span"));
+    if (!span_position_is_coherent(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != location.path.len)
+        return unsupported(is_valid_span(location.path_span) ? location.path_span : location.span,
+                           lit_str("invalid exact no-content return path span"));
+    if (!span_position_is_coherent(location.span, response.span) ||
+        location.path_span.end >= response.span.start)
+        return unsupported(is_valid_span(response.span) ? response.span : location.span,
+                           lit_str("invalid exact no-content return directive span"));
+    if (!span_position_is_coherent(response.span, response.status_span) ||
+        response.status_span.end - response.status_span.start != 3u ||
+        response.span.start >= response.status_span.start ||
+        response.status_span.end >= response.span.end)
+        return unsupported(
+            is_valid_span(response.status_span) ? response.status_span : response.span,
+            lit_str("invalid exact no-content return status span"));
+
+    if (has_exact_local_return_inventory(server.exact_local_return))
+        return unsupported(exact_local_return_span(server),
+                           lit_str("multiple exact semantic actions are unsupported"));
+    if (has_exact_absolute_redirect_inventory(server.exact_absolute_redirect))
+        return unsupported(exact_absolute_redirect_span(server),
+                           lit_str("multiple exact semantic actions are unsupported"));
+
+    const Location& fallback = server.location;
+    const uintptr_t fallback_path_address = reinterpret_cast<uintptr_t>(fallback.path.ptr);
+    if (!span_position_is_coherent(server.span, fallback.span) ||
+        !span_position_is_coherent(fallback.span, fallback.path_span) ||
+        fallback.path.ptr == nullptr || fallback_path_address < fallback.path_span.start ||
+        fallback.path.len != 1u ||
+        fallback.path_span.end - fallback.path_span.start != fallback.path.len)
+        return unsupported(is_valid_span(fallback.path_span) ? fallback.path_span : server.span,
+                           lit_str("invalid exact no-content return fallback provenance"));
+
+    const uintptr_t path_address = reinterpret_cast<uintptr_t>(location.path.ptr);
+    if (location.path.ptr == nullptr || path_address < location.path_span.start)
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return path provenance"));
+    const uintptr_t fallback_source_base = fallback_path_address - fallback.path_span.start;
+    const uintptr_t path_source_base = path_address - location.path_span.start;
+    if (fallback_source_base > UINTPTR_MAX - server.span.end)
+        return unsupported(fallback.path_span,
+                           lit_str("invalid exact no-content return fallback provenance"));
+    if (path_source_base > UINTPTR_MAX - server.span.end)
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return path provenance"));
+    if (fallback_source_base != path_source_base)
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return path provenance"));
+
+    const uintptr_t source_base = fallback_source_base;
+    if (!source_borrow_is_coherent(fallback.path, fallback.path_span, source_base))
+        return unsupported(fallback.path_span,
+                           lit_str("invalid exact no-content return fallback provenance"));
+    if (!source_borrow_is_coherent(location.path, location.path_span, source_base))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return path provenance"));
+    if (!source_position_is_coherent(source_base, server.span, fallback.span))
+        return unsupported(fallback.span,
+                           lit_str("invalid exact no-content return fallback source position"));
+    if (!source_position_is_coherent(source_base, server.span, fallback.path_span))
+        return unsupported(
+            fallback.path_span,
+            lit_str("invalid exact no-content return fallback path source position"));
+    if (!source_position_is_coherent(source_base, server.span, location.span))
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return source positions"));
+    if (!source_position_is_coherent(source_base, server.span, location.path_span))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return path source position"));
+    if (!source_position_is_coherent(source_base, server.span, response.span))
+        return unsupported(response.span,
+                           lit_str("invalid exact no-content return directive source position"));
+    if (!source_position_is_coherent(source_base, server.span, response.status_span))
+        return unsupported(response.status_span,
+                           lit_str("invalid exact no-content return status source position"));
+
+    // Byte reads begin only after the common source base and every relevant
+    // source position have been proven. Pin both semantic literals and the
+    // directive delimiters so forged subspans cannot manufacture a valid action.
+    if (!eq(location.path, "/static", 7u))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact no-content return location path"));
+    if (!eq(fallback.path, "/", 1u))
+        return unsupported(fallback.path_span,
+                           lit_str("invalid exact no-content return fallback path"));
+
+    // Reconstruct only this bounded exact-location shell with a trusted-source
+    // cursor. Every cursor limit is one of the nested spans proven above. This
+    // prevents a forged model from borrowing valid `/static` and `return 204;`
+    // interiors out of a comment or a different lexical container.
+    const u32 location_prefix_len = location.path_span.start - location.span.start;
+    if (location_prefix_len <= 8u)
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+    const Str location_keyword{reinterpret_cast<const char*>(source_base + location.span.start),
+                               8u};
+    if (!eq(location_keyword, "location", 8u))
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+
+    u32 cursor = location.span.start + 8u;
+    if (cursor >= location.path_span.start ||
+        (!source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + cursor)) &&
+         *reinterpret_cast<const char*>(source_base + cursor) != '#'))
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+    const u32 keyword_gap_start = cursor;
+    if (!advance_trusted_source_gap(source_base, cursor, location.path_span.start) ||
+        cursor == keyword_gap_start || cursor >= location.path_span.start ||
+        *reinterpret_cast<const char*>(source_base + cursor) != '=')
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+    cursor++;
+    if (cursor >= location.path_span.start ||
+        (!source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + cursor)) &&
+         *reinterpret_cast<const char*>(source_base + cursor) != '#'))
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+    const u32 equals_gap_start = cursor;
+    if (!advance_trusted_source_gap(source_base, cursor, location.path_span.start) ||
+        cursor == equals_gap_start || cursor != location.path_span.start)
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+
+    cursor = location.path_span.end;
+    if (*reinterpret_cast<const char*>(source_base + cursor) == '#')
+        return unsupported(location.path_span,
+                           lit_str("exact local return path is outside the bounded clean profile"));
+    if (!advance_trusted_source_gap(source_base, cursor, response.span.start) ||
+        cursor >= response.span.start ||
+        *reinterpret_cast<const char*>(source_base + cursor) != '{')
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+    cursor++;
+    if (!trusted_source_gap_is_exact(source_base, cursor, response.span.start))
+        return unsupported(response.span,
+                           lit_str("invalid exact no-content return pre-response gap"));
+
+    cursor = response.span.end;
+    if (!advance_trusted_source_gap(source_base, cursor, location.span.end) ||
+        cursor >= location.span.end ||
+        *reinterpret_cast<const char*>(source_base + cursor) != '}' ||
+        cursor + 1u != location.span.end)
+        return unsupported(location.span,
+                           lit_str("invalid exact no-content return location shell"));
+
+    const Str status_text{reinterpret_cast<const char*>(source_base + response.status_span.start),
+                          3u};
+    if (!eq(status_text, "204", 3u))
+        return unsupported(response.status_span,
+                           lit_str("invalid exact no-content return status literal"));
+    const Str directive_keyword{reinterpret_cast<const char*>(source_base + response.span.start),
+                                6u};
+    if (response.status_span.start - response.span.start <= 6u ||
+        !eq(directive_keyword, "return", 6u))
+        return unsupported(response.span,
+                           lit_str("invalid exact no-content return directive delimiter"));
+    const char after_keyword =
+        *reinterpret_cast<const char*>(source_base + response.span.start + 6u);
+    const char before_status =
+        *reinterpret_cast<const char*>(source_base + response.status_span.start - 1u);
+    const char terminator = *reinterpret_cast<const char*>(source_base + response.span.end - 1u);
+    const bool after_keyword_delimits =
+        source_byte_is_lexer_space(after_keyword) || after_keyword == '#';
+    const bool before_status_delimits = source_byte_is_lexer_space(before_status);
+    const u32 after_status_start = response.status_span.end;
+    const u32 before_terminator = response.span.end - 1u;
+    const bool status_has_adjacent_comment =
+        after_status_start < before_terminator &&
+        *reinterpret_cast<const char*>(source_base + after_status_start) == '#';
+    if (!after_keyword_delimits || !before_status_delimits || terminator != ';' ||
+        !trusted_source_gap_is_exact(
+            source_base, response.span.start + 6u, response.status_span.start) ||
+        status_has_adjacent_comment ||
+        !trusted_source_gap_is_exact(source_base, after_status_start, before_terminator))
+        return unsupported(response.span,
+                           lit_str("invalid exact no-content return directive delimiter"));
     return true;
 }
 
@@ -935,16 +1162,20 @@ bool put_exact_local_return(Writer& writer, Str path, Str body) {
            writer.put_cstr("\"\n}) }\n");
 }
 
+bool put_exact_no_content_return(Writer& writer) {
+    return writer.put_cstr("route exact GET \"/static\" { return local_response({\n") &&
+           writer.put_cstr(
+               "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+               "\"nginx/1.29.7\",\n") &&
+           writer.put_cstr("  date: \"current\", content_type: \"\", connection: \"request\",\n") &&
+           writer.put_cstr("  head_mode: \"suppress_body\", body: b\"\"\n}) }\n");
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
-    // Stage 2 deliberately recognizes and models this nginx action without
-    // emitting the observably different ordinary `return 204`.  This complete
-    // scalar/span inventory fence must precede every validator that could read
-    // a borrowed path or response byte.
-    if (has_exact_no_content_return_inventory(server.exact_no_content_return))
-        return unsupported(exact_no_content_return_span(server),
-                           lit_str("exact no-content return lowering is not implemented"));
+    auto exact_no_content_return = validate_exact_no_content_return(server);
+    if (!exact_no_content_return) return core::make_unexpected(exact_no_content_return.error());
     auto exact_absolute_redirect = validate_exact_absolute_redirect(server);
     if (!exact_absolute_redirect) return core::make_unexpected(exact_absolute_redirect.error());
     auto exact_local_return = validate_exact_local_return(server);
@@ -968,6 +1199,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_absolute_redirect.value() && !is_root)
         return unsupported(server.exact_absolute_redirect.span,
                            lit_str("exact absolute redirect requires location / fallback"));
+    if (exact_no_content_return.value() && !is_root)
+        return unsupported(server.exact_no_content_return.span,
+                           lit_str("exact no-content return requires location / fallback"));
 
     RutSource output{};
     Writer writer(output);
@@ -1027,8 +1261,10 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                  : !put_root_forward(writer, "GET", 3, false, true)) ||
             !put_root_forward(writer, "", 0, false, false) ||
             (exact_local_return.value() &&
-             !put_exact_local_return(
-                 writer, server.exact_local_return.path, server.exact_local_return.response.body)))
+             !put_exact_local_return(writer,
+                                     server.exact_local_return.path,
+                                     server.exact_local_return.response.body)) ||
+            (exact_no_content_return.value() && !put_exact_no_content_return(writer)))
             return fail_overflow();
         return output;
     }
