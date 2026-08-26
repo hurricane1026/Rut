@@ -717,6 +717,18 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 60
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
+    add_test(
+        NAME test_rut_no_content204_production
+        COMMAND test_nginx_differential --no-content204-rut-production
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_rut_no_content204_production PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_test(
             NAME test_rut_iouring_gate_spike
