@@ -1,5 +1,7 @@
 #include "rut/nginx/parser.h"
 
+#include "rut/common/forward_target_transform.h"
+
 namespace rut::nginx {
 namespace {
 
@@ -81,6 +83,37 @@ constexpr bool contains(Str a, char needle) {
         if (a.ptr[i] == needle) return true;
     }
     return false;
+}
+
+static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
+
+constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
+    const u8 byte = static_cast<u8>(value);
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+           (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' || byte == '~';
+}
+
+bool proxy_pass_uri_is_clean(Str uri) {
+    if (uri.ptr == nullptr || uri.len == 0 || uri.len > kMaxProxyPassUriLen || uri.ptr[0] != '/' ||
+        (uri.len > 1 && uri.ptr[uri.len - 1] != '/'))
+        return false;
+    if (uri.len == 1) return true;
+
+    u32 segment_start = 1;
+    for (u32 i = 1; i < uri.len; i++) {
+        if (uri.ptr[i] != '/') {
+            if (!proxy_pass_uri_segment_byte_is_clean(uri.ptr[i])) return false;
+            continue;
+        }
+
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0 || (segment_len == 1 && uri.ptr[segment_start] == '.') ||
+            (segment_len == 2 && uri.ptr[segment_start] == '.' &&
+             uri.ptr[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+    return true;
 }
 
 auto invalid(Span span, Str detail) {
@@ -544,8 +577,9 @@ private:
         const UrlParseStatus url_status = parse_url(url.text, url.span, result);
         if (url_status == UrlParseStatus::InvalidInteger)
             return invalid_integer(url.span, lit_str("invalid upstream IPv4 address or port"));
-        if (url_status == UrlParseStatus::UriSuffix)
-            return unsupported(url.span, lit_str("proxy_pass URI suffixes are unsupported"));
+        if (url_status == UrlParseStatus::InvalidUri)
+            return unsupported(result.uri_span,
+                               lit_str("proxy_pass URI is outside the bounded clean profile"));
         if (url_status != UrlParseStatus::Ok)
             return unsupported(url.span, lit_str("only literal IPv4 HTTP upstreams are supported"));
         advance();
@@ -604,7 +638,7 @@ private:
         return TimeoutParseStatus::Unsupported;
     }
 
-    enum class UrlParseStatus : u8 { Ok, InvalidInteger, UriSuffix, Unsupported };
+    enum class UrlParseStatus : u8 { Ok, InvalidInteger, InvalidUri, Unsupported };
 
     static UrlParseStatus parse_url(Str text, Span span, ProxyPass& out) {
         constexpr Str kPrefix = lit_str("http://");
@@ -638,10 +672,10 @@ private:
             return UrlParseStatus::InvalidInteger;
         if (pos == text.len) return UrlParseStatus::Ok;
         if (text.ptr[pos] != '/') return UrlParseStatus::InvalidInteger;
-        if (pos + 1 != text.len) return UrlParseStatus::UriSuffix;
-        out.has_uri = true;
         out.uri = text.slice(pos, text.len);
         out.uri_span = Span{span.start + pos, span.end, span.line, span.col + pos};
+        if (!proxy_pass_uri_is_clean(out.uri)) return UrlParseStatus::InvalidUri;
+        out.has_uri = true;
         return UrlParseStatus::Ok;
     }
 
