@@ -197,9 +197,10 @@ FrontendResult<bool> validate_exact_absolute_redirect(const Server& server) {
     if (!eq(location.path, "/old", 4))
         return unsupported(location.path_span,
                            lit_str("invalid exact absolute redirect location path"));
-    if (response.status != 301)
+    if (response.status != 301 && response.status != 302)
         return unsupported(response.status_span, lit_str("invalid exact absolute redirect status"));
-    if (!eq(response.status_lexeme, "301", 3))
+    const char* expected_status_lexeme = response.status == 301 ? "301" : "302";
+    if (!eq(response.status_lexeme, expected_status_lexeme, 3))
         return unsupported(response.status_span,
                            lit_str("invalid exact absolute redirect status lexeme"));
     if (!eq(response.target, "http://redirect.example/new", 27))
@@ -418,11 +419,23 @@ static constexpr char kGatewayTimeoutBody[] =
     "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
     "</html>\\r\\n";
 
-static constexpr char kRedirectBody[] =
+static constexpr char kRedirect301Reason[] = "Moved Permanently";
+static constexpr char kRedirect302Reason[] = "Moved Temporarily";
+
+static constexpr char kRedirect301Body[] =
     "<html>\\r\\n"
     "<head><title>301 Moved Permanently</title></head>\\r\\n"
     "<body>\\r\\n"
     "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n"
+    "</html>\\r\\n";
+
+static constexpr char kRedirect302Body[] =
+    "<html>\\r\\n"
+    "<head><title>302 Found</title></head>\\r\\n"
+    "<body>\\r\\n"
+    "<center><h1>302 Found</h1></center>\\r\\n"
     "<hr><center>nginx/1.29.7</center>\\r\\n"
     "</body>\\r\\n"
     "</html>\\r\\n";
@@ -550,10 +563,28 @@ bool put_root_forward_action(Writer& writer, bool suppress_body, bool buffered, 
            writer.put_cstr("    )\n");
 }
 
-bool put_exact_absolute_redirect(Writer& writer,
-                                 Str location_path,
-                                 Str static_authority,
-                                 Str target_path) {
+bool put_exact_absolute_redirect(
+    Writer& writer, Str location_path, u16 status, Str static_authority, Str target_path) {
+    const char* reason = nullptr;
+    const char* body = nullptr;
+    u32 reason_len = 0;
+    u32 body_len = 0;
+    switch (status) {
+        case 301:
+            reason = kRedirect301Reason;
+            reason_len = sizeof(kRedirect301Reason) - 1u;
+            body = kRedirect301Body;
+            body_len = sizeof(kRedirect301Body) - 1u;
+            break;
+        case 302:
+            reason = kRedirect302Reason;
+            reason_len = sizeof(kRedirect302Reason) - 1u;
+            body = kRedirect302Body;
+            body_len = sizeof(kRedirect302Body) - 1u;
+            break;
+        default:
+            return false;
+    }
     return writer.put_cstr("route GET \"/\" {\n") && writer.put_cstr("    if req.pathOnly == \"") &&
            writer.put(location_path) && writer.put_cstr("\" {\n") &&
            writer.put_cstr(
@@ -563,14 +594,14 @@ bool put_exact_absolute_redirect(Writer& writer,
            writer.put_cstr(
                "            path: \"static\", query: \"discard\", date: \"current\", "
                "connection: \"close\",\n") &&
-           writer.put_cstr(
-               "            header_order: \"connection_then_location\", status: 301, reason: "
-               "\"Moved Permanently\",\n") &&
+           writer.put_cstr("            header_order: \"connection_then_location\", status: ") &&
+           writer.put_u16(status) && writer.put_cstr(", reason: \"") &&
+           writer.put_lit(reason, reason_len) && writer.put_cstr("\",\n") &&
            writer.put_cstr(
                "            server: \"nginx/1.29.7\", content_type: \"text/html\", "
                "target_path: \"") &&
            writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
-           writer.put_lit(kRedirectBody, sizeof(kRedirectBody) - 1u) && writer.put_cstr("\"})\n") &&
+           writer.put_lit(body, body_len) && writer.put_cstr("\"})\n") &&
            writer.put_cstr("    } else {\n") &&
            put_root_forward_action(writer, false, true, lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
@@ -680,6 +711,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
             (exact_absolute_redirect.value()
                  ? !put_exact_absolute_redirect(writer,
                                                 server.exact_absolute_redirect.path,
+                                                server.exact_absolute_redirect.response.status,
                                                 server.exact_absolute_redirect.response.authority,
                                                 server.exact_absolute_redirect.response.path)
                  : !put_root_forward(writer, "GET", 3, false, true)) ||
@@ -699,7 +731,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !put("            status: 301, reason: \"Moved Permanently\", server: "
              "\"nginx/1.29.7\",\n") ||
         !put("            content_type: \"text/html\", target_path: \"/api/\", body: b\"") ||
-        !writer.put_lit(kRedirectBody, static_cast<u32>(__builtin_strlen(kRedirectBody))) ||
+        !writer.put_lit(kRedirect301Body, static_cast<u32>(__builtin_strlen(kRedirect301Body))) ||
         !put("\"})\n") || !put("    } else {\n") ||
         !put("        return forward(nginx_upstream, target_transform: {\n") ||
         !put("            strip_prefix: \"/api/\",\n") ||
