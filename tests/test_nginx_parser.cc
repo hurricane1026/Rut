@@ -4,6 +4,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
@@ -247,13 +248,8 @@ TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
         CHECK_EQ(server.pre_route_trace.span.end, server.span.end);
 
         const auto lowered = nginx::lower_to_rut(server);
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(lit_str("invalid exact local return body")));
-        CHECK_EQ(lowered.error().span.start, response.body_span.start);
-        CHECK_EQ(lowered.error().span.end, response.body_span.end);
-        CHECK_EQ(lowered.error().span.line, response.body_span.line);
-        CHECK_EQ(lowered.error().span.col, response.body_span.col);
+        REQUIRE(lowered);
+        CHECK(strstr(lowered.value().data, "body: b\"hello world\"") != nullptr);
     };
 
     check(root_first, sizeof(root_first) - 1u, 3u, 4u);
@@ -2287,6 +2283,60 @@ TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
     CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
 }
 
+TEST(nginx_converter, lowers_one_internal_exact_local_body_space_to_stable_rut) {
+    static constexpr char kRootFirst[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 200 \"hello world\"; } }";
+    static constexpr char kExactFirst[] =
+        "server { listen 8080; location = /static { return 200 \"hello world\"; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kLegacySafe[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 200 \"hello-world\"; } }";
+    const auto root_parsed = nginx::parse({kRootFirst, sizeof(kRootFirst) - 1u});
+    const auto exact_parsed = nginx::parse({kExactFirst, sizeof(kExactFirst) - 1u});
+    const auto safe_parsed = nginx::parse({kLegacySafe, sizeof(kLegacySafe) - 1u});
+    REQUIRE(root_parsed);
+    REQUIRE(exact_parsed);
+    REQUIRE(safe_parsed);
+    const auto root_lowered = nginx::lower_to_rut(root_parsed.value());
+    const auto exact_lowered = nginx::lower_to_rut(exact_parsed.value());
+    const auto safe_lowered = nginx::lower_to_rut(safe_parsed.value());
+    REQUIRE(root_lowered);
+    REQUIRE(exact_lowered);
+    REQUIRE(safe_lowered);
+    CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
+    REQUIRE_EQ(root_lowered.value().len, safe_lowered.value().len);
+
+    static constexpr char kBodyLiteral[] = "body: b\"hello world\"";
+    const char* literal = strstr(root_lowered.value().data, kBodyLiteral);
+    REQUIRE(literal != nullptr);
+    CHECK(strstr(literal + sizeof(kBodyLiteral) - 1u, kBodyLiteral) == nullptr);
+    const char* safe_literal = strstr(safe_lowered.value().data, "body: b\"hello-world\"");
+    REQUIRE(safe_literal != nullptr);
+    const u32 literal_offset = static_cast<u32>(literal - root_lowered.value().data);
+    REQUIRE_EQ(literal_offset, static_cast<u32>(safe_literal - safe_lowered.value().data));
+    const u32 body_prefix_end = literal_offset + static_cast<u32>(sizeof("body: b\"") - 1u);
+    CHECK((Str{root_lowered.value().data, body_prefix_end}.eq(
+        {safe_lowered.value().data, body_prefix_end})));
+    const u32 body_end = literal_offset + sizeof(kBodyLiteral) - 1u;
+    const u32 safe_body_end = literal_offset + sizeof("body: b\"hello-world\"") - 1u;
+    REQUIRE_EQ(body_end, safe_body_end);
+    CHECK((Str{root_lowered.value().data + body_end, root_lowered.value().len - body_end}.eq(
+        {safe_lowered.value().data + safe_body_end, safe_lowered.value().len - safe_body_end})));
+
+    static constexpr char kGolden[] =
+        "route exact \"/static\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"hello world\"\n"
+        "}) }\n";
+    REQUIRE_GE(root_lowered.value().len, static_cast<u32>(sizeof(kGolden) - 1u));
+    CHECK((Str{root_lowered.value().data + root_lowered.value().len - sizeof(kGolden) + 1u,
+               sizeof(kGolden) - 1u}
+               .eq({kGolden, sizeof(kGolden) - 1u})));
+}
+
 TEST(nginx_converter, emits_clean_trailing_slash_and_multisegment_exact_local_paths) {
     const char* paths[] = {"/healthz/", "/health/check", "/old/"};
     const char* routes[] = {"route exact slash_normalized \"/healthz/\"",
@@ -2391,7 +2441,8 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
 
 TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_source) {
     static constexpr char kBody[] =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static_assert(sizeof(kBody) - 1u == nginx::kMaxLocalReturnBodyLen);
     char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
     path[0] = '/';
     for (u32 i = 1; i < nginx::kMaxExactLocalReturnPathLen; i++) path[i] = 'p';
@@ -2413,11 +2464,14 @@ TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_sourc
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
 }
 
 TEST(nginx_converter, normalized_exact_local_return_maximum_path_and_body_fit_bounded_source) {
     static constexpr char kBody[] =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     static_assert(sizeof(kBody) - 1u == nginx::kMaxLocalReturnBodyLen);
     char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
     path[0] = '/';
@@ -2640,7 +2694,7 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
 TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_later_models) {
     char source[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /healthz { return 200 \"successor-static\"; } }";
+        "location = /healthz { return 200 \"hello world\"; } }";
     const auto parsed = nginx::parse({source, sizeof(source) - 1u});
     REQUIRE(parsed);
     const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span span) {
@@ -2662,30 +2716,26 @@ TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_late
 
     auto forged = parsed.value();
     forged.location.path.ptr = nullptr;
-    expect_rejected(forged,
-                    lit_str("invalid exact local return fallback provenance"),
-                    fallback_path_span);
+    expect_rejected(
+        forged, lit_str("invalid exact local return fallback provenance"), fallback_path_span);
     for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
         forged = parsed.value();
         forged.location.path.ptr = reinterpret_cast<const char*>(address);
-        expect_rejected(forged,
-                        lit_str("invalid exact local return fallback provenance"),
-                        fallback_path_span);
+        expect_rejected(
+            forged, lit_str("invalid exact local return fallback provenance"), fallback_path_span);
     }
 
     static constexpr char kExternalFallback[] = "/";
     forged = parsed.value();
     forged.location.path = {kExternalFallback, sizeof(kExternalFallback) - 1u};
-    expect_rejected(forged,
-                    lit_str("invalid exact local return fallback provenance"),
-                    fallback_path_span);
+    expect_rejected(
+        forged, lit_str("invalid exact local return fallback provenance"), fallback_path_span);
     char reconstructed_source[sizeof(source)]{};
     memcpy(reconstructed_source, source, sizeof(source));
     forged = parsed.value();
     forged.location.path.ptr = reconstructed_source + fallback_path_span.start;
-    expect_rejected(forged,
-                    lit_str("invalid exact local return fallback provenance"),
-                    fallback_path_span);
+    expect_rejected(
+        forged, lit_str("invalid exact local return fallback provenance"), fallback_path_span);
 
     for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
         forged = parsed.value();
@@ -2697,7 +2747,7 @@ TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_late
     }
 
     static constexpr char kExternalPath[] = "/healthz";
-    static constexpr char kExternalBody[] = "successor-static";
+    static constexpr char kExternalBody[] = "hello world";
     forged = parsed.value();
     forged.exact_local_return.path = {kExternalPath, sizeof(kExternalPath) - 1u};
     expect_rejected(forged, lit_str("invalid exact local return path provenance"), path_span);
@@ -2790,6 +2840,22 @@ TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_late
                     lit_str("invalid exact local return body span"),
                     forged.exact_local_return.response.body_span);
 
+    char* opening_quote = source + body_span.start - 1u;
+    const char saved_opening_quote = *opening_quote;
+    REQUIRE_EQ(saved_opening_quote, '"');
+    *opening_quote = 'x';
+    expect_rejected(
+        parsed.value(), lit_str("invalid exact local return body delimiters"), body_span);
+    *opening_quote = saved_opening_quote;
+
+    char* closing_quote = source + body_span.end;
+    const char saved_closing_quote = *closing_quote;
+    REQUIRE_EQ(saved_closing_quote, '"');
+    *closing_quote = 'x';
+    expect_rejected(
+        parsed.value(), lit_str("invalid exact local return body delimiters"), body_span);
+    *closing_quote = saved_closing_quote;
+
     char* path = source + path_span.start;
     const char saved_path_byte = path[0];
     path[0] = 'x';
@@ -2798,8 +2864,7 @@ TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_late
     path[0] = saved_path_byte;
 
     static constexpr char kControlPath[] = {'/', 'a', '\x01', 'b', '\0'};
-    static constexpr char kNonAsciiPath[] = {
-        '/', 'a', static_cast<char>(0x80), 'b', '\0'};
+    static constexpr char kNonAsciiPath[] = {'/', 'a', static_cast<char>(0x80), 'b', '\0'};
     struct ForgedPathCase {
         const char* clean;
         const char* invalid;
@@ -2842,6 +2907,25 @@ TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_late
     body[0] = '$';
     expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
     body[0] = saved_body_byte;
+
+    body[0] = ' ';
+    expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
+    body[0] = saved_body_byte;
+
+    const char saved_last_body_byte = body[body_span.end - body_span.start - 1u];
+    body[body_span.end - body_span.start - 1u] = ' ';
+    expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
+    body[body_span.end - body_span.start - 1u] = saved_last_body_byte;
+
+    const char saved_second_space_byte = body[1];
+    body[1] = ' ';
+    expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
+    body[1] = saved_second_space_byte;
+
+    const char saved_tab_byte = body[1];
+    body[1] = '\t';
+    expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
+    body[1] = saved_tab_byte;
 
     char old_source[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
@@ -4207,6 +4291,160 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     REQUIRE(populated->strict_local_response_policy_id_is_owned(exact_id));
     const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
     CHECK(owned_policy.body.eq(lit_str("successor-static")));
+    CHECK(owned_policy.server.eq(lit_str("nginx/1.29.7")));
+}
+
+TEST(nginx_converter, emitted_body_space_exact_source_reaches_owned_runtime_config) {
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        char nginx_source[] =
+            "server { listen 8080; location = /static { return 200 \"hello world\"; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 10u);
+        CHECK(ast_owned->items[2].kind == AstItemKind::PreRoute);
+        CHECK(ast_owned->items[9].kind == AstItemKind::ExactStrictLocalResponse);
+        REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(ast_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+        CHECK(ast_owned->strict_local_response_policies[0].body.eq(
+            lit_str("<html>\r\n<head><title>405 Not Allowed</title></head>\r\n"
+                    "<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n"
+                    "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n")));
+        const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(ast_binding.method, kRouteMethodAny);
+        CHECK_EQ(ast_binding.policy_id, 5u);
+        CHECK_EQ(ast_binding.path_view, ExactPathView::Raw);
+        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/static"))));
+        const auto& ast_policy = ast_owned->strict_local_response_policies[4];
+        CHECK(ast_policy.version == StrictLocalResponseVersion::Http11);
+        CHECK_EQ(ast_policy.status_code, 200u);
+        CHECK(ast_policy.reason.eq(lit_str("OK")));
+        CHECK(ast_policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(ast_policy.date == StrictLocalResponseDate::Current);
+        CHECK(ast_policy.content_type.eq(lit_str("text/plain")));
+        CHECK(ast_policy.connection == StrictLocalResponseConnection::Request);
+        CHECK(ast_policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
+        CHECK(ast_policy.body.eq(lit_str("hello world")));
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(hir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].policy_id, 5u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
+        CHECK((Str{hir_owned->exact_strict_local_response_bindings[0].path,
+                   hir_owned->exact_strict_local_response_bindings[0].path_len}
+                   .eq(lit_str("/static"))));
+        CHECK(hir_owned->strict_local_response_policies[4].body.eq(lit_str("hello world")));
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(mir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+        CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+        CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
+        CHECK((Str{mir_owned->exact_strict_local_response_bindings[0].path,
+                   mir_owned->exact_strict_local_response_bindings[0].path_len}
+                   .eq(lit_str("/static"))));
+        CHECK(mir_owned->strict_local_response_policies[4].body.eq(lit_str("hello world")));
+        for (u32 i = 0; i < mir_owned->functions.len; i++)
+            CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
+        REQUIRE_EQ(rir.module.strict_local_response_policy_count, 5u);
+        const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
+        CHECK_EQ(rir_binding.method, kRouteMethodAny);
+        CHECK_EQ(rir_binding.policy_id, 5u);
+        CHECK_EQ(rir_binding.path_view, ExactPathView::Raw);
+        CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/static"))));
+        CHECK(rir.module.strict_local_response_policies[4].body.eq(lit_str("hello world")));
+        for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
+            CHECK(exact_strict_local_response_binding_is_neutral(
+                rir.module.exact_strict_local_response_bindings[i]));
+        char printed_storage[65536]{};
+        rir::PrintBuf printed;
+        printed.init(printed_storage, sizeof(printed_storage), -1);
+        rir::print_module(printed, rir.module);
+        REQUIRE_FALSE(printed.overflow);
+        CHECK_NE(std::string(printed.data, printed.len).find("body=b\"hello world\" (len=11)"),
+                 std::string::npos);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    // nginx/source/compiler storage above has either been overwritten or
+    // destroyed. Resolve runtime IDs only now: installation may semantically
+    // deduplicate source policy IDs (TRACE and unmatched CONNECT are equal).
+    REQUIRE(populated->strict_local_response_table_is_valid());
+    // Exact policies are installed as dispatch metadata rather than executable
+    // route functions. The three root fallbacks remain RIR functions above;
+    // production dispatch consults this owned exact table before that prefix
+    // route table is entered.
+    REQUIRE_EQ(populated->route_count, 0u);
+    const u16 trace_id = populated->pre_route_policy_id(kRouteMethodTrace);
+    REQUIRE_NE(trace_id, 0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(trace_id));
+    CHECK_EQ(trace_id, populated->unmatched_policy_ids[kRouteMethodConnect]);
+    const auto& trace_policy = populated->strict_local_response_policies[trace_id - 1u];
+    CHECK(trace_policy.version == StrictLocalResponseVersion::Http11);
+    CHECK_EQ(trace_policy.status_code, 405u);
+    CHECK(trace_policy.reason.eq(lit_str("Not Allowed")));
+    CHECK(trace_policy.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(trace_policy.date == StrictLocalResponseDate::Current);
+    CHECK(trace_policy.content_type.eq(lit_str("text/html")));
+    CHECK(trace_policy.connection == StrictLocalResponseConnection::Request);
+    CHECK(trace_policy.head_mode == StrictLocalResponseHeadMode::Reject);
+    static constexpr char kDecodedTraceBody[] =
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kDecodedTraceBody) - 1u == 157u);
+    CHECK(trace_policy.body.eq({kDecodedTraceBody, sizeof(kDecodedTraceBody) - 1u}));
+    REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+    CHECK_EQ(populated->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
+    CHECK((Str{populated->exact_strict_local_response_bindings[0].path,
+               populated->exact_strict_local_response_bindings[0].path_len}
+               .eq(lit_str("/static"))));
+    const u16 exact_id =
+        populated->match_exact_strict_local_response(lit_str("/static"), kRouteMethodGet);
+    REQUIRE_EQ(exact_id, 4u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static?x=1"), kRouteMethodGet),
+             exact_id);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static/"), kRouteMethodGet),
+             0u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/stat"), kRouteMethodGet), 0u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/"), kRouteMethodGet), 0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(exact_id));
+    const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
+    CHECK(owned_policy.body.eq(lit_str("hello world")));
+    CHECK_EQ(owned_policy.body.len, 11u);
     CHECK(owned_policy.server.eq(lit_str("nginx/1.29.7")));
 }
 

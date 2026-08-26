@@ -406,6 +406,19 @@ bool local_return_body_byte_is_safe(char value) {
            value != '#' && value != '{' && value != '}' && value != ';';
 }
 
+bool local_return_body_is_clean(Str body) {
+    if (body.ptr == nullptr || body.len == 0 || body.len > kMaxLocalReturnBodyLen) return false;
+    u32 space_count = 0;
+    for (u32 i = 0; i < body.len; i++) {
+        if (body.ptr[i] == ' ') {
+            if (i == 0 || i + 1u == body.len || ++space_count > 1) return false;
+            continue;
+        }
+        if (!local_return_body_byte_is_safe(body.ptr[i])) return false;
+    }
+    return true;
+}
+
 bool exact_local_return_path_is_clean(Str path) {
     if (path.ptr == nullptr || path.len < 2 || path.len > kMaxExactLocalReturnPathLen ||
         path.ptr[0] != '/')
@@ -524,16 +537,25 @@ FrontendResult<bool> validate_exact_local_return(const Server& server) {
         return unsupported(response.body_span,
                            lit_str("invalid exact local return body source position"));
 
+    // Only after all three borrows have established one bounded source and all
+    // source positions are coherent may the bytes adjacent to the borrowed
+    // body be trusted. The semantic model represents the raw quote interior,
+    // so both delimiters are part of its provenance contract.
+    const char opening_quote =
+        *reinterpret_cast<const char*>(source_base + response.body_span.start - 1u);
+    const char closing_quote = *reinterpret_cast<const char*>(source_base + response.body_span.end);
+    if (opening_quote != '"' || closing_quote != '"')
+        return unsupported(response.body_span,
+                           lit_str("invalid exact local return body delimiters"));
+
     if (!exact_local_return_path_is_clean(location.path) || eq(location.path, "/old", 4))
         return unsupported(location.path_span,
                            lit_str("invalid bounded exact local return path model"));
     if (response.status != 200)
         return unsupported(is_valid_span(response.span) ? response.span : location.span,
                            lit_str("invalid exact local return status"));
-    for (u32 i = 0; i < response.body.len; i++) {
-        if (!local_return_body_byte_is_safe(response.body.ptr[i]))
-            return unsupported(response.body_span, lit_str("invalid exact local return body"));
-    }
+    if (!local_return_body_is_clean(response.body))
+        return unsupported(response.body_span, lit_str("invalid exact local return body"));
     return true;
 }
 
