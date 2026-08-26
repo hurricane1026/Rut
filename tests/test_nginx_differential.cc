@@ -13156,18 +13156,26 @@ route exact "/static" { return local_response({
 }
 
 static bool run_slash_normalized_exact_rut_production(
-    u16 frontend_port, u16 backend_port, TempDir& temp, const char* rut_path, std::string& error) {
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    std::string& error,
+    const std::string* generated_source = nullptr,
+    NormalizedExactTrailingSlashOracleObservation* generated_observation = nullptr) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "slash-normalized production evidence requires an executable absolute RUT path";
         return false;
     }
 
-    // Generic RUT capability evidence only. This is deliberately hand-authored
-    // ordinary source and never enters the nginx parser or converter.
-    const std::string source = "listen :" + std::to_string(frontend_port) + "\n" +
-                               "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) +
-                               "\"\n" +
-                               R"rut(route GET "/" {
+    // The default #319 capability evidence is deliberately hand-authored. The
+    // #320 caller instead injects source that it just obtained from the public
+    // nginx parser/converter API; both paths exercise the same CLI/io_uring
+    // observation harness below.
+    const std::string hand_authored_source =
+        "listen :" + std::to_string(frontend_port) + "\n" +
+        "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
+        R"rut(route GET "/" {
   return forward(backend,
     request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
       strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
@@ -13192,12 +13200,21 @@ route exact slash_normalized GET "/health/check/" { return local_response({
   head_mode: "suppress_body", body: b"successor-static"
 }) }
 )rut";
-    if (source.find("route GET \"/\"") == std::string::npos ||
-        source.find("route exact slash_normalized GET \"/health/check/\"") == std::string::npos ||
-        source.find("return forward(backend") == std::string::npos ||
-        source.find("nginx::") != std::string::npos ||
+    const std::string& source =
+        generated_source == nullptr ? hand_authored_source : *generated_source;
+    const char* expected_root_route =
+        generated_source == nullptr ? "route GET \"/\"" : "route \"/\"";
+    const char* expected_exact_route = generated_source == nullptr
+                                           ? "route exact slash_normalized GET \"/health/check/\""
+                                           : "route exact slash_normalized \"/health/check/\"";
+    const char* expected_forward =
+        generated_source == nullptr ? "return forward(backend" : "return forward(nginx_upstream";
+    if (source.find(expected_root_route) == std::string::npos ||
+        source.find(expected_exact_route) == std::string::npos ||
+        source.find(expected_forward) == std::string::npos ||
+        (generated_source == nullptr && source.find("nginx::") != std::string::npos) ||
         !write_file(temp.source, source.data(), source.size())) {
-        error = "failed to preserve/write hand-authored slash-normalized ordinary RUT source";
+        error = "failed to preserve/write slash-normalized ordinary RUT source";
         return false;
     }
 
@@ -13216,9 +13233,17 @@ route exact slash_normalized GET "/health/check/" { return local_response({
     static constexpr char kNoSlashRequest[] =
         "GET /health/check HTTP/1.1\r\n"
         "Host: normalized-exact.example\r\n"
-        "X-319-Vector: no-slash\r\n"
         "Connection: close\r\n\r\n";
     static constexpr char kRootRequest[] =
+        "GET / HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kGenericNoSlashRequest[] =
+        "GET /health/check HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "X-319-Vector: no-slash\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kGenericRootRequest[] =
         "GET / HTTP/1.1\r\n"
         "Host: normalized-exact.example\r\n"
         "X-319-Vector: root\r\n"
@@ -13230,7 +13255,7 @@ route exact slash_normalized GET "/health/check/" { return local_response({
         const char* expected;
         size_t expected_len;
     };
-    static constexpr Vector kVectors[] = {
+    const Vector kVectors[] = {
         {"/health/check/",
          kLocalRequest,
          sizeof(kLocalRequest) - 1u,
@@ -13247,13 +13272,14 @@ route exact slash_normalized GET "/health/check/" { return local_response({
          kExactLocalCloseResponseNormalized,
          sizeof(kExactLocalCloseResponseNormalized) - 1u},
         {"/health/check",
-         kNoSlashRequest,
-         sizeof(kNoSlashRequest) - 1u,
+         generated_source == nullptr ? kGenericNoSlashRequest : kNoSlashRequest,
+         generated_source == nullptr ? sizeof(kGenericNoSlashRequest) - 1u
+                                     : sizeof(kNoSlashRequest) - 1u,
          kSuccessResponseNormalized,
          sizeof(kSuccessResponseNormalized) - 1u},
         {"/",
-         kRootRequest,
-         sizeof(kRootRequest) - 1u,
+         generated_source == nullptr ? kGenericRootRequest : kRootRequest,
+         generated_source == nullptr ? sizeof(kGenericRootRequest) - 1u : sizeof(kRootRequest) - 1u,
          kSuccessResponseNormalized,
          sizeof(kSuccessResponseNormalized) - 1u},
     };
@@ -13393,6 +13419,10 @@ route exact slash_normalized GET "/health/check/" { return local_response({
                     " did not equal the complete expected Date-normalized response wire";
             return false;
         }
+        if (std::string(wire.begin(), wire.end()).find("\r\nLocation:") != std::string::npos) {
+            error = std::string(vector.name) + " unexpectedly emitted Location";
+            return false;
+        }
         return true;
     };
 
@@ -13475,10 +13505,10 @@ route exact slash_normalized GET "/health/check/" { return local_response({
     }
     const std::string expected_no_slash =
         "GET /health/check HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
-        "\r\nX-319-Vector: no-slash\r\n\r\n";
+        (generated_source == nullptr ? "\r\nX-319-Vector: no-slash\r\n\r\n" : "\r\n\r\n");
     const std::string expected_root =
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
-        "\r\nX-319-Vector: root\r\n\r\n";
+        (generated_source == nullptr ? "\r\nX-319-Vector: root\r\n\r\n" : "\r\n\r\n");
     if (backend.history[0] !=
             std::vector<char>(expected_no_slash.begin(), expected_no_slash.end()) ||
         backend.history[1] != std::vector<char>(expected_root.begin(), expected_root.end())) {
@@ -13494,13 +13524,15 @@ route exact slash_normalized GET "/health/check/" { return local_response({
         " GET / 200 ",
     };
     u32 total = 0;
-    for (const char* marker : kLogMarkers) {
+    for (size_t i = 0; i < sizeof(kLogMarkers) / sizeof(kLogMarkers[0]); i++) {
+        const char* marker = kLogMarkers[i];
         u32 count = 0;
         if (!log_count_line_with(temp.rut_access_log, marker, " s=0", count) || count != 1) {
             error = std::string("production access log did not retain exactly one raw spelling: ") +
                     marker;
             return false;
         }
+        if (generated_observation != nullptr) generated_observation->access_records[i] = count;
         total += count;
     }
     u32 all_gets = 0;
@@ -13508,6 +13540,246 @@ route exact slash_normalized GET "/health/check/" { return local_response({
         all_gets != 5) {
         error = "production access log did not contain exactly the five raw request spellings";
         return false;
+    }
+    if (generated_observation != nullptr) {
+        generated_observation->wires = std::move(wires);
+        generated_observation->local_accepts = 0;
+        generated_observation->local_requests = 0;
+        generated_observation->local_sends = 0;
+        generated_observation->forward_accepts = backend.accepted.load(std::memory_order_acquire);
+        generated_observation->forward_requests = backend.requests.load(std::memory_order_acquire);
+        generated_observation->forward_sends =
+            backend.response_send_all_calls.load(std::memory_order_acquire);
+        generated_observation->forward_history = backend.history;
+    }
+    return true;
+}
+
+static std::string make_normalized_exact_trailing_slash_fragment(u16 frontend_port,
+                                                                 u16 backend_port,
+                                                                 bool exact_first) {
+    const std::string exact_location =
+        "  location = /health/check/ { return 200 \"successor-static\"; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
+}
+
+static bool capture_generated_normalized_exact_trailing_slash_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool exact_first,
+    NormalizedExactTrailingSlashOracleObservation& observation,
+    std::string& generated_source,
+    std::string& error) {
+    const std::string fragment =
+        make_normalized_exact_trailing_slash_fragment(frontend_port, backend_port, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#320 accepted nginx fragment did not parse for converter-generated RUT";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_local_return;
+    if (server.listen.port != frontend_port || !root.path.eq(rut::lit_str("/")) ||
+        root.path.ptr != fragment.data() + root.path_span.start || proxy.has_uri ||
+        proxy.address[0] != 127 || proxy.address[1] != 0 || proxy.address[2] != 0 ||
+        proxy.address[3] != 1 || proxy.port != backend_port || !exact.present ||
+        !exact.path.eq(rut::lit_str("/health/check/")) ||
+        exact.path.ptr != fragment.data() + exact.path_span.start ||
+        exact.path_span.end - exact.path_span.start != exact.path.len ||
+        exact.response.status != 200 || !exact.response.body.eq(rut::lit_str("successor-static")) ||
+        exact.response.body.ptr != fragment.data() + exact.response.body_span.start ||
+        exact.response.body_span.end - exact.response.body_span.start != exact.response.body.len ||
+        server.exact_absolute_redirect.present) {
+        error = "#320 nginx text did not reach the genuine normalized exact semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#320 accepted nginx semantic model failed ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    generated_source.assign(generated.ptr, generated.len);
+    const auto count_literal = [&](const char* literal) {
+        size_t count = 0;
+        for (size_t offset = 0;;) {
+            offset = generated_source.find(literal, offset);
+            if (offset == std::string::npos) return count;
+            count++;
+            offset += strlen(literal);
+        }
+    };
+    if (count_literal("route exact slash_normalized \"/health/check/\" {") != 1 ||
+        count_literal("route exact \"") != 0 || count_literal("route exact ") != 1 ||
+        count_literal("route \"/\" {") != 1 ||
+        generated_source.find("return forward(nginx_upstream") == std::string::npos ||
+        generated_source.find("proxy_pass") != std::string::npos ||
+        generated_source.find("nginx.conf") != std::string::npos) {
+        error = "#320 converter output was not one generic slash-normalized exact route plus root";
+        return false;
+    }
+
+    observation = NormalizedExactTrailingSlashOracleObservation{};
+    observation.order = exact_first ? "generated-exact-before-root" : "generated-root-before-exact";
+    return run_slash_normalized_exact_rut_production(
+        frontend_port, backend_port, temp, rut_path, error, &generated_source, &observation);
+}
+
+static bool run_converter_normalized_exact_trailing_slash_differential(
+    TempDir& oracle_temp,
+    const std::string& container_prefix,
+    const char* rut_path,
+    NormalizedExactTrailingSlashOracleObservation& nginx_exact_first,
+    NormalizedExactTrailingSlashOracleObservation& nginx_root_first,
+    NormalizedExactTrailingSlashOracleObservation& rut_exact_first,
+    NormalizedExactTrailingSlashOracleObservation& rut_root_first,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "converter-generated #320 differential requires an executable absolute RUT path";
+        return false;
+    }
+    if (!run_pinned_normalized_exact_trailing_slash_oracle(
+            oracle_temp, container_prefix, nginx_exact_first, nginx_root_first, error))
+        return false;
+
+    u16 exact_frontend_port = 0;
+    u16 exact_backend_port = 0;
+    u16 root_frontend_port = 0;
+    u16 root_backend_port = 0;
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        if (!allocate_port(exact_frontend_port) || !allocate_port(exact_backend_port) ||
+            !allocate_port(root_frontend_port) || !allocate_port(root_backend_port))
+            continue;
+        ports_unique =
+            exact_frontend_port != exact_backend_port &&
+            exact_frontend_port != root_frontend_port && exact_frontend_port != root_backend_port &&
+            exact_backend_port != root_frontend_port && exact_backend_port != root_backend_port &&
+            root_frontend_port != root_backend_port;
+    }
+    if (!ports_unique) {
+        error = "#320 could not allocate four distinct generated-RUT declaration-order ports";
+        return false;
+    }
+    TempDir exact_temp;
+    TempDir root_temp;
+    if (!exact_temp.create() || !root_temp.create() ||
+        strcmp(exact_temp.path, root_temp.path) == 0) {
+        error = "#320 could not create independent generated-RUT order directories";
+        return false;
+    }
+    std::string exact_source;
+    std::string root_source;
+    if (!capture_generated_normalized_exact_trailing_slash_order(exact_frontend_port,
+                                                                 exact_backend_port,
+                                                                 exact_temp,
+                                                                 rut_path,
+                                                                 true,
+                                                                 rut_exact_first,
+                                                                 exact_source,
+                                                                 error) ||
+        !capture_generated_normalized_exact_trailing_slash_order(root_frontend_port,
+                                                                 root_backend_port,
+                                                                 root_temp,
+                                                                 rut_path,
+                                                                 false,
+                                                                 rut_root_first,
+                                                                 root_source,
+                                                                 error))
+        return false;
+
+    const auto replace_once =
+        [&](std::string& source, const std::string& needle, const char* replacement) {
+            const size_t first = source.find(needle);
+            if (first == std::string::npos ||
+                source.find(needle, first + needle.size()) != std::string::npos)
+                return false;
+            source.replace(first, needle.size(), replacement);
+            return true;
+        };
+    std::string canonical_exact = exact_source;
+    std::string canonical_root = root_source;
+    if (!replace_once(canonical_exact,
+                      "listen :" + std::to_string(exact_frontend_port),
+                      "listen :FRONTEND") ||
+        !replace_once(canonical_exact,
+                      "127.0.0.1:" + std::to_string(exact_backend_port),
+                      "127.0.0.1:BACKEND") ||
+        !replace_once(
+            canonical_root, "listen :" + std::to_string(root_frontend_port), "listen :FRONTEND") ||
+        !replace_once(canonical_root,
+                      "127.0.0.1:" + std::to_string(root_backend_port),
+                      "127.0.0.1:BACKEND") ||
+        canonical_exact != canonical_root) {
+        error = "#320 declaration order changed canonical converter output";
+        return false;
+    }
+
+    const auto exact_counts = [](const NormalizedExactTrailingSlashOracleObservation& value) {
+        return value.local_accepts == 0 && value.local_requests == 0 && value.local_sends == 0 &&
+               value.forward_accepts == 2 && value.forward_requests == 2 &&
+               value.forward_sends == 2 && value.wires.size() == 5 &&
+               value.forward_history.size() == 2;
+    };
+    if (!exact_counts(nginx_exact_first) || !exact_counts(nginx_root_first) ||
+        !exact_counts(rut_exact_first) || !exact_counts(rut_root_first)) {
+        error = "#320 four-way local/forward counts were not exactly zero-plus-two";
+        return false;
+    }
+    const auto canonical_history = [](const std::vector<std::vector<char>>& history) {
+        std::vector<std::string> result;
+        result.reserve(history.size());
+        for (const auto& wire : history) {
+            std::string request(wire.begin(), wire.end());
+            static constexpr char kHostPrefix[] = "\r\nHost: 127.0.0.1:";
+            const size_t port_begin = request.find(kHostPrefix);
+            const size_t digits_begin = port_begin == std::string::npos
+                                            ? std::string::npos
+                                            : port_begin + sizeof(kHostPrefix) - 1u;
+            const size_t port_end = digits_begin == std::string::npos
+                                        ? std::string::npos
+                                        : request.find("\r\n", digits_begin);
+            if (port_end == std::string::npos) return std::vector<std::string>{};
+            request.replace(digits_begin, port_end - digits_begin, "BACKEND");
+            result.push_back(std::move(request));
+        }
+        return result;
+    };
+    const auto canonical_nginx_exact = canonical_history(nginx_exact_first.forward_history);
+    const auto canonical_nginx_root = canonical_history(nginx_root_first.forward_history);
+    const auto canonical_rut_exact = canonical_history(rut_exact_first.forward_history);
+    const auto canonical_rut_root = canonical_history(rut_root_first.forward_history);
+    if (canonical_nginx_exact.size() != 2 || canonical_nginx_exact != canonical_nginx_root ||
+        canonical_nginx_exact != canonical_rut_exact ||
+        canonical_nginx_exact != canonical_rut_root) {
+        error = "#320 four-way ordered upstream histories differed after isolated-port binding";
+        return false;
+    }
+    for (size_t i = 0; i < 5; i++) {
+        std::vector<char> nginx_exact_wire = nginx_exact_first.wires[i];
+        std::vector<char> nginx_root_wire = nginx_root_first.wires[i];
+        std::vector<char> rut_exact_wire = rut_exact_first.wires[i];
+        std::vector<char> rut_root_wire = rut_root_first.wires[i];
+        if (nginx_exact_wire.empty() || nginx_root_wire.empty() || rut_exact_wire.empty() ||
+            rut_root_wire.empty() || !normalize_date(nginx_exact_wire) ||
+            !normalize_date(nginx_root_wire) || !normalize_date(rut_exact_wire) ||
+            !normalize_date(rut_root_wire) || nginx_exact_wire != nginx_root_wire ||
+            nginx_exact_wire != rut_exact_wire || nginx_exact_wire != rut_root_wire ||
+            nginx_exact_first.access_records[i] != 1 || nginx_root_first.access_records[i] != 1 ||
+            rut_exact_first.access_records[i] != 1 || rut_root_first.access_records[i] != 1) {
+            error = "#320 four-way Date-normalized wire/raw-access mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
     }
     return true;
 }
@@ -13542,6 +13814,9 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
     const bool converter_bounded_exact_local_path_differential =
         argc == 3 && strcmp(argv[1], "--converter-bounded-exact-local-path-differential") == 0;
+    const bool converter_normalized_exact_trailing_slash_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-normalized-exact-trailing-slash-differential") == 0;
     const bool converter_root_proxy_trace_differential =
         argc == 3 && strcmp(argv[1], "--converter-root-proxy-trace-differential") == 0;
     const bool converter_api_proxy_trace_differential =
@@ -13584,8 +13859,10 @@ int main(int argc, char** argv) {
          !normalized_exact_trailing_slash_oracle &&
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
-         !converter_bounded_exact_local_path_differential && !strict_local_response_differential &&
-         !converter_root_proxy_trace_differential && !converter_api_proxy_trace_differential &&
+         !converter_bounded_exact_local_path_differential &&
+         !converter_normalized_exact_trailing_slash_differential &&
+         !strict_local_response_differential && !converter_root_proxy_trace_differential &&
+         !converter_api_proxy_trace_differential &&
          !converter_exact_absolute_redirect_differential &&
          !converter_exact_absolute_redirect_302_differential &&
          !converter_exact_local_differential && !exact_strict_route_differential &&
@@ -13602,6 +13879,7 @@ int main(int argc, char** argv) {
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
+        (converter_normalized_exact_trailing_slash_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
@@ -13638,6 +13916,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-bounded-exact-local-path-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-normalized-exact-trailing-slash-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-root-proxy-trace-differential "
                      "<absolute-rut-executable>\n"
@@ -14112,6 +14393,48 @@ int main(int argc, char** argv) {
                "parser/converter/RUT equivalence claim; excludes other methods, bodies/framing, "
                "HTTP/1.0, keep-alive/reuse, TLS/H2, percent/dot normalization, arbitrary slash "
                "runs, variables, merge_slashes off, other location forms, and multiple servers)\n";
+        return 0;
+    }
+
+    if (converter_normalized_exact_trailing_slash_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-converter-normalized-exact-trailing-slash-" + std::to_string(getpid()) +
+            "-" + source_suffix;
+        NormalizedExactTrailingSlashOracleObservation nginx_exact_first;
+        NormalizedExactTrailingSlashOracleObservation nginx_root_first;
+        NormalizedExactTrailingSlashOracleObservation rut_exact_first;
+        NormalizedExactTrailingSlashOracleObservation rut_root_first;
+        std::string differential_error;
+        if (!run_converter_normalized_exact_trailing_slash_differential(temp,
+                                                                        container_prefix,
+                                                                        argv[2],
+                                                                        nginx_exact_first,
+                                                                        nginx_root_first,
+                                                                        rut_exact_first,
+                                                                        rut_root_first,
+                                                                        differential_error)) {
+            std::cerr << "FAIL [converter-generated normalized exact trailing-slash differential]: "
+                      << differential_error << "\n";
+            dump_normalized_exact_trailing_slash_oracle_observation(nginx_exact_first);
+            dump_normalized_exact_trailing_slash_oracle_observation(nginx_root_first);
+            dump_normalized_exact_trailing_slash_oracle_observation(rut_exact_first);
+            dump_normalized_exact_trailing_slash_oracle_observation(rut_root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of the bounded exact /health/check/ nginx text "
+               "passed through the independent parser/semantic model/converter to one generic "
+               "slash_normalized ordinary-RUT exact route and the public io_uring CLI; pinned "
+               "nginx 1.29.7 and each independently generated RUT matched all five exact "
+               "Date-normalized client wires/close/EOF and raw access spellings, including "
+               "literal, query, and raw double-slash local 200/CL16/full-successor-static "
+               "responses with live and settled zero upstream, while no-slash /health/check "
+               "emitted no redirect and joined / at the root proxy with exactly two ordered "
+               "byte-exact backend histories and no third (#320 bounded converter equivalence; "
+               "excludes other normalization, methods, bodies/framing, HTTP/1.0, reuse, "
+               "TLS/H2, location forms, and multiple servers)\n";
         return 0;
     }
 
