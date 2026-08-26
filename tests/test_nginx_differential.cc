@@ -129,6 +129,22 @@ static constexpr char kExactAbsoluteRedirectResponseNormalized[] =
     "</body>\r\n"
     "</html>\r\n";
 static_assert(sizeof(kExactAbsoluteRedirectResponseNormalized) - 1u == 366u);
+static constexpr char kExactAbsoluteRedirect302ResponseNormalized[] =
+    "HTTP/1.1 302 Moved Temporarily\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 145\r\n"
+    "Connection: close\r\n"
+    "Location: http://redirect.example/new\r\n\r\n"
+    "<html>\r\n"
+    "<head><title>302 Found</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>302 Found</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
+static_assert(sizeof(kExactAbsoluteRedirect302ResponseNormalized) - 1u == 342u);
 static constexpr char kExactLocalTraceResponseNormalized[] =
     "HTTP/1.1 405 Not Allowed\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -7836,6 +7852,432 @@ static bool run_pinned_exact_absolute_redirect_oracle(u16 frontend_port,
     return true;
 }
 
+struct ExactAbsoluteRedirect302Observation {
+    std::string order;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> forward_history;
+    u32 access_records[5]{};
+    u32 redirect_upstream_accepts = 0;
+    u32 redirect_upstream_requests = 0;
+    u32 forward_upstream_accepts = 0;
+    u32 forward_upstream_requests = 0;
+    u32 forward_upstream_response_sends = 0;
+};
+
+static void dump_exact_absolute_redirect_302_observation(
+    const ExactAbsoluteRedirect302Observation& observation) {
+    std::cerr << "exact-absolute-redirect-302 order=" << observation.order
+              << " access=" << observation.access_records[0] << "/" << observation.access_records[1]
+              << "/" << observation.access_records[2] << "/" << observation.access_records[3] << "/"
+              << observation.access_records[4]
+              << " upstream=" << observation.redirect_upstream_requests << "+"
+              << observation.forward_upstream_requests << "\n";
+    static constexpr const char* kLabels[] = {
+        "GET /old",
+        "GET /old alternate Host",
+        "GET /old?x=1",
+        "GET /old/",
+        "GET /",
+    };
+    for (size_t i = 0; i < observation.wires.size(); i++) {
+        const char* label = i < sizeof(kLabels) / sizeof(kLabels[0]) ? kLabels[i] : "extra vector";
+        dump_wire(label, observation.wires[i]);
+    }
+    for (size_t i = 0; i < observation.forward_history.size(); i++) {
+        const std::string label = "302 oracle upstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.forward_history[i]);
+    }
+}
+
+static bool capture_pinned_exact_absolute_redirect_302_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    ExactAbsoluteRedirect302Observation& observation,
+    std::string& error) {
+    observation = ExactAbsoluteRedirect302Observation{};
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+
+    struct Vector {
+        const char* name;
+        const char* request;
+        size_t request_len;
+        const char* expected;
+    };
+    static constexpr Vector kVectors[] = {
+        {"GET /old",
+         kExactAbsoluteRedirectCloseRequest,
+         sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old alternate Host",
+         kExactAbsoluteRedirectAlternateHostCloseRequest,
+         sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old?x=1",
+         kExactAbsoluteRedirectQueryCloseRequest,
+         sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old/",
+         kExactAbsoluteRedirectSlashNeighborCloseRequest,
+         sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+         kSuccessResponseNormalized},
+        {"GET /",
+         kExactAbsoluteRedirectRootNeighborCloseRequest,
+         sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
+         kSuccessResponseNormalized},
+    };
+    static constexpr const char* kExactRequests[] = {
+        "GET /old HTTP/1.1\r\nHost: redirect-source.example\r\nConnection: close\r\n\r\n",
+        ("GET /old HTTP/1.1\r\nHost: alternate-redirect-source.example\r\nConnection: "
+         "close\r\n\r\n"),
+        "GET /old?x=1 HTTP/1.1\r\nHost: redirect-source.example\r\nConnection: close\r\n\r\n",
+        "GET /old/ HTTP/1.1\r\nHost: redirect-source.example\r\nConnection: close\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: redirect-source.example\r\nConnection: close\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(kVectors) / sizeof(kVectors[0]); i++) {
+        const std::string request(kVectors[i].request, kVectors[i].request_len);
+        const size_t close_header = request.find("\r\nConnection: close\r\n");
+        const size_t header_end = request.find("\r\n\r\n");
+        if (request != kExactRequests[i] || request.rfind("GET /", 0) != 0 ||
+            request.find('#') != std::string::npos || close_header == std::string::npos ||
+            request.rfind("\r\nConnection: close\r\n") != close_header ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.find("\r\nTE:") != std::string::npos ||
+            request.find("\r\nExpect:") != std::string::npos ||
+            request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+            header_end + 4u != request.size() || request.rfind("\r\n\r\n") != header_end) {
+            error = std::string(
+                        "302 oracle vector escaped the fresh depth-zero bounded GET "
+                        "domain: ") +
+                    kVectors[i].name;
+            return false;
+        }
+    }
+
+    const std::string root_location =
+        "    location / {\n"
+        "      proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        ";\n"
+        "    }\n";
+    const std::string exact_location =
+        "    location = /old {\n"
+        "      return 302 http://redirect.example/new;\n"
+        "    }\n";
+    const std::string access_prefix = "rut-nginx-exact-302-" + observation.order;
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format redirect_302_oracle '" +
+        access_prefix +
+        " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
+        "host=\"$host\"';\n"
+        "  access_log /dev/stderr redirect_302_oracle;\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n"
+        "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write exact absolute redirect 302 pinned nginx config";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, Child& process, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process)) {
+                error = std::string("pinned nginx exited before ") + phase + " recorder readiness";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = std::string(phase) + " recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string(phase) + " recorder readiness timed out";
+        return false;
+    };
+    const auto send_vector = [&](Child& process, const Vector& vector, std::vector<char>& wire) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, vector.request, vector.request_len) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string(vector.name) +
+                    " response/EOF failed: " + (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, vector.expected, detail)) {
+            error = std::string(vector.name) + " fixed wire mismatch: " + detail;
+            return false;
+        }
+        if (poll_child(process)) {
+            error = std::string("pinned nginx exited after ") + vector.name;
+            return false;
+        }
+        return true;
+    };
+    const auto observe_count =
+        [&](Recorder& recorder, Child& process, u32 expected, const char* phase) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(process)) {
+                    error = std::string("pinned nginx exited during ") + phase;
+                    return false;
+                }
+                if (!recorder_live(recorder)) {
+                    error = std::string("upstream recorder stopped or failed during ") + phase;
+                    return false;
+                }
+                if (recorder.accepted.load(std::memory_order_acquire) != expected ||
+                    recorder.requests.load(std::memory_order_acquire) != expected ||
+                    recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                    error = std::string("unexpected upstream count during ") + phase;
+                    return false;
+                }
+                usleep(5000);
+            }
+            return true;
+        };
+    const auto wait_request_count = [&](Recorder& recorder, Child& process, u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process) || !recorder_live(recorder)) {
+                error = "pinned nginx or forward recorder failed while waiting for exact count";
+                return false;
+            }
+            const u32 accepted = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepted > expected || requests > expected || sends > expected) {
+                error = "forward recorder exceeded the exact upstream count";
+                return false;
+            }
+            if (accepted == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        error = "timed out waiting for the exact forward upstream count";
+        return false;
+    };
+
+    Recorder redirect_recorder;
+    redirect_recorder.observe_extra_requests_until_stop = true;
+    if (!redirect_recorder.setup(backend_port)) {
+        error = "failed to start exact absolute redirect 302 zero-upstream recorder";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for exact absolute redirect 302 oracle";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error) ||
+        !wait_recorder_live(redirect_recorder, nginx.child, "redirect"))
+        return false;
+
+    for (size_t i = 0; i < 3; i++) {
+        observation.wires.emplace_back();
+        if (!send_vector(nginx.child, kVectors[i], observation.wires.back())) return false;
+        if (redirect_recorder.accepted.load(std::memory_order_acquire) != 0 ||
+            redirect_recorder.requests.load(std::memory_order_acquire) != 0 ||
+            redirect_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+            error = std::string(kVectors[i].name) + " unexpectedly entered the root proxy";
+            return false;
+        }
+    }
+    if (!observe_count(redirect_recorder, nginx.child, 0, "live redirect zero-upstream window"))
+        return false;
+    redirect_recorder.stop();
+    observation.redirect_upstream_accepts =
+        redirect_recorder.accepted.load(std::memory_order_acquire);
+    observation.redirect_upstream_requests =
+        redirect_recorder.requests.load(std::memory_order_acquire);
+    if (redirect_recorder.thread_alive.load(std::memory_order_acquire) ||
+        redirect_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.redirect_upstream_accepts != 0 || observation.redirect_upstream_requests != 0 ||
+        redirect_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0 ||
+        redirect_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !redirect_recorder.history.empty() || !redirect_recorder.request.empty()) {
+        error = "302 redirect recorder did not settle with zero upstream activity";
+        return false;
+    }
+
+    Recorder forward_recorder;
+    forward_recorder.observe_extra_requests_until_stop = true;
+    if (!forward_recorder.setup(backend_port, 2, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
+        !wait_recorder_live(forward_recorder, nginx.child, "forward")) {
+        if (error.empty()) error = "failed to start exact absolute redirect 302 forward recorder";
+        return false;
+    }
+    for (size_t i = 3; i < sizeof(kVectors) / sizeof(kVectors[0]); i++) {
+        observation.wires.emplace_back();
+        if (!send_vector(nginx.child, kVectors[i], observation.wires.back()) ||
+            !wait_request_count(forward_recorder, nginx.child, static_cast<u32>(i - 2u)))
+            return false;
+    }
+    if (!observe_count(forward_recorder, nginx.child, 2, "live no-third-forward window"))
+        return false;
+
+    if (!stop_child(nginx.child)) {
+        error = "failed to stop exact absolute redirect 302 pinned nginx";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after exact absolute redirect 302 oracle";
+        return false;
+    }
+    forward_recorder.stop();
+    observation.forward_upstream_accepts =
+        forward_recorder.accepted.load(std::memory_order_acquire);
+    observation.forward_upstream_requests =
+        forward_recorder.requests.load(std::memory_order_acquire);
+    observation.forward_upstream_response_sends =
+        forward_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = forward_recorder.history;
+    if (forward_recorder.thread_alive.load(std::memory_order_acquire) ||
+        forward_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_upstream_accepts != 2 || observation.forward_upstream_requests != 2 ||
+        observation.forward_upstream_response_sends != 2 ||
+        !forward_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !forward_recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !forward_recorder.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 2) {
+        error = "302 forward recorder did not settle at exactly two upstream episodes";
+        return false;
+    }
+
+    const std::string expected_slash =
+        "GET /old/ HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::string expected_root =
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<std::vector<char>> expected_history = {
+        std::vector<char>(expected_slash.begin(), expected_slash.end()),
+        std::vector<char>(expected_root.begin(), expected_root.end()),
+    };
+    if (observation.forward_history != expected_history) {
+        error = "302 forward neighbors did not preserve exact method/URI/headers/body wires";
+        return false;
+    }
+
+    static constexpr const char* kAccessMarkers[] = {
+        "\"GET /old HTTP/1.1\" 302 145 host=\"redirect-source.example\"",
+        "\"GET /old HTTP/1.1\" 302 145 host=\"alternate-redirect-source.example\"",
+        "\"GET /old?x=1 HTTP/1.1\" 302 145 host=\"redirect-source.example\"",
+        "\"GET /old/ HTTP/1.1\" 200 2 host=\"redirect-source.example\"",
+        "\"GET / HTTP/1.1\" 200 2 host=\"redirect-source.example\"",
+    };
+    bool logs_readable = true;
+    for (size_t i = 0; i < sizeof(kAccessMarkers) / sizeof(kAccessMarkers[0]); i++) {
+        logs_readable = logs_readable && log_count_line_with(temp.nginx_log,
+                                                             kAccessMarkers[i],
+                                                             access_prefix.c_str(),
+                                                             observation.access_records[i]);
+    }
+    u32 total_redirect_access = 0;
+    u32 total_forward_access = 0;
+    u32 total_scoped_access = 0;
+    u32 upstream_connect_logs = 0;
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    logs_readable =
+        logs_readable &&
+        log_count_line_with(
+            temp.nginx_log, "302 145 host=", access_prefix.c_str(), total_redirect_access) &&
+        log_count_line_with(
+            temp.nginx_log, "200 2 host=", access_prefix.c_str(), total_forward_access) &&
+        log_count_line_with(
+            temp.nginx_log, access_prefix.c_str(), access_prefix.c_str(), total_scoped_access) &&
+        log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), upstream_connect_logs);
+    if (!logs_readable || observation.access_records[0] != 1 ||
+        observation.access_records[1] != 1 || observation.access_records[2] != 1 ||
+        observation.access_records[3] != 1 || observation.access_records[4] != 1 ||
+        total_redirect_access != 3 || total_forward_access != 2 || total_scoped_access != 5 ||
+        upstream_connect_logs != 0) {
+        error = "302 order-scoped access log did not retain exactly five records (actual=" +
+                std::to_string(total_scoped_access) +
+                "), three redirects, two forwards, and zero upstream failures";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_exact_absolute_redirect_302_oracle(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_prefix,
+    ExactAbsoluteRedirect302Observation& exact_first,
+    ExactAbsoluteRedirect302Observation& root_first,
+    std::string& error) {
+    if (!capture_pinned_exact_absolute_redirect_302_order(frontend_port,
+                                                          backend_port,
+                                                          temp,
+                                                          container_prefix + "-exact-first",
+                                                          true,
+                                                          exact_first,
+                                                          error) ||
+        !capture_pinned_exact_absolute_redirect_302_order(frontend_port,
+                                                          backend_port,
+                                                          temp,
+                                                          container_prefix + "-root-first",
+                                                          false,
+                                                          root_first,
+                                                          error))
+        return false;
+
+    if (exact_first.wires.size() != 5 || root_first.wires.size() != 5) {
+        error = "302 oracle did not complete the exact five-vector matrix for both orders";
+        return false;
+    }
+    for (size_t i = 0; i < exact_first.wires.size(); i++) {
+        std::vector<char> exact_wire = exact_first.wires[i];
+        std::vector<char> root_wire = root_first.wires[i];
+        if (!normalize_date(exact_wire) || !normalize_date(root_wire) || exact_wire != root_wire) {
+            error = "302 location declaration order changed normalized vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    if (exact_first.forward_history != root_first.forward_history) {
+        error = "302 location declaration order changed exact forward upstream history";
+        return false;
+    }
+    return true;
+}
+
 struct ConverterExactAbsoluteRedirectSideObservation {
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> forward_history;
@@ -10572,6 +11014,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--api-proxy-trace-oracle") == 0;
     const bool exact_absolute_redirect_oracle =
         argc == 2 && strcmp(argv[1], "--exact-absolute-redirect-oracle") == 0;
+    const bool exact_absolute_redirect_302_oracle =
+        argc == 2 && strcmp(argv[1], "--exact-absolute-redirect-302-oracle") == 0;
     const bool converter_root_proxy_trace_differential =
         argc == 3 && strcmp(argv[1], "--converter-root-proxy-trace-differential") == 0;
     const bool converter_api_proxy_trace_differential =
@@ -10605,8 +11049,8 @@ int main(int argc, char** argv) {
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
-         !strict_local_response_differential && !converter_root_proxy_trace_differential &&
-         !converter_api_proxy_trace_differential &&
+         !exact_absolute_redirect_302_oracle && !strict_local_response_differential &&
+         !converter_root_proxy_trace_differential && !converter_api_proxy_trace_differential &&
          !converter_exact_absolute_redirect_differential && !converter_exact_local_differential &&
          !exact_strict_route_differential && !converter_coalesced_successor_differential &&
          !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
@@ -10639,6 +11083,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --root-proxy-trace-oracle\n"
                      "   or: test_nginx_differential --api-proxy-trace-oracle\n"
                      "   or: test_nginx_differential --exact-absolute-redirect-oracle\n"
+                     "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
                      "   or: test_nginx_differential --converter-root-proxy-trace-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-api-proxy-trace-differential "
@@ -10901,6 +11346,44 @@ int main(int argc, char** argv) {
                "or RUT equivalence claim; excludes /old/, relative/variable targets, other "
                "methods/statuses, request framing/body/reuse/pipeline, explicit target ports, "
                "HTTPS, TLS/H2, multiple servers/listeners, and broader location semantics)\n";
+        return 0;
+    }
+
+    if (exact_absolute_redirect_302_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-exact-absolute-redirect-302-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactAbsoluteRedirect302Observation exact_first;
+        ExactAbsoluteRedirect302Observation root_first;
+        std::string oracle_error;
+        if (!run_pinned_exact_absolute_redirect_302_oracle(frontend_port,
+                                                           backend_port,
+                                                           temp,
+                                                           container_prefix,
+                                                           exact_first,
+                                                           root_first,
+                                                           oracle_error)) {
+            std::cerr << "FAIL [pinned exact absolute redirect 302 oracle]: " << oracle_error
+                      << "\n";
+            dump_exact_absolute_redirect_302_observation(exact_first);
+            dump_exact_absolute_redirect_302_observation(root_first);
+            dump_log(temp.nginx_config, "exact absolute redirect 302 pinned nginx config");
+            dump_log(temp.nginx_log, "exact absolute redirect 302 pinned nginx log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx exact /old absolute return 302 is declaration-order "
+               "independent across five fresh explicit-close GET vectors; /old, alternate-Host "
+               "/old, and /old?x=1 emit the same exact Date-normalized 342-byte status-line "
+               "302 Moved Temporarily/CL145/title-H1 302 Found/Connection-before-Location/close/"
+               "EOF wire, with a fixed Location independent of Host and query; the redirect "
+               "epoch has live/settled zero-upstream evidence, while /old/ and / each forward "
+               "exactly once with byte-exact backend histories; each declaration order has "
+               "exactly five scoped access records (three 302/145, two 200/2; nginx-only #313 "
+               "oracle; no parser/converter/RUT equivalence claim; excludes other statuses, "
+               "targets, methods, framing/body, reuse/pipeline, explicit target ports, TLS/H2, "
+               "multiple servers/listeners, and broader location semantics)\n";
         return 0;
     }
 
