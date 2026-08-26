@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
+
 using namespace rut;
 
 namespace {
@@ -887,12 +889,15 @@ TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
     normalized.exact_strict_local_response_binding_count = 2;
     REQUIRE(rir::verify_module(normalized).ok);
     auto normalized_cfg = std::make_unique<RouteConfig>();
-    std::vector<u8> normalized_before(sizeof(RouteConfig));
-    __builtin_memcpy(normalized_before.data(), normalized_cfg.get(), sizeof(RouteConfig));
-    CHECK_FALSE(populate_route_config(*normalized_cfg, normalized));
-    CHECK_EQ(__builtin_memcmp(
-                 normalized_before.data(), normalized_cfg.get(), sizeof(RouteConfig)),
-             0);
+    REQUIRE(populate_route_config(*normalized_cfg, normalized));
+    REQUIRE(normalized_cfg->strict_local_response_table_is_valid());
+    CHECK_EQ(normalized_cfg->upstream_count, 1u);
+    CHECK_EQ(normalized_cfg->exact_strict_local_response_binding_count, 2u);
+    CHECK_EQ(normalized_cfg->strict_local_response_policy_count, 1u);
+    CHECK_EQ(normalized_cfg->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(normalized_cfg->exact_strict_local_response_bindings[1].policy_id, 1u);
+    CHECK_EQ(normalized_cfg->exact_strict_local_response_bindings[1].path_view,
+             ExactPathView::SlashNormalized);
 }
 
 TEST(serve_loader, slash_normalized_exact_source_reaches_verified_rir_but_not_activation) {
@@ -926,17 +931,46 @@ route exact slash_normalized "/health/any" { return local_response({
     CHECK((Str{any.path, any.path_len}.eq({"/health/any", 11})));
     CHECK_EQ(program.config.route_count, 0u);
     CHECK_EQ(program.config.upstream_count, 0u);
-    CHECK_FALSE(program.config.has_strict_local_response_table_inventory());
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK(program.config.has_strict_local_response_table_inventory());
+    CHECK_EQ(program.config.exact_strict_local_response_binding_count, 2u);
+    CHECK_EQ(program.config.exact_strict_local_response_bindings[0].path_view,
+             ExactPathView::SlashNormalized);
+    CHECK_EQ(program.config.exact_strict_local_response_bindings[1].path_view,
+             ExactPathView::SlashNormalized);
 
-    // Direct activation is public and must enforce the same stage-2 boundary as
-    // population. This module has no JIT functions: before the early gate it
-    // could return success after mutating the destination dispatcher.
+    // Population is now a preparation boundary. Production registration must
+    // still reject the already-established table before dispatcher mutation.
     REQUIRE_EQ(program.rir.module.func_count, 0u);
     auto direct_cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*direct_cfg, program.rir.module));
     std::vector<u8> direct_before(sizeof(RouteConfig));
     __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));
     CHECK_FALSE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
     CHECK_EQ(__builtin_memcmp(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig)), 0);
+
+    // load_rut_program has already destroyed AST/HIR/MIR. End every remaining
+    // compiler/source lifetime and prove the prepared RouteConfig owns both
+    // normalized inline paths and the GET/ANY policies independently.
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    std::filesystem::remove(path);
+    REQUIRE(direct_cfg->strict_local_response_table_is_valid());
+    const auto owned_get = direct_cfg->match_exact_strict_local_response_views(
+        {"/health//check", 14}, {"/health/check", 13}, kRouteMethodGet);
+    CHECK_EQ(owned_get.state, ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(owned_get.policy_id, 1u);
+    const auto owned_any = direct_cfg->match_exact_strict_local_response_views(
+        {"/health//any", 12}, {"/health/any", 11}, kRouteMethodPost);
+    CHECK_EQ(owned_any.state, ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(owned_any.policy_id, 2u);
+    CHECK(direct_cfg->strict_local_response_policies[0].body.eq({"get", 3}));
+    CHECK(direct_cfg->strict_local_response_policies[1].body.eq({"any", 3}));
     program.destroy();
 }
 
@@ -966,7 +1000,8 @@ route GET "/sentinel" { return 204 }
     REQUIRE(program.engine.lookup("handler_route_0") != nullptr);
 
     // Without an entry gate, this valid compiled handler is looked up and its
-    // ordinary route is installed despite the unsupported exact-path view.
+    // ordinary route is installed despite the not-yet-active exact-path view.
+    // A fresh direct destination remains byte-identical at this boundary.
     auto direct_cfg = std::make_unique<RouteConfig>();
     std::vector<u8> direct_before(sizeof(RouteConfig));
     __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));

@@ -517,13 +517,17 @@ StrictLocalResponsePolicySpec local_policy(
     return p;
 }
 
-ExactStrictLocalResponseBinding exact_local_binding(const char* path, u8 method, u16 policy_id) {
+ExactStrictLocalResponseBinding exact_local_binding(const char* path,
+                                                    u8 method,
+                                                    u16 policy_id,
+                                                    ExactPathView path_view = ExactPathView::Raw) {
     ExactStrictLocalResponseBinding binding{};
     const u32 len = static_cast<u32>(strlen(path));
     if (len > kMaxExactStrictLocalResponsePathLen) return binding;
     __builtin_memcpy(binding.path, path, len);
     binding.path_len = static_cast<u8>(len);
     binding.method = method;
+    binding.path_view = path_view;
     binding.policy_id = policy_id;
     return binding;
 }
@@ -808,15 +812,25 @@ TEST(route_config, exact_strict_table_dedups_remaps_owns_copies_and_rolls_back_a
                                                      normalized_unmatched,
                                                      normalized_source,
                                                      2));
-    auto normalized_rejected = std::make_unique<RouteConfig>();
-    REQUIRE(normalized_rejected->add_static("/kept-normalized", kRouteMethodGet, 208));
-    std::vector<u8> normalized_before(sizeof(RouteConfig));
-    __builtin_memcpy(
-        normalized_before.data(), normalized_rejected.get(), sizeof(RouteConfig));
-    CHECK_FALSE(normalized_rejected->install_strict_local_response_table(
+    auto normalized_installed = std::make_unique<RouteConfig>();
+    REQUIRE(normalized_installed->install_strict_local_response_table(
         normalized_policies, 2, normalized_unmatched, normalized_source, 2));
-    CHECK_EQ(__builtin_memcmp(
-                 normalized_before.data(), normalized_rejected.get(), sizeof(RouteConfig)),
+    REQUIRE(normalized_installed->strict_local_response_table_is_valid());
+    CHECK_EQ(normalized_installed->exact_strict_local_response_binding_count, 2u);
+    CHECK_EQ(normalized_installed->exact_strict_local_response_bindings[0].path_view,
+             ExactPathView::Raw);
+    CHECK_EQ(normalized_installed->exact_strict_local_response_bindings[1].path_view,
+             ExactPathView::SlashNormalized);
+    CHECK_EQ(normalized_installed->strict_local_response_policy_count, 1u);
+    CHECK_EQ(normalized_installed->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(normalized_installed->exact_strict_local_response_bindings[1].policy_id, 1u);
+
+    auto normalized_copy = std::make_unique<RouteConfig>();
+    REQUIRE(normalized_copy->copy_strict_local_response_table_from_owned(*normalized_installed));
+    REQUIRE(normalized_copy->strict_local_response_table_is_valid());
+    CHECK_EQ(__builtin_memcmp(normalized_copy->exact_strict_local_response_bindings,
+                              normalized_installed->exact_strict_local_response_bindings,
+                              sizeof(normalized_copy->exact_strict_local_response_bindings)),
              0);
 }
 
@@ -851,8 +865,10 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
             static_cast<ExactPathView>(255);
     });
     rejects([](RouteConfig& c) {
-        c.exact_strict_local_response_bindings[0].path_view =
-            ExactPathView::SlashNormalized;
+        auto& binding = c.exact_strict_local_response_bindings[0];
+        binding.path_view = ExactPathView::SlashNormalized;
+        binding.path[2] = '/';
+        binding.path[3] = '/';
     });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].reserved1 = 1; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].policy_id = 0; });
@@ -893,6 +909,151 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
         precedence_policies, 2, precedence_unmatched, precedence_bindings, 2));
     CHECK_EQ(precedence->match_exact_strict_local_response({"/priority", 9}, kRouteMethodGet), 1u);
     CHECK_EQ(precedence->match_exact_strict_local_response({"/priority", 9}, kRouteMethodPost), 2u);
+}
+
+TEST(route_config, exact_strict_mixed_views_are_owned_and_match_with_explicit_precedence) {
+    StrictLocalResponsePolicySpec policies[4] = {
+        local_policy({"Raw GET", 7}, {"text/plain", 10}, {"rut", 3}, {"raw-get", 7}, 400),
+        local_policy({"Norm GET", 8}, {"text/plain", 10}, {"rut", 3}, {"norm-get", 8}, 401),
+        local_policy({"Raw ANY", 7},
+                     {"text/plain", 10},
+                     {"rut", 3},
+                     {"raw-any", 7},
+                     402,
+                     StrictLocalResponseHeadMode::SuppressBody),
+        local_policy({"Norm ANY", 8},
+                     {"text/plain", 10},
+                     {"rut", 3},
+                     {"norm-any", 8},
+                     403,
+                     StrictLocalResponseHeadMode::SuppressBody),
+    };
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding bindings[kMaxExactStrictLocalResponseBindings]{};
+    bindings[0] = exact_local_binding("/health/check/", kRouteMethodGet, 1);
+    bindings[1] =
+        exact_local_binding("/health/check/", kRouteMethodGet, 2, ExactPathView::SlashNormalized);
+    bindings[2] = exact_local_binding("/health/check/", kRouteMethodAny, 3);
+    bindings[3] =
+        exact_local_binding("/health/check/", kRouteMethodAny, 4, ExactPathView::SlashNormalized);
+
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->install_strict_local_response_table(policies, 4, unmatched, bindings, 4));
+    REQUIRE(config->strict_local_response_table_is_valid());
+
+    const auto expect = [&](Str raw, Str normalized, u8 method, u16 policy_id) {
+        const auto result =
+            config->match_exact_strict_local_response_views(raw, normalized, method);
+        CHECK_EQ(result.state, ExactStrictLocalResponseMatchState::Match);
+        CHECK_EQ(result.policy_id, policy_id);
+    };
+    // Raw concrete beats normalized concrete, including raw query-boundary matching.
+    expect({"/health/check/?x=1", 18}, {"/health/check/", 14}, kRouteMethodGet, 1);
+    // A doubled slash misses Raw but selects the supplied normalized concrete view.
+    expect({"/health/check//", 15}, {"/health/check/", 14}, kRouteMethodGet, 2);
+    expect({"/health/check//?x=1", 19}, {"/health/check/", 14}, kRouteMethodGet, 2);
+    // Concrete method classes are exhausted before either ANY class.
+    expect({"/health/check/", 14}, {"/health/check/", 14}, kRouteMethodPost, 3);
+    expect({"/health/check//", 15}, {"/health/check/", 14}, kRouteMethodPost, 4);
+
+    const auto no_slash = config->match_exact_strict_local_response_views(
+        {"/health/check", 13}, {"/health/check", 13}, kRouteMethodGet);
+    CHECK_EQ(no_slash.state, ExactStrictLocalResponseMatchState::Miss);
+    CHECK_EQ(no_slash.policy_id, 0u);
+    const auto unrelated = config->match_exact_strict_local_response_views(
+        {"/other", 6}, {"/other", 6}, kRouteMethodDelete);
+    CHECK_EQ(unrelated.state, ExactStrictLocalResponseMatchState::Miss);
+    CHECK_EQ(unrelated.policy_id, 0u);
+    const auto opaque = config->match_exact_strict_local_response_views(
+        {"/opaque:%2F/../", 15}, {"/opaque:%2F/../", 15}, kRouteMethodGet);
+    CHECK_EQ(opaque.state, ExactStrictLocalResponseMatchState::Miss);
+    CHECK_EQ(opaque.policy_id, 0u);
+
+    // The legacy raw API remains byte-compatible and ignores normalized rows.
+    CHECK_EQ(config->match_exact_strict_local_response({"/health/check//", 15}, kRouteMethodGet),
+             0u);
+    CHECK_EQ(config->match_exact_strict_local_response({"/health/check/?x=1", 18}, kRouteMethodGet),
+             1u);
+
+    const auto invalid = [&](Str normalized) {
+        const auto result = config->match_exact_strict_local_response_views(
+            {"/health/check/", 14}, normalized, kRouteMethodGet);
+        CHECK_EQ(result.state, ExactStrictLocalResponseMatchState::InvalidInput);
+        CHECK_EQ(result.policy_id, 0u);
+    };
+    invalid({nullptr, 0});
+    invalid({"", 0});
+    invalid({"health/check/", 13});
+    invalid({"/health//check/", 15});
+    invalid({"/health/check/?x", 16});
+    const char too_long[63] = {'/'};
+    invalid({too_long, 63});
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*config));
+    config.reset();
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    const auto after_source_lifetime = copied->match_exact_strict_local_response_views(
+        {"/health/check//", 15}, {"/health/check/", 14}, kRouteMethodGet);
+    CHECK_EQ(after_source_lifetime.state, ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(after_source_lifetime.policy_id, 2u);
+    CHECK(copied->strict_local_response_policies[1].body.eq({"norm-get", 8}));
+    copied->exact_strict_local_response_bindings[0].reserved1 = 1;
+    const auto invalid_table = copied->match_exact_strict_local_response_views(
+        {"/health/check/", 14}, {"/health/check/", 14}, kRouteMethodGet);
+    CHECK_EQ(invalid_table.state, ExactStrictLocalResponseMatchState::InvalidInput);
+    CHECK_EQ(invalid_table.policy_id, 0u);
+}
+
+TEST(route_config, exact_strict_mixed_view_capacity_and_normalized_duplicates_are_atomic) {
+    StrictLocalResponsePolicySpec policies[kMaxStrictLocalResponsePolicies]{};
+    ExactStrictLocalResponseBinding bindings[kMaxExactStrictLocalResponseBindings]{};
+    const auto shared = local_policy({"Bad", 3}, {"text/plain", 10}, {"rut", 3}, {"owned", 5}, 400);
+    for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
+        policies[i] = shared;
+        const std::string path = "/capacity/" + std::to_string(i);
+        bindings[i] = exact_local_binding(
+            path.c_str(),
+            kRouteMethodGet,
+            static_cast<u16>(i + 1),
+            (i & 1u) == 0u ? ExactPathView::Raw : ExactPathView::SlashNormalized);
+    }
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    auto full = std::make_unique<RouteConfig>();
+    REQUIRE(full->install_strict_local_response_table(policies,
+                                                      kMaxStrictLocalResponsePolicies,
+                                                      unmatched,
+                                                      bindings,
+                                                      kMaxExactStrictLocalResponseBindings));
+    REQUIRE(full->strict_local_response_table_is_valid());
+    CHECK_EQ(full->exact_strict_local_response_binding_count, kMaxExactStrictLocalResponseBindings);
+    CHECK_EQ(full->strict_local_response_policy_count, 1u);
+
+    auto overflow = std::make_unique<RouteConfig>();
+    REQUIRE(overflow->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> overflow_before(sizeof(RouteConfig));
+    __builtin_memcpy(overflow_before.data(), overflow.get(), sizeof(RouteConfig));
+    CHECK_FALSE(
+        overflow->install_strict_local_response_table(policies,
+                                                      kMaxStrictLocalResponsePolicies,
+                                                      unmatched,
+                                                      bindings,
+                                                      kMaxExactStrictLocalResponseBindings + 1));
+    CHECK_EQ(__builtin_memcmp(overflow_before.data(), overflow.get(), sizeof(RouteConfig)), 0);
+
+    StrictLocalResponsePolicySpec duplicate_policies[2] = {shared, shared};
+    ExactStrictLocalResponseBinding duplicate[kMaxExactStrictLocalResponseBindings]{};
+    duplicate[0] =
+        exact_local_binding("/duplicate", kRouteMethodGet, 1, ExactPathView::SlashNormalized);
+    duplicate[1] =
+        exact_local_binding("/duplicate", kRouteMethodGet, 2, ExactPathView::SlashNormalized);
+    auto rejected = std::make_unique<RouteConfig>();
+    REQUIRE(rejected->add_static("/kept-duplicate", kRouteMethodGet, 208));
+    std::vector<u8> rejected_before(sizeof(RouteConfig));
+    __builtin_memcpy(rejected_before.data(), rejected.get(), sizeof(RouteConfig));
+    CHECK_FALSE(rejected->install_strict_local_response_table(
+        duplicate_policies, 2, unmatched, duplicate, 2));
+    CHECK_EQ(__builtin_memcmp(rejected_before.data(), rejected.get(), sizeof(RouteConfig)), 0);
 }
 
 TEST(route_config, pre_route_strict_table_is_concrete_owned_transactional_and_combined) {

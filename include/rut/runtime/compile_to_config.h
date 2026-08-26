@@ -134,9 +134,10 @@ inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
 
 // Call only after rir::verify_module has accepted the module: verification
 // proves the fixed-table count before this helper indexes the binding inventory.
-// Slash-normalized exact selectors remain compiler metadata in stage 2; every
-// public config-activation entry must reject them until runtime storage and
-// selection are introduced by the next capability increment.
+// Slash-normalized exact selectors may be owned by a prepared RouteConfig, but
+// production activation remains closed until request-time raw-target capture
+// and selection are introduced. Keep this check at the public JIT-registration
+// boundary before lookup, replay, or any destination mutation.
 inline bool verified_exact_path_views_are_runtime_supported(const rir::Module& mod) {
     for (u32 i = 0; i < mod.exact_strict_local_response_binding_count; i++) {
         if (mod.exact_strict_local_response_bindings[i].path_view != ExactPathView::Raw)
@@ -153,8 +154,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         mod.func_count > RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers)
         return false;
     // This public activation entry can be called without populate_route_config.
-    // Reject stage-2-only metadata before symbol lookup, replay, policy ownership,
-    // dispatcher selection, or any other destination mutation.
+    // Reject not-yet-active metadata before symbol lookup, replay, dispatcher
+    // selection, or any other destination mutation.
     if (!verified_exact_path_views_are_runtime_supported(mod)) return false;
     if (cfg.policy_bundle_count != mod.policy_bundle_count) return false;
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
@@ -303,8 +304,6 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
 
     if (!redirect_references_valid(mod)) return false;
-
-    if (!verified_exact_path_views_are_runtime_supported(mod)) return false;
 
     // Upstreams admit one of two shapes (see file docstring):
     //   - Fully empty: helper adds every upstream itself.

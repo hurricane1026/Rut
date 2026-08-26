@@ -32,6 +32,17 @@ struct Module;
 struct RouteConfig;
 bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
 
+enum class ExactStrictLocalResponseMatchState : u8 {
+    InvalidInput = 0,
+    Miss = 1,
+    Match = 2,
+};
+
+struct ExactStrictLocalResponseMatchResult {
+    ExactStrictLocalResponseMatchState state = ExactStrictLocalResponseMatchState::InvalidInput;
+    u16 policy_id = 0;
+};
+
 // Action for a matched route.
 enum class RouteAction : u8 {
     Static,      // respond with fixed status (e.g., 200 OK, 404)
@@ -625,7 +636,6 @@ struct RouteConfig {
                 continue;
             }
             if (!exact_strict_local_response_binding_shape_valid(binding) ||
-                binding.path_view != ExactPathView::Raw ||
                 binding.policy_id > strict_local_response_policy_count)
                 return false;
             const u32 slot = route_method_slot_from_key(binding.method);
@@ -636,7 +646,8 @@ struct RouteConfig {
                 return false;
             for (u32 prior = 0; prior < i; prior++) {
                 const auto& other = exact_strict_local_response_bindings[prior];
-                if (binding.method == other.method && binding.path_len == other.path_len &&
+                if (binding.method == other.method && binding.path_view == other.path_view &&
+                    binding.path_len == other.path_len &&
                     __builtin_memcmp(binding.path, other.path, binding.path_len) == 0)
                     return false;
             }
@@ -672,7 +683,9 @@ struct RouteConfig {
         auto match_method = [&](u8 wanted) -> u16 {
             for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
                 const auto& binding = exact_strict_local_response_bindings[i];
-                if (binding.method != wanted || raw_target.len < binding.path_len) continue;
+                if (binding.path_view != ExactPathView::Raw || binding.method != wanted ||
+                    raw_target.len < binding.path_len)
+                    continue;
                 bool equal = true;
                 for (u32 byte = 0; byte < binding.path_len; byte++)
                     equal &= raw_target.ptr[byte] == binding.path[byte];
@@ -684,6 +697,72 @@ struct RouteConfig {
         };
         const u16 exact = match_method(method_key);
         return exact != 0 ? exact : match_method(kRouteMethodAny);
+    }
+
+    // Exact strict-local lookup over two independently supplied selection
+    // views. The caller owns storage provenance for both ranges and must supply
+    // the complete raw target plus an already-computed slash-normalized,
+    // path-only fixed point. This helper never allocates, normalizes, or mutates
+    // either input. Invalid table/input state is distinct from a valid miss so a
+    // caller can fail closed rather than silently continue to prefix routing.
+    // Selection order is Raw concrete, SlashNormalized concrete, Raw ANY,
+    // SlashNormalized ANY.
+    ExactStrictLocalResponseMatchResult match_exact_strict_local_response_views(
+        Str raw_target, Str slash_normalized_path, u8 method_key) const {
+        const ExactStrictLocalResponseMatchResult invalid{
+            ExactStrictLocalResponseMatchState::InvalidInput, 0};
+        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
+            raw_target.len == 0 || slash_normalized_path.ptr == nullptr ||
+            slash_normalized_path.len == 0 ||
+            slash_normalized_path.len > kMaxExactStrictLocalResponsePathLen ||
+            method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
+            route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
+            return invalid;
+        const uintptr_t raw_address = reinterpret_cast<uintptr_t>(raw_target.ptr);
+        const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
+        if (raw_target.len > UINTPTR_MAX - raw_address ||
+            slash_normalized_path.len > UINTPTR_MAX - normalized_address)
+            return invalid;
+        if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
+        bool previous_slash = false;
+        for (u32 i = 0; i < slash_normalized_path.len; i++) {
+            const char byte = slash_normalized_path.ptr[i];
+            const u8 unsigned_byte = static_cast<u8>(byte);
+            if (byte == '?' || byte == '#' || unsigned_byte < 0x20 || unsigned_byte == 0x7f ||
+                (byte == '/' && previous_slash))
+                return invalid;
+            previous_slash = byte == '/';
+        }
+
+        auto match = [&](ExactPathView view, u8 wanted) -> u16 {
+            const Str target = view == ExactPathView::Raw ? raw_target : slash_normalized_path;
+            for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
+                const auto& binding = exact_strict_local_response_bindings[i];
+                if (binding.path_view != view || binding.method != wanted ||
+                    target.len < binding.path_len)
+                    continue;
+                bool equal = true;
+                for (u32 byte = 0; byte < binding.path_len; byte++)
+                    equal &= target.ptr[byte] == binding.path[byte];
+                if (!equal) continue;
+                if (view == ExactPathView::SlashNormalized) {
+                    if (target.len == binding.path_len) return binding.policy_id;
+                } else if (target.len == binding.path_len || target.ptr[binding.path_len] == '?') {
+                    return binding.policy_id;
+                }
+            }
+            return 0;
+        };
+        const ExactPathView views[] = {ExactPathView::Raw,
+                                       ExactPathView::SlashNormalized,
+                                       ExactPathView::Raw,
+                                       ExactPathView::SlashNormalized};
+        const u8 methods[] = {method_key, method_key, kRouteMethodAny, kRouteMethodAny};
+        for (u32 i = 0; i < 4; i++) {
+            const u16 id = match(views[i], methods[i]);
+            if (id != 0) return {ExactStrictLocalResponseMatchState::Match, id};
+        }
+        return {ExactStrictLocalResponseMatchState::Miss, 0};
     }
 
     bool strict_local_response_policy_id_is_owned(u16 id) const {
@@ -767,8 +846,7 @@ struct RouteConfig {
     bool append_exact_strict_local_response_binding(const ExactStrictLocalResponseBinding& source,
                                                     u16 owned_policy_id) {
         if (exact_strict_local_response_binding_count >= kMaxExactStrictLocalResponseBindings ||
-            !exact_strict_local_response_binding_shape_valid(source) ||
-            source.path_view != ExactPathView::Raw || owned_policy_id == 0 ||
+            !exact_strict_local_response_binding_shape_valid(source) || owned_policy_id == 0 ||
             !strict_local_response_policy_id_is_owned(owned_policy_id))
             return false;
         const u32 slot = route_method_slot_from_key(source.method);
@@ -947,7 +1025,8 @@ struct RouteConfig {
                 return false;
             for (u32 prior = 0; prior < i; prior++) {
                 const auto& earlier = exact_bindings[prior];
-                if (earlier.method == binding.method && earlier.path_len == binding.path_len &&
+                if (earlier.method == binding.method && earlier.path_view == binding.path_view &&
+                    earlier.path_len == binding.path_len &&
                     __builtin_memcmp(earlier.path, binding.path, binding.path_len) == 0)
                     return false;
             }
