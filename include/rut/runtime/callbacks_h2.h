@@ -34,6 +34,7 @@ namespace rut {
 bool h2_apply_forward_request_overrides(Connection& conn);
 
 inline void h2_reset_request_mutations(Connection& conn) {
+    conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
     conn.target_transform_id = 0;
@@ -62,12 +63,12 @@ inline bool h2_prepare_forward_request(
     if (header_end == 0) return false;
 
     u8* saved_slice = conn.recv_slice;
+    const u32 saved_slice_capacity = conn.recv_slice_capacity;
     Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
     const u32 saved_header_end = conn.req_header_end;
     const u32 saved_initial_send_len = conn.req_initial_send_len;
     const RequestTransferEncoding saved_transfer_encoding = conn.req_client_transfer_encoding;
-    conn.recv_slice = out;
-    conn.recv_buf.bind(out, out_cap);
+    conn.bind_request_receive_buffer(out, out_cap);
     conn.recv_buf.commit(synth_len);
     conn.req_header_end = header_end;
     conn.req_initial_send_len = synth_len;
@@ -76,6 +77,7 @@ inline bool h2_prepare_forward_request(
     if (ok) *out_len = conn.recv_buf.len();
     conn.recv_buf = static_cast<Buffer&&>(saved_buf);
     conn.recv_slice = saved_slice;
+    conn.recv_slice_capacity = saved_slice_capacity;
     conn.req_header_end = saved_header_end;
     conn.req_initial_send_len = saved_initial_send_len;
     conn.req_client_transfer_encoding = saved_transfer_encoding;
@@ -1472,7 +1474,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     const u32 kRemaining = kLen - r.consumed;
     if (kRemaining > 0 && r.consumed > 0)
         memmove(conn.recv_slice, conn.recv_slice + r.consumed, kRemaining);
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
     const bool kClose = r.close || d.overflow;

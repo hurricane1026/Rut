@@ -8,6 +8,7 @@
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -164,6 +165,17 @@ enum class Http1RequestBufferDisposition : u8 {
 
 static constexpr u8 kHttp1WaitHeaderSend = 1u << 0;
 static constexpr u8 kHttp1WaitUpstreamRetirement = 1u << 1;
+
+enum class RawRequestTargetWitnessState : u8 {
+    Neutral,
+    Invalid,
+    Valid,
+};
+
+struct RawRequestTargetWitnessResult {
+    RawRequestTargetWitnessState state;
+    Str target;
+};
 
 static_assert(static_cast<u8>(ConnState::Count) == 6u,
               "ConnState count is part of the static network state contract");
@@ -894,6 +906,11 @@ struct ConnectionBase {
         http1_pipeline_request_generation = source.http1_pipeline_request_generation;
         http1_pipeline_boundary_owners_settled = source.http1_pipeline_boundary_owners_settled;
         req_target_has_fragment = source.req_target_has_fragment;
+        // Unlike the fragment fact above, raw-target offsets are owned by one
+        // concrete recv_buf episode.  A metadata-only state copy cannot prove
+        // that ownership, so it deliberately leaves the destination neutral.
+        req_metadata_episode = 0;
+        clear_raw_request_target_witness();
     }
 
     // Body streaming state (proxy large body support)
@@ -956,9 +973,141 @@ struct ConnectionBase {
     // HTTP/1.0 or HTTP/1.1 header block. Fallback method/path recovery never
     // publishes it.
     bool req_strict_h1_complete;
+    // A checked, connection-owned witness for the complete request-target.  The
+    // target itself remains in recv_buf; these fields never borrow a pointer and
+    // are neutral unless capture_request_metadata completed a strict origin-form
+    // parse for the current metadata episode.  The witness includes the query
+    // spelling and is independent of the bounded req_path logging copy.
+    u32 req_metadata_episode;
+    u32 req_raw_target_episode;
+    u32 req_raw_target_offset;
+    u32 req_raw_target_length;
     // Full raw request-target fragment witness for the current request. This is
     // deliberately independent of the bounded req_path copy and canonical view.
     bool req_target_has_fragment;
+
+    void clear_raw_request_target_witness() {
+        req_raw_target_episode = 0;
+        req_raw_target_offset = 0;
+        req_raw_target_length = 0;
+    }
+
+    void begin_request_metadata_episode() {
+        req_metadata_episode++;
+        if (req_metadata_episode == 0) req_metadata_episode = 1;
+        clear_raw_request_target_witness();
+    }
+
+    // Reset/compaction paths must use this instead of resetting recv_buf
+    // directly.  It makes a previous request's offsets neutral before the
+    // backing storage can be repopulated with a successor request.
+    void reset_request_receive_buffer() {
+        clear_raw_request_target_witness();
+        recv_buf.reset();
+    }
+
+    void consume_request_receive_buffer(u32 count) {
+        clear_raw_request_target_witness();
+        recv_buf.consume(count);
+    }
+
+    RawRequestTargetWitnessResult checked_raw_request_target() const {
+        const RawRequestTargetWitnessResult neutral{RawRequestTargetWitnessState::Neutral,
+                                                    {nullptr, 0}};
+        const RawRequestTargetWitnessResult invalid{RawRequestTargetWitnessState::Invalid,
+                                                    {nullptr, 0}};
+        if (req_raw_target_episode == 0 && req_raw_target_offset == 0 && req_raw_target_length == 0)
+            return neutral;
+        if (req_raw_target_episode == 0 || req_raw_target_offset == 0 ||
+            req_raw_target_length == 0 || req_metadata_episode == 0 ||
+            req_raw_target_episode != req_metadata_episode || !req_strict_h1_complete ||
+            req_malformed || req_header_end == 0 || req_initial_send_len == 0 ||
+            req_header_end > req_initial_send_len || !recv_buf.valid() || recv_buf.is_released())
+            return invalid;
+
+        const u32 capacity = recv_buf.capacity();
+        const u32 count = recv_buf.len();
+        if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
+            count > capacity || req_header_end > count || req_initial_send_len > count ||
+            req_raw_target_offset >= req_header_end)
+            return invalid;
+        const u64 target_end64 = static_cast<u64>(req_raw_target_offset) + req_raw_target_length;
+        if (target_end64 >= req_header_end || target_end64 > count || target_end64 > capacity)
+            return invalid;
+
+        const u8* base = recv_buf.data();
+        const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+        if (base != recv_slice || address < 4096 || capacity > UINTPTR_MAX - address)
+            return invalid;
+
+        const char* method = nullptr;
+        u32 method_length = 0;
+        switch (static_cast<LogHttpMethod>(req_method)) {
+            case LogHttpMethod::Get:
+                method = "GET";
+                method_length = 3;
+                break;
+            case LogHttpMethod::Post:
+                method = "POST";
+                method_length = 4;
+                break;
+            case LogHttpMethod::Put:
+                method = "PUT";
+                method_length = 3;
+                break;
+            case LogHttpMethod::Delete:
+                method = "DELETE";
+                method_length = 6;
+                break;
+            case LogHttpMethod::Patch:
+                method = "PATCH";
+                method_length = 5;
+                break;
+            case LogHttpMethod::Head:
+                method = "HEAD";
+                method_length = 4;
+                break;
+            case LogHttpMethod::Options:
+                method = "OPTIONS";
+                method_length = 7;
+                break;
+            case LogHttpMethod::Connect:
+                method = "CONNECT";
+                method_length = 7;
+                break;
+            case LogHttpMethod::Trace:
+                method = "TRACE";
+                method_length = 5;
+                break;
+            case LogHttpMethod::Other:
+                return invalid;
+        }
+        if (method == nullptr || req_raw_target_offset != method_length + 1u ||
+            method_length >= req_header_end || base[method_length] != ' ')
+            return invalid;
+        for (u32 i = 0; i < method_length; i++) {
+            if (base[i] != static_cast<u8>(method[i])) return invalid;
+        }
+
+        const u32 target_end = static_cast<u32>(target_end64);
+        // Bind the offsets to the strictly parsed request line, not merely an
+        // arbitrary slash-delimited substring elsewhere in the header block.
+        // Bounds above are proven before these bytes are examined.
+        const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
+        const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
+        if ((!h10 && !h11) || base[req_raw_target_offset - 1] != ' ' ||
+            base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
+            target_end64 + 11u > req_header_end || base[target_end + 1] != 'H' ||
+            base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
+            base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
+            base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
+            base[target_end + 8] != (h11 ? '1' : '0') || base[target_end + 9] != '\r' ||
+            base[target_end + 10] != '\n')
+            return invalid;
+        return {
+            RawRequestTargetWitnessState::Valid,
+            {reinterpret_cast<const char*>(base + req_raw_target_offset), req_raw_target_length}};
+    }
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's
@@ -1148,6 +1297,10 @@ struct ConnectionBase {
     // Slices are allocated in EventLoop::alloc_conn_impl() and freed in free_conn_impl().
     // Idle/free connections hold nullptr (zero buffer memory).
     u8* recv_slice;
+    // Capacity declared when recv_slice was installed by the owning loop.  Keep
+    // this independent of Buffer's mutable binding so checked request metadata
+    // can reject a rebound/shifted/recapped Buffer before reading through it.
+    u32 recv_slice_capacity;
     u8* send_slice;
     Buffer recv_buf;
     Buffer send_buf;
@@ -1160,6 +1313,13 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+
+    void bind_request_receive_buffer(u8* slice, u32 capacity) {
+        clear_raw_request_target_witness();
+        recv_slice = slice;
+        recv_slice_capacity = capacity;
+        recv_buf.bind(slice, capacity);
+    }
 
     void clear_response_accounting() {
         resp_status = 0;
@@ -1322,6 +1482,10 @@ struct ConnectionBase {
         failure_policy_suppress_body = false;
         req_http_version = 255;
         req_strict_h1_complete = false;
+        req_metadata_episode = 0;
+        req_raw_target_episode = 0;
+        req_raw_target_offset = 0;
+        req_raw_target_length = 0;
         req_target_has_fragment = false;
         req_keep_alive = false;
         req_client_keep_alive = false;
@@ -1391,6 +1555,7 @@ struct ConnectionBase {
         epoch_held = false;
         pending_ops = 0;
         recv_slice = nullptr;
+        recv_slice_capacity = 0;
         send_slice = nullptr;
         recv_buf.bind(nullptr, 0);
         send_buf.bind(nullptr, 0);

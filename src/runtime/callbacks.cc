@@ -92,6 +92,7 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
 }
 
 void capture_request_metadata(Connection& conn) {
+    conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
@@ -148,6 +149,22 @@ void capture_request_metadata(Connection& conn) {
     const ParseStatus parse_status = parser.parse(data, kLen, &req);
     conn.req_target_has_fragment = req.target_has_fragment;
     if (parse_status == ParseStatus::Complete) {
+        u32 raw_target_offset = 0;
+        u32 raw_target_length = 0;
+        const uintptr_t base_address = reinterpret_cast<uintptr_t>(data);
+        const uintptr_t target_address = reinterpret_cast<uintptr_t>(req.path.ptr);
+        const bool target_address_range_valid =
+            base_address >= 4096 && kLen <= UINTPTR_MAX - base_address &&
+            target_address >= base_address && target_address - base_address <= kLen;
+        if (target_address_range_valid) {
+            const u64 offset = target_address - base_address;
+            const u64 end = offset + req.path.len;
+            if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
+                data[offset] == '/' && req.path_canon.ptr != nullptr) {
+                raw_target_offset = static_cast<u32>(offset);
+                raw_target_length = req.path.len;
+            }
+        }
         conn.req_header_end = parser.header_end;
         conn.req_http_version = static_cast<u8>(req.version);
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is
@@ -271,6 +288,16 @@ void capture_request_metadata(Connection& conn) {
         conn.req_strict_h1_complete =
             (req.version == HttpVersion::Http10 || req.version == HttpVersion::Http11) &&
             conn.req_header_end != 0;
+        // The strict parser intentionally accepts fragment spelling as part of
+        // its historical origin-form-like target contract.  Capture it exactly
+        // here; consumers that disallow fragments continue to gate on
+        // req_target_has_fragment before using this witness.
+        if (conn.req_strict_h1_complete && !conn.req_malformed && raw_target_offset != 0 &&
+            raw_target_length != 0) {
+            conn.req_raw_target_episode = conn.req_metadata_episode;
+            conn.req_raw_target_offset = raw_target_offset;
+            conn.req_raw_target_length = raw_target_length;
+        }
         return;
     }
 
@@ -323,7 +350,7 @@ bool pipeline_shift(Connection& conn) {
     const u32 kLeftover = pipeline_leftover(conn);
     if (kLeftover == 0) return false;
     const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     u8* dst = conn.recv_buf.write_ptr();
     __builtin_memmove(dst, src, kLeftover);
     conn.recv_buf.commit(kLeftover);
@@ -360,7 +387,7 @@ bool pipeline_recover(Connection& conn) {
     if (kExisting == 0) {
         // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just
         // restore the stash.
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         u8* dst = conn.recv_buf.write_ptr();
         __builtin_memmove(dst, src, kStashLen);
         conn.recv_buf.commit(kStashLen);
@@ -373,6 +400,7 @@ bool pipeline_recover(Connection& conn) {
             return false;  // can't hold both — signal failure so the caller closes
                            // rather than forwarding a truncated (corrupt) stream
         u8* base = conn.recv_buf.write_ptr() - kExisting;
+        conn.clear_raw_request_target_witness();
         __builtin_memmove(base + kStashLen, base, kExisting);
         __builtin_memmove(base, src, kStashLen);
         conn.recv_buf.set_len(kStashLen + kExisting);
@@ -757,11 +785,11 @@ void prepare_early_response_state(Connection& conn) {
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (kHasRemainingBody) {
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.keep_alive = false;
     } else {
         if (!pipeline_stash(conn)) conn.keep_alive = false;
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();
 }

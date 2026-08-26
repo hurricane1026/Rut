@@ -799,6 +799,7 @@ private:
                     return false;
                 const u32 late = c.recv_buf.len() - prefix;
                 if (late != 0) __builtin_memmove(c.recv_slice, c.recv_buf.data() + prefix, late);
+                c.clear_raw_request_target_witness();
                 c.recv_buf.set_len(late);
                 return true;
             }
@@ -1699,6 +1700,7 @@ public:
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
+            conns[cid].recv_slice_capacity = 0;
         }
         if (conns[cid].send_slice) {
             pool.free(conns[cid].send_slice);
@@ -1726,6 +1728,7 @@ public:
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
+                    conns[cid].recv_slice_capacity = 0;
                 }
                 if (conns[cid].send_slice) {
                     pool.free(conns[cid].send_slice);
@@ -1765,9 +1768,8 @@ public:
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
         conns[id].listener_context = this->listener_context;
-        conns[id].recv_slice = rs;
+        conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
-        conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
             conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
@@ -1845,6 +1847,7 @@ public:
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
         conns[cid].recv_slice = rs;
+        conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
         conns[cid].response_header_slice = hs;

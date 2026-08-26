@@ -580,9 +580,8 @@ public:
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
         conns[id].listener_context = this->listener_context;
-        conns[id].recv_slice = rs;
+        conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
-        conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
             conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;

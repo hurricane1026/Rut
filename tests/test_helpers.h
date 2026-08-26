@@ -145,9 +145,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         conns[id].reset();
         conns[id].id = id;
         conns[id].listener_context = this->listener_context;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
@@ -551,9 +550,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
@@ -575,6 +573,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
+            conns[cid].recv_slice_capacity = rs != nullptr ? kBufSize : 0;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
             conns[cid].pending_ops = ops;
@@ -902,9 +901,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
-        conns[id].recv_slice = recv_storage[id];
+        conns[id].bind_request_receive_buffer(recv_storage[id], kBufSize);
         conns[id].send_slice = send_storage[id];
-        conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
         conns[id].response_header_slice = response_header_storage[id];
         conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);

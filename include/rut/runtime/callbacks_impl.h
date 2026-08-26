@@ -330,7 +330,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
         return false;
     }
 
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     build_probe_request(conn, target, backend_idx);
 
     conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
@@ -2491,7 +2491,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.pipeline_depth = 0;
     conn.http1_pipeline_boundary_owners_settled = false;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     if (!loop->submit_recv(conn)) loop->close_conn(conn);
 }
@@ -4300,6 +4300,7 @@ inline bool rewrite_request_line_path(Connection& conn) {
         __builtin_memmove(
             buf + (static_cast<i64>(j) + delta), buf + j, static_cast<size_t>(total - j));
     }
+    conn.clear_raw_request_target_witness();
     __builtin_memcpy(buf + path_start, conn.req_path_override.ptr, new_len);
     conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
     // The path sits at the front of the request, so every absolute offset past
@@ -4638,6 +4639,7 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     const u32 new_target_end = target_start + static_cast<u32>(new_target_len);
     const u32 suffix_start = target_start + spec.strip_prefix.len;
     const u32 suffix_dest = target_start + spec.replace_prefix.len;
+    conn.clear_raw_request_target_witness();
     if (delta < 0) {
         __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
         __builtin_memmove(
@@ -4872,7 +4874,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                           original_successor_len) != 0))
         return false;
     if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
         return false;
     conn.req_header_end = new_header_len;
@@ -5277,7 +5279,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.req_body_streamed = true;
         conn.request_upload_complete = false;
         reserve_response_mutation_snapshot(conn);
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
         loop->submit_recv(conn);
@@ -5331,7 +5333,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // recv_buf is released: pipelined downstream bytes read during the upstream wait
         // then land at offset 0 and flow through pipeline_recover, and the just-sent
         // request can never leak into the next request's parse.
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         if (coalesced_get && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                  conn, conn.response_read_deadline_upload)) {
             loop->close_conn(conn);
@@ -6343,7 +6345,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.pipeline_stash_len = 0;
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
         conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
@@ -6364,7 +6366,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     }
     conn.pipeline_depth = 0;
     conn.http1_pipeline_boundary_owners_settled = false;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
 }
@@ -6632,7 +6634,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -6652,7 +6654,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
     loop->submit_recv(conn);
     loop->submit_recv_upstream(conn);
@@ -6943,13 +6945,13 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
         // consumed bytes and keep receiving the rest of the next frame. We didn't pause, so
         // a sync (epoll, one-shot) recv must be re-armed; an async multishot recv stays
         // armed UNLESS this was its terminal completion (recv_armed cleared) — re-arm then.
-        if (consumed > 0) conn.recv_buf.consume(consumed);
+        if (consumed > 0) conn.consume_request_receive_buffer(consumed);
         if (st == WsInspectStatus::Close) return false;  // caller closes
         if ((conn.ws_client_eof || conn.ws_upstream_eof)) {
             // Peer FIN'd and the drain stops new reads, so a leftover partial frame can
             // never complete — drop it so ws_close_if_drained (which needs an empty buffer)
             // can tear down, instead of a partial-frame-then-FIN wedging the tunnel open.
-            conn.recv_buf.consume(conn.recv_buf.len());
+            conn.consume_request_receive_buffer(conn.recv_buf.len());
             return true;
         }
         if constexpr (ws_loop_async<Loop>()) {
@@ -7132,7 +7134,7 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     if (conn.is_ws_terminate) {
         // Drop the consumed prefix (the re-framed output we just sent + any dropped
         // frames), keeping the partial trailing frame at the front for the next read.
-        conn.recv_buf.consume(conn.ws_c2u_consumed);
+        conn.consume_request_receive_buffer(conn.ws_c2u_consumed);
         conn.ws_c2u_consumed = 0;
         conn.ws_client_send_len = 0;
         if (conn.ws_closing) {  // a Close drained on the upstream slot — advance the handshake
@@ -7166,7 +7168,7 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 #endif
-    conn.recv_buf.consume(conn.ws_client_send_len);
+    conn.consume_request_receive_buffer(conn.ws_client_send_len);
     conn.ws_client_send_len = 0;
     if (ws_draining(conn)) {
         // Keep flushing both directions; close once everything has drained.
@@ -8339,7 +8341,7 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
     }
     conn.pipeline_depth = 0;
     conn.http1_pipeline_boundary_owners_settled = false;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     if (!loop->submit_recv(conn)) loop->close_conn(conn);
 }
@@ -9760,7 +9762,7 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
         conn.pipeline_stash_len = 0;
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
-        conn.recv_buf.reset();
+        conn.reset_request_receive_buffer();
         conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
         conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
@@ -9781,7 +9783,7 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     }
     conn.pipeline_depth = 0;
     conn.http1_pipeline_boundary_owners_settled = false;
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
 }

@@ -769,6 +769,9 @@ TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
     const char kReq[] = "GET /original HTTP/1.1\r\nHost: client\r\n\r\n";
     const u32 kLen = sizeof(kReq) - 1;
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    capture_request_metadata(*c);
+    REQUIRE_EQ(c->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    REQUIRE(c->checked_raw_request_target().target.eq({"/original", 9}));
     c->req_header_end = kLen;
     c->req_initial_send_len = kLen;
     c->req_path_overridden = true;
@@ -781,6 +784,7 @@ TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
     REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
     REQUIRE(rewrite_request_line_path(*c));
 
+    CHECK_EQ(c->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
     CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
     CHECK(buf_has(c->recv_buf.data(), c->recv_buf.len(), "GET /forwarded HTTP/1.1\r\n"));
     CHECK_FALSE(c->retry_req_snapshot_replayable);
@@ -2165,7 +2169,11 @@ TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
         auto* conn = setup_target_transform_request(
             loop, cfg, request.data(), static_cast<u32>(request.size()));
         REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+        REQUIRE(conn->checked_raw_request_target().target.eq(
+            {v.target, static_cast<u32>(strlen(v.target))}));
         REQUIRE(materialize_request_target_transform(*conn, cfg));
+        CHECK_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
         std::string expected = std::string("GET ") + v.expected + " HTTP/1.1\r\n";
         CHECK(conn->recv_buf.len() >= expected.size());
         CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected.data(), expected.size()), 0);
@@ -3029,6 +3037,28 @@ TEST(target_transform, h2_request_boundary_clears_recorded_effect) {
     h2_reset_request_mutations(conn);
     CHECK_FALSE(conn.target_transform_recorded);
     CHECK_EQ(conn.target_transform_id, 0u);
+}
+
+TEST(raw_request_target_witness, h2_header_callback_clears_prior_h1_episode) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    static constexpr char kPriorH1[] = "GET /prior HTTP/1.1\r\nHost: old\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPriorH1), sizeof(kPriorH1) - 1u),
+               sizeof(kPriorH1) - 1u);
+    capture_request_metadata(*conn);
+    REQUIRE_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+
+    u8 response[256]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_on_headers_cb<SmallLoop>(&dispatch, h2, 1, nullptr, 0, true);
+
+    CHECK_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    CHECK_GT(dispatch.resp_len, 0u);
 }
 
 TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
@@ -4289,6 +4319,32 @@ TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
     CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
     CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+}
+
+TEST(websocket, downstream_send_completion_consumes_and_invalidates_prior_h1_target) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+    static constexpr char kPrior[] = "GET /prior HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrior), sizeof(kPrior) - 1u),
+               sizeof(kPrior) - 1u);
+    capture_request_metadata(*conn);
+    REQUIRE_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+
+    loop.backend.clear_ops();
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, sizeof(kPrior) - 1u));
+    REQUIRE(conn->ws_client_send_pending);
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, sizeof(kPrior) - 1u));
+
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
 }
 
 TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
@@ -13291,6 +13347,10 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     source.http1_pipeline_request_generation = 41;
     source.http1_pipeline_boundary_owners_settled = true;
     source.req_target_has_fragment = true;
+    source.req_metadata_episode = 40;
+    source.req_raw_target_episode = 40;
+    source.req_raw_target_offset = 4;
+    source.req_raw_target_length = 9;
     ConnectionBase destination{};
     destination.reset();
     destination.copy_downstream_transport_state_from(source);
@@ -13301,8 +13361,14 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
     CHECK(destination.http1_pipeline_boundary_owners_settled);
     CHECK(destination.req_target_has_fragment);
+    CHECK_EQ(destination.req_metadata_episode, 0u);
+    CHECK_EQ(destination.req_raw_target_episode, 0u);
+    CHECK_EQ(destination.req_raw_target_offset, 0u);
+    CHECK_EQ(destination.req_raw_target_length, 0u);
     destination.reset();
     CHECK_EQ(destination.downstream_completed_request_count, 0u);
+    CHECK_EQ(destination.req_metadata_episode, 0u);
+    CHECK_EQ(destination.req_raw_target_episode, 0u);
 }
 
 // Exact single request — pipeline_leftover returns 0.
@@ -14761,6 +14827,322 @@ TEST(metadata, empty_recv_buf) {
     CHECK_EQ(c.req_path[0], '/');
     CHECK_FALSE(c.req_client_has_content_length);
     CHECK_EQ(c.req_client_content_length_count, 0u);
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+}
+
+TEST(raw_request_target_witness, preserves_full_origin_form_target_and_existing_metadata) {
+    Connection c{};
+    c.reset();
+    u8 recv[1024]{};
+    c.bind_request_receive_buffer(recv, sizeof(recv));
+
+    std::string target = "/api//v1/./teams/%2Fmember?raw=%2f&&x=../";
+    target.append(96, 'q');
+    const std::string request = "GET " + target + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    const std::string original = request;
+    REQUIRE_GT(request.size(), static_cast<size_t>(Connection::kMaxReqPathLen));
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(request.data()),
+                                static_cast<u32>(request.size())),
+               request.size());
+    capture_request_metadata(c);
+
+    const auto witness = c.checked_raw_request_target();
+    REQUIRE_EQ(witness.state, RawRequestTargetWitnessState::Valid);
+    CHECK(witness.target.eq({target.data(), static_cast<u32>(target.size())}));
+    CHECK_EQ(witness.target.ptr, reinterpret_cast<const char*>(c.recv_buf.data() + 4));
+    CHECK_EQ(c.req_raw_target_offset, 4u);
+    CHECK_EQ(c.req_raw_target_length, target.size());
+    CHECK_EQ(__builtin_memcmp(c.recv_buf.data(), original.data(), original.size()), 0);
+    CHECK_EQ(c.req_method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(c.req_size, request.size());
+
+    // Historical bounded/logging and canonical fields remain byte-compatible.
+    CHECK_EQ(c.req_path[Connection::kMaxReqPathLen - 1], '\0');
+    CHECK_EQ(__builtin_memcmp(c.req_path, target.data(), Connection::kMaxReqPathLen - 1), 0);
+    CHECK(c.req_path_canon.eq(canonicalize_request({c.req_path, Connection::kMaxReqPathLen - 1})));
+    CHECK_FALSE(c.req_target_has_fragment);
+
+    // The parser's accepted recv-buffer boundary is recoverable exactly. One
+    // byte beyond it is a truncated/incomplete parse and publishes no witness.
+    c.reset_request_receive_buffer();
+    constexpr u32 kCapacity = sizeof(recv);
+    constexpr u32 kWireOverhead = 4u + 13u;  // "GET " + " HTTP/1.1\\r\\n\\r\\n"
+    std::string boundary_target(kCapacity - kWireOverhead, 'z');
+    boundary_target[0] = '/';
+    const std::string boundary = "GET " + boundary_target + " HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(boundary.size(), static_cast<size_t>(kCapacity));
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(boundary.data()), kCapacity),
+               kCapacity);
+    capture_request_metadata(c);
+    REQUIRE_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    CHECK(c.checked_raw_request_target().target.eq(
+        {boundary_target.data(), static_cast<u32>(boundary_target.size())}));
+
+    c.reset_request_receive_buffer();
+    std::string overflow_target(kCapacity - kWireOverhead + 1u, 'z');
+    overflow_target[0] = '/';
+    const std::string overflow = "GET " + overflow_target + " HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(overflow.data()),
+                                static_cast<u32>(overflow.size())),
+               kCapacity);
+    capture_request_metadata(c);
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+
+    c.reset_request_receive_buffer();
+    static constexpr char kFragment[] = "GET /frag//path?q=%2F#raw HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(kFragment), sizeof(kFragment) - 1u),
+               sizeof(kFragment) - 1u);
+    capture_request_metadata(c);
+    REQUIRE_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    CHECK(c.checked_raw_request_target().target.eq({"/frag//path?q=%2F#raw", 21}));
+    CHECK(c.req_target_has_fragment);
+}
+
+TEST(raw_request_target_witness, non_origin_partial_and_malformed_inputs_stay_neutral) {
+    Connection c{};
+    c.reset();
+    u8 recv[512]{};
+    c.bind_request_receive_buffer(recv, sizeof(recv));
+    const char* cases[] = {
+        "GET /partial HTTP/1.1\r\nHost: x\r\n",
+        "GET /bad HTTP/1.1\r\nBroken\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET http://example.com/path?q=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (const char* request : cases) {
+        c.reset_request_receive_buffer();
+        const u32 length = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(request), length), length);
+        capture_request_metadata(c);
+        CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+        CHECK_EQ(c.req_raw_target_episode, 0u);
+        CHECK_EQ(c.req_raw_target_offset, 0u);
+        CHECK_EQ(c.req_raw_target_length, 0u);
+    }
+}
+
+TEST(raw_request_target_witness, forged_ownership_offsets_lengths_and_counts_fail_closed) {
+    Connection c{};
+    c.reset();
+    u8 recv[512]{};
+    c.bind_request_receive_buffer(recv, sizeof(recv));
+    static constexpr char kRequest[] = "GET /a//b/./%2F?x=%2f&&y=.. HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    capture_request_metadata(c);
+    REQUIRE_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+
+    const u32 episode = c.req_raw_target_episode;
+    const u32 offset = c.req_raw_target_offset;
+    const u32 length = c.req_raw_target_length;
+    const u32 header_end = c.req_header_end;
+    const u32 initial_send_len = c.req_initial_send_len;
+    const auto restore = [&]() {
+        c.req_metadata_episode = episode;
+        c.req_raw_target_episode = episode;
+        c.req_raw_target_offset = offset;
+        c.req_raw_target_length = length;
+        c.req_header_end = header_end;
+        c.req_initial_send_len = initial_send_len;
+        c.req_strict_h1_complete = true;
+        c.req_malformed = false;
+    };
+    const auto invalid = [&]() {
+        CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Invalid);
+        restore();
+    };
+
+    c.req_raw_target_offset = 0;
+    invalid();
+    c.req_raw_target_offset = 1;
+    invalid();
+    c.req_raw_target_offset = 0xffffffffu;
+    invalid();
+    c.req_raw_target_length = 0;
+    invalid();
+    c.req_raw_target_length = 0xffffffffu;
+    invalid();
+    c.req_raw_target_offset = 0xfffffff0u;
+    c.req_raw_target_length = 0x40u;
+    invalid();
+    c.req_raw_target_episode = episode + 1u;
+    invalid();
+    c.req_metadata_episode = episode + 1u;
+    invalid();
+    c.req_header_end = offset + length;
+    invalid();
+    c.req_initial_send_len = header_end - 1u;
+    invalid();
+    c.req_strict_h1_complete = false;
+    invalid();
+    c.req_malformed = true;
+    invalid();
+
+    c.recv_buf.set_len(offset + length - 1u);
+    invalid();
+    c.recv_buf.set_len(sizeof(kRequest) - 1u);
+    restore();
+    c.recv_buf.bind(reinterpret_cast<u8*>(1), sizeof(recv));
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+    c.recv_buf.bind(reinterpret_cast<u8*>(UINTPTR_MAX - 16u), sizeof(recv));
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+
+    c.recv_buf.bind(recv, sizeof(recv));
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    restore();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+
+    u8 unrelated[sizeof(recv)]{};
+    __builtin_memcpy(unrelated, recv, sizeof(kRequest) - 1u);
+    c.recv_buf.bind(unrelated, sizeof(unrelated));
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+
+    c.recv_buf.bind(recv + 1, sizeof(recv) - 1u);
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+    c.recv_buf.bind(recv, sizeof(recv) - 1u);
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+    c.recv_buf.bind(recv, sizeof(recv) + 1u);
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+    c.recv_buf.bind(recv, UINT32_MAX);
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    invalid();
+
+    c.recv_buf.bind(recv, sizeof(recv));
+    c.recv_buf.commit(sizeof(kRequest) - 1u);
+    restore();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    c.clear_raw_request_target_witness();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+}
+
+TEST(raw_request_target_witness, forged_header_value_lookalike_is_not_a_request_line) {
+    Connection c{};
+    c.reset();
+    u8 recv[512]{};
+    c.bind_request_receive_buffer(recv, sizeof(recv));
+    static constexpr char kRequest[] =
+        "GET /real HTTP/1.1\r\nHost: client\r\nX-Lookalike: /forged HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    capture_request_metadata(c);
+    REQUIRE_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    REQUIRE(c.checked_raw_request_target().target.eq({"/real", 5}));
+
+    const char* lookalike = __builtin_strstr(kRequest, "/forged");
+    REQUIRE(lookalike != nullptr);
+    c.req_raw_target_offset = static_cast<u32>(lookalike - kRequest);
+    c.req_raw_target_length = 7;
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Invalid);
+    CHECK_EQ(__builtin_memcmp(c.recv_buf.data(), kRequest, sizeof(kRequest) - 1u), 0);
+}
+
+TEST(raw_request_target_witness, all_strict_parser_methods_bind_the_first_delimiter) {
+    const char* methods[] = {
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"};
+    for (const char* method : methods) {
+        Connection c{};
+        c.reset();
+        u8 recv[512]{};
+        c.bind_request_receive_buffer(recv, sizeof(recv));
+        const std::string request = std::string(method) + " /method HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+                   request.size());
+        capture_request_metadata(c);
+        REQUIRE_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+        CHECK(c.checked_raw_request_target().target.eq({"/method", 7}));
+
+        const u8 captured_method = c.req_method;
+        c.req_method = static_cast<u8>(LogHttpMethod::Other);
+        CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Invalid);
+        c.req_method = captured_method;
+        CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    }
+}
+
+TEST(raw_request_target_witness, reset_shift_recover_and_successor_episodes_do_not_alias) {
+    Connection c{};
+    c.reset();
+    u8 recv[512]{}, send[512]{};
+    c.bind_request_receive_buffer(recv, sizeof(recv));
+    c.send_slice = send;
+    c.send_buf.bind(send, sizeof(send));
+    static constexpr char kFirst[] = "GET /first?x=1 HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kSecond[] = "GET /second//path?y=%2F HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kThird[] = "GET /third HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kFourthPrefix[] = "GET /late//fourth?z=%2f";
+    static constexpr char kFourthSuffix[] = " HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string pipeline = std::string(kFirst) + kSecond;
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(pipeline.data()), pipeline.size()),
+               pipeline.size());
+    capture_request_metadata(c);
+    REQUIRE(c.checked_raw_request_target().target.eq({"/first?x=1", 10}));
+    const u32 first_episode = c.req_raw_target_episode;
+
+    REQUIRE(pipeline_shift(c));
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    capture_request_metadata(c);
+    REQUIRE(c.checked_raw_request_target().target.eq({"/second//path?y=%2F", 19}));
+    CHECK_NE(c.req_raw_target_episode, first_episode);
+
+    REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(kThird), sizeof(kThird) - 1u),
+               sizeof(kThird) - 1u);
+    REQUIRE(pipeline_stash(c));
+    c.reset_request_receive_buffer();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    REQUIRE(pipeline_recover(c));
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    capture_request_metadata(c);
+    REQUIRE(c.checked_raw_request_target().target.eq({"/third", 6}));
+
+    REQUIRE_EQ(
+        c.recv_buf.write(reinterpret_cast<const u8*>(kFourthPrefix), sizeof(kFourthPrefix) - 1u),
+        sizeof(kFourthPrefix) - 1u);
+    REQUIRE(pipeline_stash(c));
+    c.reset_request_receive_buffer();
+    REQUIRE_EQ(
+        c.recv_buf.write(reinterpret_cast<const u8*>(kFourthSuffix), sizeof(kFourthSuffix) - 1u),
+        sizeof(kFourthSuffix) - 1u);
+    REQUIRE(pipeline_recover(c));
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    capture_request_metadata(c);
+    REQUIRE(c.checked_raw_request_target().target.eq({"/late//fourth?z=%2f", 19}));
+
+    c.reset_request_receive_buffer();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    c.reset();
+    CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+}
+
+TEST(raw_request_target_witness, downstream_response_callback_resets_completed_request) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    static constexpr char kRequest[] = "GET /complete HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kResponse[] = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    capture_request_metadata(*conn);
+    REQUIRE_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1u),
+               sizeof(kResponse) - 1u);
+    conn->keep_alive = true;
+    conn->resp_status = 204;
+    conn->transition_to_sending(&on_response_sent<SmallLoop>);
+
+    on_response_sent<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Send, sizeof(kResponse) - 1u));
+
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
 }
 
 TEST(metadata, content_length_count_is_current_request_owned) {
@@ -29897,6 +30279,10 @@ TEST(iouring_prebuilt, send_and_retirement_orderings_resume_only_at_batch_end) {
                                   0,
                                   &fixture));
         Connection& conn = *fixture.conn;
+        capture_request_metadata(conn);
+        REQUIRE_EQ(conn.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+        REQUIRE(conn.checked_raw_request_target().target.eq({"/one", 4}));
+        const u32 request_one_metadata_episode = conn.req_metadata_episode;
         const u32 prefix_len = conn.http1_prebuilt_request_prefix_len;
         CHECK_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
 
@@ -29937,6 +30323,9 @@ TEST(iouring_prebuilt, send_and_retirement_orderings_resume_only_at_batch_end) {
         CHECK_EQ(conn.handler_gen, 1u);
         CHECK_EQ(conn.resp_status, 209u);
         CHECK_EQ(conn.request_config, &current_config);
+        REQUIRE_EQ(conn.checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+        CHECK(conn.checked_raw_request_target().target.eq({"/two", 4}));
+        CHECK_NE(conn.req_metadata_episode, request_one_metadata_episode);
         CHECK_FALSE(conn.epoch_held);
         CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
         CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
