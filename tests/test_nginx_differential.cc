@@ -8437,9 +8437,114 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
         error = "failed to start converter-generated RUT with coalesced-ingress preload";
         return false;
     }
-    if (!wait_ready(frontend_port, rut_process.child, error) ||
-        !wait_for_rut_iouring_gate_hook(*mapping.gate, 3000, error))
+    const std::string exact_backend_record = "Backend: io_uring\n";
+    const std::string exact_listener_record =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+    bool ring_handshake_ready = false;
+    bool backend_record_ready = false;
+    bool listener_record_ready = false;
+    bool startup_log_readable = false;
+    const auto observe_exact_startup_records = [&]() {
+        const int fd = open(temp.rut_log.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        std::string contents;
+        char buf[1024];
+        bool read_ok = true;
+        while (contents.size() < 8192) {
+            const size_t want =
+                sizeof(buf) < 8192 - contents.size() ? sizeof(buf) : 8192 - contents.size();
+            const ssize_t n = read(fd, buf, want);
+            if (n > 0) {
+                contents.append(buf, static_cast<size_t>(n));
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) read_ok = false;
+            break;
+        }
+        close(fd);
+        if (!read_ok) return false;
+        for (size_t line_start = 0; line_start < contents.size();) {
+            const size_t line_end = contents.find('\n', line_start);
+            if (line_end == std::string::npos) break;
+            const size_t line_length = line_end - line_start + 1u;
+            if (line_length == exact_backend_record.size() &&
+                contents.compare(line_start, line_length, exact_backend_record) == 0)
+                backend_record_ready = true;
+            if (line_length == exact_listener_record.size() &&
+                contents.compare(line_start, line_length, exact_listener_record) == 0)
+                listener_record_ready = true;
+            line_start = line_end + 1u;
+        }
+        return true;
+    };
+    const auto startup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+    while (std::chrono::steady_clock::now() < startup_deadline) {
+        if (poll_child(rut_process.child)) {
+            error = "RUT no-connection startup child exit (" +
+                    child_status_description(rut_process.child) + ")";
+            return false;
+        }
+        if (rut_downstream_gate_load(&mapping.gate->state) == RUT_DOWNSTREAM_GATE_FAILED) {
+            error = "RUT no-connection startup ring failure " +
+                    std::to_string(rut_downstream_gate_load(&mapping.gate->error_code)) +
+                    " with ring_ready=" +
+                    std::to_string(rut_downstream_gate_load(&mapping.gate->ring_ready));
+            return false;
+        }
+        ring_handshake_ready =
+            rut_downstream_gate_load(&mapping.gate->hook_magic_ok) == 1 &&
+            rut_downstream_gate_load(&mapping.gate->hook_version) == RUT_IOURING_GATE_VERSION &&
+            rut_downstream_gate_load(&mapping.gate->hook_layout_size) == sizeof(*mapping.gate) &&
+            rut_downstream_gate_load(&mapping.gate->target_pid) != 0 &&
+            rut_downstream_gate_load(&mapping.gate->ring_ready) == 1 &&
+            mapping.gate->ring_fd >= 0;
+        startup_log_readable = observe_exact_startup_records() || startup_log_readable;
+        if (ring_handshake_ready && backend_record_ready && listener_record_ready) {
+            if (poll_child(rut_process.child)) {
+                error = "RUT no-connection startup child exit (" +
+                        child_status_description(rut_process.child) + ")";
+                return false;
+            }
+            break;
+        }
+        (void)poll(nullptr, 0, 25);
+    }
+    if (poll_child(rut_process.child)) {
+        error = "RUT no-connection startup child exit (" +
+                child_status_description(rut_process.child) + ")";
         return false;
+    }
+    if (rut_downstream_gate_load(&mapping.gate->state) == RUT_DOWNSTREAM_GATE_FAILED) {
+        error = "RUT no-connection startup ring failure " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code)) +
+                " with ring_ready=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->ring_ready));
+        return false;
+    }
+    if (!ring_handshake_ready) {
+        error = "RUT no-connection startup handshake timeout with magic=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_magic_ok)) +
+                " version=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_version)) +
+                " layout=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_layout_size)) +
+                " target_pid=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->target_pid)) +
+                " ring_ready=" +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->ring_ready)) +
+                " ring_fd=" + std::to_string(mapping.gate->ring_fd);
+        return false;
+    }
+    if (!backend_record_ready || !listener_record_ready) {
+        error = "RUT no-connection startup missing exact record(s):";
+        if (!backend_record_ready) error += " Backend: io_uring";
+        if (!listener_record_ready)
+            error += " Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+        if (!startup_log_readable) error += " (startup log unreadable)";
+        return false;
+    }
     if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
         rut_downstream_gate_load(&mapping.gate->mode) != RUT_IOURING_GATE_MODE_NONE ||
         mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_fd != -1 ||
