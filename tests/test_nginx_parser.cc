@@ -1967,9 +1967,11 @@ TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
 }
 
 TEST(nginx_converter, emits_clean_trailing_slash_and_multisegment_exact_local_paths) {
-    const char* paths[] = {"/healthz/", "/health/check"};
-    const char* routes[] = {"route exact \"/healthz/\"", "route exact \"/health/check\""};
-    for (u32 i = 0; i < 2; i++) {
+    const char* paths[] = {"/healthz/", "/health/check", "/old/"};
+    const char* routes[] = {"route exact slash_normalized \"/healthz/\"",
+                            "route exact \"/health/check\"",
+                            "route exact slash_normalized \"/old/\""};
+    for (u32 i = 0; i < 3; i++) {
         char source[256]{};
         const int len = snprintf(source,
                                  sizeof(source),
@@ -1983,6 +1985,8 @@ TEST(nginx_converter, emits_clean_trailing_slash_and_multisegment_exact_local_pa
         REQUIRE(lowered);
         CHECK(strstr(lowered.value().data, routes[i]) != nullptr);
         CHECK(strstr(lowered.value().data, "body: b\"ok\"") != nullptr);
+        if (paths[i][strlen(paths[i]) - 1u] != '/')
+            CHECK(strstr(lowered.value().data, "route exact slash_normalized") == nullptr);
     }
 }
 
@@ -2088,6 +2092,40 @@ TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_sourc
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
+}
+
+TEST(nginx_converter, normalized_exact_local_return_maximum_path_and_body_fit_bounded_source) {
+    static constexpr char kBody[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static_assert(sizeof(kBody) - 1u == nginx::kMaxLocalReturnBodyLen);
+    char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
+    path[0] = '/';
+    for (u32 i = 1; i + 1u < nginx::kMaxExactLocalReturnPathLen; i++) path[i] = 'p';
+    path[nginx::kMaxExactLocalReturnPathLen - 1u] = '/';
+    char source[512]{};
+    const int len =
+        snprintf(source,
+                 sizeof(source),
+                 "server { listen 65535; location / { proxy_pass "
+                 "http://255.255.255.255:65535; } location = %s { return 200 \"%s\"; } }",
+                 path,
+                 kBody);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed.value().exact_local_return.path.len, nginx::kMaxExactLocalReturnPathLen);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 5681u);
+    CHECK_EQ(lowered.value().len, 5664u + 17u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    CHECK(strstr(lowered.value().data, "route exact slash_normalized \"") != nullptr);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
 }
 
 TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
@@ -3262,6 +3300,41 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     REQUIRE(healthz_exact);
     CHECK(healthz_root.value().view().eq(healthz_golden.view()));
     CHECK(healthz_exact.value().view().eq(healthz_golden.view()));
+
+    // A meaningful trailing slash changes only the ordinary-RUT exact view.
+    // Both nginx declaration orders still lower to one entire byte-stable
+    // source, based on the same independently fixed root-program golden.
+    static constexpr char kNormalizedExactGolden[] =
+        "route exact slash_normalized \"/health/check/\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "}) }\n";
+    nginx::RutSource normalized_golden{};
+    memcpy(normalized_golden.data, kExpected, sizeof(kExpected) - 1u);
+    memcpy(normalized_golden.data + sizeof(kExpected) - 1u,
+           kNormalizedExactGolden,
+           sizeof(kNormalizedExactGolden) - 1u);
+    normalized_golden.len =
+        static_cast<u32>(sizeof(kExpected) + sizeof(kNormalizedExactGolden) - 2u);
+    const char normalized_root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /health/check/ { return 200 \"successor-static\"; } }";
+    const char normalized_exact_first[] =
+        "server { listen 8080; location = /health/check/ { return 200 \"successor-static\"; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const auto normalized_root_model =
+        nginx::parse({normalized_root_first, sizeof(normalized_root_first) - 1u});
+    const auto normalized_exact_model =
+        nginx::parse({normalized_exact_first, sizeof(normalized_exact_first) - 1u});
+    REQUIRE(normalized_root_model);
+    REQUIRE(normalized_exact_model);
+    const auto normalized_root = nginx::lower_to_rut(normalized_root_model.value());
+    const auto normalized_exact = nginx::lower_to_rut(normalized_exact_model.value());
+    REQUIRE(normalized_root);
+    REQUIRE(normalized_exact);
+    CHECK(normalized_root.value().view().eq(normalized_golden.view()));
+    CHECK(normalized_exact.value().view().eq(normalized_golden.view()));
 }
 
 TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
@@ -3712,6 +3785,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
         CHECK_EQ(ast_binding.method, kRouteMethodAny);
         CHECK_EQ(ast_binding.policy_id, 5u);
+        CHECK_EQ(ast_binding.path_view, ExactPathView::Raw);
         CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/healthz"))));
         const auto& ast_policy = ast_owned->strict_local_response_policies[4];
         CHECK(ast_policy.version == StrictLocalResponseVersion::Http11);
@@ -3733,6 +3807,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         CHECK_EQ(hir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
         CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
         CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].policy_id, 5u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
 
         auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
@@ -3742,6 +3817,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 5u);
         CHECK_EQ(mir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
         CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+        CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
         for (u32 i = 0; i < mir_owned->functions.len; i++)
             CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
 
@@ -3755,6 +3831,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
         CHECK_EQ(rir_binding.method, kRouteMethodAny);
         CHECK_EQ(rir_binding.policy_id, 5u);
+        CHECK_EQ(rir_binding.path_view, ExactPathView::Raw);
         CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/healthz"))));
         for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
             CHECK(exact_strict_local_response_binding_is_neutral(
@@ -3796,6 +3873,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     static_assert(sizeof(kDecodedTraceBody) - 1u == 157u);
     CHECK(trace_policy.body.eq({kDecodedTraceBody, sizeof(kDecodedTraceBody) - 1u}));
     REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+    CHECK_EQ(populated->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
     CHECK((Str{populated->exact_strict_local_response_bindings[0].path,
                populated->exact_strict_local_response_bindings[0].path_len}
                .eq(lit_str("/healthz"))));
@@ -3809,6 +3887,101 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
     CHECK(owned_policy.body.eq(lit_str("successor-static")));
     CHECK(owned_policy.server.eq(lit_str("nginx/1.29.7")));
+}
+
+TEST(nginx_converter, emitted_normalized_exact_source_reaches_owned_runtime_config) {
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        char nginx_source[] =
+            "server { listen 8080; location = /health/check/ { return 200 "
+            "\"successor-static\"; } location / { proxy_pass http://127.0.0.1:9000; } }";
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        CHECK(strstr(lowered.value().data, "route exact slash_normalized \"/health/check/\"") !=
+              nullptr);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 10u);
+        REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+        const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(ast_binding.path_view, ExactPathView::SlashNormalized);
+        CHECK_EQ(ast_binding.method, kRouteMethodAny);
+        CHECK_EQ(ast_binding.policy_id, 5u);
+        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/health/check/"))));
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
+        const auto& hir_binding = hir_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(hir_binding.path_view, ExactPathView::SlashNormalized);
+        CHECK_EQ(hir_binding.method, kRouteMethodAny);
+        CHECK_EQ(hir_binding.policy_id, 5u);
+        CHECK((Str{hir_binding.path, hir_binding.path_len}.eq(lit_str("/health/check/"))));
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
+        const auto& mir_binding = mir_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(mir_binding.path_view, ExactPathView::SlashNormalized);
+        CHECK_EQ(mir_binding.method, kRouteMethodAny);
+        CHECK_EQ(mir_binding.policy_id, 5u);
+        CHECK((Str{mir_binding.path, mir_binding.path_len}.eq(lit_str("/health/check/"))));
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
+        const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
+        CHECK_EQ(rir_binding.path_view, ExactPathView::SlashNormalized);
+        CHECK_EQ(rir_binding.method, kRouteMethodAny);
+        CHECK_EQ(rir_binding.policy_id, 5u);
+        CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/health/check/"))));
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    // All nginx/frontend/compiler/RIR storage above is gone. The owned inline
+    // binding retains the normalized view and directly controls matching;
+    // zero means dispatch continues to the ordinary root fallback functions.
+    REQUIRE(populated->strict_local_response_table_is_valid());
+    REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+    const auto& binding = populated->exact_strict_local_response_bindings[0];
+    CHECK_EQ(binding.path_view, ExactPathView::SlashNormalized);
+    CHECK_EQ(binding.method, kRouteMethodAny);
+    CHECK((Str{binding.path, binding.path_len}.eq(lit_str("/health/check/"))));
+    const auto match = [&](Str raw, Str normalized) {
+        return populated->match_exact_strict_local_response_views(raw, normalized, kRouteMethodGet);
+    };
+    const auto exact = match(lit_str("/health/check/"), lit_str("/health/check/"));
+    REQUIRE(exact.state == ExactStrictLocalResponseMatchState::Match);
+    const u16 exact_id = exact.policy_id;
+    REQUIRE_NE(exact_id, 0u);
+    const auto query = match(lit_str("/health/check/?x=1"), lit_str("/health/check/"));
+    CHECK(query.state == ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(query.policy_id, exact_id);
+    const auto repeated = match(lit_str("/health/check//"), lit_str("/health/check/"));
+    CHECK(repeated.state == ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(repeated.policy_id, exact_id);
+    const auto no_slash = match(lit_str("/health/check"), lit_str("/health/check"));
+    CHECK(no_slash.state == ExactStrictLocalResponseMatchState::Miss);
+    CHECK_EQ(no_slash.policy_id, 0u);
+    const auto root = match(lit_str("/"), lit_str("/"));
+    CHECK(root.state == ExactStrictLocalResponseMatchState::Miss);
+    CHECK_EQ(root.policy_id, 0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(exact_id));
+    const auto& policy = populated->strict_local_response_policies[exact_id - 1u];
+    CHECK_EQ(policy.status_code, 200u);
+    CHECK(policy.body.eq(lit_str("successor-static")));
 }
 
 TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {

@@ -135,6 +135,7 @@ bool source_position_is_coherent(uintptr_t source_base,
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
+static_assert(kMaxExactLocalReturnPathLen == kMaxExactPathViewLen);
 
 constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
     const u8 byte = static_cast<u8>(value);
@@ -881,8 +882,12 @@ bool put_exact_absolute_redirect(
 }
 
 bool put_exact_local_return(Writer& writer, Str path, Str body) {
-    return writer.put_cstr("route exact \"") && writer.put(path) &&
-           writer.put_cstr("\" { return local_response({\n") &&
+    // validate_exact_local_return has already proven the complete path borrow
+    // and clean grammar before this final-byte view selection is reached.
+    const bool slash_normalized = path.ptr[path.len - 1u] == '/';
+    return writer.put_cstr(slash_normalized ? "route exact slash_normalized \""
+                                            : "route exact \"") &&
+           writer.put(path) && writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
                "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
                "\"nginx/1.29.7\",\n") &&
