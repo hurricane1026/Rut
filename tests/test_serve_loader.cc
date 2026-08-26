@@ -1119,8 +1119,7 @@ TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
     normalized.strict_local_response_policies[1] = policy;
     normalized.strict_local_response_policy_count = 2;
     normalized.exact_strict_local_response_bindings[1] = binding;
-    normalized.exact_strict_local_response_bindings[1].path_view =
-        ExactPathView::SlashNormalized;
+    normalized.exact_strict_local_response_bindings[1].path_view = ExactPathView::SlashNormalized;
     normalized.exact_strict_local_response_bindings[1].policy_id = 2;
     normalized.exact_strict_local_response_binding_count = 2;
     REQUIRE(rir::verify_module(normalized).ok);
@@ -1219,9 +1218,7 @@ route exact slash_normalized GET "/health/check" { return local_response({
 route GET "/sentinel" { return 204 }
 )rut";
     const std::string path =
-        write_file("/tmp/rut_serve_loader_slash_normalized_direct_jit_stage2",
-                   "app.rut",
-                   kSource);
+        write_file("/tmp/rut_serve_loader_slash_normalized_direct_jit_stage2", "app.rut", kSource);
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));

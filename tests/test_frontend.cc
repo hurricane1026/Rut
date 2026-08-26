@@ -35451,12 +35451,10 @@ route exact GET "/health" { return local_response({
     forged_ast->exact_strict_local_response_bindings[0].reserved1 = 1;
     CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
     forged_ast = std::make_unique<AstFile>(ast.value());
-    forged_ast->exact_strict_local_response_bindings[0].path_view =
-        static_cast<ExactPathView>(255);
+    forged_ast->exact_strict_local_response_bindings[0].path_view = static_cast<ExactPathView>(255);
     CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
     forged_ast = std::make_unique<AstFile>(ast.value());
-    forged_ast->exact_strict_local_response_bindings[0].path_view =
-        ExactPathView::SlashNormalized;
+    forged_ast->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
     forged_ast->exact_strict_local_response_bindings[0].path[2] = '/';
     forged_ast->exact_strict_local_response_bindings[0].path[3] = '/';
     CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
@@ -35472,8 +35470,7 @@ route exact GET "/health" { return local_response({
     forged_hir->exact_strict_local_response_bindings[0].policy_id = 2;
     CHECK_FALSE(build_mir_heap(*forged_hir).has_value());
     forged_hir = std::make_unique<HirModule>(hir.value());
-    forged_hir->exact_strict_local_response_bindings[0].path_view =
-        ExactPathView::SlashNormalized;
+    forged_hir->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
     forged_hir->exact_strict_local_response_bindings[0].path[2] = '/';
     forged_hir->exact_strict_local_response_bindings[0].path[3] = '/';
     CHECK_FALSE(build_mir_heap(*forged_hir).has_value());
@@ -35583,12 +35580,10 @@ route exact slash_normalized "/health/check" { return local_response({
         CHECK((Str{binding.path, binding.path_len}.eq(lit("/health/check"))));
         CHECK_EQ(binding.reserved1, 0u);
     }
-    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[0].path_view,
-             ExactPathView::Raw);
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
     CHECK_EQ(lowered.module.exact_strict_local_response_bindings[1].path_view,
              ExactPathView::SlashNormalized);
-    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[2].path_view,
-             ExactPathView::Raw);
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[2].path_view, ExactPathView::Raw);
     CHECK_EQ(lowered.module.exact_strict_local_response_bindings[3].path_view,
              ExactPathView::SlashNormalized);
 

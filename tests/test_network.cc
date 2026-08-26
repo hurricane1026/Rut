@@ -13024,9 +13024,7 @@ TEST(unmatched_local_response,
     loop.backend.fail_send = true;
 
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop,
-        *conn,
-        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
 
     CHECK_EQ(loop.close_calls, 1u);
     CHECK(loop.close_saw_request_inflight);
@@ -13083,9 +13081,7 @@ TEST(unmatched_local_response,
     const u32 conn_id = conn->id;
     const u32 free_before = loop.free_top;
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop,
-        *conn,
-        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
     REQUIRE_EQ(loop.close_calls, 0u);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);
@@ -13157,9 +13153,7 @@ TEST(unmatched_local_response,
     loop.close_during_submit = true;
 
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop,
-        *conn,
-        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
 
     CHECK_EQ(loop.close_calls, 1u);
     CHECK(loop.close_saw_request_inflight);
@@ -13214,9 +13208,7 @@ TEST(unmatched_local_response,
     const u32 conn_id = conn->id;
     const u32 free_before = loop.free_top;
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop,
-        *conn,
-        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
     REQUIRE_EQ(loop.close_calls, 0u);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);

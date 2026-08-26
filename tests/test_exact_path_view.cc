@@ -61,16 +61,15 @@ TEST(exact_path_view, percent_and_dot_segments_are_opaque) {
 }
 
 TEST(exact_path_view, rejects_non_origin_leading_runs_fragment_and_controls) {
-    CHECK(failure_leaves_output_unchanged({nullptr, 0},
-                                          ExactPathNormalizationResult::InvalidInput));
-    CHECK(failure_leaves_output_unchanged({nullptr, 1},
-                                          ExactPathNormalizationResult::InvalidInput));
-    CHECK(failure_leaves_output_unchanged({"", 0},
-                                          ExactPathNormalizationResult::InvalidInput));
+    CHECK(
+        failure_leaves_output_unchanged({nullptr, 0}, ExactPathNormalizationResult::InvalidInput));
+    CHECK(
+        failure_leaves_output_unchanged({nullptr, 1}, ExactPathNormalizationResult::InvalidInput));
+    CHECK(failure_leaves_output_unchanged({"", 0}, ExactPathNormalizationResult::InvalidInput));
     CHECK(failure_leaves_output_unchanged(lit_str("?x=1"),
                                           ExactPathNormalizationResult::InvalidInput));
-    CHECK(failure_leaves_output_unchanged(lit_str("*"),
-                                          ExactPathNormalizationResult::InvalidInput));
+    CHECK(
+        failure_leaves_output_unchanged(lit_str("*"), ExactPathNormalizationResult::InvalidInput));
     CHECK(failure_leaves_output_unchanged(lit_str("example.test:443"),
                                           ExactPathNormalizationResult::InvalidInput));
     CHECK(failure_leaves_output_unchanged(lit_str("//health"),
@@ -99,8 +98,8 @@ TEST(exact_path_view, bound_accepts_62_and_rejects_63_transactionally) {
     for (u32 i = 1; i < sizeof(too_long); i++) too_long[i] = 'b';
     CHECK(failure_leaves_output_unchanged({too_long, sizeof(too_long)},
                                           ExactPathNormalizationResult::OutputOverflow));
-    CHECK(failure_leaves_output_unchanged(lit_str("/abc"),
-                                          ExactPathNormalizationResult::OutputOverflow, 3));
+    CHECK(failure_leaves_output_unchanged(
+        lit_str("/abc"), ExactPathNormalizationResult::OutputOverflow, 3));
 }
 
 TEST(exact_path_view, long_raw_slash_run_may_normalize_within_bound) {
@@ -141,15 +140,12 @@ TEST(exact_path_view, rejects_overflowing_raw_range_before_dereference) {
     char output[kMaxExactPathViewLen];
     for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
     u32 output_len = 0x12345678u;
-    const Str overflowing_raw{
-        reinterpret_cast<const char*>(UINTPTR_MAX - uintptr_t{1}), 3};
+    const Str overflowing_raw{reinterpret_cast<const char*>(UINTPTR_MAX - uintptr_t{1}), 3};
 
-    CHECK(normalize_exact_path_slashes(
-              overflowing_raw, output, sizeof(output), &output_len) ==
+    CHECK(normalize_exact_path_slashes(overflowing_raw, output, sizeof(output), &output_len) ==
           ExactPathNormalizationResult::InvalidInput);
     CHECK_EQ(output_len, 0x12345678u);
-    for (u32 i = 0; i < sizeof(output); i++)
-        CHECK_EQ(output[i], static_cast<char>(0x5a));
+    for (u32 i = 0; i < sizeof(output); i++) CHECK_EQ(output[i], static_cast<char>(0x5a));
 }
 
 TEST(exact_path_view, zero_output_capacity_is_transactional) {
@@ -160,13 +156,11 @@ TEST(exact_path_view, zero_output_capacity_is_transactional) {
     for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
     u32 output_len = 0x12345678u;
 
-    CHECK(normalize_exact_path_slashes(
-              {raw, sizeof(raw) - 1u}, output, 0, &output_len) ==
+    CHECK(normalize_exact_path_slashes({raw, sizeof(raw) - 1u}, output, 0, &output_len) ==
           ExactPathNormalizationResult::OutputOverflow);
     CHECK_EQ(output_len, 0x12345678u);
     for (u32 i = 0; i < sizeof(raw); i++) CHECK_EQ(raw[i], raw_before[i]);
-    for (u32 i = 0; i < sizeof(output); i++)
-        CHECK_EQ(output[i], static_cast<char>(0x5a));
+    for (u32 i = 0; i < sizeof(output); i++) CHECK_EQ(output[i], static_cast<char>(0x5a));
 }
 
 TEST(exact_path_view, rejects_output_length_overlapping_raw_transactionally) {
@@ -186,8 +180,7 @@ TEST(exact_path_view, rejects_output_length_overlapping_raw_transactionally) {
               {storage + 2u, sizeof(kRaw) - 1u}, output, sizeof(output), aliased_len) ==
           ExactPathNormalizationResult::InvalidInput);
     for (u32 i = 0; i < sizeof(storage); i++) CHECK_EQ(storage[i], storage_before[i]);
-    for (u32 i = 0; i < sizeof(output); i++)
-        CHECK_EQ(output[i], static_cast<char>(0x5a));
+    for (u32 i = 0; i < sizeof(output); i++) CHECK_EQ(output[i], static_cast<char>(0x5a));
 }
 
 TEST(exact_path_view, rejects_output_length_overlapping_output_transactionally) {
@@ -222,8 +215,7 @@ TEST(exact_path_view, rejects_overflowing_output_length_range_before_write) {
               {raw, sizeof(raw) - 1u}, output, sizeof(output), overflowing_len) ==
           ExactPathNormalizationResult::InvalidInput);
     for (u32 i = 0; i < sizeof(raw); i++) CHECK_EQ(raw[i], raw_before[i]);
-    for (u32 i = 0; i < sizeof(output); i++)
-        CHECK_EQ(output[i], static_cast<char>(0x5a));
+    for (u32 i = 0; i < sizeof(output); i++) CHECK_EQ(output[i], static_cast<char>(0x5a));
 }
 
 int main(int argc, char** argv) {

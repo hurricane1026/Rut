@@ -807,11 +807,8 @@ TEST(route_config, exact_strict_table_dedups_remaps_owns_copies_and_rolls_back_a
     normalized_source[0] = exact_local_binding("/normalized", kRouteMethodGet, 1);
     normalized_source[1] = exact_local_binding("/normalized", kRouteMethodGet, 2);
     normalized_source[1].path_view = ExactPathView::SlashNormalized;
-    REQUIRE(strict_local_response_source_table_valid(normalized_policies,
-                                                     2,
-                                                     normalized_unmatched,
-                                                     normalized_source,
-                                                     2));
+    REQUIRE(strict_local_response_source_table_valid(
+        normalized_policies, 2, normalized_unmatched, normalized_source, 2));
     auto normalized_installed = std::make_unique<RouteConfig>();
     REQUIRE(normalized_installed->install_strict_local_response_table(
         normalized_policies, 2, normalized_unmatched, normalized_source, 2));
@@ -861,8 +858,7 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[7] = 'x'; });
     rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].method = 10; });
     rejects([](RouteConfig& c) {
-        c.exact_strict_local_response_bindings[0].path_view =
-            static_cast<ExactPathView>(255);
+        c.exact_strict_local_response_bindings[0].path_view = static_cast<ExactPathView>(255);
     });
     rejects([](RouteConfig& c) {
         auto& binding = c.exact_strict_local_response_bindings[0];

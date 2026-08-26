@@ -47,8 +47,7 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
         return ExactPathNormalizationResult::InvalidInput;
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
-    if (raw.len > UINTPTR_MAX - raw_begin)
-        return ExactPathNormalizationResult::InvalidInput;
+    if (raw.len > UINTPTR_MAX - raw_begin) return ExactPathNormalizationResult::InvalidInput;
     const uintptr_t raw_end = raw_begin + raw.len;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
@@ -60,8 +59,7 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
             return ExactPathNormalizationResult::InvalidInput;
         path_end++;
     }
-    if (path_end > 1 && raw.ptr[1] == '/')
-        return ExactPathNormalizationResult::InvalidInput;
+    if (path_end > 1 && raw.ptr[1] == '/') return ExactPathNormalizationResult::InvalidInput;
 
     u32 normalized_len = 0;
     bool previous_slash = false;

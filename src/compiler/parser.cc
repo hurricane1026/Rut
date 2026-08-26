@@ -5023,9 +5023,8 @@ struct Parser {
                                              &normalized_len) !=
                     ExactPathNormalizationResult::Success ||
                 normalized_len != binding.path_len)
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      span_from(*path.value()),
-                                      path.value()->text);
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
             for (u32 i = 0; i < normalized_len; i++) {
                 if (normalized[i] != binding.path[i])
                     return frontend_error(FrontendError::UnsupportedSyntax,

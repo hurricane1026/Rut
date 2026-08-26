@@ -1973,8 +1973,7 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
     mod.exact_strict_local_response_bindings[0].policy_id = 0;
     rejects(mod);
     mod = valid_module();
-    mod.exact_strict_local_response_bindings[0].path_view =
-        static_cast<ExactPathView>(255);
+    mod.exact_strict_local_response_bindings[0].path_view = static_cast<ExactPathView>(255);
     rejects(mod);
     mod = valid_module();
     mod.exact_strict_local_response_bindings[0].reserved1 = 1;
@@ -2001,10 +2000,8 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
     mod = valid_module();
     mod.strict_local_response_policies[1] = policy;
     mod.strict_local_response_policy_count = 2;
-    mod.exact_strict_local_response_bindings[1] =
-        mod.exact_strict_local_response_bindings[0];
-    mod.exact_strict_local_response_bindings[1].path_view =
-        ExactPathView::SlashNormalized;
+    mod.exact_strict_local_response_bindings[1] = mod.exact_strict_local_response_bindings[0];
+    mod.exact_strict_local_response_bindings[1].path_view = ExactPathView::SlashNormalized;
     mod.exact_strict_local_response_bindings[1].policy_id = 2;
     mod.exact_strict_local_response_binding_count = 2;
     REQUIRE(verify_module(mod).ok);
@@ -2024,8 +2021,7 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
 
     mod.strict_local_response_policies[2] = policy;
     mod.strict_local_response_policy_count = 3;
-    mod.exact_strict_local_response_bindings[2] =
-        mod.exact_strict_local_response_bindings[1];
+    mod.exact_strict_local_response_bindings[2] = mod.exact_strict_local_response_bindings[1];
     mod.exact_strict_local_response_bindings[2].policy_id = 3;
     mod.exact_strict_local_response_binding_count = 3;
     rejects(mod);

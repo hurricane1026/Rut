@@ -11606,8 +11606,7 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
             rut_downstream_gate_load(&mapping.gate->hook_version) == RUT_IOURING_GATE_VERSION &&
             rut_downstream_gate_load(&mapping.gate->hook_layout_size) == sizeof(*mapping.gate) &&
             rut_downstream_gate_load(&mapping.gate->target_pid) != 0 &&
-            rut_downstream_gate_load(&mapping.gate->ring_ready) == 1 &&
-            mapping.gate->ring_fd >= 0;
+            rut_downstream_gate_load(&mapping.gate->ring_ready) == 1 && mapping.gate->ring_fd >= 0;
         startup_log_readable = observe_exact_startup_records() || startup_log_readable;
         if (ring_handshake_ready && backend_record_ready && listener_record_ready) {
             if (poll_child(rut_process.child)) {
@@ -11632,17 +11631,14 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
         return false;
     }
     if (!ring_handshake_ready) {
-        error = "RUT no-connection startup handshake timeout with magic=" +
-                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_magic_ok)) +
-                " version=" +
-                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_version)) +
-                " layout=" +
-                std::to_string(rut_downstream_gate_load(&mapping.gate->hook_layout_size)) +
-                " target_pid=" +
-                std::to_string(rut_downstream_gate_load(&mapping.gate->target_pid)) +
-                " ring_ready=" +
-                std::to_string(rut_downstream_gate_load(&mapping.gate->ring_ready)) +
-                " ring_fd=" + std::to_string(mapping.gate->ring_fd);
+        error =
+            "RUT no-connection startup handshake timeout with magic=" +
+            std::to_string(rut_downstream_gate_load(&mapping.gate->hook_magic_ok)) +
+            " version=" + std::to_string(rut_downstream_gate_load(&mapping.gate->hook_version)) +
+            " layout=" + std::to_string(rut_downstream_gate_load(&mapping.gate->hook_layout_size)) +
+            " target_pid=" + std::to_string(rut_downstream_gate_load(&mapping.gate->target_pid)) +
+            " ring_ready=" + std::to_string(rut_downstream_gate_load(&mapping.gate->ring_ready)) +
+            " ring_fd=" + std::to_string(mapping.gate->ring_fd);
         return false;
     }
     if (!backend_record_ready || !listener_record_ready) {
