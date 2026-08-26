@@ -695,6 +695,7 @@ struct TempDir {
     std::string source;
     std::string nginx_config;
     std::string nginx_log;
+    std::string nginx_access_log;
     std::string rut_log;
     std::string rut_access_log;
     std::string preflight_log;
@@ -707,6 +708,7 @@ struct TempDir {
         source = std::string(path) + "/generated.rut";
         nginx_config = std::string(path) + "/nginx.conf";
         nginx_log = std::string(path) + "/nginx.log";
+        nginx_access_log = std::string(path) + "/nginx-access.log";
         rut_log = std::string(path) + "/rut.log";
         rut_access_log = std::string(path) + "/rut-access.log";
         preflight_log = std::string(path) + "/preflight.log";
@@ -720,6 +722,7 @@ struct TempDir {
             unlink(source.c_str());
             unlink(nginx_config.c_str());
             unlink(nginx_log.c_str());
+            unlink(nginx_access_log.c_str());
             unlink(rut_log.c_str());
             unlink(rut_access_log.c_str());
             unlink(preflight_log.c_str());
@@ -5937,6 +5940,7 @@ struct ExactLocalReturn204OracleObservation {
     std::string config_path;
     std::string log_path;
     std::string container_name;
+    std::string access_prefix;
     std::vector<char> local_wire;
     std::vector<char> fallback_wire;
     std::vector<std::vector<char>> fallback_history;
@@ -5973,18 +5977,31 @@ static bool capture_pinned_exact_local_return204_order(
     TempDir& temp,
     const std::string& container_name,
     bool exact_first,
+    bool query_target,
     ExactLocalReturn204OracleObservation& observation,
     std::string& error) {
     static constexpr char kLocalRequest[] =
         "GET /static HTTP/1.1\r\n"
         "Host: return204.example\r\n"
         "Connection: close\r\n\r\n";
+    static constexpr char kQueryLocalRequest[] =
+        "GET /static?x=1 HTTP/1.1\r\n"
+        "Host: query-return204.example\r\n"
+        "Connection: close\r\n\r\n";
     static constexpr char kFallbackRequest[] =
         "GET /fallback?q=1 HTTP/1.1\r\n"
         "Host: return204.example\r\n"
         "X-324-Vector: fallback\r\n"
         "Connection: close\r\n\r\n";
-    for (const char* request : {kLocalRequest, kFallbackRequest}) {
+    static constexpr char kQueryFallbackRequest[] =
+        "GET /fallback?q=1 HTTP/1.1\r\n"
+        "Host: query-return204.example\r\n"
+        "X-324-Vector: fallback\r\n"
+        "Connection: close\r\n\r\n";
+    const char* local_request = query_target ? kQueryLocalRequest : kLocalRequest;
+    const char* fallback_request = query_target ? kQueryFallbackRequest : kFallbackRequest;
+    const char* request_host = query_target ? "query-return204.example" : "return204.example";
+    for (const char* request : {local_request, fallback_request}) {
         const std::string text(request);
         const size_t headers_end = text.find("\r\n\r\n");
         if (text.rfind("GET /", 0) != 0 || text.find(" HTTP/1.1\r\n") == std::string::npos ||
@@ -6008,8 +6025,10 @@ static bool capture_pinned_exact_local_return204_order(
     observation.config_path = temp.nginx_config;
     observation.log_path = temp.nginx_log;
     observation.container_name = container_name;
-    const std::string access_prefix =
-        "rut-nginx-324-return204-" + observation.order + "-" + std::to_string(getpid()) + "-scoped";
+    const std::string access_prefix = "rut-nginx-" + std::string(query_target ? "325" : "324") +
+                                      "-return204-" + observation.order + "-" +
+                                      std::to_string(getpid()) + "-scoped";
+    observation.access_prefix = access_prefix;
     const std::string exact_location = "    location = /static { return 204; }\n";
     const std::string root_location =
         "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
@@ -6018,9 +6037,12 @@ static bool capture_pinned_exact_local_return204_order(
         "events {}\n"
         "http {\n"
         "  log_format exact_local_return204 '" +
-        access_prefix +
-        " raw=\"$request\" status=$status bytes=$bytes_sent host=\"$host\"';\n"
-        "  access_log /dev/stderr exact_local_return204;\n"
+        access_prefix + " raw=\"$request\" status=$status bytes=$bytes_sent host=\"$host\"" +
+        (query_target ? " upstream_addr=\"$upstream_addr\" upstream_status=$upstream_status" : "") +
+        "';\n"
+        "  access_log " +
+        (query_target ? temp.nginx_access_log : "/dev/stderr") +
+        " exact_local_return204;\n"
         "  server {\n"
         "    listen " +
         std::to_string(frontend_port) + ";\n" +
@@ -6137,24 +6159,24 @@ static bool capture_pinned_exact_local_return204_order(
 
     DockerGuard docker(container_name);
     ChildGuard nginx;
+    std::vector<std::string> docker_args = {"docker",
+                                            "run",
+                                            "--pull=never",
+                                            "--network",
+                                            "host",
+                                            "--name",
+                                            container_name,
+                                            "-v",
+                                            temp.nginx_config + ":/etc/nginx/nginx.conf:ro"};
+    if (query_target) {
+        docker_args.push_back("-v");
+        docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path));
+    }
+    docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
     Recorder local_recorder;
     local_recorder.observe_extra_requests_until_stop = true;
     if (!local_recorder.setup(backend_port) ||
-        !spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      container_name,
-                      "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     temp.nginx_log,
-                     nginx.child) ||
+        !spawn_child(docker_args, temp.nginx_log, nginx.child) ||
         !wait_ready(frontend_port, nginx.child, error) ||
         !wait_recorder_live(local_recorder, nginx.child, "local") ||
         !observe_count(local_recorder,
@@ -6164,7 +6186,7 @@ static bool capture_pinned_exact_local_return204_order(
                        std::chrono::milliseconds(250)) ||
         !request_close(nginx.child,
                        "strict local return 204",
-                       kLocalRequest,
+                       local_request,
                        true,
                        kExactLocalReturn204ResponseNormalized,
                        observation.local_wire) ||
@@ -6212,7 +6234,7 @@ static bool capture_pinned_exact_local_return204_order(
                        std::chrono::milliseconds(100)) ||
         !request_close(nginx.child,
                        "root fallback",
-                       kFallbackRequest,
+                       fallback_request,
                        false,
                        kSuccessResponseNormalized,
                        observation.fallback_wire) ||
@@ -6254,22 +6276,24 @@ static bool capture_pinned_exact_local_return204_order(
         return false;
     }
 
-    const std::string local_marker =
-        "raw=\"GET /static HTTP/1.1\" status=204 bytes=105 host=\"return204.example\"";
+    const std::string local_marker = "raw=\"GET /static" + std::string(query_target ? "?x=1" : "") +
+                                     " HTTP/1.1\" status=204 bytes=105 host=\"" + request_host +
+                                     "\"";
     const std::string fallback_marker = "raw=\"GET /fallback?q=1 HTTP/1.1\" status=200 bytes=" +
                                         std::to_string(sizeof(kSuccessResponseNormalized) - 1u) +
-                                        " host=\"return204.example\"";
+                                        " host=\"" + request_host + "\"";
+    const std::string access_log_path = query_target ? temp.nginx_access_log : temp.nginx_log;
     u32 total_access = 0;
-    if (!log_count_line_with(temp.nginx_log,
+    if (!log_count_line_with(access_log_path,
                              local_marker.c_str(),
                              access_prefix.c_str(),
                              observation.local_access) ||
-        !log_count_line_with(temp.nginx_log,
+        !log_count_line_with(access_log_path,
                              fallback_marker.c_str(),
                              access_prefix.c_str(),
                              observation.fallback_access) ||
         !log_count_line_with(
-            temp.nginx_log, access_prefix.c_str(), access_prefix.c_str(), total_access) ||
+            access_log_path, access_prefix.c_str(), access_prefix.c_str(), total_access) ||
         observation.local_access != 1 || observation.fallback_access != 1 || total_access != 2 ||
         log_contains(temp.nginx_log, "[warn]") || log_contains(temp.nginx_log, "[error]") ||
         log_contains(temp.nginx_log, "[crit]") || log_contains(temp.nginx_log, "[alert]") ||
@@ -6327,13 +6351,13 @@ static bool run_pinned_exact_local_return204_oracle(
         return false;
     }
     if (!capture_pinned_exact_local_return204_order(
-            ports[0], ports[1], exact_temp, exact_container, true, exact_first, error)) {
+            ports[0], ports[1], exact_temp, exact_container, true, false, exact_first, error)) {
         dump_log(exact_temp.nginx_config, "#324 exact-first pinned nginx config");
         dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
         return false;
     }
     if (!capture_pinned_exact_local_return204_order(
-            ports[2], ports[3], root_temp, root_container, false, root_first, error)) {
+            ports[2], ports[3], root_temp, root_container, false, false, root_first, error)) {
         dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
         dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
         return false;
@@ -6390,6 +6414,275 @@ static bool run_pinned_exact_local_return204_oracle(
         dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
         dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
         dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
+        return false;
+    }
+    return true;
+}
+
+static bool parse_exact_return204_query_access_log(const std::string& contents,
+                                                   const std::string& prefix,
+                                                   u16 backend_port,
+                                                   std::string& error) {
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 2u, "#325 query access log", records, error))
+        return false;
+    const auto parse_record = [&](const std::string& record,
+                                  const char* raw_target,
+                                  size_t expected_status,
+                                  size_t expected_bytes,
+                                  bool fallback_record) {
+        size_t cursor = prefix.size();
+        const auto take = [&](const std::string& literal) {
+            if (record.compare(cursor, literal.size(), literal) != 0) return false;
+            cursor += literal.size();
+            return true;
+        };
+        const auto take_token = [&](const char* label, std::string& token) {
+            if (!take(label)) return false;
+            const size_t end = record.find(' ', cursor);
+            if (end == std::string::npos) return false;
+            token = record.substr(cursor, end - cursor);
+            cursor = end;
+            return !token.empty();
+        };
+        if (record.size() < prefix.size() || record.compare(0, prefix.size(), prefix) != 0 ||
+            !take(" raw=\"") || !take(raw_target) || !take("\" status="))
+            return false;
+        std::string status;
+        std::string bytes;
+        if (!take_token("", status) || !take(" bytes=") || !take_token("", bytes)) return false;
+        size_t status_value = 0;
+        size_t bytes_value = 0;
+        if (!parse_decimal_field(status, status_value) ||
+            !parse_decimal_field(bytes, bytes_value) || status != std::to_string(expected_status) ||
+            bytes != std::to_string(expected_bytes))
+            return false;
+        if (!take(" host=\"query-return204.example\" upstream_addr=\"")) return false;
+        if (fallback_record) {
+            if (!take("127.0.0.1:")) return false;
+            const size_t port_end = record.find('"', cursor);
+            if (port_end == std::string::npos || port_end == cursor) return false;
+            const std::string port = record.substr(cursor, port_end - cursor);
+            size_t port_value = 0;
+            if (!parse_decimal_field(port, port_value) || port_value > 65535u ||
+                port != std::to_string(backend_port))
+                return false;
+            cursor = port_end;
+        } else if (!take("-")) {
+            return false;
+        }
+        if (!take("\" upstream_status=")) return false;
+        std::string upstream_status;
+        if (cursor >= record.size()) return false;
+        upstream_status = record.substr(cursor);
+        if (fallback_record) {
+            size_t upstream_status_value = 0;
+            if (!parse_decimal_field(upstream_status, upstream_status_value) ||
+                upstream_status != "200")
+                return false;
+        } else if (upstream_status != "-") {
+            return false;
+        }
+        return true;
+    };
+    if (!parse_record(records[0], "GET /static?x=1 HTTP/1.1", 204u, 105u, false) ||
+        !parse_record(records[1], "GET /fallback?q=1 HTTP/1.1", 200u, 118u, true)) {
+        error = "#325 query access log did not contain the exact ordered raw-target records";
+        return false;
+    }
+    return true;
+}
+
+static bool run_exact_return204_query_access_log_self_checks(std::string& error) {
+    const std::string prefix = "rut-nginx-325-return204-exact-before-root-123-scoped";
+    const std::string local = prefix +
+                              " raw=\"GET /static?x=1 HTTP/1.1\" status=204 bytes=105 "
+                              "host=\"query-return204.example\" upstream_addr=\"-\" "
+                              "upstream_status=-\n";
+    const std::string fallback =
+        prefix +
+        " raw=\"GET /fallback?q=1 HTTP/1.1\" status=200 bytes=118 "
+        "host=\"query-return204.example\" upstream_addr=\"127.0.0.1:54321\" "
+        "upstream_status=200\n";
+    const std::string valid = local + fallback;
+    const auto rejects = [&](const std::string& value) {
+        std::string detail;
+        return !parse_exact_return204_query_access_log(value, prefix, 54321, detail);
+    };
+    const auto mutate_at =
+        [](std::string value, size_t offset, const char* expected, const char* replacement) {
+            const size_t width = strlen(expected);
+            if (value.compare(offset, width, expected) != 0) return std::string{};
+            value.replace(offset, width, replacement);
+            return value;
+        };
+    static constexpr char kOverflow[] = "999999999999999999999999999999999999999999";
+    const size_t local_status_offset =
+        prefix.size() + strlen(" raw=\"GET /static?x=1 HTTP/1.1\" status=");
+    const size_t local_bytes_offset =
+        prefix.size() + strlen(" raw=\"GET /static?x=1 HTTP/1.1\" status=204 bytes=");
+    const size_t fallback_status_offset =
+        prefix.size() + strlen(" raw=\"GET /fallback?q=1 HTTP/1.1\" status=");
+    const size_t fallback_bytes_offset =
+        prefix.size() + strlen(" raw=\"GET /fallback?q=1 HTTP/1.1\" status=200 bytes=");
+    const size_t fallback_port_offset = prefix.size() + strlen(
+                                                            " raw=\"GET /fallback?q=1 HTTP/1.1\" "
+                                                            "status=200 bytes=118 "
+                                                            "host=\"query-return204.example\" "
+                                                            "upstream_addr=\"127.0.0.1:");
+    const size_t fallback_upstream_status_offset =
+        prefix.size() + strlen(
+                            " raw=\"GET /fallback?q=1 HTTP/1.1\" status=200 bytes=118 "
+                            "host=\"query-return204.example\" upstream_addr=\"127.0.0.1:54321\" "
+                            "upstream_status=");
+    const std::string overflow_local_status =
+        mutate_at(local, local_status_offset, "204", kOverflow);
+    const std::string overflow_local_bytes = mutate_at(local, local_bytes_offset, "105", kOverflow);
+    const std::string overflow_fallback_status =
+        mutate_at(fallback, fallback_status_offset, "200", kOverflow);
+    const std::string overflow_fallback_bytes =
+        mutate_at(fallback, fallback_bytes_offset, "118", kOverflow);
+    const std::string overflow_fallback_port =
+        mutate_at(fallback, fallback_port_offset, "54321", kOverflow);
+    const std::string overflow_fallback_upstream_status =
+        mutate_at(fallback, fallback_upstream_status_offset, "200", kOverflow);
+    if (overflow_local_status.empty() || overflow_local_bytes.empty() ||
+        overflow_fallback_status.empty() || overflow_fallback_bytes.empty() ||
+        overflow_fallback_port.empty() || overflow_fallback_upstream_status.empty() ||
+        !parse_exact_return204_query_access_log(valid, prefix, 54321, error) ||
+        !rejects(valid + local) || !rejects(fallback + local) ||
+        !rejects(valid.substr(0, valid.size() - 1u)) || !rejects(local + "\n" + fallback) ||
+        !rejects(local.substr(0, local.size() - 2u) + "x\n" + fallback) ||
+        !rejects(overflow_local_status + fallback) || !rejects(overflow_local_bytes + fallback) ||
+        !rejects(local + overflow_fallback_status) || !rejects(local + overflow_fallback_bytes) ||
+        !rejects(local + overflow_fallback_port) ||
+        !rejects(local + overflow_fallback_upstream_status)) {
+        error = "#325 query access-log exact-record mutation self-check failed";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_exact_local_return204_query_oracle(
+    const std::string& container_prefix,
+    ExactLocalReturn204OracleObservation& exact_first,
+    ExactLocalReturn204OracleObservation& root_first,
+    std::string& error) {
+    u16 ports[4]{};
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        ports_unique = true;
+        for (u16& port : ports) {
+            if (!allocate_port(port)) {
+                ports_unique = false;
+                break;
+            }
+        }
+        for (size_t i = 0; ports_unique && i < 4; i++) {
+            for (size_t j = i + 1u; j < 4; j++) {
+                if (ports[i] == ports[j]) {
+                    ports_unique = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (!ports_unique) {
+        error = "#325 could not allocate four distinct declaration-order ports";
+        return false;
+    }
+
+    TempDir exact_temp;
+    TempDir root_temp;
+    if (!exact_temp.create() || !root_temp.create() ||
+        strcmp(exact_temp.path, root_temp.path) == 0 ||
+        exact_temp.nginx_config == root_temp.nginx_config ||
+        exact_temp.nginx_log == root_temp.nginx_log ||
+        exact_temp.nginx_access_log == root_temp.nginx_access_log) {
+        error = "#325 could not create two independent temp/config/log trees";
+        return false;
+    }
+    const std::string exact_container = container_prefix + "-exact-first";
+    const std::string root_container = container_prefix + "-root-first";
+    if (exact_container == root_container) {
+        error = "#325 declaration-order container names were not independent";
+        return false;
+    }
+    if (!capture_pinned_exact_local_return204_order(
+            ports[0], ports[1], exact_temp, exact_container, true, true, exact_first, error)) {
+        dump_log(exact_temp.nginx_config, "#325 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#325 exact-first pinned nginx error log");
+        dump_log(exact_temp.nginx_access_log, "#325 exact-first pinned nginx access log");
+        return false;
+    }
+    if (!capture_pinned_exact_local_return204_order(
+            ports[2], ports[3], root_temp, root_container, false, true, root_first, error)) {
+        dump_log(root_temp.nginx_config, "#325 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#325 root-first pinned nginx error log");
+        dump_log(root_temp.nginx_access_log, "#325 root-first pinned nginx access log");
+        return false;
+    }
+    std::string exact_access;
+    std::string root_access;
+    if (!read_exact_return204_log(
+            exact_temp.nginx_access_log, "#325 exact-first access log", exact_access, error) ||
+        !read_exact_return204_log(
+            root_temp.nginx_access_log, "#325 root-first access log", root_access, error) ||
+        !parse_exact_return204_query_access_log(
+            exact_access, exact_first.access_prefix, ports[1], error) ||
+        !parse_exact_return204_query_access_log(
+            root_access, root_first.access_prefix, ports[3], error)) {
+        return false;
+    }
+    const auto same_normalized_wire = [](const std::vector<char>& left,
+                                         const std::vector<char>& right) {
+        std::vector<char> normalized_left(left.begin(), left.end());
+        std::vector<char> normalized_right(right.begin(), right.end());
+        return normalize_date(normalized_left) && normalize_date(normalized_right) &&
+               normalized_left == normalized_right;
+    };
+    const std::vector<char> expected_local(kExactLocalReturn204ResponseNormalized,
+                                           kExactLocalReturn204ResponseNormalized + 105u);
+    const std::vector<char> expected_fallback(
+        kSuccessResponseNormalized,
+        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+    for (const ExactLocalReturn204OracleObservation* observation : {&exact_first, &root_first}) {
+        std::vector<char> local = observation->local_wire;
+        std::vector<char> fallback = observation->fallback_wire;
+        if (local.size() != 105u || fallback.size() != 118u || !normalize_date(local) ||
+            !normalize_date(fallback) || local != expected_local || fallback != expected_fallback ||
+            observation->local_accepts != 0 || observation->local_requests != 0 ||
+            observation->local_sends != 0 || observation->fallback_accepts != 1 ||
+            observation->fallback_requests != 1 || observation->fallback_sends != 1 ||
+            observation->fallback_history.size() != 1u || observation->local_access != 1 ||
+            observation->fallback_access != 1) {
+            error = "#325 one declaration order lacked exact wire/zero-upstream/fallback evidence";
+            return false;
+        }
+    }
+    if (!same_normalized_wire(exact_first.local_wire, root_first.local_wire) ||
+        !same_normalized_wire(exact_first.fallback_wire, root_first.fallback_wire)) {
+        error = "#325 declaration order changed a Date-normalized client response";
+        return false;
+    }
+    const auto canonical_backend = [](const std::vector<char>& wire) {
+        std::string result(wire.begin(), wire.end());
+        static constexpr char kHostPrefix[] = "\r\nHost: 127.0.0.1:";
+        const size_t begin = result.find(kHostPrefix);
+        if (begin == std::string::npos || result.find(kHostPrefix, begin + 1u) != std::string::npos)
+            return std::string{};
+        const size_t digits = begin + sizeof(kHostPrefix) - 1u;
+        const size_t end = result.find("\r\n", digits);
+        if (end == std::string::npos || end == digits) return std::string{};
+        for (size_t i = digits; i < end; i++)
+            if (result[i] < '0' || result[i] > '9') return std::string{};
+        result.replace(digits, end - digits, "BACKEND");
+        return result;
+    };
+    if (canonical_backend(exact_first.fallback_history[0]).empty() ||
+        canonical_backend(exact_first.fallback_history[0]) !=
+            canonical_backend(root_first.fallback_history[0])) {
+        error = "#325 declaration order changed exact fallback history after dynamic-port binding";
         return false;
     }
     return true;
@@ -6850,9 +7143,9 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
     };
     if (containers[0] == containers[1] ||
         !capture_pinned_exact_local_return204_order(
-            ports[0], ports[1], temps[0], containers[0], true, observations[0], error) ||
+            ports[0], ports[1], temps[0], containers[0], true, false, observations[0], error) ||
         !capture_pinned_exact_local_return204_order(
-            ports[2], ports[3], temps[1], containers[1], false, observations[1], error) ||
+            ports[2], ports[3], temps[1], containers[1], false, false, observations[1], error) ||
         !capture_generated_exact_local_return204_order(ports[4],
                                                        ports[5],
                                                        temps[2],
@@ -17052,6 +17345,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--exact-local-body-multiple-space-oracle") == 0;
     const bool exact_local_return204_oracle =
         argc == 2 && strcmp(argv[1], "--exact-local-return204-oracle") == 0;
+    const bool exact_local_return204_query_oracle =
+        argc == 2 && strcmp(argv[1], "--exact-local-return204-query-oracle") == 0;
     const bool converter_exact_local_body_space_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-local-body-space-differential") == 0;
     const bool converter_exact_local_body_multiple_space_differential =
@@ -17111,7 +17406,7 @@ int main(int argc, char** argv) {
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !exact_local_body_space_oracle &&
          !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
-         !converter_exact_local_body_space_differential &&
+         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_api_non_root_proxy_uri_differential &&
@@ -17173,6 +17468,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --exact-local-body-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-return204-oracle\n"
+                     "   or: test_nginx_differential --exact-local-return204-query-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-body-space-differential "
                      "<absolute-rut-executable>\n"
@@ -17248,6 +17544,13 @@ int main(int argc, char** argv) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
+            return 1;
+        }
+    }
+    if (exact_local_return204_query_oracle) {
+        std::string parser_error;
+        if (!run_exact_return204_query_access_log_self_checks(parser_error)) {
+            std::cerr << "FAIL [#325 query access-log parser self-check]: " << parser_error << "\n";
             return 1;
         }
     }
@@ -17497,6 +17800,32 @@ int main(int argc, char** argv) {
                "(nginx-only #324 oracle; no parser/converter/generated-RUT claim; excludes "
                "other statuses, return text/variables, methods, bodies/framing, HTTP/1.0, "
                "keep-alive/reuse/pipeline, other locations/listeners/servers, and TLS/H2)\n";
+        return 0;
+    }
+
+    if (exact_local_return204_query_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-exact-local-return204-query-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLocalReturn204OracleObservation exact_first;
+        ExactLocalReturn204OracleObservation root_first;
+        std::string oracle_error;
+        if (!run_pinned_exact_local_return204_query_oracle(
+                container_prefix, exact_first, root_first, oracle_error)) {
+            std::cerr << "FAIL [pinned exact-local return 204 query oracle]: " << oracle_error
+                      << "\n";
+            dump_exact_local_return204_oracle_observation(exact_first);
+            dump_exact_local_return204_oracle_observation(root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 literal exact /static return 204 preserved the raw "
+               "?x=1 target across exact-first and root-first isolated fresh bodyless explicit-"
+               "close H1.1 GET epochs, with exact Date-normalized 105-byte wire/EOF, no framing "
+               "or body, live and settled zero upstream, and an independent exact one-episode "
+               "/fallback?q=1 root proxy; bounded access logs contain exactly two ordered raw "
+               "query records (#325 nginx-only required oracle)\n";
         return 0;
     }
 
