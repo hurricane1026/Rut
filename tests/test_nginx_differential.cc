@@ -658,6 +658,7 @@ struct TempDir {
     std::string nginx_config;
     std::string nginx_log;
     std::string rut_log;
+    std::string rut_access_log;
     std::string preflight_log;
     std::string gate_control;
     std::string rut_iouring_gate_control;
@@ -669,6 +670,7 @@ struct TempDir {
         nginx_config = std::string(path) + "/nginx.conf";
         nginx_log = std::string(path) + "/nginx.log";
         rut_log = std::string(path) + "/rut.log";
+        rut_access_log = std::string(path) + "/rut-access.log";
         preflight_log = std::string(path) + "/preflight.log";
         gate_control = std::string(path) + "/downstream-gate.control";
         rut_iouring_gate_control = std::string(path) + "/rut-iouring-gate.control";
@@ -681,6 +683,7 @@ struct TempDir {
             unlink(nginx_config.c_str());
             unlink(nginx_log.c_str());
             unlink(rut_log.c_str());
+            unlink(rut_access_log.c_str());
             unlink(preflight_log.c_str());
             unlink(gate_control.c_str());
             unlink(rut_iouring_gate_control.c_str());
@@ -12696,6 +12699,363 @@ route exact "/static" { return local_response({
     return true;
 }
 
+static bool run_slash_normalized_exact_rut_production(
+    u16 frontend_port, u16 backend_port, TempDir& temp, const char* rut_path, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "slash-normalized production evidence requires an executable absolute RUT path";
+        return false;
+    }
+
+    // Generic RUT capability evidence only. This is deliberately hand-authored
+    // ordinary source and never enters the nginx parser or converter.
+    const std::string source = "listen :" + std::to_string(frontend_port) + "\n" +
+                               "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) +
+                               "\"\n" +
+                               R"rut(route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "nginx/1.29.7", date: "current",
+      hide_headers: ["Date", "Server", "X-Pad"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 60s,
+    response_buffering: "complete_content_length")
+}
+route exact slash_normalized GET "/health/check/" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+    if (source.find("route GET \"/\"") == std::string::npos ||
+        source.find("route exact slash_normalized GET \"/health/check/\"") == std::string::npos ||
+        source.find("return forward(backend") == std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        !write_file(temp.source, source.data(), source.size())) {
+        error = "failed to preserve/write hand-authored slash-normalized ordinary RUT source";
+        return false;
+    }
+
+    static constexpr char kLocalRequest[] =
+        "GET /health/check/ HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kQueryRequest[] =
+        "GET /health/check/?x=1 HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kRepeatedSlashRequest[] =
+        "GET /health/check// HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kNoSlashRequest[] =
+        "GET /health/check HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "X-319-Vector: no-slash\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kRootRequest[] =
+        "GET / HTTP/1.1\r\n"
+        "Host: normalized-exact.example\r\n"
+        "X-319-Vector: root\r\n"
+        "Connection: close\r\n\r\n";
+    struct Vector {
+        const char* name;
+        const char* request;
+        size_t request_len;
+        const char* expected;
+        size_t expected_len;
+    };
+    static constexpr Vector kVectors[] = {
+        {"/health/check/",
+         kLocalRequest,
+         sizeof(kLocalRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         sizeof(kExactLocalCloseResponseNormalized) - 1u},
+        {"/health/check/?x=1",
+         kQueryRequest,
+         sizeof(kQueryRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         sizeof(kExactLocalCloseResponseNormalized) - 1u},
+        {"/health/check//",
+         kRepeatedSlashRequest,
+         sizeof(kRepeatedSlashRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         sizeof(kExactLocalCloseResponseNormalized) - 1u},
+        {"/health/check",
+         kNoSlashRequest,
+         sizeof(kNoSlashRequest) - 1u,
+         kSuccessResponseNormalized,
+         sizeof(kSuccessResponseNormalized) - 1u},
+        {"/",
+         kRootRequest,
+         sizeof(kRootRequest) - 1u,
+         kSuccessResponseNormalized,
+         sizeof(kSuccessResponseNormalized) - 1u},
+    };
+    for (const Vector& vector : kVectors) {
+        const std::string request(vector.request, vector.request_len);
+        if (request.rfind("GET /", 0) != 0 || request.find(" HTTP/1.1\r\n") == std::string::npos ||
+            request.find("\r\nConnection: close\r\n") == std::string::npos ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.rfind("\r\n\r\n") != request.size() - 4u) {
+            error = std::string("vector escaped fresh bodyless explicit-close H1.1 scope: ") +
+                    vector.name;
+            return false;
+        }
+    }
+
+    ChildGuard runtime;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "failed to start public RUT CLI";
+        return false;
+    }
+    const auto backend_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temp.rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < backend_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "public RUT CLI exited before io_uring backend proof";
+            return false;
+        }
+        usleep(5000);
+    }
+    if (!log_contains(temp.rut_log, "Backend: io_uring\n")) {
+        error = "required production runtime did not select io_uring";
+        return false;
+    }
+    static constexpr char kDestroyedSource[] = "destroyed-after-public-load\n";
+    if (!write_file(temp.source, kDestroyedSource, sizeof(kDestroyedSource) - 1u)) {
+        error = "failed to destroy ordinary source after public CLI load";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child)) {
+                error = std::string("RUT exited before ") + phase + " recorder readiness";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = std::string(phase) + " recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string(phase) + " recorder readiness timed out";
+        return false;
+    };
+    const auto observe_count = [&](Recorder& recorder,
+                                   u32 expected,
+                                   const char* phase,
+                                   std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(runtime.child)) {
+                error = std::string("RUT exited during ") + phase;
+                return false;
+            }
+            if (!recorder_live(recorder)) {
+                error = std::string(phase) + " recorder stopped or failed";
+                return false;
+            }
+            if (recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error = std::string(phase) + " observed unexpected upstream activity";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto wait_count = [&](Recorder& recorder, u32 expected, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child) || !recorder_live(recorder)) {
+                error = std::string(phase) + " runtime or recorder stopped";
+                return false;
+            }
+            const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) {
+                error = std::string(phase) + " exceeded exact upstream count";
+                return false;
+            }
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        error = std::string(phase) + " timed out awaiting exact upstream count";
+        return false;
+    };
+    const auto request_vector = [&](const Vector& vector, std::vector<char>& wire) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, vector.request, vector.request_len) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string(vector.name) + " response/close/EOF failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        std::vector<char> normalized = wire;
+        const std::vector<char> expected(vector.expected, vector.expected + vector.expected_len);
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = std::string(vector.name) +
+                    " did not equal the complete expected Date-normalized response wire";
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<std::vector<char>> wires(5);
+    for (size_t index = 0; index < 3; index++) {
+        Recorder zero;
+        struct RecorderGuard {
+            Recorder* recorder;
+            ~RecorderGuard() {
+                if (recorder != nullptr) recorder->stop();
+            }
+        } zero_guard{&zero};
+        zero.observe_extra_requests_until_stop = true;
+        if (!zero.setup(backend_port) || !wait_recorder_live(zero, kVectors[index].name) ||
+            !observe_count(zero,
+                           0,
+                           (std::string(kVectors[index].name) + " pre-request zero window").c_str(),
+                           std::chrono::milliseconds(500)) ||
+            !request_vector(kVectors[index], wires[index]) ||
+            !observe_count(
+                zero,
+                0,
+                (std::string(kVectors[index].name) + " post-request zero window").c_str(),
+                std::chrono::milliseconds(500))) {
+            return false;
+        }
+        zero.stop();
+        zero_guard.recorder = nullptr;
+        if (zero.thread_alive.load(std::memory_order_acquire) ||
+            zero.listener_failed.load(std::memory_order_acquire) ||
+            zero.accepted.load(std::memory_order_acquire) != 0 ||
+            zero.requests.load(std::memory_order_acquire) != 0 ||
+            zero.response_send_all_calls.load(std::memory_order_acquire) != 0 ||
+            !zero.history.empty() || !zero.request.empty()) {
+            error = std::string(kVectors[index].name) +
+                    " did not settle with exactly zero upstream activity";
+            return false;
+        }
+    }
+
+    Recorder backend;
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    } backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    if (!backend.setup(backend_port, 2, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
+        !wait_recorder_live(backend, "fallback") ||
+        !observe_count(backend, 0, "pre-fallback zero window", std::chrono::milliseconds(100))) {
+        return false;
+    }
+    for (size_t index = 3; index < 5; index++) {
+        if (!request_vector(kVectors[index], wires[index]) ||
+            !wait_count(backend, static_cast<u32>(index - 2u), kVectors[index].name))
+            return false;
+    }
+    if (!observe_count(
+            backend, 2, "settled no-third-forward window", std::chrono::milliseconds(500)))
+        return false;
+
+    if (!stop_child(runtime.child)) {
+        error = "public RUT CLI did not stop cleanly after production evidence";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        backend.accepted.load(std::memory_order_acquire) != 2 ||
+        backend.requests.load(std::memory_order_acquire) != 2 ||
+        backend.response_send_all_calls.load(std::memory_order_acquire) != 2 ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire) ||
+        backend.history.size() != 2) {
+        error = "fallback recorder did not settle at exactly two complete episodes";
+        return false;
+    }
+    const std::string expected_no_slash =
+        "GET /health/check HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-319-Vector: no-slash\r\n\r\n";
+    const std::string expected_root =
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-319-Vector: root\r\n\r\n";
+    if (backend.history[0] !=
+            std::vector<char>(expected_no_slash.begin(), expected_no_slash.end()) ||
+        backend.history[1] != std::vector<char>(expected_root.begin(), expected_root.end())) {
+        error = "fallback upstream history did not preserve the two exact ordered raw targets";
+        return false;
+    }
+
+    static constexpr const char* kLogMarkers[] = {
+        " GET /health/check/ 200 ",
+        " GET /health/check/?x=1 200 ",
+        " GET /health/check// 200 ",
+        " GET /health/check 200 ",
+        " GET / 200 ",
+    };
+    u32 total = 0;
+    for (const char* marker : kLogMarkers) {
+        u32 count = 0;
+        if (!log_count_line_with(temp.rut_access_log, marker, " s=0", count) || count != 1) {
+            error = std::string("production access log did not retain exactly one raw spelling: ") +
+                    marker;
+            return false;
+        }
+        total += count;
+    }
+    u32 all_gets = 0;
+    if (!log_count_line_with(temp.rut_access_log, " GET ", " s=0", all_gets) || total != 5 ||
+        all_gets != 5) {
+        error = "production access log did not contain exactly the five raw request spellings";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -12738,6 +13098,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-exact-local-differential") == 0;
     const bool exact_strict_route_differential =
         argc == 3 && strcmp(argv[1], "--exact-strict-route-differential") == 0;
+    const bool slash_normalized_exact_rut_production =
+        argc == 3 && strcmp(argv[1], "--slash-normalized-exact-rut-production") == 0;
     const bool converter_coalesced_successor_differential =
         argc == 5 && strcmp(argv[1], "--converter-coalesced-successor-differential") == 0;
     const bool late_successor_differential =
@@ -12768,11 +13130,11 @@ int main(int argc, char** argv) {
          !converter_exact_absolute_redirect_differential &&
          !converter_exact_absolute_redirect_302_differential &&
          !converter_exact_local_differential && !exact_strict_route_differential &&
-         !converter_coalesced_successor_differential && !rut_iouring_gate_spike &&
-         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
-         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
-         !rut_iouring_coalesced_ingress_gate && !late_successor_differential &&
-         !normal_differential) ||
+         !slash_normalized_exact_rut_production && !converter_coalesced_successor_differential &&
+         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         !rut_iouring_gate_connect_journal_negative && !rut_iouring_coalesced_ingress_gate &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
@@ -12785,6 +13147,7 @@ int main(int argc, char** argv) {
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
         (exact_strict_route_differential && argv[2][0] != '/') ||
+        (slash_normalized_exact_rut_production && argv[2][0] != '/') ||
         (converter_coalesced_successor_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/')) ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
@@ -12832,6 +13195,8 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --exact-strict-route-differential "
                      "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --slash-normalized-exact-rut-production "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-coalesced-successor-differential "
                      "<absolute-rut-executable> <absolute-nginx-preload-helper> "
                      "<absolute-rut-preload-helper>\n"
@@ -12862,6 +13227,36 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
+    if (slash_normalized_exact_rut_production) {
+        u16 rut_frontend_port = 0;
+        u16 rut_backend_port = 0;
+        if (!allocate_port(rut_frontend_port) || !allocate_port(rut_backend_port) ||
+            rut_frontend_port == rut_backend_port) {
+            std::cerr << "FAIL [slash-normalized production preflight]: dynamic port allocation "
+                         "failed\n";
+            return 1;
+        }
+        std::string production_error;
+        if (!run_slash_normalized_exact_rut_production(
+                rut_frontend_port, rut_backend_port, temp, argv[2], production_error)) {
+            std::cerr << "FAIL [slash-normalized exact public-CLI/io_uring production]: "
+                      << production_error << "\n";
+            dump_log(temp.source, "destroyed slash-normalized ordinary RUT source");
+            dump_log(temp.rut_log, "slash-normalized public RUT CLI log");
+            dump_log(temp.rut_access_log, "slash-normalized production access log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: hand-authored ordinary RUT slash-normalized exact /health/check/ route "
+               "loaded through the public CLI and ran on the real io_uring frontend; three "
+               "normalized local vectors produced exact Date-normalized 200/CL16/full-body/"
+               "close/EOF wires with independent live and settled zero-upstream epochs, while "
+               "the no-slash and root fallbacks produced exact 200/CL2/close/EOF wires and two "
+               "ordered byte-exact upstream histories with no third; production access logs "
+               "retained all five raw spellings including query and repeated slash (generic "
+               "RUT #319 evidence only; no nginx/converter claim)\n";
+        return 0;
+    }
     if (rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
         rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
         rut_iouring_gate_connect_journal_negative) {
