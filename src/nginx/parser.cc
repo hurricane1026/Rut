@@ -394,8 +394,11 @@ private:
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("return requires status and target"));
         const Token status = cur_;
-        if (!eq(status.text, "301", 3))
-            return unsupported(status.span, lit_str("only redirect status 301 is supported"));
+        const bool is_301 = eq(status.text, "301", 3);
+        const bool is_302 = eq(status.text, "302", 3);
+        if (!is_301 && !is_302)
+            return unsupported(status.span,
+                               lit_str("only redirect status 301 or 302 is supported"));
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("return requires an absolute target"));
@@ -417,7 +420,7 @@ private:
         const Span end = cur_.span;
         advance();
         return AbsoluteRedirect{
-            301,
+            static_cast<u16>(is_301 ? 301 : 302),
             status.text,
             status.span,
             target.text,

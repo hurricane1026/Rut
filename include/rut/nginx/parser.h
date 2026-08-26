@@ -57,7 +57,8 @@ struct ExactLocalReturnLocation {
     LocalReturn response{};
 };
 
-// A distinct semantic action for the first bounded absolute redirect slice.
+// A distinct semantic action for the bounded literal 301/302 absolute redirect
+// slice.
 // The status lexeme, complete target, and its authority/path decomposition
 // borrow directly from the nginx source so later lowering never needs to
 // reinterpret source text.
