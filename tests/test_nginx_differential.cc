@@ -448,6 +448,30 @@ static constexpr char kExactLocalBodySpaceResponseNormalized[] =
     "\r\n"
     "hello world";
 static_assert(sizeof(kExactLocalBodySpaceResponseNormalized) - 1u == 154u);
+static constexpr char kExactLocalBodyMultipleSpaceRequest[] =
+    "GET /static HTTP/1.1\r\n"
+    "Host: multiple-body-space.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalBodyConsecutiveSpaceResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "hello  world";
+static_assert(sizeof(kExactLocalBodyConsecutiveSpaceResponseNormalized) - 1u == 155u);
+static constexpr char kExactLocalBodySeparatedSpaceResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 17\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "hello world again";
+static_assert(sizeof(kExactLocalBodySeparatedSpaceResponseNormalized) - 1u == 160u);
 static constexpr char kExactLocalHeadCloseResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -6122,18 +6146,45 @@ static void dump_exact_local_body_space_oracle_observation(
     dump_wire("GET /static body-space oracle", observation.wire);
 }
 
-static bool capture_pinned_exact_local_body_space_order(
+static void dump_exact_local_body_multiple_space_oracle_observation(
+    const char* body_case, const ExactLocalBodySpaceOracleObservation& observation) {
+    std::cerr << "#322 exact-local-body-multiple-space body=" << body_case
+              << " order=" << observation.order << " temp=" << observation.temp_path
+              << " config=" << observation.config_path << " log=" << observation.log_path
+              << " container=" << observation.container_name
+              << " access=" << observation.access_records
+              << " upstream=" << observation.upstream_accepts << "/"
+              << observation.upstream_requests << "/" << observation.upstream_sends << "\n";
+    dump_wire("#322 GET /static multiple-body-space oracle", observation.wire);
+}
+
+struct ExactLocalBodySpaceOracleSpec {
+    const char* issue;
+    const char* request;
+    const char* host;
+    const char* body;
+    const char* expected_response;
+    const char* access_prefix;
+    const char* log_format;
+    u32 content_length;
+    bool reject_failure_levels;
+};
+
+static bool capture_pinned_exact_local_body_space_order_with_spec(
     u16 frontend_port,
     u16 backend_port,
     TempDir& temp,
     const std::string& container_name,
+    const ExactLocalBodySpaceOracleSpec& spec,
     bool exact_first,
     ExactLocalBodySpaceOracleObservation& observation,
     std::string& error) {
-    const std::string request(kExactLocalBodySpaceRequest);
+    const std::string issue(spec.issue);
+    const std::string request(spec.request);
     const size_t header_end = request.find("\r\n\r\n");
-    if (request.rfind("GET /static HTTP/1.1\r\n", 0) != 0 ||
-        request.find("\r\nHost: body-space.example\r\n") == std::string::npos ||
+    if (strlen(spec.body) != spec.content_length || spec.content_length == 0 ||
+        request.rfind("GET /static HTTP/1.1\r\n", 0) != 0 ||
+        request.find("\r\nHost: " + std::string(spec.host) + "\r\n") == std::string::npos ||
         request.find("\r\nConnection: close\r\n") == std::string::npos ||
         request.find("\r\nContent-Length:") != std::string::npos ||
         request.find("\r\nTransfer-Encoding:") != std::string::npos ||
@@ -6141,9 +6192,9 @@ static bool capture_pinned_exact_local_body_space_order(
         request.find("\r\nExpect:") != std::string::npos ||
         request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
         header_end + 4u != request.size()) {
-        error =
-            "#321 oracle request escaped the one fresh bodyless origin-form explicit-close "
-            "H1.1 GET domain";
+        error = issue +
+                " oracle request escaped the one fresh bodyless origin-form explicit-close "
+                "H1.1 GET domain";
         return false;
     }
 
@@ -6153,19 +6204,22 @@ static bool capture_pinned_exact_local_body_space_order(
     observation.config_path = temp.nginx_config;
     observation.log_path = temp.nginx_log;
     observation.container_name = container_name;
-    const std::string access_prefix = "rut-nginx-321-body-space-" + observation.order + "-" +
-                                      std::to_string(getpid()) + "-scoped";
-    const std::string exact_location = "    location = /static { return 200 \"hello world\"; }\n";
+    const std::string access_prefix = std::string(spec.access_prefix) + "-" + observation.order +
+                                      "-" + std::to_string(getpid()) + "-scoped";
+    const std::string exact_location =
+        "    location = /static { return 200 \"" + std::string(spec.body) + "\"; }\n";
     const std::string root_location =
         "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
     const std::string config =
         "error_log stderr notice;\n"
         "events {}\n"
         "http {\n"
-        "  log_format exact_local_body_space '" +
-        access_prefix +
+        "  log_format " +
+        std::string(spec.log_format) + " '" + access_prefix +
         " raw=\"$request\" status=$status bytes=$body_bytes_sent host=\"$host\"';\n"
-        "  access_log /dev/stderr exact_local_body_space;\n"
+        "  access_log /dev/stderr " +
+        std::string(spec.log_format) +
+        ";\n"
         "  server {\n"
         "    listen " +
         std::to_string(frontend_port) + ";\n" +
@@ -6173,7 +6227,7 @@ static bool capture_pinned_exact_local_body_space_order(
         "  }\n"
         "}\n";
     if (!write_file(temp.nginx_config, config.data(), config.size())) {
-        error = "failed to write #321 exact local body-space pinned nginx config";
+        error = "failed to write " + issue + " exact local body-space pinned nginx config";
         return false;
     }
 
@@ -6186,31 +6240,31 @@ static bool capture_pinned_exact_local_body_space_order(
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(nginx)) {
-                error = "pinned nginx exited before #321 recorder readiness";
+                error = "pinned nginx exited before " + issue + " recorder readiness";
                 return false;
             }
             if (recorder.listener_failed.load(std::memory_order_acquire) ||
                 !recorder.running.load(std::memory_order_acquire)) {
-                error = "#321 recorder failed before readiness";
+                error = issue + " recorder failed before readiness";
                 return false;
             }
             if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
             usleep(1000);
         }
-        error = "#321 recorder readiness timed out";
+        error = issue + " recorder readiness timed out";
         return false;
     };
     const auto observe_live_zero = [&](Recorder& recorder, Child& nginx, const char* phase) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(nginx) || !recorder_live(recorder)) {
-                error = std::string("#321 pinned nginx or recorder failed during ") + phase;
+                error = issue + " pinned nginx or recorder failed during " + phase;
                 return false;
             }
             if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
                 recorder.requests.load(std::memory_order_acquire) != 0 ||
                 recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
-                error = std::string("#321 observed upstream activity during ") + phase;
+                error = issue + " observed upstream activity during " + phase;
                 return false;
             }
             usleep(5000);
@@ -6221,7 +6275,7 @@ static bool capture_pinned_exact_local_body_space_order(
     Recorder recorder;
     recorder.observe_extra_requests_until_stop = true;
     if (!recorder.setup(backend_port)) {
-        error = "failed to start #321 zero-upstream recorder";
+        error = "failed to start " + issue + " zero-upstream recorder";
         return false;
     }
     DockerGuard docker(container_name);
@@ -6241,7 +6295,7 @@ static bool capture_pinned_exact_local_body_space_order(
                       "daemon off;"},
                      temp.nginx_log,
                      nginx.child)) {
-        error = "failed to start pinned nginx for #321 oracle";
+        error = "failed to start pinned nginx for " + issue + " oracle";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error) ||
@@ -6256,33 +6310,30 @@ static bool capture_pinned_exact_local_body_space_order(
         }
     } client{connect_once(frontend_port)};
     std::string detail;
-    if (client.fd < 0 ||
-        !send_all(
-            client.fd, kExactLocalBodySpaceRequest, sizeof(kExactLocalBodySpaceRequest) - 1u) ||
+    if (client.fd < 0 || !send_all(client.fd, spec.request, strlen(spec.request)) ||
         !read_response(client.fd, observation.wire, detail) || !read_eof(client.fd, detail)) {
-        error = "#321 response/EOF/zero-tail failed: " +
+        error = issue + " response/EOF/zero-tail failed: " +
                 (detail.empty() ? std::string("connect or send failed") : detail);
         return false;
     }
-    if (!validate_exact_normalized_response(
-            observation.wire, kExactLocalBodySpaceResponseNormalized, detail)) {
-        error = "#321 exact status/reason/header-order/body wire mismatch: " + detail;
+    if (!validate_exact_normalized_response(observation.wire, spec.expected_response, detail)) {
+        error = issue + " exact status/reason/header-order/body wire mismatch: " + detail;
         return false;
     }
     const std::string wire_text(observation.wire.begin(), observation.wire.end());
     if (wire_text.find("\r\nLocation:") != std::string::npos) {
-        error = "#321 exact local body-space response unexpectedly emitted Location";
+        error = issue + " exact local body-space response unexpectedly emitted Location";
         return false;
     }
     if (!observe_live_zero(recorder, nginx.child, "post-request live zero-upstream window"))
         return false;
 
     if (!stop_child(nginx.child)) {
-        error = "failed to stop pinned nginx after #321 oracle";
+        error = "failed to stop pinned nginx after " + issue + " oracle";
         return false;
     }
     if (!docker.remove()) {
-        error = "docker rm -f failed after #321 oracle";
+        error = "docker rm -f failed after " + issue + " oracle";
         return false;
     }
     recorder.stop();
@@ -6295,12 +6346,13 @@ static bool capture_pinned_exact_local_body_space_order(
         observation.upstream_sends != 0 ||
         recorder.response_send_succeeded.load(std::memory_order_acquire) ||
         !recorder.history.empty() || !recorder.request.empty()) {
-        error = "#321 recorder did not settle with zero accepts/requests/sends/history";
+        error = issue + " recorder did not settle with zero accepts/requests/sends/history";
         return false;
     }
 
     const std::string marker =
-        "raw=\"GET /static HTTP/1.1\" status=200 bytes=11 host=\"body-space.example\"";
+        "raw=\"GET /static HTTP/1.1\" status=200 bytes=" + std::to_string(spec.content_length) +
+        " host=\"" + spec.host + "\"";
     u32 total_access = 0;
     u32 connect_failures = 0;
     u32 upstream_failures = 0;
@@ -6314,13 +6366,37 @@ static bool capture_pinned_exact_local_body_space_order(
         !log_count_line_with(
             temp.nginx_log, "upstream", upstream_context.c_str(), upstream_failures) ||
         observation.access_records != 1 || total_access != 1 || connect_failures != 0 ||
-        upstream_failures != 0) {
-        error =
-            "#321 scoped logs did not prove one boundary-safe raw /static 200/11 record and "
-            "zero connect/upstream failures";
+        upstream_failures != 0 ||
+        (spec.reject_failure_levels &&
+         (log_contains(temp.nginx_log, "[emerg]") || log_contains(temp.nginx_log, "[alert]") ||
+          log_contains(temp.nginx_log, "[crit]") || log_contains(temp.nginx_log, "[error]")))) {
+        error = issue +
+                " scoped logs did not prove one boundary-safe raw /static record and zero "
+                "nginx/connect/upstream failures";
         return false;
     }
     return true;
+}
+
+static bool capture_pinned_exact_local_body_space_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    ExactLocalBodySpaceOracleObservation& observation,
+    std::string& error) {
+    const ExactLocalBodySpaceOracleSpec spec = {"#321",
+                                                kExactLocalBodySpaceRequest,
+                                                "body-space.example",
+                                                "hello world",
+                                                kExactLocalBodySpaceResponseNormalized,
+                                                "rut-nginx-321-body-space",
+                                                "exact_local_body_space",
+                                                11u,
+                                                false};
+    return capture_pinned_exact_local_body_space_order_with_spec(
+        frontend_port, backend_port, temp, container_name, spec, exact_first, observation, error);
 }
 
 static bool run_pinned_exact_local_body_space_oracle(
@@ -6399,6 +6475,169 @@ static bool run_pinned_exact_local_body_space_oracle(
     std::vector<char> root_wire(root_first.wire.begin(), root_first.wire.end());
     if (!normalize_date(exact_wire) || !normalize_date(root_wire) || exact_wire != root_wire) {
         error = "#321 location declaration order changed the exact Date-normalized response";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_exact_local_body_multiple_space_oracle(
+    const std::string& container_prefix,
+    ExactLocalBodySpaceOracleObservation& consecutive_exact_first,
+    ExactLocalBodySpaceOracleObservation& consecutive_root_first,
+    ExactLocalBodySpaceOracleObservation& separated_exact_first,
+    ExactLocalBodySpaceOracleObservation& separated_root_first,
+    std::string& error) {
+    u16 ports[8]{};
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        ports_unique = true;
+        for (u16& port : ports) {
+            if (!allocate_port(port)) {
+                ports_unique = false;
+                break;
+            }
+        }
+        for (size_t i = 0; ports_unique && i < 8; i++) {
+            for (size_t j = i + 1u; j < 8; j++) {
+                if (ports[i] == ports[j]) {
+                    ports_unique = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (!ports_unique) {
+        error = "#322 could not allocate eight distinct body/order frontend/backend ports";
+        return false;
+    }
+
+    TempDir consecutive_exact_temp;
+    TempDir consecutive_root_temp;
+    TempDir separated_exact_temp;
+    TempDir separated_root_temp;
+    TempDir* temps[] = {&consecutive_exact_temp,
+                        &consecutive_root_temp,
+                        &separated_exact_temp,
+                        &separated_root_temp};
+    for (TempDir* temp : temps) {
+        if (!temp->create()) {
+            error = "#322 could not create four independent body/order temp trees";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < 4; i++) {
+        for (size_t j = i + 1u; j < 4; j++) {
+            if (strcmp(temps[i]->path, temps[j]->path) == 0 ||
+                temps[i]->nginx_config == temps[j]->nginx_config ||
+                temps[i]->nginx_log == temps[j]->nginx_log) {
+                error = "#322 body/order temp, config, or log paths were not independent";
+                return false;
+            }
+        }
+    }
+
+    const std::string containers[] = {container_prefix + "-consecutive-exact-first",
+                                      container_prefix + "-consecutive-root-first",
+                                      container_prefix + "-separated-exact-first",
+                                      container_prefix + "-separated-root-first"};
+    for (size_t i = 0; i < 4; i++) {
+        for (size_t j = i + 1u; j < 4; j++) {
+            if (containers[i] == containers[j]) {
+                error = "#322 body/order container names were not independent";
+                return false;
+            }
+        }
+    }
+
+    struct Side {
+        const char* body_case;
+        const char* body;
+        u32 content_length;
+        const char* expected_response;
+        const char* access_prefix;
+        bool exact_first;
+        ExactLocalBodySpaceOracleObservation* observation;
+    } sides[] = {{"consecutive",
+                  "hello  world",
+                  12u,
+                  kExactLocalBodyConsecutiveSpaceResponseNormalized,
+                  "rut-nginx-322-body-multiple-space-consecutive",
+                  true,
+                  &consecutive_exact_first},
+                 {"consecutive",
+                  "hello  world",
+                  12u,
+                  kExactLocalBodyConsecutiveSpaceResponseNormalized,
+                  "rut-nginx-322-body-multiple-space-consecutive",
+                  false,
+                  &consecutive_root_first},
+                 {"separated",
+                  "hello world again",
+                  17u,
+                  kExactLocalBodySeparatedSpaceResponseNormalized,
+                  "rut-nginx-322-body-multiple-space-separated",
+                  true,
+                  &separated_exact_first},
+                 {"separated",
+                  "hello world again",
+                  17u,
+                  kExactLocalBodySeparatedSpaceResponseNormalized,
+                  "rut-nginx-322-body-multiple-space-separated",
+                  false,
+                  &separated_root_first}};
+    for (size_t i = 0; i < 4; i++) {
+        const ExactLocalBodySpaceOracleSpec spec = {"#322",
+                                                    kExactLocalBodyMultipleSpaceRequest,
+                                                    "multiple-body-space.example",
+                                                    sides[i].body,
+                                                    sides[i].expected_response,
+                                                    sides[i].access_prefix,
+                                                    "exact_local_body_multiple_space",
+                                                    sides[i].content_length,
+                                                    true};
+        if (!capture_pinned_exact_local_body_space_order_with_spec(ports[i * 2u],
+                                                                   ports[i * 2u + 1u],
+                                                                   *temps[i],
+                                                                   containers[i],
+                                                                   spec,
+                                                                   sides[i].exact_first,
+                                                                   *sides[i].observation,
+                                                                   error)) {
+            dump_log(temps[i]->nginx_config, "#322 pinned nginx config");
+            dump_log(temps[i]->nginx_log, "#322 pinned nginx log");
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < 4; i++) {
+        const auto& left = *sides[i].observation;
+        if (left.wire.empty()) {
+            error = "#322 body/order side did not retain its response buffer";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4; j++) {
+            const auto& right = *sides[j].observation;
+            if (left.temp_path == right.temp_path || left.config_path == right.config_path ||
+                left.log_path == right.log_path || left.container_name == right.container_name ||
+                (!right.wire.empty() && left.wire.data() == right.wire.data())) {
+                error = "#322 four body/order sides did not retain independent test state";
+                return false;
+            }
+        }
+    }
+    const auto same_normalized_wire = [&](const std::vector<char>& left,
+                                          const std::vector<char>& right) {
+        std::vector<char> normalized_left(left.begin(), left.end());
+        std::vector<char> normalized_right(right.begin(), right.end());
+        return normalize_date(normalized_left) && normalize_date(normalized_right) &&
+               normalized_left == normalized_right;
+    };
+    if (!same_normalized_wire(consecutive_exact_first.wire, consecutive_root_first.wire)) {
+        error = "#322 location declaration order changed the consecutive-space response";
+        return false;
+    }
+    if (!same_normalized_wire(separated_exact_first.wire, separated_root_first.wire)) {
+        error = "#322 location declaration order changed the separated-space response";
         return false;
     }
     return true;
@@ -14622,6 +14861,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--normalized-exact-trailing-slash-oracle") == 0;
     const bool exact_local_body_space_oracle =
         argc == 2 && strcmp(argv[1], "--exact-local-body-space-oracle") == 0;
+    const bool exact_local_body_multiple_space_oracle =
+        argc == 2 && strcmp(argv[1], "--exact-local-body-multiple-space-oracle") == 0;
     const bool converter_exact_local_body_space_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-local-body-space-differential") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
@@ -14673,6 +14914,7 @@ int main(int argc, char** argv) {
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !exact_local_body_space_oracle &&
+         !exact_local_body_multiple_space_oracle &&
          !converter_exact_local_body_space_differential &&
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
@@ -14727,6 +14969,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-space-oracle\n"
+                     "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-body-space-differential "
                      "<absolute-rut-executable>\n"
@@ -15246,6 +15489,51 @@ int main(int argc, char** argv) {
                "trailing spaces, tabs, escapes, variables, controls, other bodies/statuses/"
                "paths/methods/framing, HTTP/1.0, keep-alive/reuse/pipeline, TLS/H2, other "
                "location forms, and multiple servers/listeners)\n";
+        return 0;
+    }
+
+    if (exact_local_body_multiple_space_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-exact-local-body-multiple-space-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLocalBodySpaceOracleObservation consecutive_exact_first;
+        ExactLocalBodySpaceOracleObservation consecutive_root_first;
+        ExactLocalBodySpaceOracleObservation separated_exact_first;
+        ExactLocalBodySpaceOracleObservation separated_root_first;
+        std::string oracle_error;
+        if (!run_pinned_exact_local_body_multiple_space_oracle(container_prefix,
+                                                               consecutive_exact_first,
+                                                               consecutive_root_first,
+                                                               separated_exact_first,
+                                                               separated_root_first,
+                                                               oracle_error)) {
+            std::cerr << "FAIL [pinned exact-local multiple-space body oracle]: " << oracle_error
+                      << "\n";
+            dump_exact_local_body_multiple_space_oracle_observation("consecutive",
+                                                                    consecutive_exact_first);
+            dump_exact_local_body_multiple_space_oracle_observation("consecutive",
+                                                                    consecutive_root_first);
+            dump_exact_local_body_multiple_space_oracle_observation("separated",
+                                                                    separated_exact_first);
+            dump_exact_local_body_multiple_space_oracle_observation("separated",
+                                                                    separated_root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 exact /static local returns preserve consecutive "
+               "hello  world (CL12) and separated hello world again (CL17) internal ASCII "
+               "spaces byte-for-byte in both location declaration orders across four isolated "
+               "fresh bodyless origin-form explicit-close H1.1 GET observations; each emits "
+               "the complete exact Date-only-normalized nginx-header-order 200 OK/text-plain/"
+               "exact-Content-Length/no-Location/full-body-with-no-newline/no-tail/close/EOF "
+               "wire, retains live pre/post-request and settled zero-upstream evidence, and "
+               "has exactly one boundary-safe raw /static access record with no nginx/connect/"
+               "upstream failure logs (nginx-only #322 oracle; no parser/converter/generated-"
+               "RUT support or equivalence claim; excludes leading/trailing spaces, other "
+               "whitespace/non-ASCII, quoting/escapes/variables, other bodies/statuses/paths/"
+               "methods/framing, HTTP/1.0, keep-alive/reuse/pipeline, TLS/H2, other location "
+               "forms, and multiple servers/listeners)\n";
         return 0;
     }
 
