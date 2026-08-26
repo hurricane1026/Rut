@@ -1,6 +1,7 @@
 #include "rut/nginx/converter.h"
 
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/strict_local_response.h"
 
 namespace rut::nginx {
 namespace {
@@ -133,6 +134,7 @@ bool source_position_is_coherent(uintptr_t source_base,
 
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
+static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
 
 constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
     const u8 byte = static_cast<u8>(value);
@@ -403,6 +405,31 @@ bool local_return_body_byte_is_safe(char value) {
            value != '#' && value != '{' && value != '}' && value != ';';
 }
 
+bool exact_local_return_path_is_clean(Str path) {
+    if (path.ptr == nullptr || path.len < 2 || path.len > kMaxExactLocalReturnPathLen ||
+        path.ptr[0] != '/')
+        return false;
+
+    u32 segment_start = 1;
+    for (u32 i = 1; i < path.len; i++) {
+        if (path.ptr[i] != '/') {
+            if (!proxy_pass_uri_segment_byte_is_clean(path.ptr[i])) return false;
+            continue;
+        }
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0 || (segment_len == 1 && path.ptr[segment_start] == '.') ||
+            (segment_len == 2 && path.ptr[segment_start] == '.' &&
+             path.ptr[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+    if (segment_start == path.len) return true;
+    const u32 segment_len = path.len - segment_start;
+    return !(
+        (segment_len == 1 && path.ptr[segment_start] == '.') ||
+        (segment_len == 2 && path.ptr[segment_start] == '.' && path.ptr[segment_start + 1] == '.'));
+}
+
 FrontendResult<bool> validate_exact_local_return(const Server& server) {
     const ExactLocalReturnLocation& location = server.exact_local_return;
     const LocalReturn& response = location.response;
@@ -413,31 +440,99 @@ FrontendResult<bool> validate_exact_local_return(const Server& server) {
         return false;
     }
 
-    if (!eq(location.path, "/static", 7))
+    // Dynamic path/body bytes remain unread until scalar bounds, complete nested
+    // spans, arithmetic, common-source borrowing, and source positions are proven.
+    if (location.path.len < 2 || location.path.len > kMaxExactLocalReturnPathLen)
         return unsupported(is_valid_span(location.path_span) ? location.path_span
                                                              : exact_local_return_span(server),
-                           lit_str("invalid exact local return path model"));
-    if (!span_position_is_coherent(server.span, location.span) ||
-        !span_position_is_coherent(location.span, location.path_span) ||
+                           lit_str("invalid bounded exact local return path model"));
+    if (response.body.len == 0 || response.body.len > kMaxLocalReturnBodyLen)
+        return unsupported(is_valid_span(response.body_span) ? response.body_span : response.span,
+                           lit_str("invalid exact local return body"));
+    if (!span_position_is_coherent(server.span, location.span))
+        return unsupported(is_valid_span(location.span) ? location.span : server.span,
+                           lit_str("invalid exact local return location span"));
+    if (!span_position_is_coherent(location.span, location.path_span) ||
         location.path_span.end - location.path_span.start != location.path.len)
-        return unsupported(exact_local_return_span(server),
-                           lit_str("invalid exact local return location spans"));
+        return unsupported(is_valid_span(location.path_span) ? location.path_span : location.span,
+                           lit_str("invalid exact local return path span"));
+    if (!span_position_is_coherent(location.span, response.span) ||
+        location.path_span.end >= response.span.start)
+        return unsupported(is_valid_span(response.span) ? response.span : location.span,
+                           lit_str("invalid exact local return response span"));
+    if (!span_position_is_coherent(response.span, response.body_span) ||
+        response.body_span.end - response.body_span.start != response.body.len ||
+        response.span.start >= response.body_span.start ||
+        response.body_span.end >= response.span.end)
+        return unsupported(is_valid_span(response.body_span) ? response.body_span : response.span,
+                           lit_str("invalid exact local return body span"));
+
+    const Location& fallback = server.location;
+    const uintptr_t fallback_path_address = reinterpret_cast<uintptr_t>(fallback.path.ptr);
+    if (!span_position_is_coherent(server.span, fallback.span) ||
+        !span_position_is_coherent(fallback.span, fallback.path_span) ||
+        fallback.path.ptr == nullptr || fallback_path_address < fallback.path_span.start ||
+        fallback.path_span.end - fallback.path_span.start != fallback.path.len)
+        return unsupported(is_valid_span(fallback.path_span) ? fallback.path_span : server.span,
+                           lit_str("invalid exact local return fallback provenance"));
+    const uintptr_t path_address = reinterpret_cast<uintptr_t>(location.path.ptr);
+    if (location.path.ptr == nullptr || path_address < location.path_span.start)
+        return unsupported(location.path_span,
+                           lit_str("invalid exact local return path provenance"));
+    const uintptr_t body_address = reinterpret_cast<uintptr_t>(response.body.ptr);
+    if (response.body.ptr == nullptr || body_address < response.body_span.start)
+        return unsupported(response.body_span,
+                           lit_str("invalid exact local return body provenance"));
+
+    const uintptr_t fallback_source_base = fallback_path_address - fallback.path_span.start;
+    const uintptr_t path_source_base = path_address - location.path_span.start;
+    const uintptr_t body_source_base = body_address - response.body_span.start;
+    if (fallback_source_base > UINTPTR_MAX - server.span.end)
+        return unsupported(fallback.path_span,
+                           lit_str("invalid exact local return fallback provenance"));
+    if (path_source_base > UINTPTR_MAX - server.span.end)
+        return unsupported(location.path_span,
+                           lit_str("invalid exact local return path provenance"));
+    if (body_source_base > UINTPTR_MAX - server.span.end)
+        return unsupported(response.body_span,
+                           lit_str("invalid exact local return body provenance"));
+
+    // Three independent borrows identify a single forged source-base without
+    // trusting or reading any one borrow first.
+    if (fallback_source_base != path_source_base) {
+        if (path_source_base == body_source_base)
+            return unsupported(fallback.path_span,
+                               lit_str("invalid exact local return fallback provenance"));
+        return unsupported(location.path_span,
+                           lit_str("invalid exact local return path provenance"));
+    }
+    if (fallback_source_base != body_source_base)
+        return unsupported(response.body_span,
+                           lit_str("invalid exact local return body provenance"));
+
+    const uintptr_t source_base = fallback_source_base;
+    if (!source_position_is_coherent(source_base, server.span, location.span))
+        return unsupported(location.span, lit_str("invalid exact local return source positions"));
+    if (!source_position_is_coherent(source_base, server.span, location.path_span))
+        return unsupported(location.path_span,
+                           lit_str("invalid exact local return path source position"));
+    if (!source_position_is_coherent(source_base, server.span, response.span))
+        return unsupported(response.span,
+                           lit_str("invalid exact local return response source position"));
+    if (!source_position_is_coherent(source_base, server.span, response.body_span))
+        return unsupported(response.body_span,
+                           lit_str("invalid exact local return body source position"));
+
+    if (!exact_local_return_path_is_clean(location.path) || eq(location.path, "/old", 4))
+        return unsupported(location.path_span,
+                           lit_str("invalid bounded exact local return path model"));
     if (response.status != 200)
         return unsupported(is_valid_span(response.span) ? response.span : location.span,
                            lit_str("invalid exact local return status"));
-    if (response.body.ptr == nullptr || response.body.len == 0 ||
-        response.body.len > kMaxLocalReturnBodyLen)
-        return unsupported(is_valid_span(response.body_span) ? response.body_span : response.span,
-                           lit_str("invalid exact local return body"));
     for (u32 i = 0; i < response.body.len; i++) {
         if (!local_return_body_byte_is_safe(response.body.ptr[i]))
             return unsupported(response.body_span, lit_str("invalid exact local return body"));
     }
-    if (!span_position_is_coherent(location.span, response.span) ||
-        !span_position_is_coherent(response.span, response.body_span) ||
-        response.body_span.end - response.body_span.start != response.body.len)
-        return unsupported(exact_local_return_span(server),
-                           lit_str("invalid exact local return response spans"));
     return true;
 }
 
@@ -785,8 +880,9 @@ bool put_exact_absolute_redirect(
            writer.put_cstr("    }\n}\n");
 }
 
-bool put_exact_local_return(Writer& writer, Str body) {
-    return writer.put_cstr("route exact \"/static\" { return local_response({\n") &&
+bool put_exact_local_return(Writer& writer, Str path, Str body) {
+    return writer.put_cstr("route exact \"") && writer.put(path) &&
+           writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
                "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
                "\"nginx/1.29.7\",\n") &&
@@ -881,7 +977,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                  : !put_root_forward(writer, "GET", 3, false, true)) ||
             !put_root_forward(writer, "", 0, false, false) ||
             (exact_local_return.value() &&
-             !put_exact_local_return(writer, server.exact_local_return.response.body)))
+             !put_exact_local_return(
+                 writer, server.exact_local_return.path, server.exact_local_return.response.body)))
             return fail_overflow();
         return output;
     }

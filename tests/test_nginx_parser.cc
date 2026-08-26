@@ -1927,7 +1927,7 @@ static nginx::Server api_server() {
     return server;
 }
 
-TEST(nginx_converter, rejects_parsed_bounded_exact_local_path_before_lowering) {
+TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {
     const char* fragments[] = {
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /healthz { return 200 \"successor-static\"; } }",
@@ -1941,13 +1941,48 @@ TEST(nginx_converter, rejects_parsed_bounded_exact_local_path_before_lowering) {
         const Span genuine_path_span = parsed.value().exact_local_return.path_span;
         CHECK_EQ(parsed.value().exact_local_return.path.ptr, source + genuine_path_span.start);
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(lit_str("invalid exact local return path model")));
-        CHECK_EQ(lowered.error().span.start, genuine_path_span.start);
-        CHECK_EQ(lowered.error().span.end, genuine_path_span.end);
-        CHECK_EQ(lowered.error().span.line, genuine_path_span.line);
-        CHECK_EQ(lowered.error().span.col, genuine_path_span.col);
+        REQUIRE(lowered);
+        static constexpr char kGolden[] =
+            "route exact \"/healthz\" { return local_response({\n"
+            "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+            "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+            "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+            "}) }\n";
+        REQUIRE_GE(lowered.value().len, static_cast<u32>(sizeof(kGolden) - 1u));
+        const Str suffix{lowered.value().data + lowered.value().len - sizeof(kGolden) + 1u,
+                         sizeof(kGolden) - 1u};
+        CHECK(suffix.eq({kGolden, sizeof(kGolden) - 1u}));
+    }
+
+    const auto root_first = nginx::parse({fragments[0], static_cast<u32>(strlen(fragments[0]))});
+    const auto exact_first = nginx::parse({fragments[1], static_cast<u32>(strlen(fragments[1]))});
+    REQUIRE(root_first);
+    REQUIRE(exact_first);
+    const auto root_lowered = nginx::lower_to_rut(root_first.value());
+    const auto exact_lowered = nginx::lower_to_rut(exact_first.value());
+    REQUIRE(root_lowered);
+    REQUIRE(exact_lowered);
+    CHECK_EQ(root_lowered.value().len, 5554u);
+    CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
+}
+
+TEST(nginx_converter, emits_clean_trailing_slash_and_multisegment_exact_local_paths) {
+    const char* paths[] = {"/healthz/", "/health/check"};
+    const char* routes[] = {"route exact \"/healthz/\"", "route exact \"/health/check\""};
+    for (u32 i = 0; i < 2; i++) {
+        char source[256]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen 8080; location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } location = %s { return 200 \"ok\"; } }",
+                                 paths[i]);
+        REQUIRE_GT(len, 0);
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        CHECK(strstr(lowered.value().data, routes[i]) != nullptr);
+        CHECK(strstr(lowered.value().data, "body: b\"ok\"") != nullptr);
     }
 }
 
@@ -2029,126 +2064,472 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     REQUIRE(lexed);
 }
 
+TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_source) {
+    static constexpr char kBody[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    char path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
+    path[0] = '/';
+    for (u32 i = 1; i < nginx::kMaxExactLocalReturnPathLen; i++) path[i] = 'p';
+    char source[512]{};
+    const int len =
+        snprintf(source,
+                 sizeof(source),
+                 "server { listen 65535; location / { proxy_pass "
+                 "http://255.255.255.255:65535; } location = %s { return 200 \"%s\"; } }",
+                 path,
+                 kBody);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 5664u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+}
+
 TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
     static constexpr char kSource[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /static { return 200 \"successor-static\"; } }";
+        "location = /healthz { return 200 \"successor-static\"; } }";
     const auto parsed = nginx::parse({kSource, sizeof(kSource) - 1u});
     REQUIRE(parsed);
-    const auto expect_rejected = [&](const nginx::Server& model, Str detail) {
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span expected_span) {
         const auto result = nginx::lower_to_rut(model);
         REQUIRE_FALSE(result);
         CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
         CHECK(result.error().detail.eq(detail));
+        CHECK_EQ(result.error().span.start, expected_span.start);
+        CHECK_EQ(result.error().span.end, expected_span.end);
+        CHECK_EQ(result.error().span.line, expected_span.line);
+        CHECK_EQ(result.error().span.col, expected_span.col);
+    };
+    const auto expect_rejected_at_model_span = [&](const nginx::Server& model, Str detail) {
+        expect_rejected(model, detail, model.span);
     };
 
     auto absent_status = canonical_server();
     absent_status.exact_local_return.response.status = 200;
-    expect_rejected(absent_status, lit_str("invalid absent exact local return model"));
+    expect_rejected_at_model_span(absent_status,
+                                  lit_str("invalid absent exact local return model"));
     auto absent_path = canonical_server();
     absent_path.exact_local_return.path = lit_str("/static");
-    expect_rejected(absent_path, lit_str("invalid absent exact local return model"));
+    expect_rejected_at_model_span(absent_path, lit_str("invalid absent exact local return model"));
     auto missing_presence = parsed.value();
     missing_presence.exact_local_return.present = false;
-    expect_rejected(missing_presence, lit_str("invalid absent exact local return model"));
+    expect_rejected(missing_presence,
+                    lit_str("invalid absent exact local return model"),
+                    missing_presence.exact_local_return.span);
     auto present_only = canonical_server();
     present_only.exact_local_return.present = true;
-    expect_rejected(present_only, lit_str("invalid exact local return path model"));
+    expect_rejected_at_model_span(present_only,
+                                  lit_str("invalid bounded exact local return path model"));
 
     auto wrong_path = parsed.value();
     wrong_path.exact_local_return.path = lit_str("/other");
-    expect_rejected(wrong_path, lit_str("invalid exact local return path model"));
+    expect_rejected(wrong_path,
+                    lit_str("invalid exact local return path span"),
+                    wrong_path.exact_local_return.path_span);
     auto short_path = parsed.value();
     short_path.exact_local_return.path.len--;
-    expect_rejected(short_path, lit_str("invalid exact local return path model"));
+    expect_rejected(short_path,
+                    lit_str("invalid exact local return path span"),
+                    short_path.exact_local_return.path_span);
     auto null_path = parsed.value();
-    null_path.exact_local_return.path = {nullptr, 7};
-    expect_rejected(null_path, lit_str("invalid exact local return path model"));
+    null_path.exact_local_return.path.ptr = nullptr;
+    expect_rejected(null_path,
+                    lit_str("invalid exact local return path provenance"),
+                    null_path.exact_local_return.path_span);
     auto wrong_status = parsed.value();
     wrong_status.exact_local_return.response.status = 201;
-    expect_rejected(wrong_status, lit_str("invalid exact local return status"));
+    expect_rejected(wrong_status,
+                    lit_str("invalid exact local return status"),
+                    wrong_status.exact_local_return.response.span);
 
     auto empty_body = parsed.value();
     empty_body.exact_local_return.response.body.len = 0;
-    expect_rejected(empty_body, lit_str("invalid exact local return body"));
+    expect_rejected(empty_body,
+                    lit_str("invalid exact local return body"),
+                    empty_body.exact_local_return.response.body_span);
     auto null_body = parsed.value();
     null_body.exact_local_return.response.body.ptr = nullptr;
-    expect_rejected(null_body, lit_str("invalid exact local return body"));
+    expect_rejected(null_body,
+                    lit_str("invalid exact local return body provenance"),
+                    null_body.exact_local_return.response.body_span);
     static constexpr char kTooLong[] =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     auto long_body = parsed.value();
     long_body.exact_local_return.response.body = {kTooLong, sizeof(kTooLong) - 1u};
-    expect_rejected(long_body, lit_str("invalid exact local return body"));
+    expect_rejected(long_body,
+                    lit_str("invalid exact local return body"),
+                    long_body.exact_local_return.response.body_span);
     auto unsafe_body = parsed.value();
     unsafe_body.exact_local_return.response.body = lit_str("two words");
-    expect_rejected(unsafe_body, lit_str("invalid exact local return body"));
+    expect_rejected(unsafe_body,
+                    lit_str("invalid exact local return body span"),
+                    unsafe_body.exact_local_return.response.body_span);
 
     auto bad_location_span = parsed.value();
     bad_location_span.exact_local_return.span = {};
-    expect_rejected(bad_location_span, lit_str("invalid exact local return location spans"));
+    expect_rejected(bad_location_span,
+                    lit_str("invalid exact local return location span"),
+                    bad_location_span.span);
     auto outside_server_span = parsed.value();
     outside_server_span.exact_local_return.span.end = outside_server_span.span.end + 1u;
-    expect_rejected(outside_server_span, lit_str("invalid exact local return location spans"));
+    expect_rejected(outside_server_span,
+                    lit_str("invalid exact local return location span"),
+                    outside_server_span.exact_local_return.span);
     auto bad_path_length = parsed.value();
     bad_path_length.exact_local_return.path_span.end++;
-    expect_rejected(bad_path_length, lit_str("invalid exact local return location spans"));
+    expect_rejected(bad_path_length,
+                    lit_str("invalid exact local return path span"),
+                    bad_path_length.exact_local_return.path_span);
     auto bad_response_span = parsed.value();
     bad_response_span.exact_local_return.response.span = {};
-    expect_rejected(bad_response_span, lit_str("invalid exact local return response spans"));
+    expect_rejected(bad_response_span,
+                    lit_str("invalid exact local return response span"),
+                    bad_response_span.exact_local_return.span);
     auto bad_body_span = parsed.value();
     bad_body_span.exact_local_return.response.body_span.end++;
-    expect_rejected(bad_body_span, lit_str("invalid exact local return response spans"));
+    expect_rejected(bad_body_span,
+                    lit_str("invalid exact local return body span"),
+                    bad_body_span.exact_local_return.response.body_span);
 
     auto api_fallback = parsed.value();
     api_fallback.location = api_server().location;
     api_fallback.pre_route_trace = {};
-    expect_rejected(api_fallback, lit_str("missing pre-route TRACE model"));
+    expect_rejected(api_fallback,
+                    lit_str("invalid exact local return fallback provenance"),
+                    api_fallback.location.path_span);
 
     auto missing_trace = parsed.value();
     missing_trace.pre_route_trace = {};
-    expect_rejected(missing_trace, lit_str("missing pre-route TRACE model"));
+    expect_rejected(
+        missing_trace, lit_str("missing pre-route TRACE model"), missing_trace.location.span);
     auto missing_root_trace = canonical_server();
     missing_root_trace.pre_route_trace = {};
-    expect_rejected(missing_root_trace, lit_str("missing pre-route TRACE model"));
+    expect_rejected(missing_root_trace,
+                    lit_str("missing pre-route TRACE model"),
+                    missing_root_trace.location.span);
     auto unknown_trace_profile = parsed.value();
     unknown_trace_profile.pre_route_trace.profile =
         static_cast<nginx::ImplicitPreRouteProfile>(0xff);
-    expect_rejected(unknown_trace_profile, lit_str("invalid pre-route TRACE profile model"));
+    expect_rejected(unknown_trace_profile,
+                    lit_str("invalid pre-route TRACE profile model"),
+                    unknown_trace_profile.pre_route_trace.span);
     auto bad_trace_start = parsed.value();
     bad_trace_start.pre_route_trace.span.start++;
-    expect_rejected(bad_trace_start, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(bad_trace_start,
+                    lit_str("invalid pre-route TRACE spans"),
+                    bad_trace_start.pre_route_trace.span);
     auto bad_trace_end = parsed.value();
     bad_trace_end.pre_route_trace.span.end++;
-    expect_rejected(bad_trace_end, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(bad_trace_end,
+                    lit_str("invalid pre-route TRACE spans"),
+                    bad_trace_end.pre_route_trace.span);
     auto bad_trace_line = parsed.value();
     bad_trace_line.pre_route_trace.span.line++;
-    expect_rejected(bad_trace_line, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(bad_trace_line,
+                    lit_str("invalid pre-route TRACE spans"),
+                    bad_trace_line.pre_route_trace.span);
     auto bad_trace_col = parsed.value();
     bad_trace_col.pre_route_trace.span.col++;
-    expect_rejected(bad_trace_col, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(bad_trace_col,
+                    lit_str("invalid pre-route TRACE spans"),
+                    bad_trace_col.pre_route_trace.span);
     auto absent_trace_inventory = canonical_server();
     absent_trace_inventory.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
     absent_trace_inventory.pre_route_trace.span = canonical_server().span;
-    expect_rejected(absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
+    expect_rejected(absent_trace_inventory,
+                    lit_str("invalid absent pre-route TRACE model"),
+                    absent_trace_inventory.pre_route_trace.span);
     auto api_unknown_trace = api_server();
     api_unknown_trace.pre_route_trace.profile = static_cast<nginx::ImplicitPreRouteProfile>(0xff);
-    expect_rejected(api_unknown_trace, lit_str("invalid pre-route TRACE profile model"));
+    expect_rejected(api_unknown_trace,
+                    lit_str("invalid pre-route TRACE profile model"),
+                    api_unknown_trace.pre_route_trace.span);
     auto api_bad_trace_start = api_server();
     api_bad_trace_start.pre_route_trace.span.start++;
-    expect_rejected(api_bad_trace_start, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(api_bad_trace_start,
+                    lit_str("invalid pre-route TRACE spans"),
+                    api_bad_trace_start.pre_route_trace.span);
     auto api_bad_trace_end = api_server();
     api_bad_trace_end.pre_route_trace.span.end++;
-    expect_rejected(api_bad_trace_end, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(api_bad_trace_end,
+                    lit_str("invalid pre-route TRACE spans"),
+                    api_bad_trace_end.pre_route_trace.span);
     auto api_bad_trace_line = api_server();
     api_bad_trace_line.pre_route_trace.span.line++;
-    expect_rejected(api_bad_trace_line, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(api_bad_trace_line,
+                    lit_str("invalid pre-route TRACE spans"),
+                    api_bad_trace_line.pre_route_trace.span);
     auto api_bad_trace_col = api_server();
     api_bad_trace_col.pre_route_trace.span.col++;
-    expect_rejected(api_bad_trace_col, lit_str("invalid pre-route TRACE spans"));
+    expect_rejected(api_bad_trace_col,
+                    lit_str("invalid pre-route TRACE spans"),
+                    api_bad_trace_col.pre_route_trace.span);
     auto api_absent_trace_inventory = api_server();
     api_absent_trace_inventory.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
     api_absent_trace_inventory.pre_route_trace.span = api_server().span;
-    expect_rejected(api_absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
+    expect_rejected(api_absent_trace_inventory,
+                    lit_str("invalid absent pre-route TRACE model"),
+                    api_absent_trace_inventory.pre_route_trace.span);
+}
+
+TEST(nginx_converter, validates_exact_local_return_before_dynamic_reads_and_later_models) {
+    char source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /healthz { return 200 \"successor-static\"; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail, Span span) {
+        const auto result = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+        CHECK_EQ(result.error().span.start, span.start);
+        CHECK_EQ(result.error().span.end, span.end);
+        CHECK_EQ(result.error().span.line, span.line);
+        CHECK_EQ(result.error().span.col, span.col);
+    };
+
+    const Span path_span = parsed.value().exact_local_return.path_span;
+    const Span body_span = parsed.value().exact_local_return.response.body_span;
+    const Span location_span = parsed.value().exact_local_return.span;
+    const Span response_span = parsed.value().exact_local_return.response.span;
+    const Span fallback_path_span = parsed.value().location.path_span;
+
+    auto forged = parsed.value();
+    forged.location.path.ptr = nullptr;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return fallback provenance"),
+                    fallback_path_span);
+    for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
+        forged = parsed.value();
+        forged.location.path.ptr = reinterpret_cast<const char*>(address);
+        expect_rejected(forged,
+                        lit_str("invalid exact local return fallback provenance"),
+                        fallback_path_span);
+    }
+
+    static constexpr char kExternalFallback[] = "/";
+    forged = parsed.value();
+    forged.location.path = {kExternalFallback, sizeof(kExternalFallback) - 1u};
+    expect_rejected(forged,
+                    lit_str("invalid exact local return fallback provenance"),
+                    fallback_path_span);
+    char reconstructed_source[sizeof(source)]{};
+    memcpy(reconstructed_source, source, sizeof(source));
+    forged = parsed.value();
+    forged.location.path.ptr = reconstructed_source + fallback_path_span.start;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return fallback provenance"),
+                    fallback_path_span);
+
+    for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
+        forged = parsed.value();
+        forged.exact_local_return.path.ptr = reinterpret_cast<const char*>(address);
+        expect_rejected(forged, lit_str("invalid exact local return path provenance"), path_span);
+        forged = parsed.value();
+        forged.exact_local_return.response.body.ptr = reinterpret_cast<const char*>(address);
+        expect_rejected(forged, lit_str("invalid exact local return body provenance"), body_span);
+    }
+
+    static constexpr char kExternalPath[] = "/healthz";
+    static constexpr char kExternalBody[] = "successor-static";
+    forged = parsed.value();
+    forged.exact_local_return.path = {kExternalPath, sizeof(kExternalPath) - 1u};
+    expect_rejected(forged, lit_str("invalid exact local return path provenance"), path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body = {kExternalBody, sizeof(kExternalBody) - 1u};
+    expect_rejected(forged, lit_str("invalid exact local return body provenance"), body_span);
+    char reconstructed_path[sizeof(kExternalPath)]{};
+    char reconstructed_body[sizeof(kExternalBody)]{};
+    memcpy(reconstructed_path, kExternalPath, sizeof(kExternalPath));
+    memcpy(reconstructed_body, kExternalBody, sizeof(kExternalBody));
+    forged = parsed.value();
+    forged.exact_local_return.path = {reconstructed_path, sizeof(kExternalPath) - 1u};
+    expect_rejected(forged, lit_str("invalid exact local return path provenance"), path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body = {reconstructed_body, sizeof(kExternalBody) - 1u};
+    expect_rejected(forged, lit_str("invalid exact local return body provenance"), body_span);
+
+    forged = parsed.value();
+    forged.exact_local_return.span = {};
+    expect_rejected(forged, lit_str("invalid exact local return location span"), forged.span);
+    forged = parsed.value();
+    forged.exact_local_return.path_span = {};
+    expect_rejected(forged, lit_str("invalid exact local return path span"), location_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.span = {};
+    expect_rejected(forged, lit_str("invalid exact local return response span"), location_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body_span = {};
+    expect_rejected(forged, lit_str("invalid exact local return body span"), response_span);
+
+    forged = parsed.value();
+    forged.exact_local_return.path_span.start = forged.exact_local_return.span.start - 1u;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return path span"),
+                    forged.exact_local_return.path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.span.start = forged.exact_local_return.path_span.end;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return response span"),
+                    forged.exact_local_return.response.span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body_span.start =
+        forged.exact_local_return.response.span.start;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return body span"),
+                    forged.exact_local_return.response.body_span);
+    forged = parsed.value();
+    forged.exact_local_return.path_span.end++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return path span"),
+                    forged.exact_local_return.path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body_span.end++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return body span"),
+                    forged.exact_local_return.response.body_span);
+
+    forged = parsed.value();
+    forged.exact_local_return.span.line++;
+    forged.exact_local_return.path_span.line++;
+    forged.exact_local_return.response.span.line++;
+    forged.exact_local_return.response.body_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return source positions"),
+                    forged.exact_local_return.span);
+    forged = parsed.value();
+    forged.exact_local_return.path_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return path source position"),
+                    forged.exact_local_return.path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.span.line++;
+    forged.exact_local_return.response.body_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return response source position"),
+                    forged.exact_local_return.response.span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body_span.line++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return body source position"),
+                    forged.exact_local_return.response.body_span);
+    forged = parsed.value();
+    forged.exact_local_return.path_span.col++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return path span"),
+                    forged.exact_local_return.path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.body_span.col++;
+    expect_rejected(forged,
+                    lit_str("invalid exact local return body span"),
+                    forged.exact_local_return.response.body_span);
+
+    char* path = source + path_span.start;
+    const char saved_path_byte = path[0];
+    path[0] = 'x';
+    expect_rejected(
+        parsed.value(), lit_str("invalid bounded exact local return path model"), path_span);
+    path[0] = saved_path_byte;
+
+    static constexpr char kControlPath[] = {'/', 'a', '\x01', 'b', '\0'};
+    static constexpr char kNonAsciiPath[] = {
+        '/', 'a', static_cast<char>(0x80), 'b', '\0'};
+    struct ForgedPathCase {
+        const char* clean;
+        const char* invalid;
+        u32 len;
+    };
+    const ForgedPathCase forged_path_cases[] = {
+        {"/xab", "//ab", 4},
+        {"/a/ab", "/a//b", 5},
+        {"/a/x/b", "/a/./b", 6},
+        {"/a/xx/b", "/a/../b", 7},
+        {"/a-b", "/a%b", 4},
+        {"/a-b", "/a?b", 4},
+        {"/a-b", "/a b", 4},
+        {"/a-b", kControlPath, sizeof(kControlPath) - 1u},
+        {"/a-b", kNonAsciiPath, sizeof(kNonAsciiPath) - 1u},
+        {"/a/b", "/a//", 4},
+    };
+    for (const auto& path_case : forged_path_cases) {
+        char forged_source[512]{};
+        const int forged_source_len =
+            snprintf(forged_source,
+                     sizeof(forged_source),
+                     "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                     "location = %s { return 200 \"successor-static\"; } }",
+                     path_case.clean);
+        REQUIRE_GT(forged_source_len, 0);
+        const auto clean_parsed =
+            nginx::parse({forged_source, static_cast<u32>(forged_source_len)});
+        REQUIRE(clean_parsed);
+        REQUIRE_EQ(clean_parsed.value().exact_local_return.path.len, path_case.len);
+        const Span forged_path_span = clean_parsed.value().exact_local_return.path_span;
+        memcpy(forged_source + forged_path_span.start, path_case.invalid, path_case.len);
+        expect_rejected(clean_parsed.value(),
+                        lit_str("invalid bounded exact local return path model"),
+                        forged_path_span);
+    }
+
+    char* body = source + body_span.start;
+    const char saved_body_byte = body[0];
+    body[0] = '$';
+    expect_rejected(parsed.value(), lit_str("invalid exact local return body"), body_span);
+    body[0] = saved_body_byte;
+
+    char old_source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /oldx { return 200 \"successor-static\"; } }";
+    const auto old_parsed = nginx::parse({old_source, sizeof(old_source) - 1u});
+    REQUIRE(old_parsed);
+    auto old_model = old_parsed.value();
+    old_model.exact_local_return.path.len--;
+    old_model.exact_local_return.path_span.end--;
+    expect_rejected(old_model,
+                    lit_str("invalid bounded exact local return path model"),
+                    old_model.exact_local_return.path_span);
+
+    char maximum_path[nginx::kMaxExactLocalReturnPathLen + 1u]{};
+    maximum_path[0] = '/';
+    for (u32 i = 1; i < nginx::kMaxExactLocalReturnPathLen; i++) maximum_path[i] = 'a';
+    char maximum_source[512]{};
+    const int maximum_source_len =
+        snprintf(maximum_source,
+                 sizeof(maximum_source),
+                 "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                 "location = %s { return 200 \"successor-static\"; } }",
+                 maximum_path);
+    REQUIRE_GT(maximum_source_len, 0);
+    const auto maximum_parsed =
+        nginx::parse({maximum_source, static_cast<u32>(maximum_source_len)});
+    REQUIRE(maximum_parsed);
+    auto oversized = maximum_parsed.value();
+    oversized.exact_local_return.path.len++;
+    oversized.exact_local_return.path_span.end++;
+    expect_rejected(oversized,
+                    lit_str("invalid bounded exact local return path model"),
+                    oversized.exact_local_return.path_span);
+
+    forged = parsed.value();
+    forged.exact_local_return.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
+    forged.location.proxy_read_timeout.present = true;
+    forged.location.proxy_read_timeout.milliseconds = 1;
+    forged.listen.port = 0;
+    forged.location.proxy_pass.port = 0;
+    expect_rejected(forged, lit_str("invalid exact local return path provenance"), path_span);
+    forged = parsed.value();
+    forged.exact_local_return.response.status = 201;
+    forged.location.proxy_read_timeout.present = true;
+    forged.listen.port = 0;
+    forged.location.proxy_pass.port = 0;
+    expect_rejected(forged, lit_str("invalid exact local return status"), response_span);
 }
 
 TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_rut) {
@@ -2847,6 +3228,40 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_LT(result.value().len, nginx::RutSource::kCapacity);
     CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
+
+    // The complete /healthz source is a fixed root-program golden plus this
+    // independently fixed exact binding. Both declaration orders must match
+    // every byte, not merely the exact-route suffix.
+    static constexpr char kHealthzExactGolden[] =
+        "route exact \"/healthz\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "}) }\n";
+    nginx::RutSource healthz_golden{};
+    memcpy(healthz_golden.data, kExpected, sizeof(kExpected) - 1u);
+    memcpy(healthz_golden.data + sizeof(kExpected) - 1u,
+           kHealthzExactGolden,
+           sizeof(kHealthzExactGolden) - 1u);
+    healthz_golden.len = static_cast<u32>(sizeof(kExpected) + sizeof(kHealthzExactGolden) - 2u);
+    const char healthz_root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /healthz { return 200 \"successor-static\"; } }";
+    const char healthz_exact_first[] =
+        "server { listen 8080; location = /healthz { return 200 \"successor-static\"; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const auto healthz_root_model =
+        nginx::parse({healthz_root_first, sizeof(healthz_root_first) - 1u});
+    const auto healthz_exact_model =
+        nginx::parse({healthz_exact_first, sizeof(healthz_exact_first) - 1u});
+    REQUIRE(healthz_root_model);
+    REQUIRE(healthz_exact_model);
+    const auto healthz_root = nginx::lower_to_rut(healthz_root_model.value());
+    const auto healthz_exact = nginx::lower_to_rut(healthz_exact_model.value());
+    REQUIRE(healthz_root);
+    REQUIRE(healthz_exact);
+    CHECK(healthz_root.value().view().eq(healthz_golden.view()));
+    CHECK(healthz_exact.value().view().eq(healthz_golden.view()));
 }
 
 TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
@@ -3271,7 +3686,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     auto populated = std::make_unique<RouteConfig>();
     {
         char nginx_source[] =
-            "server { listen 8080; location = /static { return 200 \"successor-static\"; } "
+            "server { listen 8080; location = /healthz { return 200 \"successor-static\"; } "
             "location / { proxy_pass http://127.0.0.1:9000; } }";
         auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
         REQUIRE(parsed);
@@ -3297,7 +3712,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
         CHECK_EQ(ast_binding.method, kRouteMethodAny);
         CHECK_EQ(ast_binding.policy_id, 5u);
-        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/static"))));
+        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/healthz"))));
         const auto& ast_policy = ast_owned->strict_local_response_policies[4];
         CHECK(ast_policy.version == StrictLocalResponseVersion::Http11);
         CHECK_EQ(ast_policy.status_code, 200u);
@@ -3340,7 +3755,7 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
         CHECK_EQ(rir_binding.method, kRouteMethodAny);
         CHECK_EQ(rir_binding.policy_id, 5u);
-        CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/static"))));
+        CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/healthz"))));
         for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
             CHECK(exact_strict_local_response_binding_is_neutral(
                 rir.module.exact_strict_local_response_bindings[i]));
@@ -3383,12 +3798,13 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
     REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
     CHECK((Str{populated->exact_strict_local_response_bindings[0].path,
                populated->exact_strict_local_response_bindings[0].path_len}
-               .eq(lit_str("/static"))));
+               .eq(lit_str("/healthz"))));
     const u16 exact_id =
-        populated->match_exact_strict_local_response(lit_str("/static?x=1"), kRouteMethodGet);
+        populated->match_exact_strict_local_response(lit_str("/healthz?x=1"), kRouteMethodGet);
     REQUIRE_EQ(exact_id, 4u);
-    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static/"), kRouteMethodGet),
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/healthz/"), kRouteMethodGet),
              0u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/health"), kRouteMethodGet), 0u);
     REQUIRE(populated->strict_local_response_policy_id_is_owned(exact_id));
     const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
     CHECK(owned_policy.body.eq(lit_str("successor-static")));
