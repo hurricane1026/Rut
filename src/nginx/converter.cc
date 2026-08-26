@@ -70,6 +70,23 @@ Span exact_local_return_span(const Server& server) {
     return server.span;
 }
 
+bool has_exact_no_content_return_inventory(const ExactNoContentReturnLocation& location) {
+    const NoContentReturn& response = location.response;
+    return location.present || location.path.ptr != nullptr || location.path.len != 0 ||
+           !is_default_span(location.path_span) || !is_default_span(location.span) ||
+           response.status != 0 || !is_default_span(response.status_span) ||
+           !is_default_span(response.span);
+}
+
+Span exact_no_content_return_span(const Server& server) {
+    const auto& location = server.exact_no_content_return;
+    if (is_valid_span(location.response.span)) return location.response.span;
+    if (is_valid_span(location.span)) return location.span;
+    if (is_valid_span(location.path_span)) return location.path_span;
+    if (is_valid_span(location.response.status_span)) return location.response.status_span;
+    return server.span;
+}
+
 bool has_exact_absolute_redirect_inventory(const ExactAbsoluteRedirectLocation& location) {
     const AbsoluteRedirect& response = location.response;
     return location.present || location.path.ptr != nullptr || location.path.len != 0 ||
@@ -921,6 +938,13 @@ bool put_exact_local_return(Writer& writer, Str path, Str body) {
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
+    // Stage 2 deliberately recognizes and models this nginx action without
+    // emitting the observably different ordinary `return 204`.  This complete
+    // scalar/span inventory fence must precede every validator that could read
+    // a borrowed path or response byte.
+    if (has_exact_no_content_return_inventory(server.exact_no_content_return))
+        return unsupported(exact_no_content_return_span(server),
+                           lit_str("exact no-content return lowering is not implemented"));
     auto exact_absolute_redirect = validate_exact_absolute_redirect(server);
     if (!exact_absolute_redirect) return core::make_unexpected(exact_absolute_redirect.error());
     auto exact_local_return = validate_exact_local_return(server);

@@ -96,6 +96,26 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().exact_local_return.path.ptr, nullptr);
     CHECK_EQ(result.value().exact_local_return.path.len, 0u);
     CHECK_EQ(result.value().exact_local_return.response.status, 0u);
+    CHECK_FALSE(result.value().exact_no_content_return.present);
+    CHECK_EQ(result.value().exact_no_content_return.path.ptr, nullptr);
+    CHECK_EQ(result.value().exact_no_content_return.path.len, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.response.status, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.path_span.start, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.path_span.end, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.path_span.line, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.path_span.col, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.span.start, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.span.end, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.span.line, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.span.col, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.response.status_span.start, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.response.status_span.end, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.response.status_span.line, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.response.status_span.col, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.response.span.start, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.response.span.end, 0u);
+    CHECK_EQ(result.value().exact_no_content_return.response.span.line, 1u);
+    CHECK_EQ(result.value().exact_no_content_return.response.span.col, 1u);
     CHECK_FALSE(result.value().exact_absolute_redirect.present);
     CHECK_EQ(result.value().exact_absolute_redirect.path.ptr, nullptr);
     CHECK_EQ(result.value().exact_absolute_redirect.path.len, 0u);
@@ -123,7 +143,6 @@ TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
         "  location = /static { return 200 \"successor-static\"; }\n"
         "  location / { proxy_pass http://127.0.0.1:9000; }\n"
         "}\n";
-
     auto check = [&](const char* source, u32 len, u32 root_line, u32 exact_line) {
         const auto result = nginx::parse({source, len});
         REQUIRE(result);
@@ -142,6 +161,10 @@ TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
         CHECK_EQ(server.exact_local_return.response.body_span.end -
                      server.exact_local_return.response.body_span.start,
                  server.exact_local_return.response.body.len);
+        CHECK_FALSE(server.exact_no_content_return.present);
+        CHECK_EQ(server.exact_no_content_return.path.ptr, nullptr);
+        CHECK_EQ(server.exact_no_content_return.path.len, 0u);
+        CHECK_EQ(server.exact_no_content_return.response.status, 0u);
         REQUIRE(server.pre_route_trace.profile ==
                 nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
         CHECK_EQ(server.pre_route_trace.span.start, server.span.start);
@@ -151,6 +174,155 @@ TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
     };
     check(root_first, sizeof(root_first) - 1u, 3, 4);
     check(exact_first, sizeof(exact_first) - 1u, 4, 3);
+}
+
+TEST(nginx_parser, models_exact_no_content_return_in_either_order_with_source_provenance) {
+    const char root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static { return 204; }\n"
+        "}\n";
+    const char exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /static { return 204; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+    const char root_first_multiline[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static {\n"
+        "    return\n"
+        "      204 # separated status comment\n"
+        "      ;\n"
+        "  }\n"
+        "}\n";
+    const char exact_first_multiline[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /static {\n"
+        "    return # separated directive comment\n"
+        "      204\n"
+        "      # separated terminator comment\n"
+        "      ;\n"
+        "  }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+
+    const auto check = [&](const char* source, u32 len, u32 root_line, u32 exact_line) {
+        const auto parsed = nginx::parse({source, len});
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        const auto& location = server.exact_no_content_return;
+        const auto& response = location.response;
+        const char* server_start = strstr(source, "server {");
+        const char* server_end = strrchr(source, '}');
+        const char* root_start = strstr(source, "location / {");
+        const char* root_end = strchr(root_start, '}');
+        const char* root_path = strchr(root_start, '/');
+        const char* exact_start = strstr(source, "location = /static");
+        const char* exact_end = strchr(exact_start, '}');
+        const char* exact_path = strstr(exact_start, "/static");
+        const char* return_start = strstr(exact_start, "return");
+        const char* status = strstr(return_start, "204");
+        const char* return_end = strchr(status, ';');
+        REQUIRE(server_start != nullptr);
+        REQUIRE(server_end != nullptr);
+        REQUIRE(root_start != nullptr);
+        REQUIRE(root_end != nullptr);
+        REQUIRE(root_path != nullptr);
+        REQUIRE(exact_start != nullptr);
+        REQUIRE(exact_end != nullptr);
+        REQUIRE(exact_path != nullptr);
+        REQUIRE(return_start != nullptr);
+        REQUIRE(return_end != nullptr);
+        REQUIRE(status != nullptr);
+        const auto offset = [&](const char* ptr) { return static_cast<u32>(ptr - source); };
+        const auto column = [&](const char* ptr) {
+            const char* line_start = ptr;
+            while (line_start != source && line_start[-1] != '\n') --line_start;
+            return static_cast<u32>(ptr - line_start + 1);
+        };
+        const auto line = [&](const char* ptr) {
+            u32 result = 1;
+            for (const char* it = source; it != ptr; ++it) {
+                if (*it == '\n') ++result;
+            }
+            return result;
+        };
+        const auto check_default_span = [&](Span span) {
+            CHECK_EQ(span.start, 0u);
+            CHECK_EQ(span.end, 0u);
+            CHECK_EQ(span.line, 1u);
+            CHECK_EQ(span.col, 1u);
+        };
+
+        CHECK_EQ(server.span.start, offset(server_start));
+        CHECK_EQ(server.span.end, offset(server_end + 1));
+        CHECK_EQ(server.span.line, line(server_start));
+        CHECK_EQ(server.span.col, column(server_start));
+        CHECK_EQ(server.location.path.ptr, root_path);
+        CHECK_EQ(server.location.path_span.start, offset(root_path));
+        CHECK_EQ(server.location.path_span.end, offset(root_path + 1));
+        CHECK_EQ(server.location.path_span.line, root_line);
+        CHECK_EQ(server.location.path_span.col, column(root_path));
+        CHECK_EQ(server.location.span.start, offset(root_start));
+        CHECK_EQ(server.location.span.end, offset(root_end + 1));
+        CHECK_EQ(server.location.span.line, root_line);
+        CHECK_EQ(server.location.span.col, column(root_start));
+
+        REQUIRE(location.present);
+        CHECK(location.path.eq(lit_str("/static")));
+        CHECK_EQ(location.path.ptr, exact_path);
+        CHECK_EQ(location.path_span.start, offset(exact_path));
+        CHECK_EQ(location.path_span.end, offset(exact_path + 7));
+        CHECK_EQ(location.path_span.line, exact_line);
+        CHECK_EQ(location.path_span.col, column(exact_path));
+        CHECK_EQ(location.span.start, offset(exact_start));
+        CHECK_EQ(location.span.end, offset(exact_end + 1));
+        CHECK_EQ(location.span.line, exact_line);
+        CHECK_EQ(location.span.col, column(exact_start));
+        CHECK_EQ(response.status, 204u);
+        CHECK_EQ(response.status_span.start, offset(status));
+        CHECK_EQ(response.status_span.end, offset(status + 3));
+        CHECK_EQ(response.status_span.line, line(status));
+        CHECK_EQ(response.status_span.col, column(status));
+        CHECK_EQ(response.span.start, offset(return_start));
+        CHECK_EQ(response.span.end, offset(return_end + 1));
+        CHECK_EQ(response.span.line, line(return_start));
+        CHECK_EQ(response.span.col, column(return_start));
+        CHECK_EQ(memcmp(source + response.status_span.start, "204", 3), 0);
+        CHECK_LE(server.span.start, location.span.start);
+        CHECK_LE(location.span.end, server.span.end);
+        CHECK_LE(location.span.start, location.path_span.start);
+        CHECK_LE(location.path_span.end, location.span.end);
+        CHECK_LE(location.span.start, response.span.start);
+        CHECK_LE(response.span.end, location.span.end);
+        CHECK_LE(response.span.start, response.status_span.start);
+        CHECK_LE(response.status_span.end, response.span.end);
+
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(source);
+        CHECK_EQ(
+            reinterpret_cast<uintptr_t>(server.location.path.ptr) - server.location.path_span.start,
+            source_base);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(location.path.ptr) - location.path_span.start,
+                 source_base);
+
+        CHECK_FALSE(server.exact_local_return.present);
+        CHECK_EQ(server.exact_local_return.path.ptr, nullptr);
+        CHECK_EQ(server.exact_local_return.response.status, 0u);
+        check_default_span(server.exact_local_return.span);
+        CHECK_FALSE(server.exact_absolute_redirect.present);
+        CHECK_EQ(server.exact_absolute_redirect.path.ptr, nullptr);
+        CHECK_EQ(server.exact_absolute_redirect.response.status, 0u);
+        check_default_span(server.exact_absolute_redirect.span);
+    };
+    check(root_first, sizeof(root_first) - 1u, 3u, 4u);
+    check(exact_first, sizeof(exact_first) - 1u, 4u, 3u);
+    check(root_first_multiline, sizeof(root_first_multiline) - 1u, 3u, 4u);
+    check(exact_first_multiline, sizeof(exact_first_multiline) - 1u, 9u, 3u);
 }
 
 TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
@@ -2055,6 +2227,196 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
         lit_str("return body must match the bounded 1..64-byte safe quoted ASCII grammar")));
 }
 
+TEST(nginx_parser, rejects_unbounded_or_malformed_exact_no_content_return_shapes) {
+    struct Vector {
+        const char* source;
+        const char* marker;
+        u32 marker_len;
+        FrontendError code;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204 \"body\"; } }",
+         "\"body\"",
+         6,
+         FrontendError::UnsupportedSyntax,
+         lit_str("return 204 body or target is unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204 \"\"; } }",
+         "\"\"",
+         2,
+         FrontendError::UnsupportedSyntax,
+         lit_str("return 204 body or target is unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204 $x; } }",
+         "$x",
+         2,
+         FrontendError::UnsupportedSyntax,
+         lit_str("variables are unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204 target; } }",
+         "target",
+         6,
+         FrontendError::UnsupportedSyntax,
+         lit_str("return 204 body or target is unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204 extra; } }",
+         "extra",
+         5,
+         FrontendError::UnsupportedSyntax,
+         lit_str("return 204 body or target is unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204; extra; } }",
+         "extra",
+         5,
+         FrontendError::UnsupportedSyntax,
+         lit_str("unknown exact location directive")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204; return 204; } }",
+         "return 204; }",
+         6,
+         FrontendError::UnsupportedSyntax,
+         lit_str("duplicate return directive")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 205; } }",
+         "205",
+         3,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 201; } }",
+         "201",
+         3,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 0204; } }",
+         "0204",
+         4,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204x; } }",
+         "204x",
+         4,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return +204; } }",
+         "+204",
+         4,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return $status; } }",
+         "$status",
+         7,
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 204#adjacent\n; } }",
+         "204",
+         3,
+         FrontendError::UnsupportedSyntax,
+         lit_str("return 204 status adjacent comment is unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/healthz { return 204; } }",
+         "/healthz",
+         8,
+         FrontendError::UnsupportedSyntax,
+         lit_str("exact no-content return requires literal /static path")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/$static { return 204; } }",
+         "/$static",
+         8,
+         FrontendError::UnsupportedSyntax,
+         lit_str("variables are unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { location /nested { return 204; } } }",
+         "location /nested",
+         8,
+         FrontendError::UnsupportedSyntax,
+         lit_str("nested locations are unsupported")},
+    };
+
+    for (const auto& vector : vectors) {
+        const u32 len = static_cast<u32>(strlen(vector.source));
+        const auto parsed = nginx::parse({vector.source, len});
+        REQUIRE_FALSE(parsed);
+        const char* marker = strstr(vector.source, vector.marker);
+        REQUIRE(marker != nullptr);
+        CHECK_EQ(parsed.error().code, vector.code);
+        CHECK(parsed.error().detail.eq(vector.detail));
+        CHECK_EQ(parsed.error().span.start, static_cast<u32>(marker - vector.source));
+        CHECK_EQ(parsed.error().span.end,
+                 static_cast<u32>(marker - vector.source) + vector.marker_len);
+        CHECK_EQ(parsed.error().span.line, 1u);
+        CHECK_EQ(parsed.error().span.col, static_cast<u32>(marker - vector.source) + 1u);
+    }
+
+    const char missing_semicolon[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+        "/static { return 204 } }";
+    const auto missing_semicolon_result =
+        nginx::parse({missing_semicolon, sizeof(missing_semicolon) - 1u});
+    REQUIRE_FALSE(missing_semicolon_result);
+    const char* return_start = strstr(missing_semicolon, "return 204");
+    REQUIRE(return_start != nullptr);
+    const char* exact_close = strchr(return_start, '}');
+    REQUIRE(exact_close != nullptr);
+    CHECK_EQ(missing_semicolon_result.error().code, FrontendError::UnexpectedToken);
+    CHECK(missing_semicolon_result.error().detail.eq(lit_str("expected ';' after return 204")));
+    CHECK_EQ(missing_semicolon_result.error().span.start,
+             static_cast<u32>(exact_close - missing_semicolon));
+    CHECK_EQ(missing_semicolon_result.error().span.end,
+             static_cast<u32>(exact_close - missing_semicolon + 1));
+
+    const char eof_after_status[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+        "/static { return 204";
+    const auto eof_result = nginx::parse({eof_after_status, sizeof(eof_after_status) - 1u});
+    REQUIRE_FALSE(eof_result);
+    CHECK_EQ(eof_result.error().code, FrontendError::UnexpectedEof);
+    CHECK(eof_result.error().detail.eq(lit_str("expected ';' after return 204")));
+    CHECK_EQ(eof_result.error().span.start, sizeof(eof_after_status) - 1u);
+    CHECK_EQ(eof_result.error().span.end, sizeof(eof_after_status) - 1u);
+
+    const char missing_return[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+        "/static { } }";
+    const auto missing_return_result = nginx::parse({missing_return, sizeof(missing_return) - 1u});
+    REQUIRE_FALSE(missing_return_result);
+    CHECK_EQ(missing_return_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(missing_return_result.error().detail.eq(
+        lit_str("missing return directive in exact location")));
+
+    const char status_200_without_body[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+        "/static { return 200; } }";
+    const auto status_200_result =
+        nginx::parse({status_200_without_body, sizeof(status_200_without_body) - 1u});
+    REQUIRE_FALSE(status_200_result);
+    CHECK_EQ(status_200_result.error().code, FrontendError::UnexpectedToken);
+    CHECK(status_200_result.error().detail.eq(lit_str("return requires a literal body")));
+
+    const char no_fallback[] = "server { listen 8080; location = /static { return 204; } }";
+    const auto no_fallback_result = nginx::parse({no_fallback, sizeof(no_fallback) - 1u});
+    REQUIRE_FALSE(no_fallback_result);
+    CHECK_EQ(no_fallback_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(no_fallback_result.error().detail.eq(
+        lit_str("exact location requires a root proxy fallback")));
+
+    const char unsupported_modifier[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location ^~ "
+        "/static { return 204; } }";
+    const auto modifier_result =
+        nginx::parse({unsupported_modifier, sizeof(unsupported_modifier) - 1u});
+    REQUIRE_FALSE(modifier_result);
+    CHECK_EQ(modifier_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(modifier_result.error().detail.eq(lit_str("location modifiers are unsupported")));
+}
+
 TEST(nginx_parser, rejects_broader_exact_absolute_redirect_shapes) {
     struct Vector {
         const char* exact;
@@ -2451,6 +2813,143 @@ static nginx::Server api_server() {
     server.location.proxy_pass.uri = {kProxyUri, 1};
     server.location.proxy_pass.uri_span = Span{53, 54, 1, 54};
     return server;
+}
+
+TEST(nginx_converter, keeps_exact_no_content_return_lowering_closed_before_dynamic_reads) {
+    static constexpr char kRootFirst[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    static constexpr char kExactFirst[] =
+        "server { listen 8080; location = /static { return 204; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kLocalSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 200 \"successor-static\"; } }";
+    static constexpr char kRedirectSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 301 http://redirect.example/new; } }";
+    const auto root_first = nginx::parse({kRootFirst, sizeof(kRootFirst) - 1u});
+    const auto exact_first = nginx::parse({kExactFirst, sizeof(kExactFirst) - 1u});
+    const auto local = nginx::parse({kLocalSource, sizeof(kLocalSource) - 1u});
+    const auto redirect = nginx::parse({kRedirectSource, sizeof(kRedirectSource) - 1u});
+    REQUIRE(root_first);
+    REQUIRE(exact_first);
+    REQUIRE(local);
+    REQUIRE(redirect);
+
+    const auto expect_closed = [&](const nginx::Server& model, Span expected_span) {
+        const auto lowered = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(
+            lit_str("exact no-content return lowering is not implemented")));
+        CHECK_EQ(lowered.error().span.start, expected_span.start);
+        CHECK_EQ(lowered.error().span.end, expected_span.end);
+        CHECK_EQ(lowered.error().span.line, expected_span.line);
+        CHECK_EQ(lowered.error().span.col, expected_span.col);
+    };
+
+    for (const nginx::Server* model : {&root_first.value(), &exact_first.value()}) {
+        const Span action_span = model->exact_no_content_return.response.span;
+        expect_closed(*model, action_span);
+
+        auto forged = *model;
+        forged.exact_no_content_return.present = false;
+        expect_closed(forged, action_span);
+
+        for (const uintptr_t address : {uintptr_t{1}, UINTPTR_MAX}) {
+            forged = *model;
+            forged.exact_no_content_return.path.ptr = reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+
+            // Each later/legacy model is forged independently. The no-content
+            // inventory fence must win before any one of these pointers could
+            // be inspected by its normal validator.
+            forged = *model;
+            forged.location.path.ptr = reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+
+            forged = *model;
+            forged.exact_local_return.path.ptr = reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+
+            forged = *model;
+            forged.exact_local_return.response.body.ptr = reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+
+            forged = *model;
+            forged.exact_absolute_redirect.response.status_lexeme.ptr =
+                reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+
+            forged = *model;
+            forged.exact_absolute_redirect.response.target.ptr =
+                reinterpret_cast<const char*>(address);
+            expect_closed(forged, action_span);
+        }
+
+        forged = *model;
+        forged.pre_route_trace.profile = static_cast<nginx::ImplicitPreRouteProfile>(0xff);
+        expect_closed(forged, action_span);
+
+        forged = *model;
+        forged.location.proxy_read_timeout.present = true;
+        forged.location.proxy_read_timeout.milliseconds = 1;
+        expect_closed(forged, action_span);
+
+        forged = *model;
+        forged.listen.port = 0;
+        expect_closed(forged, action_span);
+
+        forged = *model;
+        forged.exact_no_content_return.path_span = {};
+        forged.exact_no_content_return.response.status_span = {};
+        expect_closed(forged, action_span);
+
+        forged = *model;
+        forged.exact_no_content_return.span = {};
+        forged.exact_no_content_return.response.span = {};
+        expect_closed(forged, forged.exact_no_content_return.path_span);
+
+        forged = *model;
+        forged.exact_local_return = local.value().exact_local_return;
+        expect_closed(forged, action_span);
+
+        forged = *model;
+        forged.exact_absolute_redirect = redirect.value().exact_absolute_redirect;
+        expect_closed(forged, action_span);
+    }
+
+    // A completely absent/default action has no inventory and leaves every
+    // pre-existing canonical conversion behavior unchanged.
+    const auto default_lowered = nginx::lower_to_rut(canonical_server());
+    REQUIRE(default_lowered);
+
+    auto present_only = canonical_server();
+    present_only.exact_no_content_return.present = true;
+    expect_closed(present_only, present_only.span);
+
+    auto dirty = canonical_server();
+    dirty.exact_no_content_return.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
+    expect_closed(dirty, dirty.span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.path.len = 7;
+    expect_closed(dirty, dirty.span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.path_span = Span{4, 11, 1, 5};
+    expect_closed(dirty, dirty.exact_no_content_return.path_span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.span = Span{4, 20, 1, 5};
+    expect_closed(dirty, dirty.exact_no_content_return.span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.response.status = 204;
+    expect_closed(dirty, dirty.span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.response.status_span = Span{12, 15, 1, 13};
+    expect_closed(dirty, dirty.exact_no_content_return.response.status_span);
+    dirty = canonical_server();
+    dirty.exact_no_content_return.response.span = Span{5, 16, 1, 6};
+    expect_closed(dirty, dirty.exact_no_content_return.response.span);
 }
 
 TEST(nginx_converter, lowers_parsed_bounded_exact_local_path_in_either_order) {

@@ -219,7 +219,14 @@ struct ParsedLocation {
     bool exact = false;
     Location proxy{};
     ExactLocalReturnLocation local{};
+    ExactNoContentReturnLocation no_content{};
     ExactAbsoluteRedirectLocation redirect{};
+};
+
+struct ParsedLocalReturn {
+    bool no_content = false;
+    LocalReturn local{};
+    NoContentReturn no_content_response{};
 };
 
 class Parser {
@@ -266,6 +273,8 @@ public:
                         return unsupported(location_span, lit_str("duplicate exact location"));
                     if (parsed.value().local.present)
                         result.exact_local_return = parsed.value().local;
+                    else if (parsed.value().no_content.present)
+                        result.exact_no_content_return = parsed.value().no_content;
                     else
                         result.exact_absolute_redirect = parsed.value().redirect;
                     have_exact_location = true;
@@ -290,9 +299,10 @@ public:
         if (!have_listen) return unsupported(result.span, lit_str("missing listen"));
         if (!have_proxy_location) {
             if (have_exact_location) {
-                const Span exact_span = result.exact_local_return.present
-                                            ? result.exact_local_return.span
-                                            : result.exact_absolute_redirect.span;
+                const Span exact_span =
+                    result.exact_local_return.present        ? result.exact_local_return.span
+                    : result.exact_no_content_return.present ? result.exact_no_content_return.span
+                                                             : result.exact_absolute_redirect.span;
                 return unsupported(exact_span,
                                    lit_str("exact location requires a root proxy fallback"));
             }
@@ -455,12 +465,9 @@ private:
         ParsedLocation parsed{};
         parsed.exact = true;
         ExactLocalReturnLocation& local = parsed.local;
+        ExactNoContentReturnLocation& no_content = parsed.no_content;
         ExactAbsoluteRedirectLocation& redirect = parsed.redirect;
-        if (is_local_return) {
-            local.present = true;
-            local.path = path.text;
-            local.path_span = path.span;
-        } else {
+        if (!is_local_return) {
             redirect.present = true;
             redirect.path = path.text;
             redirect.path_span = path.span;
@@ -475,7 +482,21 @@ private:
                 if (is_local_return) {
                     auto response = parse_local_return();
                     if (!response) return core::make_unexpected(response.error());
-                    local.response = response.value();
+                    if (response.value().no_content) {
+                        if (!eq(path.text, "/static", 7))
+                            return unsupported(
+                                path.span,
+                                lit_str("exact no-content return requires literal /static path"));
+                        no_content.present = true;
+                        no_content.path = path.text;
+                        no_content.path_span = path.span;
+                        no_content.response = response.value().no_content_response;
+                    } else {
+                        local.present = true;
+                        local.path = path.text;
+                        local.path_span = path.span;
+                        local.response = response.value().local;
+                    }
                 } else {
                     auto response = parse_absolute_redirect();
                     if (!response) return core::make_unexpected(response.error());
@@ -497,8 +518,10 @@ private:
         advance();
         if (!have_return)
             return unsupported(end, lit_str("missing return directive in exact location"));
-        if (is_local_return)
+        if (local.present)
             local.span = Span{start.start, end.end, start.line, start.col};
+        else if (no_content.present)
+            no_content.span = Span{start.start, end.end, start.line, start.col};
         else
             redirect.span = Span{start.start, end.end, start.line, start.col};
         return parsed;
@@ -561,7 +584,7 @@ private:
             Span{start.start, end.end, start.line, start.col}};
     }
 
-    FrontendResult<LocalReturn> parse_local_return() {
+    FrontendResult<ParsedLocalReturn> parse_local_return() {
         const Span start = cur_.span;
         advance();
         if (cur_.kind == TokenKind::End)
@@ -569,6 +592,30 @@ private:
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("return requires status and body"));
         const Token status = cur_;
+        if (eq(status.text, "204", 3)) {
+            if (status.span.end < source_.len && source_.ptr[status.span.end] == '#')
+                return unsupported(status.span,
+                                   lit_str("return 204 status adjacent comment is unsupported"));
+            advance();
+            if (cur_.kind == TokenKind::End)
+                return missing(cur_.span, lit_str("expected ';' after return 204"));
+            if (cur_.kind != TokenKind::Semicolon) {
+                if (cur_.kind == TokenKind::Word) {
+                    if (contains(cur_.text, '$'))
+                        return unsupported(cur_.span, lit_str("variables are unsupported"));
+                    return unsupported(cur_.span,
+                                       lit_str("return 204 body or target is unsupported"));
+                }
+                return invalid(cur_.span, lit_str("expected ';' after return 204"));
+            }
+            const Span end = cur_.span;
+            advance();
+            ParsedLocalReturn result{};
+            result.no_content = true;
+            result.no_content_response = NoContentReturn{
+                204, status.span, Span{start.start, end.end, start.line, start.col}};
+            return result;
+        }
         if (!eq(status.text, "200", 3))
             return unsupported(status.span, lit_str("only return status 200 is supported"));
         cur_ = lexer_.next_local_return_body();
@@ -591,11 +638,13 @@ private:
         }
         const Span end = cur_.span;
         advance();
-        return LocalReturn{
+        ParsedLocalReturn result{};
+        result.local = LocalReturn{
             200,
             body.text.slice(1, body.text.len - 1),
             Span{body.span.start + 1, body.span.end - 1, body.span.line, body.span.col + 1},
             Span{start.start, end.end, start.line, start.col}};
+        return result;
     }
 
     static bool local_return_body_valid(Str text) {

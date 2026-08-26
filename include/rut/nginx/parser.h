@@ -78,6 +78,25 @@ struct ExactLocalReturnLocation {
     LocalReturn response{};
 };
 
+// A distinct bounded nginx semantic action for literal `return 204;`.  It is
+// intentionally not represented as an empty-body LocalReturn: ordinary RUT
+// status-only responses have different observable framing.  The accepted
+// nginx slice is exactly `location = /static`, and lowering remains closed
+// until the complete strict no-content policy can be emitted.
+struct NoContentReturn {
+    u16 status = 0;
+    Span status_span{};
+    Span span{};
+};
+
+struct ExactNoContentReturnLocation {
+    bool present = false;
+    Str path{};
+    Span path_span{};
+    Span span{};
+    NoContentReturn response{};
+};
+
 // A distinct semantic action for the bounded literal 301/302 absolute redirect
 // slice.
 // The status lexeme, complete target, and its authority/path decomposition
@@ -128,6 +147,7 @@ struct Server {
     // order. At most one exact selector/action is populated by the parser.
     Location location{};
     ExactLocalReturnLocation exact_local_return{};
+    ExactNoContentReturnLocation exact_no_content_return{};
     ExactAbsoluteRedirectLocation exact_absolute_redirect{};
     ImplicitPreRouteTrace pre_route_trace{};
 };
