@@ -12811,6 +12811,326 @@ TEST(unmatched_local_response,
     closes_before_bytes(forged, "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n");
 }
 
+namespace {
+struct StrictLocalSendFailureLoop : SmallLoop {
+    u32 close_calls = 0;
+    bool close_during_submit = false;
+    bool close_saw_request_inflight = false;
+    const RouteConfig* close_saw_request_config = nullptr;
+    ConnState close_saw_state = ConnState::ReadingHeader;
+    u32 close_saw_send_len = 0;
+    u32 close_saw_send_progress = 0;
+    u32 close_saw_completed_requests = 0;
+    u32 close_saw_capture_header_len = 0;
+
+    bool submit_send(Connection& conn, const u8* buf, u32 len) {
+        if (close_during_submit) {
+            close_conn(conn);
+            return false;
+        }
+        return SmallLoop::submit_send_impl(conn, buf, len);
+    }
+
+    void close_conn(Connection& conn) {
+        close_calls++;
+        close_saw_request_inflight = conn.req_start_us != 0;
+        close_saw_request_config = conn.request_config;
+        close_saw_state = conn.state;
+        close_saw_send_len = conn.send_buf.len();
+        close_saw_send_progress = conn.send_progress;
+        close_saw_completed_requests = conn.downstream_completed_request_count;
+        close_saw_capture_header_len = conn.capture_header_len;
+        SmallLoop::close_conn_impl(conn);
+    }
+};
+
+bool configure_strict_local_send_failure_loop(StrictLocalSendFailureLoop& loop,
+                                              ShardMetrics& metrics,
+                                              AccessLogRing& access,
+                                              CaptureRing& capture,
+                                              ShardEpoch& epoch,
+                                              const RouteConfig*& active,
+                                              RouteConfig& config) {
+    loop.setup();
+    metrics.init();
+    access.init();
+    capture.init();
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    if (!loop.set_capture(&capture)) return false;
+    const auto policy = make_representation200_policy();
+    if (config.add_strict_local_response_policy(policy) != 1u ||
+        !config.set_unmatched_policy_id(kRouteMethodAny, 1) ||
+        !config.unmatched_policy_table_is_valid())
+        return false;
+    active = &config;
+    loop.config_ptr = &active;
+    return true;
+}
+}  // namespace
+
+TEST(unmatched_local_response,
+     synchronous_initial_send_failure_closes_without_success_publication_or_stale_ownership) {
+    StrictLocalSendFailureLoop loop;
+    ShardMetrics metrics{};
+    AccessLogRing access{};
+    CaptureRing capture{};
+    ShardEpoch epoch{};
+    RouteConfig config{};
+    const RouteConfig* active = nullptr;
+    REQUIRE(configure_strict_local_send_failure_loop(
+        loop, metrics, access, capture, epoch, active, config));
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    conn->downstream_completed_request_count = 7;
+    metrics.on_accept();
+    static constexpr char kRequest[] = "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    const u32 conn_id = conn->id;
+    const u32 free_before = loop.free_top;
+    loop.backend.clear_ops();
+    loop.backend.fail_send = true;
+
+    on_header_received<StrictLocalSendFailureLoop>(
+        &loop,
+        *conn,
+        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK(loop.close_saw_request_inflight);
+    CHECK(loop.close_saw_request_config == &config);
+    CHECK_EQ(loop.close_saw_state, ConnState::Sending);
+    CHECK_GT(loop.close_saw_send_len, 0u);
+    CHECK_EQ(loop.close_saw_send_progress, 0u);
+    CHECK_EQ(loop.close_saw_completed_requests, 7u);
+    CHECK_GT(loop.close_saw_capture_header_len, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.conns[conn_id].fd, -1);
+    CHECK_EQ(loop.conns[conn_id].on_send, nullptr);
+    CHECK_EQ(loop.conns[conn_id].request_config, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(metrics.connections_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+
+    // A late completion cannot repeat closure or accounting after the slot was
+    // terminally returned and reset.
+    loop.backend.fail_send = false;
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, 1));
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+}
+
+TEST(unmatched_local_response,
+     synchronous_partial_resubmit_failure_closes_without_success_publication_or_stale_ownership) {
+    StrictLocalSendFailureLoop loop;
+    ShardMetrics metrics{};
+    AccessLogRing access{};
+    CaptureRing capture{};
+    ShardEpoch epoch{};
+    RouteConfig config{};
+    const RouteConfig* active = nullptr;
+    REQUIRE(configure_strict_local_send_failure_loop(
+        loop, metrics, access, capture, epoch, active, config));
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 43;
+    conn->downstream_completed_request_count = 11;
+    metrics.on_accept();
+    static constexpr char kRequest[] = "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    const u32 conn_id = conn->id;
+    const u32 free_before = loop.free_top;
+    on_header_received<StrictLocalSendFailureLoop>(
+        &loop,
+        *conn,
+        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+    REQUIRE_EQ(loop.close_calls, 0u);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE_GT(wire_len, 7u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    loop.backend.clear_ops();
+    loop.backend.fail_send = true;
+    on_response_sent<StrictLocalSendFailureLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Send, 7));
+
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK(loop.close_saw_request_inflight);
+    CHECK(loop.close_saw_request_config == &config);
+    CHECK_EQ(loop.close_saw_state, ConnState::Sending);
+    CHECK_EQ(loop.close_saw_send_len, wire_len);
+    CHECK_EQ(loop.close_saw_send_progress, 7u);
+    CHECK_EQ(loop.close_saw_completed_requests, 11u);
+    CHECK_GT(loop.close_saw_capture_header_len, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.conns[conn_id].fd, -1);
+    CHECK_EQ(loop.conns[conn_id].on_send, nullptr);
+    CHECK_EQ(loop.conns[conn_id].request_config, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(metrics.connections_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+
+    loop.backend.fail_send = false;
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(wire_len - 7u)));
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+}
+
+TEST(unmatched_local_response,
+     initial_send_submitter_self_close_is_not_closed_or_accounted_twice_by_strict_local_caller) {
+    StrictLocalSendFailureLoop loop;
+    ShardMetrics metrics{};
+    AccessLogRing access{};
+    CaptureRing capture{};
+    ShardEpoch epoch{};
+    RouteConfig config{};
+    const RouteConfig* active = nullptr;
+    REQUIRE(configure_strict_local_send_failure_loop(
+        loop, metrics, access, capture, epoch, active, config));
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 44;
+    conn->downstream_completed_request_count = 13;
+    metrics.on_accept();
+    static constexpr char kRequest[] = "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    const u32 conn_id = conn->id;
+    const u32 free_before = loop.free_top;
+    loop.backend.clear_ops();
+    loop.close_during_submit = true;
+
+    on_header_received<StrictLocalSendFailureLoop>(
+        &loop,
+        *conn,
+        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK(loop.close_saw_request_inflight);
+    CHECK(loop.close_saw_request_config == &config);
+    CHECK_EQ(loop.close_saw_state, ConnState::Sending);
+    CHECK_GT(loop.close_saw_send_len, 0u);
+    CHECK_EQ(loop.close_saw_send_progress, 0u);
+    CHECK_EQ(loop.close_saw_completed_requests, 13u);
+    CHECK_GT(loop.close_saw_capture_header_len, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.conns[conn_id].fd, -1);
+    CHECK_EQ(loop.conns[conn_id].on_send, nullptr);
+    CHECK_EQ(loop.conns[conn_id].request_config, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(metrics.connections_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, 1));
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+}
+
+TEST(unmatched_local_response,
+     partial_resubmit_self_close_is_not_closed_or_accounted_twice_by_shared_callback) {
+    StrictLocalSendFailureLoop loop;
+    ShardMetrics metrics{};
+    AccessLogRing access{};
+    CaptureRing capture{};
+    ShardEpoch epoch{};
+    RouteConfig config{};
+    const RouteConfig* active = nullptr;
+    REQUIRE(configure_strict_local_send_failure_loop(
+        loop, metrics, access, capture, epoch, active, config));
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 45;
+    conn->downstream_completed_request_count = 17;
+    metrics.on_accept();
+    static constexpr char kRequest[] = "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    const u32 conn_id = conn->id;
+    const u32 free_before = loop.free_top;
+    on_header_received<StrictLocalSendFailureLoop>(
+        &loop,
+        *conn,
+        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+    REQUIRE_EQ(loop.close_calls, 0u);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE_GT(wire_len, 9u);
+
+    loop.backend.clear_ops();
+    loop.close_during_submit = true;
+    on_response_sent<StrictLocalSendFailureLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Send, 9));
+
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK(loop.close_saw_request_inflight);
+    CHECK(loop.close_saw_request_config == &config);
+    CHECK_EQ(loop.close_saw_state, ConnState::Sending);
+    CHECK_EQ(loop.close_saw_send_len, wire_len);
+    CHECK_EQ(loop.close_saw_send_progress, 9u);
+    CHECK_EQ(loop.close_saw_completed_requests, 17u);
+    CHECK_GT(loop.close_saw_capture_header_len, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.conns[conn_id].fd, -1);
+    CHECK_EQ(loop.conns[conn_id].on_send, nullptr);
+    CHECK_EQ(loop.conns[conn_id].request_config, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(metrics.connections_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(wire_len - 9u)));
+    CHECK_EQ(loop.close_calls, 1u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.connections_closed, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+}
+
 TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire) {
     Connection conn{};
     u8 recv[64]{}, send[1024]{};

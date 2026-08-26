@@ -2532,7 +2532,9 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
         const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        if (!client_send(loop, conn, conn.send_buf.data() + conn.send_progress, kRemaining) &&
+            conn.fd >= 0)
+            loop->close_conn(conn);
         return;
     }
 
@@ -7945,7 +7947,8 @@ bool handle_configured_strict_local_response(Loop* loop,
     conn.throttle_tat_ns = 0;
     conn.resp_status = policy.status_code;
     conn.transition_to_sending(&on_response_sent<Loop>);
-    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+    if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+        loop->close_conn(conn);
     return true;
 }
 
