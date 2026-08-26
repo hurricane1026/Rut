@@ -5625,6 +5625,369 @@ static bool run_pinned_bounded_exact_local_path_oracle(
     return true;
 }
 
+static std::string make_bounded_exact_local_path_fragment(u16 frontend_port,
+                                                          u16 backend_port,
+                                                          bool exact_first) {
+    const std::string exact_location =
+        "  location = /healthz { return 200 \"successor-static\"; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
+}
+
+static bool capture_generated_bounded_exact_local_path_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool exact_first,
+    BoundedExactLocalPathOracleObservation& observation,
+    std::string& generated_source,
+    std::string& error) {
+    static constexpr const char* kTargets[] = {
+        "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
+    const std::string fragment =
+        make_bounded_exact_local_path_fragment(frontend_port, backend_port, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#318 accepted nginx fragment did not parse for converter-generated RUT";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_local_return;
+    if (server.listen.port != frontend_port || !root.path.eq(rut::lit_str("/")) ||
+        root.path.ptr != fragment.data() + root.path_span.start || proxy.has_uri ||
+        proxy.address[0] != 127 || proxy.address[1] != 0 || proxy.address[2] != 0 ||
+        proxy.address[3] != 1 || proxy.port != backend_port || !exact.present ||
+        !exact.path.eq(rut::lit_str("/healthz")) ||
+        exact.path.ptr != fragment.data() + exact.path_span.start ||
+        exact.path_span.end - exact.path_span.start != exact.path.len ||
+        exact.response.status != 200 || !exact.response.body.eq(rut::lit_str("successor-static")) ||
+        exact.response.body.ptr != fragment.data() + exact.response.body_span.start ||
+        exact.response.body_span.end - exact.response.body_span.start != exact.response.body.len ||
+        server.exact_absolute_redirect.present) {
+        error = "#318 shared fragment did not reach the genuine bounded /healthz semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#318 accepted nginx semantic model failed ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    generated_source.assign(generated.ptr, generated.len);
+    const auto count_literal = [&](const char* literal) {
+        size_t count = 0;
+        for (size_t offset = 0;;) {
+            offset = generated_source.find(literal, offset);
+            if (offset == std::string::npos) return count;
+            count++;
+            offset += strlen(literal);
+        }
+    };
+    if (count_literal("route exact \"/healthz\" { return local_response({") != 1 ||
+        count_literal("route \"/\" {") != 1 ||
+        count_literal("return forward(nginx_upstream") == 0 ||
+        generated_source.find("successor-static") == std::string::npos ||
+        generated_source.find("proxy_pass") != std::string::npos ||
+        generated_source.find("nginx.conf") != std::string::npos ||
+        !write_file(temp.source, generated.ptr, generated.len)) {
+        error = "#318 converter output lost its single exact-local/root-forward ordinary-RUT shape";
+        return false;
+    }
+
+    observation = BoundedExactLocalPathOracleObservation{};
+    observation.order = exact_first ? "generated-exact-before-root" : "generated-root-before-exact";
+    observation.wires.resize(5);
+    const auto make_request = [](const char* target) {
+        return std::string("GET ") + target +
+               " HTTP/1.1\r\nHost: healthz.example\r\nConnection: close\r\n\r\n";
+    };
+    for (const char* target : kTargets) {
+        const std::string request = make_request(target);
+        const size_t header_end = request.find("\r\n\r\n");
+        if (request.rfind(std::string("GET ") + target + " HTTP/1.1\r\n", 0) != 0 ||
+            request.find('#') != std::string::npos ||
+            request.find("\r\nHost: healthz.example\r\n") == std::string::npos ||
+            request.find("\r\nConnection: close\r\n") == std::string::npos ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.find("\r\nTE:") != std::string::npos ||
+            request.find("\r\nExpect:") != std::string::npos ||
+            request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+            header_end + 4u != request.size() || request.rfind("\r\n\r\n") != header_end) {
+            error =
+                std::string("generated-RUT #318 vector escaped the fresh bodyless GET domain: ") +
+                target;
+            return false;
+        }
+    }
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, Child& rut, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(rut)) {
+                error = std::string("converter-generated RUT exited before #318 ") + phase +
+                        " recorder readiness (" + child_status_description(rut) + ")";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = std::string("generated-RUT #318 ") + phase +
+                        " recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("generated-RUT #318 ") + phase + " recorder readiness timed out";
+        return false;
+    };
+    const auto send_vector = [&](Child& rut, size_t index, const char* expected) {
+        const std::string request = make_request(kTargets[index]);
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::vector<char> wire;
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, request.data(), request.size()) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string("generated-RUT #318 vector ") + kTargets[index] +
+                    " response/EOF/zero-tail failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, expected, detail)) {
+            error = std::string("generated-RUT #318 vector ") + kTargets[index] +
+                    " exact status/reason/headers/body wire mismatch: " + detail;
+            return false;
+        }
+        if (poll_child(rut)) {
+            error = std::string("converter-generated RUT exited after #318 vector ") +
+                    kTargets[index] + " (" + child_status_description(rut) + ")";
+            return false;
+        }
+        observation.wires[index] = std::move(wire);
+        return true;
+    };
+    const auto observe_exact_count =
+        [&](Recorder& recorder, Child& rut, u32 expected, const char* phase) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(rut) || !recorder_live(recorder)) {
+                    error = std::string("generated-RUT #318 process or recorder failed during ") +
+                            phase;
+                    return false;
+                }
+                if (recorder.accepted.load(std::memory_order_acquire) != expected ||
+                    recorder.requests.load(std::memory_order_acquire) != expected ||
+                    recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                    error =
+                        std::string("generated-RUT #318 unexpected upstream count during ") + phase;
+                    return false;
+                }
+                usleep(5000);
+            }
+            return true;
+        };
+    const auto wait_exact_count = [&](Recorder& recorder, Child& rut, u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(rut) || !recorder_live(recorder)) {
+                error = "converter-generated RUT or #318 recorder failed while waiting for count";
+                return false;
+            }
+            const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) {
+                error = "generated-RUT #318 forward recorder exceeded its exact upstream count";
+                return false;
+            }
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        error = "timed out waiting for generated-RUT #318 exact forward upstream count";
+        return false;
+    };
+
+    Recorder local_recorder;
+    local_recorder.observe_extra_requests_until_stop = true;
+    if (!local_recorder.setup(backend_port)) {
+        error = "failed to start generated-RUT #318 local zero-upstream recorder";
+        return false;
+    }
+    ChildGuard rut;
+    if (!spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temp.rut_log,
+                     rut.child)) {
+        error = "failed to start converter-generated ordinary RUT for #318 differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error) ||
+        !wait_recorder_live(local_recorder, rut.child, "local"))
+        return false;
+    for (size_t i = 0; i < 2; i++) {
+        if (!send_vector(rut.child, i, kExactLocalCloseResponseNormalized)) return false;
+        if (local_recorder.accepted.load(std::memory_order_acquire) != 0 ||
+            local_recorder.requests.load(std::memory_order_acquire) != 0 ||
+            local_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+            error = std::string("generated-RUT #318 local vector reached upstream: ") + kTargets[i];
+            return false;
+        }
+    }
+    if (!observe_exact_count(local_recorder, rut.child, 0, "live local zero-upstream window"))
+        return false;
+    local_recorder.stop();
+    observation.local_accepts = local_recorder.accepted.load(std::memory_order_acquire);
+    observation.local_requests = local_recorder.requests.load(std::memory_order_acquire);
+    observation.local_sends =
+        local_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    if (local_recorder.thread_alive.load(std::memory_order_acquire) ||
+        local_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.local_accepts != 0 || observation.local_requests != 0 ||
+        observation.local_sends != 0 ||
+        local_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !local_recorder.history.empty() || !local_recorder.request.empty()) {
+        error = "generated-RUT #318 local recorder did not settle with zero upstream activity";
+        return false;
+    }
+
+    Recorder forward_recorder;
+    forward_recorder.observe_extra_requests_until_stop = true;
+    if (!forward_recorder.setup(backend_port, 3, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
+        !wait_recorder_live(forward_recorder, rut.child, "forward")) {
+        if (error.empty()) error = "failed to start generated-RUT #318 forward recorder";
+        return false;
+    }
+    for (size_t i = 2; i < 5; i++) {
+        if (!send_vector(rut.child, i, kSuccessResponseNormalized) ||
+            !wait_exact_count(forward_recorder, rut.child, static_cast<u32>(i - 1u)))
+            return false;
+    }
+    if (!observe_exact_count(forward_recorder, rut.child, 3, "live no-fourth-forward window"))
+        return false;
+    if (!stop_child(rut.child)) {
+        error = "failed to stop converter-generated ordinary RUT after #318 differential";
+        return false;
+    }
+    forward_recorder.stop();
+    observation.forward_accepts = forward_recorder.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = forward_recorder.requests.load(std::memory_order_acquire);
+    observation.forward_sends =
+        forward_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = forward_recorder.history;
+    if (forward_recorder.thread_alive.load(std::memory_order_acquire) ||
+        forward_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3 || observation.forward_requests != 3 ||
+        observation.forward_sends != 3 ||
+        !forward_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !forward_recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !forward_recorder.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 3) {
+        error = "generated-RUT #318 forward recorder did not settle at exactly three episodes";
+        return false;
+    }
+    std::vector<std::vector<char>> expected_history;
+    expected_history.reserve(3);
+    for (size_t i = 2; i < 5; i++) {
+        const std::string request = std::string("GET ") + kTargets[i] + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error = "generated-RUT #318 root neighbors lost exact upstream request histories";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_bounded_exact_local_path_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_prefix,
+    const char* rut_path,
+    BoundedExactLocalPathOracleObservation& nginx_exact_first,
+    BoundedExactLocalPathOracleObservation& nginx_root_first,
+    BoundedExactLocalPathOracleObservation& rut_exact_first,
+    BoundedExactLocalPathOracleObservation& rut_root_first,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "converter-generated #318 differential requires an executable absolute RUT path";
+        return false;
+    }
+    std::string exact_first_source;
+    std::string root_first_source;
+    if (!run_pinned_bounded_exact_local_path_oracle(frontend_port,
+                                                    backend_port,
+                                                    temp,
+                                                    container_prefix,
+                                                    nginx_exact_first,
+                                                    nginx_root_first,
+                                                    error) ||
+        !capture_generated_bounded_exact_local_path_order(frontend_port,
+                                                          backend_port,
+                                                          temp,
+                                                          rut_path,
+                                                          true,
+                                                          rut_exact_first,
+                                                          exact_first_source,
+                                                          error) ||
+        !capture_generated_bounded_exact_local_path_order(frontend_port,
+                                                          backend_port,
+                                                          temp,
+                                                          rut_path,
+                                                          false,
+                                                          rut_root_first,
+                                                          root_first_source,
+                                                          error))
+        return false;
+    const auto exact_counts = [](const BoundedExactLocalPathOracleObservation& observation) {
+        return observation.local_accepts == 0 && observation.local_requests == 0 &&
+               observation.local_sends == 0 && observation.forward_accepts == 3 &&
+               observation.forward_requests == 3 && observation.forward_sends == 3 &&
+               observation.wires.size() == 5 && observation.forward_history.size() == 3;
+    };
+    if (!exact_counts(nginx_exact_first) || !exact_counts(nginx_root_first) ||
+        !exact_counts(rut_exact_first) || !exact_counts(rut_root_first) ||
+        exact_first_source != root_first_source ||
+        nginx_exact_first.forward_history != nginx_root_first.forward_history ||
+        nginx_exact_first.forward_history != rut_exact_first.forward_history ||
+        nginx_exact_first.forward_history != rut_root_first.forward_history) {
+        error = "#318 declaration-order source, count, or exact upstream-history mismatch";
+        return false;
+    }
+    for (size_t i = 0; i < 5; i++) {
+        std::vector<char> nginx_exact_wire = nginx_exact_first.wires[i];
+        std::vector<char> nginx_root_wire = nginx_root_first.wires[i];
+        std::vector<char> rut_exact_wire = rut_exact_first.wires[i];
+        std::vector<char> rut_root_wire = rut_root_first.wires[i];
+        if (!normalize_date(nginx_exact_wire) || !normalize_date(nginx_root_wire) ||
+            !normalize_date(rut_exact_wire) || !normalize_date(rut_root_wire) ||
+            nginx_exact_wire != nginx_root_wire || nginx_exact_wire != rut_exact_wire ||
+            nginx_exact_wire != rut_root_wire || nginx_exact_first.access_records[i] != 1 ||
+            nginx_root_first.access_records[i] != 1) {
+            error = "#318 four-way Date-normalized wire/access mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
                                                u16 backend_port,
                                                TempDir& temp,
@@ -12359,6 +12722,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
+    const bool converter_bounded_exact_local_path_differential =
+        argc == 3 && strcmp(argv[1], "--converter-bounded-exact-local-path-differential") == 0;
     const bool converter_root_proxy_trace_differential =
         argc == 3 && strcmp(argv[1], "--converter-root-proxy-trace-differential") == 0;
     const bool converter_api_proxy_trace_differential =
@@ -12397,7 +12762,8 @@ int main(int argc, char** argv) {
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !converter_api_non_root_proxy_uri_differential &&
-         !converter_service_root_proxy_uri_differential && !strict_local_response_differential &&
+         !converter_service_root_proxy_uri_differential &&
+         !converter_bounded_exact_local_path_differential && !strict_local_response_differential &&
          !converter_root_proxy_trace_differential && !converter_api_proxy_trace_differential &&
          !converter_exact_absolute_redirect_differential &&
          !converter_exact_absolute_redirect_302_differential &&
@@ -12414,6 +12780,7 @@ int main(int argc, char** argv) {
         (converter_api_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
+        (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
@@ -12445,6 +12812,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-service-root-proxy-uri-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-bounded-exact-local-path-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-root-proxy-trace-differential "
                      "<absolute-rut-executable>\n"
@@ -12855,6 +13225,53 @@ int main(int argc, char** argv) {
                "connect/upstream failures (nginx-only #318 oracle; no parser/converter/RUT "
                "equivalence claim; excludes other exact paths, statuses, bodies, headers, "
                "methods, framing, reuse/pipeline, location kinds, TLS/H2, and multiple servers)\n";
+        return 0;
+    }
+
+    if (converter_bounded_exact_local_path_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-bounded-exact-local-path-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        BoundedExactLocalPathOracleObservation nginx_exact_first;
+        BoundedExactLocalPathOracleObservation nginx_root_first;
+        BoundedExactLocalPathOracleObservation rut_exact_first;
+        BoundedExactLocalPathOracleObservation rut_root_first;
+        std::string differential_error;
+        if (!run_converter_bounded_exact_local_path_differential(frontend_port,
+                                                                 backend_port,
+                                                                 temp,
+                                                                 container_prefix,
+                                                                 argv[2],
+                                                                 nginx_exact_first,
+                                                                 nginx_root_first,
+                                                                 rut_exact_first,
+                                                                 rut_root_first,
+                                                                 differential_error)) {
+            std::cerr << "FAIL [converter-generated bounded exact-local /healthz differential]: "
+                      << differential_error << "\n";
+            dump_bounded_exact_local_path_oracle_observation(nginx_exact_first);
+            dump_bounded_exact_local_path_oracle_observation(nginx_root_first);
+            dump_bounded_exact_local_path_oracle_observation(rut_exact_first);
+            dump_bounded_exact_local_path_oracle_observation(rut_root_first);
+            dump_log(temp.nginx_config, "#318 differential pinned nginx config");
+            dump_log(temp.source, "#318 converter-generated ordinary RUT source");
+            dump_log(temp.nginx_log, "#318 differential pinned nginx log");
+            dump_log(temp.rut_log, "#318 differential converter-generated RUT log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of one bounded /healthz exact-local nginx fragment "
+               "passed through the independent parser/semantic model/converter to ordinary RUT "
+               "and the public production rut CLI; pinned nginx 1.29.7 and each independently "
+               "generated RUT matched all five exact Date-normalized client wires/close/EOF, "
+               "including local /healthz and /healthz?x=1 200/CL16/full-successor-static "
+               "responses with live and settled zero upstream, plus root-proxied /healthz/, "
+               "/health, and / with three byte-exact ordered backend histories and no fourth; "
+               "each nginx declaration order proved exactly five uniquely scoped access records "
+               "and zero upstream failures (bounded #318 converter equivalence only; excludes "
+               "other paths, statuses, bodies, methods, framing, reuse/pipeline, normalization-"
+               "sensitive targets, TLS/H2, and multiple locations or servers)\n";
         return 0;
     }
 
