@@ -86,8 +86,9 @@ constexpr bool contains(Str a, char needle) {
 }
 
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
+static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 
-constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
+constexpr bool clean_path_segment_byte_is_unreserved(char value) {
     const u8 byte = static_cast<u8>(value);
     return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' || byte == '~';
@@ -102,7 +103,7 @@ bool proxy_pass_uri_is_clean(Str uri) {
     u32 segment_start = 1;
     for (u32 i = 1; i < uri.len; i++) {
         if (uri.ptr[i] != '/') {
-            if (!proxy_pass_uri_segment_byte_is_clean(uri.ptr[i])) return false;
+            if (!clean_path_segment_byte_is_unreserved(uri.ptr[i])) return false;
             continue;
         }
 
@@ -110,6 +111,29 @@ bool proxy_pass_uri_is_clean(Str uri) {
         if (segment_len == 0 || (segment_len == 1 && uri.ptr[segment_start] == '.') ||
             (segment_len == 2 && uri.ptr[segment_start] == '.' &&
              uri.ptr[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+    return true;
+}
+
+bool proxy_location_path_is_clean(Str path) {
+    if (path.ptr == nullptr || path.len == 0 || path.len > kMaxProxyLocationPathLen ||
+        path.ptr[0] != '/' || (path.len > 1 && path.ptr[path.len - 1] != '/'))
+        return false;
+    if (path.len == 1) return true;
+
+    u32 segment_start = 1;
+    for (u32 i = 1; i < path.len; i++) {
+        if (path.ptr[i] != '/') {
+            if (!clean_path_segment_byte_is_unreserved(path.ptr[i])) return false;
+            continue;
+        }
+
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0 || (segment_len == 1 && path.ptr[segment_start] == '.') ||
+            (segment_len == 2 && path.ptr[segment_start] == '.' &&
+             path.ptr[segment_start + 1] == '.'))
             return false;
         segment_start = i + 1;
     }
@@ -288,8 +312,9 @@ private:
             return unsupported(path.span, lit_str("location modifiers are unsupported"));
         if (contains(path.text, '$'))
             return unsupported(path.span, lit_str("variables are unsupported"));
-        if (!eq(path.text, "/", 1) && !eq(path.text, "/api/", 5))
-            return unsupported(path.span, lit_str("only location / or /api/ is supported"));
+        if (!proxy_location_path_is_clean(path.text))
+            return unsupported(path.span,
+                               lit_str("location path is outside the bounded clean proxy profile"));
         advance();
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after location path")))
             return core::make_unexpected(error_);
@@ -339,7 +364,7 @@ private:
                                lit_str("location / cannot use a proxy_pass URI"));
         if (!is_root && !result.proxy_pass.has_uri)
             return unsupported(result.path_span,
-                               lit_str("location /api/ requires proxy_pass URI /"));
+                               lit_str("non-root location requires a proxy_pass URI"));
         result.span = Span{start.start, end.end, start.line, start.col};
         return parsed;
     }

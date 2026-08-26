@@ -32,6 +32,13 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
+// A proxy location prefix must fit completely in the runtime request-path
+// observation buffer, including its trailing slash. The runtime reserves one
+// byte for termination, so the semantic model admits at most 63 source bytes.
+// Broader nginx location-selection and normalization semantics remain
+// unsupported.
+static constexpr u32 kMaxProxyLocationPathLen = 63;
+
 // Existing bounded prefix-location proxy action. This remains separate from
 // the exact local-return action below so source order cannot change their
 // semantic roles.

@@ -7,6 +7,7 @@
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/connection_base.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
 #include <memory>
@@ -483,7 +484,8 @@ TEST(nginx_parser, rejects_proxy_read_timeout_outside_exact_root_location_contex
     const auto other_result = nginx::parse({other_location, sizeof(other_location) - 1});
     REQUIRE_FALSE(other_result);
     CHECK_EQ(other_result.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(other_result.error().detail.eq(lit_str("only location / or /api/ is supported")));
+    CHECK(other_result.error().detail.eq(
+        lit_str("location path is outside the bounded clean proxy profile")));
 }
 
 TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
@@ -511,6 +513,236 @@ TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
     CHECK_EQ(result.value().pre_route_trace.span.end, result.value().span.end);
     CHECK_EQ(result.value().pre_route_trace.span.line, result.value().span.line);
     CHECK_EQ(result.value().pre_route_trace.span.col, result.value().span.col);
+}
+
+TEST(nginx_parser, parses_bounded_clean_proxy_location_with_exact_source_provenance) {
+    const char root_uri[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "\n"
+        "    location /service/ {\n"
+        "      proxy_pass http://127.0.0.1:9000/;\n"
+        "    }\n"
+        "}\n";
+    const char replacement_uri[] =
+        "server { listen 8080; location /service/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+
+    const auto root_result = nginx::parse({root_uri, sizeof(root_uri) - 1u});
+    const auto replacement_result = nginx::parse({replacement_uri, sizeof(replacement_uri) - 1u});
+    REQUIRE(root_result);
+    REQUIRE(replacement_result);
+
+    const auto& server = root_result.value();
+    const auto& location = server.location;
+    const char* location_keyword = strstr(root_uri, "location");
+    const char* path = strstr(root_uri, "/service/");
+    const char* closing_brace = strstr(strstr(root_uri, "proxy_pass"), "}");
+    REQUIRE(location_keyword != nullptr);
+    REQUIRE(path != nullptr);
+    REQUIRE(closing_brace != nullptr);
+    CHECK(location.path.eq(lit_str("/service/")));
+    CHECK_EQ(location.path.ptr, path);
+    CHECK_EQ(location.path.ptr, root_uri + location.path_span.start);
+    CHECK_EQ(location.path_span.end - location.path_span.start, location.path.len);
+    CHECK_EQ(location.path_span.line, 4u);
+    CHECK_EQ(location.path_span.col, 14u);
+    CHECK_EQ(location.span.start, static_cast<u32>(location_keyword - root_uri));
+    CHECK_EQ(location.span.end, static_cast<u32>(closing_brace - root_uri + 1));
+    CHECK_EQ(location.span.line, 4u);
+    CHECK_EQ(location.span.col, 5u);
+    CHECK_GE(location.path.ptr, root_uri);
+    CHECK_LE(location.path.ptr + location.path.len, root_uri + sizeof(root_uri) - 1u);
+    REQUIRE(location.proxy_pass.has_uri);
+    CHECK(location.proxy_pass.uri.eq(lit_str("/")));
+    CHECK_EQ(location.proxy_pass.uri.ptr, root_uri + location.proxy_pass.uri_span.start);
+    CHECK_EQ(location.proxy_pass.uri_span.end - location.proxy_pass.uri_span.start,
+             location.proxy_pass.uri.len);
+
+    const auto& replacement = replacement_result.value().location;
+    CHECK(replacement.path.eq(lit_str("/service/")));
+    REQUIRE(replacement.proxy_pass.has_uri);
+    CHECK(replacement.proxy_pass.uri.eq(lit_str("/v1/")));
+    CHECK_EQ(replacement.path.ptr, replacement_uri + replacement.path_span.start);
+    CHECK_EQ(replacement.proxy_pass.uri.ptr,
+             replacement_uri + replacement.proxy_pass.uri_span.start);
+}
+
+TEST(nginx_parser, enforces_bounded_clean_proxy_location_capacity) {
+    static_assert(nginx::kMaxProxyLocationPathLen == 63u);
+    static_assert(nginx::kMaxProxyLocationPathLen + 1u == ConnectionBase::kMaxReqPathLen);
+    static_assert(nginx::kMaxProxyLocationPathLen < RouteEntry::kMaxPathLen);
+    static_assert(nginx::kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
+    char accepted_path[nginx::kMaxProxyLocationPathLen + 1u]{};
+    accepted_path[0] = '/';
+    for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) accepted_path[i] = 'a';
+    accepted_path[nginx::kMaxProxyLocationPathLen - 1u] = '/';
+
+    char accepted_source[256]{};
+    const int accepted_len = snprintf(accepted_source,
+                                      sizeof(accepted_source),
+                                      "server { listen 8080; location %s { proxy_pass "
+                                      "http://127.0.0.1:9000/; } }",
+                                      accepted_path);
+    REQUIRE_GT(accepted_len, 0);
+    REQUIRE_LT(static_cast<u32>(accepted_len), static_cast<u32>(sizeof(accepted_source)));
+    const auto accepted = nginx::parse({accepted_source, static_cast<u32>(accepted_len)});
+    REQUIRE(accepted);
+    const auto& accepted_location = accepted.value().location;
+    const char* accepted_keyword = strstr(accepted_source, "location");
+    const char* accepted_closing_brace = strstr(strstr(accepted_source, "proxy_pass"), "}");
+    REQUIRE(accepted_keyword != nullptr);
+    REQUIRE(accepted_closing_brace != nullptr);
+    CHECK_EQ(accepted_location.path.len, nginx::kMaxProxyLocationPathLen);
+    CHECK_EQ(accepted_location.path.ptr, accepted_source + accepted_location.path_span.start);
+    CHECK_EQ(accepted_location.path_span.end - accepted_location.path_span.start,
+             nginx::kMaxProxyLocationPathLen);
+    CHECK_EQ(accepted_location.path_span.line, 1u);
+    CHECK_EQ(accepted_location.path_span.col, 32u);
+    CHECK_EQ(accepted_location.span.start, static_cast<u32>(accepted_keyword - accepted_source));
+    CHECK_EQ(accepted_location.span.end,
+             static_cast<u32>(accepted_closing_brace - accepted_source + 1));
+    CHECK_EQ(accepted_location.span.line, 1u);
+    CHECK_EQ(accepted_location.span.col, 23u);
+
+    char rejected_path[nginx::kMaxProxyLocationPathLen + 2u]{};
+    rejected_path[0] = '/';
+    for (u32 i = 1; i < nginx::kMaxProxyLocationPathLen; i++) rejected_path[i] = 'a';
+    rejected_path[nginx::kMaxProxyLocationPathLen] = '/';
+
+    char rejected_source[256]{};
+    const int rejected_len = snprintf(rejected_source,
+                                      sizeof(rejected_source),
+                                      "server { listen 8080; location %s { proxy_pass "
+                                      "http://127.0.0.1:9000/; } }",
+                                      rejected_path);
+    REQUIRE_GT(rejected_len, 0);
+    REQUIRE_LT(static_cast<u32>(rejected_len), static_cast<u32>(sizeof(rejected_source)));
+    const auto rejected = nginx::parse({rejected_source, static_cast<u32>(rejected_len)});
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(
+        lit_str("location path is outside the bounded clean proxy profile")));
+    CHECK_EQ(rejected.error().span.start,
+             static_cast<u32>(strstr(rejected_source, rejected_path) - rejected_source));
+    CHECK_EQ(rejected.error().span.end - rejected.error().span.start,
+             nginx::kMaxProxyLocationPathLen + 1u);
+}
+
+TEST(nginx_parser, rejects_non_clean_proxy_location_shapes) {
+    struct Rejection {
+        const char* path;
+        u32 len;
+        Str detail;
+    };
+    static constexpr Rejection kRejected[] = {
+        {"service/", 8, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/service", 8, lit_str("location path is outside the bounded clean proxy profile")},
+        {"//service/", 10, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/service//x/", 12, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/./", 3, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/../", 4, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a/../b/", 8, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/%41/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/service/?x=1", 13, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a\\b/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a\"b/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a'b/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a:b/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a\x01"
+         "b/",
+         5,
+         lit_str("location path is outside the bounded clean proxy profile")},
+        {"/a\xC3\xA9/", 5, lit_str("location path is outside the bounded clean proxy profile")},
+        {"/service/$x/", 12, lit_str("variables are unsupported")},
+    };
+
+    for (const auto& vector : kRejected) {
+        char source[256]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen 8080; location %.*s { proxy_pass "
+                                 "http://127.0.0.1:1/; } }",
+                                 static_cast<int>(vector.len),
+                                 vector.path);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto result = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(vector.detail));
+        const char* path = strstr(source, "location ") + 9;
+        CHECK_EQ(result.error().span.start, static_cast<u32>(path - source));
+    }
+
+    const char whitespace[] =
+        "server { listen 8080; location /a b/ { proxy_pass http://127.0.0.1:1/; } }";
+    const auto whitespace_result = nginx::parse({whitespace, sizeof(whitespace) - 1u});
+    REQUIRE_FALSE(whitespace_result);
+    CHECK_EQ(whitespace_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(whitespace_result.error().detail.eq(
+        lit_str("location path is outside the bounded clean proxy profile")));
+
+    const char fragment[] =
+        "server { listen 8080; location \"/service/#fragment\" { proxy_pass "
+        "http://127.0.0.1:1/; } }";
+    const auto fragment_result = nginx::parse({fragment, sizeof(fragment) - 1u});
+    REQUIRE_FALSE(fragment_result);
+    CHECK_EQ(fragment_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(fragment_result.error().detail.eq(
+        lit_str("location path is outside the bounded clean proxy profile")));
+
+    const char all_unreserved[] =
+        "server { listen 8080; location /AZaz09-._~/ { proxy_pass http://127.0.0.1:1/; } }";
+    REQUIRE(nginx::parse({all_unreserved, sizeof(all_unreserved) - 1u}));
+}
+
+TEST(nginx_parser, parsed_generic_proxy_location_remains_converter_fail_closed) {
+    const char service[] =
+        "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const auto parsed = nginx::parse({service, sizeof(service) - 1u});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(lowered);
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lowered.error().detail.eq(lit_str("converter requires location / or /api/")));
+    const char* path = strstr(service, "/service/");
+    REQUIRE(path != nullptr);
+    CHECK_EQ(lowered.error().span.start, static_cast<u32>(path - service));
+    CHECK_EQ(lowered.error().span.end - lowered.error().span.start, 9u);
+    CHECK_EQ(lowered.error().span.start, parsed.value().location.path_span.start);
+    CHECK_EQ(lowered.error().span.end, parsed.value().location.path_span.end);
+
+    const char service_without_uri[] =
+        "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000; } }";
+    const auto missing_uri = nginx::parse({service_without_uri, sizeof(service_without_uri) - 1u});
+    REQUIRE_FALSE(missing_uri);
+    CHECK_EQ(missing_uri.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(missing_uri.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
+    const char* missing_uri_path = strstr(service_without_uri, "/service/");
+    REQUIRE(missing_uri_path != nullptr);
+    CHECK_EQ(missing_uri.error().span.start,
+             static_cast<u32>(missing_uri_path - service_without_uri));
+    CHECK_EQ(missing_uri.error().span.end - missing_uri.error().span.start, 9u);
+
+    const char api[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const char formatted_api[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/;\n"
+        "  }\n"
+        "}\n";
+    const auto legacy_parsed = nginx::parse({api, sizeof(api) - 1u});
+    const auto formatted_legacy_parsed = nginx::parse({formatted_api, sizeof(formatted_api) - 1u});
+    REQUIRE(legacy_parsed);
+    REQUIRE(formatted_legacy_parsed);
+    const auto legacy_lowered = nginx::lower_to_rut(legacy_parsed.value());
+    const auto formatted_legacy_lowered = nginx::lower_to_rut(formatted_legacy_parsed.value());
+    REQUIRE(legacy_lowered);
+    REQUIRE(formatted_legacy_lowered);
+    CHECK(legacy_lowered.value().view().eq(formatted_legacy_lowered.value().view()));
 }
 
 TEST(nginx_parser, parses_bounded_clean_non_root_proxy_uri_with_source_provenance) {
@@ -620,7 +852,7 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
                    FrontendError::UnsupportedSyntax,
                    1,
                    32,
-                   lit_str("location /api/ requires proxy_pass URI /")));
+                   lit_str("non-root location requires a proxy_pass URI")));
 
     const char api_without_trailing_slash[] =
         "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1/; } }";
@@ -629,7 +861,7 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
                  FrontendError::UnsupportedSyntax,
                  1,
                  32,
-                 lit_str("only location / or /api/ is supported")));
+                 lit_str("location path is outside the bounded clean proxy profile")));
 
     const char missing_trailing_slash[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/v1; } }";
@@ -1149,7 +1381,7 @@ TEST(nginx_parser, rejects_out_of_scope_contexts_and_values) {
                    FrontendError::UnsupportedSyntax,
                    1,
                    32,
-                   lit_str("only location / or /api/ is supported")));
+                   lit_str("location path is outside the bounded clean proxy profile")));
 
     const char dns[] = "server { listen 8080; location / { proxy_pass http://backend:1; } }";
     CHECK(is_error(nginx::parse({dns, sizeof(dns) - 1}),
@@ -1224,14 +1456,14 @@ TEST(nginx_parser, rejects_invalid_ports_ip_and_trailing_tokens) {
 }
 
 TEST(nginx_parser, rejects_modifiers_variables_and_non_http_upstreams) {
-    const char modifiers[][80] = {
-        "server { listen 8080; location ^~ / { proxy_pass http://127.0.0.1:1; } }",
-        "server { listen 8080; location ~ / { proxy_pass http://127.0.0.1:1; } }",
-        "server { listen 8080; location ~* / { proxy_pass http://127.0.0.1:1; } }",
+    const char* const modifiers[] = {
+        "server { listen 8080; location ^~ /service/ { proxy_pass http://127.0.0.1:1/; } }",
+        "server { listen 8080; location ~ /service/ { proxy_pass http://127.0.0.1:1/; } }",
+        "server { listen 8080; location ~* /service/ { proxy_pass http://127.0.0.1:1/; } }",
         "server { listen 8080; location @named { proxy_pass http://127.0.0.1:1; } }",
     };
     for (u32 i = 0; i < 4; i++) {
-        CHECK(is_error(nginx::parse({modifiers[i], sizeof(modifiers[i]) - 1}),
+        CHECK(is_error(nginx::parse({modifiers[i], static_cast<u32>(strlen(modifiers[i]))}),
                        FrontendError::UnsupportedSyntax,
                        1,
                        32,
