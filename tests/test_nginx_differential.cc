@@ -5666,6 +5666,477 @@ static bool run_pinned_bounded_exact_local_path_oracle(
     return true;
 }
 
+static constexpr char kExactLocalReturn204ResponseNormalized[] =
+    "HTTP/1.1 204 No Content\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Connection: close\r\n\r\n";
+static_assert(sizeof(kExactLocalReturn204ResponseNormalized) - 1u == 105u);
+
+struct ExactLocalReturn204OracleObservation {
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string container_name;
+    std::vector<char> local_wire;
+    std::vector<char> fallback_wire;
+    std::vector<std::vector<char>> fallback_history;
+    u32 local_accepts = 0;
+    u32 local_requests = 0;
+    u32 local_sends = 0;
+    u32 fallback_accepts = 0;
+    u32 fallback_requests = 0;
+    u32 fallback_sends = 0;
+    u32 local_access = 0;
+    u32 fallback_access = 0;
+};
+
+static void dump_exact_local_return204_oracle_observation(
+    const ExactLocalReturn204OracleObservation& observation) {
+    std::cerr << "#324 exact-local-return204 order=" << observation.order
+              << " temp=" << observation.temp_path << " config=" << observation.config_path
+              << " log=" << observation.log_path << " container=" << observation.container_name
+              << " access=" << observation.local_access << "/" << observation.fallback_access
+              << " upstream=" << observation.local_accepts << "/" << observation.local_requests
+              << "/" << observation.local_sends << "+" << observation.fallback_accepts << "/"
+              << observation.fallback_requests << "/" << observation.fallback_sends << "\n";
+    dump_wire("#324 GET /static return 204 oracle", observation.local_wire);
+    dump_wire("#324 GET /fallback?q=1 client response", observation.fallback_wire);
+    for (size_t i = 0; i < observation.fallback_history.size(); i++) {
+        const std::string label = "#324 fallback upstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.fallback_history[i]);
+    }
+}
+
+static bool capture_pinned_exact_local_return204_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    ExactLocalReturn204OracleObservation& observation,
+    std::string& error) {
+    static constexpr char kLocalRequest[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: return204.example\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kFallbackRequest[] =
+        "GET /fallback?q=1 HTTP/1.1\r\n"
+        "Host: return204.example\r\n"
+        "X-324-Vector: fallback\r\n"
+        "Connection: close\r\n\r\n";
+    for (const char* request : {kLocalRequest, kFallbackRequest}) {
+        const std::string text(request);
+        const size_t headers_end = text.find("\r\n\r\n");
+        if (text.rfind("GET /", 0) != 0 || text.find(" HTTP/1.1\r\n") == std::string::npos ||
+            text.find("\r\nConnection: close\r\n") == std::string::npos ||
+            text.find("\r\nContent-Length:") != std::string::npos ||
+            text.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            text.find("\r\nTE:") != std::string::npos ||
+            text.find("\r\nExpect:") != std::string::npos ||
+            text.find("\r\nUpgrade:") != std::string::npos || headers_end == std::string::npos ||
+            headers_end + 4u != text.size()) {
+            error =
+                "#324 oracle request escaped the fresh bodyless origin-form explicit-close "
+                "H1.1 GET domain";
+            return false;
+        }
+    }
+
+    observation = ExactLocalReturn204OracleObservation{};
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.container_name = container_name;
+    const std::string access_prefix =
+        "rut-nginx-324-return204-" + observation.order + "-" + std::to_string(getpid()) + "-scoped";
+    const std::string exact_location = "    location = /static { return 204; }\n";
+    const std::string root_location =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format exact_local_return204 '" +
+        access_prefix +
+        " raw=\"$request\" status=$status bytes=$bytes_sent host=\"$host\"';\n"
+        "  access_log /dev/stderr exact_local_return204;\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n"
+        "}\n";
+    const size_t return204 = config.find("return 204;");
+    if (config.find("location = /static { return 204; }") == std::string::npos ||
+        return204 == std::string::npos ||
+        config.find("return 204;", return204 + sizeof("return 204;") - 1u) != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#324 failed to preserve/write one literal return 204 nginx config";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_live = [&](Recorder& recorder, Child& nginx, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx)) {
+                error =
+                    std::string("#324 pinned nginx exited before ") + phase + " recorder readiness";
+                return false;
+            }
+            if (recorder.listener_failed.load(std::memory_order_acquire) ||
+                !recorder.running.load(std::memory_order_acquire)) {
+                error = std::string("#324 ") + phase + " recorder failed before readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#324 ") + phase + " recorder readiness timed out";
+        return false;
+    };
+    const auto observe_count = [&](Recorder& recorder,
+                                   Child& nginx,
+                                   u32 expected,
+                                   const char* phase,
+                                   std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(nginx) || !recorder_live(recorder)) {
+                error = std::string("#324 pinned nginx or recorder failed during ") + phase;
+                return false;
+            }
+            if (recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error = std::string("#324 unexpected upstream count during ") + phase;
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto wait_count = [&](Recorder& recorder, Child& nginx, u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx) || !recorder_live(recorder)) {
+                error = "#324 pinned nginx or fallback recorder stopped awaiting request";
+                return false;
+            }
+            const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) {
+                error = "#324 fallback recorder observed a retry or extra request";
+                return false;
+            }
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        error = "#324 fallback recorder timed out awaiting one complete request";
+        return false;
+    };
+    const auto request_close = [&](Child& nginx,
+                                   const char* name,
+                                   const char* request,
+                                   bool header_only,
+                                   const char* expected,
+                                   std::vector<char>& wire) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        const bool response_ok = client.fd >= 0 && send_all(client.fd, request, strlen(request)) &&
+                                 (header_only ? read_head_response(client.fd, wire, detail)
+                                              : read_response(client.fd, wire, detail)) &&
+                                 read_eof(client.fd, detail);
+        if (!response_ok) {
+            error = std::string("#324 ") + name + " response/EOF/no-tail failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, expected, detail)) {
+            error = std::string("#324 ") + name + " complete response wire mismatch: " + detail;
+            return false;
+        }
+        if (poll_child(nginx)) {
+            error = std::string("#324 pinned nginx exited after ") + name;
+            return false;
+        }
+        return true;
+    };
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    Recorder local_recorder;
+    local_recorder.observe_extra_requests_until_stop = true;
+    if (!local_recorder.setup(backend_port) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error) ||
+        !wait_recorder_live(local_recorder, nginx.child, "local") ||
+        !observe_count(local_recorder,
+                       nginx.child,
+                       0,
+                       "pre-local live zero-upstream window",
+                       std::chrono::milliseconds(250)) ||
+        !request_close(nginx.child,
+                       "strict local return 204",
+                       kLocalRequest,
+                       true,
+                       kExactLocalReturn204ResponseNormalized,
+                       observation.local_wire) ||
+        !observe_count(local_recorder,
+                       nginx.child,
+                       0,
+                       "post-local live zero-upstream window",
+                       std::chrono::milliseconds(500))) {
+        if (error.empty()) error = "#324 failed to start pinned nginx/local recorder";
+        return false;
+    }
+    const std::string local_text(observation.local_wire.begin(), observation.local_wire.end());
+    if (observation.local_wire.size() != 105u ||
+        header_end(observation.local_wire) != observation.local_wire.size() ||
+        local_text.find("\r\nContent-Type:") != std::string::npos ||
+        local_text.find("\r\nContent-Length:") != std::string::npos ||
+        local_text.find("\r\nTransfer-Encoding:") != std::string::npos) {
+        error = "#324 strict local 204 contained representation/framing fields, body, or tail";
+        return false;
+    }
+    local_recorder.stop();
+    observation.local_accepts = local_recorder.accepted.load(std::memory_order_acquire);
+    observation.local_requests = local_recorder.requests.load(std::memory_order_acquire);
+    observation.local_sends =
+        local_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    if (local_recorder.thread_alive.load(std::memory_order_acquire) ||
+        local_recorder.listener_failed.load(std::memory_order_acquire) ||
+        observation.local_accepts != 0 || observation.local_requests != 0 ||
+        observation.local_sends != 0 ||
+        local_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !local_recorder.history.empty() || !local_recorder.request.empty()) {
+        error = "#324 local recorder did not settle with zero upstream activity/history";
+        return false;
+    }
+
+    Recorder fallback_recorder;
+    fallback_recorder.observe_extra_requests_until_stop = true;
+    if (!fallback_recorder.setup(
+            backend_port, 1, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
+        !wait_recorder_live(fallback_recorder, nginx.child, "fallback") ||
+        !observe_count(fallback_recorder,
+                       nginx.child,
+                       0,
+                       "pre-fallback live zero-upstream window",
+                       std::chrono::milliseconds(100)) ||
+        !request_close(nginx.child,
+                       "root fallback",
+                       kFallbackRequest,
+                       false,
+                       kSuccessResponseNormalized,
+                       observation.fallback_wire) ||
+        !wait_count(fallback_recorder, nginx.child, 1) ||
+        !observe_count(fallback_recorder,
+                       nginx.child,
+                       1,
+                       "fallback live no-second-request window",
+                       std::chrono::milliseconds(500)))
+        return false;
+
+    if (!stop_child(nginx.child)) {
+        error = "#324 pinned nginx did not remain alive until controlled shutdown";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "#324 failed to remove pinned nginx container after controlled shutdown";
+        return false;
+    }
+    fallback_recorder.stop();
+    observation.fallback_accepts = fallback_recorder.accepted.load(std::memory_order_acquire);
+    observation.fallback_requests = fallback_recorder.requests.load(std::memory_order_acquire);
+    observation.fallback_sends =
+        fallback_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.fallback_history = fallback_recorder.history;
+    if (fallback_recorder.thread_alive.load(std::memory_order_acquire) ||
+        fallback_recorder.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(fallback_recorder) ||
+        observation.fallback_history.size() != 1u) {
+        error = "#324 fallback recorder did not settle at exactly one complete episode";
+        return false;
+    }
+    const std::string expected_backend =
+        "GET /fallback?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-324-Vector: fallback\r\n\r\n";
+    if (observation.fallback_history[0] !=
+        std::vector<char>(expected_backend.begin(), expected_backend.end())) {
+        error = "#324 root fallback upstream request was not byte-exact";
+        return false;
+    }
+
+    const std::string local_marker =
+        "raw=\"GET /static HTTP/1.1\" status=204 bytes=105 host=\"return204.example\"";
+    const std::string fallback_marker = "raw=\"GET /fallback?q=1 HTTP/1.1\" status=200 bytes=" +
+                                        std::to_string(sizeof(kSuccessResponseNormalized) - 1u) +
+                                        " host=\"return204.example\"";
+    u32 total_access = 0;
+    if (!log_count_line_with(temp.nginx_log,
+                             local_marker.c_str(),
+                             access_prefix.c_str(),
+                             observation.local_access) ||
+        !log_count_line_with(temp.nginx_log,
+                             fallback_marker.c_str(),
+                             access_prefix.c_str(),
+                             observation.fallback_access) ||
+        !log_count_line_with(
+            temp.nginx_log, access_prefix.c_str(), access_prefix.c_str(), total_access) ||
+        observation.local_access != 1 || observation.fallback_access != 1 || total_access != 2 ||
+        log_contains(temp.nginx_log, "[warn]") || log_contains(temp.nginx_log, "[error]") ||
+        log_contains(temp.nginx_log, "[crit]") || log_contains(temp.nginx_log, "[alert]") ||
+        log_contains(temp.nginx_log, "[emerg]")) {
+        error =
+            "#324 scoped access/error logs did not prove exact two-record wire accounting "
+            "and clean nginx operation";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_exact_local_return204_oracle(
+    const std::string& container_prefix,
+    ExactLocalReturn204OracleObservation& exact_first,
+    ExactLocalReturn204OracleObservation& root_first,
+    std::string& error) {
+    u16 ports[4]{};
+    bool ports_unique = false;
+    for (int attempt = 0; attempt < 8 && !ports_unique; attempt++) {
+        ports_unique = true;
+        for (u16& port : ports) {
+            if (!allocate_port(port)) {
+                ports_unique = false;
+                break;
+            }
+        }
+        for (size_t i = 0; ports_unique && i < 4; i++) {
+            for (size_t j = i + 1u; j < 4; j++) {
+                if (ports[i] == ports[j]) {
+                    ports_unique = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (!ports_unique) {
+        error = "#324 could not allocate four distinct declaration-order ports";
+        return false;
+    }
+
+    TempDir exact_temp;
+    TempDir root_temp;
+    if (!exact_temp.create() || !root_temp.create() ||
+        strcmp(exact_temp.path, root_temp.path) == 0 ||
+        exact_temp.nginx_config == root_temp.nginx_config ||
+        exact_temp.nginx_log == root_temp.nginx_log) {
+        error = "#324 could not create two independent temp/config/log trees";
+        return false;
+    }
+    const std::string exact_container = container_prefix + "-exact-first";
+    const std::string root_container = container_prefix + "-root-first";
+    if (exact_container == root_container) {
+        error = "#324 declaration-order container names were not independent";
+        return false;
+    }
+    if (!capture_pinned_exact_local_return204_order(
+            ports[0], ports[1], exact_temp, exact_container, true, exact_first, error)) {
+        dump_log(exact_temp.nginx_config, "#324 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
+        return false;
+    }
+    if (!capture_pinned_exact_local_return204_order(
+            ports[2], ports[3], root_temp, root_container, false, root_first, error)) {
+        dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
+        return false;
+    }
+    if (exact_first.temp_path == root_first.temp_path ||
+        exact_first.config_path == root_first.config_path ||
+        exact_first.log_path == root_first.log_path ||
+        exact_first.container_name == root_first.container_name || exact_first.local_wire.empty() ||
+        root_first.local_wire.empty() || exact_first.fallback_wire.empty() ||
+        root_first.fallback_wire.empty()) {
+        error = "#324 declaration orders did not retain independent resources and observations";
+        dump_log(exact_temp.nginx_config, "#324 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
+        dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
+        return false;
+    }
+    const auto same_normalized_wire = [](const std::vector<char>& left,
+                                         const std::vector<char>& right) {
+        std::vector<char> normalized_left(left.begin(), left.end());
+        std::vector<char> normalized_right(right.begin(), right.end());
+        return normalize_date(normalized_left) && normalize_date(normalized_right) &&
+               normalized_left == normalized_right;
+    };
+    if (!same_normalized_wire(exact_first.local_wire, root_first.local_wire) ||
+        !same_normalized_wire(exact_first.fallback_wire, root_first.fallback_wire)) {
+        error = "#324 declaration order changed a Date-normalized client response";
+        dump_log(exact_temp.nginx_config, "#324 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
+        dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
+        return false;
+    }
+    const auto canonical_backend = [](const std::vector<char>& wire) {
+        std::string result(wire.begin(), wire.end());
+        static constexpr char kHostPrefix[] = "\r\nHost: 127.0.0.1:";
+        const size_t port_begin = result.find(kHostPrefix);
+        const size_t digits_begin = port_begin == std::string::npos
+                                        ? std::string::npos
+                                        : port_begin + sizeof(kHostPrefix) - 1u;
+        const size_t port_end = digits_begin == std::string::npos
+                                    ? std::string::npos
+                                    : result.find("\r\n", digits_begin);
+        if (port_end == std::string::npos) return std::string{};
+        result.replace(digits_begin, port_end - digits_begin, "BACKEND");
+        return result;
+    };
+    if (exact_first.fallback_history.size() != 1u || root_first.fallback_history.size() != 1u ||
+        canonical_backend(exact_first.fallback_history[0]).empty() ||
+        canonical_backend(exact_first.fallback_history[0]) !=
+            canonical_backend(root_first.fallback_history[0])) {
+        error = "#324 declaration order changed exact fallback history after dynamic-port binding";
+        dump_log(exact_temp.nginx_config, "#324 exact-first pinned nginx config");
+        dump_log(exact_temp.nginx_log, "#324 exact-first pinned nginx log");
+        dump_log(root_temp.nginx_config, "#324 root-first pinned nginx config");
+        dump_log(root_temp.nginx_log, "#324 root-first pinned nginx log");
+        return false;
+    }
+    return true;
+}
+
 struct NormalizedExactTrailingSlashOracleObservation {
     std::string order;
     std::vector<std::vector<char>> wires;
@@ -15738,6 +16209,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--exact-local-body-space-oracle") == 0;
     const bool exact_local_body_multiple_space_oracle =
         argc == 2 && strcmp(argv[1], "--exact-local-body-multiple-space-oracle") == 0;
+    const bool exact_local_return204_oracle =
+        argc == 2 && strcmp(argv[1], "--exact-local-return204-oracle") == 0;
     const bool converter_exact_local_body_space_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-local-body-space-differential") == 0;
     const bool converter_exact_local_body_multiple_space_differential =
@@ -15794,7 +16267,7 @@ int main(int argc, char** argv) {
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !exact_local_body_space_oracle &&
-         !exact_local_body_multiple_space_oracle &&
+         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
          !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_api_non_root_proxy_uri_differential &&
@@ -15854,6 +16327,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
+                     "   or: test_nginx_differential --exact-local-return204-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-body-space-differential "
                      "<absolute-rut-executable>\n"
@@ -16115,6 +16589,36 @@ int main(int argc, char** argv) {
         frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
+    }
+
+    if (exact_local_return204_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-exact-local-return204-" + std::to_string(getpid()) + "-" + source_suffix;
+        ExactLocalReturn204OracleObservation exact_first;
+        ExactLocalReturn204OracleObservation root_first;
+        std::string oracle_error;
+        if (!run_pinned_exact_local_return204_oracle(
+                container_prefix, exact_first, root_first, oracle_error)) {
+            std::cerr << "FAIL [pinned exact-local return 204 oracle]: " << oracle_error << "\n";
+            dump_exact_local_return204_oracle_observation(exact_first);
+            dump_exact_local_return204_oracle_observation(root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 literal exact /static return 204 is declaration-order "
+               "independent across two isolated fresh bodyless origin-form explicit-close H1.1 "
+               "GET epochs; each emits the exact Date-only-normalized 105-byte 204 No Content/"
+               "Server/Date/Connection/final-CRLF/EOF wire with no representation, framing, "
+               "body, or tail and live plus settled zero upstream, then an unmatched "
+               "/fallback?q=1 reaches the independent root proxy exactly once with a byte-exact "
+               "request history and no retry; each order has exactly two uniquely scoped raw-"
+               "target access records with full-wire byte accounting and clean nginx logs "
+               "(nginx-only #324 oracle; no parser/converter/generated-RUT claim; excludes "
+               "other statuses, return text/variables, methods, bodies/framing, HTTP/1.0, "
+               "keep-alive/reuse/pipeline, other locations/listeners/servers, and TLS/H2)\n";
+        return 0;
     }
 
     if (root_proxy_trace_oracle) {
