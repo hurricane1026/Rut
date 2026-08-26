@@ -4854,6 +4854,19 @@ static std::string make_api_non_root_proxy_uri_fragment(u16 frontend_port, u16 b
            "}\n";
 }
 
+static std::string make_service_root_proxy_uri_fragment(u16 frontend_port, u16 backend_port) {
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) +
+           ";\n"
+           "  location /service/ {\n"
+           "    proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           "/;\n"
+           "  }\n"
+           "}\n";
+}
+
 static void dump_api_non_root_proxy_uri_oracle_observation(
     const ApiNonRootProxyUriOracleObservation& observation) {
     std::cerr << "api-non-root-proxy-uri access=" << observation.access_records[0] << "/"
@@ -5229,17 +5242,15 @@ static bool run_pinned_api_non_root_proxy_uri_oracle(
                                              error);
 }
 
-static bool run_generated_api_non_root_proxy_uri_side(
-    u16 frontend_port,
-    u16 backend_port,
-    TempDir& temp,
-    const char* rut_path,
-    ApiNonRootProxyUriOracleObservation& observation,
-    std::string& error) {
+static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
+                                               u16 backend_port,
+                                               TempDir& temp,
+                                               const char* rut_path,
+                                               const CleanProxyUriOracleProfile& profile,
+                                               ApiNonRootProxyUriOracleObservation& observation,
+                                               std::string& error) {
     observation = ApiNonRootProxyUriOracleObservation{};
     observation.wires.resize(5);
-    static constexpr const char* kTargets[] = {"/api/", "/api/x", "/api/x?y=1", "/api", "/api?x=1"};
-    static constexpr const char* kForwardTargets[] = {"/v1/", "/v1/x", "/v1/x?y=1"};
     const auto recorder_live = [](const Recorder& recorder) {
         return recorder.running.load(std::memory_order_acquire) &&
                recorder.thread_alive.load(std::memory_order_acquire) &&
@@ -5249,24 +5260,25 @@ static bool run_generated_api_non_root_proxy_uri_side(
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(rut)) {
-                error = std::string("converter-generated RUT exited before #316 ") + phase +
-                        " recorder readiness (" + child_status_description(rut) + ")";
+                error = std::string("converter-generated RUT exited before ") + profile.issue +
+                        " " + phase + " recorder readiness (" + child_status_description(rut) + ")";
                 return false;
             }
             if (recorder.listener_failed.load(std::memory_order_acquire) ||
                 !recorder.running.load(std::memory_order_acquire)) {
-                error = std::string("generated-RUT #316 ") + phase +
+                error = std::string("generated-RUT ") + profile.issue + " " + phase +
                         " recorder failed before readiness";
                 return false;
             }
             if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
             usleep(1000);
         }
-        error = std::string("generated-RUT #316 ") + phase + " recorder readiness timed out";
+        error = std::string("generated-RUT ") + profile.issue + " " + phase +
+                " recorder readiness timed out";
         return false;
     };
     const auto send_vector = [&](Child& rut, size_t index, const std::vector<char>& expected) {
-        const std::string request = api_request(kTargets[index]);
+        const std::string request = api_request(profile.targets[index]);
         struct ClientGuard {
             int fd = -1;
             ~ClientGuard() {
@@ -5277,19 +5289,21 @@ static bool run_generated_api_non_root_proxy_uri_side(
         std::string detail;
         if (client.fd < 0 || !send_all(client.fd, request.data(), request.size()) ||
             !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
-            error = std::string("generated-RUT #316 vector ") + kTargets[index] +
+            error = std::string("generated-RUT ") + profile.issue + " vector " +
+                    profile.targets[index] +
                     " response/EOF failed: " + (detail.empty() ? "connect or send failed" : detail);
             return false;
         }
         std::vector<char> normalized = wire;
         if (!normalize_date(normalized) || normalized != expected) {
-            error = std::string("generated-RUT #316 vector ") + kTargets[index] +
-                    " did not match the exact Date-normalized nginx wire";
+            error = std::string("generated-RUT ") + profile.issue + " vector " +
+                    profile.targets[index] + " did not match the exact Date-normalized nginx wire";
             return false;
         }
         if (poll_child(rut)) {
-            error = std::string("converter-generated RUT exited after #316 vector ") +
-                    kTargets[index] + " (" + child_status_description(rut) + ")";
+            error = std::string("converter-generated RUT exited after ") + profile.issue +
+                    " vector " + profile.targets[index] + " (" + child_status_description(rut) +
+                    ")";
             return false;
         }
         observation.wires[index] = std::move(wire);
@@ -5300,20 +5314,20 @@ static bool run_generated_api_non_root_proxy_uri_side(
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
             while (std::chrono::steady_clock::now() < deadline) {
                 if (poll_child(rut)) {
-                    error = std::string("converter-generated RUT exited during #316 ") + phase +
-                            " (" + child_status_description(rut) + ")";
+                    error = std::string("converter-generated RUT exited during ") + profile.issue +
+                            " " + phase + " (" + child_status_description(rut) + ")";
                     return false;
                 }
                 if (!recorder_live(recorder)) {
-                    error = std::string("generated-RUT #316 recorder stopped or failed during ") +
-                            phase;
+                    error = std::string("generated-RUT ") + profile.issue +
+                            " recorder stopped or failed during " + phase;
                     return false;
                 }
                 if (recorder.accepted.load(std::memory_order_acquire) != expected ||
                     recorder.requests.load(std::memory_order_acquire) != expected ||
                     recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
-                    error =
-                        std::string("generated-RUT #316 unexpected upstream count during ") + phase;
+                    error = std::string("generated-RUT ") + profile.issue +
+                            " unexpected upstream count during " + phase;
                     return false;
                 }
                 usleep(5000);
@@ -5324,34 +5338,39 @@ static bool run_generated_api_non_root_proxy_uri_side(
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(rut) || !recorder_live(recorder)) {
-                error = "converter-generated RUT or #316 recorder failed while waiting for count";
+                error = std::string("converter-generated RUT or ") + profile.issue +
+                        " recorder failed while waiting for count";
                 return false;
             }
             const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
             const u32 requests = recorder.requests.load(std::memory_order_acquire);
             const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
             if (accepts > expected || requests > expected || sends > expected) {
-                error = "generated-RUT #316 forward recorder exceeded its exact upstream count";
+                error = std::string("generated-RUT ") + profile.issue +
+                        " forward recorder exceeded its exact upstream count";
                 return false;
             }
             if (accepts == expected && requests == expected && sends == expected) return true;
             usleep(1000);
         }
-        error = "timed out waiting for generated-RUT #316 exact forward upstream count";
+        error = std::string("timed out waiting for generated-RUT ") + profile.issue +
+                " exact forward upstream count";
         return false;
     };
 
     Recorder redirect_recorder;
     redirect_recorder.observe_extra_requests_until_stop = true;
     if (!redirect_recorder.setup(backend_port)) {
-        error = "failed to start generated-RUT #316 redirect zero-upstream recorder";
+        error = std::string("failed to start generated-RUT ") + profile.issue +
+                " redirect zero-upstream recorder";
         return false;
     }
     ChildGuard rut;
     if (!spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
                      temp.rut_log,
                      rut.child)) {
-        error = "failed to start converter-generated ordinary RUT for #316 differential";
+        error = std::string("failed to start converter-generated ordinary RUT for ") +
+                profile.issue + " differential";
         return false;
     }
     if (!wait_ready(frontend_port, rut.child, error) ||
@@ -5359,14 +5378,14 @@ static bool run_generated_api_non_root_proxy_uri_side(
         return false;
 
     for (size_t i = 3; i < 5; i++) {
-        const std::vector<char> expected =
-            expected_api_redirect(frontend_port, i == 3 ? "" : "?x=1");
+        const std::vector<char> expected = expected_clean_proxy_location_redirect(
+            frontend_port, profile.location, i == 3 ? "" : "?x=1");
         if (!send_vector(rut.child, i, expected)) return false;
         if (redirect_recorder.accepted.load(std::memory_order_acquire) != 0 ||
             redirect_recorder.requests.load(std::memory_order_acquire) != 0 ||
             redirect_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
-            error = std::string("generated-RUT #316 redirect unexpectedly reached upstream: ") +
-                    kTargets[i];
+            error = std::string("generated-RUT ") + profile.issue +
+                    " redirect unexpectedly reached upstream: " + profile.targets[i];
             return false;
         }
     }
@@ -5383,7 +5402,8 @@ static bool run_generated_api_non_root_proxy_uri_side(
         observation.redirect_sends != 0 ||
         redirect_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
         !redirect_recorder.history.empty() || !redirect_recorder.request.empty()) {
-        error = "generated-RUT #316 redirect recorder did not settle with zero upstream activity";
+        error = std::string("generated-RUT ") + profile.issue +
+                " redirect recorder did not settle with zero upstream activity";
         return false;
     }
 
@@ -5391,7 +5411,9 @@ static bool run_generated_api_non_root_proxy_uri_side(
     forward_recorder.observe_extra_requests_until_stop = true;
     if (!forward_recorder.setup(backend_port, 3, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
         !wait_recorder_live(forward_recorder, rut.child, "forward")) {
-        if (error.empty()) error = "failed to start generated-RUT #316 forward recorder";
+        if (error.empty())
+            error =
+                std::string("failed to start generated-RUT ") + profile.issue + " forward recorder";
         return false;
     }
     const std::vector<char> success(
@@ -5405,7 +5427,8 @@ static bool run_generated_api_non_root_proxy_uri_side(
     if (!observe_exact_count(forward_recorder, rut.child, 3, "live no-fourth-forward window"))
         return false;
     if (!stop_child(rut.child)) {
-        error = "failed to stop converter-generated ordinary RUT after #316 differential";
+        error = std::string("failed to stop converter-generated ordinary RUT after ") +
+                profile.issue + " differential";
         return false;
     }
     forward_recorder.stop();
@@ -5422,20 +5445,22 @@ static bool run_generated_api_non_root_proxy_uri_side(
         !forward_recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
         !forward_recorder.response_connection_closed.load(std::memory_order_acquire) ||
         observation.forward_history.size() != 3) {
-        error = "generated-RUT #316 forward recorder did not settle at exactly three episodes";
+        error = std::string("generated-RUT ") + profile.issue +
+                " forward recorder did not settle at exactly three episodes";
         return false;
     }
 
     std::vector<std::vector<char>> expected_history;
     expected_history.reserve(3);
-    for (const char* target : kForwardTargets) {
+    for (const char* target : profile.forward_targets) {
         const std::string request = std::string("GET ") + target + " HTTP/1.1\r\n" +
                                     "Host: 127.0.0.1:" + std::to_string(backend_port) +
                                     "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
         expected_history.emplace_back(request.begin(), request.end());
     }
     if (observation.forward_history != expected_history) {
-        error = "generated-RUT #316 did not preserve the exact /v1/ upstream request wires";
+        error = std::string("generated-RUT ") + profile.issue +
+                " did not preserve the exact clean proxy upstream request wires";
         return false;
     }
     return true;
@@ -5512,8 +5537,13 @@ static bool run_converter_api_non_root_proxy_uri_differential(
 
     if (!run_pinned_api_non_root_proxy_uri_oracle(
             frontend_port, backend_port, temp, container_name, "diff", nginx_observation, error) ||
-        !run_generated_api_non_root_proxy_uri_side(
-            frontend_port, backend_port, temp, rut_path, rut_observation, error))
+        !run_generated_clean_proxy_uri_side(frontend_port,
+                                            backend_port,
+                                            temp,
+                                            rut_path,
+                                            kApiV1ProxyUriOracleProfile,
+                                            rut_observation,
+                                            error))
         return false;
 
     if (nginx_observation.wires.size() != 5 || rut_observation.wires.size() != 5 ||
@@ -5529,6 +5559,125 @@ static bool run_converter_api_non_root_proxy_uri_differential(
         if (!normalize_date(nginx_normalized) || !normalize_date(rut_normalized) ||
             nginx_normalized != rut_normalized) {
             error = "#316 pinned-nginx and converter-generated RUT wire mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_converter_service_root_proxy_uri_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    ApiNonRootProxyUriOracleObservation& nginx_observation,
+    ApiNonRootProxyUriOracleObservation& rut_observation,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "converter-generated #317 differential requires an executable absolute RUT path";
+        return false;
+    }
+
+    // This fragment is the only nginx semantic input. Its borrowed semantic
+    // model is lowered verbatim to ordinary RUT and executed by the public CLI.
+    const std::string fragment = make_service_root_proxy_uri_fragment(frontend_port, backend_port);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#317 accepted nginx fragment did not parse";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& location = server.location;
+    const auto& proxy = location.proxy_pass;
+    if (server.listen.port != frontend_port || !location.path.eq(rut::lit_str("/service/")) ||
+        location.path.ptr != fragment.data() + location.path_span.start ||
+        location.path_span.end - location.path_span.start != location.path.len ||
+        location.path_span.line != 3u || location.path_span.col != 12u ||
+        location.span.start >= location.path_span.start ||
+        location.path_span.end >= proxy.span.start || !proxy.has_uri ||
+        !proxy.uri.eq(rut::lit_str("/")) ||
+        proxy.uri.ptr != fragment.data() + proxy.uri_span.start ||
+        proxy.uri_span.end - proxy.uri_span.start != proxy.uri.len || proxy.uri_span.line != 4u ||
+        proxy.uri_span.start < proxy.span.start || proxy.uri_span.end >= proxy.span.end ||
+        proxy.port != backend_port || server.exact_local_return.present ||
+        server.exact_absolute_redirect.present) {
+        error = "#317 shared fragment did not reach the genuine bounded /service/ -> / model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#317 accepted nginx semantic model failed converter lowering";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    const std::string rut_source(generated.ptr, generated.len);
+    const auto count_literal = [&](const char* literal) {
+        size_t count = 0;
+        for (size_t offset = 0;;) {
+            offset = rut_source.find(literal, offset);
+            if (offset == std::string::npos) return count;
+            count++;
+            offset += strlen(literal);
+        }
+    };
+    static constexpr char kTransform[] =
+        "            strip_prefix: \"/service/\",\n"
+        "            replace_prefix: \"/\"";
+    if (count_literal("route \"/service\" {") != 1 || count_literal(kTransform) != 1 ||
+        count_literal("return forward(nginx_upstream, target_transform: {") != 1 ||
+        count_literal("target_path: \"/service/\"") != 1 ||
+        rut_source.find("proxy_pass") != std::string::npos ||
+        rut_source.find("nginx.conf") != std::string::npos) {
+        error =
+            "#317 converter output did not contain exactly one ordinary-RUT /service/ -> / "
+            "transform and automatic slash redirect";
+        return false;
+    }
+    if (!write_file(temp.source, generated.ptr, generated.len)) {
+        error = "failed to write #317 converter-generated ordinary RUT source verbatim";
+        return false;
+    }
+
+    if (!run_pinned_clean_proxy_uri_oracle(frontend_port,
+                                           backend_port,
+                                           temp,
+                                           container_name,
+                                           "diff",
+                                           kServiceRootProxyUriOracleProfile,
+                                           nginx_observation,
+                                           error) ||
+        !run_generated_clean_proxy_uri_side(frontend_port,
+                                            backend_port,
+                                            temp,
+                                            rut_path,
+                                            kServiceRootProxyUriOracleProfile,
+                                            rut_observation,
+                                            error))
+        return false;
+
+    const auto exact_counts = [](const ApiNonRootProxyUriOracleObservation& observation) {
+        return observation.redirect_accepts == 0 && observation.redirect_requests == 0 &&
+               observation.redirect_sends == 0 && observation.forward_accepts == 3 &&
+               observation.forward_requests == 3 && observation.forward_sends == 3;
+    };
+    if (!exact_counts(nginx_observation) || !exact_counts(rut_observation) ||
+        nginx_observation.wires.size() != 5 || rut_observation.wires.size() != 5 ||
+        nginx_observation.forward_history.size() != 3 ||
+        rut_observation.forward_history.size() != 3 ||
+        nginx_observation.forward_history != rut_observation.forward_history) {
+        error =
+            "#317 nginx/RUT vector, exact upstream count, or byte-exact forward-history "
+            "cardinality mismatch";
+        return false;
+    }
+    for (size_t i = 0; i < 5; i++) {
+        std::vector<char> nginx_normalized = nginx_observation.wires[i];
+        std::vector<char> rut_normalized = rut_observation.wires[i];
+        if (!normalize_date(nginx_normalized) || !normalize_date(rut_normalized) ||
+            nginx_normalized != rut_normalized) {
+            error = "#317 pinned-nginx and converter-generated RUT wire mismatch at vector " +
                     std::to_string(i + 1u);
             return false;
         }
@@ -11823,6 +11972,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--service-root-proxy-uri-oracle") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
+    const bool converter_service_root_proxy_uri_differential =
+        argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
     const bool converter_root_proxy_trace_differential =
         argc == 3 && strcmp(argv[1], "--converter-root-proxy-trace-differential") == 0;
     const bool converter_api_proxy_trace_differential =
@@ -11860,8 +12011,8 @@ int main(int argc, char** argv) {
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !converter_api_non_root_proxy_uri_differential &&
-         !strict_local_response_differential && !converter_root_proxy_trace_differential &&
-         !converter_api_proxy_trace_differential &&
+         !converter_service_root_proxy_uri_differential && !strict_local_response_differential &&
+         !converter_root_proxy_trace_differential && !converter_api_proxy_trace_differential &&
          !converter_exact_absolute_redirect_differential &&
          !converter_exact_absolute_redirect_302_differential &&
          !converter_exact_local_differential && !exact_strict_route_differential &&
@@ -11876,6 +12027,7 @@ int main(int argc, char** argv) {
         (converter_root_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
+        (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
@@ -11903,6 +12055,9 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-service-root-proxy-uri-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-root-proxy-trace-differential "
                      "<absolute-rut-executable>\n"
@@ -12315,6 +12470,47 @@ int main(int argc, char** argv) {
                "redirect upstream activity plus exactly three forward episodes and no fourth, "
                "while the unique #316-diff nginx access scope proved exactly five records and "
                "zero upstream failures (bounded #316 converter equivalence only; excludes "
+               "wider prefixes, normalization-sensitive targets, other methods, framing/body, "
+               "reuse/pipeline, TLS/H2, and multiple locations or servers)\n";
+        return 0;
+    }
+
+    if (converter_service_root_proxy_uri_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-converter-service-root-uri-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        ApiNonRootProxyUriOracleObservation nginx_observation;
+        ApiNonRootProxyUriOracleObservation rut_observation;
+        std::string differential_error;
+        if (!run_converter_service_root_proxy_uri_differential(frontend_port,
+                                                               backend_port,
+                                                               temp,
+                                                               container_name,
+                                                               argv[2],
+                                                               nginx_observation,
+                                                               rut_observation,
+                                                               differential_error)) {
+            std::cerr << "FAIL [converter-generated /service/ -> / differential]: "
+                      << differential_error << "\n";
+            dump_service_root_proxy_uri_oracle_observation(nginx_observation);
+            dump_service_root_proxy_uri_oracle_observation(rut_observation);
+            dump_log(temp.nginx_config, "#317 differential pinned nginx config");
+            dump_log(temp.source, "#317 converter-generated ordinary RUT source");
+            dump_log(temp.nginx_log, "#317 differential pinned nginx log");
+            dump_log(temp.rut_log, "#317 differential converter-generated RUT log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: one /service/ -> / nginx fragment passed through the independent parser/"
+               "semantic model/converter to ordinary RUT and the public production rut CLI; "
+               "pinned nginx 1.29.7 and generated RUT matched all five exact Date-normalized "
+               "client wires, including three 200/2 forwards with byte-exact /, /x, and "
+               "/x?y=1 backend histories and two 301/169 dynamic-listener-port, "
+               "query-preserving slash redirects; both sides proved live and settled zero "
+               "redirect upstream activity plus exactly three forward episodes and no fourth, "
+               "while the unique #317-diff nginx access scope proved exactly five records and "
+               "zero upstream failures (bounded #317 converter equivalence only; excludes "
                "wider prefixes, normalization-sensitive targets, other methods, framing/body, "
                "reuse/pipeline, TLS/H2, and multiple locations or servers)\n";
         return 0;
