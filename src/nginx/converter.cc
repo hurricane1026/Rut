@@ -239,7 +239,6 @@ bool listener_endpoint_matches(uintptr_t source_base,
 
 FrontendResult<bool> validate_listener(const Server& server,
                                        ProxyLocationProfile proxy_profile,
-                                       bool has_exact_local_return,
                                        bool has_exact_absolute_redirect) {
     static constexpr char kIpv4WildcardPrefix[] = "0.0.0.0:";
     static constexpr char kAsteriskWildcardPrefix[] = "*:";
@@ -315,8 +314,7 @@ FrontendResult<bool> validate_listener(const Server& server,
                                    sizeof(kExactLoopbackPrefix) - 1u,
                                    listener.port))
         return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
-    if (proxy_profile != ProxyLocationProfile::RootWithoutUri || has_exact_local_return ||
-        has_exact_absolute_redirect)
+    if (proxy_profile != ProxyLocationProfile::RootWithoutUri || has_exact_absolute_redirect)
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
     return true;
@@ -1275,10 +1273,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
-    auto listener = validate_listener(server,
-                                      proxy_location.value(),
-                                      exact_local_return.value(),
-                                      exact_absolute_redirect.value());
+    auto listener =
+        validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
     if (!listener) return core::make_unexpected(listener.error());
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)

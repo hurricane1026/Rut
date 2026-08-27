@@ -789,6 +789,174 @@ TEST(serve_loader, nginx_exact_loopback_no_content_output_is_owned_and_reuses_cl
     std::filesystem::remove(path);
 }
 
+TEST(serve_loader, nginx_exact_loopback_bodyful_output_is_owned_and_reuses_cleanly) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_bodyful";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8082; "
+            "location = /static { return 200 \"successor-static\"; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError err;
+    const auto check_root_inventory = [&](u16 expected_backend_port) {
+        REQUIRE_EQ(program.config.route_count, 3u);
+        u32 head_count = 0u;
+        u32 get_count = 0u;
+        u32 any_count = 0u;
+        for (u32 i = 0u; i < program.config.route_count; i++) {
+            const RouteEntry& route = program.config.routes[i];
+            CHECK_EQ(route.path_len, 1u);
+            CHECK_EQ(route.path[0], '/');
+            CHECK(route.action == RouteAction::JitHandler);
+            CHECK_FALSE(route.needs_req_body);
+            if (route.method == kRouteMethodHead) head_count++;
+            if (route.method == kRouteMethodGet) get_count++;
+            if (route.method == kRouteMethodAny) any_count++;
+        }
+        CHECK_EQ(head_count, 1u);
+        CHECK_EQ(get_count, 1u);
+        CHECK_EQ(any_count, 1u);
+        static constexpr u8 kRoot[] = {'/'};
+        const RouteEntry* head = program.config.match(kRoot, 1u, kRouteMethodHead);
+        const RouteEntry* get = program.config.match(kRoot, 1u, kRouteMethodGet);
+        const RouteEntry* post = program.config.match(kRoot, 1u, kRouteMethodPost);
+        REQUIRE(head != nullptr);
+        REQUIRE(get != nullptr);
+        REQUIRE(post != nullptr);
+        CHECK_EQ(head->method, kRouteMethodHead);
+        CHECK_EQ(get->method, kRouteMethodGet);
+        CHECK_EQ(post->method, kRouteMethodAny);
+        CHECK_NE(head, get);
+        CHECK_NE(head, post);
+        CHECK_NE(get, post);
+
+        REQUIRE_EQ(program.config.upstream_count, 1u);
+        const UpstreamTarget& upstream = program.config.upstreams[0];
+        CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+        REQUIRE_EQ(upstream.addr_count, 1u);
+        CHECK_EQ(upstream.addrs[0].sin_family, AF_INET);
+        CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0x7f000001u);
+        CHECK_EQ(ntohs(upstream.addrs[0].sin_port), expected_backend_port);
+    };
+    const auto check_exact_bodyful = [&] {
+        REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 1u);
+        REQUIRE(program.config.strict_local_response_table_is_valid());
+        const auto exact = program.config.match_exact_strict_local_response_views(
+            lit_str("/static"), lit_str("/static"), kRouteMethodGet);
+        REQUIRE(exact.state == ExactStrictLocalResponseMatchState::Match);
+        REQUIRE(program.config.strict_local_response_policy_id_is_owned(exact.policy_id));
+        const auto& binding = program.config.exact_strict_local_response_bindings[0];
+        CHECK_EQ(binding.method, kRouteMethodAny);
+        CHECK_EQ(binding.path_view, ExactPathView::SlashNormalized);
+        CHECK((Str{binding.path, binding.path_len}.eq(lit_str("/static"))));
+        const auto& policy = program.config.strict_local_response_policies[exact.policy_id - 1u];
+        CHECK_EQ(strict_local_response_policy_profile(policy),
+                 StrictLocalResponseProfile::Representation200);
+        CHECK_EQ(policy.status_code, 200u);
+        CHECK(policy.version == StrictLocalResponseVersion::Http11);
+        CHECK(policy.reason.eq(lit_str("OK")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.date == StrictLocalResponseDate::Current);
+        CHECK(policy.content_type.eq(lit_str("text/plain")));
+        CHECK(policy.connection == StrictLocalResponseConnection::Request);
+        CHECK(policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
+        CHECK(policy.body.eq(lit_str("successor-static")));
+        CHECK(program.config.strict_local_response_bytes_owned(policy.reason));
+        CHECK(program.config.strict_local_response_bytes_owned(policy.server));
+        CHECK(program.config.strict_local_response_bytes_owned(policy.content_type));
+        CHECK(program.config.strict_local_response_bytes_owned(policy.body));
+        CHECK(program.config
+                  .match_exact_strict_local_response_views(
+                      lit_str("/"), lit_str("/"), kRouteMethodGet)
+                  .state == ExactStrictLocalResponseMatchState::Miss);
+    };
+
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8082u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    CHECK_NE(program.config.pre_route_policy_id(kRouteMethodTrace), 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodOptions], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodConnect], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodAny], 0u);
+    check_root_inventory(9000u);
+    check_exact_bodyful();
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8082u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_root_inventory(9000u);
+    check_exact_bodyful();
+
+    program.destroy();
+    CHECK_FALSE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.exact_strict_local_response_binding_count, 0u);
+
+    {
+        char nginx_source[] =
+            "server { listen *:8083; "
+            "location / { proxy_pass http://127.0.0.1:9001; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'z', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8083u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.exact_strict_local_response_binding_count, 0u);
+    CHECK_FALSE(program.config.has_exact_strict_local_response_inventory());
+    // TRACE and CONNECT share the same owned 405 policy; OPTIONS and the
+    // method-omitted fallback own the two distinct 400 profiles.
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 3u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    for (u32 i = 0u; i < program.config.strict_local_response_policy_count; i++) {
+        const auto& policy = program.config.strict_local_response_policies[i];
+        CHECK_NE(strict_local_response_policy_profile(policy),
+                 StrictLocalResponseProfile::Representation200);
+        CHECK_FALSE(policy.body.eq(lit_str("successor-static")));
+    }
+    check_root_inventory(9001u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
     const struct {
         const char* name;
