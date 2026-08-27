@@ -11437,8 +11437,8 @@ static bool run_converter_trailing_slash_no_content_differential(
 }
 
 static std::string make_max_boundary_no_content_fragment(u16 frontend_port,
-                                                          u16 backend_port,
-                                                          bool trailing) {
+                                                         u16 backend_port,
+                                                         bool trailing) {
     const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
     const std::string exact_location = "  location = " + key + " { return 204; }\n";
     const std::string root_location =
@@ -11450,10 +11450,10 @@ static std::string make_max_boundary_no_content_fragment(u16 frontend_port,
 }
 
 static bool validate_max_boundary_generated_source(const std::string& source,
-                                                    u16 frontend_port,
-                                                    u16 backend_port,
-                                                    bool trailing,
-                                                    std::string& error) {
+                                                   u16 frontend_port,
+                                                   u16 backend_port,
+                                                   bool trailing,
+                                                   std::string& error) {
     const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
     const std::string other_key = trailing ? max_boundary_raw_key() : max_boundary_trailing_key();
     const std::string exact_tuple =
@@ -11478,15 +11478,19 @@ static bool validate_max_boundary_generated_source(const std::string& source,
         count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
         source.find("?x=1") != std::string::npos || source.find("Host") != std::string::npos ||
         source.find("max-boundary.example") != std::string::npos ||
-        source.find("runtime") != std::string::npos || source.find("proxy_pass") != std::string::npos ||
-        source.find("nginx.conf") != std::string::npos || source.find("propagat") != std::string::npos ||
+        source.find("runtime") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("propagat") != std::string::npos ||
         source.find("NoContent204") != std::string::npos ||
         source.find("strict_local_response") != std::string::npos ||
-        source.find("profile") != std::string::npos || source.find("return 204") != std::string::npos ||
+        source.find("profile") != std::string::npos ||
+        source.find("return 204") != std::string::npos ||
         source.find("nginx::") != std::string::npos ||
         source.find("nginx_compat") != std::string::npos) {
-        error = "#330 Stage 4 generated source was not one exact maximum-boundary public "
-                "SlashNormalized NoContent204 tuple plus the canonical root forwards";
+        error =
+            "#330 Stage 4 generated source was not one exact maximum-boundary public "
+            "SlashNormalized NoContent204 tuple plus the canonical root forwards";
         return false;
     }
     return true;
@@ -11518,8 +11522,7 @@ static bool parse_max_boundary_rut_access_log(const std::string& contents,
             (i < 3u && fields[8] != "s=0") ||
             (i >= 3u && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) ||
                          fields[10] != "s=0"))) {
-            error = "converter-generated #330 Stage 4 access record " +
-                    std::to_string(i + 1u) +
+            error = "converter-generated #330 Stage 4 access record " + std::to_string(i + 1u) +
                     " lost raw target/order/status/size/upstream outcome: " + records[i];
             return false;
         }
@@ -11528,14 +11531,13 @@ static bool parse_max_boundary_rut_access_log(const std::string& contents,
 }
 
 static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
-    const auto replace_once = [](std::string value,
-                                 const std::string& from,
-                                 const std::string& to) {
-        const size_t offset = value.find(from);
-        if (offset == std::string::npos) return std::string{};
-        value.replace(offset, from.size(), to);
-        return value;
-    };
+    const auto replace_once =
+        [](std::string value, const std::string& from, const std::string& to) {
+            const size_t offset = value.find(from);
+            if (offset == std::string::npos) return std::string{};
+            value.replace(offset, from.size(), to);
+            return value;
+        };
     for (const bool trailing : {false, true}) {
         MaxBoundaryNoContentObservation observation;
         observation.trailing = trailing;
@@ -11560,20 +11562,18 @@ static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
         std::string swapped = access;
         swapped.replace(0u,
                         second + 1u,
-                        access.substr(first + 1u, second - first) +
-                            access.substr(0u, first + 1u));
+                        access.substr(first + 1u, second - first) + access.substr(0u, first + 1u));
         if (!parse_max_boundary_rut_access_log(access, observation, sizes, error) ||
             !rejects_access(access + access.substr(0u, first + 1u)) ||
-            !rejects_access(access.substr(0u, access.size() - 1u)) ||
-            !rejects_access(swapped) || !rejects_access(replace_once(access, " 204 ", " 200 ")) ||
+            !rejects_access(access.substr(0u, access.size() - 1u)) || !rejects_access(swapped) ||
+            !rejects_access(replace_once(access, " 204 ", " 200 ")) ||
             !rejects_access(replace_once(access, " 105 ", " 106 ")) ||
             !rejects_access(replace_once(access,
                                          " " + observation.targets[0] + " ",
                                          " " + observation.targets.back() + " ")) ||
-            !rejects_access(replace_once(
-                access,
-                " " + std::to_string(sizes[0]) + " 105 ",
-                " 999999999999999999999999999999999 105 ")) ||
+            !rejects_access(replace_once(access,
+                                         " " + std::to_string(sizes[0]) + " 105 ",
+                                         " 999999999999999999999999999999999 105 ")) ||
             !rejects_access(replace_once(access, " 204 ", " 0204 ")) ||
             !rejects_access(replace_once(access, " nginx_upstream ", " other_upstream ")) ||
             !rejects_access(replace_once(
@@ -11584,8 +11584,7 @@ static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
             return false;
         }
 
-        std::string fragment =
-            make_max_boundary_no_content_fragment(54330u, 54331u, trailing);
+        std::string fragment = make_max_boundary_no_content_fragment(54330u, 54331u, trailing);
         const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
         if (!parsed) {
             error = "#330 Stage 4 source self-check fixture did not parse";
@@ -11600,29 +11599,26 @@ static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
         const std::string canonical(view.ptr, view.len);
         const auto rejects_source = [&](std::string value) {
             std::string detail;
-            return !validate_max_boundary_generated_source(
-                value, 54330u, 54331u, trailing, detail);
+            return !validate_max_boundary_generated_source(value, 54330u, 54331u, trailing, detail);
         };
-        const std::string selector =
-            "route exact slash_normalized GET \"" + observation.key + "\"";
-        if (!validate_max_boundary_generated_source(
-                canonical, 54330u, 54331u, trailing, error) ||
-            !rejects_source(replace_once(canonical, selector, "route exact GET \"" +
-                                                                  observation.key + "\"")) ||
+        const std::string selector = "route exact slash_normalized GET \"" + observation.key + "\"";
+        if (!validate_max_boundary_generated_source(canonical, 54330u, 54331u, trailing, error) ||
+            !rejects_source(
+                replace_once(canonical, selector, "route exact GET \"" + observation.key + "\"")) ||
             !rejects_source(canonical + "route exact GET \"" + observation.key +
                             "?x=1\" { return response() }\n") ||
             !rejects_source(canonical + "if Host == \"max-boundary.example\" {}\n") ||
             !rejects_source(replace_once(canonical, "status: 204", "status: 200")) ||
-            !rejects_source(replace_once(canonical, observation.key,
-                                         trailing ? max_boundary_raw_key()
-                                                  : max_boundary_trailing_key()))) {
+            !rejects_source(
+                replace_once(canonical,
+                             observation.key,
+                             trailing ? max_boundary_raw_key() : max_boundary_trailing_key()))) {
             error = "#330 Stage 4 generated source mutation self-check failed";
             return false;
         }
         std::string normalized = canonical;
         if (!canonicalize_unique_port(normalized, "listen :54330", "listen :FRONTEND") ||
-            !canonicalize_unique_port(
-                normalized, "127.0.0.1:54331", "127.0.0.1:BACKEND")) {
+            !canonicalize_unique_port(normalized, "127.0.0.1:54331", "127.0.0.1:BACKEND")) {
             error = "#330 Stage 4 source port normalization valid self-check failed";
             return false;
         }
@@ -11638,17 +11634,16 @@ static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
     return true;
 }
 
-static bool capture_generated_max_boundary_side(
-    u16 frontend_port,
-    u16 backend_port,
-    TempDir& temp,
-    const char* rut_path,
-    bool trailing,
-    MaxBoundaryNoContentObservation& observation,
-    std::string& generated_source,
-    std::string& error,
-    int* frontend_reservation,
-    int* backend_reservation) {
+static bool capture_generated_max_boundary_side(u16 frontend_port,
+                                                u16 backend_port,
+                                                TempDir& temp,
+                                                const char* rut_path,
+                                                bool trailing,
+                                                MaxBoundaryNoContentObservation& observation,
+                                                std::string& generated_source,
+                                                std::string& error,
+                                                int* frontend_reservation,
+                                                int* backend_reservation) {
     const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
     const std::vector<std::string> targets = max_boundary_targets(trailing);
     const size_t vector_count = trailing ? 5u : 6u;
@@ -11656,8 +11651,9 @@ static bool capture_generated_max_boundary_side(
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
         key.size() != 62u || targets.size() != vector_count || frontend_reservation == nullptr ||
         backend_reservation == nullptr || *frontend_reservation < 0 || *backend_reservation < 0) {
-        error = "converter-generated #330 Stage 4 requires an executable absolute RUT path, "
-                "exact maximum-boundary vectors, and held port reservations";
+        error =
+            "converter-generated #330 Stage 4 requires an executable absolute RUT path, "
+            "exact maximum-boundary vectors, and held port reservations";
         return false;
     }
     std::string fragment =
@@ -11683,7 +11679,8 @@ static bool capture_generated_max_boundary_side(
     const size_t exact_end = fragment.find('}', semicolon);
     const uintptr_t source_base = reinterpret_cast<uintptr_t>(fragment.data());
     const auto same_source = [&](rut::Str value, rut::Span span) {
-        return value.ptr != nullptr && span.end >= span.start && span.end - span.start == value.len &&
+        return value.ptr != nullptr && span.end >= span.start &&
+               span.end - span.start == value.len &&
                reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
     };
     const rut::Str expected_path{key.data(), static_cast<u32>(key.size())};
@@ -11697,9 +11694,10 @@ static bool capture_generated_max_boundary_side(
         proxy.has_uri || proxy.address[0] != 127u || proxy.address[1] != 0u ||
         proxy.address[2] != 0u || proxy.address[3] != 1u || proxy.port != backend_port ||
         !exact.present || !exact.path.eq(expected_path) ||
-        exact.path.ptr != fragment.data() + exact_path || !same_source(exact.path, exact.path_span) ||
-        exact.span.start != exact_location || exact.span.end != exact_end + 1u ||
-        response.status != 204u || response.status_span.start != status_offset ||
+        exact.path.ptr != fragment.data() + exact_path ||
+        !same_source(exact.path, exact.path_span) || exact.span.start != exact_location ||
+        exact.span.end != exact_end + 1u || response.status != 204u ||
+        response.status_span.start != status_offset ||
         response.status_span.end != status_offset + 3u || response.span.start != return_offset ||
         response.span.end != semicolon + 1u ||
         memcmp(fragment.data() + response.status_span.start, "204", 3u) != 0 ||
@@ -11750,8 +11748,8 @@ static bool capture_generated_max_boundary_side(
             requests[i].find("\r\nTransfer-Encoding:") != std::string::npos ||
             requests[i].find("\r\nTE:") != std::string::npos ||
             requests[i].find("\r\nExpect:") != std::string::npos ||
-            requests[i].find("\r\nUpgrade:") != std::string::npos ||
-            header == std::string::npos || header + 4u != requests[i].size()) {
+            requests[i].find("\r\nUpgrade:") != std::string::npos || header == std::string::npos ||
+            header + 4u != requests[i].size()) {
             error = "#330 Stage 4 generated request escaped the fresh bodyless H1.1 domain";
             return false;
         }
@@ -11824,8 +11822,8 @@ static bool capture_generated_max_boundary_side(
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(runtime.child) || !recorder.running.load(std::memory_order_acquire) ||
                 recorder.listener_failed.load(std::memory_order_acquire)) {
-                error = std::string("#330 Stage 4 RUT/recorder failed before ") + phase +
-                        " readiness";
+                error =
+                    std::string("#330 Stage 4 RUT/recorder failed before ") + phase + " readiness";
                 return false;
             }
             if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
@@ -11844,8 +11842,8 @@ static bool capture_generated_max_boundary_side(
                 recorder.accepted.load(std::memory_order_acquire) != expected ||
                 recorder.requests.load(std::memory_order_acquire) != expected ||
                 recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
-                error = std::string("#330 Stage 4 unexpected process/upstream state during ") +
-                        phase;
+                error =
+                    std::string("#330 Stage 4 unexpected process/upstream state during ") + phase;
                 return false;
             }
             if (std::chrono::steady_clock::now() >= deadline) return true;
@@ -11950,10 +11948,8 @@ static bool capture_generated_max_boundary_side(
         if (fallback.accepted.load(std::memory_order_acquire) != expected ||
             fallback.requests.load(std::memory_order_acquire) != expected ||
             fallback.response_send_all_calls.load(std::memory_order_acquire) != expected ||
-            !observe(fallback,
-                     expected,
-                     "ordered fallback count",
-                     std::chrono::milliseconds(100))) {
+            !observe(
+                fallback, expected, "ordered fallback count", std::chrono::milliseconds(100))) {
             error = "#330 Stage 4 fallback episode count did not settle exactly";
             return false;
         }
@@ -11975,9 +11971,9 @@ static bool capture_generated_max_boundary_side(
     if (fallback.thread_alive.load(std::memory_order_acquire) ||
         fallback.listener_failed.load(std::memory_order_acquire) ||
         observation.forward_accepts != fallback_count ||
-        observation.forward_requests != fallback_count || observation.forward_sends != fallback_count ||
-        !fallback.response_send_succeeded.load() || !fallback.response_clean_shutdown.load() ||
-        !fallback.response_connection_closed.load() ||
+        observation.forward_requests != fallback_count ||
+        observation.forward_sends != fallback_count || !fallback.response_send_succeeded.load() ||
+        !fallback.response_clean_shutdown.load() || !fallback.response_connection_closed.load() ||
         observation.forward_history.size() != fallback_count) {
         error = "#330 Stage 4 fallback recorder lifecycle/count was incomplete";
         return false;
@@ -11993,8 +11989,7 @@ static bool capture_generated_max_boundary_side(
                                   "converter-generated #330 Stage 4 access log",
                                   access_contents,
                                   error) ||
-        !parse_max_boundary_rut_access_log(
-            access_contents, observation, request_sizes, error) ||
+        !parse_max_boundary_rut_access_log(access_contents, observation, request_sizes, error) ||
         !read_exact_return204_log(temp.rut_log,
                                   "converter-generated #330 Stage 4 runtime log",
                                   runtime_contents,
@@ -12010,9 +12005,8 @@ static bool canonicalize_max_boundary_source(std::string& source,
                                              const std::string& key) {
     return canonicalize_unique_port(
                source, "listen :" + std::to_string(frontend_port), "listen :FRONTEND") &&
-           canonicalize_unique_port(source,
-                                    "127.0.0.1:" + std::to_string(backend_port),
-                                    "127.0.0.1:BACKEND") &&
+           canonicalize_unique_port(
+               source, "127.0.0.1:" + std::to_string(backend_port), "127.0.0.1:BACKEND") &&
            canonicalize_unique_port(source, key, "MAX_BOUNDARY_KEY");
 }
 
@@ -12094,8 +12088,8 @@ static bool validate_max_boundary_four_way(const MaxBoundaryNoContentObservation
         return false;
     }
     for (const size_t profile : {0u, 2u}) {
-        const auto pinned_history = canonicalize_trailing_no_content_backend_history(
-            observations[profile].forward_history);
+        const auto pinned_history =
+            canonicalize_trailing_no_content_backend_history(observations[profile].forward_history);
         const auto generated_history = canonicalize_trailing_no_content_backend_history(
             observations[profile + 1u].forward_history);
         const size_t expected_count = profile == 0u ? 3u : 2u;
@@ -12108,8 +12102,7 @@ static bool validate_max_boundary_four_way(const MaxBoundaryNoContentObservation
             std::vector<char> generated = observations[profile + 1u].wires[vector];
             if (!normalize_date(pinned) || !normalize_date(generated) || generated != pinned) {
                 error = "#330 Stage 4 pinned/generated Date-normalized wire mismatch at profile " +
-                        std::to_string(profile / 2u) + " vector " +
-                        std::to_string(vector + 1u);
+                        std::to_string(profile / 2u) + " vector " + std::to_string(vector + 1u);
                 return false;
             }
         }
@@ -12127,8 +12120,8 @@ static bool run_max_boundary_four_way_self_checks(std::string& error) {
     std::string sources[2];
     for (size_t i = 0u; i < 2u; i++) {
         const bool trailing = i == 1u;
-        std::string fragment = make_max_boundary_no_content_fragment(
-            ports[2u + i * 4u], ports[3u + i * 4u], trailing);
+        std::string fragment =
+            make_max_boundary_no_content_fragment(ports[2u + i * 4u], ports[3u + i * 4u], trailing);
         const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
         if (!parsed) {
             error = "#330 Stage 4 four-way self-check fragment did not parse";
@@ -12214,8 +12207,9 @@ static bool run_max_boundary_four_way_self_checks(std::string& error) {
     return true;
 }
 
-static bool run_converter_max_boundary_no_content_differential(
-    const std::string& container_prefix, const char* rut_path, std::string& error) {
+static bool run_converter_max_boundary_no_content_differential(const std::string& container_prefix,
+                                                               const char* rut_path,
+                                                               std::string& error) {
     struct ReservedPorts {
         int fds[8];
         ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
@@ -12286,15 +12280,15 @@ static bool run_converter_max_boundary_no_content_differential(
                                           &reservations.fds[1]))
         return failed_side("pinned non_trailing");
     if (!capture_generated_max_boundary_side(ports[2],
-                                              ports[3],
-                                              temps[1],
-                                              rut_path,
-                                              false,
-                                              observations[1],
-                                              sources[0],
-                                              error,
-                                              &reservations.fds[2],
-                                              &reservations.fds[3]))
+                                             ports[3],
+                                             temps[1],
+                                             rut_path,
+                                             false,
+                                             observations[1],
+                                             sources[0],
+                                             error,
+                                             &reservations.fds[2],
+                                             &reservations.fds[3]))
         return failed_side("generated non_trailing");
     if (!capture_pinned_max_boundary_side(ports[4],
                                           ports[5],
@@ -12307,15 +12301,15 @@ static bool run_converter_max_boundary_no_content_differential(
                                           &reservations.fds[5]))
         return failed_side("pinned trailing");
     if (!capture_generated_max_boundary_side(ports[6],
-                                              ports[7],
-                                              temps[3],
-                                              rut_path,
-                                              true,
-                                              observations[3],
-                                              sources[1],
-                                              error,
-                                              &reservations.fds[6],
-                                              &reservations.fds[7]))
+                                             ports[7],
+                                             temps[3],
+                                             rut_path,
+                                             true,
+                                             observations[3],
+                                             sources[1],
+                                             error,
+                                             &reservations.fds[6],
+                                             &reservations.fds[7]))
         return failed_side("generated trailing");
     return validate_max_boundary_four_way(observations, sources, ports, error);
 }
@@ -22236,8 +22230,8 @@ int main(int argc, char** argv) {
         }
         if (converter_max_boundary_no_content_differential &&
             !run_max_boundary_generated_parser_self_checks(parser_error)) {
-            std::cerr << "FAIL [#330 Stage 4 generated source/access self-check]: "
-                      << parser_error << "\n";
+            std::cerr << "FAIL [#330 Stage 4 generated source/access self-check]: " << parser_error
+                      << "\n";
             return 1;
         }
         if (converter_max_boundary_no_content_differential &&
