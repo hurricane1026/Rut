@@ -128,6 +128,15 @@ bool source_borrow_is_coherent(Str text, const Span& span, uintptr_t source_base
     return reinterpret_cast<uintptr_t>(text.ptr) == source_base + span.start;
 }
 
+// Return a byte from the already-proven borrowed nginx source. Callers must
+// establish common-source provenance, offset/range bounds, and integer-overflow
+// safety before calling this helper. It deliberately performs no validation or
+// read-side checks of its own.
+const char* trusted_source_at(uintptr_t source_base, u32 offset) {
+    return reinterpret_cast<const char*>(  // NOLINT(performance-no-int-to-ptr)
+        source_base + offset);
+}
+
 bool source_position_is_coherent(uintptr_t source_base,
                                  const Span& source_span,
                                  const Span& inner_span) {
@@ -136,7 +145,7 @@ bool source_position_is_coherent(uintptr_t source_base,
     u32 line = source_span.line;
     u32 col = source_span.col;
     for (u32 pos = source_span.start; pos < inner_span.start; pos++) {
-        const char value = *reinterpret_cast<const char*>(source_base + pos);
+        const char value = *trusted_source_at(source_base, pos);
         if (value == '\n') {
             if (line == 0xFFFFFFFFu) return false;
             line++;
@@ -156,11 +165,9 @@ constexpr bool source_byte_is_lexer_space(char value) {
 
 bool advance_trusted_source_gap(uintptr_t source_base, u32& pos, u32 end) {
     while (pos < end) {
-        while (pos < end &&
-               source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + pos)))
-            pos++;
-        if (pos == end || *reinterpret_cast<const char*>(source_base + pos) != '#') return true;
-        while (pos < end && *reinterpret_cast<const char*>(source_base + pos) != '\n') pos++;
+        while (pos < end && source_byte_is_lexer_space(*trusted_source_at(source_base, pos))) pos++;
+        if (pos == end || *trusted_source_at(source_base, pos) != '#') return true;
+        while (pos < end && *trusted_source_at(source_base, pos) != '\n') pos++;
         if (pos == end) return false;
     }
     return true;
@@ -558,28 +565,27 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
     if (location_prefix_len <= 8u)
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
-    const Str location_keyword{reinterpret_cast<const char*>(source_base + location.span.start),
-                               8u};
+    const Str location_keyword{trusted_source_at(source_base, location.span.start), 8u};
     if (!eq(location_keyword, "location", 8u))
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
 
     u32 cursor = location.span.start + 8u;
     if (cursor >= location.path_span.start ||
-        (!source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + cursor)) &&
-         *reinterpret_cast<const char*>(source_base + cursor) != '#'))
+        (!source_byte_is_lexer_space(*trusted_source_at(source_base, cursor)) &&
+         *trusted_source_at(source_base, cursor) != '#'))
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
     const u32 keyword_gap_start = cursor;
     if (!advance_trusted_source_gap(source_base, cursor, location.path_span.start) ||
         cursor == keyword_gap_start || cursor >= location.path_span.start ||
-        *reinterpret_cast<const char*>(source_base + cursor) != '=')
+        *trusted_source_at(source_base, cursor) != '=')
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
     cursor++;
     if (cursor >= location.path_span.start ||
-        (!source_byte_is_lexer_space(*reinterpret_cast<const char*>(source_base + cursor)) &&
-         *reinterpret_cast<const char*>(source_base + cursor) != '#'))
+        (!source_byte_is_lexer_space(*trusted_source_at(source_base, cursor)) &&
+         *trusted_source_at(source_base, cursor) != '#'))
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
     const u32 equals_gap_start = cursor;
@@ -589,12 +595,11 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
                            lit_str("invalid exact no-content return location shell"));
 
     cursor = location.path_span.end;
-    if (*reinterpret_cast<const char*>(source_base + cursor) == '#')
+    if (*trusted_source_at(source_base, cursor) == '#')
         return unsupported(location.path_span,
                            lit_str("exact local return path is outside the bounded clean profile"));
     if (!advance_trusted_source_gap(source_base, cursor, response.span.start) ||
-        cursor >= response.span.start ||
-        *reinterpret_cast<const char*>(source_base + cursor) != '{')
+        cursor >= response.span.start || *trusted_source_at(source_base, cursor) != '{')
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
     cursor++;
@@ -604,28 +609,23 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
 
     cursor = response.span.end;
     if (!advance_trusted_source_gap(source_base, cursor, location.span.end) ||
-        cursor >= location.span.end ||
-        *reinterpret_cast<const char*>(source_base + cursor) != '}' ||
+        cursor >= location.span.end || *trusted_source_at(source_base, cursor) != '}' ||
         cursor + 1u != location.span.end)
         return unsupported(location.span,
                            lit_str("invalid exact no-content return location shell"));
 
-    const Str status_text{reinterpret_cast<const char*>(source_base + response.status_span.start),
-                          3u};
+    const Str status_text{trusted_source_at(source_base, response.status_span.start), 3u};
     if (!eq(status_text, "204", 3u))
         return unsupported(response.status_span,
                            lit_str("invalid exact no-content return status literal"));
-    const Str directive_keyword{reinterpret_cast<const char*>(source_base + response.span.start),
-                                6u};
+    const Str directive_keyword{trusted_source_at(source_base, response.span.start), 6u};
     if (response.status_span.start - response.span.start <= 6u ||
         !eq(directive_keyword, "return", 6u))
         return unsupported(response.span,
                            lit_str("invalid exact no-content return directive delimiter"));
-    const char after_keyword =
-        *reinterpret_cast<const char*>(source_base + response.span.start + 6u);
-    const char before_status =
-        *reinterpret_cast<const char*>(source_base + response.status_span.start - 1u);
-    const char terminator = *reinterpret_cast<const char*>(source_base + response.span.end - 1u);
+    const char after_keyword = *trusted_source_at(source_base, response.span.start + 6u);
+    const char before_status = *trusted_source_at(source_base, response.status_span.start - 1u);
+    const char terminator = *trusted_source_at(source_base, response.span.end - 1u);
     const bool after_keyword_delimits =
         source_byte_is_lexer_space(after_keyword) || after_keyword == '#';
     const bool before_status_delimits = source_byte_is_lexer_space(before_status);
@@ -633,7 +633,7 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
     const u32 before_terminator = response.span.end - 1u;
     const bool status_has_adjacent_comment =
         after_status_start < before_terminator &&
-        *reinterpret_cast<const char*>(source_base + after_status_start) == '#';
+        *trusted_source_at(source_base, after_status_start) == '#';
     if (!after_keyword_delimits || !before_status_delimits || terminator != ';' ||
         !trusted_source_gap_is_exact(
             source_base, response.span.start + 6u, response.status_span.start) ||
@@ -784,9 +784,8 @@ FrontendResult<bool> validate_exact_local_return(const Server& server) {
     // source positions are coherent may the bytes adjacent to the borrowed
     // body be trusted. The semantic model represents the raw quote interior,
     // so both delimiters are part of its provenance contract.
-    const char opening_quote =
-        *reinterpret_cast<const char*>(source_base + response.body_span.start - 1u);
-    const char closing_quote = *reinterpret_cast<const char*>(source_base + response.body_span.end);
+    const char opening_quote = *trusted_source_at(source_base, response.body_span.start - 1u);
+    const char closing_quote = *trusted_source_at(source_base, response.body_span.end);
     if (opening_quote != '"' || closing_quote != '"')
         return unsupported(response.body_span,
                            lit_str("invalid exact local return body delimiters"));
