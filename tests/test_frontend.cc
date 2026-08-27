@@ -6,6 +6,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
 #include "rut/runtime/route_method.h"
 #include "test.h"
@@ -34397,6 +34398,62 @@ route GET "/api" {
     rir.destroy();
 }
 
+TEST(frontend, query_bearing_target_transform_reaches_owned_config_after_source_destruction) {
+    auto config = std::make_unique<RouteConfig>();
+    {
+        std::string source =
+            "upstream backend at \"127.0.0.1:9000\"\n"
+            "route GET \"/api\" { return forward(backend, target_transform: { strip_prefix: "
+            "\"/api/\", replace_prefix: \"/v1/?fixed=1\" }) }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto* statement = ast->items[1].route.statements[0];
+        REQUIRE(statement != nullptr);
+        REQUIRE(statement->has_forward_target_transform);
+        CHECK(statement->forward_target_transform.strip_prefix.eq(lit("/api/")));
+        CHECK(statement->forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& hir_term = hir->routes[0].control.direct_term;
+        REQUIRE(hir_term.has_forward_target_transform);
+        CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+        CHECK(hir_term.forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        const auto& mir_term = mir->functions[0].blocks[0].term;
+        REQUIRE(mir_term.has_forward_target_transform);
+        CHECK(mir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+        CHECK(mir_term.forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.target_transform_count, 1u);
+        CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+        CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit("/v1/?fixed=1")));
+        REQUIRE(populate_route_config(*config, rir.module));
+        memset(source.data(), 'x', source.size());
+        rir.destroy();
+    }
+
+    REQUIRE_EQ(config->target_transform_count, 1u);
+    REQUIRE_EQ(config->target_transform_bytes_used, 17u);
+    CHECK(config->target_transforms[0].strip_prefix.eq(lit("/api/")));
+    CHECK(config->target_transforms[0].replace_prefix.eq(lit("/v1/?fixed=1")));
+    const uintptr_t pool_begin = reinterpret_cast<uintptr_t>(config->target_transform_bytes);
+    const uintptr_t pool_end = pool_begin + config->target_transform_bytes_used;
+    for (Str value :
+         {config->target_transforms[0].strip_prefix, config->target_transforms[0].replace_prefix}) {
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        CHECK(ptr >= pool_begin);
+        CHECK(ptr + value.len <= pool_end);
+    }
+}
+
 TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions) {
     const char* invalid[] = {
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: {}) }\n",
@@ -34414,6 +34471,10 @@ TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions)
         "\"api/\", replace_prefix: \"/\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/?fixed=1\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/v1/?bad#\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", "
         "replace_prefix: \"/\" }) }\n",
@@ -34439,16 +34500,25 @@ TEST(frontend, target_transform_analyzer_defends_forged_spec) {
     const char source[] =
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
         "\"/api/\", replace_prefix: \"/\" }) }\n";
-    auto lexed = lex(lit(source));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto* stmt = ast->items[1].route.statements[0];
-    REQUIRE(stmt != nullptr);
-    stmt->forward_target_transform.strip_prefix = {nullptr, 5};
-    auto hir = analyze_file_heap(ast.value());
-    CHECK_FALSE(hir.has_value());
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    const char query_strip[] = "/api/?fixed=1";
+    const char invalid_query[] = "/v1/?bad#";
+    const ForwardTargetTransformSpec forgeries[] = {
+        {{nullptr, 5}, {"/", 1}},
+        {{query_strip, sizeof(query_strip) - 1}, {"/", 1}},
+        {{"/api/", 5}, {invalid_query, sizeof(invalid_query) - 1}},
+    };
+    for (const auto& forgery : forgeries) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto* stmt = ast->items[1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        stmt->forward_target_transform = forgery;
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }
 
 TEST(frontend, target_transform_rejects_response_mutations_in_direct_and_if_control) {
@@ -34763,6 +34833,38 @@ TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transpar
     REQUIRE(ret != nullptr);
     CHECK_EQ(ret->operand_count, 1u);
     plain.destroy();
+}
+
+TEST(frontend, target_transform_lowering_defends_forged_query_specs) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    const char query_strip[] = "/api/?fixed=1";
+    const char invalid_query[] = "/v1/?bad#";
+    const ForwardTargetTransformSpec forgeries[] = {
+        {{query_strip, sizeof(query_strip) - 1}, {"/", 1}},
+        {{"/api/", 5}, {invalid_query, sizeof(invalid_query) - 1}},
+    };
+
+    for (const auto& forgery : forgeries) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto& term = hir->routes[0].control.direct_term;
+        term.has_forward_target_transform = true;
+        term.forward_target_transform = forgery;
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rir.module.target_transform_count, 0u);
+        rir.destroy();
+    }
 }
 
 TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {

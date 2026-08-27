@@ -4,7 +4,7 @@
 
 namespace rut {
 
-// Foundation-only metadata for a future general forward target transform.
+// Metadata for bounded forward target transforms.
 // IDs are 1-based; zero means no transform. Strings are borrowed by this
 // descriptor and must be copied by the owning RIR/config container.
 static constexpr u32 kMaxForwardTargetTransforms = 16;
@@ -40,9 +40,35 @@ inline bool forward_target_transform_clean_prefix(Str value) {
     return true;
 }
 
+inline bool forward_target_transform_replacement_prefix(Str value) {
+    if (forward_target_transform_clean_prefix(value)) return true;
+    if (value.ptr == nullptr || value.len < 3 || value.len > kMaxForwardTargetTransformPrefixLen)
+        return false;
+
+    u32 query_delimiter = value.len;
+    for (u32 i = 0; i < value.len; i++) {
+        if (value.ptr[i] != '?') continue;
+        if (query_delimiter != value.len) return false;
+        query_delimiter = i;
+    }
+    if (query_delimiter == value.len || query_delimiter + 1 == value.len ||
+        !forward_target_transform_clean_prefix({value.ptr, query_delimiter}))
+        return false;
+
+    for (u32 i = query_delimiter + 1; i < value.len; i++) {
+        const u8 c = static_cast<u8>(value.ptr[i]);
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!alpha && !digit && c != '.' && c != '_' && c != '~' && c != '-' && c != '=' &&
+            c != '&')
+            return false;
+    }
+    return true;
+}
+
 inline bool forward_target_transform_spec_valid(const ForwardTargetTransformSpec& spec) {
     return forward_target_transform_clean_prefix(spec.strip_prefix) &&
-           forward_target_transform_clean_prefix(spec.replace_prefix);
+           forward_target_transform_replacement_prefix(spec.replace_prefix);
 }
 
 inline bool forward_target_transform_id_is_valid(u16 id, u32 count) {

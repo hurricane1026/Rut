@@ -263,7 +263,7 @@ add_test(NAME test_rir COMMAND test_rir)
 set_tests_properties(test_rir PROPERTIES LABELS "unit")
 
 add_executable(test_frontend test_frontend.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-target_link_libraries(test_frontend rut_compiler)
+target_link_libraries(test_frontend rut_compiler rut_runtime)
 target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
