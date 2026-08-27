@@ -547,6 +547,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_trailing_slash_no_content_oracle
+        COMMAND test_nginx_differential --trailing-slash-no-content-oracle
+    )
+    set_tests_properties(test_nginx_trailing_slash_no_content_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_exact_local_body_space_oracle
         COMMAND test_nginx_differential --exact-local-body-space-oracle
     )

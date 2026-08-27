@@ -8721,7 +8721,13 @@ static bool run_converter_bounded_no_content_path_differential(const std::string
 
 struct NormalizedExactTrailingSlashOracleObservation {
     std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
     std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> local_history;
     std::vector<std::vector<char>> forward_history;
     u32 access_records[5]{};
     u32 local_accepts = 0;
@@ -8782,22 +8788,47 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
     const std::string& container_name,
     bool exact_first,
     NormalizedExactTrailingSlashOracleObservation& observation,
-    std::string& error) {
-    static constexpr const char* kTargets[] = {
+    std::string& error,
+    bool no_content_return204 = false,
+    const std::string* separate_access_path = nullptr,
+    int* frontend_reservation = nullptr,
+    int* backend_reservation = nullptr) {
+    static constexpr const char* kStatus200Targets[] = {
         "/health/check/", "/health/check/?x=1", "/health/check//", "/health/check", "/"};
+    static constexpr const char* kStatus204Targets[] = {
+        "/healthz/", "/healthz/?x=1", "/healthz//", "/healthz", "/"};
     static constexpr bool kLocal[] = {true, true, true, false, false};
-    static_assert(sizeof(kTargets) / sizeof(kTargets[0]) == sizeof(kLocal) / sizeof(kLocal[0]));
+    static_assert(sizeof(kStatus200Targets) / sizeof(kStatus200Targets[0]) ==
+                  sizeof(kLocal) / sizeof(kLocal[0]));
+    static_assert(sizeof(kStatus204Targets) / sizeof(kStatus204Targets[0]) ==
+                  sizeof(kLocal) / sizeof(kLocal[0]));
+    const char* const* targets = no_content_return204 ? kStatus204Targets : kStatus200Targets;
+    const char* issue = no_content_return204 ? "#329" : "#320";
+    const char* host =
+        no_content_return204 ? "trailing-return204.example" : "normalized-exact.example";
+    if (no_content_return204 &&
+        (separate_access_path == nullptr || separate_access_path->empty())) {
+        error = "#329 pinned oracle requires a separate bounded access-log path";
+        return false;
+    }
+    if ((frontend_reservation == nullptr) != (backend_reservation == nullptr) ||
+        (frontend_reservation != nullptr &&
+         (*frontend_reservation < 0 || *backend_reservation < 0))) {
+        error = std::string(issue) + " pinned oracle received incomplete port reservations";
+        return false;
+    }
 
-    const auto make_request = [](const char* target) {
-        return std::string("GET ") + target +
-               " HTTP/1.1\r\nHost: normalized-exact.example\r\nConnection: close\r\n\r\n";
+    const auto make_request = [host](const char* target) {
+        return std::string("GET ") + target + " HTTP/1.1\r\nHost: " + host +
+               "\r\nConnection: close\r\n\r\n";
     };
-    for (const char* target : kTargets) {
+    for (size_t i = 0; i < 5u; i++) {
+        const char* target = targets[i];
         const std::string request = make_request(target);
         const size_t header_end = request.find("\r\n\r\n");
         if (request.rfind(std::string("GET ") + target + " HTTP/1.1\r\n", 0) != 0 ||
             request.find('#') != std::string::npos ||
-            request.find("\r\nHost: normalized-exact.example\r\n") == std::string::npos ||
+            request.find(std::string("\r\nHost: ") + host + "\r\n") == std::string::npos ||
             request.find("\r\nConnection: close\r\n") == std::string::npos ||
             request.find("\r\nContent-Length:") != std::string::npos ||
             request.find("\r\nTransfer-Encoding:") != std::string::npos ||
@@ -8805,19 +8836,30 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
             request.find("\r\nExpect:") != std::string::npos ||
             request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
             header_end + 4u != request.size() || request.rfind("\r\n\r\n") != header_end) {
-            error =
-                std::string("#320 oracle vector escaped the fresh bodyless GET domain: ") + target;
+            error = std::string(issue) +
+                    " oracle vector escaped the fresh bodyless GET domain: " + target;
             return false;
         }
     }
 
     observation = NormalizedExactTrailingSlashOracleObservation{};
     observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    const size_t slash = config_path.rfind('/');
+    observation.temp_path =
+        slash == std::string::npos ? std::string{} : config_path.substr(0u, slash);
+    observation.config_path = config_path;
+    observation.log_path = log_path;
+    observation.access_path = no_content_return204 ? *separate_access_path : log_path;
+    observation.process_identity = container_name;
     observation.wires.resize(5);
-    const std::string access_prefix = "rut-nginx-320-normalized-exact-" + observation.order + "-" +
-                                      std::to_string(getpid()) + "-scoped";
-    const std::string exact_location =
-        "    location = /health/check/ { return 200 \"successor-static\"; }\n";
+    const std::string access_prefix =
+        std::string("rut-nginx-") +
+        (no_content_return204 ? "329-trailing-return204-" : "320-normalized-exact-") +
+        observation.order + "-" + std::to_string(getpid()) + "-scoped";
+    const std::string exact_location = no_content_return204
+                                           ? "    location = /healthz/ { return 204; }\n"
+                                           : "    location = /health/check/ { return 200 "
+                                             "\"successor-static\"; }\n";
     const std::string root_location =
         "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
     const std::string config =
@@ -8826,9 +8868,13 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         "http {\n"
         "  log_format normalized_exact_trailing_slash '" +
         access_prefix +
-        " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
-        "host=\"$host\"';\n"
-        "  access_log /dev/stderr normalized_exact_trailing_slash;\n"
+        (no_content_return204
+             ? " raw=\"$request\" status=$status bytes=$bytes_sent host=\"$host\" "
+               "upstream_addr=\"$upstream_addr\" upstream_status=$upstream_status';\n"
+             : " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
+               "host=\"$host\"';\n") +
+        "  access_log " + (no_content_return204 ? *separate_access_path : "/dev/stderr") +
+        " normalized_exact_trailing_slash;\n"
         "  server {\n"
         "    listen " +
         std::to_string(frontend_port) + ";\n" +
@@ -8836,7 +8882,8 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         "  }\n"
         "}\n";
     if (!write_file(config_path, config.data(), config.size())) {
-        error = "failed to write #320 normalized exact trailing-slash pinned nginx config";
+        error = std::string("failed to write ") + issue +
+                " normalized exact trailing-slash pinned nginx config";
         return false;
     }
 
@@ -8849,23 +8896,23 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(nginx)) {
-                error =
-                    std::string("pinned nginx exited before #320 ") + phase + " recorder readiness";
+                error = std::string("pinned nginx exited before ") + issue + " " + phase +
+                        " recorder readiness";
                 return false;
             }
             if (recorder.listener_failed.load(std::memory_order_acquire) ||
                 !recorder.running.load(std::memory_order_acquire)) {
-                error = std::string("#320 ") + phase + " recorder failed before readiness";
+                error = std::string(issue) + " " + phase + " recorder failed before readiness";
                 return false;
             }
             if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
             usleep(1000);
         }
-        error = std::string("#320 ") + phase + " recorder readiness timed out";
+        error = std::string(issue) + " " + phase + " recorder readiness timed out";
         return false;
     };
     const auto send_vector = [&](Child& nginx, size_t index, const char* expected) {
-        const std::string request = make_request(kTargets[index]);
+        const std::string request = make_request(targets[index]);
         struct ClientGuard {
             int fd = -1;
             ~ClientGuard() {
@@ -8874,25 +8921,45 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         } client{connect_once(frontend_port)};
         std::vector<char> wire;
         std::string detail;
-        if (client.fd < 0 || !send_all(client.fd, request.data(), request.size()) ||
-            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
-            error = std::string("#320 vector ") + kTargets[index] +
+        if (client.fd < 0 || !send_all(client.fd, request.data(), request.size())) {
+            error = std::string(issue) + " vector " + targets[index] +
+                    " response/EOF/zero-tail failed: connect or send failed";
+            return false;
+        }
+        const bool read_ok = no_content_return204 && index < 3u
+                                 ? read_head_response(client.fd, wire, detail)
+                                 : read_response(client.fd, wire, detail);
+        if (!read_ok || !read_eof(client.fd, detail)) {
+            error = std::string(issue) + " vector " + targets[index] +
                     " response/EOF/zero-tail failed: " +
                     (detail.empty() ? "connect or send failed" : detail);
             return false;
         }
         if (!validate_exact_normalized_response(wire, expected, detail)) {
-            error = std::string("#320 vector ") + kTargets[index] +
+            error = std::string(issue) + " vector " + targets[index] +
                     " exact status/reason/headers/body wire mismatch: " + detail;
             return false;
         }
         const std::string wire_text(wire.begin(), wire.end());
+        const size_t header_end = wire_text.find("\r\n\r\n");
         if (wire_text.find("\r\nLocation:") != std::string::npos) {
-            error = std::string("#320 vector unexpectedly emitted Location: ") + kTargets[index];
+            error = std::string(issue) + " vector unexpectedly emitted Location: " + targets[index];
+            return false;
+        }
+        if (no_content_return204 && index < 3u &&
+            (wire.size() != 105u || header_end == std::string::npos ||
+             wire_text.size() != header_end + 4u ||
+             wire_text.find("\r\nContent-Type:") != std::string::npos ||
+             wire_text.find("\r\nContent-Length:") != std::string::npos ||
+             wire_text.find("\r\nTransfer-Encoding:") != std::string::npos)) {
+            error = std::string(issue) +
+                    " local vector contained framing, representation, body, "
+                    "or tail: " +
+                    targets[index];
             return false;
         }
         if (poll_child(nginx)) {
-            error = std::string("pinned nginx exited after #320 vector ") + kTargets[index];
+            error = std::string("pinned nginx exited after ") + issue + " vector " + targets[index];
             return false;
         }
         observation.wires[index] = std::move(wire);
@@ -8903,13 +8970,13 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
             while (std::chrono::steady_clock::now() < deadline) {
                 if (poll_child(nginx) || !recorder_live(recorder)) {
-                    error = std::string("#320 pinned nginx or recorder failed during ") + phase;
+                    error = std::string(issue) + " pinned nginx or recorder failed during " + phase;
                     return false;
                 }
                 if (recorder.accepted.load(std::memory_order_acquire) != expected ||
                     recorder.requests.load(std::memory_order_acquire) != expected ||
                     recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
-                    error = std::string("#320 unexpected upstream count during ") + phase;
+                    error = std::string(issue) + " unexpected upstream count during " + phase;
                     return false;
                 }
                 usleep(5000);
@@ -8920,47 +8987,56 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             if (poll_child(nginx) || !recorder_live(recorder)) {
-                error = "#320 pinned nginx or forward recorder failed while waiting for count";
+                error = std::string(issue) +
+                        " pinned nginx or forward recorder failed while waiting for count";
                 return false;
             }
             const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
             const u32 requests = recorder.requests.load(std::memory_order_acquire);
             const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
             if (accepts > expected || requests > expected || sends > expected) {
-                error = "#320 forward recorder exceeded its exact upstream count";
+                error = std::string(issue) + " forward recorder exceeded its exact upstream count";
                 return false;
             }
             if (accepts == expected && requests == expected && sends == expected) return true;
             usleep(1000);
         }
-        error = "timed out waiting for #320 exact forward upstream count";
+        error = std::string("timed out waiting for ") + issue + " exact forward upstream count";
         return false;
     };
 
     Recorder local_recorder;
     local_recorder.observe_extra_requests_until_stop = true;
+    if (backend_reservation != nullptr) {
+        close(*backend_reservation);
+        *backend_reservation = -1;
+    }
     if (!local_recorder.setup(backend_port)) {
-        error = "failed to start #320 local zero-upstream recorder";
+        error = std::string("failed to start ") + issue + " local zero-upstream recorder";
         return false;
     }
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      container_name,
-                      "-v",
-                      config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     log_path,
-                     nginx.child)) {
-        error = "failed to start pinned nginx for #320 oracle";
+    std::vector<std::string> docker_args = {"docker",
+                                            "run",
+                                            "--pull=never",
+                                            "--network",
+                                            "host",
+                                            "--name",
+                                            container_name,
+                                            "-v",
+                                            config_path + ":/etc/nginx/nginx.conf:ro"};
+    if (no_content_return204) {
+        docker_args.push_back("-v");
+        docker_args.push_back(observation.temp_path + ":" + observation.temp_path);
+    }
+    docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
+    if (frontend_reservation != nullptr) {
+        close(*frontend_reservation);
+        *frontend_reservation = -1;
+    }
+    if (!spawn_child(docker_args, log_path, nginx.child)) {
+        error = std::string("failed to start pinned nginx for ") + issue + " oracle";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error) ||
@@ -8968,14 +9044,14 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         return false;
 
     for (size_t i = 0; i < 3; i++) {
-        if (!kLocal[i] || !send_vector(nginx.child, i, kExactLocalCloseResponseNormalized))
-            return false;
+        const char* expected = no_content_return204 ? kExactLocalReturn204ResponseNormalized
+                                                    : kExactLocalCloseResponseNormalized;
+        if (!kLocal[i] || !send_vector(nginx.child, i, expected)) return false;
         if (local_recorder.accepted.load(std::memory_order_acquire) != 0 ||
             local_recorder.requests.load(std::memory_order_acquire) != 0 ||
             local_recorder.response_send_all_calls.load(std::memory_order_acquire) != 0) {
-            error =
-                std::string("#320 normalized exact local vector unexpectedly reached upstream: ") +
-                kTargets[i];
+            error = std::string(issue) +
+                    " normalized exact local vector unexpectedly reached upstream: " + targets[i];
             return false;
         }
     }
@@ -8986,13 +9062,14 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
     observation.local_requests = local_recorder.requests.load(std::memory_order_acquire);
     observation.local_sends =
         local_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = local_recorder.history;
     if (local_recorder.thread_alive.load(std::memory_order_acquire) ||
         local_recorder.listener_failed.load(std::memory_order_acquire) ||
         observation.local_accepts != 0 || observation.local_requests != 0 ||
         observation.local_sends != 0 ||
         local_recorder.response_send_succeeded.load(std::memory_order_acquire) ||
         !local_recorder.history.empty() || !local_recorder.request.empty()) {
-        error = "#320 local recorder did not settle with zero upstream activity";
+        error = std::string(issue) + " local recorder did not settle with zero upstream activity";
         return false;
     }
 
@@ -9000,7 +9077,7 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
     forward_recorder.observe_extra_requests_until_stop = true;
     if (!forward_recorder.setup(backend_port, 2, kBackendResponse, sizeof(kBackendResponse) - 1u) ||
         !wait_recorder_live(forward_recorder, nginx.child, "forward")) {
-        if (error.empty()) error = "failed to start #320 forward recorder";
+        if (error.empty()) error = std::string("failed to start ") + issue + " forward recorder";
         return false;
     }
     for (size_t i = 3; i < 5; i++) {
@@ -9012,11 +9089,11 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         return false;
 
     if (!stop_child(nginx.child)) {
-        error = "failed to stop pinned nginx after #320 oracle";
+        error = std::string("failed to stop pinned nginx after ") + issue + " oracle";
         return false;
     }
     if (!docker.remove()) {
-        error = "docker rm -f failed after #320 oracle";
+        error = std::string("docker rm -f failed after ") + issue + " oracle";
         return false;
     }
     forward_recorder.stop();
@@ -9033,27 +9110,41 @@ static bool capture_pinned_normalized_exact_trailing_slash_order(
         !forward_recorder.response_clean_shutdown.load(std::memory_order_acquire) ||
         !forward_recorder.response_connection_closed.load(std::memory_order_acquire) ||
         observation.forward_history.size() != 2) {
-        error = "#320 forward recorder did not settle at exactly two upstream episodes";
+        error = std::string(issue) +
+                " forward recorder did not settle at exactly two upstream episodes";
         return false;
     }
 
     std::vector<std::vector<char>> expected_history;
     expected_history.reserve(2);
     for (size_t i = 3; i < 5; i++) {
-        const std::string request = std::string("GET ") + kTargets[i] + " HTTP/1.1\r\n" +
+        const std::string request = std::string("GET ") + targets[i] + " HTTP/1.1\r\n" +
                                     "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
         expected_history.emplace_back(request.begin(), request.end());
     }
     if (observation.forward_history != expected_history) {
-        error =
-            "#320 root fallbacks did not preserve exact method/request-target/headers/body "
-            "histories";
+        error = std::string(issue) +
+                " root fallbacks did not preserve exact method/request-target/headers/body "
+                "histories";
         return false;
+    }
+
+    if (no_content_return204) {
+        std::string error_log;
+        if (!read_exact_return204_log(log_path, "#329 pinned nginx error log", error_log, error))
+            return false;
+        for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+            if (error_log.find(severity) != std::string::npos) {
+                error = std::string("#329 pinned nginx error log contained ") + severity;
+                return false;
+            }
+        }
+        return true;
     }
 
     bool logs_readable = true;
     for (size_t i = 0; i < 5; i++) {
-        const std::string marker = std::string("\"GET ") + kTargets[i] + " HTTP/1.1\" 200 " +
+        const std::string marker = std::string("\"GET ") + targets[i] + " HTTP/1.1\" 200 " +
                                    (i < 3 ? "16" : "2") + " host=\"normalized-exact.example\"";
         logs_readable =
             logs_readable &&
@@ -9173,6 +9264,477 @@ static bool run_pinned_normalized_exact_trailing_slash_oracle(
         }
     }
     return true;
+}
+
+static void dump_trailing_no_content_oracle_observation(
+    const NormalizedExactTrailingSlashOracleObservation& observation) {
+    std::cerr << "#329 trailing-no-content order=" << observation.order
+              << " temp=" << observation.temp_path << " config=" << observation.config_path
+              << " error-log=" << observation.log_path << " access=" << observation.access_path
+              << " process=" << observation.process_identity
+              << " records=" << observation.access_records[0] << "/"
+              << observation.access_records[1] << "/" << observation.access_records[2] << "/"
+              << observation.access_records[3] << "/" << observation.access_records[4]
+              << " upstream=" << observation.local_requests << "+" << observation.forward_requests
+              << "\n";
+    static constexpr const char* kLabels[] = {
+        "GET /healthz/", "GET /healthz/?x=1", "GET /healthz//", "GET /healthz", "GET /"};
+    for (size_t i = 0u; i < observation.wires.size(); i++)
+        dump_wire(i < 5u ? kLabels[i] : "#329 extra vector", observation.wires[i]);
+    for (size_t i = 0u; i < observation.forward_history.size(); i++) {
+        const std::string label = "#329 fallback " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.forward_history[i]);
+    }
+}
+
+static bool parse_trailing_no_content_access_log(const std::string& contents,
+                                                 const std::string& prefix,
+                                                 u16 backend_port,
+                                                 std::string& error) {
+    static constexpr const char* kTargets[] = {
+        "/healthz/", "/healthz/?x=1", "/healthz//", "/healthz", "/"};
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 5u, "#329 bounded access log", records, error))
+        return false;
+    for (size_t i = 0u; i < records.size(); i++) {
+        const std::string& record = records[i];
+        size_t cursor = 0u;
+        const auto take = [&](const std::string& literal) {
+            if (record.compare(cursor, literal.size(), literal) != 0) return false;
+            cursor += literal.size();
+            return true;
+        };
+        const auto take_token = [&](const char* literal, std::string& token) {
+            if (!take(literal)) return false;
+            const size_t end = record.find(' ', cursor);
+            if (end == std::string::npos || end == cursor) return false;
+            token = record.substr(cursor, end - cursor);
+            cursor = end;
+            return true;
+        };
+        const std::string raw = std::string("GET ") + kTargets[i] + " HTTP/1.1";
+        if (!take(prefix + " raw=\"" + raw + "\" status=")) {
+            error = "#329 access log lost exact raw target or request order";
+            return false;
+        }
+        std::string status;
+        std::string bytes;
+        if (!take_token("", status) || !take(" bytes=") || !take_token("", bytes)) {
+            error = "#329 access log status/size schema mismatch";
+            return false;
+        }
+        const size_t expected_status = i < 3u ? 204u : 200u;
+        const size_t expected_bytes = i < 3u ? 105u : 118u;
+        size_t status_value = 0u;
+        size_t bytes_value = 0u;
+        if (!parse_decimal_field(status, status_value) ||
+            !parse_decimal_field(bytes, bytes_value) || status_value != expected_status ||
+            bytes_value != expected_bytes || status != std::to_string(expected_status) ||
+            bytes != std::to_string(expected_bytes) ||
+            !take(" host=\"trailing-return204.example\" upstream_addr=\"")) {
+            error = "#329 access log status/size/host fields were not exact";
+            return false;
+        }
+        if (i < 3u) {
+            if (!take("-\" upstream_status=-")) {
+                error = "#329 local access record did not prove zero upstream";
+                return false;
+            }
+        } else {
+            if (!take("127.0.0.1:")) {
+                error = "#329 fallback access record lost upstream address";
+                return false;
+            }
+            const size_t port_end = record.find('"', cursor);
+            if (port_end == std::string::npos || port_end == cursor) {
+                error = "#329 fallback access record has malformed upstream port";
+                return false;
+            }
+            const std::string port = record.substr(cursor, port_end - cursor);
+            size_t port_value = 0u;
+            if (!parse_decimal_field(port, port_value) || port_value > 65535u ||
+                port_value != backend_port || port != std::to_string(backend_port) ||
+                record.compare(
+                    port_end, strlen("\" upstream_status=200"), "\" upstream_status=200") != 0) {
+                error = "#329 fallback access record upstream port/status was not exact";
+                return false;
+            }
+            cursor = port_end + strlen("\" upstream_status=200");
+        }
+        if (cursor != record.size()) {
+            error = "#329 access record contained an unexpected tail";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_trailing_no_content_access_log_self_checks(std::string& error) {
+    const std::string prefix = "rut-nginx-329-trailing-return204-exact-before-root-123-scoped";
+    static constexpr const char* kTargets[] = {
+        "/healthz/", "/healthz/?x=1", "/healthz//", "/healthz", "/"};
+    std::string valid;
+    for (size_t i = 0u; i < 5u; i++) {
+        valid += prefix + " raw=\"GET " + kTargets[i] +
+                 " HTTP/1.1\" status=" + (i < 3u ? "204" : "200") +
+                 " bytes=" + (i < 3u ? "105" : "118") +
+                 " host=\"trailing-return204.example\" upstream_addr=\"" +
+                 (i < 3u ? "-\" upstream_status=-" : "127.0.0.1:54321\" upstream_status=200") +
+                 "\n";
+    }
+    const auto replace_once =
+        [](std::string value, const std::string& from, const std::string& to) {
+            const size_t offset = value.find(from);
+            if (offset == std::string::npos) return std::string{};
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    const auto rejects = [&](const std::string& value) {
+        std::string detail;
+        return !parse_trailing_no_content_access_log(value, prefix, 54321u, detail);
+    };
+    const size_t first_end = valid.find('\n');
+    const size_t second_end = valid.find('\n', first_end + 1u);
+    std::string swapped = valid;
+    swapped.replace(
+        0u,
+        second_end + 1u,
+        valid.substr(first_end + 1u, second_end - first_end) + valid.substr(0u, first_end + 1u));
+    if (!parse_trailing_no_content_access_log(valid, prefix, 54321u, error)) return false;
+    const std::pair<const char*, bool> mutations[] = {
+        {"extra-record", rejects(valid + valid.substr(0u, first_end + 1u))},
+        {"truncated-record", rejects(valid.substr(0u, valid.size() - 1u))},
+        {"order", rejects(swapped)},
+        {"raw-target", rejects(replace_once(valid, "/healthz//", "/healthz/"))},
+        {"local-status", rejects(replace_once(valid, "status=204", "status=200"))},
+        {"fallback-size", rejects(replace_once(valid, "bytes=118", "bytes=119"))},
+        {"overflow",
+         rejects(replace_once(valid, "status=204", "status=999999999999999999999999999999999"))},
+        {"local-upstream",
+         rejects(replace_once(valid,
+                              "upstream_addr=\"-\" upstream_status=-",
+                              "upstream_addr=\"127.0.0.1:54321\" upstream_status=200"))},
+        {"fallback-upstream",
+         rejects(replace_once(
+             valid, "127.0.0.1:54321\" upstream_status=200", "-\" upstream_status=-"))},
+        {"port", rejects(replace_once(valid, "127.0.0.1:54321", "127.0.0.1:054321"))}};
+    for (const auto& mutation : mutations) {
+        if (!mutation.second) {
+            error = std::string("#329 access mutation accepted: ") + mutation.first;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validate_trailing_no_content_observation(
+    const NormalizedExactTrailingSlashOracleObservation& observation,
+    u16 backend_port,
+    std::string& error) {
+    if (observation.wires.size() != 5u || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        !observation.local_history.empty()) {
+        error = "#329 observation lacked five vectors or settled zero local-upstream evidence";
+        return false;
+    }
+    if (observation.forward_accepts != 2u || observation.forward_requests != 2u ||
+        observation.forward_sends != 2u || observation.forward_history.size() != 2u) {
+        error = "#329 observation lacked exactly two fallback episodes";
+        return false;
+    }
+    for (u32 access : observation.access_records) {
+        if (access != 1u) {
+            error = "#329 observation lacked exactly five ordered access records";
+            return false;
+        }
+    }
+    const std::vector<char> local(kExactLocalReturn204ResponseNormalized,
+                                  kExactLocalReturn204ResponseNormalized + 105u);
+    const std::vector<char> fallback(
+        kSuccessResponseNormalized,
+        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+    for (size_t i = 0u; i < observation.wires.size(); i++) {
+        std::vector<char> normalized = observation.wires[i];
+        if (!normalize_date(normalized) || normalized != (i < 3u ? local : fallback)) {
+            error = "#329 observation wire differed from its exact 204/fallback baseline";
+            return false;
+        }
+    }
+    std::vector<std::vector<char>> expected_history;
+    for (const char* target : {"/healthz", "/"}) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error = "#329 fallback history contained a retry, reorder, or wire mismatch";
+        return false;
+    }
+    return true;
+}
+
+static NormalizedExactTrailingSlashOracleObservation make_trailing_no_content_self_check_value(
+    u16 backend_port, const char* order, const char* resource_suffix) {
+    static constexpr char kObservedDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    const auto observed = [](const char* normalized, size_t size) {
+        std::vector<char> wire(normalized, normalized + size);
+        const std::string marker(29u, 'X');
+        const auto offset = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        if (offset != wire.end()) std::copy_n(kObservedDate, 29u, offset);
+        return wire;
+    };
+    NormalizedExactTrailingSlashOracleObservation value;
+    value.order = order;
+    value.temp_path = std::string("/tmp/329-") + resource_suffix;
+    value.config_path = value.temp_path + "/nginx.conf";
+    value.log_path = value.temp_path + "/nginx.log";
+    value.access_path = value.temp_path + "/access.log";
+    value.process_identity = std::string("rut-nginx-329-") + resource_suffix;
+    value.wires = {observed(kExactLocalReturn204ResponseNormalized, 105u),
+                   observed(kExactLocalReturn204ResponseNormalized, 105u),
+                   observed(kExactLocalReturn204ResponseNormalized, 105u),
+                   observed(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u),
+                   observed(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u)};
+    value.forward_accepts = 2u;
+    value.forward_requests = 2u;
+    value.forward_sends = 2u;
+    for (u32& access : value.access_records) access = 1u;
+    for (const char* target : {"/healthz", "/"}) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        value.forward_history.emplace_back(request.begin(), request.end());
+    }
+    return value;
+}
+
+static bool validate_trailing_no_content_pair(
+    const NormalizedExactTrailingSlashOracleObservation& exact_first,
+    const NormalizedExactTrailingSlashOracleObservation& root_first,
+    const u16 ports[4],
+    std::string& error) {
+    for (size_t i = 0u; i < 4u; i++) {
+        if (ports[i] == 0u) {
+            error = "#329 pair validator received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#329 declaration orders shared a frontend/backend port";
+                return false;
+            }
+        }
+    }
+    if (!validate_trailing_no_content_observation(exact_first, ports[1], error) ||
+        !validate_trailing_no_content_observation(root_first, ports[3], error))
+        return false;
+    const std::string* resources[] = {&exact_first.temp_path,
+                                      &exact_first.config_path,
+                                      &exact_first.log_path,
+                                      &exact_first.access_path,
+                                      &exact_first.process_identity,
+                                      &root_first.temp_path,
+                                      &root_first.config_path,
+                                      &root_first.log_path,
+                                      &root_first.access_path,
+                                      &root_first.process_identity};
+    for (size_t i = 0u; i < 10u; i++) {
+        if (resources[i]->empty()) {
+            error = "#329 declaration-order resource identity was empty or aliased";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 10u; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#329 declaration-order resource identity was empty or aliased";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0u; i < 5u; i++) {
+        std::vector<char> left = exact_first.wires[i];
+        std::vector<char> right = root_first.wires[i];
+        if (!normalize_date(left) || !normalize_date(right) || left != right) {
+            error =
+                "#329 declaration order changed Date-normalized vector " + std::to_string(i + 1u);
+            return false;
+        }
+    }
+    const auto exact_history = canonicalize_bounded_backend_history(exact_first.forward_history);
+    const auto root_history = canonicalize_bounded_backend_history(root_first.forward_history);
+    if (exact_history.size() != 2u || exact_history != root_history) {
+        error = "#329 declaration order changed port-canonical fallback history";
+        return false;
+    }
+    return true;
+}
+
+static bool run_trailing_no_content_observation_self_checks(std::string& error) {
+    static constexpr u16 kPorts[] = {54320u, 54321u, 54322u, 54323u};
+    const auto valid_exact =
+        make_trailing_no_content_self_check_value(kPorts[1], "exact-before-root", "exact");
+    const auto valid_root =
+        make_trailing_no_content_self_check_value(kPorts[3], "root-before-exact", "root");
+    if (!validate_trailing_no_content_pair(valid_exact, valid_root, kPorts, error)) return false;
+    const auto rejects_observation = [&](const char* name,
+                                         NormalizedExactTrailingSlashOracleObservation value) {
+        std::string detail;
+        if (!validate_trailing_no_content_observation(value, kPorts[1], detail)) return true;
+        error = std::string("#329 observation mutation accepted: ") + name;
+        return false;
+    };
+    auto mutated = valid_exact;
+    mutated.wires[2].push_back('x');
+    if (!rejects_observation("local-wire-tail", mutated)) return false;
+    mutated = valid_exact;
+    mutated.wires[3] = valid_exact.wires[0];
+    if (!rejects_observation("fallback-wire", mutated)) return false;
+    mutated = valid_exact;
+    mutated.local_accepts = 1u;
+    if (!rejects_observation("local-count", mutated)) return false;
+    mutated = valid_exact;
+    mutated.local_history.push_back(valid_exact.forward_history[0]);
+    if (!rejects_observation("local-history", mutated)) return false;
+    mutated = valid_exact;
+    mutated.forward_requests = 3u;
+    if (!rejects_observation("fallback-count", mutated)) return false;
+    mutated = valid_exact;
+    mutated.forward_history.push_back(valid_exact.forward_history[0]);
+    if (!rejects_observation("third/retry", mutated)) return false;
+    mutated = valid_exact;
+    std::swap(mutated.forward_history[0], mutated.forward_history[1]);
+    if (!rejects_observation("fallback-order", mutated)) return false;
+    mutated = valid_exact;
+    mutated.access_records[4] = 0u;
+    if (!rejects_observation("access-count", mutated)) return false;
+
+    const auto rejects_pair = [&](const char* name,
+                                  const NormalizedExactTrailingSlashOracleObservation& left,
+                                  const NormalizedExactTrailingSlashOracleObservation& right,
+                                  const u16 pair_ports[4]) {
+        std::string detail;
+        if (!validate_trailing_no_content_pair(left, right, pair_ports, detail)) return true;
+        error = std::string("#329 pair mutation accepted: ") + name;
+        return false;
+    };
+    auto aliased_root = valid_root;
+    aliased_root.access_path = valid_exact.access_path;
+    if (!rejects_pair("resource-alias", valid_exact, aliased_root, kPorts)) return false;
+    u16 changed_ports[4];
+    std::copy(std::begin(kPorts), std::end(kPorts), std::begin(changed_ports));
+    changed_ports[3] = changed_ports[0];
+    if (!rejects_pair("duplicate-port", valid_exact, valid_root, changed_ports)) return false;
+    changed_ports[3] = kPorts[3];
+    changed_ports[0] = 0u;
+    if (!rejects_pair("zero-port", valid_exact, valid_root, changed_ports)) return false;
+    auto changed_root = valid_root;
+    changed_root.wires[1].push_back('x');
+    if (!rejects_pair("order-wire", valid_exact, changed_root, kPorts)) return false;
+    return true;
+}
+
+static bool run_pinned_trailing_no_content_oracle(
+    const std::string& container_prefix,
+    NormalizedExactTrailingSlashOracleObservation& exact_first,
+    NormalizedExactTrailingSlashOracleObservation& root_first,
+    std::string& error) {
+    struct ReservedPorts {
+        int fds[4];
+
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#329 could not bind-reserve four unique declaration-order ports";
+            return false;
+        }
+    }
+    TempDir exact_temp;
+    TempDir root_temp;
+    if (!exact_temp.create() || !root_temp.create() ||
+        strcmp(exact_temp.path, root_temp.path) == 0 ||
+        exact_temp.nginx_config == root_temp.nginx_config ||
+        exact_temp.nginx_log == root_temp.nginx_log ||
+        exact_temp.nginx_access_log == root_temp.nginx_access_log) {
+        error = "#329 declaration orders did not receive independent temp/config/log trees";
+        return false;
+    }
+    if (!capture_pinned_normalized_exact_trailing_slash_order(ports[0],
+                                                              ports[1],
+                                                              exact_temp.nginx_config,
+                                                              exact_temp.nginx_log,
+                                                              container_prefix + "-exact-first",
+                                                              true,
+                                                              exact_first,
+                                                              error,
+                                                              true,
+                                                              &exact_temp.nginx_access_log,
+                                                              &reservations.fds[0],
+                                                              &reservations.fds[1]) ||
+        !capture_pinned_normalized_exact_trailing_slash_order(ports[2],
+                                                              ports[3],
+                                                              root_temp.nginx_config,
+                                                              root_temp.nginx_log,
+                                                              container_prefix + "-root-first",
+                                                              false,
+                                                              root_first,
+                                                              error,
+                                                              true,
+                                                              &root_temp.nginx_access_log,
+                                                              &reservations.fds[2],
+                                                              &reservations.fds[3])) {
+        dump_log(exact_temp.nginx_config, "#329 exact-first nginx config");
+        dump_log(exact_temp.nginx_log, "#329 exact-first nginx error log");
+        dump_log(exact_temp.nginx_access_log, "#329 exact-first nginx access log");
+        dump_log(root_temp.nginx_config, "#329 root-first nginx config");
+        dump_log(root_temp.nginx_log, "#329 root-first nginx error log");
+        dump_log(root_temp.nginx_access_log, "#329 root-first nginx access log");
+        return false;
+    }
+    std::string exact_access;
+    std::string root_access;
+    if (!read_exact_return204_log(
+            exact_temp.nginx_access_log, "#329 exact-first access log", exact_access, error) ||
+        !read_exact_return204_log(
+            root_temp.nginx_access_log, "#329 root-first access log", root_access, error) ||
+        !parse_trailing_no_content_access_log(
+            exact_access,
+            "rut-nginx-329-trailing-return204-exact-before-root-" + std::to_string(getpid()) +
+                "-scoped",
+            ports[1],
+            error) ||
+        !parse_trailing_no_content_access_log(
+            root_access,
+            "rut-nginx-329-trailing-return204-root-before-exact-" + std::to_string(getpid()) +
+                "-scoped",
+            ports[3],
+            error))
+        return false;
+    for (u32& access : exact_first.access_records) access = 1u;
+    for (u32& access : root_first.access_records) access = 1u;
+    return validate_trailing_no_content_pair(exact_first, root_first, ports, error);
 }
 
 struct ExactLocalBodySpaceOracleObservation {
@@ -18785,6 +19347,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--bounded-no-content-path-oracle") == 0;
     const bool normalized_exact_trailing_slash_oracle =
         argc == 2 && strcmp(argv[1], "--normalized-exact-trailing-slash-oracle") == 0;
+    const bool trailing_slash_no_content_oracle =
+        argc == 2 && strcmp(argv[1], "--trailing-slash-no-content-oracle") == 0;
     const bool exact_local_body_space_oracle =
         argc == 2 && strcmp(argv[1], "--exact-local-body-space-oracle") == 0;
     const bool exact_local_body_multiple_space_oracle =
@@ -18855,9 +19419,9 @@ int main(int argc, char** argv) {
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
-         !exact_local_body_space_oracle && !exact_local_body_multiple_space_oracle &&
-         !exact_local_return204_oracle && !exact_local_return204_query_oracle &&
-         !converter_exact_local_body_space_differential &&
+         !trailing_slash_no_content_oracle && !exact_local_body_space_oracle &&
+         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
+         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
@@ -18921,6 +19485,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
+                     "   or: test_nginx_differential --trailing-slash-no-content-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-return204-oracle\n"
@@ -19024,6 +19589,21 @@ int main(int argc, char** argv) {
         if (converter_bounded_no_content_path_differential &&
             !run_bounded_no_content_four_way_self_checks(parser_error)) {
             std::cerr << "FAIL [#328 four-way validator self-check]: " << parser_error << "\n";
+            return 1;
+        }
+    }
+    if (trailing_slash_no_content_oracle) {
+        std::string parser_error;
+        if (!run_bounded_no_content_path_wire_self_checks(parser_error)) {
+            std::cerr << "FAIL [#329 strict 204 wire self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (!run_trailing_no_content_access_log_self_checks(parser_error)) {
+            std::cerr << "FAIL [#329 bounded access-log self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (!run_trailing_no_content_observation_self_checks(parser_error)) {
+            std::cerr << "FAIL [#329 observation/pair self-check]: " << parser_error << "\n";
             return 1;
         }
     }
@@ -19595,6 +20175,36 @@ int main(int argc, char** argv) {
                "connect/upstream failures (nginx-only #318 oracle; no parser/converter/RUT "
                "equivalence claim; excludes other exact paths, statuses, bodies, headers, "
                "methods, framing, reuse/pipeline, location kinds, TLS/H2, and multiple servers)\n";
+        return 0;
+    }
+
+    if (trailing_slash_no_content_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-trailing-slash-no-content-" + std::to_string(getpid()) + "-" + source_suffix;
+        NormalizedExactTrailingSlashOracleObservation exact_first;
+        NormalizedExactTrailingSlashOracleObservation root_first;
+        std::string oracle_error;
+        if (!run_pinned_trailing_no_content_oracle(
+                container_prefix, exact_first, root_first, oracle_error)) {
+            std::cerr << "FAIL [#329 pinned trailing-slash bodyless 204 oracle]: " << oracle_error
+                      << "\n";
+            dump_trailing_no_content_oracle_observation(exact_first);
+            dump_trailing_no_content_oracle_observation(root_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 exact /healthz/ return 204 is declaration-order "
+               "independent across two isolated five-request epochs; /healthz/, its raw query "
+               "spelling, and /healthz// each emit the exact Date-normalized 105-byte bodyless "
+               "204 No Content/final-CRLF/close/EOF wire with live and settled zero upstream, "
+               "while /healthz and / do not redirect and emit the exact 118-byte fallback wire "
+               "with exactly two ordered byte-exact backend histories and no third/retry. Each "
+               "order has five exact raw-target/status/full-wire-size/upstream-accounted access "
+               "records, clean bounded error logs, four distinct ports, and independent temp/"
+               "config/log/access/process identities (nginx-only #329 Stage 1 oracle; no parser/"
+               "converter/generated-RUT equivalence claim)\n";
         return 0;
     }
 
