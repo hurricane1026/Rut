@@ -10,10 +10,12 @@ struct Listen {
     Span span{};
 };
 
-// The bounded proxy replacement-URI slice accepts only absolute, trailing-slash
-// paths made from clean ASCII-unreserved segments. This limit intentionally
-// matches the ordinary RUT forward-target transform capacity; wider nginx URI
-// and normalization semantics remain unsupported.
+// The bounded proxy replacement-URI slice accepts an absolute clean replacement
+// path, optionally followed by one literal `?` and a non-empty static query.
+// `uri` and `uri_span` below retain the complete configured replacement target,
+// including that query. This limit intentionally matches the ordinary RUT
+// forward-target transform capacity; wider nginx URI and normalization semantics
+// remain unsupported.
 static constexpr u32 kMaxProxyPassUriLen = 128;
 
 struct ProxyPass {

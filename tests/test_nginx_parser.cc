@@ -2093,6 +2093,182 @@ TEST(nginx_parser, parses_bounded_clean_non_root_proxy_uri_with_source_provenanc
     CHECK_NE(compact_proxy.uri_span.start, formatted_proxy.uri_span.start);
 }
 
+TEST(nginx_parser, models_static_query_proxy_uri_in_either_server_directive_order) {
+    const char listen_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/?fixed=1;\n"
+        "  }\n"
+        "}\n";
+    const char location_first[] =
+        "server {\n"
+        "  location /api/ { proxy_pass http://127.0.0.1:9000/v1/?fixed=1; }\n"
+        "  listen 8080;\n"
+        "}\n";
+
+    const auto check = [&](const char* source, u32 source_len, u32 expected_line) {
+        const auto parsed = nginx::parse({source, source_len});
+        REQUIRE(parsed);
+        const auto& proxy = parsed.value().location.proxy_pass;
+        const char* replacement = strstr(source, "/v1/?fixed=1");
+        REQUIRE(replacement != nullptr);
+        REQUIRE(proxy.has_uri);
+        CHECK(proxy.uri.eq(lit_str("/v1/?fixed=1")));
+        CHECK_EQ(proxy.uri.ptr, replacement);
+        CHECK_EQ(proxy.uri.ptr, source + proxy.uri_span.start);
+        CHECK_EQ(proxy.uri_span.end - proxy.uri_span.start, proxy.uri.len);
+        CHECK_EQ(proxy.uri_span.line, expected_line);
+        const char* line_start = replacement;
+        while (line_start != source && line_start[-1] != '\n') --line_start;
+        CHECK_EQ(proxy.uri_span.col, static_cast<u32>(replacement - line_start + 1u));
+        CHECK_LT(proxy.uri_span.end, proxy.span.end);
+        CHECK_GE(proxy.uri.ptr, source);
+        CHECK_LE(proxy.uri.ptr + proxy.uri.len, source + source_len);
+    };
+    check(listen_first, sizeof(listen_first) - 1u, 4u);
+    check(location_first, sizeof(location_first) - 1u, 2u);
+}
+
+TEST(nginx_parser, accepts_bounded_static_query_grammar_and_root_replacement_path) {
+    static constexpr const char* kAccepted[] = {
+        "/?a",    // Three-byte minimum and a one-byte query.
+        "/?=",    // `=` is allowed as the complete one-byte query.
+        "/?&",    // `&` is allowed as the complete one-byte query.
+        "/?=&",   // Both query separators may be adjacent.
+        "/?x=1",  // Root replacement path with the requested static query.
+        "/?x=1&y=two",
+        "/v1/?AZaz09._~-=&",
+    };
+    for (const char* uri : kAccepted) {
+        char source[256]{};
+        const int source_len = snprintf(source,
+                                        sizeof(source),
+                                        "server { listen 8080; location /api/ { proxy_pass "
+                                        "http://127.0.0.1:9000%s; } }",
+                                        uri);
+        REQUIRE_GT(source_len, 0);
+        REQUIRE_LT(static_cast<u32>(source_len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(source_len)});
+        REQUIRE(parsed);
+        const auto& proxy = parsed.value().location.proxy_pass;
+        const u32 uri_len = static_cast<u32>(strlen(uri));
+        CHECK((proxy.uri.eq({uri, uri_len})));
+        CHECK_EQ(proxy.uri.ptr, source + proxy.uri_span.start);
+        CHECK_EQ(proxy.uri_span.end - proxy.uri_span.start, uri_len);
+    }
+}
+
+TEST(nginx_parser, enforces_complete_static_query_proxy_uri_capacity) {
+    static_assert(nginx::kMaxProxyPassUriLen == 128u);
+    char accepted_uri[nginx::kMaxProxyPassUriLen + 1u]{};
+    accepted_uri[0] = '/';
+    accepted_uri[1] = '?';
+    for (u32 i = 2; i < nginx::kMaxProxyPassUriLen; i++) accepted_uri[i] = 'a';
+
+    char accepted_source[512]{};
+    const int accepted_len = snprintf(accepted_source,
+                                      sizeof(accepted_source),
+                                      "server { listen 8080; location /api/ { proxy_pass "
+                                      "http://127.0.0.1:9000%s; } }",
+                                      accepted_uri);
+    REQUIRE_GT(accepted_len, 0);
+    REQUIRE_LT(static_cast<u32>(accepted_len), static_cast<u32>(sizeof(accepted_source)));
+    const auto accepted = nginx::parse({accepted_source, static_cast<u32>(accepted_len)});
+    REQUIRE(accepted);
+    CHECK_EQ(accepted.value().location.proxy_pass.uri.len, nginx::kMaxProxyPassUriLen);
+    CHECK_EQ(accepted.value().location.proxy_pass.uri.ptr,
+             accepted_source + accepted.value().location.proxy_pass.uri_span.start);
+
+    char rejected_uri[nginx::kMaxProxyPassUriLen + 2u]{};
+    rejected_uri[0] = '/';
+    rejected_uri[1] = '?';
+    for (u32 i = 2; i <= nginx::kMaxProxyPassUriLen; i++) rejected_uri[i] = 'b';
+
+    char rejected_source[512]{};
+    const int rejected_len = snprintf(rejected_source,
+                                      sizeof(rejected_source),
+                                      "server { listen 8080; location /api/ { proxy_pass "
+                                      "http://127.0.0.1:9000%s; } }",
+                                      rejected_uri);
+    REQUIRE_GT(rejected_len, 0);
+    REQUIRE_LT(static_cast<u32>(rejected_len), static_cast<u32>(sizeof(rejected_source)));
+    const auto rejected = nginx::parse({rejected_source, static_cast<u32>(rejected_len)});
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(
+        rejected.error().detail.eq(lit_str("proxy_pass URI is outside the bounded clean profile")));
+    CHECK_EQ(rejected.error().span.end - rejected.error().span.start,
+             nginx::kMaxProxyPassUriLen + 1u);
+}
+
+TEST(nginx_parser, rejects_excluded_static_query_bytes_and_invalid_query_paths) {
+    struct Rejection {
+        const char* uri;
+        u32 len;
+    };
+    const char control[] = {'/', '?', '\x01'};
+    const char nul[] = {'/', '?', '\0'};
+    const char del[] = {'/', '?', static_cast<char>(0x7f)};
+    const char non_ascii[] = {'/', '?', static_cast<char>(0x80)};
+    const Rejection rejected[] = {
+        {"/?", 2},
+        {"/?a?b", 5},
+        {"/?a#fragment", 12},
+        {"/?%", 3},
+        {"/?+", 3},
+        {"/?/", 3},
+        {"/?:", 3},
+        {"/?$request_uri", 14},
+        {"/?'", 3},
+        {"/?\"", 3},
+        {"/?\\", 3},
+        {"/? ", 3},
+        {"/?\t", 3},
+        {control, sizeof(control)},
+        {nul, sizeof(nul)},
+        {del, sizeof(del)},
+        {non_ascii, sizeof(non_ascii)},
+        {"//?x", 4},
+        {"/./?x", 5},
+        {"/../?x", 6},
+        {"/v1?x", 5},
+        {"/%41/?x", 7},
+    };
+    static constexpr char kPrefix[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000";
+    static constexpr char kSuffix[] = "; } }";
+
+    for (const auto& vector : rejected) {
+        char source[512]{};
+        const u32 prefix_len = sizeof(kPrefix) - 1u;
+        const u32 suffix_len = sizeof(kSuffix) - 1u;
+        REQUIRE_LE(prefix_len + vector.len + suffix_len, static_cast<u32>(sizeof(source)));
+        memcpy(source, kPrefix, prefix_len);
+        memcpy(source + prefix_len, vector.uri, vector.len);
+        memcpy(source + prefix_len + vector.len, kSuffix, suffix_len);
+        const auto parsed = nginx::parse({source, prefix_len + vector.len + suffix_len});
+        REQUIRE_FALSE(parsed);
+    }
+
+    // nginx's existing path-only clean profile never admitted generic RUT's
+    // historical `$` byte. The new query branch must not broaden that profile.
+    const char path_variable[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/$/; } }";
+    const auto path_variable_result = nginx::parse({path_variable, sizeof(path_variable) - 1u});
+    REQUIRE_FALSE(path_variable_result);
+    CHECK_EQ(path_variable_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(path_variable_result.error().detail.eq(lit_str("variables are unsupported")));
+
+    const char retained_path_only[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/AZaz09-._~/; } }";
+    const auto retained = nginx::parse({retained_path_only, sizeof(retained_path_only) - 1u});
+    REQUIRE(retained);
+    CHECK(retained.value().location.proxy_pass.uri.eq(lit_str("/AZaz09-._~/")));
+}
+
 TEST(nginx_parser, enforces_bounded_clean_proxy_uri_capacity) {
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
     char accepted_uri[nginx::kMaxProxyPassUriLen + 1u]{};
@@ -2188,9 +2364,9 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
                    51,
                    lit_str("variables are unsupported")));
 
-    const char query_uri[] =
-        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/?x; } }";
-    CHECK(is_error(nginx::parse({query_uri, sizeof(query_uri) - 1}),
+    const char empty_query_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/?; } }";
+    CHECK(is_error(nginx::parse({empty_query_uri, sizeof(empty_query_uri) - 1}),
                    FrontendError::UnsupportedSyntax,
                    1,
                    69,
@@ -2219,7 +2395,7 @@ TEST(nginx_parser, rejects_non_clean_proxy_uri_replacement_forms) {
         {"/../", 4},
         {"/a/../b/", 8},
         {"/%41/", 5},
-        {"/v1/?x=1", 8},
+        {"/v1?x=1", 7},
         {"/a\\b/", 5},
         {"/a\"b/", 5},
         {"/a'b/", 5},
@@ -8373,6 +8549,66 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
     uri[1] = 'v';
     uri[3] = 'x';
     expect_rejected(accepted, lit_str("invalid bounded proxy_pass URI model"));
+}
+
+TEST(nginx_converter, static_query_proxy_uri_reaches_current_path_only_fail_closed_gate) {
+    char source[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/?fixed=1;\n"
+        "  }\n"
+        "}\n";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const nginx::Server model = parsed.value();
+    const auto& proxy = model.location.proxy_pass;
+    const Span uri_span = proxy.uri_span;
+    REQUIRE(proxy.uri.eq(lit_str("/v1/?fixed=1")));
+    REQUIRE_EQ(proxy.uri.ptr, source + uri_span.start);
+    REQUIRE_EQ(uri_span.end - uri_span.start, proxy.uri.len);
+
+    const auto expect_rejected = [&](const nginx::Server& candidate, Str detail, Span span) {
+        const auto lowered = nginx::lower_to_rut(candidate);
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(detail));
+        CHECK_EQ(lowered.error().span.start, span.start);
+        CHECK_EQ(lowered.error().span.end, span.end);
+        CHECK_EQ(lowered.error().span.line, span.line);
+        CHECK_EQ(lowered.error().span.col, span.col);
+    };
+
+    // Copying the semantic model preserves its exact borrowed view. The source
+    // must remain alive for every parser-model and converter validation use.
+    const nginx::Server copied = model;
+    CHECK_EQ(copied.location.proxy_pass.uri.ptr, proxy.uri.ptr);
+    CHECK_EQ(copied.location.proxy_pass.uri_span.start, uri_span.start);
+    expect_rejected(copied, lit_str("invalid bounded proxy_pass URI model"), uri_span);
+
+    static constexpr char kExternalIdentical[] = "/v1/?fixed=1";
+    auto forged = model;
+    forged.location.proxy_pass.uri = {kExternalIdentical, sizeof(kExternalIdentical) - 1u};
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
+
+    forged = model;
+    forged.location.proxy_pass.uri.ptr++;
+    expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
+
+    forged = model;
+    forged.location.proxy_pass.uri_span.start++;
+    forged.location.proxy_pass.uri_span.col++;
+    expect_rejected(
+        forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.uri_span);
+
+    char* replacement = source + uri_span.start;
+    replacement[5] = '%';
+    expect_rejected(model, lit_str("invalid bounded proxy_pass URI model"), uri_span);
+    replacement[5] = 'f';
+    replacement[6] = '?';
+    expect_rejected(model, lit_str("invalid bounded proxy_pass URI model"), uri_span);
+    replacement[6] = 'i';
+    expect_rejected(model, lit_str("invalid bounded proxy_pass URI model"), uri_span);
 }
 
 TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_timeout) {
