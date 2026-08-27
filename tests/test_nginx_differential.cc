@@ -30662,6 +30662,601 @@ static void dump_wildcard_listen_observation(const WildcardListenOracleObservati
 
 }  // namespace
 
+struct RutExactIpv4Reservations {
+    int frontend = -1;
+    int guard = -1;
+    int backend = -1;
+    u16 frontend_port = 0;
+    u16 backend_port = 0;
+
+    ~RutExactIpv4Reservations() {
+        if (frontend >= 0) close(frontend);
+        if (guard >= 0) close(guard);
+        if (backend >= 0) close(backend);
+    }
+
+    static bool bind_exact(u32 address, u16 requested_port, int& fd, u16& actual_port) {
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return false;
+        sockaddr_in bind_address{};
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_addr.s_addr = htonl(address);
+        bind_address.sin_port = htons(requested_port);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&bind_address), sizeof(bind_address)) != 0) {
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        sockaddr_in observed{};
+        socklen_t observed_len = sizeof(observed);
+        int socket_type = 0;
+        socklen_t socket_type_len = sizeof(socket_type);
+        int accepting = -1;
+        socklen_t accepting_len = sizeof(accepting);
+        const int fd_flags = fcntl(fd, F_GETFD);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&observed), &observed_len) != 0 ||
+            observed_len != sizeof(observed) || observed.sin_family != AF_INET ||
+            ntohl(observed.sin_addr.s_addr) != address || ntohs(observed.sin_port) == 0u ||
+            (requested_port != 0u && ntohs(observed.sin_port) != requested_port) || fd_flags < 0 ||
+            (fd_flags & FD_CLOEXEC) == 0 ||
+            getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) != 0 ||
+            socket_type_len != sizeof(socket_type) || socket_type != SOCK_STREAM ||
+            getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_len) != 0 ||
+            accepting_len != sizeof(accepting) || accepting != 0) {
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        actual_port = ntohs(observed.sin_port);
+        return true;
+    }
+
+    bool reserve(std::string& error) {
+        if (!bind_exact(0x7F000001u, 0u, frontend, frontend_port)) {
+            error = "#345 failed to reserve exact 127.0.0.1 frontend";
+            return false;
+        }
+        u16 guard_port = 0;
+        if (!bind_exact(0x7F000002u, frontend_port, guard, guard_port) ||
+            guard_port != frontend_port) {
+            error = "#345 failed to reserve same-port 127.0.0.2 anti-wildcard guard";
+            return false;
+        }
+        if (!bind_exact(0x7F000001u, 0u, backend, backend_port) || backend_port == frontend_port) {
+            error = "#345 failed to reserve an independent exact backend";
+            return false;
+        }
+        return true;
+    }
+
+    bool release_frontend(std::string& error) {
+        if (frontend < 0 || close(frontend) != 0) {
+            error = "#345 exact frontend handoff close failed";
+            return false;
+        }
+        frontend = -1;
+        return validate_exact_loopback_guard_fd(guard, frontend_port, error);
+    }
+
+    bool reacquire_frontend(std::string& error) {
+        if (frontend >= 0) {
+            error = "#345 exact frontend was already reserved";
+            return false;
+        }
+        u16 actual = 0;
+        if (!bind_exact(0x7F000001u, frontend_port, frontend, actual) || actual != frontend_port ||
+            !validate_exact_loopback_guard_fd(guard, frontend_port, error)) {
+            if (error.empty()) error = "#345 failed to reacquire exact frontend after mutation";
+            return false;
+        }
+        return true;
+    }
+};
+
+static bool validate_rut_exact_ipv4_source(const std::string& source,
+                                           u16 frontend_port,
+                                           u16 backend_port,
+                                           bool wildcard,
+                                           std::string& error) {
+    const std::string listener = wildcard
+                                     ? "listen :" + std::to_string(frontend_port) + "\n"
+                                     : "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string other_listener =
+        wildcard ? "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n"
+                 : "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream exact_backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    if (source.rfind(listener, 0u) != 0u || count_text(source, listener) != 1u ||
+        source.find(other_listener) != std::string::npos ||
+        wildcard_listen_source_declarations(source, "listen") != 1u ||
+        count_text(source, upstream) != 1u ||
+        wildcard_listen_source_declarations(source, "upstream") != 1u ||
+        count_text(source, "route GET \"/\" {\n") != 1u ||
+        wildcard_listen_source_declarations(source, "route") != 1u ||
+        count_text(source, "return forward(exact_backend,") != 1u ||
+        source.find("127.0.0.2") != std::string::npos ||
+        source.find("0.0.0.0") != std::string::npos || source.find("*:") != std::string::npos ||
+        source.find("nginx") != std::string::npos ||
+        source.find("converter") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("bind_address") != std::string::npos ||
+        source.find("local_address") != std::string::npos) {
+        error = "#345 ordinary RUT source inventory/address scope was not exact";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_rut_exact_ipv4_runtime_log(const std::string& contents,
+                                                const std::string& source_path,
+                                                u16 frontend_port,
+                                                std::string& error) {
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 5u, "#345 RUT exact IPv4 runtime log", records, error))
+        return false;
+    const std::string loaded = "Loaded program: " + source_path + " (opt O2)";
+    const std::string listening =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    if (records[0] != loaded || records[1] != "Backend: io_uring" || records[2] != listening ||
+        records[3] != "Draining connections (0s)..." || records[4] != "Shutdown complete.") {
+        error = "#345 runtime log was not the exact ordered five-line public lifecycle";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_rut_exact_ipv4_access(const std::string& contents,
+                                           size_t rewritten_upstream_request_size,
+                                           size_t downstream_response_wire_size,
+                                           std::string& error) {
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 1u, "#345 RUT exact IPv4 access log", records, error))
+        return false;
+    std::vector<std::string> fields;
+    if (!split_space_fields(records[0], fields) || fields.size() != 11u ||
+        !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != "/scope?q=1" ||
+        fields[3] != "200" || !decimal_field_equals(fields[3], 200u) ||
+        !exact_log_duration(fields[4]) ||
+        !decimal_field_equals(fields[5], rewritten_upstream_request_size) ||
+        !decimal_field_equals(fields[6], downstream_response_wire_size) ||
+        fields[7] != "127.0.0.1" || fields[8] != "exact_backend" ||
+        !exact_log_duration(fields[9]) || fields[10] != "s=0") {
+        error =
+            "#345 access record lost raw target/status/current-RUT rewritten-upstream "
+            "request size/downstream response size/upstream/outcome evidence (#347 tracks "
+            "original downstream request-length semantics)";
+        return false;
+    }
+    return true;
+}
+
+static bool run_rut_exact_ipv4_production_self_checks(std::string& error) {
+    static constexpr u16 kFrontend = 54321u;
+    static constexpr u16 kBackend = 54322u;
+    const std::string exact =
+        "listen 127.0.0.1:54321\n"
+        "upstream exact_backend at \"127.0.0.1:54322\"\n"
+        "route GET \"/\" {\n  return forward(exact_backend,\n"
+        "    request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\",\n"
+        "      strip_headers: [\"Connection\"] },\n"
+        "    response_policy: { version: \"HTTP/1.1\", framing: \"content_length\",\n"
+        "      connection: \"request\", server: \"rut-stage4\", date: \"current\",\n"
+        "      hide_headers: [\"Date\", \"Server\"] })\n}\n";
+    if (!validate_rut_exact_ipv4_source(exact, kFrontend, kBackend, false, error)) return false;
+    for (const std::pair<std::string, std::string>& mutation :
+         {std::pair{std::string("listen 127.0.0.1:54321\n"), std::string("listen :54321\n")},
+          std::pair{std::string("listen 127.0.0.1:54321\n"),
+                    std::string("listen 127.0.0.2:54321\n")},
+          std::pair{std::string("listen 127.0.0.1:54321\n"),
+                    std::string("listen 127.0.0.1:54320\n")},
+          std::pair{std::string("listen 127.0.0.1:54321\n"), std::string()},
+          std::pair{std::string("route GET \"/\" {\n"),
+                    std::string("route GET \"/\" {\nroute GET \"/\" { return 204 }\n")}}) {
+        std::string candidate = exact;
+        const size_t offset = candidate.find(mutation.first);
+        if (offset == std::string::npos ||
+            candidate.find(mutation.first, offset + mutation.first.size()) != std::string::npos) {
+            error = "#345 source self-check mutation target was absent or duplicate";
+            return false;
+        }
+        candidate.replace(offset, mutation.first.size(), mutation.second);
+        std::string mutation_error;
+        if (candidate == exact ||
+            validate_rut_exact_ipv4_source(candidate, kFrontend, kBackend, false, mutation_error)) {
+            error = "#345 source validator accepted a changed invalid address/inventory";
+            return false;
+        }
+    }
+    std::string absent_guard_error;
+    if (validate_exact_loopback_guard_fd(-1, kFrontend, absent_guard_error) ||
+        absent_guard_error.empty()) {
+        error = "#345 guard validator accepted a released/absent reservation";
+        return false;
+    }
+    const std::string runtime =
+        "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\n"
+        "Listening on port 54321 with 1 shard(s)\n"
+        "Draining connections (0s)...\nShutdown complete.\n";
+    if (!validate_rut_exact_ipv4_runtime_log(runtime, "/tmp/stage4.rut", kFrontend, error))
+        return false;
+    for (const std::string& mutation :
+         {"Loaded program: /tmp/other.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\nShutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: epoll\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\nShutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54322 with 1 shard(s)\nDraining connections (0s)...\nShutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nShutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (1s)...\nShutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\nShutdown incomplete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\nDraining connections (0s)...\n"
+          "Shutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nDraining connections (0s)...\nShutdown complete.\n"
+          "Shutdown complete.\n",
+          "Loaded program: /tmp/stage4.rut (opt O2)\nBackend: io_uring\nListening on port "
+          "54321 with 1 shard(s)\nShutdown complete.\nDraining connections (0s)...\n"}) {
+        std::string mutation_error;
+        if (validate_rut_exact_ipv4_runtime_log(
+                mutation, "/tmp/stage4.rut", kFrontend, mutation_error)) {
+            error = "#345 runtime-log validator accepted a missing public evidence record";
+            return false;
+        }
+    }
+    const std::string access =
+        "2026-08-28T01:02:03.456Z GET /scope?q=1 200 7us 77 112 127.0.0.1 "
+        "exact_backend 3us s=0\n";
+    if (!validate_rut_exact_ipv4_access(access, 77u, 112u, error)) return false;
+    for (const std::string& mutation :
+         {access + access,
+          std::string("2026-08-28T01:02:03.456Z GET /other 200 7us 77 112 127.0.0.1 "
+                      "exact_backend 3us s=0\n"),
+          std::string("2026-08-28T01:02:03.456Z GET /scope?q=1 200 7us 77 112 127.0.0.2 "
+                      "exact_backend 3us s=0\n"),
+          std::string("2026-08-28T01:02:03.456Z GET /scope?q=1 502 7us 77 112 127.0.0.1 "
+                      "exact_backend 3us s=0\n"),
+          std::string("2026-08-28T01:02:03.456Z GET /scope?q=1 200 7us 78 112 127.0.0.1 "
+                      "exact_backend 3us s=0\n"),
+          std::string("2026-08-28T01:02:03.456Z GET /scope?q=1 200 7us 77 113 127.0.0.1 "
+                      "exact_backend 3us s=0\n"),
+          std::string("2026-08-28T01:02:03.456Z GET /scope?q=1 200 7us 77 112 127.0.0.1 "
+                      "other 3us s=0\n")}) {
+        std::string mutation_error;
+        if (validate_rut_exact_ipv4_access(mutation, 77u, 112u, mutation_error)) {
+            error = "#345 access validator accepted duplicate or mutated evidence";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_rut_exact_ipv4_listener_production(TempDir& temp,
+                                                   const char* rut_path,
+                                                   std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#345 public capability evidence requires an executable absolute RUT path";
+        return false;
+    }
+    RutExactIpv4Reservations reservations;
+    if (!reservations.reserve(error)) return false;
+    const u16 frontend_port = reservations.frontend_port;
+    const u16 backend_port = reservations.backend_port;
+    const auto make_source = [&](bool wildcard) {
+        return std::string(wildcard ? "listen :" : "listen 127.0.0.1:") +
+               std::to_string(frontend_port) + "\n" +
+               "upstream exact_backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
+               R"rut(route GET "/" {
+  return forward(exact_backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "rut-stage4", date: "current",
+      hide_headers: ["Date", "Server"] })
+}
+)rut";
+    };
+    const std::string exact_source = make_source(false);
+    const std::string wildcard_source = make_source(true);
+    if (exact_source == wildcard_source ||
+        !validate_rut_exact_ipv4_source(exact_source, frontend_port, backend_port, false, error) ||
+        !validate_rut_exact_ipv4_source(wildcard_source, frontend_port, backend_port, true, error))
+        return false;
+    const std::string exact_listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string wildcard_listener = "listen :" + std::to_string(frontend_port) + "\n";
+    std::string listener_only_mutation = exact_source;
+    const size_t listener_offset = listener_only_mutation.find(exact_listener);
+    if (listener_offset == std::string::npos ||
+        listener_only_mutation.find(exact_listener, listener_offset + exact_listener.size()) !=
+            std::string::npos) {
+        error = "#345 exact source lacked one unique listener mutation target";
+        return false;
+    }
+    listener_only_mutation.replace(listener_offset, exact_listener.size(), wildcard_listener);
+    if (listener_only_mutation != wildcard_source) {
+        error = "#345 wildcard mutation changed bytes beyond the listener address";
+        return false;
+    }
+
+    struct ExtraPaths {
+        std::string runtime;
+        std::string access;
+        ~ExtraPaths() {
+            unlink(runtime.c_str());
+            unlink(access.c_str());
+        }
+    } wildcard_paths{std::string(temp.path) + "/wildcard-runtime.log",
+                     std::string(temp.path) + "/wildcard-access.log"};
+
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    } recorder_guard;
+    Recorder backend;
+    recorder_guard.recorder = &backend;
+    backend.observe_extra_requests_until_stop = true;
+    close(reservations.backend);
+    reservations.backend = -1;
+    if (!backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#345 recorder could not bind the held backend endpoint";
+        return false;
+    }
+    const auto recorder_live = [&]() {
+        return backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live() && std::chrono::steady_clock::now() < recorder_deadline) usleep(1000);
+    if (!recorder_live()) {
+        error = "#345 recorder failed before the public mutation gate";
+        return false;
+    }
+    const auto exact_counts = [&](u32 expected,
+                                  std::chrono::milliseconds duration,
+                                  Child* monitored_child) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (monitored_child != nullptr && poll_child(*monitored_child)) return false;
+            if (!recorder_live() || backend.accepted.load(std::memory_order_acquire) != expected ||
+                backend.requests.load(std::memory_order_acquire) != expected ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != expected)
+                return false;
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+
+    if (!write_file(temp.source, wildcard_source.data(), wildcard_source.size()) ||
+        !reservations.release_frontend(error)) {
+        if (error.empty()) error = "#345 failed to write/handoff the wildcard mutation";
+        return false;
+    }
+    ChildGuard wildcard_child;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      std::to_string(frontend_port),
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      wildcard_paths.access},
+                     wildcard_paths.runtime,
+                     wildcard_child.child) ||
+        !wait_child(wildcard_child.child, 3000)) {
+        error = "#345 wildcard mutation did not fail within the bounded startup window";
+        return false;
+    }
+    if (!wildcard_child.child.status_valid || !WIFEXITED(wildcard_child.child.status) ||
+        WEXITSTATUS(wildcard_child.child.status) == 0) {
+        error = "#345 wildcard mutation did not exit with a startup failure";
+        return false;
+    }
+    wildcard_child.child.pid = -1;
+    std::string wildcard_log;
+    if (!read_exact_return204_log(
+            wildcard_paths.runtime, "#345 wildcard mutation runtime log", wildcard_log, error) ||
+        count_text(wildcard_log, "Loaded program: " + temp.source + " (opt O2)\n") != 1u ||
+        count_text(wildcard_log, "Backend: io_uring\n") != 1u ||
+        count_text(wildcard_log, "Failed to create listen socket for shard 0") != 1u ||
+        wildcard_log.find("errno=98") == std::string::npos ||
+        wildcard_log.find("Listening on port ") != std::string::npos ||
+        !validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error) ||
+        !exact_loopback_negative_connect_fails(frontend_port, error) ||
+        !exact_counts(0u, std::chrono::milliseconds(150), nullptr)) {
+        if (error.empty())
+            error = "#345 wildcard public mutation lacked exact bind-failure evidence";
+        return false;
+    }
+    std::string wildcard_access;
+    const int wildcard_access_fd = open(wildcard_paths.access.c_str(), O_RDONLY);
+    if (wildcard_access_fd >= 0) {
+        char buffer[256];
+        for (;;) {
+            const ssize_t count = read(wildcard_access_fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                wildcard_access.append(buffer, static_cast<size_t>(count));
+                continue;
+            }
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) {
+                close(wildcard_access_fd);
+                error = "#345 wildcard access log read failed";
+                return false;
+            }
+            break;
+        }
+        close(wildcard_access_fd);
+    } else if (errno != ENOENT) {
+        error = "#345 wildcard access log could not be checked";
+        return false;
+    }
+    if (!wildcard_access.empty() || !reservations.reacquire_frontend(error) ||
+        !write_file(temp.source, exact_source.data(), exact_source.size())) {
+        if (error.empty()) error = "#345 wildcard mutation produced access or exact restore failed";
+        return false;
+    }
+
+    ChildGuard runtime;
+    if (!reservations.release_frontend(error) ||
+        !spawn_child({rut_path,
+                      temp.source,
+                      std::to_string(frontend_port),
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "#345 exact public RUT failed before readiness";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+    const auto log_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < log_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#345 exact public RUT exited before load/io_uring/listener proof";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (poll_child(runtime.child) ||
+        !validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error) ||
+        !exact_loopback_negative_connect_fails(frontend_port, error) ||
+        !exact_counts(0u, std::chrono::milliseconds(150), &runtime.child)) {
+        if (error.empty()) error = "#345 pre-request address scope or zero episode failed";
+        return false;
+    }
+    static constexpr char kDestroyedSource[] = "invalid-after-owned-exact-listener-load\n";
+    if (!write_file(temp.source, kDestroyedSource, sizeof(kDestroyedSource) - 1u)) {
+        error = "#345 failed to overwrite source after public readiness";
+        return false;
+    }
+    std::string destroyed_readback;
+    if (!read_exact_return204_log(
+            temp.source, "#345 destroyed owned source", destroyed_readback, error) ||
+        destroyed_readback != kDestroyedSource) {
+        error = "#345 source overwrite/readback was not exact";
+        return false;
+    }
+
+    static constexpr char kRequest[] =
+        "GET /scope?q=1 HTTP/1.1\r\n"
+        "Host: exact-listener.example\r\n"
+        "X-Stage4: owned\r\n"
+        "Connection: close\r\n\r\n";
+    const std::string request_text(kRequest, sizeof(kRequest) - 1u);
+    if (request_text.rfind("GET /scope?q=1 HTTP/1.1\r\n", 0u) != 0u ||
+        request_text.find("\r\nConnection: close\r\n") == std::string::npos ||
+        request_text.find("\r\nContent-Length:") != std::string::npos ||
+        request_text.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request_text.rfind("\r\n\r\n") != request_text.size() - 4u) {
+        error = "#345 request escaped the exact fresh bodyless explicit-close H1.1 scope";
+        return false;
+    }
+    static constexpr char kResponseNormalized[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut-stage4\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\nok";
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    std::vector<char> wire;
+    std::string detail;
+    if (client.fd < 0 || !send_all(client.fd, kRequest, sizeof(kRequest) - 1u) ||
+        !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+        error = "#345 exact response/zero-tail/EOF failed: " +
+                (detail.empty() ? std::string("connect or send failed") : detail);
+        return false;
+    }
+    std::vector<char> normalized = wire;
+    if (!normalize_date(normalized) || normalized.size() != sizeof(kResponseNormalized) - 1u ||
+        memcmp(normalized.data(), kResponseNormalized, sizeof(kResponseNormalized) - 1u) != 0) {
+        error = "#345 downstream response was not the exact Date-normalized expected wire";
+        return false;
+    }
+    const auto episode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < episode_deadline && recorder_live() &&
+           !poll_child(runtime.child)) {
+        if (backend.accepted.load(std::memory_order_acquire) > 1u ||
+            backend.requests.load(std::memory_order_acquire) > 1u ||
+            backend.response_send_all_calls.load(std::memory_order_acquire) > 1u ||
+            (backend.accepted.load(std::memory_order_acquire) == 1u &&
+             backend.requests.load(std::memory_order_acquire) == 1u &&
+             backend.response_send_all_calls.load(std::memory_order_acquire) == 1u))
+            break;
+        usleep(1000);
+    }
+    if (!exact_counts(1u, std::chrono::milliseconds(500), &runtime.child) ||
+        !validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error) ||
+        !exact_loopback_negative_connect_fails(frontend_port, error) ||
+        !exact_counts(1u, std::chrono::milliseconds(150), &runtime.child) ||
+        !stop_child(runtime.child)) {
+        if (error.empty())
+            error = "#345 post-request exact address/no-retry/clean-stop proof failed";
+        return false;
+    }
+    backend.stop();
+    recorder_guard.recorder = nullptr;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u) {
+        error = "#345 recorder did not settle at one complete origin episode";
+        return false;
+    }
+    const std::string rewritten_upstream_wire =
+        "GET /scope?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Stage4: owned\r\n\r\n";
+    // Current generic RUT proxy access req_size is the rewritten upstream wire size. It is
+    // intentionally not nginx $request_length/original downstream request size; #347 tracks that
+    // separate access-log semantic capability.
+    if (request_text.size() == rewritten_upstream_wire.size()) {
+        error =
+            "#345 fixture no longer distinguishes current rewritten-upstream req_size from "
+            "the original downstream request length tracked by #347";
+        return false;
+    }
+    if (backend.history[0] !=
+        std::vector<char>(rewritten_upstream_wire.begin(), rewritten_upstream_wire.end())) {
+        error = "#345 upstream method/target/H1.1/Host/Connection wire was not exact";
+        return false;
+    }
+    std::string runtime_contents;
+    std::string access_contents;
+    if (!read_exact_return204_log(
+            temp.rut_log, "#345 exact RUT runtime log", runtime_contents, error) ||
+        !validate_rut_exact_ipv4_runtime_log(runtime_contents, temp.source, frontend_port, error) ||
+        !read_exact_return204_log(
+            temp.rut_access_log, "#345 exact RUT access log", access_contents, error) ||
+        !validate_rut_exact_ipv4_access(
+            access_contents, rewritten_upstream_wire.size(), wire.size(), error))
+        return false;
+    return validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error);
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -30768,6 +31363,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--slash-normalized-exact-rut-production") == 0;
     const bool no_content204_rut_production =
         argc == 3 && strcmp(argv[1], "--no-content204-rut-production") == 0;
+    const bool rut_exact_ipv4_listener_production =
+        argc == 3 && strcmp(argv[1], "--rut-exact-ipv4-listener-production") == 0;
     const bool converter_coalesced_successor_differential =
         argc == 5 && strcmp(argv[1], "--converter-coalesced-successor-differential") == 0;
     const bool late_successor_differential =
@@ -30821,11 +31418,11 @@ int main(int argc, char** argv) {
          !converter_exact_absolute_redirect_302_differential &&
          !converter_exact_local_differential && !exact_strict_route_differential &&
          !slash_normalized_exact_rut_production && !no_content204_rut_production &&
-         !converter_coalesced_successor_differential && !rut_iouring_gate_spike &&
-         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
-         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
-         !rut_iouring_coalesced_ingress_gate && !late_successor_differential &&
-         !normal_differential) ||
+         !rut_exact_ipv4_listener_production && !converter_coalesced_successor_differential &&
+         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         !rut_iouring_gate_connect_journal_negative && !rut_iouring_coalesced_ingress_gate &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
@@ -30855,6 +31452,7 @@ int main(int argc, char** argv) {
         (exact_strict_route_differential && argv[2][0] != '/') ||
         (slash_normalized_exact_rut_production && argv[2][0] != '/') ||
         (no_content204_rut_production && argv[2][0] != '/') ||
+        (rut_exact_ipv4_listener_production && argv[2][0] != '/') ||
         (converter_coalesced_successor_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/')) ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
@@ -30967,6 +31565,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --slash-normalized-exact-rut-production "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --no-content204-rut-production "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --rut-exact-ipv4-listener-production "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-coalesced-successor-differential "
                      "<absolute-rut-executable> <absolute-nginx-preload-helper> "
@@ -31168,6 +31768,14 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (rut_exact_ipv4_listener_production) {
+        std::string self_check_error;
+        if (!run_rut_exact_ipv4_production_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#345 exact IPv4 RUT production self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+    }
     if (bodyful_normalized_exact_oracle || converter_bodyful_normalized_exact_differential) {
         std::string parser_error;
         if (!run_bodyful_normalized_exact_self_checks(parser_error)) {
@@ -31231,6 +31839,24 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#325 query access-log parser self-check]: " << parser_error << "\n";
             return 1;
         }
+    }
+    if (rut_exact_ipv4_listener_production) {
+        std::string production_error;
+        if (!run_rut_exact_ipv4_listener_production(temp, argv[2], production_error)) {
+            std::cerr << "FAIL [#345 exact IPv4 public-CLI/io_uring production]: "
+                      << production_error << "\n";
+            dump_log(temp.source, "destroyed #345 ordinary RUT source");
+            dump_log(temp.rut_log, "#345 public RUT CLI log");
+            dump_log(temp.rut_access_log, "#345 public RUT access log");
+            return 1;
+        }
+        std::cerr << "PASS: ordinary RUT exact IPv4 listener used the public CLI with a same-port "
+                     "positional override and real io_uring; a held 127.0.0.2 same-port guard "
+                     "forced the wildcard source mutation to fail binding, while the exact "
+                     "127.0.0.1 source survived source overwrite and produced one byte-exact "
+                     "upstream episode, exact response/EOF and one strict access record with no "
+                     "retry (generic RUT #345 capability only; no nginx/converter claim)\n";
+        return 0;
     }
     if (no_content204_rut_production) {
         u16 rut_frontend_port = 0;
