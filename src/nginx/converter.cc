@@ -1149,11 +1149,10 @@ bool put_exact_absolute_redirect(
 
 bool put_exact_local_return(Writer& writer, Str path, Str body) {
     // validate_exact_local_return has already proven the complete path borrow
-    // and clean grammar before this final-byte view selection is reached.
-    const bool slash_normalized = path.ptr[path.len - 1u] == '/';
-    return writer.put_cstr(slash_normalized ? "route exact slash_normalized \""
-                                            : "route exact \"") &&
-           writer.put(path) && writer.put_cstr("\" { return local_response({\n") &&
+    // and clean grammar. nginx performs exact-location selection against its
+    // slash-normalized URI under the accepted default merge_slashes profile.
+    return writer.put_cstr("route exact slash_normalized \"") && writer.put(path) &&
+           writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
                "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
                "\"nginx/1.29.7\",\n") &&

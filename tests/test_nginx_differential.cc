@@ -13491,6 +13491,75 @@ static std::string make_exact_local_body_space_fragment(u16 frontend_port,
            (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
 }
 
+static std::string canonical_generated_bodyful_exact_route(const char* path, const char* body) {
+    return "route exact slash_normalized \"" + std::string(path) +
+           "\" { return local_response({\n"
+           "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+           "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+           "  head_mode: \"suppress_body\", body: b\"" +
+           std::string(body) + "\"\n}) }\n";
+}
+
+static size_t count_source_literal(const std::string& source, const std::string& literal) {
+    size_t count = 0;
+    for (size_t offset = 0;;) {
+        offset = source.find(literal, offset);
+        if (offset == std::string::npos) return count;
+        count++;
+        offset += literal.size();
+    }
+}
+
+static bool validate_converter_coalesced_source(const std::string& source) {
+    const std::string exact_route =
+        canonical_generated_bodyful_exact_route("/static", "successor-static");
+    return count_source_literal(source, exact_route) == 1u &&
+           count_source_literal(source, "route exact ") == 1u &&
+           source.find("route exact \"/static\"") == std::string::npos &&
+           source.find("route exact GET \"/static\"") == std::string::npos &&
+           source.find("route exact slash_normalized GET \"/static\"") == std::string::npos &&
+           source.find("route exact slash_normalized OPTIONS \"/static\"") == std::string::npos &&
+           source.find("/static?") == std::string::npos &&
+           source.find("coalesced-ingress.example") == std::string::npos &&
+           source.find("route \"/\"") != std::string::npos &&
+           source.find("return forward(nginx_upstream") != std::string::npos &&
+           source.find("proxy_pass") == std::string::npos &&
+           source.find("nginx.conf") == std::string::npos &&
+           source.find("nginx::") == std::string::npos &&
+           source.find("nginx_compat") == std::string::npos &&
+           source.find("workaround") == std::string::npos &&
+           source.find("return response(") == std::string::npos;
+}
+
+static bool run_converter_coalesced_source_self_checks(std::string& error) {
+    const std::string exact_route =
+        canonical_generated_bodyful_exact_route("/static", "successor-static");
+    const std::string canonical = exact_route + "route \"/\" { return forward(nginx_upstream) }\n";
+    if (!validate_converter_coalesced_source(canonical)) {
+        error = "coalesced-source validator rejected its canonical normalized ANY baseline";
+        return false;
+    }
+    const auto method_binding = [&](const char* method) {
+        std::string binding = exact_route;
+        const std::string selector = "route exact slash_normalized ";
+        const size_t offset = binding.find(selector);
+        if (offset != 0u) return std::string{};
+        binding.insert(selector.size(), std::string(method) + " ");
+        return binding;
+    };
+    const std::string get = method_binding("GET");
+    const std::string options = method_binding("OPTIONS");
+    if (get.empty() || validate_converter_coalesced_source(canonical + get)) {
+        error = "coalesced-source validator accepted an appended normalized GET binding";
+        return false;
+    }
+    if (options.empty() || validate_converter_coalesced_source(canonical + options)) {
+        error = "coalesced-source validator accepted an appended normalized OPTIONS binding";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_generated_exact_local_body_space_order(
     u16 frontend_port,
     u16 backend_port,
@@ -13541,30 +13610,35 @@ static bool capture_generated_exact_local_body_space_order(
     }
     const rut::Str generated = lowered.value().view();
     generated_source.assign(generated.ptr, generated.len);
-    const auto count_literal = [&](const char* literal) {
+    const auto count_literal = [&](const std::string& literal) {
         size_t count = 0;
         for (size_t offset = 0;;) {
             offset = generated_source.find(literal, offset);
             if (offset == std::string::npos) return count;
             count++;
-            offset += strlen(literal);
+            offset += literal.size();
         }
     };
-    if (count_literal("body: b\"hello world\"") != 1 ||
-        count_literal("route exact \"/static\" { return local_response({") != 1 ||
+    const std::string exact_route =
+        canonical_generated_bodyful_exact_route("/static", "hello world");
+    if (count_literal("body: b\"hello world\"") != 1 || count_literal(exact_route) != 1 ||
         count_literal("/static") != 1 || count_literal("route exact ") != 1 ||
         count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") == 0 ||
-        generated_source.find("slash_normalized") != std::string::npos ||
+        count_literal("return forward(nginx_upstream") != 3 ||
+        generated_source.find("route exact \"/static\"") != std::string::npos ||
         generated_source.find("route exact \"/static/") != std::string::npos ||
         generated_source.find("route \"/static") != std::string::npos ||
         generated_source.find("req.pathOnly == \"/static") != std::string::npos ||
+        generated_source.find("/static?") != std::string::npos ||
+        generated_source.find("body-space.example") != std::string::npos ||
         generated_source.find("proxy_pass") != std::string::npos ||
         generated_source.find("nginx.conf") != std::string::npos ||
         generated_source.find("nginx::") != std::string::npos ||
         generated_source.find("nginx_compat") != std::string::npos ||
+        generated_source.find("workaround") != std::string::npos ||
         !write_file(temp.source, generated.ptr, generated.len)) {
-        error = "#321 converter output was not one Raw /static local route plus unchanged root";
+        error =
+            "#321 converter output was not one normalized /static local route plus unchanged root";
         return false;
     }
 
@@ -13951,18 +14025,20 @@ static bool capture_generated_exact_local_body_multiple_space_order(
         }
     };
     const std::string expected_literal = "body: b\"" + std::string(spec.body) + "\"";
+    const std::string exact_route = canonical_generated_bodyful_exact_route("/static", spec.body);
     const char* other_body =
         strcmp(spec.body, "hello  world") == 0 ? "hello world again" : "hello  world";
-    if (count_literal(expected_literal) != 1 ||
-        count_literal("route exact \"/static\" { return local_response({") != 1 ||
+    if (count_literal(expected_literal) != 1 || count_literal(exact_route) != 1 ||
         count_literal("/static") != 1 || count_literal("route exact ") != 1 ||
         count_literal("route \"/\" {") != 1 ||
         count_literal("return forward(nginx_upstream") != 3 ||
         generated_source.find("body: b\"" + std::string(other_body) + "\"") != std::string::npos ||
-        generated_source.find("slash_normalized") != std::string::npos ||
+        generated_source.find("route exact \"/static\"") != std::string::npos ||
         generated_source.find("route exact \"/static/") != std::string::npos ||
         generated_source.find("route \"/static") != std::string::npos ||
         generated_source.find("req.pathOnly == \"/static") != std::string::npos ||
+        generated_source.find("/static?") != std::string::npos ||
+        generated_source.find("multiple-body-space.example") != std::string::npos ||
         generated_source.find("alias") != std::string::npos ||
         generated_source.find("proxy_pass") != std::string::npos ||
         generated_source.find("nginx.conf") != std::string::npos ||
@@ -13970,7 +14046,8 @@ static bool capture_generated_exact_local_body_multiple_space_order(
         generated_source.find("nginx_compat") != std::string::npos ||
         generated_source.find("workaround") != std::string::npos ||
         !write_file(temp.source, generated.ptr, generated.len)) {
-        error = "#322 output was not one ordinary Raw /static body plus unchanged root forward";
+        error =
+            "#322 output was not one ordinary normalized /static body plus unchanged root forward";
         return false;
     }
 
@@ -14385,21 +14462,29 @@ static bool capture_generated_bounded_exact_local_path_order(
     }
     const rut::Str generated = lowered.value().view();
     generated_source.assign(generated.ptr, generated.len);
-    const auto count_literal = [&](const char* literal) {
+    const auto count_literal = [&](const std::string& literal) {
         size_t count = 0;
         for (size_t offset = 0;;) {
             offset = generated_source.find(literal, offset);
             if (offset == std::string::npos) return count;
             count++;
-            offset += strlen(literal);
+            offset += literal.size();
         }
     };
-    if (count_literal("route exact \"/healthz\" { return local_response({") != 1 ||
-        count_literal("route \"/\" {") != 1 ||
-        count_literal("return forward(nginx_upstream") == 0 ||
+    const std::string exact_route =
+        canonical_generated_bodyful_exact_route("/healthz", "successor-static");
+    if (count_literal(exact_route) != 1 || count_literal("route exact ") != 1 ||
+        count_literal("/healthz") != 1 || count_literal("route \"/\" {") != 1 ||
+        count_literal("return forward(nginx_upstream") != 3 ||
         generated_source.find("successor-static") == std::string::npos ||
+        generated_source.find("route exact \"/healthz\"") != std::string::npos ||
+        generated_source.find("/healthz?") != std::string::npos ||
+        generated_source.find("healthz.example") != std::string::npos ||
         generated_source.find("proxy_pass") != std::string::npos ||
         generated_source.find("nginx.conf") != std::string::npos ||
+        generated_source.find("nginx::") != std::string::npos ||
+        generated_source.find("nginx_compat") != std::string::npos ||
+        generated_source.find("workaround") != std::string::npos ||
         !write_file(temp.source, generated.ptr, generated.len)) {
         error = "#318 converter output lost its single exact-local/root-forward ordinary-RUT shape";
         return false;
@@ -16585,11 +16670,7 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
     }
     const rut::Str generated = lowered.value().view();
     const std::string source(generated.ptr, generated.len);
-    if (source.find("route exact \"/static\" { return local_response({") == std::string::npos ||
-        source.find("route exact GET \"/static\"") != std::string::npos ||
-        source.find("route \"/\"") == std::string::npos ||
-        source.find("return forward(nginx_upstream") == std::string::npos ||
-        source.find("return response(") != std::string::npos ||
+    if (!validate_converter_coalesced_source(source) ||
         !write_file(temp.source, source.data(), source.size())) {
         error = "converter output lost the exact-ANY/root-forward ordinary-RUT shape";
         return false;
@@ -20333,7 +20414,10 @@ static bool run_converter_exact_local_differential(
         error = "converter output did not preserve exactly one concrete pre-route TRACE policy";
         return false;
     }
-    static constexpr char kExactTerminator[] = "route exact \"/static\" { return local_response({";
+    static constexpr char kExactTerminator[] =
+        "route exact slash_normalized \"/static\" { return local_response({";
+    const std::string canonical_exact =
+        canonical_generated_bodyful_exact_route("/static", "successor-static");
     const size_t exact_begin = rut_source.find(kExactTerminator);
     const size_t exact_end =
         exact_begin == std::string::npos ? std::string::npos : rut_source.find("}) }", exact_begin);
@@ -20346,7 +20430,8 @@ static bool run_converter_exact_local_differential(
         const std::string line = rut_source.substr(line_begin, length);
         if (line.rfind("route ", 0) == 0 && line.find("\"/static\"") != std::string::npos) {
             static_route_count++;
-            only_exact_static_route &= line.rfind("route exact \"/static\"", 0) == 0;
+            only_exact_static_route &=
+                line.rfind("route exact slash_normalized \"/static\"", 0) == 0;
         }
         if (line_end == std::string::npos) break;
         line_begin = line_end + 1;
@@ -20357,9 +20442,10 @@ static bool run_converter_exact_local_differential(
         return found != std::string::npos && found < exact_end;
     };
     if (exact_begin == std::string::npos || exact_end == std::string::npos ||
-        static_route_count != 1 || !only_exact_static_route ||
-        !exact_contains("status: 200, reason: \"OK\"") ||
+        count_source_literal(canonical_exact.c_str()) != 1 || static_route_count != 1 ||
+        !only_exact_static_route || !exact_contains("status: 200, reason: \"OK\"") ||
         !exact_contains("head_mode: \"suppress_body\", body: b\"successor-static\"") ||
+        rut_source.find("route exact \"/static\"") != std::string::npos ||
         rut_source.find("route exact GET \"/static\"") != std::string::npos ||
         rut_source.find("route exact OPTIONS \"/static\"") != std::string::npos ||
         rut_source.find("route exact DELETE \"/static\"") != std::string::npos ||
@@ -20369,6 +20455,12 @@ static bool run_converter_exact_local_differential(
         rut_source.find("PUT") != std::string::npos ||
         rut_source.find("PATCH") != std::string::npos ||
         rut_source.find("/static?") != std::string::npos ||
+        rut_source.find("exact-local.example") != std::string::npos ||
+        rut_source.find("proxy_pass") != std::string::npos ||
+        rut_source.find("nginx.conf") != std::string::npos ||
+        rut_source.find("nginx::") != std::string::npos ||
+        rut_source.find("nginx_compat") != std::string::npos ||
+        rut_source.find("workaround") != std::string::npos ||
         rut_source.find("return forward(nginx_upstream") == std::string::npos ||
         rut_source.find("route \"/\"") == std::string::npos ||
         rut_source.find("return response(") != std::string::npos) {
@@ -22376,12 +22468,21 @@ static bool capture_generated_normalized_exact_trailing_slash_order(
             offset += strlen(literal);
         }
     };
-    if (count_literal("route exact slash_normalized \"/health/check/\" {") != 1 ||
-        count_literal("route exact \"") != 0 || count_literal("route exact ") != 1 ||
+    const std::string exact_route =
+        canonical_generated_bodyful_exact_route("/health/check/", "successor-static");
+    if (count_literal(exact_route.c_str()) != 1 || count_literal("route exact \"") != 0 ||
+        count_literal("route exact ") != 1 || count_literal("/health/check/") != 1 ||
         count_literal("route \"/\" {") != 1 ||
-        generated_source.find("return forward(nginx_upstream") == std::string::npos ||
+        count_literal("return forward(nginx_upstream") != 3 ||
+        generated_source.find("route exact slash_normalized GET \"/health/check/\"") !=
+            std::string::npos ||
+        generated_source.find("/health/check/?") != std::string::npos ||
+        generated_source.find("normalized-exact.example") != std::string::npos ||
         generated_source.find("proxy_pass") != std::string::npos ||
-        generated_source.find("nginx.conf") != std::string::npos) {
+        generated_source.find("nginx.conf") != std::string::npos ||
+        generated_source.find("nginx::") != std::string::npos ||
+        generated_source.find("nginx_compat") != std::string::npos ||
+        generated_source.find("workaround") != std::string::npos) {
         error = "#320 converter output was not one generic slash-normalized exact route plus root";
         return false;
     }
@@ -22809,6 +22910,13 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
+    if (rut_iouring_coalesced_ingress_gate || converter_coalesced_successor_differential) {
+        std::string source_error;
+        if (!run_converter_coalesced_source_self_checks(source_error)) {
+            std::cerr << "FAIL [coalesced converter-source self-check]: " << source_error << "\n";
+            return 1;
+        }
+    }
     if (bounded_no_content_path_oracle || converter_bounded_no_content_path_differential) {
         std::string parser_error;
         if (!run_bounded_no_content_path_access_log_self_checks(parser_error)) {
@@ -23681,7 +23789,8 @@ int main(int argc, char** argv) {
             << "PASS: both declaration orders of complete bounded exact /static nginx server "
                "fragments with consecutive hello  world (CL12) and separated hello world "
                "again (CL17) bodies passed through production parse/borrowed-span validation/"
-               "lowering into canonical ordinary Raw RUT with one exact route, one unique body "
+               "lowering into canonical ordinary slash-normalized RUT with one exact route, "
+               "one unique body "
                "literal, and the unchanged root forward; after exact frontend/backend port "
                "normalization each order was identical and the body variants differed only at "
                "that literal. Four pinned nginx 1.29.7 containers and four independently "

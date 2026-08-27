@@ -15,10 +15,9 @@ struct RutSource {
     // model additionally emits the implicit pre-route TRACE policy. The
     // exact-redirect measured maximum uses listen and upstream port 65535 and
     // IPv4 255.255.255.255: 5936 bytes for 301 and 5912 bytes for 302. The
-    // exact-local-return maximum is 5681 bytes for a 62-byte trailing-slash
-    // path, a 64-byte body containing internal ASCII spaces, and the
-    // slash_normalized exact-path view keyword. Bodyful raw exact source shapes
-    // remain unchanged. The fixed `/static` no-content action measures 5564
+    // exact-local-return maximum is 5681 bytes for any 62-byte clean path, a
+    // 64-byte body containing internal ASCII spaces, and the slash_normalized
+    // exact-path view keyword. The fixed `/static` no-content action measures 5564
     // bytes at maximum ports/address; a maximum 62-byte no-content path measures
     // 5619 bytes with 318 bytes of strict writer headroom. The bounded
     // transformed-location maximum uses a 63-byte path, 128-byte replacement
