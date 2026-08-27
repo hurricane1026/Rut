@@ -985,6 +985,17 @@ struct ConnectionBase {
     // Full raw request-target fragment witness for the current request. This is
     // deliberately independent of the bounded req_path copy and canonical view.
     bool req_target_has_fragment;
+    // Access-log-only owned copy of the original strict-H1 target. It is
+    // populated only when access logging is enabled and remains valid after the
+    // borrowed recv_buf witness is cleared by rewrite/consume/reset paths.
+    AccessLogTargetSnapshot access_log_target_snapshot;
+
+    void clear_access_log_target_snapshot() {
+        access_log_target_snapshot.episode = 0;
+        access_log_target_snapshot.target_length = 0;
+        access_log_target_snapshot.target_state = AccessLogTargetState::LegacyNullTerminated;
+        access_log_target_snapshot.path[0] = '\0';
+    }
 
     void clear_raw_request_target_witness() {
         req_raw_target_episode = 0;
@@ -996,6 +1007,7 @@ struct ConnectionBase {
         req_metadata_episode++;
         if (req_metadata_episode == 0) req_metadata_episode = 1;
         clear_raw_request_target_witness();
+        clear_access_log_target_snapshot();
     }
 
     // Reset/compaction paths must use this instead of resetting recv_buf
@@ -1107,6 +1119,36 @@ struct ConnectionBase {
         return {
             RawRequestTargetWitnessState::Valid,
             {reinterpret_cast<const char*>(base + req_raw_target_offset), req_raw_target_length}};
+    }
+
+    // Called exactly once at request start when the owning loop has access
+    // logging enabled. checked_raw_request_target() performs every provenance
+    // and range gate before any target byte is copied here.
+    void capture_access_log_target_snapshot() {
+        clear_access_log_target_snapshot();
+        const u32 episode = req_metadata_episode;
+        const RawRequestTargetWitnessResult witness = checked_raw_request_target();
+        if (witness.state == RawRequestTargetWitnessState::Valid) {
+            if (witness.target.len == 0 ||
+                witness.target.len > kAccessLogObservedStrictH1TargetMax) {
+                access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
+            } else if (witness.target.len > kAccessLogCompleteTargetMax) {
+                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+                access_log_target_snapshot.target_state = AccessLogTargetState::OverLimit;
+            } else {
+                for (u32 i = 0; i < witness.target.len; i++)
+                    access_log_target_snapshot.path[i] = witness.target.ptr[i];
+                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+                access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+            }
+        } else if (witness.state == RawRequestTargetWitnessState::Neutral) {
+            access_log_target_snapshot.target_state = AccessLogTargetState::Unavailable;
+        } else {
+            access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
+        }
+        // Publish the owner last. A zero episode can never be consumed as the
+        // current request and therefore remains fail-closed at completion.
+        access_log_target_snapshot.episode = episode;
     }
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
@@ -1487,6 +1529,7 @@ struct ConnectionBase {
         req_raw_target_offset = 0;
         req_raw_target_length = 0;
         req_target_has_fragment = false;
+        clear_access_log_target_snapshot();
         req_keep_alive = false;
         req_client_keep_alive = false;
         req_client_connection_close = false;

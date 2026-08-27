@@ -16040,6 +16040,379 @@ TEST(streaming, response_body_recvd_wrong_type_closes) {
 
 // === Coverage: capture_request_metadata edge cases ===
 
+static std::string make_access_log_snapshot_target(u32 length) {
+    std::string target(length, 'r');
+    if (length == 0) return target;
+    target[0] = '/';
+    if (length >= 8u) {
+        target[1] = 'a';
+        target[2] = '/';
+        target[3] = '/';
+        target[length - 4u] = '?';
+        target[length - 3u] = 'x';
+        target[length - 2u] = '=';
+        target[length - 1u] = '1';
+    }
+    return target;
+}
+
+static bool load_access_log_snapshot_request(Connection& conn,
+                                             u8* storage,
+                                             u32 capacity,
+                                             const std::string& target) {
+    const u32 id = conn.id;
+    conn.reset();
+    conn.id = id;
+    conn.bind_request_receive_buffer(storage, capacity);
+    const std::string request = "GET " + target + " HTTP/1.1\r\n\r\n";
+    if (request.size() > capacity ||
+        conn.recv_buf.write(reinterpret_cast<const u8*>(request.data()),
+                            static_cast<u32>(request.size())) != request.size())
+        return false;
+    capture_request_metadata(conn);
+    return conn.checked_raw_request_target().state == RawRequestTargetWitnessState::Valid;
+}
+
+TEST(access_log_snapshot, bounded_capture_is_owned_and_access_disabled_does_not_capture) {
+    Connection conn{};
+    u8 storage[SlicePool::kSliceSize]{};
+
+    const std::string disabled_target = make_access_log_snapshot_target(66u);
+    REQUIRE(load_access_log_snapshot_request(conn, storage, sizeof(storage), disabled_target));
+    CHECK_EQ(conn.access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn.access_log_target_snapshot.target_length, 0u);
+    CHECK_EQ(conn.access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    CHECK_EQ(conn.access_log_target_snapshot.path[0], '\0');
+
+    for (const u32 length : {62u, 63u, 64u, 66u, 128u, 129u, 16367u}) {
+        const std::string target = make_access_log_snapshot_target(length);
+        REQUIRE(load_access_log_snapshot_request(conn, storage, sizeof(storage), target));
+        const u32 episode = conn.req_metadata_episode;
+        conn.capture_access_log_target_snapshot();
+        CHECK_EQ(conn.access_log_target_snapshot.episode, episode);
+        if (length <= kAccessLogCompleteTargetMax) {
+            CHECK_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+            CHECK_EQ(conn.access_log_target_snapshot.target_length, length);
+            CHECK_EQ(__builtin_memcmp(
+                         conn.access_log_target_snapshot.path, target.data(), target.size()),
+                     0);
+            if (length == kAccessLogCompleteTargetMax)
+                CHECK_EQ(conn.access_log_target_snapshot.path[length - 1u], '1');
+        } else {
+            CHECK_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::OverLimit);
+            CHECK_EQ(conn.access_log_target_snapshot.target_length, length);
+            CHECK_EQ(conn.access_log_target_snapshot.path[0], '\0');
+        }
+
+        // The owned snapshot remains exact after the borrowed witness and its
+        // backing receive bytes are invalidated.
+        if (length == 64u)
+            conn.consume_request_receive_buffer(1u);
+        else
+            conn.reset_request_receive_buffer();
+        CHECK_EQ(conn.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+        CHECK_EQ(conn.access_log_target_snapshot.episode, episode);
+        CHECK_EQ(conn.access_log_target_snapshot.target_length, length);
+        if (length <= kAccessLogCompleteTargetMax)
+            CHECK_EQ(__builtin_memcmp(
+                         conn.access_log_target_snapshot.path, target.data(), target.size()),
+                     0);
+    }
+
+    conn.req_metadata_episode = ~u32{0};
+    conn.access_log_target_snapshot.episode = ~u32{0};
+    conn.access_log_target_snapshot.target_length = 7u;
+    conn.access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+    __builtin_memcpy(conn.access_log_target_snapshot.path, "/stale", 6u);
+    conn.begin_request_metadata_episode();
+    CHECK_EQ(conn.req_metadata_episode, 1u);
+    CHECK_EQ(conn.access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn.access_log_target_snapshot.target_length, 0u);
+    CHECK_EQ(conn.access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+}
+
+TEST(access_log_snapshot, completion_publication_is_explicit_episode_owned_and_one_shot) {
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+
+    const std::string original = make_access_log_snapshot_target(66u);
+    const std::string request = "GET " + original + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+               request.size());
+    capture_request_metadata(*conn);
+    conn->capture_access_log_target_snapshot();
+    REQUIRE_EQ(conn->access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+
+    static constexpr char kReplacement[] = "/rewritten";
+    conn->req_path_overridden = true;
+    conn->req_path_override = {kReplacement, sizeof(kReplacement) - 1u};
+    REQUIRE(rewrite_request_line_path(*conn));
+    CHECK_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 105);
+
+    AccessLogEntry complete{};
+    REQUIRE(ring.pop(complete));
+    CHECK_EQ(complete.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(complete.target_length, original.size());
+    CHECK_EQ(__builtin_memcmp(complete.path, original.data(), original.size()), 0);
+    CHECK_EQ(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+
+    // A duplicate completion cannot reuse the consumed target.
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 105);
+    AccessLogEntry duplicate{};
+    REQUIRE(ring.pop(duplicate));
+    CHECK_EQ(duplicate.target_state, AccessLogTargetState::Invalid);
+    CHECK_NE(duplicate.target_state, AccessLogTargetState::LegacyNullTerminated);
+    CHECK_EQ(duplicate.target_length, 0u);
+    CHECK_EQ(duplicate.path[0], '\0');
+
+    // Logging can be disabled after request-start capture. Completion still
+    // consumes the snapshot without emitting; re-enable + duplicate is Invalid.
+    const std::string disabled_midflight = make_access_log_snapshot_target(64u);
+    REQUIRE(load_access_log_snapshot_request(
+        *conn, loop.recv_storage[conn->id], SmallLoop::kBufSize, disabled_midflight));
+    REQUIRE(loop.access_log != nullptr);
+    conn->capture_access_log_target_snapshot();
+    REQUIRE_EQ(conn->access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+    loop.access_log = nullptr;
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 105);
+    CHECK_EQ(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    AccessLogEntry disabled_record{};
+    CHECK_FALSE(ring.pop(disabled_record));
+    loop.access_log = &ring;
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 105);
+    REQUIRE(ring.pop(disabled_record));
+    CHECK_EQ(disabled_record.target_state, AccessLogTargetState::Invalid);
+    CHECK_EQ(disabled_record.target_length, 0u);
+    CHECK_EQ(disabled_record.path[0], '\0');
+
+    // Exact 128 is length-delimited without a NUL; larger valid targets publish
+    // only their observed length.
+    u8 large_storage[SlicePool::kSliceSize]{};
+    for (const u32 length : {128u, 129u, 16367u}) {
+        const std::string bounded_target = make_access_log_snapshot_target(length);
+        REQUIRE(load_access_log_snapshot_request(
+            *conn, large_storage, sizeof(large_storage), bounded_target));
+        conn->capture_access_log_target_snapshot();
+        conn->consume_request_receive_buffer(1u);
+        conn->req_start_us = monotonic_us();
+        on_request_complete<SmallLoop>(&loop, *conn, 204, 105);
+        AccessLogEntry bounded{};
+        REQUIRE(ring.pop(bounded));
+        CHECK_EQ(bounded.target_length, length);
+        if (length == kAccessLogCompleteTargetMax) {
+            CHECK_EQ(bounded.target_state, AccessLogTargetState::Complete);
+            CHECK_EQ(__builtin_memcmp(bounded.path, bounded_target.data(), bounded_target.size()),
+                     0);
+            CHECK_EQ(bounded.path[length - 1u], '1');
+        } else {
+            CHECK_EQ(bounded.target_state, AccessLogTargetState::OverLimit);
+            CHECK_EQ(bounded.path[0], '\0');
+        }
+    }
+
+    // Strict parsing without an origin-form witness is explicit Unavailable.
+    conn->reset();
+    conn->bind_request_receive_buffer(loop.recv_storage[conn->id], SmallLoop::kBufSize);
+    static constexpr char kUnavailable[] = "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kUnavailable), sizeof(kUnavailable) - 1u),
+        sizeof(kUnavailable) - 1u);
+    capture_request_metadata(*conn);
+    conn->capture_access_log_target_snapshot();
+    REQUIRE_EQ(conn->access_log_target_snapshot.target_state, AccessLogTargetState::Unavailable);
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 400, 0);
+    AccessLogEntry unavailable{};
+    REQUIRE(ring.pop(unavailable));
+    CHECK_EQ(unavailable.target_state, AccessLogTargetState::Unavailable);
+    CHECK_EQ(unavailable.target_length, 0u);
+
+    // Stale and poisoned snapshots never fall back to the legacy req_path.
+    const auto rejects_snapshot = [&](AccessLogTargetState state, u16 length, u32 episode_delta) {
+        conn->reset();
+        conn->req_metadata_episode = 17u;
+        conn->access_log_target_snapshot.episode = 17u + episode_delta;
+        conn->access_log_target_snapshot.target_state = state;
+        conn->access_log_target_snapshot.target_length = length;
+        __builtin_memcpy(conn->access_log_target_snapshot.path, "/poison", 7u);
+        __builtin_memcpy(conn->req_path, "/legacy-must-not-appear", 23u);
+        conn->req_start_us = monotonic_us();
+        on_request_complete<SmallLoop>(&loop, *conn, 500, 0);
+        AccessLogEntry entry{};
+        REQUIRE(ring.pop(entry));
+        CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+        CHECK_NE(entry.target_state, AccessLogTargetState::LegacyNullTerminated);
+        CHECK_EQ(entry.target_length, 0u);
+        CHECK_EQ(entry.path[0], '\0');
+    };
+    rejects_snapshot(AccessLogTargetState::Complete, 7u, 1u);
+    rejects_snapshot(AccessLogTargetState::Complete, 129u, 0u);
+    rejects_snapshot(AccessLogTargetState::OverLimit, 128u, 0u);
+    rejects_snapshot(AccessLogTargetState::LegacyNullTerminated, 0u, 0u);
+    rejects_snapshot(static_cast<AccessLogTargetState>(255u), 7u, 0u);
+
+    // A full ring drops the whole entry but still consumes its request episode.
+    AccessLogEntry filler{};
+    filler.target_state = AccessLogTargetState::Unavailable;
+    for (u32 i = 0; i < AccessLogRing::kCapacity; i++) REQUIRE(ring.push(filler));
+    conn->reset();
+    conn->req_metadata_episode = 23u;
+    conn->access_log_target_snapshot.episode = 23u;
+    conn->access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+    conn->access_log_target_snapshot.target_length = 5u;
+    __builtin_memcpy(conn->access_log_target_snapshot.path, "/full", 5u);
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 0);
+    CHECK_EQ(ring.available(), AccessLogRing::kCapacity);
+    CHECK_EQ(conn->access_log_target_snapshot.episode, 0u);
+    AccessLogEntry discarded{};
+    REQUIRE(ring.pop(discarded));
+    conn->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *conn, 204, 0);
+    for (u32 i = 1; i < AccessLogRing::kCapacity; i++) REQUIRE(ring.pop(discarded));
+    AccessLogEntry after_drop{};
+    REQUIRE(ring.pop(after_drop));
+    CHECK_EQ(after_drop.target_state, AccessLogTargetState::Invalid);
+    CHECK_EQ(after_drop.target_length, 0u);
+    CHECK_FALSE(ring.pop(discarded));
+}
+
+TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_isolated) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_static("/", 0, 204));
+
+    Connection* disabled = dispatch_unmatched_request(
+        loop, config, "GET /disabled//?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(disabled != nullptr);
+    CHECK_EQ(disabled->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(disabled->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    loop.close_conn(*disabled);
+
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    Connection* first =
+        dispatch_unmatched_request(loop, config, "GET /first//?x=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(first != nullptr);
+    const u32 first_id = first->id;
+    const u32 first_episode = first->access_log_target_snapshot.episode;
+    REQUIRE_NE(first_episode, 0u);
+    CHECK_EQ(first->access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+    loop.inject_and_dispatch(
+        make_ev(first_id, IoEventType::Send, static_cast<i32>(first->send_buf.len())));
+    AccessLogEntry first_entry{};
+    REQUIRE(ring.pop(first_entry));
+    CHECK_EQ(first_entry.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(std::string(first_entry.path, first_entry.target_length), "/first//?x=1");
+    REQUIRE_EQ(first->state, ConnState::ReadingHeader);
+    CHECK_EQ(first->access_log_target_snapshot.episode, 0u);
+
+    static constexpr char kSuccessor[] =
+        "GET /second//?y=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        first->recv_buf.write(reinterpret_cast<const u8*>(kSuccessor), sizeof(kSuccessor) - 1u),
+        sizeof(kSuccessor) - 1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop,
+        *first,
+        make_ev(first_id, IoEventType::Recv, static_cast<i32>(sizeof(kSuccessor) - 1u)));
+    loop.config_ptr = nullptr;
+    REQUIRE_NE(first->access_log_target_snapshot.episode, first_episode);
+    loop.inject_and_dispatch(
+        make_ev(first_id, IoEventType::Send, static_cast<i32>(first->send_buf.len())));
+    AccessLogEntry second_entry{};
+    REQUIRE(ring.pop(second_entry));
+    CHECK_EQ(std::string(second_entry.path, second_entry.target_length), "/second//?y=2");
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, first_id);
+    CHECK_EQ(reused->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(reused->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    loop.close_conn(*reused);
+
+    Connection* pipelined = loop.alloc_conn();
+    REQUIRE(pipelined != nullptr);
+    const u32 pipeline_id = pipelined->id;
+    static constexpr char kPipeline[] =
+        "GET /pipe-one//?a=1 HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /pipe-two//?b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        pipelined->recv_buf.write(reinterpret_cast<const u8*>(kPipeline), sizeof(kPipeline) - 1u),
+        sizeof(kPipeline) - 1u);
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop,
+        *pipelined,
+        make_ev(pipeline_id, IoEventType::Recv, static_cast<i32>(sizeof(kPipeline) - 1u)));
+    const u32 pipeline_first_episode = pipelined->access_log_target_snapshot.episode;
+    REQUIRE_NE(pipeline_first_episode, 0u);
+    loop.inject_and_dispatch(
+        make_ev(pipeline_id, IoEventType::Send, static_cast<i32>(pipelined->send_buf.len())));
+    AccessLogEntry pipeline_first{};
+    REQUIRE(ring.pop(pipeline_first));
+    CHECK_EQ(std::string(pipeline_first.path, pipeline_first.target_length), "/pipe-one//?a=1");
+    REQUIRE_EQ(pipelined->pipeline_depth, 1u);
+    REQUIRE_NE(pipelined->access_log_target_snapshot.episode, pipeline_first_episode);
+    loop.inject_and_dispatch(
+        make_ev(pipeline_id, IoEventType::Send, static_cast<i32>(pipelined->send_buf.len())));
+    loop.config_ptr = nullptr;
+    AccessLogEntry pipeline_second{};
+    REQUIRE(ring.pop(pipeline_second));
+    CHECK_EQ(std::string(pipeline_second.path, pipeline_second.target_length), "/pipe-two//?b=2");
+    AccessLogEntry extra{};
+    CHECK_FALSE(ring.pop(extra));
+}
+
+TEST(access_log_snapshot, transport_rejects_16368_target_without_fabricated_entry) {
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    u8 storage[SlicePool::kSliceSize]{};
+    conn->bind_request_receive_buffer(storage, sizeof(storage));
+    const std::string target = make_access_log_snapshot_target(16368u);
+    const std::string request = "GET " + target + " HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(request.size(), static_cast<size_t>(SlicePool::kSliceSize + 1u));
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()),
+                                    static_cast<u32>(request.size())),
+               SlicePool::kSliceSize);
+
+    // Production backends report a receive-buffer overflow as -ENOBUFS. The
+    // request is rejected before metadata capture/completion and creates no log.
+    on_header_received<SmallLoop>(&loop, *conn, make_ev(id, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(loop.conns[id].fd, -1);
+    CHECK_EQ(loop.conns[id].access_log_target_snapshot.episode, 0u);
+    AccessLogEntry fabricated{};
+    CHECK_FALSE(ring.pop(fabricated));
+}
+
 TEST(metadata, empty_recv_buf) {
     Connection c;
     c.reset();

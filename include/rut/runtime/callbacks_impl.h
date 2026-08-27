@@ -1804,12 +1804,40 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.req_size = conn.req_size;
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
-        // Stage-1 compatibility: the enlarged destination remains legacy state zero and must
-        // never widen reads from Connection::req_path[64]. Explicit target-state publication is
-        // activated only after the request-start owned snapshot lifecycle is implemented.
-        for (u32 i = 0; i < sizeof(conn.req_path) && i < sizeof(entry.path); i++) {
-            entry.path[i] = conn.req_path[i];
-            if (conn.req_path[i] == '\0') break;
+        // Every access-enabled production entry uses an explicit state. A snapshot must belong
+        // to this exact metadata episode; stale, poisoned, or internally inconsistent metadata
+        // fails closed instead of falling back to the bounded legacy req_path copy.
+        entry.target_state = AccessLogTargetState::Invalid;
+        const AccessLogTargetSnapshot& snapshot = conn.access_log_target_snapshot;
+        if (snapshot.episode != 0 && snapshot.episode == conn.req_metadata_episode) {
+            switch (snapshot.target_state) {
+                case AccessLogTargetState::Complete:
+                    if (snapshot.target_length != 0 &&
+                        snapshot.target_length <= kAccessLogCompleteTargetMax &&
+                        snapshot.path[0] == '/') {
+                        for (u32 i = 0; i < snapshot.target_length; i++)
+                            entry.path[i] = snapshot.path[i];
+                        entry.target_length = snapshot.target_length;
+                        entry.target_state = AccessLogTargetState::Complete;
+                    }
+                    break;
+                case AccessLogTargetState::OverLimit:
+                    if (snapshot.target_length > kAccessLogCompleteTargetMax &&
+                        snapshot.target_length <= kAccessLogObservedStrictH1TargetMax) {
+                        entry.target_length = snapshot.target_length;
+                        entry.target_state = AccessLogTargetState::OverLimit;
+                    }
+                    break;
+                case AccessLogTargetState::Unavailable:
+                    if (snapshot.target_length == 0)
+                        entry.target_state = AccessLogTargetState::Unavailable;
+                    break;
+                case AccessLogTargetState::Invalid:
+                    break;
+                case AccessLogTargetState::LegacyNullTerminated:
+                default:
+                    break;
+            }
         }
         for (u32 i = 0; i < sizeof(entry.upstream); i++) {
             entry.upstream[i] = conn.upstream_name[i];
@@ -1817,6 +1845,10 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         }
         loop->access_log->push(entry);
     }
+    // Every completion consumes the episode-owned snapshot, including when logging was disabled
+    // after request-start capture or the ring is full. A later duplicate completion can therefore
+    // publish only an explicit Invalid record, never the old target.
+    conn.clear_access_log_target_snapshot();
 
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
         CaptureEntry* cap_entry = nullptr;
@@ -1941,6 +1973,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);
+    if (loop->access_log) conn.capture_access_log_target_snapshot();
 
     // Tag the request with a fresh generation so the yield-heap stale
     // filter can reliably reject entries left by a close+reuse even if

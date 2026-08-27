@@ -918,12 +918,11 @@ TEST(callback_log, captures_request_metadata) {
     CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
     CHECK_EQ(out.req_size, req_len);
     CHECK_EQ(out.addr, 0x0100007F);
-    CHECK_EQ(out.target_state, AccessLogTargetState::LegacyNullTerminated);
-    CHECK_EQ(out.target_length, 0u);
-    CHECK_EQ(out.path[0], '/');
-    CHECK_EQ(out.path[1], 'a');
-    for (u32 i = kAccessLogLegacyTargetWidth; i < sizeof(out.path); i++)
-        CHECK_EQ(out.path[i], '\0');
+    static constexpr char kTarget[] = "/api/users?id=1";
+    CHECK_EQ(out.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(out.target_length, sizeof(kTarget) - 1u);
+    CHECK_EQ(__builtin_memcmp(out.path, kTarget, sizeof(kTarget) - 1u), 0);
+    for (u32 i = sizeof(kTarget) - 1u; i < sizeof(out.path); i++) CHECK_EQ(out.path[i], '\0');
 }
 
 TEST(callback_log, no_log_when_ring_null) {

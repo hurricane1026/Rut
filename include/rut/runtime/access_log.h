@@ -33,6 +33,7 @@ inline constexpr u32 kAccessLogCompleteTargetMax = 128;
 inline constexpr u32 kAccessLogLegacyTargetWidth = 64;
 inline constexpr u32 kAccessLogObservedStrictH1TargetMax = 16367;
 inline constexpr u32 kAccessLogTextLineCapacity = 512;
+static_assert(kAccessLogObservedStrictH1TargetMax <= static_cast<u32>(~u16{0}));
 
 enum class AccessLogTargetState : u8 {
     LegacyNullTerminated = 0,
@@ -49,9 +50,23 @@ static_assert(static_cast<u8>(AccessLogTargetState::OverLimit) == 2);
 static_assert(static_cast<u8>(AccessLogTargetState::Unavailable) == 3);
 static_assert(static_cast<u8>(AccessLogTargetState::Invalid) == 4);
 
+// Per-request owned copy captured while the checked strict-H1 target still
+// refers to the live receive slice.  The episode makes a stale snapshot fail
+// closed after keep-alive/pipeline successor capture or Connection reuse.
+struct AccessLogTargetSnapshot {
+    char path[kAccessLogCompleteTargetMax];
+    u32 episode;
+    u16 target_length;
+    AccessLogTargetState target_state;
+    u8 _pad;
+};
+
+static_assert(sizeof(AccessLogTargetSnapshot) == 136);
+static_assert(alignof(AccessLogTargetSnapshot) == 4);
+
 // Access log entry — fixed-size, written by shard thread on request completion.
-// State zero is the staged legacy format. Production activation of explicit target states is
-// intentionally separate from this layout/formatter foundation.
+// State zero remains available only for legacy/manual callers. Access-enabled production
+// completions publish an explicit nonzero target state.
 struct AccessLogEntry {
     u64 timestamp_us;  // microseconds since epoch (clock_realtime)
     u32 duration_us;   // request processing time
