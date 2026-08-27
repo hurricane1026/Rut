@@ -10569,7 +10569,7 @@ struct BodyfulNormalizedExactObservation {
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> local_history;
     std::vector<std::vector<char>> forward_history;
-    u32 access_records[6]{};
+    u32 access_records[7]{};
     u32 local_accepts = 0u;
     u32 local_requests = 0u;
     u32 local_sends = 0u;
@@ -10579,7 +10579,7 @@ struct BodyfulNormalizedExactObservation {
 };
 
 static std::vector<std::string> bodyful_normalized_exact_targets() {
-    return {"/a/b", "/a/b?x=1", "/a//b", "/a/b/", "/a/c", "/"};
+    return {"/a/b", "/a/b?x=1", "/a//b", "/a//b?x=1", "/a/b/", "/a/c", "/"};
 }
 
 static bool parse_bodyful_normalized_exact_access_log(
@@ -10589,13 +10589,13 @@ static bool parse_bodyful_normalized_exact_access_log(
     u16 backend_port,
     std::string& error) {
     std::vector<std::string> records;
-    if (!split_exact_complete_log(contents, 6u, "#331 bounded access log", records, error) ||
+    if (!split_exact_complete_log(contents, 7u, "#331 bounded access log", records, error) ||
         observation.targets != bodyful_normalized_exact_targets()) {
-        if (error.empty()) error = "#331 access parser lost its exact six-vector inventory";
+        if (error.empty()) error = "#331 access parser lost its exact seven-vector inventory";
         return false;
     }
     for (size_t i = 0u; i < records.size(); i++) {
-        const bool local = i < 3u;
+        const bool local = i < 4u;
         const std::string expected =
             prefix + " raw=\"GET " + observation.targets[i] +
             " HTTP/1.1\" status=" + (local ? "200" : "201") + " bytes=" + (local ? "144" : "175") +
@@ -10614,7 +10614,7 @@ static bool validate_bodyful_normalized_exact_observation(
     const BodyfulNormalizedExactObservation& observation, u16 backend_port, std::string& error) {
     const auto targets = bodyful_normalized_exact_targets();
     if (observation.targets != targets || observation.wires.size() != targets.size()) {
-        error = "#331 observation lost its exact six-vector inventory";
+        error = "#331 observation lost its exact seven-vector inventory";
         return false;
     }
     if (observation.local_accepts != 0u || observation.local_requests != 0u ||
@@ -10629,7 +10629,7 @@ static bool validate_bodyful_normalized_exact_observation(
     }
     for (u32 count : observation.access_records) {
         if (count != 1u) {
-            error = "#331 observation lacked exactly six ordered access records";
+            error = "#331 observation lacked exactly seven ordered access records";
             return false;
         }
     }
@@ -10639,13 +10639,13 @@ static bool validate_bodyful_normalized_exact_observation(
                                      kBodyfulNormalizedFallbackResponseNormalized + 175u);
     for (size_t i = 0u; i < observation.wires.size(); i++) {
         std::vector<char> normalized = observation.wires[i];
-        if (!normalize_date(normalized) || normalized != (i < 3u ? local : fallback)) {
+        if (!normalize_date(normalized) || normalized != (i < 4u ? local : fallback)) {
             error = "#331 observation wire differed from its exact local/fallback baseline";
             return false;
         }
     }
     std::vector<std::vector<char>> expected_history;
-    for (size_t i = 3u; i < targets.size(); i++) {
+    for (size_t i = 4u; i < targets.size(); i++) {
         const std::string request = "GET " + targets[i] +
                                     " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
                                     "\r\n\r\n";
@@ -10701,7 +10701,7 @@ static bool validate_bodyful_normalized_exact_pair(
             }
         }
     }
-    for (size_t i = 0u; i < 6u; i++) {
+    for (size_t i = 0u; i < 7u; i++) {
         std::vector<char> left = observations[0].wires[i];
         std::vector<char> right = observations[1].wires[i];
         if (!normalize_date(left) || !normalize_date(right) || left != right) {
@@ -10729,7 +10729,7 @@ static bool capture_pinned_bodyful_normalized_exact_side(
     int* frontend_reservation,
     int* backend_reservation) {
     const auto targets = bodyful_normalized_exact_targets();
-    if (targets.size() != 6u || frontend_reservation == nullptr || backend_reservation == nullptr ||
+    if (targets.size() != 7u || frontend_reservation == nullptr || backend_reservation == nullptr ||
         *frontend_reservation < 0 || *backend_reservation < 0) {
         error = "#331 capture received incomplete vectors or port reservations";
         return false;
@@ -10854,9 +10854,9 @@ static bool capture_pinned_bodyful_normalized_exact_side(
             dump_wire("#331 mismatched response", observation.wires[index]);
             return false;
         }
-        const size_t expected_size = index < 3u ? 144u : 175u;
+        const size_t expected_size = index < 4u ? 144u : 175u;
         if (observation.wires[index].size() != expected_size ||
-            header_end(observation.wires[index]) + (index < 3u ? 2u : 8u) != expected_size ||
+            header_end(observation.wires[index]) + (index < 4u ? 2u : 8u) != expected_size ||
             poll_child(nginx.child)) {
             error = "#331 vector gained a wrong body length, tail, or process state";
             return false;
@@ -10895,7 +10895,7 @@ static bool capture_pinned_bodyful_normalized_exact_side(
         if (error.empty()) error = "#331 failed to start pinned nginx/local recorder";
         return false;
     }
-    for (size_t i = 0u; i < 3u; i++) {
+    for (size_t i = 0u; i < 4u; i++) {
         if (!request(i, kBodyfulNormalizedExactResponseNormalized) ||
             local.accepted.load(std::memory_order_acquire) != 0u ||
             local.requests.load(std::memory_order_acquire) != 0u ||
@@ -10927,8 +10927,8 @@ static bool capture_pinned_bodyful_normalized_exact_side(
                        sizeof(kBodyfulNormalizedFallbackBackendResponse) - 1u) ||
         !wait_live(forward, "fallback") || !observe(forward, 0u, "pre-fallback zero window"))
         return false;
-    for (size_t i = 3u; i < targets.size(); i++) {
-        const u32 expected = static_cast<u32>(i - 2u);
+    for (size_t i = 4u; i < targets.size(); i++) {
+        const u32 expected = static_cast<u32>(i - 3u);
         if (!request(i, kBodyfulNormalizedFallbackResponseNormalized)) return false;
         if (!wait_count(forward, expected) ||
             !observe(forward, expected, "ordered fallback count")) {
@@ -10995,7 +10995,7 @@ static BodyfulNormalizedExactObservation make_bodyful_normalized_exact_self_chec
     value.process_identity = std::string("rut-nginx-331-") + suffix;
     value.targets = bodyful_normalized_exact_targets();
     for (size_t i = 0u; i < value.targets.size(); i++) {
-        value.wires.push_back(i < 3u
+        value.wires.push_back(i < 4u
                                   ? observed(kBodyfulNormalizedExactResponseNormalized, 144u)
                                   : observed(kBodyfulNormalizedFallbackResponseNormalized, 175u));
         value.access_records[i] = 1u;
@@ -11003,7 +11003,7 @@ static BodyfulNormalizedExactObservation make_bodyful_normalized_exact_self_chec
     value.forward_accepts = 3u;
     value.forward_requests = 3u;
     value.forward_sends = 3u;
-    for (size_t i = 3u; i < value.targets.size(); i++) {
+    for (size_t i = 4u; i < value.targets.size(); i++) {
         const std::string request = "GET " + value.targets[i] +
                                     " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
                                     "\r\n\r\n";
@@ -11028,17 +11028,36 @@ static bool run_bodyful_normalized_exact_self_checks(std::string& error) {
         return false;
     };
     auto changed = exact;
-    changed.wires[2] = exact.wires[3];
+    changed.wires[2] = exact.wires[4];
     if (!rejects_observation("doubled-slash-selection", changed)) return false;
     changed = exact;
     changed.targets[2] = "/a/b";
     if (!rejects_observation("missing-doubled-slash", changed)) return false;
     changed = exact;
-    changed.wires[3] = exact.wires[0];
+    changed.wires[3] = exact.wires[4];
+    if (!rejects_observation("combined-query-slash-fallback-selection", changed)) return false;
+    changed = exact;
+    changed.targets.erase(changed.targets.begin() + 3);
+    changed.wires.erase(changed.wires.begin() + 3);
+    if (!rejects_observation("missing-combined-observation", changed)) return false;
+    changed = exact;
+    changed.targets.insert(changed.targets.begin() + 4, exact.targets[3]);
+    changed.wires.insert(changed.wires.begin() + 4, exact.wires[3]);
+    if (!rejects_observation("duplicate-combined-observation", changed)) return false;
+    changed = exact;
+    changed.local_accepts = 1u;
+    changed.local_requests = 1u;
+    changed.local_sends = 1u;
+    const std::string combined_backend =
+        "GET /a//b?x=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPorts[1]) + "\r\n\r\n";
+    changed.local_history.emplace_back(combined_backend.begin(), combined_backend.end());
+    if (!rejects_observation("combined-unexpected-backend-episode", changed)) return false;
+    changed = exact;
+    changed.wires[4] = exact.wires[0];
     if (!rejects_observation("fallback-selection", changed)) return false;
     changed = exact;
-    changed.access_records[2] = 0u;
-    if (!rejects_observation("access-count", changed)) return false;
+    changed.access_records[3] = 0u;
+    if (!rejects_observation("combined-access-count", changed)) return false;
     changed = exact;
     changed.forward_requests = 2u;
     if (!rejects_observation("backend-count", changed)) return false;
@@ -11071,7 +11090,7 @@ static bool run_bodyful_normalized_exact_self_checks(std::string& error) {
     const std::string prefix = "rut-nginx-331-self-check";
     std::string access;
     for (size_t i = 0u; i < exact.targets.size(); i++) {
-        const bool local = i < 3u;
+        const bool local = i < 4u;
         access +=
             prefix + " raw=\"GET " + exact.targets[i] +
             " HTTP/1.1\" status=" + (local ? "200" : "201") + " bytes=" + (local ? "144" : "175") +
@@ -11098,9 +11117,38 @@ static bool run_bodyful_normalized_exact_self_checks(std::string& error) {
         return false;
     }
     missing_double.erase(doubled + 2u, 1u);
+    const std::string combined_record =
+        prefix +
+        " raw=\"GET /a//b?x=1 HTTP/1.1\" status=200 bytes=144 "
+        "host=\"bodyful-normalized.example\" upstream_addr=\"-\" upstream_status=-\n";
+    const size_t combined = access.find(combined_record);
+    if (combined == std::string::npos) {
+        error = "#337 access self-check fixture lacked the combined raw observation";
+        return false;
+    }
+    std::string missing_combined = access;
+    missing_combined.erase(combined, combined_record.size());
+    std::string duplicate_combined = access;
+    duplicate_combined.insert(combined + combined_record.size(), combined_record);
+    std::string combined_lost_query = access;
+    const size_t combined_lost_query_at = combined_lost_query.find(" /a//b?x=1 ");
+    if (combined_lost_query_at == std::string::npos) {
+        error = "#337 access self-check fixture lacked the combined query boundary";
+        return false;
+    }
+    combined_lost_query.erase(combined_lost_query_at + strlen(" /a//b"), strlen("?x=1"));
+    std::string combined_collapsed = access;
+    const size_t combined_collapsed_at = combined_collapsed.find(" /a//b?x=1 ");
+    if (combined_collapsed_at == std::string::npos) {
+        error = "#337 access self-check fixture lacked the combined slash boundary";
+        return false;
+    }
+    combined_collapsed.erase(combined_collapsed_at + strlen(" /a/"), 1u);
     if (!access_rejects(access.substr(0u, access.size() - 1u)) ||
         !access_rejects(access + access.substr(0u, first_end + 1u)) || !access_rejects(reordered) ||
-        !access_rejects(missing_double)) {
+        !access_rejects(missing_double) || !access_rejects(missing_combined) ||
+        !access_rejects(duplicate_combined) || !access_rejects(combined_lost_query) ||
+        !access_rejects(combined_collapsed)) {
         error = "#331 access count/order/raw-spelling mutation was accepted";
         return false;
     }
@@ -13645,7 +13693,7 @@ static bool validate_bodyful_normalized_generated_source(const std::string& sour
         source.find("route exact GET \"/a/b\"") != std::string::npos ||
         source.find("route exact slash_normalized GET \"/a/b\"") != std::string::npos ||
         source.find("route exact slash_normalized OPTIONS \"/a/b\"") != std::string::npos ||
-        source.find("/a/b?") != std::string::npos ||
+        source.find("/a/b?") != std::string::npos || source.find("/a//b") != std::string::npos ||
         source.find("bodyful-normalized.example") != std::string::npos ||
         source.find("proxy_pass") != std::string::npos ||
         source.find("nginx.conf") != std::string::npos ||
@@ -13678,7 +13726,7 @@ static bool parse_bodyful_normalized_rut_access_log(
                                   error))
         return false;
     for (size_t i = 0u; i < records.size(); i++) {
-        const bool local = i < 3u;
+        const bool local = i < 4u;
         std::vector<std::string> fields;
         const size_t field_count = local ? 9u : 11u;
         const size_t status = local ? 200u : 201u;
@@ -13741,6 +13789,8 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
                                                  "route exact slash_normalized GET \"/a/b\"")) ||
         !rejects_source(canonical + "route exact slash_normalized OPTIONS \"/a/b\" {}\n") ||
         !rejects_source(canonical + "route exact slash_normalized \"/a/b?x=1\" {}\n") ||
+        !rejects_source(canonical + "route exact slash_normalized \"/a//b\" {}\n") ||
+        !rejects_source(canonical + "route exact slash_normalized \"/a//b?x=1\" {}\n") ||
         !rejects_source(canonical + "if Host == \"bodyful-normalized.example\" {}\n") ||
         !rejects_source(canonical + "# nginx_compat runtime workaround\n") ||
         !rejects_source(replace_once(canonical, "status: 200", "status: 204")) ||
@@ -13762,7 +13812,7 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
     std::vector<size_t> request_sizes;
     std::string access;
     for (size_t i = 0u; i < observation.targets.size(); i++) {
-        const bool local = i < 3u;
+        const bool local = i < 4u;
         const std::string client = "GET " + observation.targets[i] +
                                    " HTTP/1.1\r\nHost: bodyful-normalized.example\r\nConnection: "
                                    "close\r\n\r\n";
@@ -13783,10 +13833,32 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
     std::string reordered = access;
     reordered.replace(
         0u, second + 1u, access.substr(first + 1u, second - first) + access.substr(0u, first + 1u));
+    const size_t combined_marker = access.find(" GET /a//b?x=1 ");
+    if (combined_marker == std::string::npos) {
+        error = "#337 generated access self-check fixture lacked the combined observation";
+        return false;
+    }
+    const size_t combined_begin = access.rfind('\n', combined_marker);
+    const size_t combined_end = access.find('\n', combined_marker);
+    if (combined_end == std::string::npos) {
+        error = "#337 generated access self-check fixture lacked a complete combined record";
+        return false;
+    }
+    const size_t combined_record_begin =
+        combined_begin == std::string::npos ? 0u : combined_begin + 1u;
+    const std::string combined_record =
+        access.substr(combined_record_begin, combined_end + 1u - combined_record_begin);
+    std::string missing_combined = access;
+    missing_combined.erase(combined_record_begin, combined_record.size());
+    std::string duplicate_combined = access;
+    duplicate_combined.insert(combined_end + 1u, combined_record);
     if (!parse_bodyful_normalized_rut_access_log(access, observation, request_sizes, error) ||
         !rejects_access(access.substr(0u, access.size() - 1u)) ||
         !rejects_access(access + access.substr(0u, first + 1u)) || !rejects_access(reordered) ||
+        !rejects_access(missing_combined) || !rejects_access(duplicate_combined) ||
         !rejects_access(replace_once(access, " /a//b ", " /a/b ")) ||
+        !rejects_access(replace_once(access, " /a//b?x=1 ", " /a//b ")) ||
+        !rejects_access(replace_once(access, " /a//b?x=1 ", " /a/b?x=1 ")) ||
         !rejects_access(replace_once(access, " 200 ", " 201 ")) ||
         !rejects_access(replace_once(access, " 144 ", " 145 ")) ||
         !rejects_access(replace_once(access, " nginx_upstream ", " other_upstream ")) ||
@@ -13918,9 +13990,9 @@ static bool capture_generated_bodyful_normalized_exact_side(
     const auto targets = bodyful_normalized_exact_targets();
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
         frontend_reservation == nullptr || backend_reservation == nullptr ||
-        *frontend_reservation < 0 || *backend_reservation < 0 || targets.size() != 6u) {
+        *frontend_reservation < 0 || *backend_reservation < 0 || targets.size() != 7u) {
         error =
-            "converter-generated #331 Stage 3 requires an executable absolute RUT path, six "
+            "converter-generated #331 Stage 3 requires an executable absolute RUT path, seven "
             "vectors, and held endpoint reservations";
         return false;
     }
@@ -14137,8 +14209,8 @@ static bool capture_generated_bodyful_normalized_exact_side(
                     std::string(observation.wires[index].begin(), observation.wires[index].end());
             return false;
         }
-        if (observation.wires[index].size() != (index < 3u ? 144u : 175u) ||
-            header_end(observation.wires[index]) + (index < 3u ? 2u : 8u) !=
+        if (observation.wires[index].size() != (index < 4u ? 144u : 175u) ||
+            header_end(observation.wires[index]) + (index < 4u ? 2u : 8u) !=
                 observation.wires[index].size() ||
             poll_child(runtime.child)) {
             error = "#331 Stage 3 generated vector gained wrong body/tail/process state";
@@ -14157,7 +14229,7 @@ static bool capture_generated_bodyful_normalized_exact_side(
         if (error.empty()) error = "#331 Stage 3 local recorder could not bind reserved port";
         return false;
     }
-    for (size_t i = 0u; i < 3u; i++) {
+    for (size_t i = 0u; i < 4u; i++) {
         if (!request(i, kBodyfulNormalizedExactResponseNormalized) ||
             !observe(zero, 0u, "local vector zero window", std::chrono::milliseconds(250)))
             return false;
@@ -14190,11 +14262,11 @@ static bool capture_generated_bodyful_normalized_exact_side(
         if (error.empty()) error = "#331 Stage 3 fallback recorder failed readiness";
         return false;
     }
-    for (size_t i = 3u; i < targets.size(); i++) {
-        const u32 expected = static_cast<u32>(i - 2u);
+    for (size_t i = 4u; i < targets.size(); i++) {
+        const u32 expected = static_cast<u32>(i - 3u);
         if (!request(i, kBodyfulNormalizedFallbackResponseNormalized)) {
             const std::string downstream_error = error;
-            if (i != 3u || !observation.wires[i].empty() ||
+            if (i != 4u || !observation.wires[i].empty() ||
                 downstream_error.find("response ended before Content-Length body size=0 wire=") ==
                     std::string::npos) {
                 return false;
@@ -14298,8 +14370,8 @@ static bool capture_generated_bodyful_normalized_exact_side(
         error = "#331 Stage 3 fallback recorder lifecycle/count was incomplete";
         return false;
     }
-    for (size_t i = 3u; i < targets.size(); i++)
-        request_sizes[i] = observation.forward_history[i - 3u].size();
+    for (size_t i = 4u; i < targets.size(); i++)
+        request_sizes[i] = observation.forward_history[i - 4u].size();
     for (u32& count : observation.access_records) count = 1u;
     if (!validate_bodyful_normalized_exact_observation(observation, backend_port, error))
         return false;
@@ -14370,8 +14442,8 @@ static bool validate_bodyful_normalized_four_way(
             }
         }
     }
-    if (total_wires != 24u || total_access != 24u) {
-        error = "#331 Stage 3 did not retain exactly 24 wire/access observations";
+    if (total_wires != 28u || total_access != 28u) {
+        error = "#331 Stage 3 did not retain exactly 28 wire/access observations";
         return false;
     }
     for (size_t i = 0u; i < resources.size(); i++) {
@@ -14417,7 +14489,7 @@ static bool validate_bodyful_normalized_four_way(
             return false;
         }
     }
-    for (size_t vector = 0u; vector < 6u; vector++) {
+    for (size_t vector = 0u; vector < 7u; vector++) {
         std::vector<char> baseline = observations[0].wires[vector];
         if (!normalize_date(baseline)) {
             error = "#331 Stage 3 baseline Date normalization failed";
@@ -14470,14 +14542,39 @@ static bool run_bodyful_normalized_four_way_self_checks(std::string& error) {
     BodyfulNormalizedExactObservation changed[4];
     std::string changed_sources[2] = {sources[0], sources[1]};
     std::copy(std::begin(values), std::end(values), std::begin(changed));
-    changed[2].wires[2] = changed[2].wires[3];
+    changed[2].wires[2] = changed[2].wires[4];
     if (!rejects(changed, changed_sources, "doubled-slash-selection")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(changed));
     changed[2].targets[2] = "/a/b";
     if (!rejects(changed, changed_sources, "raw-doubled-slash-spelling")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(changed));
-    changed[2].access_records[2] = 0u;
-    if (!rejects(changed, changed_sources, "access-count")) return false;
+    changed[2].wires[3] = changed[2].wires[4];
+    if (!rejects(changed, changed_sources, "combined-query-slash-fallback-selection")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].targets.erase(changed[2].targets.begin() + 3);
+    changed[2].wires.erase(changed[2].wires.begin() + 3);
+    if (!rejects(changed, changed_sources, "missing-combined-observation")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].targets.insert(changed[2].targets.begin() + 4, values[2].targets[3]);
+    changed[2].wires.insert(changed[2].wires.begin() + 4, values[2].wires[3]);
+    if (!rejects(changed, changed_sources, "duplicate-combined-observation")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].local_accepts = 1u;
+    changed[2].local_requests = 1u;
+    changed[2].local_sends = 1u;
+    const std::string combined_backend =
+        "GET /a//b?x=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[5]) + "\r\n\r\n";
+    changed[2].local_history.emplace_back(combined_backend.begin(), combined_backend.end());
+    if (!rejects(changed, changed_sources, "combined-unexpected-backend-episode")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].access_records[3] = 0u;
+    if (!rejects(changed, changed_sources, "combined-access-count")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[3].wires[3][9] = '5';
+    if (!rejects(changed, changed_sources, "generated-order-combined-wire-mismatch")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[3].order = "generated-exact-before-root";
+    if (!rejects(changed, changed_sources, "generated-declaration-order-mismatch")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(changed));
     std::swap(changed[2].forward_history[0], changed[2].forward_history[1]);
     if (!rejects(changed, changed_sources, "backend-order")) return false;
@@ -26804,9 +26901,10 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: pinned nginx 1.29.7 default slash normalization made exact /a/b return "
-               "200 ok declaration-order independent: /a/b, /a/b?x=1, and raw /a//b emitted "
-               "the exact Date-normalized 144-byte text/plain/CL2/close/EOF wire with live and "
-               "settled zero upstream, while /a/b/, /a/c, and / emitted the exact 175-byte "
+               "200 ok declaration-order independent: /a/b, /a/b?x=1, raw /a//b, and combined "
+               "/a//b?x=1 emitted the exact Date-normalized 144-byte text/plain/CL2/close/EOF "
+               "wire with live and settled zero upstream, while /a/b/, /a/c, and / emitted the "
+               "exact 175-byte "
                "201/CL8/fallback/close/EOF wire with three ordered byte-exact backend histories "
                "and no fourth/retry. Both isolated sides proved exact raw-spelling access "
                "records, clean bounded error logs, and four simultaneous unique port "
@@ -26831,12 +26929,13 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: both declaration orders of exact /a/b return 200 ok matched between two "
                "isolated pinned-nginx 1.29.7 sides and two genuine parser/borrowed-model/lowerer-"
-               "generated ordinary public-RUT CLI/io_uring sides. Literal, query, and raw "
-               "embedded-doubled-slash targets emitted exact Date-normalized 144-byte text/"
-               "plain/CL2/close/EOF responses with live and settled zero upstream; slash "
-               "extension, neighbor, and root emitted exact 175-byte 201/CL8/fallback/close/EOF "
+               "generated ordinary public-RUT CLI/io_uring sides. Literal, query, raw embedded-"
+               "doubled-slash, and combined /a//b?x=1 targets emitted exact Date-normalized "
+               "144-byte text/plain/CL2/close/EOF responses with live and settled zero upstream; "
+               "slash extension, neighbor, and root emitted exact 175-byte "
+               "201/CL8/fallback/close/EOF "
                "responses and three ordered byte-exact upstream requests with no fourth/retry. "
-               "All 24 observations proved exact raw-target access accounting, clean bounded "
+               "All 28 observations proved exact raw-target access accounting, clean bounded "
                "lifecycle logs, eight simultaneously reserved unique ports, isolated resources, "
                "borrowed nginx-source destruction, canonical method-omitted slash-normalized "
                "generated source, and generated-source ownership after public load (#331 Stage 3 "
