@@ -13560,6 +13560,846 @@ static bool run_converter_coalesced_source_self_checks(std::string& error) {
     return true;
 }
 
+static std::string make_bodyful_normalized_exact_fragment(u16 frontend_port,
+                                                          u16 backend_port,
+                                                          bool exact_first) {
+    const std::string exact_location = "  location = /a/b { return 200 \"ok\"; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
+}
+
+static bool validate_bodyful_normalized_generated_source(const std::string& source,
+                                                         u16 frontend_port,
+                                                         u16 backend_port,
+                                                         std::string& error) {
+    const std::string exact_route = canonical_generated_bodyful_exact_route("/a/b", "ok");
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string backend =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
+    if (count_source_literal(source, exact_route) != 1u ||
+        count_source_literal(source, "route exact ") != 1u ||
+        count_source_literal(source, "route exact slash_normalized \"/a/b\"") != 1u ||
+        count_source_literal(source, "route HEAD \"/\" {") != 1u ||
+        count_source_literal(source, "route GET \"/\" {") != 1u ||
+        count_source_literal(source, "route \"/\" {") != 1u ||
+        count_source_literal(source, "return forward(nginx_upstream") != 3u ||
+        count_source_literal(source, listener) != 1u ||
+        count_source_literal(source, backend) != 1u ||
+        source.find("route exact \"/a/b\"") != std::string::npos ||
+        source.find("route exact GET \"/a/b\"") != std::string::npos ||
+        source.find("route exact slash_normalized GET \"/a/b\"") != std::string::npos ||
+        source.find("route exact slash_normalized OPTIONS \"/a/b\"") != std::string::npos ||
+        source.find("/a/b?") != std::string::npos ||
+        source.find("bodyful-normalized.example") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("strict_local_response") != std::string::npos ||
+        source.find("runtime") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("return 200") != std::string::npos) {
+        error =
+            "#331 Stage 3 generated source was not one method-omitted public "
+            "SlashNormalized strict-200 tuple plus canonical root forwards";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_bodyful_normalized_rut_access_log(
+    const std::string& contents,
+    const BodyfulNormalizedExactObservation& observation,
+    const std::vector<size_t>& request_sizes,
+    std::string& error) {
+    const auto targets = bodyful_normalized_exact_targets();
+    std::vector<std::string> records;
+    if (observation.targets != targets || request_sizes.size() != targets.size() ||
+        !split_exact_complete_log(contents,
+                                  targets.size(),
+                                  "converter-generated #331 Stage 3 access log",
+                                  records,
+                                  error))
+        return false;
+    for (size_t i = 0u; i < records.size(); i++) {
+        const bool local = i < 3u;
+        std::vector<std::string> fields;
+        const size_t field_count = local ? 9u : 11u;
+        const size_t status = local ? 200u : 201u;
+        const size_t response_size = local ? 144u : 175u;
+        if (!split_space_fields(records[i], fields) || fields.size() != field_count ||
+            !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != targets[i] ||
+            fields[3] != std::to_string(status) || !decimal_field_equals(fields[3], status) ||
+            !exact_log_duration(fields[4]) || fields[5] != std::to_string(request_sizes[i]) ||
+            !decimal_field_equals(fields[5], request_sizes[i]) ||
+            fields[6] != std::to_string(response_size) ||
+            !decimal_field_equals(fields[6], response_size) || fields[7] != "127.0.0.1" ||
+            (local && fields[8] != "s=0") ||
+            (!local && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) ||
+                        fields[10] != "s=0"))) {
+            error = "converter-generated #331 Stage 3 access record " + std::to_string(i + 1u) +
+                    " lost raw target/order/status/size/upstream outcome: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
+    static constexpr u16 kFrontend = 54330u;
+    static constexpr u16 kBackend = 54331u;
+    std::string fragment = make_bodyful_normalized_exact_fragment(kFrontend, kBackend, true);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#331 Stage 3 generated source self-check fixture did not parse";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) {
+        error = "#331 Stage 3 generated source self-check fixture did not lower";
+        return false;
+    }
+    const rut::Str view = lowered.value().view();
+    const std::string canonical(view.ptr, view.len);
+    const auto replace_once =
+        [](std::string value, const std::string& from, const std::string& to) {
+            const size_t offset = value.find(from);
+            if (offset == std::string::npos) return std::string{};
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    const auto rejects_source = [&](const std::string& source) {
+        std::string detail;
+        return !validate_bodyful_normalized_generated_source(source, kFrontend, kBackend, detail);
+    };
+    const std::string selector = "route exact slash_normalized \"/a/b\"";
+    const std::string complete = canonical_generated_bodyful_exact_route("/a/b", "ok");
+    if (!validate_bodyful_normalized_generated_source(canonical, kFrontend, kBackend, error) ||
+        !rejects_source(replace_once(canonical, selector, "route exact \"/a/b\"")) ||
+        !rejects_source(canonical + complete) ||
+        !rejects_source(canonical + replace_once(complete,
+                                                 selector,
+                                                 "route exact slash_normalized GET \"/a/b\"")) ||
+        !rejects_source(canonical + "route exact slash_normalized OPTIONS \"/a/b\" {}\n") ||
+        !rejects_source(canonical + "route exact slash_normalized \"/a/b?x=1\" {}\n") ||
+        !rejects_source(canonical + "if Host == \"bodyful-normalized.example\" {}\n") ||
+        !rejects_source(canonical + "# nginx_compat runtime workaround\n") ||
+        !rejects_source(replace_once(canonical, "status: 200", "status: 204"))) {
+        error = "#331 Stage 3 generated source mutation self-check failed";
+        return false;
+    }
+
+    BodyfulNormalizedExactObservation observation;
+    observation.targets = bodyful_normalized_exact_targets();
+    std::vector<size_t> request_sizes;
+    std::string access;
+    for (size_t i = 0u; i < observation.targets.size(); i++) {
+        const bool local = i < 3u;
+        const std::string client = "GET " + observation.targets[i] +
+                                   " HTTP/1.1\r\nHost: bodyful-normalized.example\r\nConnection: "
+                                   "close\r\n\r\n";
+        const std::string upstream =
+            "GET " + observation.targets[i] + " HTTP/1.1\r\nHost: 127.0.0.1:54331\r\n\r\n";
+        request_sizes.push_back(local ? client.size() : upstream.size());
+        access += "2026-08-26T21:13:05.248Z GET " + observation.targets[i] + " " +
+                  (local ? "200" : "201") + " 361us " + std::to_string(request_sizes.back()) + " " +
+                  (local ? "144" : "175") + " 127.0.0.1" +
+                  (local ? " s=0\n" : " nginx_upstream 243us s=0\n");
+    }
+    const auto rejects_access = [&](const std::string& value) {
+        std::string detail;
+        return !parse_bodyful_normalized_rut_access_log(value, observation, request_sizes, detail);
+    };
+    const size_t first = access.find('\n');
+    const size_t second = access.find('\n', first + 1u);
+    std::string reordered = access;
+    reordered.replace(
+        0u, second + 1u, access.substr(first + 1u, second - first) + access.substr(0u, first + 1u));
+    if (!parse_bodyful_normalized_rut_access_log(access, observation, request_sizes, error) ||
+        !rejects_access(access.substr(0u, access.size() - 1u)) ||
+        !rejects_access(access + access.substr(0u, first + 1u)) || !rejects_access(reordered) ||
+        !rejects_access(replace_once(access, " /a//b ", " /a/b ")) ||
+        !rejects_access(replace_once(access, " 200 ", " 201 ")) ||
+        !rejects_access(replace_once(access, " 144 ", " 145 ")) ||
+        !rejects_access(replace_once(access, " nginx_upstream ", " other_upstream ")) ||
+        !rejects_access(replace_once(access, " s=0\n", " s=1\n"))) {
+        error = "#331 Stage 3 generated access mutation self-check failed";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_generated_bodyful_normalized_exact_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool exact_first,
+    BodyfulNormalizedExactObservation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    const auto targets = bodyful_normalized_exact_targets();
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0 || targets.size() != 6u) {
+        error =
+            "converter-generated #331 Stage 3 requires an executable absolute RUT path, six "
+            "vectors, and held endpoint reservations";
+        return false;
+    }
+    std::string fragment =
+        make_bodyful_normalized_exact_fragment(frontend_port, backend_port, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#331 Stage 3 accepted nginx fragment did not traverse the independent parser";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_local_return;
+    const auto& response = exact.response;
+    const size_t root_location = fragment.find("location / {");
+    const size_t root_path = fragment.find('/', root_location);
+    const size_t exact_location = fragment.find("location = /a/b");
+    const size_t exact_path = fragment.find("/a/b", exact_location);
+    const size_t return_offset = fragment.find("return", exact_location);
+    const size_t status_offset = fragment.find("200", return_offset);
+    const size_t body_offset = fragment.find("ok", status_offset);
+    const size_t semicolon = fragment.find(';', body_offset);
+    const size_t exact_end = fragment.find('}', semicolon);
+    const uintptr_t source_base = reinterpret_cast<uintptr_t>(fragment.data());
+    const auto same_source = [&](rut::Str value, rut::Span span) {
+        return value.ptr != nullptr && span.end >= span.start &&
+               span.end - span.start == value.len &&
+               reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+    };
+    if (root_location == std::string::npos || root_path == std::string::npos ||
+        exact_location == std::string::npos || exact_path == std::string::npos ||
+        return_offset == std::string::npos || status_offset == std::string::npos ||
+        body_offset == std::string::npos || semicolon == std::string::npos ||
+        exact_end == std::string::npos || server.span.start != 0u ||
+        server.span.end != fragment.size() - 1u || server.listen.port != frontend_port ||
+        !root.path.eq(rut::lit_str("/")) || root.path.ptr != fragment.data() + root_path ||
+        !same_source(root.path, root.path_span) || proxy.has_uri || proxy.address[0] != 127u ||
+        proxy.address[1] != 0u || proxy.address[2] != 0u || proxy.address[3] != 1u ||
+        proxy.port != backend_port || !exact.present || !exact.path.eq(rut::lit_str("/a/b")) ||
+        exact.path.ptr != fragment.data() + exact_path ||
+        !same_source(exact.path, exact.path_span) || exact.span.start != exact_location ||
+        exact.span.end != exact_end + 1u || response.status != 200u ||
+        response.span.start != return_offset || response.span.end != semicolon + 1u ||
+        !response.body.eq(rut::lit_str("ok")) ||
+        response.body.ptr != fragment.data() + body_offset ||
+        !same_source(response.body, response.body_span) || status_offset < response.span.start ||
+        status_offset + 3u > response.span.end ||
+        memcmp(fragment.data() + status_offset, "200", 3u) != 0 ||
+        memcmp(fragment.data() + response.body_span.start, "ok", 2u) != 0 ||
+        server.exact_no_content_return.present || server.exact_absolute_redirect.present ||
+        exact.span.start >= exact.path_span.start || exact.path_span.end > response.span.start ||
+        response.span.end >= exact.span.end || root.span.start != root_location) {
+        error = "#331 Stage 3 fragment lost borrowed path/body/status provenance or root role";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#331 Stage 3 genuine bounded model failed public ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str output = lowered.value().view();
+    generated_source.assign(output.ptr, output.len);
+    if (!validate_bodyful_normalized_generated_source(
+            generated_source, frontend_port, backend_port, error) ||
+        !write_file(temp.source, output.ptr, output.len))
+        return false;
+    std::fill(fragment.begin(), fragment.end(), '\0');
+    if (!std::all_of(fragment.begin(), fragment.end(), [](char byte) { return byte == '\0'; })) {
+        error = "#331 Stage 3 failed to destroy the borrowed nginx source after lowering";
+        return false;
+    }
+
+    observation = BodyfulNormalizedExactObservation{};
+    observation.order = exact_first ? "generated-exact-before-root" : "generated-root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity =
+        std::string(rut_path) + " " + temp.source + " listen:" + std::to_string(frontend_port);
+    observation.targets = targets;
+    observation.wires.resize(targets.size());
+    std::vector<std::string> requests(targets.size());
+    std::vector<size_t> request_sizes(targets.size());
+    for (size_t i = 0u; i < targets.size(); i++) {
+        requests[i] = "GET " + targets[i] +
+                      " HTTP/1.1\r\nHost: bodyful-normalized.example\r\nConnection: close\r\n\r\n";
+        request_sizes[i] = requests[i].size();
+        const size_t header = requests[i].find("\r\n\r\n");
+        if (requests[i].rfind("GET " + targets[i] + " HTTP/1.1\r\n", 0u) != 0u ||
+            requests[i].find('#') != std::string::npos ||
+            requests[i].find("\r\nContent-Length:") != std::string::npos ||
+            requests[i].find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests[i].find("\r\nTE:") != std::string::npos ||
+            requests[i].find("\r\nExpect:") != std::string::npos ||
+            requests[i].find("\r\nUpgrade:") != std::string::npos || header == std::string::npos ||
+            header + 4u != requests[i].size()) {
+            error = "#331 Stage 3 generated request escaped the fresh bodyless H1.1 domain";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* value = nullptr;
+        ~RecorderGuard() {
+            if (value != nullptr) value->stop();
+        }
+    };
+    ChildGuard runtime;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "#331 Stage 3 failed to start converter-generated RUT";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#331 Stage 3 RUT exited before public load/io_uring/listener readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#331 Stage 3 RUT lacked public load/io_uring/listener readiness evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "destroyed-after-331-stage3-public-load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "#331 Stage 3 failed to overwrite generated source after public load";
+        return false;
+    }
+    std::string destroyed;
+    if (!read_exact_return204_log(
+            temp.source, "#331 Stage 3 destroyed generated source", destroyed, error) ||
+        destroyed != kDestroyed) {
+        error = "#331 Stage 3 generated source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto wait_live = [&](Recorder& recorder, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child) || !recorder.running.load(std::memory_order_acquire) ||
+                recorder.listener_failed.load(std::memory_order_acquire)) {
+                error =
+                    std::string("#331 Stage 3 RUT/recorder failed before ") + phase + " readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#331 Stage 3 recorder readiness timed out: ") + phase;
+        return false;
+    };
+    const auto observe = [&](Recorder& recorder,
+                             u32 expected,
+                             const char* phase,
+                             std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(runtime.child) || !recorder_live(recorder) ||
+                recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error =
+                    std::string("#331 Stage 3 unexpected process/upstream state during ") + phase;
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto request = [&](size_t index, const char* expected) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[index].data(), requests[index].size()) ||
+            !read_response(client.fd, observation.wires[index], detail) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(observation.wires[index], expected, detail)) {
+            error = "#331 Stage 3 generated vector " + targets[index] +
+                    " exact response/EOF failed: " + detail +
+                    " size=" + std::to_string(observation.wires[index].size()) + " wire=" +
+                    std::string(observation.wires[index].begin(), observation.wires[index].end());
+            return false;
+        }
+        if (observation.wires[index].size() != (index < 3u ? 144u : 175u) ||
+            header_end(observation.wires[index]) + (index < 3u ? 2u : 8u) !=
+                observation.wires[index].size() ||
+            poll_child(runtime.child)) {
+            error = "#331 Stage 3 generated vector gained wrong body/tail/process state";
+            return false;
+        }
+        return true;
+    };
+
+    Recorder zero;
+    RecorderGuard zero_guard{&zero};
+    zero.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!zero.setup(backend_port) || !wait_live(zero, "local") ||
+        !observe(zero, 0u, "pre-local zero window", std::chrono::milliseconds(250))) {
+        if (error.empty()) error = "#331 Stage 3 local recorder could not bind reserved port";
+        return false;
+    }
+    for (size_t i = 0u; i < 3u; i++) {
+        if (!request(i, kBodyfulNormalizedExactResponseNormalized) ||
+            !observe(zero, 0u, "local vector zero window", std::chrono::milliseconds(250)))
+            return false;
+    }
+    if (!observe(zero, 0u, "post-local zero window", std::chrono::milliseconds(500))) return false;
+    zero.stop();
+    zero_guard.value = nullptr;
+    observation.local_accepts = zero.accepted.load(std::memory_order_acquire);
+    observation.local_requests = zero.requests.load(std::memory_order_acquire);
+    observation.local_sends = zero.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = zero.history;
+    if (zero.thread_alive.load(std::memory_order_acquire) ||
+        zero.listener_failed.load(std::memory_order_acquire) || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        zero.response_send_succeeded.load(std::memory_order_acquire) || !zero.history.empty() ||
+        !zero.request.empty()) {
+        error = "#331 Stage 3 local recorder did not settle at exact zero";
+        return false;
+    }
+
+    Recorder fallback;
+    RecorderGuard fallback_guard{&fallback};
+    fallback.observe_extra_requests_until_stop = true;
+    if (!fallback.setup(backend_port,
+                        3u,
+                        kBodyfulNormalizedFallbackBackendResponse,
+                        sizeof(kBodyfulNormalizedFallbackBackendResponse) - 1u) ||
+        !wait_live(fallback, "fallback") ||
+        !observe(fallback, 0u, "pre-fallback zero window", std::chrono::milliseconds(100))) {
+        if (error.empty()) error = "#331 Stage 3 fallback recorder failed readiness";
+        return false;
+    }
+    for (size_t i = 3u; i < targets.size(); i++) {
+        const u32 expected = static_cast<u32>(i - 2u);
+        if (!request(i, kBodyfulNormalizedFallbackResponseNormalized)) {
+            const auto evidence_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < evidence_deadline &&
+                   (fallback.accepted.load(std::memory_order_acquire) < expected ||
+                    fallback.requests.load(std::memory_order_acquire) < expected ||
+                    fallback.response_send_all_calls.load(std::memory_order_acquire) < expected))
+                usleep(1000);
+            error +=
+                " upstream_accepts=" +
+                std::to_string(fallback.accepted.load(std::memory_order_acquire)) +
+                " upstream_requests=" +
+                std::to_string(fallback.requests.load(std::memory_order_acquire)) +
+                " upstream_sends=" +
+                std::to_string(fallback.response_send_all_calls.load(std::memory_order_acquire));
+            return false;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const u32 accepts = fallback.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = fallback.requests.load(std::memory_order_acquire);
+            const u32 sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+            if (poll_child(runtime.child) || !recorder_live(fallback) || accepts > expected ||
+                requests_seen > expected || sends > expected) {
+                error = "#331 Stage 3 generated fallback observed retry/extra request";
+                return false;
+            }
+            if (accepts == expected && requests_seen == expected && sends == expected) break;
+            usleep(1000);
+        }
+        if (fallback.accepted.load(std::memory_order_acquire) != expected ||
+            fallback.requests.load(std::memory_order_acquire) != expected ||
+            fallback.response_send_all_calls.load(std::memory_order_acquire) != expected ||
+            !observe(
+                fallback, expected, "ordered fallback count", std::chrono::milliseconds(100))) {
+            error = "#331 Stage 3 fallback episode count did not settle exactly";
+            return false;
+        }
+    }
+    if (!observe(fallback, 3u, "no-fourth-fallback window", std::chrono::milliseconds(500)) ||
+        !stop_child(runtime.child)) {
+        error = "#331 Stage 3 generated RUT did not survive controlled shutdown";
+        return false;
+    }
+    fallback.stop();
+    fallback_guard.value = nullptr;
+    observation.forward_accepts = fallback.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = fallback.requests.load(std::memory_order_acquire);
+    observation.forward_sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = fallback.history;
+    if (fallback.thread_alive.load(std::memory_order_acquire) ||
+        fallback.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || !fallback.response_send_succeeded.load() ||
+        !fallback.response_clean_shutdown.load() || !fallback.response_connection_closed.load() ||
+        observation.forward_history.size() != 3u) {
+        error = "#331 Stage 3 fallback recorder lifecycle/count was incomplete";
+        return false;
+    }
+    for (size_t i = 3u; i < targets.size(); i++)
+        request_sizes[i] = observation.forward_history[i - 3u].size();
+    for (u32& count : observation.access_records) count = 1u;
+    if (!validate_bodyful_normalized_exact_observation(observation, backend_port, error))
+        return false;
+
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(temp.rut_access_log,
+                                  "converter-generated #331 Stage 3 access log",
+                                  access_contents,
+                                  error) ||
+        !parse_bodyful_normalized_rut_access_log(
+            access_contents, observation, request_sizes, error) ||
+        !read_exact_return204_log(temp.rut_log,
+                                  "converter-generated #331 Stage 3 runtime log",
+                                  runtime_contents,
+                                  error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
+        return false;
+    return true;
+}
+
+static bool validate_bodyful_normalized_four_way(
+    const BodyfulNormalizedExactObservation observations[4],
+    const std::string generated_sources[2],
+    const u16 ports[8],
+    std::string& error) {
+    for (size_t i = 0u; i < 8u; i++) {
+        if (ports[i] == 0u) {
+            error = "#331 Stage 3 four-way validator received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#331 Stage 3 four-way validator received duplicate ports";
+                return false;
+            }
+        }
+    }
+    static constexpr const char* kOrders[] = {"exact-before-root",
+                                              "root-before-exact",
+                                              "generated-exact-before-root",
+                                              "generated-root-before-exact"};
+    std::vector<std::string> resources;
+    resources.reserve(20u);
+    size_t total_wires = 0u;
+    u32 total_access = 0u;
+    for (size_t side = 0u; side < 4u; side++) {
+        if (observations[side].order != kOrders[side] ||
+            !validate_bodyful_normalized_exact_observation(
+                observations[side], ports[side * 2u + 1u], error))
+            return false;
+        total_wires += observations[side].wires.size();
+        for (u32 count : observations[side].access_records) total_access += count;
+        resources.insert(resources.end(),
+                         {observations[side].temp_path,
+                          observations[side].config_path,
+                          observations[side].log_path,
+                          observations[side].access_path,
+                          observations[side].process_identity});
+        if (observations[side].wires.data() == nullptr) {
+            error = "#331 Stage 3 one side lacked owned wire storage";
+            return false;
+        }
+        for (size_t other = side + 1u; other < 4u; other++) {
+            if (observations[side].wires.data() == observations[other].wires.data()) {
+                error = "#331 Stage 3 two sides aliased wire storage";
+                return false;
+            }
+        }
+    }
+    if (total_wires != 24u || total_access != 24u) {
+        error = "#331 Stage 3 did not retain exactly 24 wire/access observations";
+        return false;
+    }
+    for (size_t i = 0u; i < resources.size(); i++) {
+        if (resources[i].empty()) {
+            error = "#331 Stage 3 one resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < resources.size(); j++) {
+            if (resources[i] == resources[j]) {
+                error = "#331 Stage 3 resource/process identities were globally aliased";
+                return false;
+            }
+        }
+    }
+    if (!validate_bodyful_normalized_generated_source(
+            generated_sources[0], ports[4], ports[5], error) ||
+        !validate_bodyful_normalized_generated_source(
+            generated_sources[1], ports[6], ports[7], error))
+        return false;
+    std::string canonical[2] = {generated_sources[0], generated_sources[1]};
+    if (!canonicalize_unique_port(
+            canonical[0], "listen :" + std::to_string(ports[4]), "listen :FRONTEND") ||
+        !canonicalize_unique_port(
+            canonical[0], "127.0.0.1:" + std::to_string(ports[5]), "127.0.0.1:BACKEND") ||
+        !canonicalize_unique_port(
+            canonical[1], "listen :" + std::to_string(ports[6]), "listen :FRONTEND") ||
+        !canonicalize_unique_port(
+            canonical[1], "127.0.0.1:" + std::to_string(ports[7]), "127.0.0.1:BACKEND") ||
+        canonical[0] != canonical[1]) {
+        error = "#331 Stage 3 declaration order changed canonical generated source";
+        return false;
+    }
+    const auto baseline_history =
+        canonicalize_bounded_backend_history(observations[0].forward_history);
+    if (baseline_history.size() != 3u) {
+        error = "#331 Stage 3 baseline fallback history was incomplete";
+        return false;
+    }
+    for (size_t side = 1u; side < 4u; side++) {
+        if (canonicalize_bounded_backend_history(observations[side].forward_history) !=
+            baseline_history) {
+            error = "#331 Stage 3 four sides differed in canonical ordered backend history";
+            return false;
+        }
+    }
+    for (size_t vector = 0u; vector < 6u; vector++) {
+        std::vector<char> baseline = observations[0].wires[vector];
+        if (!normalize_date(baseline)) {
+            error = "#331 Stage 3 baseline Date normalization failed";
+            return false;
+        }
+        for (size_t side = 1u; side < 4u; side++) {
+            std::vector<char> candidate = observations[side].wires[vector];
+            if (!normalize_date(candidate) || candidate != baseline) {
+                error =
+                    "#331 Stage 3 four-side wire mismatch at vector " + std::to_string(vector + 1u);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_bodyful_normalized_four_way_self_checks(std::string& error) {
+    u16 ports[8] = {54340u, 54341u, 54342u, 54343u, 54344u, 54345u, 54346u, 54347u};
+    BodyfulNormalizedExactObservation values[4] = {
+        make_bodyful_normalized_exact_self_check(
+            ports[1], "exact-before-root", "stage3-pinned-exact"),
+        make_bodyful_normalized_exact_self_check(
+            ports[3], "root-before-exact", "stage3-pinned-root"),
+        make_bodyful_normalized_exact_self_check(
+            ports[5], "generated-exact-before-root", "stage3-generated-exact"),
+        make_bodyful_normalized_exact_self_check(
+            ports[7], "generated-root-before-exact", "stage3-generated-root")};
+    std::string sources[2];
+    for (size_t i = 0u; i < 2u; i++) {
+        std::string fragment =
+            make_bodyful_normalized_exact_fragment(ports[4u + i * 2u], ports[5u + i * 2u], i == 0u);
+        const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+        if (!parsed) return false;
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) return false;
+        const rut::Str view = lowered.value().view();
+        sources[i].assign(view.ptr, view.len);
+    }
+    if (!validate_bodyful_normalized_four_way(values, sources, ports, error)) return false;
+    const auto rejects = [&](BodyfulNormalizedExactObservation changed[4],
+                             std::string changed_sources[2],
+                             const char* name) {
+        std::string detail;
+        if (!validate_bodyful_normalized_four_way(changed, changed_sources, ports, detail))
+            return true;
+        error = std::string("#331 Stage 3 four-way mutation accepted: ") + name;
+        return false;
+    };
+    BodyfulNormalizedExactObservation changed[4];
+    std::string changed_sources[2] = {sources[0], sources[1]};
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].wires[2] = changed[2].wires[3];
+    if (!rejects(changed, changed_sources, "doubled-slash-selection")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].targets[2] = "/a/b";
+    if (!rejects(changed, changed_sources, "raw-doubled-slash-spelling")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].access_records[2] = 0u;
+    if (!rejects(changed, changed_sources, "access-count")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    std::swap(changed[2].forward_history[0], changed[2].forward_history[1]);
+    if (!rejects(changed, changed_sources, "backend-order")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[3].forward_history.push_back(changed[3].forward_history[0]);
+    changed[3].forward_accepts++;
+    changed[3].forward_requests++;
+    changed[3].forward_sends++;
+    if (!rejects(changed, changed_sources, "backend-retry-count")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed[2].temp_path = changed[0].temp_path;
+    if (!rejects(changed, changed_sources, "resource-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(changed));
+    changed_sources[0].clear();
+    if (!rejects(changed, changed_sources, "source-ownership")) return false;
+    changed_sources[0] = sources[0];
+    u16 changed_ports[8];
+    std::copy(std::begin(ports), std::end(ports), std::begin(changed_ports));
+    changed_ports[7] = changed_ports[0];
+    std::string detail;
+    if (validate_bodyful_normalized_four_way(values, sources, changed_ports, detail)) {
+        error = "#331 Stage 3 duplicate-port mutation was accepted";
+        return false;
+    }
+    changed_ports[7] = ports[7];
+    changed_ports[0] = 0u;
+    if (validate_bodyful_normalized_four_way(values, sources, changed_ports, detail)) {
+        error = "#331 Stage 3 zero-port mutation was accepted";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_bodyful_normalized_exact_differential(const std::string& container_prefix,
+                                                                const char* rut_path,
+                                                                std::string& error) {
+    struct ReservedPorts {
+        int fds[8];
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = 0;
+            socklen_t length = sizeof(address);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+                ntohs(address.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(address.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[8]{};
+    for (size_t i = 0u; i < 8u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#331 Stage 3 could not simultaneously reserve eight unique ports";
+            return false;
+        }
+    }
+    TempDir temps[4];
+    for (TempDir& temp : temps) {
+        if (!temp.create()) {
+            error = "#331 Stage 3 could not create four independent resource trees";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (strcmp(temps[i].path, temps[j].path) == 0 ||
+                temps[i].nginx_config == temps[j].nginx_config ||
+                temps[i].source == temps[j].source || temps[i].nginx_log == temps[j].nginx_log ||
+                temps[i].rut_log == temps[j].rut_log ||
+                temps[i].nginx_access_log == temps[j].nginx_access_log ||
+                temps[i].rut_access_log == temps[j].rut_access_log) {
+                error = "#331 Stage 3 four sides shared a resource path";
+                return false;
+            }
+        }
+    }
+    BodyfulNormalizedExactObservation observations[4];
+    std::string sources[2];
+    const auto failed_side = [&](const char* side) {
+        if (error.empty()) error = std::string("#331 Stage 3 ") + side + " returned no diagnostic";
+        return false;
+    };
+    if (!capture_pinned_bodyful_normalized_exact_side(ports[0],
+                                                      ports[1],
+                                                      temps[0],
+                                                      container_prefix + "-nginx-exact-first",
+                                                      true,
+                                                      observations[0],
+                                                      error,
+                                                      &reservations.fds[0],
+                                                      &reservations.fds[1]))
+        return failed_side("pinned exact-first");
+    if (!capture_pinned_bodyful_normalized_exact_side(ports[2],
+                                                      ports[3],
+                                                      temps[1],
+                                                      container_prefix + "-nginx-root-first",
+                                                      false,
+                                                      observations[1],
+                                                      error,
+                                                      &reservations.fds[2],
+                                                      &reservations.fds[3]))
+        return failed_side("pinned root-first");
+    if (!capture_generated_bodyful_normalized_exact_side(ports[4],
+                                                         ports[5],
+                                                         temps[2],
+                                                         rut_path,
+                                                         true,
+                                                         observations[2],
+                                                         sources[0],
+                                                         error,
+                                                         &reservations.fds[4],
+                                                         &reservations.fds[5]))
+        return failed_side("generated exact-first");
+    if (!capture_generated_bodyful_normalized_exact_side(ports[6],
+                                                         ports[7],
+                                                         temps[3],
+                                                         rut_path,
+                                                         false,
+                                                         observations[3],
+                                                         sources[1],
+                                                         error,
+                                                         &reservations.fds[6],
+                                                         &reservations.fds[7]))
+        return failed_side("generated root-first");
+    return validate_bodyful_normalized_four_way(observations, sources, ports, error);
+}
+
 static bool capture_generated_exact_local_body_space_order(
     u16 frontend_port,
     u16 backend_port,
@@ -22704,6 +23544,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-trailing-slash-no-content-differential") == 0;
     const bool converter_max_boundary_no_content_differential =
         argc == 3 && strcmp(argv[1], "--converter-max-boundary-no-content-differential") == 0;
+    const bool converter_bodyful_normalized_exact_differential =
+        argc == 3 && strcmp(argv[1], "--converter-bodyful-normalized-exact-differential") == 0;
     const bool converter_normalized_exact_trailing_slash_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-normalized-exact-trailing-slash-differential") == 0;
@@ -22762,6 +23604,7 @@ int main(int argc, char** argv) {
          !converter_bounded_no_content_path_differential &&
          !converter_trailing_slash_no_content_differential &&
          !converter_max_boundary_no_content_differential &&
+         !converter_bodyful_normalized_exact_differential &&
          !converter_normalized_exact_trailing_slash_differential &&
          !strict_local_response_differential && !converter_root_proxy_trace_differential &&
          !converter_api_proxy_trace_differential &&
@@ -22785,6 +23628,7 @@ int main(int argc, char** argv) {
         (converter_bounded_no_content_path_differential && argv[2][0] != '/') ||
         (converter_trailing_slash_no_content_differential && argv[2][0] != '/') ||
         (converter_max_boundary_no_content_differential && argv[2][0] != '/') ||
+        (converter_bodyful_normalized_exact_differential && argv[2][0] != '/') ||
         (converter_normalized_exact_trailing_slash_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_space_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_multiple_space_differential && argv[2][0] != '/') ||
@@ -22847,6 +23691,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-max-boundary-no-content-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-bodyful-normalized-exact-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
@@ -22996,10 +23843,22 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (bodyful_normalized_exact_oracle) {
+    if (bodyful_normalized_exact_oracle || converter_bodyful_normalized_exact_differential) {
         std::string parser_error;
         if (!run_bodyful_normalized_exact_self_checks(parser_error)) {
             std::cerr << "FAIL [#331 access/observation/pair self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (converter_bodyful_normalized_exact_differential &&
+            !run_bodyful_normalized_generated_self_checks(parser_error)) {
+            std::cerr << "FAIL [#331 Stage 3 generated source/access self-check]: " << parser_error
+                      << "\n";
+            return 1;
+        }
+        if (converter_bodyful_normalized_exact_differential &&
+            !run_bodyful_normalized_four_way_self_checks(parser_error)) {
+            std::cerr << "FAIL [#331 Stage 3 four-way validator self-check]: " << parser_error
+                      << "\n";
             return 1;
         }
     }
@@ -23626,6 +24485,35 @@ int main(int argc, char** argv) {
                "records, clean bounded error logs, and four simultaneous unique port "
                "reservations (#331 Stage 1 nginx-only oracle; no converter/RUT equivalence "
                "claim)\n";
+        return 0;
+    }
+
+    if (converter_bodyful_normalized_exact_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-bodyful-normalized-exact-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_bodyful_normalized_exact_differential(
+                container_prefix, argv[2], differential_error)) {
+            std::cerr << "FAIL [#331 Stage 3 converter-generated bodyful normalized exact "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of exact /a/b return 200 ok matched between two "
+               "isolated pinned-nginx 1.29.7 sides and two genuine parser/borrowed-model/lowerer-"
+               "generated ordinary public-RUT CLI/io_uring sides. Literal, query, and raw "
+               "embedded-doubled-slash targets emitted exact Date-normalized 144-byte text/"
+               "plain/CL2/close/EOF responses with live and settled zero upstream; slash "
+               "extension, neighbor, and root emitted exact 175-byte 201/CL8/fallback/close/EOF "
+               "responses and three ordered byte-exact upstream requests with no fourth/retry. "
+               "All 24 observations proved exact raw-target access accounting, clean bounded "
+               "lifecycle logs, eight simultaneously reserved unique ports, isolated resources, "
+               "borrowed nginx-source destruction, canonical method-omitted slash-normalized "
+               "generated source, and generated-source ownership after public load (#331 Stage 3 "
+               "bounded behavioral evidence)\n";
         return 0;
     }
 
