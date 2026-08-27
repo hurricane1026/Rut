@@ -9477,7 +9477,7 @@ TEST(nginx_parser, parses_exact_loopback_listen_with_endpoint_provenance_and_own
     }
 }
 
-TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_fail_closed) {
+TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_with_provenance) {
     char exact_then_root[] =
         "server {\n"
         "  listen 127.0.0.1:8080;\n"
@@ -9637,8 +9637,14 @@ TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_fa
                 CHECK_EQ(lowered.error().span.line, expected_span.line);
                 CHECK_EQ(lowered.error().span.col, expected_span.col);
             };
-        expect_rejected(
-            server, lit_str("exact listen requires the minimal root proxy profile"), listener.span);
+        const auto valid_lowering = nginx::lower_to_rut(server);
+        REQUIRE(valid_lowering);
+        CHECK(valid_lowering.value()
+                  .view()
+                  .slice(0u, strlen("listen 127.0.0.1:8080\n"))
+                  .eq(lit_str("listen 127.0.0.1:8080\n")));
+        CHECK(strstr(valid_lowering.value().data, "route exact slash_normalized GET \"/static\"") !=
+              nullptr);
 
         std::vector<char> independent_source(source, source + len);
         auto forged = server;
@@ -9666,6 +9672,28 @@ TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_fa
         expect_rejected(
             forged, lit_str("invalid exact listen endpoint model"), forged.listen.value_span);
 
+        char bodyful_source[] =
+            "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+            "location = /body { return 200 \"ok\"; } }";
+        const auto bodyful = nginx::parse({bodyful_source, sizeof(bodyful_source) - 1u});
+        REQUIRE(bodyful);
+        forged = server;
+        forged.exact_local_return = bodyful.value().exact_local_return;
+        expect_rejected(forged,
+                        lit_str("multiple exact semantic actions are unsupported"),
+                        forged.exact_local_return.span);
+
+        char redirect_source[] =
+            "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+            "location = /old { return 301 http://redirect.example/new; } }";
+        const auto redirect = nginx::parse({redirect_source, sizeof(redirect_source) - 1u});
+        REQUIRE(redirect);
+        forged = server;
+        forged.exact_absolute_redirect = redirect.value().exact_absolute_redirect;
+        expect_rejected(forged,
+                        lit_str("multiple exact semantic actions are unsupported"),
+                        forged.exact_absolute_redirect.span);
+
         const nginx::Server retained = server;
         const Span retained_server_span = server.span;
         const Span retained_listener_span = listener.span;
@@ -9677,6 +9705,12 @@ TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_fa
         const Span retained_response_span = response.span;
         const Span retained_status_span = response.status_span;
         memset(source, 'x', len);
+        CHECK(valid_lowering.value()
+                  .view()
+                  .slice(0u, strlen("listen 127.0.0.1:8080\n"))
+                  .eq(lit_str("listen 127.0.0.1:8080\n")));
+        CHECK(strstr(valid_lowering.value().data, "route exact slash_normalized GET \"/static\"") !=
+              nullptr);
         CHECK(retained.listen.address == ListenerAddress::IPv4Exact);
         CHECK_EQ(retained.listen.ipv4_host, 0x7f000001u);
         CHECK_EQ(retained.listen.port, 8080u);
@@ -9821,12 +9855,13 @@ TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_fa
     CHECK_EQ(maximum.value().pre_route_trace.span.start, maximum.value().span.start);
     CHECK_EQ(maximum.value().pre_route_trace.span.end, maximum.value().span.end);
     const auto maximum_lowering = nginx::lower_to_rut(maximum.value());
-    REQUIRE_FALSE(maximum_lowering);
-    CHECK_EQ(maximum_lowering.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(maximum_lowering.error().detail.eq(
-        lit_str("exact listen requires the minimal root proxy profile")));
-    CHECK_EQ(maximum_lowering.error().span.start, maximum.value().listen.span.start);
-    CHECK_EQ(maximum_lowering.error().span.end, maximum.value().listen.span.end);
+    REQUIRE(maximum_lowering);
+    CHECK_LT(maximum_lowering.value().len, nginx::RutSource::kCapacity);
+    CHECK(maximum_lowering.value()
+              .view()
+              .slice(0u, strlen("listen 127.0.0.1:65535\n"))
+              .eq(lit_str("listen 127.0.0.1:65535\n")));
+    CHECK(strstr(maximum_lowering.value().data, "route exact slash_normalized GET \"") != nullptr);
 }
 
 TEST(nginx_parser, rejects_non_loopback_and_malformed_exact_listen_endpoints) {
@@ -10758,9 +10793,6 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     const char* const exact_action_sources[] = {
         "server { listen 127.0.0.1:8080; "
         "location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /static { return 204; } }",
-        "server { listen 127.0.0.1:8080; "
-        "location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /static { return 200 \"ok\"; } }",
         "server { listen 127.0.0.1:8080; "
         "location / { proxy_pass http://127.0.0.1:9000; } "
@@ -10787,6 +10819,215 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
               .view()
               .slice(0, strlen("listen 127.0.0.1:65535\n"))
               .eq(lit_str("listen 127.0.0.1:65535\n")));
+}
+
+TEST(nginx_converter, issue348_exact_loopback_no_content_has_canonical_ordinary_rut_golden) {
+    static constexpr char kNoContentRoute[] =
+        "route exact slash_normalized GET \"/static\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    char exact_first[] =
+        "server { listen 127.0.0.1:8080; location = /static { return 204; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    char exact_root_first[] =
+        "server { listen 127.0.0.1:8080; "
+        "location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+    static constexpr char kWildcardFirst[] =
+        "server { listen 8080; location = /static { return 204; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kWildcardRootFirst[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 204; } }";
+
+    const auto exact_first_parsed = nginx::parse({exact_first, sizeof(exact_first) - 1u});
+    const auto exact_root_first_parsed =
+        nginx::parse({exact_root_first, sizeof(exact_root_first) - 1u});
+    REQUIRE(exact_first_parsed);
+    REQUIRE(exact_root_first_parsed);
+    const auto exact_first_lowered = nginx::lower_to_rut(exact_first_parsed.value());
+    const auto exact_root_first_lowered = nginx::lower_to_rut(exact_root_first_parsed.value());
+    char wildcard_first[sizeof(kWildcardFirst)]{};
+    char wildcard_root_first[sizeof(kWildcardRootFirst)]{};
+    memcpy(wildcard_first, kWildcardFirst, sizeof(kWildcardFirst));
+    memcpy(wildcard_root_first, kWildcardRootFirst, sizeof(kWildcardRootFirst));
+    const auto wildcard_first_parsed = nginx::parse({wildcard_first, sizeof(wildcard_first) - 1u});
+    const auto wildcard_root_first_parsed =
+        nginx::parse({wildcard_root_first, sizeof(wildcard_root_first) - 1u});
+    REQUIRE(wildcard_first_parsed);
+    REQUIRE(wildcard_root_first_parsed);
+    const auto wildcard_first_lowered = nginx::lower_to_rut(wildcard_first_parsed.value());
+    const auto wildcard_root_first_lowered =
+        nginx::lower_to_rut(wildcard_root_first_parsed.value());
+    REQUIRE(exact_first_lowered);
+    REQUIRE(exact_root_first_lowered);
+    REQUIRE(wildcard_first_lowered);
+    REQUIRE(wildcard_root_first_lowered);
+
+    const std::string exact_first_source(exact_first_lowered.value().data,
+                                         exact_first_lowered.value().len);
+    const std::string exact_root_first_source(exact_root_first_lowered.value().data,
+                                              exact_root_first_lowered.value().len);
+    const std::string wildcard_first_source(wildcard_first_lowered.value().data,
+                                            wildcard_first_lowered.value().len);
+    const std::string wildcard_root_first_source(wildcard_root_first_lowered.value().data,
+                                                 wildcard_root_first_lowered.value().len);
+    REQUIRE_EQ(exact_first_source, exact_root_first_source);
+    REQUIRE_EQ(wildcard_first_source, wildcard_root_first_source);
+    std::string expected_exact = wildcard_first_source;
+    REQUIRE_EQ(expected_exact.rfind("listen :8080\n", 0u), 0u);
+    expected_exact.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
+    REQUIRE_EQ(exact_first_source, expected_exact);
+
+    // RutSource is an owned value: invalidating every nginx input after
+    // lowering cannot alter the generated ordinary-RUT bytes.
+    memset(exact_first, 'x', sizeof(exact_first) - 1u);
+    memset(exact_root_first, 'y', sizeof(exact_root_first) - 1u);
+    memset(wildcard_first, 'z', sizeof(wildcard_first) - 1u);
+    memset(wildcard_root_first, 'w', sizeof(wildcard_root_first) - 1u);
+    CHECK_EQ(std::string(exact_first_lowered.value().data, exact_first_lowered.value().len),
+             expected_exact);
+    CHECK_EQ(
+        std::string(exact_root_first_lowered.value().data, exact_root_first_lowered.value().len),
+        expected_exact);
+
+    const auto listener_is_canonical = [](const std::string& candidate) {
+        return candidate.rfind("listen 127.0.0.1:8080\n", 0u) == 0u &&
+               count_text(candidate, "listen 127.0.0.1:8080\n") == 1u &&
+               ((candidate.rfind("listen ", 0u) == 0u ? 1u : 0u) +
+                count_text(candidate, "\nlisten ")) == 1u &&
+               candidate.find("listen :") == std::string::npos;
+    };
+    const auto upstream_is_canonical = [](const std::string& candidate) {
+        return count_upstream_declarations(candidate) == 1u &&
+               count_text(candidate, "upstream nginx_upstream at \"127.0.0.1:9000\"\n") == 1u;
+    };
+    const auto policies_are_canonical = [](const std::string& candidate) {
+        const size_t pre_route = candidate.find("pre_route TRACE {");
+        const size_t pre_route_end = candidate.find("}) }\n", pre_route);
+        return pre_route != std::string::npos && pre_route_end != std::string::npos &&
+               ((candidate.rfind("pre_route ", 0u) == 0u ? 1u : 0u) +
+                count_text(candidate, "\npre_route ")) == 1u &&
+               count_text(candidate, "pre_route TRACE { return local_response({\n") == 1u &&
+               count_text(candidate.substr(pre_route, pre_route_end - pre_route), "status: 405") ==
+                   1u &&
+               count_text(candidate.substr(pre_route, pre_route_end - pre_route),
+                          "reason: \"Not Allowed\"") == 1u &&
+               count_text(candidate, "unmatched OPTIONS {") == 1u &&
+               count_text(candidate, "unmatched CONNECT {") == 1u &&
+               count_text(candidate, "\nunmatched { return local_response({\n") == 1u;
+    };
+    const auto routes_are_canonical = [](const std::string& candidate) {
+        return count_route_declarations(candidate) == 4u &&
+               count_text(candidate, "route HEAD \"/\" {") == 1u &&
+               count_text(candidate, "route GET \"/\" {") == 1u &&
+               count_text(candidate, "\nroute \"/\" {") == 1u &&
+               count_text(candidate, kNoContentRoute) == 1u;
+    };
+    const auto has_no_nginx_hook_or_workaround = [](const std::string& candidate) {
+        return candidate.find("nginx.conf") == std::string::npos &&
+               candidate.find("nginx::") == std::string::npos &&
+               candidate.find("nginx_compat") == std::string::npos &&
+               candidate.find("workaround") == std::string::npos &&
+               candidate.find("bind_address") == std::string::npos &&
+               candidate.find("local_address") == std::string::npos &&
+               candidate.find("req.listener") == std::string::npos;
+    };
+    const auto source_is_canonical = [&](const std::string& candidate) {
+        return listener_is_canonical(candidate) && upstream_is_canonical(candidate) &&
+               policies_are_canonical(candidate) && routes_are_canonical(candidate) &&
+               has_no_nginx_hook_or_workaround(candidate);
+    };
+    REQUIRE(listener_is_canonical(expected_exact));
+    REQUIRE(upstream_is_canonical(expected_exact));
+    REQUIRE(policies_are_canonical(expected_exact));
+    REQUIRE(routes_are_canonical(expected_exact));
+    REQUIRE(has_no_nginx_hook_or_workaround(expected_exact));
+    REQUIRE(source_is_canonical(expected_exact));
+
+    std::string wrong_listener = expected_exact;
+    REQUIRE_EQ(count_text(wrong_listener, "listen 127.0.0.1:8080\n"), 1u);
+    wrong_listener.replace(0u, strlen("listen 127.0.0.1:8080"), "listen :8080");
+    CHECK_NE(wrong_listener, expected_exact);
+    CHECK_FALSE(listener_is_canonical(wrong_listener));
+    CHECK(upstream_is_canonical(wrong_listener));
+    CHECK(policies_are_canonical(wrong_listener));
+    CHECK(routes_are_canonical(wrong_listener));
+    CHECK_FALSE(source_is_canonical(wrong_listener));
+
+    std::string wrong_upstream = expected_exact;
+    static constexpr char kCanonicalUpstream[] = "upstream nginx_upstream at \"127.0.0.1:9000\"\n";
+    static constexpr char kChangedUpstream[] = "upstream nginx_upstream at \"127.0.0.1:9001\"\n";
+    REQUIRE_EQ(count_text(wrong_upstream, kCanonicalUpstream), 1u);
+    REQUIRE_EQ(count_text(wrong_upstream, kChangedUpstream), 0u);
+    const size_t upstream = wrong_upstream.find(kCanonicalUpstream);
+    REQUIRE_NE(upstream, std::string::npos);
+    wrong_upstream.replace(upstream, sizeof(kCanonicalUpstream) - 1u, kChangedUpstream);
+    CHECK_NE(wrong_upstream, expected_exact);
+    CHECK_EQ(count_text(wrong_upstream, kCanonicalUpstream), 0u);
+    CHECK_EQ(count_text(wrong_upstream, kChangedUpstream), 1u);
+    CHECK_EQ(count_upstream_declarations(wrong_upstream), 1u);
+    CHECK(listener_is_canonical(wrong_upstream));
+    CHECK_FALSE(upstream_is_canonical(wrong_upstream));
+    CHECK(policies_are_canonical(wrong_upstream));
+    CHECK(routes_are_canonical(wrong_upstream));
+    CHECK_FALSE(source_is_canonical(wrong_upstream));
+
+    std::string wrong_pre_route = expected_exact;
+    const size_t pre_route = wrong_pre_route.find("pre_route TRACE {");
+    const size_t pre_route_end = wrong_pre_route.find("}) }\n", pre_route);
+    const size_t trace_status = wrong_pre_route.find("status: 405", pre_route);
+    REQUIRE_NE(pre_route, std::string::npos);
+    REQUIRE_NE(pre_route_end, std::string::npos);
+    REQUIRE_NE(trace_status, std::string::npos);
+    REQUIRE_LT(trace_status, pre_route_end);
+    wrong_pre_route.replace(trace_status, strlen("status: 405"), "status: 400");
+    CHECK_NE(wrong_pre_route, expected_exact);
+    CHECK(listener_is_canonical(wrong_pre_route));
+    CHECK(upstream_is_canonical(wrong_pre_route));
+    CHECK_FALSE(policies_are_canonical(wrong_pre_route));
+    CHECK(routes_are_canonical(wrong_pre_route));
+    CHECK_FALSE(source_is_canonical(wrong_pre_route));
+
+    std::string wrong_action = expected_exact;
+    const size_t action = wrong_action.find(kNoContentRoute);
+    REQUIRE_NE(action, std::string::npos);
+    const size_t action_status = wrong_action.find("status: 204", action);
+    REQUIRE_NE(action_status, std::string::npos);
+    REQUIRE_LT(action_status, action + sizeof(kNoContentRoute) - 1u);
+    wrong_action.replace(action_status, strlen("status: 204"), "status: 200");
+    CHECK_NE(wrong_action, expected_exact);
+    CHECK(listener_is_canonical(wrong_action));
+    CHECK(upstream_is_canonical(wrong_action));
+    CHECK(policies_are_canonical(wrong_action));
+    CHECK_FALSE(routes_are_canonical(wrong_action));
+    CHECK_FALSE(source_is_canonical(wrong_action));
+
+    const auto lexed = lex({expected_exact.data(), static_cast<u32>(expected_exact.size())});
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    REQUIRE_EQ(ast_owned->items.len, 10u);
+    REQUIRE(ast_owned->items[0].kind == AstItemKind::Listen);
+    CHECK(ast_owned->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(ast_owned->items[0].listen.ipv4_host, 0x7f000001u);
+    CHECK_EQ(ast_owned->items[0].listen.port, 8080u);
+    REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+    CHECK_EQ(ast_owned->exact_strict_local_response_bindings[0].path_view,
+             ExactPathView::SlashNormalized);
+    const auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE(hir_owned->has_listener);
+    CHECK(hir_owned->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(hir_owned->listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(hir_owned->listener.port, 8080u);
+    REQUIRE_EQ(hir_owned->routes.len, 3u);
+    REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
 }
 
 TEST(nginx_converter, explicit_ipv4_wildcard_listener_survives_frontend_lifetimes) {

@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <sys/mman.h>
 
 using namespace rut;
@@ -629,6 +630,161 @@ TEST(serve_loader, nginx_exact_loopback_generated_source_owns_listener_and_reuse
     CHECK(program.listener.transport == ListenerTransport::Cleartext);
     CHECK_EQ(program.listener.port, 8081u);
     CHECK_EQ(program.listener.ipv4_host, 0u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
+TEST(serve_loader, nginx_exact_loopback_no_content_output_is_owned_and_reuses_cleanly) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_no_content";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8080; "
+            "location = /static { return 204; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError err;
+    const auto check_root_forward_inventory = [&](u16 expected_backend_port) {
+        REQUIRE_EQ(program.config.route_count, 3u);
+        u32 head_count = 0u;
+        u32 get_count = 0u;
+        u32 any_count = 0u;
+        for (u32 i = 0u; i < program.config.route_count; i++) {
+            const RouteEntry& route = program.config.routes[i];
+            CHECK_EQ(route.path_len, 1u);
+            CHECK_EQ(route.path[0], '/');
+            CHECK(route.action == RouteAction::JitHandler);
+            CHECK_FALSE(route.needs_req_body);
+            if (route.method == kRouteMethodHead) head_count++;
+            if (route.method == kRouteMethodGet) get_count++;
+            if (route.method == kRouteMethodAny) any_count++;
+        }
+        CHECK_EQ(head_count, 1u);
+        CHECK_EQ(get_count, 1u);
+        CHECK_EQ(any_count, 1u);
+
+        static constexpr u8 kRoot[] = {'/'};
+        const RouteEntry* head = program.config.match(kRoot, 1u, kRouteMethodHead);
+        const RouteEntry* get = program.config.match(kRoot, 1u, kRouteMethodGet);
+        const RouteEntry* post = program.config.match(kRoot, 1u, kRouteMethodPost);
+        REQUIRE(head != nullptr);
+        REQUIRE(get != nullptr);
+        REQUIRE(post != nullptr);
+        CHECK_NE(head, get);
+        CHECK_NE(head, post);
+        CHECK_NE(get, post);
+        CHECK_EQ(head->method, kRouteMethodHead);
+        CHECK_EQ(get->method, kRouteMethodGet);
+        CHECK_EQ(post->method, kRouteMethodAny);
+        CHECK(head->action == RouteAction::JitHandler);
+        CHECK(get->action == RouteAction::JitHandler);
+        CHECK(post->action == RouteAction::JitHandler);
+
+        REQUIRE_EQ(program.config.upstream_count, 1u);
+        const UpstreamTarget& upstream = program.config.upstreams[0];
+        CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+        REQUIRE_EQ(upstream.addr_count, 1u);
+        CHECK_EQ(upstream.addrs[0].sin_family, AF_INET);
+        CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0x7f000001u);
+        CHECK_EQ(ntohs(upstream.addrs[0].sin_port), expected_backend_port);
+    };
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_root_forward_inventory(9000u);
+    REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 1u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK_NE(program.config.pre_route_policy_id(kRouteMethodTrace), 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodOptions], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodConnect], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodAny], 0u);
+    const auto exact = program.config.match_exact_strict_local_response_views(
+        lit_str("/static"), lit_str("/static"), kRouteMethodGet);
+    REQUIRE(exact.state == ExactStrictLocalResponseMatchState::Match);
+    REQUIRE(program.config.strict_local_response_policy_id_is_owned(exact.policy_id));
+    const auto& policy = program.config.strict_local_response_policies[exact.policy_id - 1u];
+    CHECK_EQ(strict_local_response_policy_profile(policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(policy.status_code, 204u);
+    CHECK(policy.reason.eq(lit_str("No Content")));
+    CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+    CHECK_EQ(policy.content_type.len, 0u);
+    CHECK_EQ(policy.body.len, 0u);
+    CHECK(program.config.strict_local_response_bytes_owned(policy.content_type));
+    CHECK(program.config.strict_local_response_bytes_owned(policy.body));
+
+    // Remove every source/frontend owner while preserving the process-owned
+    // endpoint, routing table and normalized exact action.
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_root_forward_inventory(9000u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    const auto retained = program.config.match_exact_strict_local_response_views(
+        lit_str("/static"), lit_str("/static"), kRouteMethodGet);
+    REQUIRE(retained.state == ExactStrictLocalResponseMatchState::Match);
+    REQUIRE(program.config.strict_local_response_policy_id_is_owned(retained.policy_id));
+    CHECK_EQ(strict_local_response_policy_profile(
+                 program.config.strict_local_response_policies[retained.policy_id - 1u]),
+             StrictLocalResponseProfile::NoContent204);
+
+    program.destroy();
+    CHECK_FALSE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.exact_strict_local_response_binding_count, 0u);
+
+    // Reuse the same owner for a converter-generated wildcard root proxy with
+    // no exact action; neither address nor action inventory may survive.
+    {
+        char nginx_source[] =
+            "server { listen *:8081; "
+            "location / { proxy_pass http://127.0.0.1:9001; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'z', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8081u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.exact_strict_local_response_binding_count, 0u);
+    CHECK_FALSE(program.config.has_exact_strict_local_response_inventory());
+    check_root_forward_inventory(9001u);
     program.destroy();
     std::filesystem::remove(path);
 }
