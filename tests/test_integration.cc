@@ -21490,6 +21490,297 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
 }
+
+static constexpr char kPublicAccessTargetKey62[] =
+    "/A-Z_a.z~9/more_2/"
+    "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR";
+static constexpr char kPublicAccessTarget66[] =
+    "/A-Z_a.z~9/more_2/"
+    "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR?x=1";
+static_assert(sizeof(kPublicAccessTargetKey62) - 1u == 62u);
+static_assert(sizeof(kPublicAccessTarget66) - 1u == 66u);
+
+static bool validate_public_complete_access_target_66(const AccessLogEntry* entries,
+                                                      u32 entry_count,
+                                                      u32 expected_request_size,
+                                                      u32 expected_response_size) {
+    if (entries == nullptr || entry_count != 1u) return false;
+    const AccessLogEntry& entry = entries[0];
+    if (entry.target_state != AccessLogTargetState::Complete || entry.target_length != 66u ||
+        memcmp(entry.path, kPublicAccessTarget66, 66u) != 0 || entry.status != 204u ||
+        entry.method != static_cast<u8>(LogHttpMethod::Get) ||
+        entry.req_size != expected_request_size || entry.resp_size != expected_response_size ||
+        entry.upstream_us != 0u || entry.upstream[0] != '\0')
+        return false;
+
+    char storage[kAccessLogTextLineCapacity];
+    const u32 text_size = format_access_log_text(entry, storage, sizeof(storage));
+    if (text_size == 0u || text_size > sizeof(storage) || storage[text_size - 1u] != '\n')
+        return false;
+    u32 newline_count = 0u;
+    for (u32 i = 0; i < text_size; i++)
+        if (storage[i] == '\n') newline_count++;
+    if (newline_count != 1u) return false;
+
+    const std::string text(storage, storage + text_size);
+    const std::string exact = " GET " + std::string(kPublicAccessTarget66) + " 204 ";
+    const size_t exact_offset = text.find(exact);
+    return exact_offset != std::string::npos &&
+           text.find(exact, exact_offset + 1u) == std::string::npos &&
+           text.find("<request-target-") == std::string::npos;
+}
+
+static bool public_complete_access_target_66_validator_self_checks() {
+    AccessLogEntry valid{};
+    valid.status = 204u;
+    valid.method = static_cast<u8>(LogHttpMethod::Get);
+    valid.req_size = 130u;
+    valid.resp_size = 105u;
+    valid.target_state = AccessLogTargetState::Complete;
+    valid.target_length = 66u;
+    memcpy(valid.path, kPublicAccessTarget66, 66u);
+    if (!validate_public_complete_access_target_66(&valid, 1u, 130u, 105u) ||
+        validate_public_complete_access_target_66(nullptr, 1u, 130u, 105u) ||
+        validate_public_complete_access_target_66(&valid, 0u, 130u, 105u) ||
+        validate_public_complete_access_target_66(&valid, 2u, 130u, 105u))
+        return false;
+
+    const auto rejects = [&](const AccessLogEntry& mutation) {
+        return !validate_public_complete_access_target_66(&mutation, 1u, 130u, 105u);
+    };
+    AccessLogEntry truncated = valid;
+    truncated.target_length = 64u;
+    truncated.path[64] = '\0';
+    AccessLogEntry legacy = valid;
+    legacy.target_state = AccessLogTargetState::LegacyNullTerminated;
+    legacy.target_length = 0u;
+    AccessLogEntry wrong_length = valid;
+    wrong_length.target_length = 65u;
+    AccessLogEntry wrong_target = valid;
+    wrong_target.path[65] = '2';
+    AccessLogEntry wrong_status = valid;
+    wrong_status.status = 200u;
+    AccessLogEntry wrong_request_size = valid;
+    wrong_request_size.req_size--;
+    AccessLogEntry wrong_response_size = valid;
+    wrong_response_size.resp_size--;
+    return rejects(truncated) && rejects(legacy) && rejects(wrong_length) &&
+           rejects(wrong_target) && rejects(wrong_status) && rejects(wrong_request_size) &&
+           rejects(wrong_response_size);
+}
+
+TEST(access_log, public_complete_target_66_validator_self_checks) {
+    REQUIRE(public_complete_access_target_66_validator_self_checks());
+}
+
+template <typename Loop>
+static void run_public_complete_access_target_66(rut::test::TestCase* _tc) {
+    using namespace rut;
+    static constexpr char kExpected[] =
+        "HTTP/1.1 204 No Content\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Connection: close\r\n\r\n";
+    static_assert(sizeof(kExpected) - 1u == 105u);
+
+    const std::string source_text =
+        "listen :0\n"
+        "route GET \"/\" { return 500 }\n"
+        "route exact slash_normalized GET \"" +
+        std::string(kPublicAccessTargetKey62) +
+        "\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    REQUIRE_EQ(source_text.find("?x=1"), std::string::npos);
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_access_target_66_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+
+        bool create(Str source) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0u;
+            while (written < source.len) {
+                const ssize_t count = write(fd, source.ptr + written, source.len - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) return false;
+                written += static_cast<u32>(count);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        bool remove() {
+            if (!present) return true;
+            if (unlink(path) != 0) return false;
+            present = false;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.upstream_count, 0u);
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 0u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 1u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    REQUIRE(program.config.strict_local_response_policy_id_is_owned(1u));
+    const auto& rir_binding = program.rir.module.exact_strict_local_response_bindings[0];
+    const auto& binding = program.config.exact_strict_local_response_bindings[0];
+    REQUIRE_EQ(binding.path_len, 62u);
+    CHECK_EQ(binding.path_view, ExactPathView::SlashNormalized);
+    CHECK_EQ(binding.method, kRouteMethodGet);
+    CHECK_EQ(binding.policy_id, 1u);
+    CHECK_EQ(memcmp(binding.path, kPublicAccessTargetKey62, 62u), 0);
+    CHECK_NE(&binding.path[0], &rir_binding.path[0]);
+    const auto exact_match = program.config.match_exact_strict_local_response_views(
+        {kPublicAccessTarget66, 66u}, {kPublicAccessTargetKey62, 62u}, kRouteMethodGet);
+    CHECK_EQ(exact_match.state, ExactStrictLocalResponseMatchState::Match);
+    CHECK_EQ(exact_match.policy_id, 1u);
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(program.src_map);
+    const uintptr_t source_end = source_begin + program.src_map_len;
+    const uintptr_t owned_path = reinterpret_cast<uintptr_t>(binding.path);
+    CHECK(owned_path < source_begin || owned_path >= source_end);
+    REQUIRE(source.remove());
+    CHECK_EQ(access(source.path, F_OK), -1);
+    CHECK_EQ(errno, ENOENT);
+
+    Shard<Loop> shard;
+    struct ShardGuard {
+        Shard<Loop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listener{create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(listener.fd, 0);
+    const u16 port = get_port(listener.fd);
+    REQUIRE_NE(port, 0u);
+    REQUIRE(shard.init(0, listener.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listener.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    const std::string request = "GET " + std::string(kPublicAccessTarget66) +
+                                " HTTP/1.1\r\nHost: max-boundary.example\r\n"
+                                "Connection: close\r\n\r\n";
+    REQUIRE_EQ(request.size(), 130u);
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 5);
+    REQUIRE(send_all(client.fd, request.data(), static_cast<u32>(request.size())));
+    char response[256]{};
+    u32 response_size = 0u;
+    REQUIRE(read_public_close_response(client.fd, 0u, response, sizeof(response), response_size));
+    REQUIRE_EQ(response_size, sizeof(kExpected) - 1u);
+    REQUIRE(normalize_public_date(response, response_size));
+    CHECK_EQ(memcmp(response, kExpected, response_size), 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+
+    for (u32 wait = 0u; wait < 400u && shard.log_ring->available() == 0u; wait++) usleep(5000);
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+
+    AccessLogEntry access_entry{};
+    REQUIRE(shard.log_ring->pop(access_entry));
+    REQUIRE(validate_public_complete_access_target_66(
+        &access_entry, 1u, static_cast<u32>(request.size()), response_size));
+    AccessLogEntry duplicate{};
+    CHECK_FALSE(shard.log_ring->pop(duplicate));
+    CHECK_EQ(shard.log_ring->available(), 0u);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 1u);
+
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
+TEST(route, public_ordinary_source_complete_access_target_66_epoll) {
+    run_public_complete_access_target_66<EpollEventLoop>(_tc);
+}
+
+TEST(route, public_ordinary_source_complete_access_target_66_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    run_public_complete_access_target_66<IoUringEventLoop>(_tc);
+}
 #endif
 
 static bool run_strict_response_rejection_case(const char* response) {
