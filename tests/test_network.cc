@@ -2184,6 +2184,218 @@ TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
     }
 }
 
+TEST(target_transform, h1_static_query_prefix_is_exact_through_upstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    REQUIRE_EQ(cfg.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
+
+    struct Vector {
+        const char* target;
+        const char* expected_target;
+        bool check_query_mutations;
+    } vectors[] = {
+        {"/api/users?x=1", "/v1/?fixed=1users?x=1", true},
+        {"/api/users", "/v1/?fixed=1users", false},
+        {"/api/?x=1", "/v1/?fixed=1?x=1", false},
+        {"/api/", "/v1/?fixed=1", false},
+    };
+    static constexpr char kTail[] =
+        " HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\nX-Tail: keep?&\r\n\r\n";
+    for (const auto& vector : vectors) {
+        const std::string request = std::string("GET ") + vector.target + kTail;
+        const std::string expected = std::string("GET ") + vector.expected_target + kTail;
+        auto* conn = setup_target_transform_request(
+            loop, cfg, request.data(), static_cast<u32>(request.size()));
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->checked_raw_request_target().state, RawRequestTargetWitnessState::Valid);
+        REQUIRE(conn->checked_raw_request_target().target.eq(
+            {vector.target, static_cast<u32>(strlen(vector.target))}));
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+        REQUIRE_EQ(conn->recv_buf.len(), static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected.data(), expected.size()), 0);
+        CHECK_EQ(conn->req_header_end, expected.size());
+        CHECK_EQ(conn->req_initial_send_len, expected.size());
+        CHECK_FALSE(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(conn->upstream_attempts, 1u);
+        REQUIRE(conn->upstream_fd >= 0);
+        const i32 expected_upstream_fd = conn->upstream_fd;
+
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+        const MockOp* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        CHECK_EQ(send->fd, expected_upstream_fd);
+        CHECK_EQ(send->fd, conn->upstream_fd);
+        REQUIRE_EQ(send->send_len, static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(send->send_buf, expected.data(), expected.size()), 0);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(conn->upstream_attempts, 1u);
+
+        if (vector.check_query_mutations) {
+            const std::string actual(reinterpret_cast<const char*>(send->send_buf), send->send_len);
+            CHECK_NE(actual, std::string("GET /v1/?fixed=1?x=1") + kTail);       // suffix loss
+            CHECK_NE(actual, std::string("GET /v1/?fixed=1users") + kTail);      // query loss
+            CHECK_NE(actual, std::string("GET /v1/users?x=1?fixed=1") + kTail);  // reorder
+            CHECK_NE(actual, std::string("GET /v1/?fixed=1users&x=1") + kTail);  // normalized
+        }
+        loop.close_conn(*conn);
+    }
+}
+
+TEST(target_transform, h1_static_query_invalid_specs_and_capacity_fail_atomically) {
+    SmallLoop loop;
+    loop.setup();
+    static constexpr char kRequest[] =
+        "GET /api/users?x=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+
+    auto reject_forged_spec = [&](RouteConfig& cfg) {
+        auto* conn = setup_target_transform_request(loop, cfg, kRequest, sizeof(kRequest) - 1);
+        REQUIRE(conn != nullptr);
+        const u32 before_len = conn->recv_buf.len();
+        const u32 before_header_end = conn->req_header_end;
+        const u32 before_send_len = conn->req_initial_send_len;
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        loop.backend.clear_ops();
+
+        CHECK_FALSE(materialize_request_target_transform(*conn, cfg));
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(conn->req_header_end, before_header_end);
+        CHECK_EQ(conn->req_initial_send_len, before_send_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.op_count, 0u);
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.free_conn(*conn);
+    };
+
+    RouteConfig query_strip{};
+    REQUIRE(query_strip.add_upstream("backend", 0x7F000001, 8080).has_value());
+    REQUIRE_EQ(query_strip.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
+    char* owned_strip = const_cast<char*>(query_strip.target_transforms[0].strip_prefix.ptr);
+    owned_strip[4] = '?';
+    CHECK_FALSE(query_strip.target_transform_id_is_valid(1));
+    reject_forged_spec(query_strip);
+
+    RouteConfig second_delimiter{};
+    REQUIRE(second_delimiter.add_upstream("backend", 0x7F000001, 8080).has_value());
+    REQUIRE_EQ(second_delimiter.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
+    char* owned_replace =
+        const_cast<char*>(second_delimiter.target_transforms[0].replace_prefix.ptr);
+    owned_replace[11] = '?';
+    CHECK_FALSE(second_delimiter.target_transform_id_is_valid(1));
+    reject_forged_spec(second_delimiter);
+
+    RouteConfig capacity_cfg{};
+    REQUIRE(capacity_cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    REQUIRE_EQ(capacity_cfg.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
+    static constexpr char kCapacityPrefix[] = "GET /api/users?x=";
+    static constexpr char kCapacityTail[] =
+        " HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\nX-Tail: keep?&\r\n\r\n";
+    auto make_request = [](u32 total) -> std::string {
+        if (total <= sizeof(kCapacityPrefix) - 1u + sizeof(kCapacityTail) - 1u) return {};
+        std::string request = kCapacityPrefix;
+        request.append(total - (sizeof(kCapacityPrefix) - 1u) - (sizeof(kCapacityTail) - 1u), 'a');
+        request += kCapacityTail;
+        return request;
+    };
+    const u32 capacity = SmallLoop::kBufSize;
+    for (const u32 requested : {capacity - 7u, capacity - 6u}) {
+        const std::string request = make_request(requested);
+        auto* conn = setup_target_transform_request(
+            loop, capacity_cfg, request.data(), static_cast<u32>(request.size()));
+        REQUIRE(conn != nullptr);
+        const u32 before_len = conn->recv_buf.len();
+        const u32 before_header_end = conn->req_header_end;
+        const u32 before_send_len = conn->req_initial_send_len;
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        loop.backend.clear_ops();
+
+        const bool materialized = materialize_request_target_transform(*conn, capacity_cfg);
+        if (requested == capacity - 7u) {
+            const u32 query_value_len =
+                requested - (sizeof(kCapacityPrefix) - 1u) - (sizeof(kCapacityTail) - 1u);
+            std::string expected_target = "/v1/?fixed=1users?x=";
+            expected_target.append(query_value_len, 'a');
+            const std::string expected = std::string("GET ") + expected_target + kCapacityTail;
+            REQUIRE_EQ(expected.size(), capacity);
+            CHECK(materialized);
+            CHECK_EQ(conn->recv_buf.len(), capacity);
+            CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected.data(), expected.size()), 0);
+            const u32 target_end = 4u + static_cast<u32>(expected_target.size());
+            CHECK_EQ(conn->recv_buf.data()[target_end], static_cast<u8>(' '));
+            HttpParser exact_parser;
+            ParsedRequest exact_request;
+            exact_parser.reset();
+            REQUIRE_EQ(
+                exact_parser.parse(conn->recv_buf.data(), conn->recv_buf.len(), &exact_request),
+                ParseStatus::Complete);
+            CHECK(exact_request.path.eq(
+                {expected_target.data(), static_cast<u32>(expected_target.size())}));
+            CHECK_EQ(exact_parser.header_end, capacity);
+            CHECK_EQ(conn->req_header_end, capacity);
+            CHECK_EQ(conn->req_initial_send_len, capacity);
+            CHECK_EQ(conn->checked_raw_request_target().state,
+                     RawRequestTargetWitnessState::Neutral);
+            CHECK_FALSE(conn->target_transform_recorded);
+            CHECK_EQ(conn->target_transform_id, 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            CHECK_EQ(loop.backend.op_count, 0u);
+            loop.free_conn(*conn);
+            continue;
+        }
+
+        CHECK_FALSE(materialized);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(conn->req_header_end, before_header_end);
+        CHECK_EQ(conn->req_initial_send_len, before_send_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.op_count, 0u);
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.free_conn(*conn);
+    }
+}
+
 TEST(target_transform, h1_materialization_rejects_atomically_outside_clean_domain) {
     SmallLoop loop;
     loop.setup();
