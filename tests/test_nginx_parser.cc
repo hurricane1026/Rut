@@ -325,6 +325,220 @@ TEST(nginx_parser, models_exact_no_content_return_in_either_order_with_source_pr
     check(exact_first_multiline, sizeof(exact_first_multiline) - 1u, 9u, 3u);
 }
 
+TEST(nginx_parser, models_bounded_exact_no_content_path_in_either_order) {
+    const char root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /healthz { return 204; }\n"
+        "}\n";
+    const char exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /healthz { return 204; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+
+    const auto check = [&](const char* source, u32 len, u32 exact_line) {
+        const auto parsed = nginx::parse({source, len});
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        const auto& location = server.exact_no_content_return;
+        const auto& response = location.response;
+        const char* exact_start = strstr(source, "location = /healthz");
+        REQUIRE(exact_start != nullptr);
+        const char* exact_path = strstr(exact_start, "/healthz");
+        const char* exact_end = strchr(exact_start, '}');
+        const char* return_start = strstr(exact_start, "return 204");
+        REQUIRE(return_start != nullptr);
+        const char* status = strstr(return_start, "204");
+        const char* return_end = strchr(return_start, ';');
+        const char* root_start = strstr(source, "location / {");
+        REQUIRE(root_start != nullptr);
+        const char* root_path = strchr(root_start, '/');
+        REQUIRE(exact_path != nullptr);
+        REQUIRE(exact_end != nullptr);
+        REQUIRE(status != nullptr);
+        REQUIRE(return_end != nullptr);
+        REQUIRE(root_path != nullptr);
+        const auto offset = [&](const char* ptr) { return static_cast<u32>(ptr - source); };
+        const auto column = [&](const char* ptr) {
+            const char* line_start = ptr;
+            while (line_start != source && line_start[-1] != '\n') --line_start;
+            return static_cast<u32>(ptr - line_start + 1);
+        };
+
+        REQUIRE(location.present);
+        CHECK(location.path.eq(lit_str("/healthz")));
+        CHECK_EQ(location.path.ptr, exact_path);
+        CHECK_EQ(location.path_span.start, offset(exact_path));
+        CHECK_EQ(location.path_span.end, offset(exact_path + 8));
+        CHECK_EQ(location.path_span.line, exact_line);
+        CHECK_EQ(location.path_span.col, column(exact_path));
+        CHECK_EQ(location.span.start, offset(exact_start));
+        CHECK_EQ(location.span.end, offset(exact_end + 1));
+        CHECK_EQ(location.span.line, exact_line);
+        CHECK_EQ(location.span.col, column(exact_start));
+        CHECK_EQ(response.status, 204u);
+        CHECK_EQ(response.status_span.start, offset(status));
+        CHECK_EQ(response.status_span.end, offset(status + 3));
+        CHECK_EQ(response.status_span.line, exact_line);
+        CHECK_EQ(response.status_span.col, column(status));
+        CHECK_EQ(memcmp(source + response.status_span.start, "204", 3), 0);
+        CHECK_EQ(response.span.start, offset(return_start));
+        CHECK_EQ(response.span.end, offset(return_end + 1));
+        CHECK_EQ(response.span.line, exact_line);
+        CHECK_EQ(response.span.col, column(return_start));
+
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(source);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(location.path.ptr) - location.path_span.start,
+                 source_base);
+        CHECK_EQ(
+            reinterpret_cast<uintptr_t>(server.location.path.ptr) - server.location.path_span.start,
+            source_base);
+        CHECK_EQ(server.location.path.ptr, root_path);
+        CHECK_FALSE(server.exact_local_return.present);
+        CHECK_FALSE(server.exact_absolute_redirect.present);
+    };
+
+    check(root_first, sizeof(root_first) - 1u, 4u);
+    check(exact_first, sizeof(exact_first) - 1u, 3u);
+}
+
+TEST(nginx_parser, accepts_bounded_clean_exact_no_content_path_grammar) {
+    const char* paths[] = {
+        "/healthz",
+        "/healthz/",
+        "/api/v1",
+        "/A-Z_a.z~9/more_2/",
+        "/old/",
+        "/static",
+    };
+    for (const char* path : paths) {
+        char source[384]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen 8080; location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } location = %s { return 204; } }",
+                                 path);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE(parsed);
+        const auto& action = parsed.value().exact_no_content_return;
+        REQUIRE(action.present);
+        const Str expected{path, static_cast<u32>(strlen(path))};
+        CHECK(action.path.eq(expected));
+        CHECK_EQ(action.path.ptr, source + action.path_span.start);
+        CHECK_EQ(action.path_span.end - action.path_span.start, action.path.len);
+        CHECK_EQ(action.response.status, 204u);
+        CHECK_FALSE(parsed.value().exact_local_return.present);
+        CHECK_FALSE(parsed.value().exact_absolute_redirect.present);
+    }
+}
+
+TEST(nginx_parser, enforces_bounded_clean_exact_no_content_path_capacity) {
+    char maximum[nginx::kMaxExactLocalReturnPathLen + 1u]{};
+    maximum[0] = '/';
+    memset(maximum + 1, 'a', nginx::kMaxExactLocalReturnPathLen - 1u);
+    maximum[nginx::kMaxExactLocalReturnPathLen] = '\0';
+    char source[512]{};
+    int len = snprintf(source,
+                       sizeof(source),
+                       "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                       "location = %s { return 204; } }",
+                       maximum);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto accepted = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE(accepted);
+    CHECK_EQ(accepted.value().exact_no_content_return.path.len, nginx::kMaxExactLocalReturnPathLen);
+    CHECK_EQ(accepted.value().exact_no_content_return.path.ptr,
+             source + accepted.value().exact_no_content_return.path_span.start);
+
+    char oversized[nginx::kMaxExactLocalReturnPathLen + 2u]{};
+    oversized[0] = '/';
+    memset(oversized + 1, 'a', nginx::kMaxExactLocalReturnPathLen);
+    oversized[nginx::kMaxExactLocalReturnPathLen + 1u] = '\0';
+    len = snprintf(source,
+                   sizeof(source),
+                   "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+                   "location = %s { return 204; } }",
+                   oversized);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto rejected = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(
+        lit_str("exact local return path is outside the bounded clean profile")));
+    const char* path = strstr(source, oversized);
+    REQUIRE(path != nullptr);
+    CHECK_EQ(rejected.error().span.start, static_cast<u32>(path - source));
+    CHECK_EQ(rejected.error().span.end - rejected.error().span.start,
+             nginx::kMaxExactLocalReturnPathLen + 1u);
+}
+
+TEST(nginx_parser, rejects_excluded_exact_no_content_path_shapes_and_reserved_action) {
+    struct Vector {
+        const char* path;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"/", lit_str("exact local return path is outside the bounded clean profile")},
+        {"healthz", lit_str("exact local return path is outside the bounded clean profile")},
+        {"//healthz", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/healthz//", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/a//b", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/.", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/..", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/a/./b", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/a/../b", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health%7A", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health?x=1", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health$uri", lit_str("variables are unsupported")},
+        {"\"/healthz\"", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health\\z", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health:z", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health*z", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/health\x01z", lit_str("exact local return path is outside the bounded clean profile")},
+        {"/h\xc3\xa9", lit_str("exact local return path is outside the bounded clean profile")},
+    };
+    for (const auto& vector : vectors) {
+        char source[384]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen 8080; location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } location = %s { return 204; } }",
+                                 vector.path);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE_FALSE(parsed);
+        CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(parsed.error().detail.eq(vector.detail));
+        const char* exact = strstr(source, "location = ");
+        REQUIRE(exact != nullptr);
+        const char* path = exact + strlen("location = ");
+        CHECK_EQ(parsed.error().span.start, static_cast<u32>(path - source));
+        CHECK_EQ(parsed.error().span.end - parsed.error().span.start,
+                 static_cast<u32>(strlen(vector.path)));
+    }
+
+    const char reserved[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 204; } }";
+    const auto reserved_result = nginx::parse({reserved, sizeof(reserved) - 1u});
+    REQUIRE_FALSE(reserved_result);
+    CHECK_EQ(reserved_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(
+        reserved_result.error().detail.eq(lit_str("only redirect status 301 or 302 is supported")));
+    const char* status = strstr(reserved, "204");
+    REQUIRE(status != nullptr);
+    CHECK_EQ(reserved_result.error().span.start, static_cast<u32>(status - reserved));
+    CHECK_EQ(reserved_result.error().span.end, static_cast<u32>(status - reserved + 3));
+}
+
 TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
     const char root_first[] =
         "server {\n"
@@ -2321,12 +2535,6 @@ TEST(nginx_parser, rejects_unbounded_or_malformed_exact_no_content_return_shapes
          FrontendError::UnsupportedSyntax,
          lit_str("return 204 status adjacent comment is unsupported")},
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
-         "/healthz { return 204; } }",
-         "/healthz",
-         8,
-         FrontendError::UnsupportedSyntax,
-         lit_str("exact no-content return requires literal /static path")},
-        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/$static { return 204; } }",
          "/$static",
          8,
@@ -2813,6 +3021,40 @@ static nginx::Server api_server() {
     server.location.proxy_pass.uri = {kProxyUri, 1};
     server.location.proxy_pass.uri_span = Span{53, 54, 1, 54};
     return server;
+}
+
+TEST(nginx_converter, rejects_newly_modeled_no_content_paths_before_emission) {
+    struct Vector {
+        const char* path;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"/healthz", lit_str("invalid bounded exact no-content return path model")},
+        {"/status", lit_str("invalid exact no-content return location path")},
+    };
+    for (const auto& vector : vectors) {
+        char source[256]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen 8080; location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } location = %s { return 204; } }",
+                                 vector.path);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE(parsed);
+        REQUIRE(parsed.value().exact_no_content_return.present);
+        CHECK(parsed.value().exact_no_content_return.path.eq(
+            {vector.path, static_cast<u32>(strlen(vector.path))}));
+
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(vector.detail));
+        CHECK_EQ(lowered.error().span.start,
+                 parsed.value().exact_no_content_return.path_span.start);
+        CHECK_EQ(lowered.error().span.end, parsed.value().exact_no_content_return.path_span.end);
+    }
 }
 
 TEST(nginx_converter, validates_exact_no_content_return_before_dynamic_reads) {

@@ -81,9 +81,9 @@ struct ExactLocalReturnLocation {
 // A distinct bounded nginx semantic action for literal `return 204;`.  It is
 // intentionally not represented as an empty-body LocalReturn: ordinary RUT
 // status-only responses have different observable framing.  The accepted
-// nginx slice is exactly `location = /static`; lowering emits the complete
-// public strict no-content policy rather than observably different ordinary
-// status-only response framing.
+// location uses the bounded clean exact-path profile above; lowering decides
+// which modeled paths it can faithfully emit as the public strict no-content
+// policy.
 struct NoContentReturn {
     u16 status = 0;
     Span status_span{};

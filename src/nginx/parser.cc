@@ -483,10 +483,6 @@ private:
                     auto response = parse_local_return();
                     if (!response) return core::make_unexpected(response.error());
                     if (response.value().no_content) {
-                        if (!eq(path.text, "/static", 7))
-                            return unsupported(
-                                path.span,
-                                lit_str("exact no-content return requires literal /static path"));
                         no_content.present = true;
                         no_content.path = path.text;
                         no_content.path_span = path.span;
