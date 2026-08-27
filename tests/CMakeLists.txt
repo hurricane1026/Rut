@@ -535,6 +535,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue341_zero_suffix_static_query_proxy_oracle
+        COMMAND test_nginx_differential --pinned-nginx-zero-suffix-static-query-proxy-uri-oracle
+    )
+    set_tests_properties(test_nginx_issue341_zero_suffix_static_query_proxy_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_static_query_proxy_uri_differential
         COMMAND test_nginx_differential --converter-static-query-proxy-uri-differential
                 $<TARGET_FILE:rut>
