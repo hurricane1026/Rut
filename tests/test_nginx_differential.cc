@@ -11436,6 +11436,890 @@ static bool run_converter_trailing_slash_no_content_differential(
     return validate_trailing_slash_no_content_four_way(observations, sources, ports, error);
 }
 
+static std::string make_max_boundary_no_content_fragment(u16 frontend_port,
+                                                          u16 backend_port,
+                                                          bool trailing) {
+    const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
+    const std::string exact_location = "  location = " + key + " { return 204; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (trailing ? root_location + exact_location : exact_location + root_location) + "}\n";
+}
+
+static bool validate_max_boundary_generated_source(const std::string& source,
+                                                    u16 frontend_port,
+                                                    u16 backend_port,
+                                                    bool trailing,
+                                                    std::string& error) {
+    const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
+    const std::string other_key = trailing ? max_boundary_raw_key() : max_boundary_trailing_key();
+    const std::string exact_tuple =
+        "route exact slash_normalized GET \"" + key +
+        "\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    const std::string backend =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    if (count_text(source, exact_tuple) != 1u ||
+        count_text(source, "route exact slash_normalized GET \"" + key + "\"") != 1u ||
+        count_text(source, "route exact slash_normalized GET") != 1u ||
+        count_text(source, "route exact ") != 1u || count_text(source, "route exact GET") != 0u ||
+        count_text(source, other_key) != 0u || count_text(source, "route HEAD \"/\" {") != 1u ||
+        count_text(source, "route GET \"/\" {") != 1u ||
+        count_text(source, "route \"/\" {") != 1u ||
+        count_text(source, "return forward(nginx_upstream") != 3u ||
+        count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
+        source.find("?x=1") != std::string::npos || source.find("Host") != std::string::npos ||
+        source.find("max-boundary.example") != std::string::npos ||
+        source.find("runtime") != std::string::npos || source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos || source.find("propagat") != std::string::npos ||
+        source.find("NoContent204") != std::string::npos ||
+        source.find("strict_local_response") != std::string::npos ||
+        source.find("profile") != std::string::npos || source.find("return 204") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos) {
+        error = "#330 Stage 4 generated source was not one exact maximum-boundary public "
+                "SlashNormalized NoContent204 tuple plus the canonical root forwards";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_max_boundary_rut_access_log(const std::string& contents,
+                                              const MaxBoundaryNoContentObservation& observation,
+                                              const std::vector<size_t>& request_sizes,
+                                              std::string& error) {
+    const size_t vector_count = observation.trailing ? 5u : 6u;
+    std::vector<std::string> records;
+    if (observation.targets.size() != vector_count || request_sizes.size() != vector_count ||
+        !split_exact_complete_log(
+            contents, vector_count, "converter-generated #330 Stage 4 access log", records, error))
+        return false;
+    for (size_t i = 0u; i < vector_count; i++) {
+        std::vector<std::string> fields;
+        const size_t expected_fields = i < 3u ? 9u : 11u;
+        const size_t expected_status = i < 3u ? 204u : 200u;
+        const size_t expected_response = i < 3u ? 105u : 118u;
+        if (!split_space_fields(records[i], fields) || fields.size() != expected_fields ||
+            !exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
+            fields[2] != observation.targets[i] || fields[3] != std::to_string(expected_status) ||
+            !decimal_field_equals(fields[3], expected_status) || !exact_log_duration(fields[4]) ||
+            fields[5] != std::to_string(request_sizes[i]) ||
+            !decimal_field_equals(fields[5], request_sizes[i]) ||
+            fields[6] != std::to_string(expected_response) ||
+            !decimal_field_equals(fields[6], expected_response) || fields[7] != "127.0.0.1" ||
+            (i < 3u && fields[8] != "s=0") ||
+            (i >= 3u && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) ||
+                         fields[10] != "s=0"))) {
+            error = "converter-generated #330 Stage 4 access record " +
+                    std::to_string(i + 1u) +
+                    " lost raw target/order/status/size/upstream outcome: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_max_boundary_generated_parser_self_checks(std::string& error) {
+    const auto replace_once = [](std::string value,
+                                 const std::string& from,
+                                 const std::string& to) {
+        const size_t offset = value.find(from);
+        if (offset == std::string::npos) return std::string{};
+        value.replace(offset, from.size(), to);
+        return value;
+    };
+    for (const bool trailing : {false, true}) {
+        MaxBoundaryNoContentObservation observation;
+        observation.trailing = trailing;
+        observation.key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
+        observation.targets = max_boundary_targets(trailing);
+        const size_t vector_count = trailing ? 5u : 6u;
+        std::vector<size_t> sizes(vector_count);
+        std::string access;
+        for (size_t i = 0u; i < vector_count; i++) {
+            sizes[i] = 70u + observation.targets[i].size();
+            access += "2026-08-26T21:13:05.248Z GET " + observation.targets[i] + " " +
+                      (i < 3u ? "204" : "200") + " 361us " + std::to_string(sizes[i]) + " " +
+                      (i < 3u ? "105" : "118") + " 127.0.0.1" +
+                      (i < 3u ? " s=0\n" : " nginx_upstream 243us s=0\n");
+        }
+        const auto rejects_access = [&](const std::string& value) {
+            std::string detail;
+            return !parse_max_boundary_rut_access_log(value, observation, sizes, detail);
+        };
+        const size_t first = access.find('\n');
+        const size_t second = access.find('\n', first + 1u);
+        std::string swapped = access;
+        swapped.replace(0u,
+                        second + 1u,
+                        access.substr(first + 1u, second - first) +
+                            access.substr(0u, first + 1u));
+        if (!parse_max_boundary_rut_access_log(access, observation, sizes, error) ||
+            !rejects_access(access + access.substr(0u, first + 1u)) ||
+            !rejects_access(access.substr(0u, access.size() - 1u)) ||
+            !rejects_access(swapped) || !rejects_access(replace_once(access, " 204 ", " 200 ")) ||
+            !rejects_access(replace_once(access, " 105 ", " 106 ")) ||
+            !rejects_access(replace_once(access,
+                                         " " + observation.targets[0] + " ",
+                                         " " + observation.targets.back() + " ")) ||
+            !rejects_access(replace_once(
+                access,
+                " " + std::to_string(sizes[0]) + " 105 ",
+                " 999999999999999999999999999999999 105 ")) ||
+            !rejects_access(replace_once(access, " 204 ", " 0204 ")) ||
+            !rejects_access(replace_once(access, " nginx_upstream ", " other_upstream ")) ||
+            !rejects_access(replace_once(
+                access, " nginx_upstream 243us ", " nginx_upstream not-a-duration ")) ||
+            !rejects_access(replace_once(access, " s=0\n", " extra s=0\n")) ||
+            !rejects_access(replace_once(access, " s=0\n", " s=1\n"))) {
+            error = "#330 Stage 4 generated access parser mutation self-check failed";
+            return false;
+        }
+
+        std::string fragment =
+            make_max_boundary_no_content_fragment(54330u, 54331u, trailing);
+        const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+        if (!parsed) {
+            error = "#330 Stage 4 source self-check fixture did not parse";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            error = "#330 Stage 4 source self-check fixture did not lower";
+            return false;
+        }
+        const rut::Str view = lowered.value().view();
+        const std::string canonical(view.ptr, view.len);
+        const auto rejects_source = [&](std::string value) {
+            std::string detail;
+            return !validate_max_boundary_generated_source(
+                value, 54330u, 54331u, trailing, detail);
+        };
+        const std::string selector =
+            "route exact slash_normalized GET \"" + observation.key + "\"";
+        if (!validate_max_boundary_generated_source(
+                canonical, 54330u, 54331u, trailing, error) ||
+            !rejects_source(replace_once(canonical, selector, "route exact GET \"" +
+                                                                  observation.key + "\"")) ||
+            !rejects_source(canonical + "route exact GET \"" + observation.key +
+                            "?x=1\" { return response() }\n") ||
+            !rejects_source(canonical + "if Host == \"max-boundary.example\" {}\n") ||
+            !rejects_source(replace_once(canonical, "status: 204", "status: 200")) ||
+            !rejects_source(replace_once(canonical, observation.key,
+                                         trailing ? max_boundary_raw_key()
+                                                  : max_boundary_trailing_key()))) {
+            error = "#330 Stage 4 generated source mutation self-check failed";
+            return false;
+        }
+        std::string normalized = canonical;
+        if (!canonicalize_unique_port(normalized, "listen :54330", "listen :FRONTEND") ||
+            !canonicalize_unique_port(
+                normalized, "127.0.0.1:54331", "127.0.0.1:BACKEND")) {
+            error = "#330 Stage 4 source port normalization valid self-check failed";
+            return false;
+        }
+        std::string missing = canonical;
+        missing.erase(missing.find("listen :54330"), strlen("listen :54330"));
+        std::string duplicate = canonical + "listen :54330\n";
+        if (canonicalize_unique_port(missing, "listen :54330", "listen :FRONTEND") ||
+            canonicalize_unique_port(duplicate, "listen :54330", "listen :FRONTEND")) {
+            error = "#330 Stage 4 missing/duplicate port normalization mutation was accepted";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool capture_generated_max_boundary_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool trailing,
+    MaxBoundaryNoContentObservation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    const std::string key = trailing ? max_boundary_trailing_key() : max_boundary_raw_key();
+    const std::vector<std::string> targets = max_boundary_targets(trailing);
+    const size_t vector_count = trailing ? 5u : 6u;
+    const size_t fallback_count = trailing ? 2u : 3u;
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        key.size() != 62u || targets.size() != vector_count || frontend_reservation == nullptr ||
+        backend_reservation == nullptr || *frontend_reservation < 0 || *backend_reservation < 0) {
+        error = "converter-generated #330 Stage 4 requires an executable absolute RUT path, "
+                "exact maximum-boundary vectors, and held port reservations";
+        return false;
+    }
+    std::string fragment =
+        make_max_boundary_no_content_fragment(frontend_port, backend_port, trailing);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#330 Stage 4 accepted nginx fragment did not traverse the independent parser";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_no_content_return;
+    const auto& response = exact.response;
+    const size_t root_location = fragment.find("location / {");
+    const size_t root_path = fragment.find('/', root_location);
+    const std::string exact_marker = "location = " + key;
+    const size_t exact_location = fragment.find(exact_marker);
+    const size_t exact_path = fragment.find(key, exact_location);
+    const size_t return_offset = fragment.find("return", exact_location);
+    const size_t status_offset = fragment.find("204", return_offset);
+    const size_t semicolon = fragment.find(';', status_offset);
+    const size_t exact_end = fragment.find('}', semicolon);
+    const uintptr_t source_base = reinterpret_cast<uintptr_t>(fragment.data());
+    const auto same_source = [&](rut::Str value, rut::Span span) {
+        return value.ptr != nullptr && span.end >= span.start && span.end - span.start == value.len &&
+               reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+    };
+    const rut::Str expected_path{key.data(), static_cast<u32>(key.size())};
+    if (root_location == std::string::npos || root_path == std::string::npos ||
+        exact_location == std::string::npos || exact_path == std::string::npos ||
+        return_offset == std::string::npos || status_offset == std::string::npos ||
+        semicolon == std::string::npos || exact_end == std::string::npos ||
+        server.span.start != 0u || server.span.end != fragment.size() - 1u ||
+        server.listen.port != frontend_port || !root.path.eq(rut::lit_str("/")) ||
+        root.path.ptr != fragment.data() + root_path || !same_source(root.path, root.path_span) ||
+        proxy.has_uri || proxy.address[0] != 127u || proxy.address[1] != 0u ||
+        proxy.address[2] != 0u || proxy.address[3] != 1u || proxy.port != backend_port ||
+        !exact.present || !exact.path.eq(expected_path) ||
+        exact.path.ptr != fragment.data() + exact_path || !same_source(exact.path, exact.path_span) ||
+        exact.span.start != exact_location || exact.span.end != exact_end + 1u ||
+        response.status != 204u || response.status_span.start != status_offset ||
+        response.status_span.end != status_offset + 3u || response.span.start != return_offset ||
+        response.span.end != semicolon + 1u ||
+        memcmp(fragment.data() + response.status_span.start, "204", 3u) != 0 ||
+        server.exact_local_return.present || server.exact_absolute_redirect.present ||
+        exact.span.start >= exact.path_span.start || exact.path_span.end > response.span.start ||
+        response.span.end >= exact.span.end || root.span.start != root_location) {
+        error = "#330 Stage 4 fragment lost borrowed 62-byte path/status provenance or root role";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#330 Stage 4 genuine bounded model failed public ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str output = lowered.value().view();
+    generated_source.assign(output.ptr, output.len);
+    if (!validate_max_boundary_generated_source(
+            generated_source, frontend_port, backend_port, trailing, error) ||
+        !write_file(temp.source, output.ptr, output.len))
+        return false;
+    std::fill(fragment.begin(), fragment.end(), '\0');
+    if (!std::all_of(fragment.begin(), fragment.end(), [](char byte) { return byte == '\0'; })) {
+        error = "#330 Stage 4 failed to destroy the borrowed nginx source after lowering";
+        return false;
+    }
+
+    observation = MaxBoundaryNoContentObservation{};
+    observation.trailing = trailing;
+    observation.key = key;
+    observation.targets = targets;
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity =
+        std::string(rut_path) + " " + temp.source + " listen:" + std::to_string(frontend_port);
+    observation.wires.resize(vector_count);
+    std::vector<std::string> requests(vector_count);
+    std::vector<size_t> request_sizes(vector_count);
+    for (size_t i = 0u; i < vector_count; i++) {
+        requests[i] = "GET " + targets[i] +
+                      " HTTP/1.1\r\nHost: max-boundary.example\r\nConnection: close\r\n\r\n";
+        request_sizes[i] = requests[i].size();
+        const size_t header = requests[i].find("\r\n\r\n");
+        if (requests[i].rfind("GET " + targets[i] + " HTTP/1.1\r\n", 0u) != 0u ||
+            requests[i].find('#') != std::string::npos ||
+            requests[i].find("\r\nContent-Length:") != std::string::npos ||
+            requests[i].find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests[i].find("\r\nTE:") != std::string::npos ||
+            requests[i].find("\r\nExpect:") != std::string::npos ||
+            requests[i].find("\r\nUpgrade:") != std::string::npos ||
+            header == std::string::npos || header + 4u != requests[i].size()) {
+            error = "#330 Stage 4 generated request escaped the fresh bodyless H1.1 domain";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* value = nullptr;
+        ~RecorderGuard() {
+            if (value != nullptr) value->stop();
+        }
+    };
+    ChildGuard runtime;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "failed to start converter-generated RUT for #330 Stage 4";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#330 Stage 4 RUT exited before exact public readiness evidence";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#330 Stage 4 RUT lacked load/io_uring/listener readiness evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "destroyed-after-330-stage4-public-load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "#330 Stage 4 failed to overwrite generated source after public load";
+        return false;
+    }
+    std::string destroyed;
+    if (!read_exact_return204_log(
+            temp.source, "#330 Stage 4 destroyed generated source", destroyed, error) ||
+        destroyed != kDestroyed) {
+        error = "#330 Stage 4 generated source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto wait_live = [&](Recorder& recorder, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child) || !recorder.running.load(std::memory_order_acquire) ||
+                recorder.listener_failed.load(std::memory_order_acquire)) {
+                error = std::string("#330 Stage 4 RUT/recorder failed before ") + phase +
+                        " readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#330 Stage 4 recorder readiness timed out: ") + phase;
+        return false;
+    };
+    const auto observe = [&](Recorder& recorder,
+                             u32 expected,
+                             const char* phase,
+                             std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(runtime.child) || !recorder_live(recorder) ||
+                recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error = std::string("#330 Stage 4 unexpected process/upstream state during ") +
+                        phase;
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto request = [&](size_t index, const char* expected) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[index].data(), requests[index].size()) ||
+            !(index < 3u ? read_head_response(client.fd, observation.wires[index], detail)
+                         : read_response(client.fd, observation.wires[index], detail)) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(observation.wires[index], expected, detail)) {
+            error = "#330 Stage 4 generated vector " + targets[index] +
+                    " exact response/EOF failed: " + detail;
+            return false;
+        }
+        if (poll_child(runtime.child)) {
+            error = "#330 Stage 4 generated RUT exited after vector " + targets[index] + " (" +
+                    child_status_description(runtime.child) + ")";
+            return false;
+        }
+        return true;
+    };
+
+    Recorder zero;
+    RecorderGuard zero_guard{&zero};
+    zero.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!zero.setup(backend_port) || !wait_live(zero, "local") ||
+        !observe(zero, 0u, "pre-local zero window", std::chrono::milliseconds(250))) {
+        if (error.empty())
+            error = "#330 Stage 4 local recorder could not bind the reserved backend port";
+        return false;
+    }
+    for (size_t i = 0u; i < 3u; i++) {
+        if (!request(i, kExactLocalReturn204ResponseNormalized) ||
+            !observe(zero, 0u, "local vector zero window", std::chrono::milliseconds(250)))
+            return false;
+        const std::string text(observation.wires[i].begin(), observation.wires[i].end());
+        if (observation.wires[i].size() != 105u ||
+            header_end(observation.wires[i]) != observation.wires[i].size() ||
+            text.find("\r\nContent-Type:") != std::string::npos ||
+            text.find("\r\nContent-Length:") != std::string::npos ||
+            text.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            text.find("\r\nLocation:") != std::string::npos) {
+            error = "#330 Stage 4 generated strict 204 gained framing/body/tail/redirect";
+            return false;
+        }
+    }
+    if (!observe(zero, 0u, "post-local zero window", std::chrono::milliseconds(500))) return false;
+    zero.stop();
+    zero_guard.value = nullptr;
+    observation.local_accepts = zero.accepted.load(std::memory_order_acquire);
+    observation.local_requests = zero.requests.load(std::memory_order_acquire);
+    observation.local_sends = zero.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = zero.history;
+    if (zero.thread_alive.load(std::memory_order_acquire) ||
+        zero.listener_failed.load(std::memory_order_acquire) || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        zero.response_send_succeeded.load(std::memory_order_acquire) || !zero.history.empty() ||
+        !zero.request.empty()) {
+        error = "#330 Stage 4 local recorder did not settle at exact zero";
+        return false;
+    }
+
+    Recorder fallback;
+    RecorderGuard fallback_guard{&fallback};
+    fallback.observe_extra_requests_until_stop = true;
+    if (!fallback.setup(backend_port,
+                        static_cast<u32>(fallback_count),
+                        kBackendResponse,
+                        sizeof(kBackendResponse) - 1u) ||
+        !wait_live(fallback, "fallback") ||
+        !observe(fallback, 0u, "pre-fallback zero window", std::chrono::milliseconds(100))) {
+        if (error.empty()) error = "#330 Stage 4 fallback recorder failed readiness";
+        return false;
+    }
+    for (size_t i = 3u; i < vector_count; i++) {
+        if (!request(i, kSuccessResponseNormalized)) return false;
+        const u32 expected = static_cast<u32>(i - 2u);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const u32 accepts = fallback.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = fallback.requests.load(std::memory_order_acquire);
+            const u32 sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+            if (poll_child(runtime.child) || !recorder_live(fallback) || accepts > expected ||
+                requests_seen > expected || sends > expected) {
+                error = "#330 Stage 4 generated fallback observed retry/extra request";
+                return false;
+            }
+            if (accepts == expected && requests_seen == expected && sends == expected) break;
+            usleep(1000);
+        }
+        if (fallback.accepted.load(std::memory_order_acquire) != expected ||
+            fallback.requests.load(std::memory_order_acquire) != expected ||
+            fallback.response_send_all_calls.load(std::memory_order_acquire) != expected ||
+            !observe(fallback,
+                     expected,
+                     "ordered fallback count",
+                     std::chrono::milliseconds(100))) {
+            error = "#330 Stage 4 fallback episode count did not settle exactly";
+            return false;
+        }
+    }
+    if (!observe(fallback,
+                 static_cast<u32>(fallback_count),
+                 "no-additional-fallback window",
+                 std::chrono::milliseconds(500)) ||
+        !stop_child(runtime.child)) {
+        error = "#330 Stage 4 generated RUT did not survive controlled shutdown";
+        return false;
+    }
+    fallback.stop();
+    fallback_guard.value = nullptr;
+    observation.forward_accepts = fallback.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = fallback.requests.load(std::memory_order_acquire);
+    observation.forward_sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = fallback.history;
+    if (fallback.thread_alive.load(std::memory_order_acquire) ||
+        fallback.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != fallback_count ||
+        observation.forward_requests != fallback_count || observation.forward_sends != fallback_count ||
+        !fallback.response_send_succeeded.load() || !fallback.response_clean_shutdown.load() ||
+        !fallback.response_connection_closed.load() ||
+        observation.forward_history.size() != fallback_count) {
+        error = "#330 Stage 4 fallback recorder lifecycle/count was incomplete";
+        return false;
+    }
+    for (size_t i = 3u; i < vector_count; i++)
+        request_sizes[i] = observation.forward_history[i - 3u].size();
+    for (size_t i = 0u; i < vector_count; i++) observation.access_records[i] = 1u;
+    if (!validate_max_boundary_observation(observation, backend_port, error)) return false;
+
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(temp.rut_access_log,
+                                  "converter-generated #330 Stage 4 access log",
+                                  access_contents,
+                                  error) ||
+        !parse_max_boundary_rut_access_log(
+            access_contents, observation, request_sizes, error) ||
+        !read_exact_return204_log(temp.rut_log,
+                                  "converter-generated #330 Stage 4 runtime log",
+                                  runtime_contents,
+                                  error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
+        return false;
+    return true;
+}
+
+static bool canonicalize_max_boundary_source(std::string& source,
+                                             u16 frontend_port,
+                                             u16 backend_port,
+                                             const std::string& key) {
+    return canonicalize_unique_port(
+               source, "listen :" + std::to_string(frontend_port), "listen :FRONTEND") &&
+           canonicalize_unique_port(source,
+                                    "127.0.0.1:" + std::to_string(backend_port),
+                                    "127.0.0.1:BACKEND") &&
+           canonicalize_unique_port(source, key, "MAX_BOUNDARY_KEY");
+}
+
+static bool validate_max_boundary_four_way(const MaxBoundaryNoContentObservation observations[4],
+                                           const std::string generated_sources[2],
+                                           const u16 ports[8],
+                                           std::string& error) {
+    for (size_t i = 0u; i < 8u; i++) {
+        if (ports[i] == 0u) {
+            error = "#330 Stage 4 four-way validator received a zero dynamic port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#330 Stage 4 four-way validator received duplicate dynamic ports";
+                return false;
+            }
+        }
+    }
+    if (observations[0].trailing || observations[1].trailing || !observations[2].trailing ||
+        !observations[3].trailing) {
+        error = "#330 Stage 4 profile identities crossed non_trailing/trailing sides";
+        return false;
+    }
+    size_t total_wires = 0u;
+    u32 total_access = 0u;
+    std::vector<std::string> resources;
+    resources.reserve(20u);
+    for (size_t side = 0u; side < 4u; side++) {
+        if (!validate_max_boundary_observation(observations[side], ports[side * 2u + 1u], error))
+            return false;
+        total_wires += observations[side].wires.size();
+        for (u32 count : observations[side].access_records) total_access += count;
+        resources.insert(resources.end(),
+                         {observations[side].temp_path,
+                          observations[side].config_path,
+                          observations[side].log_path,
+                          observations[side].access_path,
+                          observations[side].process_identity});
+        if (observations[side].wires.data() == nullptr) {
+            error = "#330 Stage 4 one side lacked owned wire observation storage";
+            return false;
+        }
+        for (size_t other = side + 1u; other < 4u; other++) {
+            if (observations[side].wires.data() == observations[other].wires.data()) {
+                error = "#330 Stage 4 two sides aliased wire observation storage";
+                return false;
+            }
+        }
+    }
+    if (total_wires != 22u || total_access != 22u) {
+        error = "#330 Stage 4 did not retain exactly 22 wire/access observations";
+        return false;
+    }
+    for (size_t i = 0u; i < resources.size(); i++) {
+        if (resources[i].empty()) {
+            error = "#330 Stage 4 one resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < resources.size(); j++) {
+            if (resources[i] == resources[j]) {
+                error = "#330 Stage 4 resource/process identities were not globally isolated";
+                return false;
+            }
+        }
+    }
+    if (!validate_max_boundary_generated_source(
+            generated_sources[0], ports[2], ports[3], false, error) ||
+        !validate_max_boundary_generated_source(
+            generated_sources[1], ports[6], ports[7], true, error))
+        return false;
+    std::string canonical[2] = {generated_sources[0], generated_sources[1]};
+    if (!canonicalize_max_boundary_source(
+            canonical[0], ports[2], ports[3], max_boundary_raw_key()) ||
+        !canonicalize_max_boundary_source(
+            canonical[1], ports[6], ports[7], max_boundary_trailing_key()) ||
+        canonical[0] != canonical[1]) {
+        error = "#330 Stage 4 profile lowering differed after exact endpoint/key canonicalization";
+        return false;
+    }
+    for (const size_t profile : {0u, 2u}) {
+        const auto pinned_history = canonicalize_trailing_no_content_backend_history(
+            observations[profile].forward_history);
+        const auto generated_history = canonicalize_trailing_no_content_backend_history(
+            observations[profile + 1u].forward_history);
+        const size_t expected_count = profile == 0u ? 3u : 2u;
+        if (pinned_history.size() != expected_count || generated_history != pinned_history) {
+            error = "#330 Stage 4 pinned/generated ordered backend histories differed by profile";
+            return false;
+        }
+        for (size_t vector = 0u; vector < observations[profile].wires.size(); vector++) {
+            std::vector<char> pinned = observations[profile].wires[vector];
+            std::vector<char> generated = observations[profile + 1u].wires[vector];
+            if (!normalize_date(pinned) || !normalize_date(generated) || generated != pinned) {
+                error = "#330 Stage 4 pinned/generated Date-normalized wire mismatch at profile " +
+                        std::to_string(profile / 2u) + " vector " +
+                        std::to_string(vector + 1u);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_max_boundary_four_way_self_checks(std::string& error) {
+    u16 ports[8] = {54340u, 54341u, 54342u, 54343u, 54344u, 54345u, 54346u, 54347u};
+    MaxBoundaryNoContentObservation values[4] = {
+        make_max_boundary_self_check(false, ports[1], "stage4-pinned-non-trailing"),
+        make_max_boundary_self_check(false, ports[3], "stage4-generated-non-trailing"),
+        make_max_boundary_self_check(true, ports[5], "stage4-pinned-trailing"),
+        make_max_boundary_self_check(true, ports[7], "stage4-generated-trailing")};
+    std::string sources[2];
+    for (size_t i = 0u; i < 2u; i++) {
+        const bool trailing = i == 1u;
+        std::string fragment = make_max_boundary_no_content_fragment(
+            ports[2u + i * 4u], ports[3u + i * 4u], trailing);
+        const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+        if (!parsed) {
+            error = "#330 Stage 4 four-way self-check fragment did not parse";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            error = "#330 Stage 4 four-way self-check fragment did not lower";
+            return false;
+        }
+        const rut::Str view = lowered.value().view();
+        sources[i].assign(view.ptr, view.len);
+    }
+    if (!validate_max_boundary_four_way(values, sources, ports, error)) return false;
+    const auto rejects = [&](MaxBoundaryNoContentObservation mutated[4],
+                             std::string changed_sources[2],
+                             const char* name) {
+        std::string detail;
+        if (!validate_max_boundary_four_way(mutated, changed_sources, ports, detail)) return true;
+        error = std::string("#330 Stage 4 four-way mutation accepted: ") + name;
+        return false;
+    };
+    MaxBoundaryNoContentObservation mutated[4];
+    std::string changed[2] = {sources[0], sources[1]};
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].temp_path = mutated[0].temp_path;
+    if (!rejects(mutated, changed, "resource-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].process_identity = mutated[0].process_identity;
+    if (!rejects(mutated, changed, "process-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].wires[0][9] = '5';
+    if (!rejects(mutated, changed, "wire-status")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].wires[0].push_back('x');
+    if (!rejects(mutated, changed, "wire-tail")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].local_requests = 1u;
+    if (!rejects(mutated, changed, "local-nonzero")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[0] = mutated[1].forward_history[1];
+    if (!rejects(mutated, changed, "history-order-target")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].forward_history.push_back(mutated[3].forward_history[0]);
+    mutated[3].forward_accepts++;
+    mutated[3].forward_requests++;
+    mutated[3].forward_sends++;
+    if (!rejects(mutated, changed, "retry-history-count")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].access_records[0] = 0u;
+    if (!rejects(mutated, changed, "access-truncation")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].trailing = false;
+    if (!rejects(mutated, changed, "profile-cross-wire")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    changed[0] = sources[0];
+    const std::string selector = "route exact slash_normalized GET";
+    const size_t selector_offset = changed[0].find(selector);
+    if (selector_offset == std::string::npos) {
+        error = "#330 Stage 4 self-check could not find generated selector";
+        return false;
+    }
+    changed[0].replace(selector_offset, selector.size(), "route exact GET");
+    if (!rejects(mutated, changed, "SlashNormalized-to-Raw")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    changed[0] = sources[0];
+    changed[1] = sources[1] + "# mismatch\n";
+    if (!rejects(mutated, changed, "source-mismatch")) return false;
+    u16 changed_ports[8];
+    std::copy(std::begin(ports), std::end(ports), std::begin(changed_ports));
+    std::string detail;
+    changed_ports[7] = changed_ports[0];
+    if (validate_max_boundary_four_way(values, sources, changed_ports, detail)) {
+        error = "#330 Stage 4 duplicate-port mutation was accepted";
+        return false;
+    }
+    changed_ports[7] = ports[7];
+    changed_ports[0] = 0u;
+    if (validate_max_boundary_four_way(values, sources, changed_ports, detail)) {
+        error = "#330 Stage 4 zero-port mutation was accepted";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_max_boundary_no_content_differential(
+    const std::string& container_prefix, const char* rut_path, std::string& error) {
+    struct ReservedPorts {
+        int fds[8];
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[8]{};
+    for (size_t i = 0u; i < 8u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#330 Stage 4 could not simultaneously reserve eight unique ports";
+            return false;
+        }
+    }
+    TempDir temps[4];
+    for (TempDir& temp : temps) {
+        if (!temp.create()) {
+            error = "#330 Stage 4 could not create four independent resource trees";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (strcmp(temps[i].path, temps[j].path) == 0 ||
+                temps[i].nginx_config == temps[j].nginx_config ||
+                temps[i].source == temps[j].source || temps[i].nginx_log == temps[j].nginx_log ||
+                temps[i].rut_log == temps[j].rut_log ||
+                temps[i].nginx_access_log == temps[j].nginx_access_log ||
+                temps[i].rut_access_log == temps[j].rut_access_log) {
+                error = "#330 Stage 4 four sides shared a temp/config/source/log/access path";
+                return false;
+            }
+        }
+    }
+    MaxBoundaryNoContentObservation observations[4];
+    std::string sources[2];
+    const auto failed_side = [&](const char* side) {
+        if (error.empty()) error = std::string("#330 Stage 4 ") + side + " returned no diagnostic";
+        return false;
+    };
+    if (!capture_pinned_max_boundary_side(ports[0],
+                                          ports[1],
+                                          temps[0],
+                                          container_prefix + "-nginx-non-trailing",
+                                          false,
+                                          observations[0],
+                                          error,
+                                          &reservations.fds[0],
+                                          &reservations.fds[1]))
+        return failed_side("pinned non_trailing");
+    if (!capture_generated_max_boundary_side(ports[2],
+                                              ports[3],
+                                              temps[1],
+                                              rut_path,
+                                              false,
+                                              observations[1],
+                                              sources[0],
+                                              error,
+                                              &reservations.fds[2],
+                                              &reservations.fds[3]))
+        return failed_side("generated non_trailing");
+    if (!capture_pinned_max_boundary_side(ports[4],
+                                          ports[5],
+                                          temps[2],
+                                          container_prefix + "-nginx-trailing",
+                                          true,
+                                          observations[2],
+                                          error,
+                                          &reservations.fds[4],
+                                          &reservations.fds[5]))
+        return failed_side("pinned trailing");
+    if (!capture_generated_max_boundary_side(ports[6],
+                                              ports[7],
+                                              temps[3],
+                                              rut_path,
+                                              true,
+                                              observations[3],
+                                              sources[1],
+                                              error,
+                                              &reservations.fds[6],
+                                              &reservations.fds[7]))
+        return failed_side("generated trailing");
+    return validate_max_boundary_four_way(observations, sources, ports, error);
+}
+
 struct ExactLocalBodySpaceOracleObservation {
     std::string order;
     std::string temp_path;
@@ -21077,6 +21961,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-bounded-no-content-path-differential") == 0;
     const bool converter_trailing_slash_no_content_differential =
         argc == 3 && strcmp(argv[1], "--converter-trailing-slash-no-content-differential") == 0;
+    const bool converter_max_boundary_no_content_differential =
+        argc == 3 && strcmp(argv[1], "--converter-max-boundary-no-content-differential") == 0;
     const bool converter_normalized_exact_trailing_slash_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-normalized-exact-trailing-slash-differential") == 0;
@@ -21134,6 +22020,7 @@ int main(int argc, char** argv) {
          !converter_bounded_exact_local_path_differential &&
          !converter_bounded_no_content_path_differential &&
          !converter_trailing_slash_no_content_differential &&
+         !converter_max_boundary_no_content_differential &&
          !converter_normalized_exact_trailing_slash_differential &&
          !strict_local_response_differential && !converter_root_proxy_trace_differential &&
          !converter_api_proxy_trace_differential &&
@@ -21156,6 +22043,7 @@ int main(int argc, char** argv) {
         (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
         (converter_bounded_no_content_path_differential && argv[2][0] != '/') ||
         (converter_trailing_slash_no_content_differential && argv[2][0] != '/') ||
+        (converter_max_boundary_no_content_differential && argv[2][0] != '/') ||
         (converter_normalized_exact_trailing_slash_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_space_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_multiple_space_differential && argv[2][0] != '/') ||
@@ -21214,6 +22102,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-trailing-slash-no-content-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-max-boundary-no-content-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
@@ -21329,7 +22220,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (max_boundary_no_content_oracle) {
+    if (max_boundary_no_content_oracle || converter_max_boundary_no_content_differential) {
         std::string parser_error;
         if (!run_bounded_no_content_path_wire_self_checks(parser_error)) {
             std::cerr << "FAIL [#330 strict 204 wire self-check]: " << parser_error << "\n";
@@ -21343,11 +22234,24 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#330 observation/pair self-check]: " << parser_error << "\n";
             return 1;
         }
+        if (converter_max_boundary_no_content_differential &&
+            !run_max_boundary_generated_parser_self_checks(parser_error)) {
+            std::cerr << "FAIL [#330 Stage 4 generated source/access self-check]: "
+                      << parser_error << "\n";
+            return 1;
+        }
+        if (converter_max_boundary_no_content_differential &&
+            !run_max_boundary_four_way_self_checks(parser_error)) {
+            std::cerr << "FAIL [#330 Stage 4 four-way validator self-check]: " << parser_error
+                      << "\n";
+            return 1;
+        }
     }
     if (converter_exact_local_return204_differential ||
         converter_exact_local_return204_query_differential ||
         converter_bounded_no_content_path_differential ||
-        converter_trailing_slash_no_content_differential) {
+        converter_trailing_slash_no_content_differential ||
+        converter_max_boundary_no_content_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -22230,6 +23134,38 @@ int main(int argc, char** argv) {
                "eight reserved unique ports, isolated resources, borrowed nginx-source "
                "destruction, and generated-source ownership after public load (#329 Stage 2 "
                "bounded behavioral evidence)\n";
+        return 0;
+    }
+
+    if (converter_max_boundary_no_content_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-max-boundary-no-content-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_max_boundary_no_content_differential(
+                container_prefix, argv[2], differential_error)) {
+            std::cerr << "FAIL [#330 Stage 4 converter-generated maximum-boundary bodyless 204 "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: the accepted clean maximum-boundary exact bodyless-204 class matched "
+               "between two isolated pinned-nginx 1.29.7 sides and two genuine parser/borrowed-"
+               "model/lowerer-generated ordinary public-RUT CLI/io_uring sides. The 62-byte "
+               "non_trailing exact-first profile matched literal, query-at-index-62, and "
+               "embedded doubled-separator targets locally, then slash-extension, last-byte "
+               "neighbor, and root through exactly three ordered fallback episodes; the "
+               "62-byte trailing root-first profile matched literal, query, and full-capacity "
+               "trailing doubled-slash targets locally, then missing-slash and root through "
+               "exactly two fallbacks. All 22 fresh bodyless explicit-close H1.1 observations "
+               "proved exact Date-normalized 105/118-byte wires and EOF, raw target/order/size/"
+               "upstream access accounting, clean lifecycle logs, zero local upstream, no "
+               "retry, eight simultaneously reserved unique ports, isolated resources, "
+               "borrowed-source destruction, and post-load generated-source ownership (#330 "
+               "Stage 4 bounded evidence; excludes other normalization and protocol/location "
+               "semantics)\n";
         return 0;
     }
 

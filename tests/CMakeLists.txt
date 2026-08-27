@@ -688,6 +688,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_converter_max_boundary_no_content_differential
+        COMMAND test_nginx_differential --converter-max-boundary-no-content-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_converter_max_boundary_no_content_differential PROPERTIES
+        LABELS "integration;nginx;docker;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_normalized_exact_trailing_slash_differential
         COMMAND test_nginx_differential
                 --converter-normalized-exact-trailing-slash-differential
