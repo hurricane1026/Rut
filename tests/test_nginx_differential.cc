@@ -27975,6 +27975,7 @@ static void dump_static_query_proxy_oracle_observation(
 }
 
 struct WildcardListenOracleObservation {
+    std::string side;
     std::string order;
     std::string temp_path;
     std::string config_path;
@@ -28069,8 +28070,9 @@ static bool parse_wildcard_listen_access(const std::string& contents,
 
 static bool validate_wildcard_listen_observation(const WildcardListenOracleObservation& observation,
                                                  std::string& error) {
-    if (observation.order != "listen-first" && observation.order != "location-first") {
-        error = "#342 observation had an unknown declaration order";
+    if ((observation.side != "pinned-nginx" && observation.side != "converter-generated-rut") ||
+        (observation.order != "listen-first" && observation.order != "location-first")) {
+        error = "#342 observation had an unknown side or declaration order";
         return false;
     }
     if (observation.frontend_port == 0u || observation.backend_port == 0u ||
@@ -28095,10 +28097,13 @@ static bool validate_wildcard_listen_observation(const WildcardListenOracleObser
         error = "#342 observation upstream target/Host/Connection wire was not exact";
         return false;
     }
-    if (observation.access_record != wildcard_listen_expected_access(observation.access_scope,
-                                                                     observation.backend_port,
-                                                                     observation.wire.size())) {
-        error = "#342 observation access record was not exact";
+    if ((observation.side == "pinned-nginx" &&
+         observation.access_record != wildcard_listen_expected_access(observation.access_scope,
+                                                                      observation.backend_port,
+                                                                      observation.wire.size())) ||
+        (observation.side == "converter-generated-rut" &&
+         (observation.access_scope.empty() || observation.access_record.empty()))) {
+        error = "#342 observation access record was not exact for its side";
         return false;
     }
     return true;
@@ -28106,8 +28111,9 @@ static bool validate_wildcard_listen_observation(const WildcardListenOracleObser
 
 static bool validate_wildcard_listen_pair(const WildcardListenOracleObservation (&observations)[2],
                                           std::string& error) {
-    if (observations[0].order != "listen-first" || observations[1].order != "location-first") {
-        error = "#342 pair did not preserve both declaration orders";
+    if (observations[0].side != "pinned-nginx" || observations[1].side != "pinned-nginx" ||
+        observations[0].order != "listen-first" || observations[1].order != "location-first") {
+        error = "#342 nginx-only pair did not preserve its pinned sides and declaration orders";
         return false;
     }
     for (const auto& observation : observations)
@@ -28256,6 +28262,7 @@ static bool run_wildcard_listen_oracle_self_checks(std::string& error) {
     };
     WildcardListenOracleObservation valid[2];
     for (size_t i = 0u; i < 2u; i++) {
+        valid[i].side = "pinned-nginx";
         valid[i].order = i == 0u ? "listen-first" : "location-first";
         valid[i].temp_path = "/tmp/342-" + std::to_string(i);
         valid[i].config_path = valid[i].temp_path + "/nginx.conf";
@@ -28398,6 +28405,7 @@ static bool capture_wildcard_listen_oracle_side(u16 frontend_port,
         return false;
     }
     observation = WildcardListenOracleObservation{};
+    observation.side = "pinned-nginx";
     observation.order = listen_first ? "listen-first" : "location-first";
     observation.temp_path = temp.path;
     observation.config_path = temp.nginx_config;
@@ -28658,10 +28666,1003 @@ static bool run_pinned_wildcard_listen_oracle(const std::string& container_prefi
     return validate_wildcard_listen_pair(observations, error);
 }
 
+static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword) {
+    const std::string prefix = std::string(keyword) + " ";
+    return (source.rfind(prefix, 0u) == 0u ? 1u : 0u) + count_text(source, "\n" + prefix);
+}
+
+static bool validate_wildcard_listen_generated_source(const std::string& source,
+                                                      u16 frontend_port,
+                                                      u16 backend_port,
+                                                      std::string& error) {
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const u32 routes = wildcard_listen_source_declarations(source, "route");
+    const u32 pre_routes = wildcard_listen_source_declarations(source, "pre_route");
+    const u32 upstreams = wildcard_listen_source_declarations(source, "upstream");
+    if (source.rfind(listener, 0u) != 0u || count_text(source, listener) != 1u ||
+        count_text(source, "listen :") != 1u || count_text(source, upstream) != 1u ||
+        upstreams != 1u || pre_routes != 1u ||
+        count_text(source, kStaticQueryCanonicalTraceHook) != 1u || routes != 3u ||
+        count_text(source, "route HEAD \"/\" {\n") != 1u ||
+        count_text(source, "route GET \"/\" {\n") != 1u ||
+        count_text(source, "\nroute \"/\" {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
+        count_text(source, "            host: \"upstream\",\n") != 3u ||
+        count_text(source, "            connection: \"omit\",\n") != 3u ||
+        count_text(source,
+                   "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+                   "\"Expect\", \"Upgrade\"]\n") != 3u ||
+        count_text(source, "        response_policy: {\n") != 3u ||
+        count_text(source, "        failure_policy: {\n") != 3u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 1u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 1u ||
+        wildcard_listen_source_declarations(source, "unmatched") != 3u ||
+        count_text(source, "unmatched OPTIONS {") != 1u ||
+        count_text(source, "unmatched CONNECT {") != 1u ||
+        count_text(source, "\nunmatched {") != 1u || source.find("0.0.0.0") != std::string::npos ||
+        source.find("bind_address") != std::string::npos ||
+        source.find("local_address") != std::string::npos ||
+        source.find("req.listener") != std::string::npos ||
+        source.find("address_condition") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("route exact ") != std::string::npos ||
+        source.find("route raw ") != std::string::npos ||
+        source.find("req.host") != std::string::npos ||
+        source.find("req.headers") != std::string::npos) {
+        error =
+            "#342 generated source was not exactly the canonical ordinary port-only listener, "
+            "one upstream, TRACE pre-route and three root forward routes";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_wildcard_listen_rut_access(const std::string& contents,
+                                             WildcardListenOracleObservation& observation,
+                                             std::string& error) {
+    std::vector<std::string> records;
+    if (observation.side != "converter-generated-rut" || observation.forward_history.size() != 1u ||
+        !split_exact_complete_log(contents, 1u, "#342 generated RUT access log", records, error))
+        return false;
+    std::vector<std::string> fields;
+    if (!split_space_fields(records[0], fields) || fields.size() != 11u ||
+        !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != "/" ||
+        fields[3] != "200" || !decimal_field_equals(fields[3], 200u) ||
+        !exact_log_duration(fields[4]) ||
+        fields[5] != std::to_string(observation.forward_history[0].size()) ||
+        !decimal_field_equals(fields[5], observation.forward_history[0].size()) ||
+        fields[6] != std::to_string(observation.wire.size()) ||
+        !decimal_field_equals(fields[6], observation.wire.size()) || fields[7] != "127.0.0.1" ||
+        fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) || fields[10] != "s=0") {
+        error =
+            "#342 generated access record lost raw target/method/status/request+response size/"
+            "upstream/outcome evidence";
+        return false;
+    }
+    observation.access_record = records[0];
+    return true;
+}
+
+static bool capture_generated_wildcard_listen_side(u16 frontend_port,
+                                                   u16 backend_port,
+                                                   TempDir& temp,
+                                                   const std::string& process_identity,
+                                                   bool listen_first,
+                                                   const char* rut_path,
+                                                   WildcardListenOracleObservation& observation,
+                                                   std::string& generated_source,
+                                                   std::string& error,
+                                                   int* frontend_reservation,
+                                                   int* backend_reservation) {
+    if (frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0 || rut_path == nullptr ||
+        rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#342 generated capture requires held endpoints and an executable absolute RUT";
+        return false;
+    }
+    const std::string request(kWildcardListenRequest, sizeof(kWildcardListenRequest) - 1u);
+    if (request != "GET / HTTP/1.1\r\nHost: wildcard-listen.example\r\nConnection: close\r\n\r\n" ||
+        request.find("\r\nContent-Length:") != std::string::npos ||
+        request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request.find("\r\nTE:") != std::string::npos ||
+        request.find("\r\nExpect:") != std::string::npos ||
+        request.find("\r\nUpgrade:") != std::string::npos) {
+        error = "#342 generated request escaped the exact bodyless explicit-close GET domain";
+        return false;
+    }
+
+    observation = WildcardListenOracleObservation{};
+    observation.side = "converter-generated-rut";
+    observation.order = listen_first ? "listen-first" : "location-first";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity = process_identity;
+    observation.access_scope =
+        "rut-public-342-" + observation.order + "-" + std::to_string(frontend_port);
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+
+    std::string borrowed_fragment =
+        make_wildcard_listen_fragment(frontend_port, backend_port, listen_first);
+    if (!validate_wildcard_listen_config(
+            borrowed_fragment, frontend_port, backend_port, listen_first, error))
+        return false;
+    {
+        const auto parsed = rut::nginx::parse(
+            {borrowed_fragment.data(), static_cast<u32>(borrowed_fragment.size())});
+        if (!parsed) {
+            error = "#342 explicit wildcard fragment failed the genuine nginx parser";
+            return false;
+        }
+        const auto& server = parsed.value();
+        const std::string listen_directive =
+            "listen 0.0.0.0:" + std::to_string(frontend_port) + ";";
+        const size_t listen_offset = borrowed_fragment.find(listen_directive);
+        const size_t path_offset = borrowed_fragment.find("location /");
+        const size_t proxy_offset = borrowed_fragment.find("proxy_pass http://127.0.0.1:");
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
+        const auto same_source = [&](rut::Str value, rut::Span span) {
+            return value.ptr != nullptr && span.end >= span.start &&
+                   span.end - span.start == value.len &&
+                   reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+        };
+        if (listen_offset == std::string::npos || path_offset == std::string::npos ||
+            proxy_offset == std::string::npos || server.listen.port != frontend_port ||
+            server.listen.span.start != listen_offset ||
+            server.listen.span.end != listen_offset + listen_directive.size() ||
+            server.listen.span.line != (listen_first ? 2u : 3u) || server.listen.span.col != 3u ||
+            !server.location.path.eq(rut::lit_str("/")) ||
+            !same_source(server.location.path, server.location.path_span) ||
+            server.location.proxy_pass.has_uri || server.location.proxy_pass.uri.len != 0u ||
+            server.location.proxy_pass.address[0] != 127u ||
+            server.location.proxy_pass.address[1] != 0u ||
+            server.location.proxy_pass.address[2] != 0u ||
+            server.location.proxy_pass.address[3] != 1u ||
+            server.location.proxy_pass.port != backend_port || server.exact_local_return.present ||
+            server.exact_no_content_return.present || server.exact_absolute_redirect.present) {
+            error = "#342 parsed model lost exact wildcard listen span or root-proxy provenance";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(server);
+        if (!lowered) {
+            error = "#342 genuine wildcard model failed ordinary-RUT lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        generated_source.assign(output.ptr, output.len);
+        if (!validate_wildcard_listen_generated_source(
+                generated_source, frontend_port, backend_port, error))
+            return false;
+
+        std::string port_only_fragment = borrowed_fragment;
+        const std::string wildcard_argument = "listen 0.0.0.0:";
+        const size_t wildcard_offset = port_only_fragment.find(wildcard_argument);
+        if (wildcard_offset == std::string::npos ||
+            port_only_fragment.find(wildcard_argument,
+                                    wildcard_offset + wildcard_argument.size()) !=
+                std::string::npos) {
+            error = "#342 wildcard-to-port-only comparison did not find one exact listen spelling";
+            return false;
+        }
+        port_only_fragment.replace(wildcard_offset, wildcard_argument.size(), "listen ");
+        const auto port_parsed = rut::nginx::parse(
+            {port_only_fragment.data(), static_cast<u32>(port_only_fragment.size())});
+        if (!port_parsed) {
+            error = "#342 equivalent port-only fragment failed genuine parsing";
+            return false;
+        }
+        const auto port_lowered = rut::nginx::lower_to_rut(port_parsed.value());
+        if (!port_lowered || port_lowered.value().view().len != output.len ||
+            memcmp(port_lowered.value().view().ptr, output.ptr, output.len) != 0) {
+            error = "#342 explicit wildcard spelling did not lower byte-identically to port-only";
+            return false;
+        }
+        if (!write_file(temp.source, output.ptr, output.len)) {
+            error = "#342 failed to persist converter-generated ordinary RUT";
+            return false;
+        }
+        std::fill(port_only_fragment.begin(), port_only_fragment.end(), '\0');
+    }
+    std::fill(borrowed_fragment.begin(), borrowed_fragment.end(), '\0');
+    if (!std::all_of(borrowed_fragment.begin(), borrowed_fragment.end(), [](char byte) {
+            return byte == 0;
+        })) {
+        error = "#342 failed to destroy borrowed nginx source before public loading";
+        return false;
+    }
+
+    {
+        rut::LoadedProgram program{};
+        struct ProgramGuard {
+            rut::LoadedProgram* program;
+            ~ProgramGuard() { program->destroy(); }
+        } guard{&program};
+        rut::LoadError load_error{};
+        if (!rut::load_rut_program(
+                temp.source.c_str(), program, load_error, rut::jit::OptLevel::O0)) {
+            char detail[512]{};
+            rut::format_load_error(load_error, detail, sizeof(detail));
+            error = std::string("#342 generated source failed public lex/parse/load: ") + detail;
+            return false;
+        }
+        if (!program.has_listener || program.listener.port != frontend_port ||
+            program.rir.module.upstream_count != 1u || program.config.upstream_count != 1u ||
+            program.rir.module.func_count != 3u ||
+            program.rir.module.target_transform_count != 0u ||
+            program.config.target_transform_count != 0u ||
+            program.config.upstreams[0].addr_count != 1u ||
+            ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7F000001u ||
+            ntohs(program.config.upstreams[0].addrs[0].sin_port) != backend_port) {
+            error = "#342 public load lost the owned listener/root-forward/upstream profile";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#342 generated recorder could not bind its reserved backend port";
+        return false;
+    }
+
+    ChildGuard process;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     process.child) ||
+        !wait_ready(frontend_port, process.child, error)) {
+        if (error.empty()) error = "#342 converter-generated RUT failed before readiness";
+        return false;
+    }
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live(backend) && std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(process.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#342 generated frontend/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(backend)) {
+        error = "#342 generated recorder readiness timed out";
+        return false;
+    }
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const auto log_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < log_deadline) {
+        if (poll_child(process.child)) {
+            error = "#342 generated RUT exited before load/io_uring/listener evidence";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#342 generated RUT lacked exact public load/io_uring/listener evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "destroyed-after-342-rut-load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "#342 failed to overwrite generated source after readiness";
+        return false;
+    }
+    std::string destroyed_readback;
+    if (!read_exact_return204_log(
+            temp.source, "#342 destroyed generated source", destroyed_readback, error) ||
+        destroyed_readback != kDestroyed) {
+        error = "#342 generated source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto observe_count = [&](u32 expected, std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(process.child) || !recorder_live(backend)) return false;
+            if (backend.accepted.load(std::memory_order_acquire) != expected ||
+                backend.requests.load(std::memory_order_acquire) != expected ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != expected)
+                return false;
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    if (!observe_count(0u, std::chrono::milliseconds(100))) {
+        error = "#342 generated upstream was not quiet before the request";
+        return false;
+    }
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    std::string detail;
+    if (client.fd < 0 || !send_all(client.fd, request.data(), request.size()) ||
+        !read_response(client.fd, observation.wire, detail) || !read_eof(client.fd, detail)) {
+        error = "#342 generated response/zero-tail/EOF failed: " +
+                (detail.empty() ? std::string("connect or send failed") : detail);
+        return false;
+    }
+    const auto episode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < episode_deadline && recorder_live(backend) &&
+           !poll_child(process.child)) {
+        const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+        const u32 requests = backend.requests.load(std::memory_order_acquire);
+        const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+        if (accepts > 1u || requests > 1u || sends > 1u ||
+            (accepts == 1u && requests == 1u && sends == 1u))
+            break;
+        usleep(1000);
+    }
+    if (!observe_count(1u, std::chrono::milliseconds(500)) || !stop_child(process.child)) {
+        error = "#342 generated side did not settle at one episode or stop cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 1u || observation.forward_requests != 1u ||
+        observation.forward_sends != 1u || observation.forward_history.size() != 1u ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire)) {
+        error = "#342 generated recorder did not finish exactly one clean episode";
+        return false;
+    }
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(
+            temp.rut_access_log, "#342 generated RUT access log", access_contents, error) ||
+        !parse_wildcard_listen_rut_access(access_contents, observation, error) ||
+        !read_exact_return204_log(
+            temp.rut_log, "#342 generated RUT runtime log", runtime_contents, error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error) ||
+        !validate_wildcard_listen_observation(observation, error))
+        return false;
+    return true;
+}
+
+static bool validate_wildcard_listen_four_way(
+    const WildcardListenOracleObservation (&observations)[4],
+    const std::string (&generated_sources)[2],
+    std::string& error) {
+    static constexpr const char* kSides[] = {
+        "pinned-nginx", "pinned-nginx", "converter-generated-rut", "converter-generated-rut"};
+    static constexpr const char* kOrders[] = {
+        "listen-first", "location-first", "listen-first", "location-first"};
+    u16 ports[8]{};
+    for (size_t side = 0u; side < 4u; side++) {
+        ports[side * 2u] = observations[side].frontend_port;
+        ports[side * 2u + 1u] = observations[side].backend_port;
+        if (observations[side].side != kSides[side] || observations[side].order != kOrders[side] ||
+            !validate_wildcard_listen_observation(observations[side], error))
+            return false;
+    }
+    for (size_t i = 0u; i < 8u; i++) {
+        if (ports[i] == 0u) {
+            error = "#342 four-side validator received a zero endpoint";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#342 nginx/generated sides shared a frontend/backend port";
+                return false;
+            }
+        }
+    }
+    if (!validate_wildcard_listen_generated_source(
+            generated_sources[0], ports[4], ports[5], error) ||
+        !validate_wildcard_listen_generated_source(generated_sources[1], ports[6], ports[7], error))
+        return false;
+
+    const std::string* resources[24];
+    size_t resource_count = 0u;
+    for (const auto& observation : observations) {
+        for (const std::string* resource : {&observation.temp_path,
+                                            &observation.config_path,
+                                            &observation.log_path,
+                                            &observation.access_path,
+                                            &observation.process_identity,
+                                            &observation.access_scope})
+            resources[resource_count++] = resource;
+    }
+    for (size_t i = 0u; i < resource_count; i++) {
+        if (resources[i]->empty()) {
+            error = "#342 four-side resource or label identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < resource_count; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#342 nginx/generated sides shared a resource or label identity";
+                return false;
+            }
+        }
+    }
+
+    std::string canonical_sources[2] = {generated_sources[0], generated_sources[1]};
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string listener = "listen :" + std::to_string(ports[4u + side * 2u]) + "\n";
+        const std::string upstream =
+            "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(ports[5u + side * 2u]) +
+            "\"\n";
+        if (!canonicalize_unique_port(canonical_sources[side], listener, "listen :FRONTEND\n") ||
+            !canonicalize_unique_port(canonical_sources[side],
+                                      upstream,
+                                      "upstream nginx_upstream at "
+                                      "\"127.0.0.1:BACKEND\"\n")) {
+            error = "#342 generated source endpoint canonicalization was missing or duplicate";
+            return false;
+        }
+    }
+    if (canonical_sources[0] != canonical_sources[1]) {
+        error = "#342 wildcard declaration orders generated different ordinary RUT bytes";
+        return false;
+    }
+
+    std::vector<char> canonical_wires[4];
+    std::string canonical_histories[4];
+    for (size_t side = 0u; side < 4u; side++) {
+        canonical_wires[side] = observations[side].wire;
+        if (!normalize_date(canonical_wires[side])) {
+            error = "#342 four-side wire lacked one strict Date";
+            return false;
+        }
+        canonical_histories[side].assign(observations[side].forward_history[0].begin(),
+                                         observations[side].forward_history[0].end());
+        if (!canonicalize_unique_port(
+                canonical_histories[side],
+                "127.0.0.1:" + std::to_string(observations[side].backend_port),
+                "127.0.0.1:BACKEND")) {
+            error = "#342 four-side upstream backend canonicalization was missing or duplicate";
+            return false;
+        }
+    }
+    for (size_t side = 1u; side < 4u; side++) {
+        if (canonical_wires[side] != canonical_wires[0]) {
+            error = "#342 nginx/generated Date-normalized downstream wires differed";
+            return false;
+        }
+        if (canonical_histories[side] != canonical_histories[0]) {
+            error = "#342 nginx/generated canonical upstream histories differed";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_wildcard_listen_differential_self_checks(std::string& error) {
+    static constexpr u16 kPorts[8] = {
+        41101u, 41102u, 41103u, 41104u, 41105u, 41106u, 41107u, 41108u};
+    const auto observed_wire = [] {
+        std::vector<char> wire(
+            kSuccessResponseNormalized,
+            kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+        const std::string marker(29u, 'X');
+        const auto offset = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+        if (offset != wire.end()) std::copy_n(kDate, 29u, offset);
+        return wire;
+    };
+    WildcardListenOracleObservation values[4];
+    for (size_t side = 0u; side < 4u; side++) {
+        auto& value = values[side];
+        value.side = side < 2u ? "pinned-nginx" : "converter-generated-rut";
+        value.order = side % 2u == 0u ? "listen-first" : "location-first";
+        value.temp_path = "/tmp/342-" + value.side + "-" + value.order;
+        value.config_path = value.temp_path + (side < 2u ? "/nginx.conf" : "/generated.rut");
+        value.log_path = value.temp_path + (side < 2u ? "/nginx.log" : "/rut.log");
+        value.access_path = value.temp_path + "/access.log";
+        value.process_identity = "process-342-" + value.side + "-" + value.order;
+        value.access_scope = "scope-342-" + value.side + "-" + value.order;
+        value.frontend_port = kPorts[side * 2u];
+        value.backend_port = kPorts[side * 2u + 1u];
+        value.wire = observed_wire();
+        const std::string upstream = wildcard_listen_expected_upstream(value.backend_port);
+        value.forward_history.emplace_back(upstream.begin(), upstream.end());
+        value.forward_accepts = value.forward_requests = value.forward_sends = 1u;
+        if (side < 2u) {
+            value.access_record = wildcard_listen_expected_access(
+                value.access_scope, value.backend_port, value.wire.size());
+        } else {
+            value.access_record = "2026-08-26T21:13:05.248Z GET / 200 361us " +
+                                  std::to_string(value.forward_history[0].size()) + " " +
+                                  std::to_string(value.wire.size()) +
+                                  " 127.0.0.1 nginx_upstream 243us s=0";
+        }
+    }
+
+    std::string sources[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string input = make_wildcard_listen_fragment(
+            kPorts[4u + side * 2u], kPorts[5u + side * 2u], side == 0u);
+        if (!validate_wildcard_listen_config(
+                input, kPorts[4u + side * 2u], kPorts[5u + side * 2u], side == 0u, error))
+            return false;
+        const auto parsed = rut::nginx::parse({input.data(), static_cast<u32>(input.size())});
+        if (!parsed) {
+            error = "#342 generated self-check wildcard fixture failed genuine parsing";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            error = "#342 generated self-check wildcard fixture failed genuine lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        sources[side].assign(output.ptr, output.len);
+    }
+    if (!validate_wildcard_listen_four_way(values, sources, error)) return false;
+
+    const auto unique_replace = [&](const std::string& canonical,
+                                    const std::string& from,
+                                    const std::string& to,
+                                    std::string& candidate,
+                                    const char* label) {
+        const size_t first = canonical.find(from);
+        if (from.empty() || from == to || first == std::string::npos ||
+            canonical.find(from, first + from.size()) != std::string::npos) {
+            error = std::string("#342 differential mutation precondition failed: ") + label;
+            return false;
+        }
+        candidate = canonical;
+        candidate.replace(first, from.size(), to);
+        if (candidate == canonical) {
+            error = std::string("#342 differential mutation did not change fixture: ") + label;
+            return false;
+        }
+        return true;
+    };
+    const auto rejects_four_way = [&](WildcardListenOracleObservation(&mutated)[4],
+                                      const std::string(&mutated_sources)[2],
+                                      const char* label) {
+        std::string detail;
+        if (!validate_wildcard_listen_four_way(mutated, mutated_sources, detail)) return true;
+        error = std::string("#342 four-way mutation was accepted: ") + label;
+        return false;
+    };
+    WildcardListenOracleObservation mutated[4];
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].forward_accepts = mutated[2].forward_requests = mutated[2].forward_sends = 0u;
+    mutated[2].forward_history.clear();
+    if (!rejects_four_way(mutated, sources, "zero-episode")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].forward_accepts = mutated[2].forward_requests = mutated[2].forward_sends = 2u;
+    mutated[2].forward_history.push_back(mutated[2].forward_history[0]);
+    if (!rejects_four_way(mutated, sources, "duplicate-episode")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].forward_history.push_back(mutated[2].forward_history[0]);
+    if (!rejects_four_way(mutated, sources, "extra-history")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].wire.back() = 'X';
+    if (!rejects_four_way(mutated, sources, "cross-side-wire")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].forward_history[0].back() = 'X';
+    if (!rejects_four_way(mutated, sources, "cross-side-history")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].temp_path = mutated[0].temp_path;
+    if (!rejects_four_way(mutated, sources, "shared-resource")) return false;
+
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].frontend_port = mutated[0].frontend_port;
+    std::string shared_port_sources[2] = {sources[0], sources[1]};
+    if (!unique_replace(sources[1],
+                        "listen :" + std::to_string(kPorts[6]) + "\n",
+                        "listen :" + std::to_string(kPorts[0]) + "\n",
+                        shared_port_sources[1],
+                        "shared-frontend-port"))
+        return false;
+    std::string precondition_error;
+    for (size_t side = 0u; side < 4u; side++) {
+        const auto& observation = mutated[side];
+        if (observation.side != values[side].side || observation.order != values[side].order ||
+            observation.temp_path != values[side].temp_path ||
+            observation.config_path != values[side].config_path ||
+            observation.log_path != values[side].log_path ||
+            observation.access_path != values[side].access_path ||
+            observation.process_identity != values[side].process_identity ||
+            observation.access_scope != values[side].access_scope) {
+            error = "#342 shared-port mutation changed an unrelated side/order/resource label";
+            return false;
+        }
+        if (!validate_wildcard_listen_observation(observation, precondition_error)) {
+            error =
+                "#342 shared-port mutation broke a single-side observation before the "
+                "eight-port uniqueness gate: " +
+                precondition_error;
+            return false;
+        }
+    }
+    if (!validate_wildcard_listen_generated_source(
+            shared_port_sources[0], kPorts[4], kPorts[5], precondition_error) ||
+        !validate_wildcard_listen_generated_source(shared_port_sources[1],
+                                                   mutated[3].frontend_port,
+                                                   mutated[3].backend_port,
+                                                   precondition_error)) {
+        error =
+            "#342 shared-port mutation broke a generated-source guard before the "
+            "eight-port uniqueness gate: " +
+            precondition_error;
+        return false;
+    }
+    const u16 shared_ports[8] = {mutated[0].frontend_port,
+                                 mutated[0].backend_port,
+                                 mutated[1].frontend_port,
+                                 mutated[1].backend_port,
+                                 mutated[2].frontend_port,
+                                 mutated[2].backend_port,
+                                 mutated[3].frontend_port,
+                                 mutated[3].backend_port};
+    u32 duplicate_port_pairs = 0u;
+    for (size_t i = 0u; i < 8u; i++) {
+        if (shared_ports[i] == 0u) {
+            error = "#342 shared-port mutation introduced an unintended zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (shared_ports[i] != shared_ports[j]) continue;
+            duplicate_port_pairs++;
+            if (i != 0u || j != 6u) {
+                error = "#342 shared-port mutation introduced the wrong duplicate endpoint pair";
+                return false;
+            }
+        }
+    }
+    const std::string* shared_port_resources[24];
+    size_t shared_port_resource_count = 0u;
+    for (const auto& observation : mutated) {
+        for (const std::string* resource : {&observation.temp_path,
+                                            &observation.config_path,
+                                            &observation.log_path,
+                                            &observation.access_path,
+                                            &observation.process_identity,
+                                            &observation.access_scope})
+            shared_port_resources[shared_port_resource_count++] = resource;
+    }
+    for (size_t i = 0u; i < shared_port_resource_count; i++) {
+        if (shared_port_resources[i]->empty()) {
+            error = "#342 shared-port mutation emptied an unrelated resource identity";
+            return false;
+        }
+        for (size_t j = i + 1u; j < shared_port_resource_count; j++) {
+            if (*shared_port_resources[i] == *shared_port_resources[j]) {
+                error = "#342 shared-port mutation duplicated an unrelated resource identity";
+                return false;
+            }
+        }
+    }
+    if (duplicate_port_pairs != 1u) {
+        error = "#342 shared-port mutation did not isolate exactly one duplicate endpoint pair";
+        return false;
+    }
+    std::string shared_canonical_sources[2] = {shared_port_sources[0], shared_port_sources[1]};
+    const u16 shared_generated_frontends[2] = {mutated[2].frontend_port, mutated[3].frontend_port};
+    const u16 shared_generated_backends[2] = {mutated[2].backend_port, mutated[3].backend_port};
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string listener =
+            "listen :" + std::to_string(shared_generated_frontends[side]) + "\n";
+        const std::string upstream = "upstream nginx_upstream at \"127.0.0.1:" +
+                                     std::to_string(shared_generated_backends[side]) + "\"\n";
+        if (!canonicalize_unique_port(
+                shared_canonical_sources[side], listener, "listen :FRONTEND\n") ||
+            !canonicalize_unique_port(shared_canonical_sources[side],
+                                      upstream,
+                                      "upstream nginx_upstream at "
+                                      "\"127.0.0.1:BACKEND\"\n")) {
+            error = "#342 shared-port mutation broke canonical source endpoint inventory";
+            return false;
+        }
+    }
+    if (shared_canonical_sources[0] != shared_canonical_sources[1]) {
+        error = "#342 shared-port mutation changed canonical generated bytes";
+        return false;
+    }
+    if (!rejects_four_way(mutated, shared_port_sources, "shared-port")) return false;
+
+    const auto rejects_source = [&](const std::string& candidate, const char* label) {
+        if (candidate == sources[0]) {
+            error = std::string("#342 source mutation was identical: ") + label;
+            return false;
+        }
+        std::string detail;
+        if (!validate_wildcard_listen_generated_source(candidate, kPorts[4], kPorts[5], detail))
+            return true;
+        error = std::string("#342 structural source mutation was accepted directly: ") + label;
+        return false;
+    };
+    const auto rejects_unique_source =
+        [&](const std::string& from, const std::string& to, const char* label) {
+            std::string candidate;
+            return unique_replace(sources[0], from, to, candidate, label) &&
+                   rejects_source(candidate, label);
+        };
+    const auto rejects_appended_source =
+        [&](const std::string& suffix, const std::string& marker, const char* label) {
+            if (suffix.empty() || marker.empty() || sources[0].find(marker) != std::string::npos) {
+                error = std::string("#342 appended source mutation precondition failed: ") + label;
+                return false;
+            }
+            const std::string candidate = sources[0] + suffix;
+            if (candidate.size() != sources[0].size() + suffix.size() ||
+                count_text(candidate, marker) != 1u) {
+                error = std::string("#342 appended source mutation was not exact: ") + label;
+                return false;
+            }
+            return rejects_source(candidate, label);
+        };
+    if (!rejects_unique_source(
+            "listen :" + std::to_string(kPorts[4]) + "\n", "listen :1\n", "wrong-listen") ||
+        !rejects_appended_source("listen :1\n", "listen :1\n", "extra-listen") ||
+        !rejects_appended_source(
+            "# bind_address 0.0.0.0\n", "bind_address 0.0.0.0", "address-marker") ||
+        !rejects_appended_source("route \"/extra\" { return forward(nginx_upstream) }\n",
+                                 "route \"/extra\"",
+                                 "extra-route") ||
+        !rejects_appended_source("# nginx_compat wildcard workaround\n",
+                                 "nginx_compat wildcard workaround",
+                                 "workaround"))
+        return false;
+
+    static constexpr char kAdditionalPreRoute[] =
+        "pre_route OPTIONS { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: \"pre\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    std::string extra_pre_route;
+    if (!unique_replace(sources[0],
+                        kStaticQueryCanonicalTraceHook,
+                        std::string(kStaticQueryCanonicalTraceHook) + kAdditionalPreRoute,
+                        extra_pre_route,
+                        "extra-pre-route"))
+        return false;
+    const auto lexed = rut::lex({extra_pre_route.data(), static_cast<u32>(extra_pre_route.size())});
+    if (!lexed) {
+        error = "#342 complete extra pre_route mutation failed RUT lexing";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#342 complete extra pre_route mutation failed RUT parsing";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    if (ast->pre_route_policy_ids[rut::kRouteMethodTrace] == 0u ||
+        ast->pre_route_policy_ids[rut::kRouteMethodOptions] == 0u) {
+        error = "#342 parsed extra pre_route mutation lost TRACE/OPTIONS policies";
+        return false;
+    }
+    const auto analyzed = rut::analyze_file(*ast);
+    if (!analyzed) {
+        error = "#342 complete extra pre_route mutation failed RUT analysis";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> hir(analyzed.value());
+    if (hir->pre_route_policy_ids[rut::kRouteMethodTrace] == 0u ||
+        hir->pre_route_policy_ids[rut::kRouteMethodOptions] == 0u ||
+        wildcard_listen_source_declarations(extra_pre_route, "pre_route") != 2u ||
+        count_text(extra_pre_route, kAdditionalPreRoute) != 1u ||
+        !rejects_source(extra_pre_route, "extra-pre-route"))
+        return false;
+
+    static constexpr char kEqualityOnlyComment[] = "// equality-only-semantic-noop\n";
+    std::string equality_sources[2] = {sources[0], sources[1] + std::string(kEqualityOnlyComment)};
+    precondition_error.clear();
+    if (sources[1].find(kEqualityOnlyComment) != std::string::npos ||
+        equality_sources[1] == sources[1] ||
+        equality_sources[1].size() != sources[1].size() + sizeof(kEqualityOnlyComment) - 1u ||
+        count_text(equality_sources[1], kEqualityOnlyComment) != 1u ||
+        !validate_wildcard_listen_generated_source(
+            equality_sources[1], kPorts[6], kPorts[7], precondition_error)) {
+        error = "#342 equality-only source mutation did not remain structurally valid: " +
+                precondition_error;
+        return false;
+    }
+    const auto equality_lexed =
+        rut::lex({equality_sources[1].data(), static_cast<u32>(equality_sources[1].size())});
+    if (!equality_lexed) {
+        error = "#342 equality-only source mutation failed RUT lexing";
+        return false;
+    }
+    const auto equality_parsed = rut::parse_file(equality_lexed.value());
+    if (!equality_parsed) {
+        error = "#342 equality-only source mutation failed RUT parsing";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> equality_ast(equality_parsed.value());
+    const auto equality_analyzed = rut::analyze_file(*equality_ast);
+    if (!equality_analyzed) {
+        error = "#342 equality-only source mutation failed RUT analysis";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> equality_hir(equality_analyzed.value());
+    if (equality_hir->routes.len != 3u) {
+        error = "#342 equality-only source mutation changed the ordinary route inventory";
+        return false;
+    }
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    if (!rejects_four_way(mutated, equality_sources, "canonical-source-byte-inequality"))
+        return false;
+
+    WildcardListenOracleObservation access_observation = values[2];
+    const std::string valid_access = access_observation.access_record + "\n";
+    if (!parse_wildcard_listen_rut_access(valid_access, access_observation, error)) return false;
+    const auto rejects_access = [&](const std::string& candidate, const char* label) {
+        if (candidate == valid_access) {
+            error = std::string("#342 access mutation was identical: ") + label;
+            return false;
+        }
+        auto changed_observation = values[2];
+        std::string detail;
+        if (!parse_wildcard_listen_rut_access(candidate, changed_observation, detail)) return true;
+        error = std::string("#342 generated access mutation was accepted: ") + label;
+        return false;
+    };
+    const auto rejects_unique_access =
+        [&](const std::string& from, const std::string& to, const char* label) {
+            std::string candidate;
+            return unique_replace(valid_access, from, to, candidate, label) &&
+                   rejects_access(candidate, label);
+        };
+    const std::string sizes = " 361us " + std::to_string(values[2].forward_history[0].size()) +
+                              " " + std::to_string(values[2].wire.size()) + " 127.0.0.1";
+    if (!rejects_access("", "zero-record") ||
+        !rejects_access(valid_access + valid_access, "duplicate-record") ||
+        !rejects_access(valid_access + "extra\n", "extra-record") ||
+        !rejects_unique_access(" GET / 200 ", " GET /x 200 ", "target") ||
+        !rejects_unique_access(" GET / 200 ", " POST / 200 ", "method") ||
+        !rejects_unique_access(" GET / 200 ", " GET / 502 ", "status") ||
+        !rejects_unique_access(sizes,
+                               " 361us 1 " + std::to_string(values[2].wire.size()) + " 127.0.0.1",
+                               "request-size") ||
+        !rejects_unique_access(
+            sizes,
+            " 361us " + std::to_string(values[2].forward_history[0].size()) + " 1 127.0.0.1",
+            "response-size") ||
+        !rejects_unique_access(" nginx_upstream ", " other_upstream ", "upstream") ||
+        !rejects_unique_access(" s=0\n", " s=1\n", "outcome"))
+        return false;
+    return true;
+}
+
+static bool run_converter_wildcard_listen_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    WildcardListenOracleObservation (&observations)[4],
+    std::string (&generated_sources)[2],
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#342 converter differential requires an executable absolute RUT path";
+        return false;
+    }
+    struct Reservations {
+        int fds[4];
+        Reservations() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~Reservations() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 generated_ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, generated_ports[i])) {
+            error = "#342 could not simultaneously reserve four generated-side ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (generated_ports[i] == generated_ports[j]) {
+                error = "#342 generated sides reserved duplicate ports";
+                return false;
+            }
+        }
+    }
+
+    // The four generated endpoints remain held while the oracle reserves and
+    // consumes its four endpoints, proving eight-way disjointness by bind.
+    WildcardListenOracleObservation oracle[2];
+    if (!run_pinned_wildcard_listen_oracle(container_prefix, oracle, error)) return false;
+    observations[0] = oracle[0];
+    observations[1] = oracle[1];
+
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].source == temps[1].source || temps[0].rut_log == temps[1].rut_log ||
+        temps[0].rut_access_log == temps[1].rut_access_log) {
+        error = "#342 could not create independent generated-side resource trees";
+        return false;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t port = side * 2u;
+        const std::string identity = std::string(rut_path) + " " + temps[side].source +
+                                     " listen:" + std::to_string(generated_ports[port]);
+        if (!capture_generated_wildcard_listen_side(generated_ports[port],
+                                                    generated_ports[port + 1u],
+                                                    temps[side],
+                                                    identity,
+                                                    side == 0u,
+                                                    rut_path,
+                                                    observations[side + 2u],
+                                                    generated_sources[side],
+                                                    error,
+                                                    &reservations.fds[port],
+                                                    &reservations.fds[port + 1u]))
+            return false;
+    }
+    for (const int fd : reservations.fds) {
+        if (fd >= 0) {
+            error = "#342 generated capture did not consume all held reservations";
+            return false;
+        }
+    }
+    return validate_wildcard_listen_four_way(observations, generated_sources, error);
+}
+
 static void dump_wildcard_listen_observation(const WildcardListenOracleObservation& observation) {
-    std::cerr << "#342 order=" << observation.order << " ports=" << observation.frontend_port << "/"
-              << observation.backend_port << " upstream=" << observation.forward_accepts << "/"
-              << observation.forward_requests << "/" << observation.forward_sends << "\n";
+    std::cerr << "#342 side=" << observation.side << " order=" << observation.order
+              << " ports=" << observation.frontend_port << "/" << observation.backend_port
+              << " upstream=" << observation.forward_accepts << "/" << observation.forward_requests
+              << "/" << observation.forward_sends << "\n";
     dump_wire("#342 downstream", observation.wire);
     for (const auto& upstream : observation.forward_history) dump_wire("#342 upstream", upstream);
     if (!observation.config_path.empty())
@@ -28698,6 +29699,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-zero-suffix-static-query-proxy-uri-oracle") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
+    const bool converter_wildcard_listen_differential =
+        argc == 3 && strcmp(argv[1], "--converter-wildcard-listen-differential") == 0;
     const bool bounded_exact_local_path_oracle =
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool bounded_no_content_path_oracle =
@@ -28795,12 +29798,12 @@ int main(int argc, char** argv) {
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !wildcard_listen_oracle &&
-         !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
-         !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
-         !max_boundary_no_content_oracle && !bodyful_normalized_exact_oracle &&
-         !exact_local_body_space_oracle && !exact_local_body_multiple_space_oracle &&
-         !exact_local_return204_oracle && !exact_local_return204_query_oracle &&
-         !converter_exact_local_body_space_differential &&
+         !converter_wildcard_listen_differential && !bounded_exact_local_path_oracle &&
+         !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
+         !trailing_slash_no_content_oracle && !max_boundary_no_content_oracle &&
+         !bodyful_normalized_exact_oracle && !exact_local_body_space_oracle &&
+         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
+         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
@@ -28835,6 +29838,7 @@ int main(int argc, char** argv) {
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_static_query_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_zero_suffix_static_query_proxy_uri_differential && argv[2][0] != '/') ||
+        (converter_wildcard_listen_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
@@ -28880,6 +29884,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-zero-suffix-static-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
+                     "   or: test_nginx_differential --converter-wildcard-listen-differential "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
@@ -29120,11 +30126,17 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (wildcard_listen_oracle) {
+    if (wildcard_listen_oracle || converter_wildcard_listen_differential) {
         std::string self_check_error;
         if (!run_wildcard_listen_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#342 wildcard-listen oracle self-check]: " << self_check_error
                       << "\n";
+            return 1;
+        }
+        if (converter_wildcard_listen_differential &&
+            !run_wildcard_listen_differential_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#342 wildcard-listen generated/four-side self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
     }
@@ -29161,7 +30173,8 @@ int main(int argc, char** argv) {
         converter_bodyful_normalized_exact_differential ||
         converter_max_proxy_prefix_differential || converter_max_proxy_replacement_differential ||
         converter_static_query_proxy_uri_differential ||
-        converter_zero_suffix_static_query_proxy_uri_differential) {
+        converter_zero_suffix_static_query_proxy_uri_differential ||
+        converter_wildcard_listen_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -29412,6 +30425,39 @@ int main(int argc, char** argv) {
                "nginx-only; no parser, converter, generated-RUT, or runtime equivalence claim; "
                "excludes other addresses/options/listeners/servers, methods, bodies/framing, "
                "reuse/pipeline/retries/failures, H1.0, H2, and TLS)\n";
+        return 0;
+    }
+
+    if (converter_wildcard_listen_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-342-wildcard-listen-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        WildcardListenOracleObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_wildcard_listen_differential(
+                container_prefix, argv[2], observations, generated_sources, differential_error)) {
+            std::cerr << "FAIL [#342 converter-generated wildcard-listen differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_wildcard_listen_observation(observation);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #342 both declaration orders of the exact explicit "
+               "listen 0.0.0.0:<port> minimal root-proxy fragment traversed the genuine "
+               "borrowed parser/provenance model and converter into the byte-identical canonical "
+               "port-only ordinary RUT listener profile; two isolated pinned-nginx 1.29.7 sides "
+               "and two isolated public-CLI/io_uring RUT sides matched one exact fresh "
+               "explicit-close GET / as a byte-exact Host-rebuilt, Connection-omitted upstream "
+               "history and exact Date-normalized 118-byte 200/CL2/ok/close/zero-tail/EOF "
+               "downstream wire, with exactly one clean episode and no second/retry per side; "
+               "strict nginx and RUT access records, clean generated runtime lifecycles, all eight "
+               "held-handoff ports, disjoint resources/side/order labels, owned public load state "
+               "and post-readiness source overwrite were proven (#342 exact bounded converter "
+               "equivalence only; excludes other addresses/options/listeners/servers, methods, "
+               "bodies/framing, reuse/pipeline, retries/failures, H1.0, H2 and TLS)\n";
         return 0;
     }
 
