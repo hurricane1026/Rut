@@ -1804,7 +1804,10 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.req_size = conn.req_size;
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
-        for (u32 i = 0; i < sizeof(entry.path); i++) {
+        // Stage-1 compatibility: the enlarged destination remains legacy state zero and must
+        // never widen reads from Connection::req_path[64]. Explicit target-state publication is
+        // activated only after the request-start owned snapshot lifecycle is implemented.
+        for (u32 i = 0; i < sizeof(conn.req_path) && i < sizeof(entry.path); i++) {
             entry.path[i] = conn.req_path[i];
             if (conn.req_path[i] == '\0') break;
         }

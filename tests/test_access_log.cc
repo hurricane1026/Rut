@@ -4,9 +4,13 @@
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
+#include <cstddef>
+#include <string>
+#include <vector>
 
 #include <fcntl.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,7 +31,7 @@ static AccessLogEntry make_entry(u16 status, u32 duration_us, u8 shard, const ch
     e.resp_size = 1024;
     e.addr = 0x0100007F;  // 127.0.0.1 in network byte order
     u32 i = 0;
-    while (path[i] && i < sizeof(e.path) - 1) {
+    while (path[i] && i < kAccessLogLegacyTargetWidth - 1u) {
         e.path[i] = path[i];
         i++;
     }
@@ -35,6 +39,86 @@ static AccessLogEntry make_entry(u16 status, u32 duration_us, u8 shard, const ch
     e.upstream[0] = '\0';
     e.upstream_us = 0;
     return e;
+}
+
+static AccessLogEntry make_explicit_entry(AccessLogTargetState state,
+                                          u16 target_length,
+                                          char fill = 'x') {
+    AccessLogEntry entry = make_entry(200, 1234, 3, "/legacy");
+    for (char& byte : entry.path) byte = fill;
+    entry.target_state = state;
+    entry.target_length = target_length;
+    return entry;
+}
+
+static std::string formatted(const AccessLogEntry& entry) {
+    char buf[kAccessLogTextLineCapacity];
+    const u32 size = format_access_log_text(entry, buf, sizeof(buf));
+    return std::string(buf, buf + size);
+}
+
+static std::string formatted_target(const AccessLogEntry& entry) {
+    const std::string line = formatted(entry);
+    const size_t begin = line.find("GET ");
+    const size_t end = line.find(" 200 ", begin == std::string::npos ? 0u : begin + 4u);
+    if (begin == std::string::npos || end == std::string::npos) return {};
+    return line.substr(begin + 4u, end - begin - 4u);
+}
+
+static bool decompress_with_isolated_helper(const char* compressed,
+                                            size_t compressed_size,
+                                            std::string& output) {
+    i32 input[2];
+    i32 result[2];
+    if (pipe(input) != 0) return false;
+    if (pipe(result) != 0) {
+        close(input[0]);
+        close(input[1]);
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(input[0]);
+        close(input[1]);
+        close(result[0]);
+        close(result[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(input[1]);
+        close(result[0]);
+        if (dup2(input[0], STDIN_FILENO) < 0 || dup2(result[1], STDOUT_FILENO) < 0) _exit(126);
+        close(input[0]);
+        close(result[1]);
+        execl(RUT_TEST_ZSTD_DECOMPRESS_HELPER,
+              RUT_TEST_ZSTD_DECOMPRESS_HELPER,
+              static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(input[0]);
+    close(result[1]);
+    size_t sent = 0u;
+    while (sent < compressed_size) {
+        const ssize_t count = write(input[1], compressed + sent, compressed_size - sent);
+        if (count <= 0) break;
+        sent += static_cast<size_t>(count);
+    }
+    close(input[1]);
+    char plain[8192];
+    size_t plain_size = 0u;
+    while (plain_size < sizeof(plain)) {
+        const ssize_t count = read(result[0], plain + plain_size, sizeof(plain) - plain_size);
+        if (count < 0) break;
+        if (count == 0) break;
+        plain_size += static_cast<size_t>(count);
+    }
+    close(result[0]);
+    i32 status = 0;
+    if (waitpid(child, &status, 0) != child || sent != compressed_size || plain_size == 0u ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return false;
+    output.assign(plain, plain + plain_size);
+    return true;
 }
 
 // Helper: count newlines.
@@ -67,8 +151,32 @@ static void write_request(Connection& c, const char* raw) {
 
 // === AccessLogEntry size ===
 
-TEST(access_log_entry, size_is_128) {
-    CHECK_EQ(sizeof(AccessLogEntry), 128u);
+TEST(access_log_entry, exact_public_layout_and_constants) {
+    CHECK_EQ(kAccessLogCompleteTargetMax, 128u);
+    CHECK_EQ(kAccessLogLegacyTargetWidth, 64u);
+    CHECK_EQ(kAccessLogObservedStrictH1TargetMax, 16367u);
+    CHECK_EQ(kAccessLogTextLineCapacity, 512u);
+    CHECK_EQ(static_cast<u8>(AccessLogTargetState::LegacyNullTerminated), 0u);
+    CHECK_EQ(static_cast<u8>(AccessLogTargetState::Complete), 1u);
+    CHECK_EQ(static_cast<u8>(AccessLogTargetState::OverLimit), 2u);
+    CHECK_EQ(static_cast<u8>(AccessLogTargetState::Unavailable), 3u);
+    CHECK_EQ(static_cast<u8>(AccessLogTargetState::Invalid), 4u);
+    CHECK_EQ(offsetof(AccessLogEntry, timestamp_us), 0u);
+    CHECK_EQ(offsetof(AccessLogEntry, duration_us), 8u);
+    CHECK_EQ(offsetof(AccessLogEntry, req_size), 12u);
+    CHECK_EQ(offsetof(AccessLogEntry, resp_size), 16u);
+    CHECK_EQ(offsetof(AccessLogEntry, upstream_us), 20u);
+    CHECK_EQ(offsetof(AccessLogEntry, addr), 24u);
+    CHECK_EQ(offsetof(AccessLogEntry, status), 28u);
+    CHECK_EQ(offsetof(AccessLogEntry, method), 30u);
+    CHECK_EQ(offsetof(AccessLogEntry, shard_id), 31u);
+    CHECK_EQ(offsetof(AccessLogEntry, path), 32u);
+    CHECK_EQ(offsetof(AccessLogEntry, upstream), 160u);
+    CHECK_EQ(offsetof(AccessLogEntry, target_length), 184u);
+    CHECK_EQ(offsetof(AccessLogEntry, target_state), 186u);
+    CHECK_EQ(sizeof(AccessLogEntry), 192u);
+    CHECK_EQ(alignof(AccessLogEntry), 8u);
+    CHECK_EQ(sizeof(AccessLogRing), 98432u);
 }
 
 // === SPSC Ring: basic operations ===
@@ -154,6 +262,36 @@ TEST(ring, push_returns_true_when_not_full) {
     CHECK_EQ(ring.available(), 2u);
 }
 
+TEST(ring, wrap_full_and_drop_preserve_explicit_target_metadata) {
+    AccessLogRing ring;
+    ring.init();
+    AccessLogEntry complete =
+        make_explicit_entry(AccessLogTargetState::Complete, kAccessLogCompleteTargetMax, 'C');
+    for (u32 i = 0u; i < AccessLogRing::kCapacity; i++) {
+        complete.status = static_cast<u16>(i);
+        CHECK(ring.push(complete));
+    }
+    AccessLogEntry dropped = make_explicit_entry(AccessLogTargetState::OverLimit, 129u, 'D');
+    dropped.status = 999u;
+    CHECK(!ring.push(dropped));
+
+    AccessLogEntry out{};
+    REQUIRE(ring.pop(out));
+    CHECK_EQ(out.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(out.target_length, 128u);
+    for (char byte : out.path) CHECK_EQ(byte, 'C');
+
+    AccessLogEntry wrapped = make_explicit_entry(AccessLogTargetState::OverLimit, 16367u, 'W');
+    wrapped.status = 777u;
+    CHECK(ring.push(wrapped));
+    while (ring.available() > 1u) CHECK(ring.pop(out));
+    REQUIRE(ring.pop(out));
+    CHECK_EQ(out.status, 777u);
+    CHECK_EQ(out.target_state, AccessLogTargetState::OverLimit);
+    CHECK_EQ(out.target_length, 16367u);
+    for (char byte : out.path) CHECK_EQ(byte, 'W');
+}
+
 // === Clocks ===
 
 TEST(realtime, returns_nonzero) {
@@ -184,6 +322,17 @@ TEST(format, basic_text) {
     CHECK(strstr(buf, "127.0.0.1") != nullptr);
     CHECK(strstr(buf, "s=3") != nullptr);
     CHECK_EQ(buf[n - 1], '\n');
+    CHECK_EQ(std::string(buf, buf + n),
+             std::string("2024-03-22T16:04:16.789Z GET /api/users 200 1234us 256 1024 "
+                         "127.0.0.1 s=3\n"));
+}
+
+TEST(format, short_complete_text_is_byte_identical_to_legacy) {
+    AccessLogEntry legacy = make_entry(200, 1234, 3, "/api/users");
+    AccessLogEntry complete = legacy;
+    complete.target_state = AccessLogTargetState::Complete;
+    complete.target_length = 10u;
+    CHECK_EQ(formatted(complete), formatted(legacy));
 }
 
 TEST(format, all_methods) {
@@ -231,6 +380,103 @@ TEST(format, includes_upstream_fields) {
     CHECK(strstr(buf, "201") != nullptr);
 }
 
+TEST(format, legacy_width_is_exact_and_ignores_enlarged_tail) {
+    AccessLogEntry empty = make_entry(200, 1234, 3, "");
+    CHECK_EQ(formatted_target(empty), std::string{});
+
+    AccessLogEntry length63 = make_entry(200, 1234, 3, "");
+    for (u32 i = 0; i < 63u; i++) length63.path[i] = 'a';
+    length63.path[63] = '\0';
+    CHECK_EQ(formatted_target(length63), std::string(63u, 'a'));
+
+    AccessLogEntry length64 = make_entry(200, 1234, 3, "");
+    for (u32 i = 0; i < 64u; i++) length64.path[i] = 'b';
+    for (u32 i = 64u; i < sizeof(length64.path); i++) length64.path[i] = 'P';
+    CHECK_EQ(formatted_target(length64), std::string(64u, 'b'));
+    CHECK(formatted(length64).find("PPPP") == std::string::npos);
+}
+
+TEST(format, complete_state_preserves_all_bounded_lengths) {
+    for (u16 length : {1u, 63u, 64u, 66u, 128u}) {
+        AccessLogEntry entry = make_explicit_entry(AccessLogTargetState::Complete, length, 'c');
+        CHECK_EQ(formatted_target(entry), std::string(length, 'c'));
+    }
+}
+
+TEST(format, over_limit_boundaries_emit_length_without_poisoned_prefix) {
+    for (u16 length : {129u, 16367u}) {
+        AccessLogEntry entry = make_explicit_entry(AccessLogTargetState::OverLimit, length, 'P');
+        CHECK_EQ(formatted_target(entry),
+                 "<request-target-over-limit:" + std::to_string(length) + ">");
+        CHECK(formatted(entry).find("PPPP") == std::string::npos);
+    }
+}
+
+TEST(format, unavailable_invalid_unknown_and_inconsistent_states_fail_closed) {
+    const auto invalid = [&](AccessLogTargetState state, u16 length) {
+        AccessLogEntry entry = make_explicit_entry(state, length, 'P');
+        CHECK_EQ(formatted_target(entry), std::string("<request-target-invalid>"));
+        CHECK(formatted(entry).find("PPPP") == std::string::npos);
+    };
+    AccessLogEntry unavailable = make_explicit_entry(AccessLogTargetState::Unavailable, 0u, 'P');
+    CHECK_EQ(formatted_target(unavailable), std::string("<request-target-unavailable>"));
+    CHECK(formatted(unavailable).find("PPPP") == std::string::npos);
+
+    AccessLogEntry explicit_invalid = make_explicit_entry(AccessLogTargetState::Invalid, 0u, 'P');
+    CHECK_EQ(formatted_target(explicit_invalid), std::string("<request-target-invalid>"));
+    CHECK(formatted(explicit_invalid).find("PPPP") == std::string::npos);
+
+    invalid(AccessLogTargetState::LegacyNullTerminated, 1u);
+    invalid(AccessLogTargetState::Complete, 0u);
+    invalid(AccessLogTargetState::Complete, 129u);
+    invalid(AccessLogTargetState::OverLimit, 0u);
+    invalid(AccessLogTargetState::OverLimit, 128u);
+    invalid(AccessLogTargetState::OverLimit, 16368u);
+    invalid(AccessLogTargetState::Unavailable, 1u);
+    invalid(AccessLogTargetState::Invalid, 1u);
+    invalid(static_cast<AccessLogTargetState>(255u), 0u);
+}
+
+TEST(format, transactional_null_small_and_exact_size) {
+    AccessLogEntry entry =
+        make_explicit_entry(AccessLogTargetState::Complete, kAccessLogCompleteTargetMax, 't');
+    char full[kAccessLogTextLineCapacity];
+    const u32 size = format_access_log_text(entry, full, sizeof(full));
+    REQUIRE(size > 0u);
+    CHECK_EQ(format_access_log_text(entry, nullptr, sizeof(full)), 0u);
+
+    char too_small[kAccessLogTextLineCapacity];
+    memset(too_small, 0x5A, sizeof(too_small));
+    CHECK_EQ(format_access_log_text(entry, too_small, size - 1u), 0u);
+    for (char byte : too_small) CHECK_EQ(static_cast<unsigned char>(byte), 0x5Au);
+
+    char exact[kAccessLogTextLineCapacity];
+    memset(exact, 0x6B, sizeof(exact));
+    CHECK_EQ(format_access_log_text(entry, exact, size), size);
+    CHECK(memcmp(exact, full, size) == 0);
+    for (u32 i = size; i < sizeof(exact); i++)
+        CHECK_EQ(static_cast<unsigned char>(exact[i]), 0x6Bu);
+}
+
+TEST(format, worst_case_valid_line_fits_public_flusher_capacity) {
+    AccessLogEntry entry =
+        make_explicit_entry(AccessLogTargetState::Complete, kAccessLogCompleteTargetMax, 't');
+    entry.duration_us = UINT32_MAX;
+    entry.req_size = UINT32_MAX;
+    entry.resp_size = UINT32_MAX;
+    entry.upstream_us = UINT32_MAX;
+    entry.addr = UINT32_MAX;
+    entry.status = UINT16_MAX;
+    entry.method = static_cast<u8>(LogHttpMethod::Options);
+    entry.shard_id = UINT8_MAX;
+    for (char& byte : entry.upstream) byte = 'u';
+    char line[kAccessLogTextLineCapacity];
+    const u32 size = format_access_log_text(entry, line, sizeof(line));
+    CHECK(size > 0u);
+    CHECK(size <= kAccessLogTextLineCapacity);
+    CHECK(formatted(entry).find(std::string(128u, 't')) != std::string::npos);
+}
+
 // === Flusher: plain text ===
 
 TEST(flusher, flush_empty_rings) {
@@ -268,7 +514,7 @@ TEST(flusher, add_ring_caps_at_max) {
     AccessLogFlusher flusher;
     flusher.init(-1);
 
-    AccessLogRing rings[AccessLogFlusher::kMaxRings + 1];
+    static AccessLogRing rings[AccessLogFlusher::kMaxRings + 1];
     for (u32 i = 0; i < AccessLogFlusher::kMaxRings + 1; i++) {
         rings[i].init();
         flusher.add_ring(&rings[i]);
@@ -567,6 +813,58 @@ TEST(zstd, compressed_output_is_smaller) {
     CHECK(zstd_size < plain_size / 2);
 }
 
+TEST(zstd, plain_and_decompressed_text_match_complete_and_marker_states) {
+    std::vector<AccessLogEntry> entries;
+    entries.push_back(make_explicit_entry(AccessLogTargetState::Complete, 66u, 'q'));
+    entries.push_back(make_explicit_entry(AccessLogTargetState::OverLimit, 129u, 'P'));
+    entries.push_back(make_explicit_entry(AccessLogTargetState::Unavailable, 0u, 'P'));
+    entries.push_back(make_explicit_entry(AccessLogTargetState::Invalid, 0u, 'P'));
+    entries.push_back(make_explicit_entry(static_cast<AccessLogTargetState>(255u), 0u, 'P'));
+
+    std::string expected;
+    for (const AccessLogEntry& entry : entries) expected += formatted(entry);
+
+    const auto flush = [&](bool compress, std::string& output) {
+        AccessLogRing ring;
+        ring.init();
+        for (const AccessLogEntry& entry : entries)
+            if (!ring.push(entry)) return false;
+        char path[] = "/tmp/rut-access-log-XXXXXX";
+        const i32 fd = mkstemp(path);
+        if (fd < 0) return false;
+        unlink(path);
+        AccessLogFlusher flusher;
+        flusher.init(fd, compress);
+        flusher.add_ring(&ring);
+        bool ok = true;
+        if (compress) {
+            const auto started = flusher.start();
+            ok = started.has_value();
+            if (ok) flusher.stop();
+        } else {
+            ok = flusher.flush_once() == entries.size();
+        }
+        if (lseek(fd, 0, SEEK_SET) < 0) ok = false;
+        char bytes[8192];
+        const ssize_t size = ok ? read(fd, bytes, sizeof(bytes)) : -1;
+        close(fd);
+        if (size <= 0) return false;
+        if (!compress) {
+            output.assign(bytes, bytes + size);
+            return true;
+        }
+        return decompress_with_isolated_helper(bytes, static_cast<size_t>(size), output);
+    };
+
+    std::string plain;
+    std::string decompressed;
+    REQUIRE(flush(false, plain));
+    REQUIRE(flush(true, decompressed));
+    CHECK_EQ(plain, expected);
+    CHECK_EQ(decompressed, expected);
+    CHECK(plain.find("PPPP") == std::string::npos);
+}
+
 // === Callback integration ===
 
 TEST(callback_log, emits_entry_on_response) {
@@ -620,8 +918,12 @@ TEST(callback_log, captures_request_metadata) {
     CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
     CHECK_EQ(out.req_size, req_len);
     CHECK_EQ(out.addr, 0x0100007F);
+    CHECK_EQ(out.target_state, AccessLogTargetState::LegacyNullTerminated);
+    CHECK_EQ(out.target_length, 0u);
     CHECK_EQ(out.path[0], '/');
     CHECK_EQ(out.path[1], 'a');
+    for (u32 i = kAccessLogLegacyTargetWidth; i < sizeof(out.path); i++)
+        CHECK_EQ(out.path[i], '\0');
 }
 
 TEST(callback_log, no_log_when_ring_null) {

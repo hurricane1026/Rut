@@ -302,7 +302,19 @@ add_executable(test_access_log
     test_access_log.cc
     ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
+find_library(RUT_TEST_ZSTD_DECOMPRESS_LIBRARY NAMES zstd REQUIRED)
+add_executable(test_access_log_zstd_decompress_helper zstd_decompress_helper.cc)
+target_include_directories(test_access_log_zstd_decompress_helper PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/zstd/lib
+)
+target_link_libraries(test_access_log_zstd_decompress_helper
+    ${RUT_TEST_ZSTD_DECOMPRESS_LIBRARY}
+)
 target_link_libraries(test_access_log rut_runtime)
+target_compile_definitions(test_access_log PRIVATE
+    RUT_TEST_ZSTD_DECOMPRESS_HELPER="$<TARGET_FILE:test_access_log_zstd_decompress_helper>"
+)
+add_dependencies(test_access_log test_access_log_zstd_decompress_helper)
 target_include_directories(test_access_log PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
