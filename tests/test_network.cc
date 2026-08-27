@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -49,6 +50,27 @@ static i32 count_open_fds() {
     }
     closedir(directory);
     return count - 1;  // Exclude the directory fd used for this inventory.
+}
+
+struct ScopedListenerTestFd {
+    i32 fd = -1;
+
+    ScopedListenerTestFd() = default;
+    explicit ScopedListenerTestFd(i32 value) : fd(value) {}
+    ScopedListenerTestFd(const ScopedListenerTestFd&) = delete;
+    ScopedListenerTestFd& operator=(const ScopedListenerTestFd&) = delete;
+
+    ~ScopedListenerTestFd() {
+        if (fd >= 0) close(fd);
+    }
+};
+
+static sockaddr_in listener_test_ipv4(u32 ipv4_host, u16 port) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(ipv4_host);
+    address.sin_port = htons(port);
+    return address;
 }
 
 TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
@@ -94,19 +116,187 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     close(first_fd);
 }
 
-TEST(listener_context, exact_and_invalid_metadata_fail_before_socket_creation) {
-    struct FdGuard {
-        i32 fd = -1;
-        ~FdGuard() {
-            if (fd >= 0) close(fd);
-        }
-    } occupied;
-    occupied.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+TEST(listener_context, exact_ipv4_bind_is_address_scoped_and_connectable) {
+    constexpr u32 kPositiveAddress = 0x7f000001u;
+    constexpr u32 kGuardAddress = 0x7f000002u;
+
+    ScopedListenerTestFd guard(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    REQUIRE_GE(guard.fd, 0);
+    sockaddr_in guard_address = listener_test_ipv4(kGuardAddress, 0u);
+    REQUIRE_EQ(bind(guard.fd, reinterpret_cast<sockaddr*>(&guard_address), sizeof(guard_address)),
+               0);
+    socklen_t guard_address_len = sizeof(guard_address);
+    REQUIRE_EQ(
+        getsockname(guard.fd, reinterpret_cast<sockaddr*>(&guard_address), &guard_address_len), 0);
+    REQUIRE_EQ(guard_address_len, sizeof(guard_address));
+    CHECK_EQ(guard_address.sin_family, AF_INET);
+    CHECK_EQ(ntohl(guard_address.sin_addr.s_addr), kGuardAddress);
+    const u16 port = ntohs(guard_address.sin_port);
+    REQUIRE_NE(port, 0u);
+    const i32 guard_descriptor_flags = fcntl(guard.fd, F_GETFD);
+    REQUIRE_GE(guard_descriptor_flags, 0);
+    CHECK_NE(guard_descriptor_flags & FD_CLOEXEC, 0);
+
+    // The non-listening 127.0.0.2:P guard makes a wildcard mutation fail at
+    // bind while leaving the exact 127.0.0.1:P endpoint available.
+    auto wildcard_mutation = create_listen_socket(port);
+    REQUIRE_FALSE(wildcard_mutation);
+    CHECK_EQ(wildcard_mutation.error().source, Error::Source::Socket);
+    CHECK_EQ(wildcard_mutation.error().code, EADDRINUSE);
+
+    ListenerSpec exact{
+        ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, port, kPositiveAddress};
+    ListenerContext context{};
+    auto listener_result = bind_listener_shard(exact, port, nullptr, &context);
+    REQUIRE(listener_result);
+    ScopedListenerTestFd listener(listener_result.value());
+    CHECK(context.valid());
+    CHECK(context.address == ListenerAddress::IPv4Exact);
+    CHECK(context.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(context.port, port);
+    CHECK_EQ(context.ipv4_host, kPositiveAddress);
+    const i32 listener_descriptor_flags = fcntl(listener.fd, F_GETFD);
+    REQUIRE_GE(listener_descriptor_flags, 0);
+    CHECK_NE(listener_descriptor_flags & FD_CLOEXEC, 0);
+    const i32 listener_status_flags = fcntl(listener.fd, F_GETFL);
+    REQUIRE_GE(listener_status_flags, 0);
+    CHECK_NE(listener_status_flags & O_NONBLOCK, 0);
+
+    const struct {
+        i32 level;
+        i32 option;
+        i32 expected;
+    } socket_options[] = {
+        {SOL_SOCKET, SO_TYPE, SOCK_STREAM},
+        {SOL_SOCKET, SO_REUSEADDR, 1},
+        {SOL_SOCKET, SO_REUSEPORT, 1},
+        {SOL_SOCKET, SO_ACCEPTCONN, 1},
+        {IPPROTO_TCP, TCP_NODELAY, 1},
+    };
+    for (const auto& option : socket_options) {
+        i32 actual = 0;
+        socklen_t actual_len = sizeof(actual);
+        REQUIRE_EQ(getsockopt(listener.fd, option.level, option.option, &actual, &actual_len), 0);
+        REQUIRE_EQ(actual_len, sizeof(actual));
+        CHECK_EQ(actual, option.expected);
+    }
+
+    sockaddr_in bound{};
+    socklen_t bound_len = sizeof(bound);
+    REQUIRE_EQ(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
+    REQUIRE_EQ(bound_len, sizeof(bound));
+    CHECK_EQ(bound.sin_family, AF_INET);
+    CHECK_EQ(ntohs(bound.sin_port), port);
+    CHECK_EQ(ntohl(bound.sin_addr.s_addr), kPositiveAddress);
+
+    ScopedListenerTestFd positive_client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    REQUIRE_GE(positive_client.fd, 0);
+    sockaddr_in positive_address = listener_test_ipv4(kPositiveAddress, port);
+    REQUIRE_EQ(connect(positive_client.fd,
+                       reinterpret_cast<sockaddr*>(&positive_address),
+                       sizeof(positive_address)),
+               0);
+    ScopedListenerTestFd accepted(
+        accept4(listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+    REQUIRE_GE(accepted.fd, 0);
+    const i32 accepted_descriptor_flags = fcntl(accepted.fd, F_GETFD);
+    REQUIRE_GE(accepted_descriptor_flags, 0);
+    CHECK_NE(accepted_descriptor_flags & FD_CLOEXEC, 0);
+
+    ScopedListenerTestFd negative_client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    REQUIRE_GE(negative_client.fd, 0);
+    sockaddr_in negative_address = listener_test_ipv4(kGuardAddress, port);
+    errno = 0;
+    REQUIRE_EQ(connect(negative_client.fd,
+                       reinterpret_cast<sockaddr*>(&negative_address),
+                       sizeof(negative_address)),
+               -1);
+    CHECK_EQ(errno, ECONNREFUSED);
+
+    int guard_accepts = 1;
+    socklen_t guard_accepts_len = sizeof(guard_accepts);
+    REQUIRE_EQ(getsockopt(guard.fd, SOL_SOCKET, SO_ACCEPTCONN, &guard_accepts, &guard_accepts_len),
+               0);
+    CHECK_EQ(guard_accepts, 0);
+}
+
+TEST(listener_context, exact_ephemeral_shards_share_address_and_resolved_port) {
+    constexpr u32 kExactAddress = 0x7f000001u;
+    ListenerSpec exact{ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, 0u, kExactAddress};
+
+    ListenerContext first_context{};
+    auto first_result = bind_listener_shard(exact, 0u, nullptr, &first_context);
+    REQUIRE(first_result);
+    ScopedListenerTestFd first(first_result.value());
+    CHECK(first_context.valid());
+    CHECK(first_context.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(first_context.ipv4_host, kExactAddress);
+    CHECK_NE(first_context.port, 0u);
+
+    ListenerContext second_context{};
+    auto second_result =
+        bind_listener_shard(exact, first_context.port, &first_context, &second_context);
+    REQUIRE(second_result);
+    ScopedListenerTestFd second(second_result.value());
+    CHECK(second_context.equivalent(first_context));
+
+    for (const i32 fd : {first.fd, second.fd}) {
+        sockaddr_in bound{};
+        socklen_t bound_len = sizeof(bound);
+        REQUIRE_EQ(getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
+        REQUIRE_EQ(bound_len, sizeof(bound));
+        CHECK_EQ(ntohl(bound.sin_addr.s_addr), kExactAddress);
+        CHECK_EQ(ntohs(bound.sin_port), first_context.port);
+    }
+}
+
+TEST(listener_context, exact_expected_context_mismatches_close_new_socket) {
+    constexpr u32 kExactAddress = 0x7f000001u;
+    ListenerSpec exact{ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, 0u, kExactAddress};
+    ListenerContext canonical{};
+    auto first_result = bind_listener_shard(exact, 0u, nullptr, &canonical);
+    REQUIRE(first_result);
+    ScopedListenerTestFd first(first_result.value());
+
+    ListenerContext mismatches[3] = {canonical, canonical, canonical};
+    mismatches[0].address = ListenerAddress::IPv4Exact;
+    mismatches[0].ipv4_host = 0x7f000002u;
+    mismatches[1].port = canonical.port == 65535u ? 65534u : canonical.port + 1u;
+    mismatches[2].transport = ListenerTransport::Tls;
+    const i32 baseline_fds = count_open_fds();
+    REQUIRE_GE(baseline_fds, 0);
+    for (const auto& expected : mismatches) {
+        REQUIRE(expected.valid());
+        ListenerContext out{ListenerAddress::IPv4Exact, ListenerTransport::Tls, 1234u, 0x7f000002u};
+        auto result = bind_listener_shard(exact, canonical.port, &expected, &out);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().source, Error::Source::Socket);
+        CHECK_EQ(result.error().code, EADDRINUSE);
+        CHECK(!out.valid());
+        CHECK(out.address == ListenerAddress::IPv4Wildcard);
+        CHECK(out.transport == ListenerTransport::Cleartext);
+        CHECK_EQ(out.port, 0u);
+        CHECK_EQ(out.ipv4_host, 0u);
+        CHECK_EQ(count_open_fds(), baseline_fds);
+    }
+
+    ListenerSpec wrong_address = exact;
+    wrong_address.ipv4_host = 0x7f000002u;
+    auto address_mismatch = derive_listener_context(first.fd, wrong_address, canonical.port);
+    REQUIRE_FALSE(address_mismatch);
+    CHECK(address_mismatch.error() == ListenerContextError::InvalidBoundAddress);
+
+    ListenerSpec wrong_port = exact;
+    wrong_port.port = canonical.port == 65535u ? 65534u : canonical.port + 1u;
+    auto port_mismatch = derive_listener_context(first.fd, wrong_port, wrong_port.port);
+    REQUIRE_FALSE(port_mismatch);
+    CHECK(port_mismatch.error() == ListenerContextError::InvalidBoundAddress);
+}
+
+TEST(listener_context, invalid_metadata_fails_before_socket_creation) {
+    ScopedListenerTestFd occupied(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
     REQUIRE_GE(occupied.fd, 0);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = 0;
+    sockaddr_in address = listener_test_ipv4(INADDR_ANY, 0u);
     REQUIRE_EQ(bind(occupied.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
     REQUIRE_EQ(listen(occupied.fd, 1), 0);
     socklen_t address_len = sizeof(address);
@@ -115,86 +305,74 @@ TEST(listener_context, exact_and_invalid_metadata_fail_before_socket_creation) {
     const u16 occupied_port = ntohs(address.sin_port);
     REQUIRE_NE(occupied_port, 0u);
 
-    // Control: this port would make the legacy wildcard creator enter socket()
-    // and fail at bind. The exact Stage-1 path must instead reject before it
-    // attempts that creator.
     auto wildcard_control = create_listen_socket(occupied_port);
     REQUIRE_FALSE(wildcard_control);
     CHECK_EQ(wildcard_control.error().source, Error::Source::Socket);
     CHECK_EQ(wildcard_control.error().code, EADDRINUSE);
 
+    const ListenerSpec invalid[] = {
+        {ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, occupied_port, 1u},
+        {ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, occupied_port, 0u},
+        {static_cast<ListenerAddress>(0xff), ListenerTransport::Cleartext, occupied_port, 0u},
+        {ListenerAddress::IPv4Wildcard, static_cast<ListenerTransport>(0xff), occupied_port, 0u},
+    };
     const i32 baseline_fds = count_open_fds();
     REQUIRE_GE(baseline_fds, 0);
-    ListenerSpec exact{
-        ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, occupied_port, 0x7f000001u};
-    ListenerContext out{ListenerAddress::IPv4Exact, ListenerTransport::Tls, 1234u, 0x7f000002u};
-    auto exact_result = bind_listener_shard(exact, occupied_port, nullptr, &out);
-    REQUIRE_FALSE(exact_result);
-    CHECK_EQ(exact_result.error().source, Error::Source::Socket);
-    CHECK_EQ(exact_result.error().code, EAFNOSUPPORT);
+    for (const auto& candidate : invalid) {
+        auto direct = create_listen_socket(candidate, occupied_port);
+        REQUIRE_FALSE(direct);
+        CHECK_EQ(direct.error().source, Error::Source::Socket);
+        CHECK_EQ(direct.error().code, EAFNOSUPPORT);
+        CHECK_EQ(count_open_fds(), baseline_fds);
+
+        ListenerContext out{ListenerAddress::IPv4Exact, ListenerTransport::Tls, 4321u, 0x7f000002u};
+        auto result = bind_listener_shard(candidate, occupied_port, nullptr, &out);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().source, Error::Source::Socket);
+        CHECK_EQ(result.error().code, EAFNOSUPPORT);
+        CHECK(!out.valid());
+        CHECK(out.address == ListenerAddress::IPv4Wildcard);
+        CHECK(out.transport == ListenerTransport::Cleartext);
+        CHECK_EQ(out.port, 0u);
+        CHECK_EQ(out.ipv4_host, 0u);
+        CHECK_EQ(count_open_fds(), baseline_fds);
+
+        auto derived = derive_listener_context(occupied.fd, candidate, occupied_port);
+        REQUIRE_FALSE(derived);
+        const auto expected_error = listener_transport_valid(candidate.transport)
+                                        ? ListenerContextError::UnsupportedAddress
+                                        : ListenerContextError::UnsupportedTransport;
+        CHECK(derived.error() == expected_error);
+    }
+
+    ListenerContext invalid_expected{
+        ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, occupied_port, 0u};
+    ListenerSpec valid{};
+    valid.port = occupied_port;
+    ListenerContext out{ListenerAddress::IPv4Exact, ListenerTransport::Tls, 4321u, 0x7f000002u};
+    auto expected_result = bind_listener_shard(valid, occupied_port, &invalid_expected, &out);
+    REQUIRE_FALSE(expected_result);
+    CHECK_EQ(expected_result.error().source, Error::Source::Socket);
+    CHECK_EQ(expected_result.error().code, EAFNOSUPPORT);
     CHECK(out.address == ListenerAddress::IPv4Wildcard);
     CHECK(out.transport == ListenerTransport::Cleartext);
     CHECK_EQ(out.port, 0u);
     CHECK_EQ(out.ipv4_host, 0u);
     CHECK_EQ(count_open_fds(), baseline_fds);
 
-    auto exact_derive = derive_listener_context(occupied.fd, exact);
-    REQUIRE_FALSE(exact_derive);
-    CHECK(exact_derive.error() == ListenerContextError::UnsupportedAddress);
-
-    ListenerSpec wildcard{};
-    wildcard.port = occupied_port;
-    ListenerContext exact_expected{
-        ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, occupied_port, 0x7f000001u};
-    ListenerContext expected_out{
-        ListenerAddress::IPv4Exact, ListenerTransport::Tls, 4321u, 0x7f000002u};
-    auto exact_expected_result =
-        bind_listener_shard(wildcard, occupied_port, &exact_expected, &expected_out);
-    REQUIRE_FALSE(exact_expected_result);
-    CHECK_EQ(exact_expected_result.error().source, Error::Source::Socket);
-    CHECK_EQ(exact_expected_result.error().code, EAFNOSUPPORT);
-    CHECK(!expected_out.valid());
-    CHECK_EQ(expected_out.ipv4_host, 0u);
+    auto null_out = bind_listener_shard(invalid[0], occupied_port, nullptr, nullptr);
+    REQUIRE_FALSE(null_out);
+    CHECK_EQ(null_out.error().source, Error::Source::Socket);
+    CHECK_EQ(null_out.error().code, EINVAL);
     CHECK_EQ(count_open_fds(), baseline_fds);
 
-    const ListenerSpec invalid[] = {
-        {ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, occupied_port, 1u},
-        {ListenerAddress::IPv4Exact, ListenerTransport::Cleartext, occupied_port, 0u},
-        {static_cast<ListenerAddress>(0xff), ListenerTransport::Cleartext, occupied_port, 0u},
-    };
-    for (const auto& candidate : invalid) {
-        ListenerContext invalid_out{
-            ListenerAddress::IPv4Exact, ListenerTransport::Tls, 4321u, 0x7f000002u};
-        auto result = bind_listener_shard(candidate, occupied_port, nullptr, &invalid_out);
-        REQUIRE_FALSE(result);
-        CHECK_EQ(result.error().source, Error::Source::Socket);
-        CHECK_EQ(result.error().code, EAFNOSUPPORT);
-        CHECK(!invalid_out.valid());
-        CHECK_EQ(invalid_out.ipv4_host, 0u);
-        CHECK_EQ(count_open_fds(), baseline_fds);
-        auto derived = derive_listener_context(occupied.fd, candidate);
-        REQUIRE_FALSE(derived);
-        CHECK(derived.error() == ListenerContextError::UnsupportedAddress);
-    }
-
-    ListenerSpec invalid_transport{};
-    invalid_transport.transport = static_cast<ListenerTransport>(0xff);
-    ListenerContext invalid_transport_out{};
-    auto invalid_transport_result =
-        bind_listener_shard(invalid_transport, occupied_port, nullptr, &invalid_transport_out);
-    REQUIRE_FALSE(invalid_transport_result);
-    CHECK_EQ(invalid_transport_result.error().source, Error::Source::Socket);
-    CHECK_EQ(invalid_transport_result.error().code, EAFNOSUPPORT);
+    ListenerSpec mismatched_request{};
+    mismatched_request.port = occupied_port == 65535u ? 65534u : occupied_port + 1u;
+    auto request_result = create_listen_socket(mismatched_request, occupied_port);
+    REQUIRE_FALSE(request_result);
+    CHECK_EQ(request_result.error().source, Error::Source::Socket);
+    CHECK_EQ(request_result.error().code, EINVAL);
     CHECK_EQ(count_open_fds(), baseline_fds);
-    auto invalid_transport_derive = derive_listener_context(occupied.fd, invalid_transport);
-    REQUIRE_FALSE(invalid_transport_derive);
-    CHECK(invalid_transport_derive.error() == ListenerContextError::UnsupportedTransport);
-
-    int accepts = 0;
-    socklen_t accepts_len = sizeof(accepts);
-    REQUIRE_EQ(getsockopt(occupied.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts, &accepts_len), 0);
-    CHECK_EQ(accepts, 1);
-    CHECK_EQ(ntohs(address.sin_port), occupied_port);
 }
 
 TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {

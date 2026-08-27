@@ -37,12 +37,11 @@ enum class ListenerContextError : u8 {
 };
 
 // Derive the immutable runtime context from a successfully bound listener.
-// The current socket creator is intentionally IPv4 wildcard only; callers
-// must reject any other kernel result rather than guessing its authority.
+// Address and port are kernel-observed. Transport is separately validated
+// process metadata; getsockname() cannot distinguish cleartext from TLS.
 inline core::Expected<ListenerContext, ListenerContextError> derive_listener_context(
-    i32 fd, const ListenerSpec& declared) {
-    if (!listener_address_valid(declared.address, declared.ipv4_host) ||
-        declared.address != ListenerAddress::IPv4Wildcard)
+    i32 fd, const ListenerSpec& declared, u16 requested_port) {
+    if (!listener_address_valid(declared.address, declared.ipv4_host))
         return core::make_unexpected(ListenerContextError::UnsupportedAddress);
     if (!listener_transport_valid(declared.transport))
         return core::make_unexpected(ListenerContextError::UnsupportedTransport);
@@ -51,12 +50,26 @@ inline core::Expected<ListenerContext, ListenerContextError> derive_listener_con
     socklen_t len = sizeof(bound);
     if (getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) < 0)
         return core::make_unexpected(ListenerContextError::GetSockName);
-    if (len < sizeof(sockaddr_in) || bound.sin_family != AF_INET || bound.sin_addr.s_addr != 0)
+    if (len < sizeof(sockaddr_in) || bound.sin_family != AF_INET)
         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
 
-    ListenerContext result{declared.address, declared.transport, ntohs(bound.sin_port), 0u};
+    const u16 bound_port = ntohs(bound.sin_port);
+    const u32 bound_ipv4_host = ntohl(bound.sin_addr.s_addr);
+    if ((requested_port != 0u && bound_port != requested_port) ||
+        (declared.port != 0u && bound_port != declared.port))
+        return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+    if ((declared.address == ListenerAddress::IPv4Wildcard && bound_ipv4_host != 0u) ||
+        (declared.address == ListenerAddress::IPv4Exact && bound_ipv4_host != declared.ipv4_host))
+        return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+
+    ListenerContext result{declared.address, declared.transport, bound_port, bound_ipv4_host};
     if (!result.valid()) return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
     return result;
+}
+
+inline core::Expected<ListenerContext, ListenerContextError> derive_listener_context(
+    i32 fd, const ListenerSpec& declared) {
+    return derive_listener_context(fd, declared, declared.port);
 }
 
 // Bind one shard listener and derive its actual immutable context.  The first
@@ -72,19 +85,17 @@ inline core::Expected<i32, Error> bind_listener_shard(const ListenerSpec& declar
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     *out_context = {};
 
-    // Stage 1 carries exact-address metadata but deliberately does not activate
-    // exact binding. Reject unsupported or forged metadata before creating a
-    // socket so it can never degrade to the legacy wildcard path.
-    if (!declared.valid() || declared.address != ListenerAddress::IPv4Wildcard ||
-        (expected != nullptr &&
-         (!expected->valid() || expected->address != ListenerAddress::IPv4Wildcard)))
+    // Reject forged metadata before creating a socket so it can never degrade
+    // to the legacy wildcard path. A valid but unequal expected context is
+    // checked after bind and closes the newly-created fd on mismatch.
+    if (!declared.valid() || (expected != nullptr && !expected->valid()))
         return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
 
-    auto fd_result = create_listen_socket(requested_port);
+    auto fd_result = create_listen_socket(declared, requested_port);
     if (!fd_result) return fd_result;
     const i32 fd = fd_result.value();
 
-    auto context = derive_listener_context(fd, declared);
+    auto context = derive_listener_context(fd, declared, requested_port);
     if (!context) {
         close(fd);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
