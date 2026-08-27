@@ -6124,23 +6124,52 @@ static bool run_pinned_bounded_no_content_path_oracle(
     BoundedExactLocalPathOracleObservation& exact_first,
     BoundedExactLocalPathOracleObservation& root_first,
     std::string& error) {
+    struct ReservedPorts {
+        int fds[4];
+
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
     u16 ports[4]{};
-    bool unique = false;
-    for (int attempt = 0; attempt < 8 && !unique; attempt++) {
-        unique = true;
-        for (u16& port : ports) {
-            if (!allocate_port(port)) {
-                unique = false;
-                break;
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#328 could not bind-reserve four frontend/backend ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        if (reservations.fds[i] < 0 || ports[i] == 0u) {
+            error = "#328 did not hold four nonzero frontend/backend ports";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#328 did not hold four distinct frontend/backend ports";
+                return false;
             }
         }
-        for (size_t i = 0; unique && i < 4u; i++)
-            for (size_t j = i + 1u; j < 4u; j++)
-                if (ports[i] == ports[j]) unique = false;
-    }
-    if (!unique) {
-        error = "#328 could not allocate four distinct frontend/backend ports";
-        return false;
     }
     TempDir exact_temp;
     TempDir root_temp;
@@ -6159,7 +6188,9 @@ static bool run_pinned_bounded_no_content_path_oracle(
                                                        true,
                                                        true,
                                                        exact_first,
-                                                       error) ||
+                                                       error,
+                                                       &reservations.fds[0],
+                                                       &reservations.fds[1]) ||
         !capture_pinned_bounded_exact_local_path_order(ports[2],
                                                        ports[3],
                                                        root_temp,
@@ -6167,7 +6198,9 @@ static bool run_pinned_bounded_no_content_path_oracle(
                                                        false,
                                                        true,
                                                        root_first,
-                                                       error)) {
+                                                       error,
+                                                       &reservations.fds[2],
+                                                       &reservations.fds[3])) {
         dump_log(exact_temp.nginx_config, "#328 exact-first nginx config");
         dump_log(exact_temp.nginx_log, "#328 exact-first nginx error log");
         dump_log(exact_temp.nginx_access_log, "#328 exact-first nginx access log");
@@ -6175,6 +6208,12 @@ static bool run_pinned_bounded_no_content_path_oracle(
         dump_log(root_temp.nginx_log, "#328 root-first nginx error log");
         dump_log(root_temp.nginx_access_log, "#328 root-first nginx access log");
         return false;
+    }
+    for (int fd : reservations.fds) {
+        if (fd >= 0) {
+            error = "#328 pinned oracle did not consume every frontend/backend reservation";
+            return false;
+        }
     }
     std::string exact_access;
     std::string root_access;
