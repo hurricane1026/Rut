@@ -213,6 +213,116 @@ bool proxy_location_path_is_clean(Str path) {
 
 enum class ProxyLocationProfile : u8 { RootWithoutUri, PrefixWithUri };
 
+// Call only after the listener's complete source range and common-source
+// provenance have been established. Leading zeroes are intentionally accepted
+// to match the bounded nginx parser's existing decimal-port grammar.
+bool listener_endpoint_matches(uintptr_t source_base,
+                               const Span& value_span,
+                               const char* prefix,
+                               u32 prefix_len,
+                               u16 expected_port) {
+    const u32 value_len = value_span.end - value_span.start;
+    if (value_len <= prefix_len ||
+        (prefix_len != 0u &&
+         !eq({trusted_source_at(source_base, value_span.start), prefix_len}, prefix, prefix_len)))
+        return false;
+    u32 parsed_port = 0;
+    for (u32 i = prefix_len; i < value_len; i++) {
+        const char byte = *trusted_source_at(source_base, value_span.start + i);
+        if (byte < '0' || byte > '9') return false;
+        const u32 digit = static_cast<u32>(byte - '0');
+        if (parsed_port > (65535u - digit) / 10u) return false;
+        parsed_port = parsed_port * 10u + digit;
+    }
+    return parsed_port != 0u && parsed_port == expected_port;
+}
+
+FrontendResult<bool> validate_listener(const Server& server,
+                                       ProxyLocationProfile proxy_profile,
+                                       bool has_exact_local_return,
+                                       bool has_exact_no_content_return,
+                                       bool has_exact_absolute_redirect) {
+    static constexpr char kIpv4WildcardPrefix[] = "0.0.0.0:";
+    static constexpr char kAsteriskWildcardPrefix[] = "*:";
+    static constexpr char kExactLoopbackPrefix[] = "127.0.0.1:";
+    const Listen& listener = server.listen;
+    if (listener.port == 0)
+        return invalid_integer(listener.span, lit_str("invalid model listen port"));
+    if (!listener_address_valid(listener.address, listener.ipv4_host) ||
+        (listener.address == ListenerAddress::IPv4Exact && listener.ipv4_host != 0x7f000001u))
+        return unsupported(listener.span, lit_str("invalid model listen address"));
+    if (!span_position_is_coherent(server.span, listener.span))
+        return unsupported(is_valid_span(listener.span) ? listener.span : server.span,
+                           lit_str("invalid model listen spans"));
+    if (listener.span.end - listener.span.start < 8u)
+        return unsupported(listener.span, lit_str("invalid model listen spans"));
+
+    if (is_default_span(listener.value_span)) {
+        if (listener.address != ListenerAddress::IPv4Wildcard || listener.value.ptr != nullptr ||
+            listener.value.len != 0)
+            return unsupported(listener.span, lit_str("invalid model listen spans"));
+        // Preserve the original hand-built wildcard fixtures. Parser-produced
+        // models always retain the complete endpoint token below.
+        return false;
+    }
+    if (!span_position_is_coherent(listener.span, listener.value_span) ||
+        listener.value_span.start <= listener.span.start + 6u ||
+        listener.value_span.end >= listener.span.end)
+        return unsupported(listener.value_span, lit_str("invalid model listen spans"));
+    const uintptr_t value_address = reinterpret_cast<uintptr_t>(listener.value.ptr);
+    if (listener.value.ptr == nullptr ||
+        listener.value.len != listener.value_span.end - listener.value_span.start ||
+        value_address < listener.value_span.start ||
+        value_address > UINTPTR_MAX - listener.value.len)
+        return unsupported(listener.value_span, lit_str("invalid listen source provenance"));
+
+    const uintptr_t source_base = value_address - listener.value_span.start;
+    const Location& location = server.location;
+    if (source_base > UINTPTR_MAX - server.span.end ||
+        !source_borrow_is_coherent(listener.value, listener.value_span, source_base) ||
+        !source_borrow_is_coherent(location.path, location.path_span, source_base) ||
+        !source_position_is_coherent(source_base, server.span, listener.span) ||
+        !source_position_is_coherent(source_base, server.span, listener.value_span))
+        return unsupported(listener.value_span, lit_str("invalid listen source provenance"));
+
+    if (!eq({trusted_source_at(source_base, listener.span.start), 6u}, "listen", 6u) ||
+        *trusted_source_at(source_base, listener.span.end - 1u) != ';' ||
+        !trusted_source_gap_is_exact(
+            source_base, listener.span.start + 6u, listener.value_span.start) ||
+        !trusted_source_gap_is_exact(source_base, listener.value_span.end, listener.span.end - 1u))
+        return unsupported(listener.value_span, lit_str("invalid listen source provenance"));
+
+    if (listener.address == ListenerAddress::IPv4Wildcard) {
+        if (!listener_endpoint_matches(
+                source_base, listener.value_span, nullptr, 0u, listener.port) &&
+            !listener_endpoint_matches(source_base,
+                                       listener.value_span,
+                                       kIpv4WildcardPrefix,
+                                       sizeof(kIpv4WildcardPrefix) - 1u,
+                                       listener.port) &&
+            !listener_endpoint_matches(source_base,
+                                       listener.value_span,
+                                       kAsteriskWildcardPrefix,
+                                       sizeof(kAsteriskWildcardPrefix) - 1u,
+                                       listener.port))
+            return unsupported(listener.value_span,
+                               lit_str("invalid wildcard listen endpoint model"));
+        return false;
+    }
+
+    if (!listener_endpoint_matches(source_base,
+                                   listener.value_span,
+                                   kExactLoopbackPrefix,
+                                   sizeof(kExactLoopbackPrefix) - 1u,
+                                   listener.port))
+        return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
+    if (proxy_profile != ProxyLocationProfile::RootWithoutUri || has_exact_local_return ||
+        has_exact_no_content_return || has_exact_absolute_redirect)
+        return unsupported(listener.span,
+                           lit_str("exact listen requires the minimal root proxy profile"));
+    return true;
+}
+
 bool basic_borrow_address_is_safe(Str text, const Span& span) {
     if (text.ptr == nullptr || !is_valid_span(span) || span.end - span.start != text.len)
         return false;
@@ -1166,8 +1276,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
-    if (server.listen.port == 0)
-        return invalid_integer(server.listen.span, lit_str("invalid model listen port"));
+    auto listener = validate_listener(server,
+                                      proxy_location.value(),
+                                      exact_local_return.value(),
+                                      exact_no_content_return.value(),
+                                      exact_absolute_redirect.value());
+    if (!listener) return core::make_unexpected(listener.error());
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)
         return invalid_integer(server.location.proxy_pass.span,
@@ -1194,7 +1308,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return out_of_memory(server.span, lit_str("generated RUT source is too large"));
     };
 
-    if (!put("listen :") || !writer.put_u16(server.listen.port) || !put("\n") ||
+    if (!(listener.value() ? put("listen 127.0.0.1:") : put("listen :")) ||
+        !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
         !writer.put_u16(proxy.port) || !put("\"\n"))

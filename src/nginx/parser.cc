@@ -350,6 +350,9 @@ private:
             return unsupported(port.span, lit_str("variables are unsupported"));
         static constexpr char kIpv4WildcardPrefix[] = "0.0.0.0:";
         static constexpr char kAsteriskWildcardPrefix[] = "*:";
+        static constexpr char kExactLoopbackPrefix[] = "127.0.0.1:";
+        ListenerAddress address = ListenerAddress::IPv4Wildcard;
+        u32 ipv4_host = 0;
         Str port_text = port.text;
         if (port_text.len >= sizeof(kIpv4WildcardPrefix) - 1u &&
             port_text.slice(0, sizeof(kIpv4WildcardPrefix) - 1u).eq(lit_str(kIpv4WildcardPrefix))) {
@@ -358,6 +361,12 @@ private:
                    port_text.slice(0, sizeof(kAsteriskWildcardPrefix) - 1u)
                        .eq(lit_str(kAsteriskWildcardPrefix))) {
             port_text = port_text.slice(sizeof(kAsteriskWildcardPrefix) - 1u, port_text.len);
+        } else if (port_text.len >= sizeof(kExactLoopbackPrefix) - 1u &&
+                   port_text.slice(0, sizeof(kExactLoopbackPrefix) - 1u)
+                       .eq(lit_str(kExactLoopbackPrefix))) {
+            address = ListenerAddress::IPv4Exact;
+            ipv4_host = 0x7f000001u;
+            port_text = port_text.slice(sizeof(kExactLoopbackPrefix) - 1u, port_text.len);
         }
         u16 value = 0;
         if (!parse_port(port_text, &value))
@@ -375,7 +384,14 @@ private:
             return unsupported(cur_.span, lit_str("listen options are unsupported"));
         const Span end = cur_.span;
         advance();
-        return Listen{value, Span{start.start, end.end, start.line, start.col}};
+        Listen result{};
+        result.port = value;
+        result.span = Span{start.start, end.end, start.line, start.col};
+        result.address = address;
+        result.ipv4_host = ipv4_host;
+        result.value = port.text;
+        result.value_span = port.span;
+        return result;
     }
 
     FrontendResult<ParsedLocation> parse_location() {

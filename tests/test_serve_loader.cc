@@ -3,6 +3,8 @@
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
 #include "deferred_preflight_fixture.h"
+#include "rut/nginx/converter.h"
+#include "rut/nginx/parser.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
@@ -12,6 +14,7 @@
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn / WsFrameAction / WsOpcode
 #endif
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -567,6 +570,64 @@ TEST(serve_loader, exact_ipv4_listener_metadata_survives_frontend_and_source_lif
     CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
     CHECK(program.listener.transport == ListenerTransport::Cleartext);
     CHECK_EQ(program.listener.port, 0u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
+TEST(serve_loader, nginx_exact_loopback_generated_source_owns_listener_and_reuses_cleanly) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_listener";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8080; "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    program.destroy();
+
+    {
+        char nginx_source[] =
+            "server { listen *:8081; "
+            "location / { proxy_pass http://127.0.0.1:9001; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'z');
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8081u);
     CHECK_EQ(program.listener.ipv4_host, 0u);
     program.destroy();
     std::filesystem::remove(path);

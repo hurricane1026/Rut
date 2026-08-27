@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/listener_address.h"
 #include "rut/common/types.h"
 #include "rut/compiler/diagnostic.h"
 
@@ -8,6 +9,13 @@ namespace rut::nginx {
 struct Listen {
     u16 port = 0;
     Span span{};
+    // Address and port are normalized semantic startup metadata. `value`
+    // borrows the complete endpoint token from the nginx source and
+    // `value_span` pins that token's provenance.
+    ListenerAddress address = ListenerAddress::IPv4Wildcard;
+    u32 ipv4_host = 0;
+    Str value{};
+    Span value_span{};
 };
 
 // The bounded proxy replacement-URI slice accepts an absolute clean replacement

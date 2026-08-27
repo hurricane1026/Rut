@@ -1177,7 +1177,7 @@ if(RUT_ENABLE_JIT)
 
     # Exercise the same reusable loader library linked by rut and SourceTarget.
     add_executable(test_serve_loader test_serve_loader.cc)
-    target_link_libraries(test_serve_loader rut_loader)
+    target_link_libraries(test_serve_loader rut_loader rut_nginx)
     target_include_directories(test_serve_loader PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/testing
