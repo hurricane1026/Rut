@@ -348,8 +348,14 @@ private:
         const Token port = cur_;
         if (contains(port.text, '$'))
             return unsupported(port.span, lit_str("variables are unsupported"));
+        static constexpr char kIpv4WildcardPrefix[] = "0.0.0.0:";
+        Str port_text = port.text;
+        if (port_text.len >= sizeof(kIpv4WildcardPrefix) - 1u &&
+            port_text.slice(0, sizeof(kIpv4WildcardPrefix) - 1u).eq(lit_str(kIpv4WildcardPrefix))) {
+            port_text = port_text.slice(sizeof(kIpv4WildcardPrefix) - 1u, port_text.len);
+        }
         u16 value = 0;
-        if (!parse_port(port.text, &value))
+        if (!parse_port(port_text, &value))
             return invalid_integer(port.span, lit_str("invalid listen port"));
         advance();
         if (cur_.kind == TokenKind::End)
@@ -738,8 +744,9 @@ private:
         u32 value = 0;
         for (u32 i = 0; i < text.len; i++) {
             if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
-            value = value * 10u + static_cast<u32>(text.ptr[i] - '0');
-            if (value > 65535u) return false;
+            const u32 digit = static_cast<u32>(text.ptr[i] - '0');
+            if (value > (65535u - digit) / 10u) return false;
+            value = value * 10u + digit;
         }
         if (value == 0) return false;
         *out = static_cast<u16>(value);
