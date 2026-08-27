@@ -9342,6 +9342,71 @@ TEST(nginx_parser, parses_explicit_ipv4_wildcard_listen_with_exact_spans_and_lif
     }
 }
 
+TEST(nginx_parser, parses_asterisk_ipv4_wildcard_listen_with_exact_spans_and_lifetime) {
+    char listen_first[] =
+        "server {\n"
+        "  listen *:8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+    char location_first[] =
+        "server {\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  listen *:8080;\n"
+        "}\n";
+
+    const auto check = [&](char* source, u32 len, u32 expected_line) {
+        const auto parsed = nginx::parse({source, len});
+        REQUIRE(parsed);
+        const char* directive = strstr(source, "listen *:8080");
+        REQUIRE(directive != nullptr);
+        const char* semicolon = strchr(directive, ';');
+        REQUIRE(semicolon != nullptr);
+        const auto& listen = parsed.value().listen;
+        CHECK_EQ(listen.port, 8080u);
+        CHECK_EQ(listen.span.start, static_cast<u32>(directive - source));
+        CHECK_EQ(listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(listen.span.line, expected_line);
+        CHECK_EQ(listen.span.col, 3u);
+
+        const nginx::Listen retained = listen;
+        memset(source, 'x', len);
+        CHECK_EQ(retained.port, 8080u);
+        CHECK_EQ(retained.span.start, static_cast<u32>(directive - source));
+        CHECK_EQ(retained.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(retained.span.line, expected_line);
+        CHECK_EQ(retained.span.col, 3u);
+    };
+    check(listen_first, sizeof(listen_first) - 1u, 2u);
+    check(location_first, sizeof(location_first) - 1u, 3u);
+
+    struct Boundary {
+        const char* token;
+        u16 port;
+    };
+    const Boundary boundaries[] = {{"*:1", 1u}, {"*:65535", 65535u}};
+    for (const auto& boundary : boundaries) {
+        char source[160]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { listen %s; location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } }",
+                                 boundary.token);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE(parsed);
+        CHECK_EQ(parsed.value().listen.port, boundary.port);
+        const char* directive = strstr(source, "listen ");
+        const char* semicolon = directive == nullptr ? nullptr : strchr(directive, ';');
+        REQUIRE(directive != nullptr);
+        REQUIRE(semicolon != nullptr);
+        CHECK_EQ(parsed.value().listen.span.start, static_cast<u32>(directive - source));
+        CHECK_EQ(parsed.value().listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(parsed.value().listen.span.line, 1u);
+        CHECK_EQ(parsed.value().listen.span.col, 10u);
+    }
+}
+
 TEST(nginx_parser, rejects_other_explicit_listen_shapes_without_partial_model) {
     struct Rejection {
         const char* listen_fragment;
@@ -9361,7 +9426,6 @@ TEST(nginx_parser, rejects_other_explicit_listen_shapes_without_partial_model) {
         {"listen 0.0.0:8080;", FrontendError::InvalidInteger},
         {"listen 00.0.0.0:8080;", FrontendError::InvalidInteger},
         {"listen 0.00.0.0:8080;", FrontendError::InvalidInteger},
-        {"listen *:8080;", FrontendError::InvalidInteger},
         {"listen localhost:8080;", FrontendError::InvalidInteger},
         {"listen [::]:8080;", FrontendError::InvalidInteger},
         {"listen unix:/tmp/nginx.sock;", FrontendError::InvalidInteger},
@@ -9475,21 +9539,167 @@ TEST(nginx_parser, rejects_other_explicit_listen_shapes_without_partial_model) {
     CHECK(duplicate_result.error().detail.eq(lit_str("duplicate listen")));
 }
 
+TEST(nginx_parser, rejects_non_exact_asterisk_listen_shapes_without_partial_model) {
+    struct Rejection {
+        const char* listen_fragment;
+        FrontendError code;
+    };
+    const Rejection rejections[] = {
+        {"listen *;", FrontendError::InvalidInteger},
+        {"listen *:;", FrontendError::InvalidInteger},
+        {"listen *::80;", FrontendError::InvalidInteger},
+        {"listen * :8080;", FrontendError::InvalidInteger},
+        {"listen * : 8080;", FrontendError::InvalidInteger},
+        {"listen *: 8080;", FrontendError::InvalidInteger},
+        {"listen *:\t8080;", FrontendError::InvalidInteger},
+        {"listen *:-1;", FrontendError::InvalidInteger},
+        {"listen *:+1;", FrontendError::InvalidInteger},
+        {"listen *:0;", FrontendError::InvalidInteger},
+        {"listen *:65536;", FrontendError::InvalidInteger},
+        {"listen *:184467440737095516161844674407370955161;", FrontendError::InvalidInteger},
+        {"listen *:*:8080;", FrontendError::InvalidInteger},
+        {"listen *:*:*:8080;", FrontendError::InvalidInteger},
+        {"listen 0.0.0.0:*:8080;", FrontendError::InvalidInteger},
+        {"listen 127.0.0.1:8080;", FrontendError::InvalidInteger},
+        {"listen 0.0.0.1:8080;", FrontendError::InvalidInteger},
+        {"listen [::]:8080;", FrontendError::InvalidInteger},
+        {"listen localhost:8080;", FrontendError::InvalidInteger},
+        {"listen unix:/tmp/nginx.sock;", FrontendError::InvalidInteger},
+        {"listen *:$port;", FrontendError::UnsupportedSyntax},
+        {"listen $address:8080;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080 default_server;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080 ssl;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080 reuseport;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080 backlog=128;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080 so_keepalive=on;", FrontendError::UnsupportedSyntax},
+        {"listen *:8080garbage;", FrontendError::InvalidInteger},
+        {"listen *:8080:extra;", FrontendError::InvalidInteger},
+        {"listen \"*:8080\";", FrontendError::InvalidInteger},
+    };
+    for (const auto& rejection : rejections) {
+        char source[256]{};
+        const int len = snprintf(source,
+                                 sizeof(source),
+                                 "server { %s location / { proxy_pass "
+                                 "http://127.0.0.1:9000; } }",
+                                 rejection.listen_fragment);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE_FALSE(parsed);
+        CHECK_MSG(parsed.error().code == rejection.code, rejection.listen_fragment);
+        CHECK_LT(parsed.error().span.start, static_cast<u32>(len));
+        CHECK_LE(parsed.error().span.end, static_cast<u32>(len));
+        CHECK_FALSE(parsed.error().detail.empty());
+    }
+
+    struct Attribution {
+        const char* source;
+        const char* offending;
+        FrontendError code;
+        Str detail;
+    };
+    static constexpr char kInvalidPort[] =
+        "server { listen *:65536; location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kVariablePort[] =
+        "server { listen *:$port; location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kOption[] =
+        "server { listen *:8080 ssl; location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kSplit[] =
+        "server { listen * :8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kMissingSemicolon[] =
+        "server { listen *:8080 location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kOverflowListen[] =
+        "server { listen 184467440737095516161844674407370955161; "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kOverflowUpstream[] =
+        "server { listen *:8080; location / { proxy_pass "
+        "http://127.0.0.1:184467440737095516161844674407370955161; } }";
+    const Attribution attributions[] = {
+        {kInvalidPort, "*:65536", FrontendError::InvalidInteger, lit_str("invalid listen port")},
+        {kVariablePort,
+         "*:$port",
+         FrontendError::UnsupportedSyntax,
+         lit_str("variables are unsupported")},
+        {kOption,
+         "ssl",
+         FrontendError::UnsupportedSyntax,
+         lit_str("listen options are unsupported")},
+        {kSplit, "*", FrontendError::InvalidInteger, lit_str("invalid listen port")},
+        {kMissingSemicolon,
+         "location",
+         FrontendError::UnexpectedToken,
+         lit_str("expected ';' after listen")},
+        {kOverflowListen,
+         "184467440737095516161844674407370955161",
+         FrontendError::InvalidInteger,
+         lit_str("invalid listen port")},
+        {kOverflowUpstream,
+         "http://127.0.0.1:184467440737095516161844674407370955161",
+         FrontendError::InvalidInteger,
+         lit_str("invalid upstream IPv4 address or port")},
+    };
+    for (const auto& attribution : attributions) {
+        const u32 source_len = static_cast<u32>(strlen(attribution.source));
+        const auto parsed = nginx::parse({attribution.source, source_len});
+        REQUIRE_FALSE(parsed);
+        const char* offending = strstr(attribution.source, attribution.offending);
+        REQUIRE(offending != nullptr);
+        const u32 start = static_cast<u32>(offending - attribution.source);
+        const u32 end = start + static_cast<u32>(strlen(attribution.offending));
+        CHECK_EQ(parsed.error().code, attribution.code);
+        CHECK(parsed.error().detail.eq(attribution.detail));
+        CHECK_EQ(parsed.error().span.start, start);
+        CHECK_EQ(parsed.error().span.end, end);
+        CHECK_EQ(parsed.error().span.line, 1u);
+        CHECK_EQ(parsed.error().span.col, start + 1u);
+    }
+
+    const char duplicate_after[] =
+        "server { listen *:8080; listen 8081; "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const char duplicate_before[] =
+        "server { listen 8081; listen *:8080; "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    for (const auto* source : {duplicate_after, duplicate_before}) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE_FALSE(parsed);
+        CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(parsed.error().detail.eq(lit_str("duplicate listen")));
+    }
+}
+
 TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
+    static constexpr char kCanonicalTraceHook[] =
+        "pre_route TRACE { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n";
     static constexpr char kPortFirst[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
     static constexpr char kWildcardFirst[] =
         "server { listen 0.0.0.0:8080; "
         "location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kAsteriskFirst[] =
+        "server { listen *:8080; location / { proxy_pass http://127.0.0.1:9000; } }";
     static constexpr char kPortLast[] =
         "server { location / { proxy_pass http://127.0.0.1:9000; } listen 8080; }";
     static constexpr char kWildcardLast[] =
         "server { location / { proxy_pass http://127.0.0.1:9000; } "
         "listen 0.0.0.0:8080; }";
-    const char* const sources[] = {kPortFirst, kWildcardFirst, kPortLast, kWildcardLast};
-    std::string generated[4];
+    static constexpr char kAsteriskLast[] =
+        "server { location / { proxy_pass http://127.0.0.1:9000; } listen *:8080; }";
+    const char* const sources[] = {
+        kPortFirst, kWildcardFirst, kAsteriskFirst, kPortLast, kWildcardLast, kAsteriskLast};
+    std::string generated[6];
     nginx::Server wildcard_model{};
-    for (u32 i = 0; i < 4u; i++) {
+    nginx::Server asterisk_model{};
+    for (u32 i = 0; i < 6u; i++) {
         const auto parsed = nginx::parse({sources[i], static_cast<u32>(strlen(sources[i]))});
         REQUIRE(parsed);
         CHECK_EQ(parsed.value().listen.port, 8080u);
@@ -9497,9 +9707,10 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
         REQUIRE(lowered);
         generated[i].assign(lowered.value().data, lowered.value().len);
         if (i == 1u) wildcard_model = parsed.value();
+        if (i == 2u) asterisk_model = parsed.value();
     }
     const std::string& canonical = generated[0];
-    for (u32 i = 0; i < 4u; i++) CHECK_EQ(generated[i], canonical);
+    for (u32 i = 0; i < 6u; i++) CHECK_EQ(generated[i], canonical);
 
     // Complete byte equality above is independent from this structural/profile
     // validator. Mutations below isolate each guard while retaining all others.
@@ -9508,10 +9719,18 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
                count_text(candidate, "listen :8080\n") == 1u &&
                count_text(candidate, "listen :") == 1u;
     };
-    const auto fixed_inventory_is_canonical = [](const std::string& candidate) {
+    const auto upstream_inventory_is_canonical = [](const std::string& candidate) {
         return count_text(candidate, "upstream nginx_upstream at \"127.0.0.1:9000\"\n") == 1u &&
-               count_upstream_declarations(candidate) == 1u &&
-               count_text(candidate, "pre_route TRACE {") == 1u;
+               count_upstream_declarations(candidate) == 1u;
+    };
+    const auto pre_route_inventory_is_canonical = [](const std::string& candidate) {
+        return count_text(candidate, kCanonicalTraceHook) == 1u &&
+               ((candidate.rfind("pre_route ", 0u) == 0u ? 1u : 0u) +
+                count_text(candidate, "\npre_route ")) == 1u;
+    };
+    const auto fixed_inventory_is_canonical = [&](const std::string& candidate) {
+        return upstream_inventory_is_canonical(candidate) &&
+               pre_route_inventory_is_canonical(candidate);
     };
     const auto route_inventory_is_canonical = [](const std::string& candidate) {
         return count_route_declarations(candidate) == 3u &&
@@ -9521,6 +9740,7 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     };
     const auto has_no_address_workaround = [](const std::string& candidate) {
         return candidate.find("0.0.0.0") == std::string::npos &&
+               candidate.find("*:") == std::string::npos &&
                candidate.find("bind_address") == std::string::npos &&
                candidate.find("local_address") == std::string::npos &&
                candidate.find("req.listener") == std::string::npos;
@@ -9540,6 +9760,8 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     REQUIRE_EQ(count_text(canonical, "upstream nginx_upstream at \"127.0.0.1:9000\"\n"), 1u);
     REQUIRE_EQ(count_upstream_declarations(canonical), 1u);
     REQUIRE_EQ(count_text(canonical, "pre_route TRACE {"), 1u);
+    REQUIRE(upstream_inventory_is_canonical(canonical));
+    REQUIRE(pre_route_inventory_is_canonical(canonical));
     REQUIRE(fixed_inventory_is_canonical(canonical));
     REQUIRE(route_inventory_is_canonical(canonical));
     REQUIRE(has_no_address_workaround(canonical));
@@ -9559,6 +9781,75 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     CHECK(has_no_nginx_hook(wrong_listener));
     CHECK_FALSE(source_has_canonical_structure(wrong_listener));
 
+    static constexpr char kCanonicalUpstream[] = "upstream nginx_upstream at \"127.0.0.1:9000\"\n";
+    static constexpr char kChangedUpstream[] = "upstream nginx_upstream at \"127.0.0.1:9001\"\n";
+    REQUIRE_EQ(count_text(canonical, kCanonicalUpstream), 1u);
+    REQUIRE_EQ(count_text(canonical, kChangedUpstream), 0u);
+    const size_t upstream_offset = canonical.find(kCanonicalUpstream);
+    REQUIRE_NE(upstream_offset, std::string::npos);
+    REQUIRE_EQ(
+        canonical.find(kCanonicalUpstream, upstream_offset + sizeof(kCanonicalUpstream) - 1u),
+        std::string::npos);
+    std::string wrong_upstream = canonical;
+    wrong_upstream.replace(upstream_offset, sizeof(kCanonicalUpstream) - 1u, kChangedUpstream);
+    CHECK_NE(wrong_upstream, canonical);
+    CHECK_EQ(count_text(wrong_upstream, kCanonicalUpstream), 0u);
+    CHECK_EQ(count_text(wrong_upstream, kChangedUpstream), 1u);
+    CHECK_EQ(count_upstream_declarations(wrong_upstream), 1u);
+    CHECK(listener_inventory_is_canonical(wrong_upstream));
+    CHECK_FALSE(upstream_inventory_is_canonical(wrong_upstream));
+    CHECK(pre_route_inventory_is_canonical(wrong_upstream));
+    CHECK(route_inventory_is_canonical(wrong_upstream));
+    CHECK(has_no_address_workaround(wrong_upstream));
+    CHECK(has_no_nginx_hook(wrong_upstream));
+    CHECK_FALSE(fixed_inventory_is_canonical(wrong_upstream));
+    CHECK_FALSE(source_has_canonical_structure(wrong_upstream));
+
+    REQUIRE_EQ(count_text(canonical, kCanonicalTraceHook), 1u);
+    std::string changed_trace_hook(kCanonicalTraceHook);
+    static constexpr char kCanonicalStatus[] = "status: 405";
+    static constexpr char kChangedStatus[] = "status: 400";
+    const size_t changed_status_offset = changed_trace_hook.find(kCanonicalStatus);
+    REQUIRE_NE(changed_status_offset, std::string::npos);
+    REQUIRE_EQ(changed_trace_hook.find(kCanonicalStatus,
+                                       changed_status_offset + sizeof(kCanonicalStatus) - 1u),
+               std::string::npos);
+    changed_trace_hook.replace(
+        changed_status_offset, sizeof(kCanonicalStatus) - 1u, kChangedStatus);
+    REQUIRE_NE(changed_trace_hook, std::string(kCanonicalTraceHook));
+    REQUIRE_EQ(count_text(changed_trace_hook, kCanonicalStatus), 0u);
+    REQUIRE_EQ(count_text(changed_trace_hook, kChangedStatus), 1u);
+    REQUIRE_EQ(count_text(canonical, changed_trace_hook), 0u);
+    const size_t trace_hook_offset = canonical.find(kCanonicalTraceHook);
+    REQUIRE_NE(trace_hook_offset, std::string::npos);
+    REQUIRE_EQ(
+        canonical.find(kCanonicalTraceHook, trace_hook_offset + sizeof(kCanonicalTraceHook) - 1u),
+        std::string::npos);
+    std::string wrong_pre_route = canonical;
+    wrong_pre_route.replace(
+        trace_hook_offset, sizeof(kCanonicalTraceHook) - 1u, changed_trace_hook);
+    CHECK_NE(wrong_pre_route, canonical);
+    CHECK_EQ(count_text(wrong_pre_route, kCanonicalTraceHook), 0u);
+    CHECK_EQ(count_text(wrong_pre_route, changed_trace_hook), 1u);
+    CHECK_EQ((wrong_pre_route.rfind("pre_route ", 0u) == 0u ? 1u : 0u) +
+                 count_text(wrong_pre_route, "\npre_route "),
+             1u);
+    const auto wrong_pre_route_lexed =
+        lex({wrong_pre_route.data(), static_cast<u32>(wrong_pre_route.size())});
+    REQUIRE(wrong_pre_route_lexed);
+    const auto wrong_pre_route_parsed = parse_file(wrong_pre_route_lexed.value());
+    REQUIRE(wrong_pre_route_parsed);
+    std::unique_ptr<AstFile> wrong_pre_route_ast(wrong_pre_route_parsed.value());
+    CHECK_NE(wrong_pre_route_ast->pre_route_policy_ids[kRouteMethodTrace], 0u);
+    CHECK(listener_inventory_is_canonical(wrong_pre_route));
+    CHECK(upstream_inventory_is_canonical(wrong_pre_route));
+    CHECK_FALSE(pre_route_inventory_is_canonical(wrong_pre_route));
+    CHECK(route_inventory_is_canonical(wrong_pre_route));
+    CHECK(has_no_address_workaround(wrong_pre_route));
+    CHECK(has_no_nginx_hook(wrong_pre_route));
+    CHECK_FALSE(fixed_inventory_is_canonical(wrong_pre_route));
+    CHECK_FALSE(source_has_canonical_structure(wrong_pre_route));
+
     const std::string address_workaround = canonical + "# bind address 0.0.0.0\n";
     CHECK_NE(address_workaround, canonical);
     CHECK_EQ(count_text(address_workaround, "0.0.0.0"), 1u);
@@ -9568,6 +9859,16 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     CHECK_FALSE(has_no_address_workaround(address_workaround));
     CHECK(has_no_nginx_hook(address_workaround));
     CHECK_FALSE(source_has_canonical_structure(address_workaround));
+
+    const std::string asterisk_workaround = canonical + "# bind address *:8080\n";
+    CHECK_NE(asterisk_workaround, canonical);
+    CHECK_EQ(count_text(asterisk_workaround, "*:8080"), 1u);
+    CHECK(listener_inventory_is_canonical(asterisk_workaround));
+    CHECK(fixed_inventory_is_canonical(asterisk_workaround));
+    CHECK(route_inventory_is_canonical(asterisk_workaround));
+    CHECK_FALSE(has_no_address_workaround(asterisk_workaround));
+    CHECK(has_no_nginx_hook(asterisk_workaround));
+    CHECK_FALSE(source_has_canonical_structure(asterisk_workaround));
 
     const std::string extra_route =
         canonical + "route \"/wildcard\" { return forward(nginx_upstream) }\n";
@@ -9596,6 +9897,12 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listen_has_port_only_golden) {
     REQUIRE_FALSE(forged);
     CHECK_EQ(forged.error().code, FrontendError::InvalidInteger);
     CHECK(forged.error().detail.eq(lit_str("invalid model listen port")));
+
+    asterisk_model.listen.port = 0;
+    const auto forged_asterisk = nginx::lower_to_rut(asterisk_model);
+    REQUIRE_FALSE(forged_asterisk);
+    CHECK_EQ(forged_asterisk.error().code, FrontendError::InvalidInteger);
+    CHECK(forged_asterisk.error().detail.eq(lit_str("invalid model listen port")));
 }
 
 TEST(nginx_converter, explicit_ipv4_wildcard_listener_survives_frontend_lifetimes) {
@@ -9604,6 +9911,75 @@ TEST(nginx_converter, explicit_ipv4_wildcard_listener_survives_frontend_lifetime
     {
         char nginx_source[] =
             "server { listen 0.0.0.0:8080; "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        const auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        const auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 9u);
+        REQUIRE(ast_owned->items[0].kind == AstItemKind::Listen);
+        CHECK_EQ(ast_owned->items[0].listen.port, 8080u);
+        REQUIRE(ast_owned->items[1].kind == AstItemKind::Upstream);
+        REQUIRE(ast_owned->items[2].kind == AstItemKind::PreRoute);
+        for (u32 i = 6u; i < 9u; i++) {
+            REQUIRE(ast_owned->items[i].kind == AstItemKind::Route);
+            CHECK(ast_owned->items[i].route.path.eq(lit_str("/")));
+        }
+
+        const auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE(hir_owned->has_listener);
+        source_listener.port = hir_owned->listener.port;
+        REQUIRE_EQ(hir_owned->upstreams.len, 1u);
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+
+        const auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        for (u32 i = 0; i < mir_owned->functions.len; i++)
+            CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        REQUIRE_EQ(rir.module.upstream_count, 1u);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    const auto resolved = resolve_listener_spec(true, source_listener, false, 0u);
+    REQUIRE(resolved);
+    CHECK(resolved.value().address == ListenerAddress::IPv4Wildcard);
+    CHECK(resolved.value().transport == ListenerTransport::Cleartext);
+    CHECK_EQ(resolved.value().port, 8080u);
+    REQUIRE_EQ(populated->response_policy_count, 2u);
+    REQUIRE_EQ(populated->failure_policy_count, 3u);
+    REQUIRE_EQ(populated->policy_bundle_count, 3u);
+    REQUIRE_EQ(populated->strict_local_response_policy_count, 3u);
+    CHECK_NE(populated->pre_route_policy_id(kRouteMethodTrace), 0u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodConnect], 1u);
+    CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodAny], 3u);
+    CHECK(populated->strict_local_response_table_is_valid());
+}
+
+TEST(nginx_converter, asterisk_ipv4_wildcard_listener_survives_frontend_lifetimes) {
+    auto populated = std::make_unique<RouteConfig>();
+    ListenerSpec source_listener{};
+    {
+        char nginx_source[] =
+            "server { listen *:8080; "
             "location / { proxy_pass http://127.0.0.1:9000; } }";
         const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
         REQUIRE(parsed);

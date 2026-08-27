@@ -349,10 +349,15 @@ private:
         if (contains(port.text, '$'))
             return unsupported(port.span, lit_str("variables are unsupported"));
         static constexpr char kIpv4WildcardPrefix[] = "0.0.0.0:";
+        static constexpr char kAsteriskWildcardPrefix[] = "*:";
         Str port_text = port.text;
         if (port_text.len >= sizeof(kIpv4WildcardPrefix) - 1u &&
             port_text.slice(0, sizeof(kIpv4WildcardPrefix) - 1u).eq(lit_str(kIpv4WildcardPrefix))) {
             port_text = port_text.slice(sizeof(kIpv4WildcardPrefix) - 1u, port_text.len);
+        } else if (port_text.len >= sizeof(kAsteriskWildcardPrefix) - 1u &&
+                   port_text.slice(0, sizeof(kAsteriskWildcardPrefix) - 1u)
+                       .eq(lit_str(kAsteriskWildcardPrefix))) {
+            port_text = port_text.slice(sizeof(kAsteriskWildcardPrefix) - 1u, port_text.len);
         }
         u16 value = 0;
         if (!parse_port(port_text, &value))
