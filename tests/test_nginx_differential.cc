@@ -25869,6 +25869,749 @@ static bool run_converter_normalized_exact_trailing_slash_differential(
     return true;
 }
 
+struct StaticQueryProxyOracleObservation {
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> forward_history;
+    u32 forward_accepts = 0u;
+    u32 forward_requests = 0u;
+    u32 forward_sends = 0u;
+};
+
+static constexpr const char* kStaticQueryClientTargets[2] = {
+    "/api/users?x=1",
+    "/api/users",
+};
+
+static constexpr const char* kStaticQueryUpstreamTargets[2] = {
+    "/v1/?fixed=1users?x=1",
+    "/v1/?fixed=1users",
+};
+
+static std::string static_query_proxy_request(const char* target) {
+    return std::string("GET ") + target +
+           " HTTP/1.1\r\nHost: static-query.example\r\nConnection: close\r\n\r\n";
+}
+
+static std::vector<char> static_query_expected_upstream(const char* target, u16 backend_port) {
+    const std::string request = std::string("GET ") + target +
+                                " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                "\r\n\r\n";
+    return {request.begin(), request.end()};
+}
+
+static bool validate_static_query_proxy_observation(
+    const StaticQueryProxyOracleObservation& observation,
+    u16 frontend_port,
+    u16 backend_port,
+    std::string& error) {
+    if ((observation.order != "listen-first" && observation.order != "location-first") ||
+        frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        observation.wires.size() != 2u || observation.forward_history.size() != 2u ||
+        observation.forward_accepts != 2u || observation.forward_requests != 2u ||
+        observation.forward_sends != 2u) {
+        error = "#339 nginx-only oracle observation lost its exact two-vector inventory";
+        return false;
+    }
+    const std::vector<char> expected_response(
+        kSuccessResponseNormalized,
+        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+    for (size_t i = 0u; i < 2u; i++) {
+        std::vector<char> normalized = observation.wires[i];
+        if (!normalize_date(normalized) || normalized != expected_response) {
+            error = "#339 nginx-only oracle downstream wire mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+        if (observation.forward_history[i] !=
+            static_query_expected_upstream(kStaticQueryUpstreamTargets[i], backend_port)) {
+            error = "#339 nginx-only oracle upstream target/Host/header/order mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_static_query_proxy_access(const std::string& contents,
+                                            const std::string& scope,
+                                            const StaticQueryProxyOracleObservation& observation,
+                                            u16 backend_port,
+                                            std::string& error) {
+    std::vector<std::string> records;
+    if (observation.wires.size() != 2u ||
+        !split_exact_complete_log(
+            contents, 2u, "#339 nginx-only oracle access log", records, error))
+        return false;
+    for (size_t i = 0u; i < 2u; i++) {
+        const std::string request = static_query_proxy_request(kStaticQueryClientTargets[i]);
+        const std::string expected =
+            scope + " raw=\"GET " + kStaticQueryClientTargets[i] +
+            " HTTP/1.1\" status=200 request_size=" + std::to_string(request.size()) +
+            " response_size=" + std::to_string(observation.wires[i].size()) +
+            " host=\"static-query.example\" upstream_addr=\"127.0.0.1:" +
+            std::to_string(backend_port) + "\" upstream_status=200";
+        if (records[i] != expected) {
+            error = "#339 nginx-only oracle access record " + std::to_string(i + 1u) +
+                    " lost raw target/order/status/size/upstream evidence: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validate_static_query_proxy_pair(
+    const StaticQueryProxyOracleObservation observations[2],
+    const u16 ports[4],
+    std::string& error) {
+    for (size_t i = 0u; i < 4u; i++) {
+        if (ports[i] == 0u) {
+            error = "#339 nginx-only oracle pair received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#339 nginx-only oracle sides shared a reserved port";
+                return false;
+            }
+        }
+    }
+    if (observations[0].order != "listen-first" || observations[1].order != "location-first" ||
+        !validate_static_query_proxy_observation(observations[0], ports[0], ports[1], error) ||
+        !validate_static_query_proxy_observation(observations[1], ports[2], ports[3], error))
+        return false;
+
+    const std::string* resources[] = {&observations[0].temp_path,
+                                      &observations[0].config_path,
+                                      &observations[0].log_path,
+                                      &observations[0].access_path,
+                                      &observations[0].process_identity,
+                                      &observations[1].temp_path,
+                                      &observations[1].config_path,
+                                      &observations[1].log_path,
+                                      &observations[1].access_path,
+                                      &observations[1].process_identity};
+    for (size_t i = 0u; i < sizeof(resources) / sizeof(resources[0]); i++) {
+        if (resources[i]->empty()) {
+            error = "#339 nginx-only oracle resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < sizeof(resources) / sizeof(resources[0]); j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#339 nginx-only oracle sides shared a resource identity";
+                return false;
+            }
+        }
+    }
+
+    for (size_t i = 0u; i < 2u; i++) {
+        std::vector<char> listen_first = observations[0].wires[i];
+        std::vector<char> location_first = observations[1].wires[i];
+        if (!normalize_date(listen_first) || !normalize_date(location_first) ||
+            listen_first != location_first) {
+            error =
+                "#339 nginx-only oracle declaration orders emitted different normalized "
+                "wires at vector " +
+                std::to_string(i + 1u);
+            return false;
+        }
+    }
+
+    std::vector<std::vector<char>> canonical_histories[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        canonical_histories[side] = observations[side].forward_history;
+        for (std::vector<char>& wire : canonical_histories[side]) {
+            std::string text(wire.begin(), wire.end());
+            if (!canonicalize_unique_port(text,
+                                          "127.0.0.1:" + std::to_string(ports[side * 2u + 1u]),
+                                          "127.0.0.1:BACKEND")) {
+                error = "#339 nginx-only oracle backend port canonicalization failed";
+                return false;
+            }
+            wire.assign(text.begin(), text.end());
+        }
+    }
+    if (canonical_histories[0] != canonical_histories[1]) {
+        error =
+            "#339 nginx-only oracle declaration orders emitted different canonical "
+            "upstream histories";
+        return false;
+    }
+    return true;
+}
+
+static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(u16 frontend_port,
+                                                                            u16 backend_port,
+                                                                            bool listen_first) {
+    static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    StaticQueryProxyOracleObservation value;
+    value.order = listen_first ? "listen-first" : "location-first";
+    value.temp_path = std::string("/tmp/339-") + (listen_first ? "listen" : "location");
+    value.config_path = value.temp_path + "/nginx.conf";
+    value.log_path = value.temp_path + "/nginx.log";
+    value.access_path = value.temp_path + "/access.log";
+    value.process_identity = std::string("process-339-") + value.order;
+    value.forward_accepts = value.forward_requests = value.forward_sends = 2u;
+    for (size_t i = 0u; i < 2u; i++) {
+        std::vector<char> wire(
+            kSuccessResponseNormalized,
+            kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+        const std::string marker(29u, 'X');
+        const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        value.wires.push_back(std::move(wire));
+        value.forward_history.push_back(
+            static_query_expected_upstream(kStaticQueryUpstreamTargets[i], backend_port));
+    }
+    (void)frontend_port;
+    return value;
+}
+
+static std::string static_query_proxy_access_fixture(
+    const StaticQueryProxyOracleObservation& observation,
+    const std::string& scope,
+    u16 backend_port) {
+    std::string result;
+    for (size_t i = 0u; i < 2u; i++) {
+        result += scope + " raw=\"GET " + kStaticQueryClientTargets[i] +
+                  " HTTP/1.1\" status=200 request_size=" +
+                  std::to_string(static_query_proxy_request(kStaticQueryClientTargets[i]).size()) +
+                  " response_size=" + std::to_string(observation.wires[i].size()) +
+                  " host=\"static-query.example\" upstream_addr=\"127.0.0.1:" +
+                  std::to_string(backend_port) + "\" upstream_status=200\n";
+    }
+    return result;
+}
+
+static bool run_static_query_proxy_oracle_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {54400u, 54401u, 54402u, 54403u};
+    StaticQueryProxyOracleObservation valid[2] = {
+        make_static_query_proxy_self_check(kPorts[0], kPorts[1], true),
+        make_static_query_proxy_self_check(kPorts[2], kPorts[3], false)};
+    if (!validate_static_query_proxy_pair(valid, kPorts, error)) return false;
+
+    const auto rejects_pair = [&](StaticQueryProxyOracleObservation mutated[2],
+                                  const u16 changed_ports[4],
+                                  const char* name) {
+        std::string detail;
+        if (!validate_static_query_proxy_pair(mutated, changed_ports, detail)) return true;
+        error = std::string("#339 nginx-only oracle pair mutation accepted: ") + name;
+        return false;
+    };
+    const auto mutate_target = [&](const char* target, const char* name) {
+        StaticQueryProxyOracleObservation mutated[2] = {valid[0], valid[1]};
+        mutated[1].forward_history[0] = static_query_expected_upstream(target, kPorts[3]);
+        return rejects_pair(mutated, kPorts, name);
+    };
+    if (!mutate_target("/v1/users?fixed=1", "wrong-nginx-target-path-query") ||
+        !mutate_target("/v1/users?fixed=1&x=1", "wrong-nginx-target-merged-query") ||
+        !mutate_target("/v1/users?x=1", "wrong-nginx-target-original-query-only") ||
+        !mutate_target("/v1/?fixed=1?x=1", "missing-unmatched-suffix") ||
+        !mutate_target("/v1/?fixed=1users", "missing-original-query") ||
+        !mutate_target("/v1/?fixed=1?x=1users", "reordered-suffix-and-query") ||
+        !mutate_target("/v1/?fixed=1users&x=1", "client-query-question-to-ampersand") ||
+        !mutate_target("/v1/&fixed=1users?x=1", "static-query-question-to-ampersand"))
+        return false;
+
+    StaticQueryProxyOracleObservation mutated[2] = {valid[0], valid[1]};
+    std::string wrong_host(mutated[1].forward_history[0].begin(),
+                           mutated[1].forward_history[0].end());
+    const size_t host = wrong_host.find("Host: 127.0.0.1:");
+    if (host == std::string::npos) {
+        error = "#339 nginx-only oracle Host self-check fixture was malformed";
+        return false;
+    }
+    wrong_host.replace(host, strlen("Host: 127.0.0.1"), "Host: static-query.example");
+    mutated[1].forward_history[0].assign(wrong_host.begin(), wrong_host.end());
+    if (!rejects_pair(mutated, kPorts, "wrong-upstream-Host")) return false;
+
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    std::string forwarded_connection(mutated[1].forward_history[0].begin(),
+                                     mutated[1].forward_history[0].end());
+    forwarded_connection.insert(forwarded_connection.size() - 2u, "Connection: close\r\n");
+    mutated[1].forward_history[0].assign(forwarded_connection.begin(), forwarded_connection.end());
+    if (!rejects_pair(mutated, kPorts, "forwarded-client-Connection")) return false;
+
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    mutated[1].forward_history.pop_back();
+    mutated[1].forward_accepts = mutated[1].forward_requests = mutated[1].forward_sends = 1u;
+    if (!rejects_pair(mutated, kPorts, "missing-episode")) return false;
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    mutated[1].forward_history[1] = mutated[1].forward_history[0];
+    if (!rejects_pair(mutated, kPorts, "duplicate-episode")) return false;
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    mutated[1].forward_history.push_back(mutated[1].forward_history[0]);
+    mutated[1].forward_accepts = mutated[1].forward_requests = mutated[1].forward_sends = 3u;
+    if (!rejects_pair(mutated, kPorts, "extra-episode")) return false;
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    std::swap(mutated[1].forward_history[0], mutated[1].forward_history[1]);
+    if (!rejects_pair(mutated, kPorts, "reordered-episode")) return false;
+
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    mutated[1].wires[0].back() = 'X';
+    if (!rejects_pair(mutated, kPorts, "declaration-order-wire-mismatch")) return false;
+
+    for (size_t resource = 0u; resource < 5u; resource++) {
+        mutated[0] = valid[0];
+        mutated[1] = valid[1];
+        std::string* left[] = {&mutated[0].temp_path,
+                               &mutated[0].config_path,
+                               &mutated[0].log_path,
+                               &mutated[0].access_path,
+                               &mutated[0].process_identity};
+        std::string* right[] = {&mutated[1].temp_path,
+                                &mutated[1].config_path,
+                                &mutated[1].log_path,
+                                &mutated[1].access_path,
+                                &mutated[1].process_identity};
+        *right[resource] = *left[resource];
+        if (!rejects_pair(mutated, kPorts, "shared-resource")) return false;
+    }
+    u16 shared_ports[4] = {kPorts[0], kPorts[1], kPorts[2], kPorts[0]};
+    mutated[0] = valid[0];
+    mutated[1] = valid[1];
+    if (!rejects_pair(mutated, shared_ports, "shared-port")) return false;
+
+    const std::string scope = "scope-339";
+    const std::string access = static_query_proxy_access_fixture(valid[0], scope, kPorts[1]);
+    if (!parse_static_query_proxy_access(access, scope, valid[0], kPorts[1], error)) return false;
+    const size_t first_end = access.find('\n');
+    if (first_end == std::string::npos) {
+        error = "#339 nginx-only oracle access self-check fixture was malformed";
+        return false;
+    }
+    const auto rejects_access = [&](const std::string& candidate, const char* name) {
+        std::string detail;
+        if (!parse_static_query_proxy_access(candidate, scope, valid[0], kPorts[1], detail))
+            return true;
+        error = std::string("#339 nginx-only oracle access mutation accepted: ") + name;
+        return false;
+    };
+    const auto rejects_unique_replacement = [&](const std::string& needle,
+                                                const std::string& replacement,
+                                                const char* name) {
+        const size_t first = access.find(needle);
+        if (needle.empty() || first == std::string::npos ||
+            access.find(needle, first + needle.size()) != std::string::npos) {
+            error = std::string("#339 nginx-only oracle access mutation needle was not unique: ") +
+                    name;
+            return false;
+        }
+        std::string candidate = access;
+        candidate.replace(first, needle.size(), replacement);
+        return rejects_access(candidate, name);
+    };
+    const std::string first_record = access.substr(0u, first_end + 1u);
+    const std::string second_record = access.substr(first_end + 1u);
+    const std::string first_request_size =
+        std::to_string(static_query_proxy_request(kStaticQueryClientTargets[0]).size());
+    const std::string response_size = std::to_string(valid[0].wires[0].size());
+    const std::string first_prefix = "raw=\"GET /api/users?x=1 HTTP/1.1\"";
+    const std::string first_status = first_prefix + " status=200";
+    const std::string size_fields =
+        "request_size=" + first_request_size + " response_size=" + response_size;
+    const std::string upstream_fields =
+        size_fields +
+        " host=\"static-query.example\" upstream_addr=\"127.0.0.1:" + std::to_string(kPorts[1]) +
+        "\" upstream_status=200\n";
+    if (!rejects_access(second_record, "missing-access") ||
+        !rejects_access(first_record + first_record, "duplicate-access") ||
+        !rejects_access(access + first_record, "extra-access") ||
+        !rejects_access(second_record + first_record, "reordered-access") ||
+        !rejects_unique_replacement(
+            first_prefix, "raw=\"GET /api/users HTTP/1.1\"", "raw-target-query-loss") ||
+        !rejects_unique_replacement(first_status, first_prefix + " status=502", "wrong-status") ||
+        !rejects_unique_replacement(size_fields,
+                                    "request_size=" + first_request_size + " response_size=" +
+                                        std::to_string(valid[0].wires[0].size() + 1u),
+                                    "wrong-response-size") ||
+        !rejects_unique_replacement(
+            upstream_fields,
+            size_fields + " host=\"static-query.example\" upstream_addr=\"127.0.0.1:1\" "
+                          "upstream_status=200\n",
+            "wrong-upstream-addr") ||
+        !rejects_unique_replacement(
+            upstream_fields,
+            size_fields + " host=\"static-query.example\" upstream_addr=\"127.0.0.1:" +
+                std::to_string(kPorts[1]) + "\" upstream_status=502\n",
+            "wrong-upstream-status"))
+        return false;
+    return true;
+}
+
+static bool capture_static_query_proxy_oracle_side(u16 frontend_port,
+                                                   u16 backend_port,
+                                                   TempDir& temp,
+                                                   const std::string& process_identity,
+                                                   bool listen_first,
+                                                   StaticQueryProxyOracleObservation& observation,
+                                                   std::string& error,
+                                                   int* frontend_reservation,
+                                                   int* backend_reservation) {
+    if (frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0) {
+        error = "#339 nginx-only oracle capture requires held frontend/backend reservations";
+        return false;
+    }
+    observation = StaticQueryProxyOracleObservation{};
+    observation.order = listen_first ? "listen-first" : "location-first";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.access_path = temp.nginx_access_log;
+    observation.process_identity = process_identity;
+    observation.wires.resize(2u);
+
+    std::vector<std::string> requests;
+    for (const char* target : kStaticQueryClientTargets) {
+        requests.push_back(static_query_proxy_request(target));
+        const std::string exact = std::string("GET ") + target +
+                                  " HTTP/1.1\r\nHost: static-query.example\r\nConnection: "
+                                  "close\r\n\r\n";
+        const size_t end = requests.back().find("\r\n\r\n");
+        if (requests.back() != exact || requests.back().rfind("GET /", 0u) != 0u ||
+            requests.back().find("\r\nContent-Length:") != std::string::npos ||
+            requests.back().find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests.back().find("\r\nTE:") != std::string::npos ||
+            requests.back().find("\r\nExpect:") != std::string::npos ||
+            requests.back().find("\r\nUpgrade:") != std::string::npos || end == std::string::npos ||
+            end + 4u != requests.back().size()) {
+            error =
+                "#339 nginx-only oracle request escaped the exact fresh bodyless "
+                "explicit-close H1.1 domain";
+            return false;
+        }
+    }
+
+    const std::string listen = "  listen " + std::to_string(frontend_port) + ";\n";
+    const std::string location =
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "/v1/?fixed=1;\n"
+        "  }\n";
+    const std::string fragment =
+        "server {\n" + (listen_first ? listen + location : location + listen) + "}\n";
+    const std::string scope =
+        "rut-nginx-339-static-query-" + observation.order + "-" + std::to_string(getpid());
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format static_query_proxy_oracle '" +
+        scope +
+        " raw=\"$request\" status=$status request_size=$request_length "
+        "response_size=$bytes_sent host=\"$host\" upstream_addr=\"$upstream_addr\" "
+        "upstream_status=$upstream_status';\n"
+        "  access_log " +
+        temp.nginx_access_log + " static_query_proxy_oracle;\n" + fragment + "}\n";
+    if (count_text(config,
+                   "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+                       "/v1/?fixed=1;") != 1u ||
+        count_text(config, "proxy_pass ") != 1u || count_text(config, "location /api/") != 1u ||
+        count_text(config, "server {") != 1u || count_text(config, "listen ") != 1u ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#339 nginx-only oracle failed to persist its exact minimal static-query config";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 2u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#339 nginx-only oracle recorder could not bind its reserved backend port";
+        return false;
+    }
+
+    ChildGuard nginx;
+    DockerGuard docker(process_identity);
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      process_identity,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = "#339 nginx-only oracle frontend failed before readiness";
+        return false;
+    }
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live(backend) && std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(nginx.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#339 nginx-only oracle frontend/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(backend)) {
+        error = "#339 nginx-only oracle recorder readiness timed out";
+        return false;
+    }
+
+    const auto observe_count = [&](u32 expected,
+                                   const char* phase,
+                                   std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(nginx.child) || !recorder_live(backend)) {
+                error =
+                    std::string("#339 nginx-only oracle frontend/recorder stopped during ") + phase;
+                return false;
+            }
+            if (backend.accepted.load(std::memory_order_acquire) != expected ||
+                backend.requests.load(std::memory_order_acquire) != expected ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error =
+                    std::string("#339 nginx-only oracle unexpected upstream count during ") + phase;
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto wait_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx.child) || !recorder_live(backend)) return false;
+            const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = backend.requests.load(std::memory_order_acquire);
+            const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests_seen > expected || sends > expected) return false;
+            if (accepts == expected && requests_seen == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    if (!observe_count(0u, "pre-request zero window", std::chrono::milliseconds(100))) return false;
+    for (size_t i = 0u; i < 2u; i++) {
+        if (poll_child(nginx.child) || !recorder_live(backend)) {
+            error = "#339 nginx-only oracle frontend/recorder was not live before vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[i].data(), requests[i].size()) ||
+            !read_response(client.fd, observation.wires[i], detail) ||
+            !read_eof(client.fd, detail)) {
+            error = "#339 nginx-only oracle vector " + std::string(kStaticQueryClientTargets[i]) +
+                    " response/zero-tail/EOF failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        std::vector<char> normalized = observation.wires[i];
+        const std::vector<char> expected(
+            kSuccessResponseNormalized,
+            kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "#339 nginx-only oracle vector " + std::string(kStaticQueryClientTargets[i]) +
+                    " did not match the exact Date-normalized 200/CL2/ok wire";
+            return false;
+        }
+        if (!wait_count(static_cast<u32>(i + 1u)) ||
+            !observe_count(static_cast<u32>(i + 1u),
+                           "ordered live episode window",
+                           std::chrono::milliseconds(100))) {
+            if (error.empty())
+                error = "#339 nginx-only oracle episode did not settle without retry";
+            return false;
+        }
+    }
+    if (!observe_count(2u, "live no-third/retry window", std::chrono::milliseconds(500)) ||
+        !stop_child(nginx.child)) {
+        if (error.empty())
+            error = "#339 nginx-only oracle frontend did not survive controlled shutdown";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "#339 nginx-only oracle failed to remove pinned nginx container";
+        return false;
+    }
+
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 2u || observation.forward_requests != 2u ||
+        observation.forward_sends != 2u ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 2u) {
+        error = "#339 nginx-only oracle recorder did not settle at exactly two clean episodes";
+        return false;
+    }
+    if (!validate_static_query_proxy_observation(observation, frontend_port, backend_port, error))
+        return false;
+
+    std::string access_contents;
+    std::string error_contents;
+    if (!read_exact_return204_log(
+            temp.nginx_access_log, "#339 nginx-only oracle access log", access_contents, error) ||
+        !parse_static_query_proxy_access(
+            access_contents, scope, observation, backend_port, error) ||
+        !read_exact_return204_log(
+            temp.nginx_log, "#339 nginx-only oracle error log", error_contents, error))
+        return false;
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (error_contents.find(severity) != std::string::npos) {
+            error = std::string("#339 nginx-only oracle error log contained ") + severity;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_pinned_static_query_proxy_oracle(const std::string& container_prefix,
+                                                 StaticQueryProxyOracleObservation& listen_first,
+                                                 StaticQueryProxyOracleObservation& location_first,
+                                                 std::string& error) {
+    struct Reservations {
+        int fds[4];
+        Reservations() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~Reservations() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#339 nginx-only oracle could not simultaneously bind-reserve four ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#339 nginx-only oracle bind-reserved duplicate ports";
+                return false;
+            }
+        }
+    }
+
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].nginx_config ||
+        temps[0].nginx_log == temps[1].nginx_log ||
+        temps[0].nginx_access_log == temps[1].nginx_access_log) {
+        error = "#339 nginx-only oracle could not create independent order resource trees";
+        return false;
+    }
+    StaticQueryProxyOracleObservation observations[2];
+    if (!capture_static_query_proxy_oracle_side(ports[0],
+                                                ports[1],
+                                                temps[0],
+                                                container_prefix + "-listen-first",
+                                                true,
+                                                observations[0],
+                                                error,
+                                                &reservations.fds[0],
+                                                &reservations.fds[1]) ||
+        !capture_static_query_proxy_oracle_side(ports[2],
+                                                ports[3],
+                                                temps[1],
+                                                container_prefix + "-location-first",
+                                                false,
+                                                observations[1],
+                                                error,
+                                                &reservations.fds[2],
+                                                &reservations.fds[3])) {
+        listen_first = observations[0];
+        location_first = observations[1];
+        return false;
+    }
+    if (!validate_static_query_proxy_pair(observations, ports, error)) return false;
+    listen_first = observations[0];
+    location_first = observations[1];
+    return true;
+}
+
+static void dump_static_query_proxy_oracle_observation(
+    const StaticQueryProxyOracleObservation& observation) {
+    std::cerr << "#339 nginx-only static-query order=" << observation.order
+              << " upstream=" << observation.forward_accepts << "/" << observation.forward_requests
+              << "/" << observation.forward_sends << "\n";
+    for (size_t i = 0u; i < observation.wires.size(); i++) {
+        const std::string label = "#339 nginx-only downstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.wires[i]);
+    }
+    for (size_t i = 0u; i < observation.forward_history.size(); i++) {
+        const std::string label = "#339 nginx-only upstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.forward_history[i]);
+    }
+    if (!observation.config_path.empty())
+        dump_log(observation.config_path, "#339 nginx-only pinned nginx config");
+    if (!observation.log_path.empty())
+        dump_log(observation.log_path, "#339 nginx-only pinned nginx error log");
+    if (!observation.access_path.empty())
+        dump_log(observation.access_path, "#339 nginx-only pinned nginx access log");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -25889,6 +26632,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--api-non-root-proxy-uri-oracle") == 0;
     const bool service_root_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--service-root-proxy-uri-oracle") == 0;
+    const bool static_query_proxy_uri_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-static-query-proxy-uri-oracle") == 0;
     const bool bounded_exact_local_path_oracle =
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool bounded_no_content_path_oracle =
@@ -25979,12 +26724,13 @@ int main(int argc, char** argv) {
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
-         !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
-         !trailing_slash_no_content_oracle && !max_boundary_no_content_oracle &&
-         !bodyful_normalized_exact_oracle && !exact_local_body_space_oracle &&
-         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
-         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
+         !service_root_proxy_uri_oracle && !static_query_proxy_uri_oracle &&
+         !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
+         !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
+         !max_boundary_no_content_oracle && !bodyful_normalized_exact_oracle &&
+         !exact_local_body_space_oracle && !exact_local_body_multiple_space_oracle &&
+         !exact_local_return204_oracle && !exact_local_return204_query_oracle &&
+         !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
@@ -26055,6 +26801,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
                      "   or: test_nginx_differential --api-non-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-static-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
@@ -26256,6 +27004,14 @@ int main(int argc, char** argv) {
         if (!run_max_proxy_replacement_self_checks(parser_error)) {
             std::cerr << "FAIL [#336 source/access/observation/pair self-check]: " << parser_error
                       << "\n";
+            return 1;
+        }
+    }
+    if (static_query_proxy_uri_oracle) {
+        std::string self_check_error;
+        if (!run_static_query_proxy_oracle_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#339 nginx-only static-query oracle self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
     }
@@ -26819,6 +27575,37 @@ int main(int argc, char** argv) {
                "equivalence claim; excludes wider prefixes, normalization-sensitive targets, "
                "other methods, framing/body, reuse/pipeline, TLS/H2, and multiple locations or "
                "servers)\n";
+        return 0;
+    }
+
+    if (static_query_proxy_uri_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-static-query-proxy-" + std::to_string(getpid()) + "-" + source_suffix;
+        StaticQueryProxyOracleObservation listen_first;
+        StaticQueryProxyOracleObservation location_first;
+        std::string oracle_error;
+        if (!run_pinned_static_query_proxy_oracle(
+                container_prefix, listen_first, location_first, oracle_error)) {
+            std::cerr << "FAIL [#339 pinned nginx-only static-query proxy URI oracle]: "
+                      << oracle_error << "\n";
+            dump_static_query_proxy_oracle_observation(listen_first);
+            dump_static_query_proxy_oracle_observation(location_first);
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 independently proves that literal /api/ proxy_pass "
+               "replacement /v1/?fixed=1 maps /api/users?x=1 to "
+               "/v1/?fixed=1users?x=1 and /api/users to /v1/?fixed=1users; listen-first and "
+               "location-first isolated sides each emitted two byte-exact Host-rebuilt, "
+               "Connection-omitted upstream requests, exact Date-normalized 200/CL2/ok/close/"
+               "zero-tail/EOF downstream wires, exactly two clean ordered recorder episodes "
+               "with no third, exactly two ordered raw-target/status/size/upstream access "
+               "records, and no warn-or-higher nginx error log entries (#339 stage 3a "
+               "nginx-only oracle; no converter, generated-RUT, or runtime equivalence claim; "
+               "excludes other queries, empty configured query, variables, percent encoding, "
+               "methods, bodies, reuse, retries, H2, and TLS)\n";
         return 0;
     }
 
