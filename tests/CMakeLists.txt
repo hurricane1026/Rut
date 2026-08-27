@@ -383,7 +383,7 @@ if(RUT_ENABLE_JIT)
 
     add_executable(test_nginx_differential test_nginx_differential.cc
                    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-    target_link_libraries(test_nginx_differential PRIVATE rut_nginx Threads::Threads)
+    target_link_libraries(test_nginx_differential PRIVATE rut_nginx rut_loader Threads::Threads)
     target_include_directories(test_nginx_differential PRIVATE
         ${PROJECT_SOURCE_DIR}/include
     )
@@ -775,6 +775,19 @@ if(RUT_ENABLE_JIT)
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 90
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_converter_max_proxy_prefix_differential
+        COMMAND test_nginx_differential --converter-max-proxy-prefix-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_converter_max_proxy_prefix_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
         SKIP_RETURN_CODE 77
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
