@@ -2,6 +2,7 @@
 
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/listener_address.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -36,7 +37,9 @@ enum class AstItemKind : u8 {
 
 struct AstListenDecl {
     Span span{};
+    ListenerAddress address = ListenerAddress::IPv4Wildcard;
     u32 port = 0;
+    u32 ipv4_host = 0;
 };
 
 enum class AstStmtKind : u8 {

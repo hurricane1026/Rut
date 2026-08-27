@@ -14821,9 +14821,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.listen.span,
                                   lit_str("only one listen declaration is supported"));
+        if (item.listen.port > 65535u ||
+            !listener_address_valid(item.listen.address, item.listen.ipv4_host))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.listen.span,
+                                  lit_str("invalid listener endpoint metadata"));
         mod.has_listener = true;
         mod.listener.span = item.listen.span;
+        mod.listener.address = item.listen.address;
         mod.listener.port = static_cast<u16>(item.listen.port);
+        mod.listener.ipv4_host = item.listen.ipv4_host;
     }
     std::string normalized_source;
     if (source_path.len != 0) {

@@ -162,36 +162,168 @@ static HeapFrontendResult<MirModule> build_mir_heap_for_internal_propagation(
 }
 
 TEST(frontend, listen_declaration_preserves_span_and_bounds) {
-    const char source[] = "listen :0\n";
-    auto lexed = lex(lit(source));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    REQUIRE_EQ(ast->items.len, 1u);
-    CHECK(ast->items[0].kind == AstItemKind::Listen);
-    CHECK_EQ(ast->items[0].listen.port, 0u);
-    CHECK_EQ(ast->items[0].listen.span.line, 1u);
-    CHECK_EQ(ast->items[0].listen.span.col, 1u);
+    for (const char* source : {"listen :0\n", "listen : 0\n", "listen :00000\n"}) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        CHECK(ast->items[0].kind == AstItemKind::Listen);
+        CHECK(ast->items[0].listen.address == ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(ast->items[0].listen.port, 0u);
+        CHECK_EQ(ast->items[0].listen.ipv4_host, 0u);
+        CHECK_EQ(ast->items[0].listen.span.start, 0u);
+        CHECK_EQ(ast->items[0].listen.span.end, static_cast<u32>(strlen(source) - 1u));
+        CHECK_EQ(ast->items[0].listen.span.line, 1u);
+        CHECK_EQ(ast->items[0].listen.span.col, 1u);
 
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    CHECK(hir->has_listener);
-    CHECK_EQ(hir->listener.port, 0u);
-    CHECK_EQ(hir->listener.span.line, 1u);
-    CHECK_EQ(hir->listener.span.col, 1u);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->has_listener);
+        CHECK(hir->listener.address == ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(hir->listener.port, 0u);
+        CHECK_EQ(hir->listener.ipv4_host, 0u);
+        CHECK_EQ(hir->listener.span.start, 0u);
+        CHECK_EQ(hir->listener.span.end, static_cast<u32>(strlen(source) - 1u));
+        CHECK_EQ(hir->listener.span.line, 1u);
+        CHECK_EQ(hir->listener.span.col, 1u);
+    }
+}
+
+TEST(frontend, exact_ipv4_listen_reaches_hir_with_host_order_boundaries_and_complete_span) {
+    const struct {
+        const char* source;
+        u16 port;
+        u32 ipv4_host;
+    } cases[] = {
+        {"listen 127.0.0.1:0\n", 0u, 0x7f000001u},
+        {"listen 0.0.0.1:1\n", 1u, 0x00000001u},
+        {"listen 255.255.255.255:65535\n", 65535u, 0xffffffffu},
+        {"listen 1.255.0.255:00001\n", 1u, 0x01ff00ffu},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        const auto& listener = ast->items[0].listen;
+        CHECK(listener.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(listener.port, tc.port);
+        CHECK_EQ(listener.ipv4_host, tc.ipv4_host);
+        CHECK_EQ(listener.span.start, 0u);
+        CHECK_EQ(listener.span.end, static_cast<u32>(strlen(tc.source) - 1u));
+        CHECK_EQ(listener.span.line, 1u);
+        CHECK_EQ(listener.span.col, 1u);
+
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->has_listener);
+        CHECK(hir->listener.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(hir->listener.port, tc.port);
+        CHECK_EQ(hir->listener.ipv4_host, tc.ipv4_host);
+        CHECK_EQ(hir->listener.span.start, listener.span.start);
+        CHECK_EQ(hir->listener.span.end, listener.span.end);
+        CHECK_EQ(hir->listener.span.line, listener.span.line);
+        CHECK_EQ(hir->listener.span.col, listener.span.col);
+    }
+
+    const char separated[] = "listen // endpoint may follow the keyword\n  255.0.255.1:65535\n";
+    auto separated_tokens = lex(lit(separated));
+    REQUIRE(separated_tokens);
+    auto separated_ast = parse_file_heap(separated_tokens.value());
+    REQUIRE(separated_ast);
+    REQUIRE_EQ(separated_ast->items.len, 1u);
+    CHECK(separated_ast->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(separated_ast->items[0].listen.ipv4_host, 0xff00ff01u);
+    CHECK_EQ(separated_ast->items[0].listen.port, 65535u);
+    CHECK_EQ(separated_ast->items[0].listen.span.start, 0u);
+    CHECK_EQ(separated_ast->items[0].listen.span.end, static_cast<u32>(sizeof(separated) - 2u));
+    CHECK_EQ(separated_ast->items[0].listen.span.line, 1u);
+    CHECK_EQ(separated_ast->items[0].listen.span.col, 1u);
+
+    auto separated_hir = analyze_file_heap(separated_ast.value());
+    REQUIRE(separated_hir);
+    CHECK(separated_hir->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(separated_hir->listener.ipv4_host, 0xff00ff01u);
+    CHECK_EQ(separated_hir->listener.port, 65535u);
+
+    auto mir = build_mir_heap(separated_hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.func_count, 0u);
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 
 TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
     const struct {
         const char* source;
         FrontendError code;
+        u32 line;
         u32 col;
+        const char* detail;
     } parse_cases[] = {
-        {"listen 8080\n", FrontendError::UnexpectedToken, 8},
-        {"listen 127.0.0.1:8080\n", FrontendError::UnexpectedToken, 8},
-        {"listen :65536\n", FrontendError::InvalidInteger, 9},
-        {"listen :8080 default_server\n", FrontendError::UnexpectedToken, 14},
-        {"listen :8080, tls\n", FrontendError::UnexpectedToken, 13},
+        {"listen 8080\n",
+         FrontendError::UnexpectedEof,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 256.0.0.1:80\n", FrontendError::InvalidInteger, 1u, 8u, "256"},
+        {"listen 127.00.0.1:80\n", FrontendError::InvalidInteger, 1u, 12u, "00"},
+        {"listen 127.0.0:80\n", FrontendError::UnexpectedToken, 1u, 15u, ":"},
+        {"listen 127.0.0.1.2:80\n", FrontendError::UnexpectedToken, 1u, 17u, "."},
+        {"listen -127.0.0.1:80\n", FrontendError::UnexpectedToken, 1u, 8u, "-"},
+        {"listen +127.0.0.1:80\n", FrontendError::UnexpectedToken, 1u, 8u, "+"},
+        {"listen localhost:80\n", FrontendError::UnexpectedToken, 1u, 8u, "localhost"},
+        {"listen unix:/tmp/listener\n", FrontendError::UnexpectedToken, 1u, 8u, "unix"},
+        {"listen [::1]:80\n", FrontendError::UnexpectedToken, 1u, 8u, "["},
+        {"listen 127 .0.0.1:80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         12u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127. 0.0.1:80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         13u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1 :80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         18u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1: 80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         19u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.// gap\n1:80\n",
+         FrontendError::UnexpectedToken,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1:\n",
+         FrontendError::UnexpectedEof,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1:65536\n", FrontendError::InvalidInteger, 1u, 18u, "65536"},
+        {"listen 127.0.0.1:80 default_server\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         21u,
+         "default_server"},
+        {"listen 127.0.0.1:80, tls\n", FrontendError::UnexpectedToken, 1u, 20u, ","},
+        {"listen :65536\n", FrontendError::InvalidInteger, 1u, 9u, "65536"},
+        {"listen :8080 default_server\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         14u,
+         "default_server"},
+        {"listen :8080, tls\n", FrontendError::UnexpectedToken, 1u, 13u, ","},
     };
     for (const auto& tc : parse_cases) {
         auto lexed = lex(lit(tc.source));
@@ -200,12 +332,27 @@ TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
         CHECK(!ast);
         if (!ast) {
             CHECK_EQ(ast.error().code, tc.code);
-            CHECK_EQ(ast.error().span.line, 1u);
+            CHECK_EQ(ast.error().span.line, tc.line);
             CHECK_EQ(ast.error().span.col, tc.col);
+            CHECK_EQ(std::string(ast.error().detail.ptr, ast.error().detail.len),
+                     std::string(tc.detail));
         }
     }
 
-    const char duplicate_source[] = "listen :8080\nlisten :8081\n";
+    const char wildcard_address[] = "listen 0.0.0.0:80\n";
+    auto wildcard_tokens = lex(lit(wildcard_address));
+    REQUIRE(wildcard_tokens);
+    auto wildcard_ast = parse_file_heap(wildcard_tokens.value());
+    REQUIRE_FALSE(wildcard_ast);
+    CHECK_EQ(wildcard_ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(wildcard_ast.error().span.start, 7u);
+    CHECK_EQ(wildcard_ast.error().span.end, 14u);
+    CHECK_EQ(wildcard_ast.error().span.line, 1u);
+    CHECK_EQ(wildcard_ast.error().span.col, 8u);
+    CHECK_EQ(std::string(wildcard_ast.error().detail.ptr, wildcard_ast.error().detail.len),
+             std::string("use `listen :PORT` for the IPv4 wildcard address"));
+
+    const char duplicate_source[] = "listen 127.0.0.1:8080\nlisten :8081\n";
     auto lexed = lex(lit(duplicate_source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -216,6 +363,42 @@ TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
         CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
         CHECK_EQ(hir.error().span.line, 2u);
         CHECK_EQ(hir.error().span.col, 1u);
+        CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+                 std::string("only one listen declaration is supported"));
+    }
+}
+
+TEST(frontend, listener_analyzer_revalidates_forged_ast_metadata_before_narrowing) {
+    const struct {
+        ListenerAddress address;
+        u32 port;
+        u32 ipv4_host;
+    } invalid[] = {
+        {ListenerAddress::IPv4Wildcard, 65536u, 0u},
+        {ListenerAddress::IPv4Wildcard, 80u, 0x7f000001u},
+        {ListenerAddress::IPv4Exact, 80u, 0u},
+        {static_cast<ListenerAddress>(0xff), 80u, 0u},
+    };
+    for (const auto& tc : invalid) {
+        auto ast = std::make_unique<AstFile>();
+        AstItem item{};
+        item.kind = AstItemKind::Listen;
+        item.span = {40u, 61u, 3u, 5u};
+        item.listen.span = item.span;
+        item.listen.address = tc.address;
+        item.listen.port = tc.port;
+        item.listen.ipv4_host = tc.ipv4_host;
+        REQUIRE(ast->items.push(item));
+
+        auto hir = analyze_file_heap(*ast);
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.start, 40u);
+        CHECK_EQ(hir.error().span.end, 61u);
+        CHECK_EQ(hir.error().span.line, 3u);
+        CHECK_EQ(hir.error().span.col, 5u);
+        CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+                 std::string("invalid listener endpoint metadata"));
     }
 }
 

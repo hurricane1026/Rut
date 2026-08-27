@@ -27,6 +27,10 @@ constexpr Str kRespondInHandlerDetail =
 constexpr Str kStatusReturnInMiddlewareDetail = lit_str(
     "middleware short-circuits with `respond <status>`; `return` is only for the function's "
     "value");
+constexpr Str kListenerEndpointContiguousDetail =
+    lit_str("numeric IPv4 listener endpoints must be byte-contiguous");
+constexpr Str kListenerWildcardSpellingDetail =
+    lit_str("use `listen :PORT` for the IPv4 wildcard address");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
@@ -139,6 +143,31 @@ struct Parser {
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+    }
+
+    FrontendResult<const Token*> expect_adjacent(TokenType type, const Token& previous) {
+        if (cur().start != previous.end) {
+            const FrontendError code = cur().type == TokenType::Eof
+                                           ? FrontendError::UnexpectedEof
+                                           : FrontendError::UnexpectedToken;
+            return frontend_error(code, span_from(cur()), kListenerEndpointContiguousDetail);
+        }
+        return expect(type);
+    }
+
+    static FrontendResult<u32> parse_bounded_decimal(const Token& token,
+                                                     u32 maximum,
+                                                     bool reject_leading_zero) {
+        if (reject_leading_zero && token.text.len > 1u && token.text.ptr[0] == '0')
+            return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
+        u32 value = 0;
+        for (u32 i = 0; i < token.text.len; i++) {
+            const u32 digit = static_cast<u32>(token.text.ptr[i] - '0');
+            if (value > (maximum - digit) / 10u)
+                return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
+            value = value * 10u + digit;
+        }
+        return value;
     }
 
     FrontendResult<const Token*> expect_field_name() {
@@ -3334,28 +3363,57 @@ struct Parser {
     FrontendResult<AstItem> parse_listen() {
         auto kw = expect(TokenType::KwListen);
         if (!kw) return core::make_unexpected(kw.error());
-        auto colon = expect(TokenType::Colon);
-        if (!colon) return core::make_unexpected(colon.error());
-        auto port = expect(TokenType::IntLit);
-        if (!port) return core::make_unexpected(port.error());
-
-        u32 value = 0;
-        for (u32 i = 0; i < port.value()->text.len; i++) {
-            const char c = port.value()->text.ptr[i];
-            const u32 digit = static_cast<u32>(c - '0');
-            if (value > (65535u - digit) / 10u)
-                return frontend_error(
-                    FrontendError::InvalidInteger, span_from(*port.value()), port.value()->text);
-            value = value * 10u + digit;
+        ListenerAddress address = ListenerAddress::IPv4Wildcard;
+        u32 ipv4_host = 0;
+        Span exact_address_span{};
+        const Token* port_token = nullptr;
+        if (take(TokenType::Colon) != nullptr) {
+            auto port = expect(TokenType::IntLit);
+            if (!port) return core::make_unexpected(port.error());
+            port_token = port.value();
+        } else {
+            address = ListenerAddress::IPv4Exact;
+            const Token* octets[4]{};
+            auto first = expect(TokenType::IntLit);
+            if (!first) return core::make_unexpected(first.error());
+            octets[0] = first.value();
+            for (u32 i = 1; i < 4; i++) {
+                auto dot = expect_adjacent(TokenType::Dot, *octets[i - 1]);
+                if (!dot) return core::make_unexpected(dot.error());
+                auto octet = expect_adjacent(TokenType::IntLit, *dot.value());
+                if (!octet) return core::make_unexpected(octet.error());
+                octets[i] = octet.value();
+            }
+            for (u32 i = 0; i < 4; i++) {
+                auto octet = parse_bounded_decimal(*octets[i], 255u, true);
+                if (!octet) return core::make_unexpected(octet.error());
+                ipv4_host = (ipv4_host << 8u) | octet.value();
+            }
+            exact_address_span =
+                Span{octets[0]->start, octets[3]->end, octets[0]->line, octets[0]->col};
+            auto exact_colon = expect_adjacent(TokenType::Colon, *octets[3]);
+            if (!exact_colon) return core::make_unexpected(exact_colon.error());
+            auto port = expect_adjacent(TokenType::IntLit, *exact_colon.value());
+            if (!port) return core::make_unexpected(port.error());
+            port_token = port.value();
         }
+
+        auto port = parse_bounded_decimal(*port_token, 65535u, false);
+        if (!port) return core::make_unexpected(port.error());
+        if (address == ListenerAddress::IPv4Exact && ipv4_host == 0u)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  exact_address_span,
+                                  kListenerWildcardSpellingDetail);
         if (cur().type == TokenType::Ident || cur().type == TokenType::Comma)
             return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
 
         AstItem item{};
         item.kind = AstItemKind::Listen;
-        item.listen.port = value;
+        item.listen.address = address;
+        item.listen.port = port.value();
+        item.listen.ipv4_host = ipv4_host;
         item.listen.span =
-            Span{kw.value()->start, port.value()->end, kw.value()->line, kw.value()->col};
+            Span{kw.value()->start, port_token->end, kw.value()->line, kw.value()->col};
         item.span = item.listen.span;
         return item;
     }

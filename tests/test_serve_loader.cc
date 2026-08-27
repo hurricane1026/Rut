@@ -473,6 +473,105 @@ TEST(serve_loader, source_listener_metadata_is_owned_by_loaded_program) {
     CHECK_EQ(program.listener.ipv4_host, 0u);
 }
 
+TEST(serve_loader, failed_listener_parse_resets_poisoned_endpoint_and_owner_is_reusable) {
+    const std::string dir = "/tmp/rut_serve_loader_failed_listener_reset";
+    const std::string path =
+        write_file(dir, "app.rut", "listen 127.0.0.1 :80\nroute GET \"/\" { return 200 }\n");
+
+    LoadedProgram program;
+    program.has_listener = true;
+    program.listener = {ListenerAddress::IPv4Exact, ListenerTransport::Tls, 9443u, 0xcb007109u};
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK(err.stage == LoadStage::Parse);
+    CHECK(err.has_diag);
+    REQUIRE(program.src_map != nullptr);
+    CHECK_GT(program.src_map_len, 0u);
+    CHECK_FALSE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+
+    // A failed load owns its mapped source until the caller releases the
+    // partial program. Clean it before reusing the same owner.
+    program.destroy();
+    CHECK(program.src_map == nullptr);
+    CHECK_EQ(program.src_map_len, 0u);
+
+    write_file(dir,
+               "app.rut",
+               "listen 203.0.113.9:65535\n"
+               "route GET \"/\" { return 200 }\n");
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 65535u);
+    CHECK_EQ(program.listener.ipv4_host, 0xcb007109u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
+TEST(serve_loader, exact_ipv4_listener_metadata_survives_frontend_and_source_lifetimes) {
+    const std::string dir = "/tmp/rut_serve_loader_exact_listener";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "listen 127.0.0.1:0\n"
+                                        "route GET \"/\" { return 200 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 0u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+
+    // load_rut_program has already destroyed AST/HIR/MIR. Remove every remaining
+    // compiler/source owner and prove the process-start endpoint is an inline,
+    // owned ListenerSpec rather than a view into any of them.
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 0u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+
+    program.destroy();
+    CHECK(!program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+
+    // Reuse the same owner for the legacy spelling. Load entry and HIR copy must
+    // replace, not retain, the prior exact address metadata.
+    write_file(dir,
+               "app.rut",
+               "listen :0\n"
+               "route GET \"/\" { return 200 }\n");
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 0u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
     const struct {
         const char* name;

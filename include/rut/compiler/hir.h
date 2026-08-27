@@ -3,6 +3,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/listener_address.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/response_policy.h"
@@ -56,7 +57,9 @@ struct HirUpstream {
 
 struct HirListener {
     Span span{};
+    ListenerAddress address = ListenerAddress::IPv4Wildcard;
     u16 port = 0;
+    u32 ipv4_host = 0;
 };
 struct HirImport {
     Span span{};
