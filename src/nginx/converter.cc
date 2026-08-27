@@ -189,28 +189,6 @@ constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' || byte == '~';
 }
 
-bool proxy_pass_uri_is_clean(Str uri) {
-    if (uri.ptr == nullptr || uri.len == 0 || uri.len > kMaxProxyPassUriLen || uri.ptr[0] != '/' ||
-        (uri.len > 1 && uri.ptr[uri.len - 1] != '/'))
-        return false;
-    if (uri.len == 1) return true;
-
-    u32 segment_start = 1;
-    for (u32 i = 1; i < uri.len; i++) {
-        if (uri.ptr[i] != '/') {
-            if (!proxy_pass_uri_segment_byte_is_clean(uri.ptr[i])) return false;
-            continue;
-        }
-        const u32 segment_len = i - segment_start;
-        if (segment_len == 0 || (segment_len == 1 && uri.ptr[segment_start] == '.') ||
-            (segment_len == 2 && uri.ptr[segment_start] == '.' &&
-             uri.ptr[segment_start + 1] == '.'))
-            return false;
-        segment_start = i + 1;
-    }
-    return true;
-}
-
 bool proxy_location_path_is_clean(Str path) {
     if (path.ptr == nullptr || path.len == 0 || path.len > kMaxProxyLocationPathLen ||
         path.ptr[0] != '/' || (path.len > 1 && path.ptr[path.len - 1] != '/'))
@@ -330,7 +308,7 @@ FrontendResult<ProxyLocationProfile> validate_proxy_location(const Server& serve
     if (!proxy_location_path_is_clean(location.path))
         return unsupported(location.path_span,
                            lit_str("invalid bounded proxy location path model"));
-    if (!proxy_pass_uri_is_clean(proxy.uri))
+    if (!proxy_pass_replacement_uri_is_clean(proxy.uri))
         return unsupported(proxy.uri_span, lit_str("invalid bounded proxy_pass URI model"));
     return ProxyLocationProfile::PrefixWithUri;
 }

@@ -147,17 +147,6 @@ bool proxy_pass_uri_is_clean(Str uri) {
     return true;
 }
 
-bool proxy_pass_replacement_uri_is_clean(Str uri) {
-    // Preserve the existing path-only grammar and validation branch unchanged.
-    if (proxy_pass_uri_is_clean(uri)) return true;
-    if (uri.ptr == nullptr || uri.len < 3 || uri.len > kMaxProxyPassUriLen) return false;
-
-    u32 query_delimiter = 0;
-    while (query_delimiter < uri.len && uri.ptr[query_delimiter] != '?') query_delimiter++;
-    return query_delimiter < uri.len && proxy_pass_uri_is_clean(uri.slice(0, query_delimiter)) &&
-           forward_target_transform_replacement_prefix(uri);
-}
-
 bool proxy_location_path_is_clean(Str path) {
     if (path.ptr == nullptr || path.len == 0 || path.len > kMaxProxyLocationPathLen ||
         path.ptr[0] != '/' || (path.len > 1 && path.ptr[path.len - 1] != '/'))
@@ -837,6 +826,17 @@ private:
 };
 
 }  // namespace
+
+bool proxy_pass_replacement_uri_is_clean(Str uri) {
+    // Preserve the existing path-only grammar and validation branch unchanged.
+    if (proxy_pass_uri_is_clean(uri)) return true;
+    if (uri.ptr == nullptr || uri.len < 3 || uri.len > kMaxProxyPassUriLen) return false;
+
+    u32 query_delimiter = 0;
+    while (query_delimiter < uri.len && uri.ptr[query_delimiter] != '?') query_delimiter++;
+    return query_delimiter < uri.len && proxy_pass_uri_is_clean(uri.slice(0, query_delimiter)) &&
+           forward_target_transform_replacement_prefix(uri);
+}
 
 FrontendResult<Server> parse(Str source) {
     return Parser(source).run();
