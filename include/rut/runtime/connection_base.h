@@ -1101,8 +1101,8 @@ struct ConnectionBase {
             base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
             base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
             base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
-            base[target_end + 8] != (h11 ? '1' : '0') || base[target_end + 9] != '\r' ||
-            base[target_end + 10] != '\n')
+            base[target_end + 8] != static_cast<u8>(h11 ? '1' : '0') ||
+            base[target_end + 9] != '\r' || base[target_end + 10] != '\n')
             return invalid;
         return {
             RawRequestTargetWitnessState::Valid,

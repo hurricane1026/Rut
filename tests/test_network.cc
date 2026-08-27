@@ -16144,6 +16144,84 @@ TEST(raw_request_target_witness, non_origin_partial_and_malformed_inputs_stay_ne
     }
 }
 
+TEST(raw_request_target_witness, http_version_wire_and_metadata_are_bound_fail_closed) {
+    Connection c{};
+    u8 recv[256]{};
+    static constexpr char kTarget[] = "/version//raw?x=%2F";
+
+    const auto load = [&](const char* request) {
+        c.reset();
+        c.bind_request_receive_buffer(recv, sizeof(recv));
+        const u32 length = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(request), length), length);
+        capture_request_metadata(c);
+    };
+    const auto require_valid = [&]() {
+        const auto witness = c.checked_raw_request_target();
+        REQUIRE_EQ(witness.state, RawRequestTargetWitnessState::Valid);
+        CHECK(witness.target.eq({kTarget, sizeof(kTarget) - 1u}));
+        CHECK_EQ(witness.target.ptr,
+                 reinterpret_cast<const char*>(c.recv_buf.data() + c.req_raw_target_offset));
+    };
+    const auto require_invalid = [&]() {
+        const auto witness = c.checked_raw_request_target();
+        CHECK_EQ(witness.state, RawRequestTargetWitnessState::Invalid);
+        CHECK_EQ(witness.target.ptr, nullptr);
+        CHECK_EQ(witness.target.len, 0u);
+    };
+
+    static constexpr char kHttp10[] = "GET /version//raw?x=%2F HTTP/1.0\r\nHost: x\r\n\r\n";
+    load(kHttp10);
+    REQUIRE_EQ(c.req_http_version, static_cast<u8>(HttpVersion::Http10));
+    require_valid();
+
+    const u32 target_end = c.req_raw_target_offset + c.req_raw_target_length;
+    const u32 minor_offset = target_end + 8u;
+    recv[minor_offset] = static_cast<u8>('1');
+    require_invalid();
+    recv[minor_offset] = static_cast<u8>('0');
+    require_valid();
+
+    static constexpr char kHttp11[] = "GET /version//raw?x=%2F HTTP/1.1\r\nHost: x\r\n\r\n";
+    load(kHttp11);
+    REQUIRE_EQ(c.req_http_version, static_cast<u8>(HttpVersion::Http11));
+    require_valid();
+
+    const u32 h11_target_end = c.req_raw_target_offset + c.req_raw_target_length;
+    const u32 h11_minor_offset = h11_target_end + 8u;
+    recv[h11_minor_offset] = static_cast<u8>('0');
+    require_invalid();
+    recv[h11_minor_offset] = static_cast<u8>('1');
+    require_valid();
+
+    recv[h11_minor_offset] = static_cast<u8>('2');
+    require_invalid();
+    recv[h11_minor_offset] = static_cast<u8>('1');
+    require_valid();
+
+    recv[h11_target_end + 4u] = static_cast<u8>('X');
+    require_invalid();
+    recv[h11_target_end + 4u] = static_cast<u8>('P');
+    require_valid();
+
+    c.req_http_version = 255;
+    require_invalid();
+    c.req_http_version = static_cast<u8>(HttpVersion::Http11);
+    require_valid();
+
+    const u32 header_end = c.req_header_end;
+    c.req_header_end = h11_target_end + 10u;
+    require_invalid();
+    c.req_header_end = header_end;
+    require_valid();
+
+    const u32 recv_len = c.recv_buf.len();
+    c.recv_buf.set_len(h11_target_end + 10u);
+    require_invalid();
+    c.recv_buf.set_len(recv_len);
+    require_valid();
+}
+
 TEST(raw_request_target_witness, forged_ownership_offsets_lengths_and_counts_fail_closed) {
     Connection c{};
     c.reset();
