@@ -16,14 +16,16 @@ struct ListenerContext {
     ListenerAddress address = ListenerAddress::IPv4Wildcard;
     ListenerTransport transport = ListenerTransport::Cleartext;
     u16 port = 0;  // kernel-assigned port; zero is never a valid bound context
+    u32 ipv4_host = 0;
 
     bool valid() const {
-        return port != 0 && address == ListenerAddress::IPv4Wildcard &&
-               (transport == ListenerTransport::Cleartext || transport == ListenerTransport::Tls);
+        return port != 0 && listener_address_valid(address, ipv4_host) &&
+               listener_transport_valid(transport);
     }
 
     bool equivalent(const ListenerContext& other) const {
-        return address == other.address && transport == other.transport && port == other.port;
+        return address == other.address && transport == other.transport && port == other.port &&
+               ipv4_host == other.ipv4_host;
     }
 };
 
@@ -39,10 +41,10 @@ enum class ListenerContextError : u8 {
 // must reject any other kernel result rather than guessing its authority.
 inline core::Expected<ListenerContext, ListenerContextError> derive_listener_context(
     i32 fd, const ListenerSpec& declared) {
-    if (declared.address != ListenerAddress::IPv4Wildcard)
+    if (!listener_address_valid(declared.address, declared.ipv4_host) ||
+        declared.address != ListenerAddress::IPv4Wildcard)
         return core::make_unexpected(ListenerContextError::UnsupportedAddress);
-    if (declared.transport != ListenerTransport::Cleartext &&
-        declared.transport != ListenerTransport::Tls)
+    if (!listener_transport_valid(declared.transport))
         return core::make_unexpected(ListenerContextError::UnsupportedTransport);
 
     sockaddr_in bound{};
@@ -52,7 +54,7 @@ inline core::Expected<ListenerContext, ListenerContextError> derive_listener_con
     if (len < sizeof(sockaddr_in) || bound.sin_family != AF_INET || bound.sin_addr.s_addr != 0)
         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
 
-    ListenerContext result{declared.address, declared.transport, ntohs(bound.sin_port)};
+    ListenerContext result{declared.address, declared.transport, ntohs(bound.sin_port), 0u};
     if (!result.valid()) return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
     return result;
 }
@@ -69,6 +71,14 @@ inline core::Expected<i32, Error> bind_listener_shard(const ListenerSpec& declar
     if (out_context == nullptr)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     *out_context = {};
+
+    // Stage 1 carries exact-address metadata but deliberately does not activate
+    // exact binding. Reject unsupported or forged metadata before creating a
+    // socket so it can never degrade to the legacy wildcard path.
+    if (!declared.valid() || declared.address != ListenerAddress::IPv4Wildcard ||
+        (expected != nullptr &&
+         (!expected->valid() || expected->address != ListenerAddress::IPv4Wildcard)))
+        return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
 
     auto fd_result = create_listen_socket(requested_port);
     if (!fd_result) return fd_result;

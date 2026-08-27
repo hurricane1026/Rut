@@ -188,6 +188,7 @@ TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
         u32 col;
     } parse_cases[] = {
         {"listen 8080\n", FrontendError::UnexpectedToken, 8},
+        {"listen 127.0.0.1:8080\n", FrontendError::UnexpectedToken, 8},
         {"listen :65536\n", FrontendError::InvalidInteger, 9},
         {"listen :8080 default_server\n", FrontendError::UnexpectedToken, 14},
         {"listen :8080, tls\n", FrontendError::UnexpectedToken, 13},

@@ -1,36 +1,40 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/listener_address.h"
 #include "rut/common/types.h"
 
 namespace rut {
 
-// The first listener slice is deliberately explicit about the dimensions that
-// are fixed by the supported declaration.  Adding another address family or
-// transport later must be an intentional capability change, not an accidental
-// interpretation of a port number.
-enum class ListenerAddress : u8 {
-    IPv4Wildcard,
+enum class ListenerTransport : u8 {
+    Cleartext = 0,
+    Tls = 1,
 };
 
-enum class ListenerTransport : u8 {
-    Cleartext,
-    Tls,
-};
+inline bool listener_transport_valid(ListenerTransport transport) {
+    return transport == ListenerTransport::Cleartext || transport == ListenerTransport::Tls;
+}
 
 struct ListenerSpec {
     ListenerAddress address = ListenerAddress::IPv4Wildcard;
     ListenerTransport transport = ListenerTransport::Cleartext;
     u16 port = 8080;
+    u32 ipv4_host = 0;
+
+    bool valid() const {
+        return listener_address_valid(address, ipv4_host) && listener_transport_valid(transport);
+    }
 
     bool equivalent(const ListenerSpec& other) const {
-        return address == other.address && transport == other.transport && port == other.port;
+        return address == other.address && transport == other.transport && port == other.port &&
+               ipv4_host == other.ipv4_host;
     }
 };
 
 enum class ListenerResolutionError : u8 {
     ConflictingPorts,
     ConflictingTransport,
+    InvalidListenerSpec,
 };
 
 // Resolve immutable startup listener metadata from the optional source
@@ -43,6 +47,8 @@ inline core::Expected<ListenerSpec, ListenerResolutionError> resolve_listener_sp
     bool cli_present,
     u16 cli_port,
     ListenerTransport cli_transport = ListenerTransport::Cleartext) {
+    if (!listener_transport_valid(cli_transport) || (source_present && !source.valid()))
+        return core::make_unexpected(ListenerResolutionError::InvalidListenerSpec);
     const bool cli_listener_present = cli_present || cli_transport == ListenerTransport::Tls;
     if (!source_present && !cli_listener_present) return ListenerSpec{};
     if (!source_present) {

@@ -173,7 +173,10 @@ bool load_rut_program(
     ir.hir = hir.value();
     if (ir.hir->has_listener) {
         out.has_listener = true;
+        out.listener.address = ListenerAddress::IPv4Wildcard;
+        out.listener.transport = ListenerTransport::Cleartext;
         out.listener.port = ir.hir->listener.port;
+        out.listener.ipv4_host = 0u;
     }
 
     err.stage = LoadStage::BuildMir;

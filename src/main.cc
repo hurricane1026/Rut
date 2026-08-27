@@ -601,6 +601,8 @@ int main(int argc, char** argv) {
     if (!resolved_listener) {
         if (resolved_listener.error() == ListenerResolutionError::ConflictingTransport)
             write_str("Conflicting source cleartext listener and CLI TLS\n");
+        else if (resolved_listener.error() == ListenerResolutionError::InvalidListenerSpec)
+            write_str("Invalid source or CLI listener metadata\n");
         else
             write_str("Conflicting source and CLI listen ports\n");
 #ifdef RUT_ENABLE_JIT

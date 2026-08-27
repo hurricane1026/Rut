@@ -103,8 +103,15 @@ TEST(serve_loader, status_routes_load) {
                                         "route GET \"/health\" { return 204 }\n");
 
     LoadedProgram program;
+    program.has_listener = true;
+    program.listener = {ListenerAddress::IPv4Exact, ListenerTransport::Tls, 8443u, 0x7f000001u};
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(!program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
     // Both routes registered into the config the shards will serve.
     CHECK_EQ(program.config.route_count, 2u);
     program.destroy();
@@ -422,6 +429,7 @@ TEST(serve_loader, six_hundred_fifty_three_slot_source_registers_owned_routes) {
     CHECK_EQ(program.listener.port, 0u);
     CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
     CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
     REQUIRE_EQ(program.config.route_count, 93u);
 
     const RouteEntry& first = program.config.routes[0];
@@ -444,13 +452,25 @@ TEST(serve_loader, source_listener_metadata_is_owned_by_loaded_program) {
                                         "route GET \"/\" { return 200 }\n");
 
     LoadedProgram program;
+    program.has_listener = true;
+    program.listener = {ListenerAddress::IPv4Exact, ListenerTransport::Tls, 8443u, 0x7f000001u};
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK(program.has_listener);
     CHECK_EQ(program.listener.port, 0u);
     CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
     CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+
+    // destroy() must clear address metadata just as load_rut_program() does at
+    // entry; a reused owner must never retain a prior exact-address value.
+    program.listener = {ListenerAddress::IPv4Exact, ListenerTransport::Tls, 8443u, 0x7f000001u};
     program.destroy();
+    CHECK(!program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
 }
 
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
