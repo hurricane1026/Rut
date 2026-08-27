@@ -10326,6 +10326,594 @@ TEST(nginx_parser,
     CHECK(strstr(maximum_lowering.value().data, maximum_body) != nullptr);
 }
 
+TEST(nginx_parser,
+     issue350_combines_exact_loopback_fixed_302_redirect_with_provenance_and_capacity_boundary) {
+    char exact_then_root[] =
+        "server {\n"
+        "  listen 127.0.0.1:8080;\n"
+        "  location = /old { return 302 http://redirect.example/new; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+    char root_then_exact[] =
+        "server {\n"
+        "  listen 127.0.0.1:8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /old { return 302 http://redirect.example/new; }\n"
+        "}\n";
+
+    const auto check = [&](char* source, u32 len, u32 exact_line, u32 root_line) {
+        const auto parsed = nginx::parse({source, len});
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        const auto& listener = server.listen;
+        const auto& root = server.location;
+        const auto& proxy = root.proxy_pass;
+        const auto& exact = server.exact_absolute_redirect;
+        const auto& response = exact.response;
+
+        const char* server_start = strstr(source, "server {");
+        const char* server_close = strrchr(source, '}');
+        const char* listen_start = strstr(source, "listen 127.0.0.1:8080");
+        const char* listen_value = listen_start == nullptr ? nullptr : listen_start + 7u;
+        const char* listen_semicolon =
+            listen_value == nullptr ? nullptr : strchr(listen_value, ';');
+        const char* root_start = strstr(source, "location / {");
+        const char* root_close = root_start == nullptr ? nullptr : strchr(root_start, '}');
+        const char* root_path = root_start == nullptr ? nullptr : strchr(root_start, '/');
+        const char* proxy_start =
+            root_start == nullptr ? nullptr : strstr(root_start, "proxy_pass");
+        const char* proxy_semicolon = proxy_start == nullptr ? nullptr : strchr(proxy_start, ';');
+        const char* exact_start = strstr(source, "location = /old");
+        const char* exact_close = exact_start == nullptr ? nullptr : strchr(exact_start, '}');
+        const char* exact_path = exact_start == nullptr ? nullptr : strstr(exact_start, "/old");
+        const char* return_start = exact_start == nullptr ? nullptr : strstr(exact_start, "return");
+        const char* status = return_start == nullptr ? nullptr : strstr(return_start, "302");
+        const char* target =
+            status == nullptr ? nullptr : strstr(status, "http://redirect.example/new");
+        const char* authority = target == nullptr ? nullptr : target + 7u;
+        const char* target_path = authority == nullptr ? nullptr : authority + 16u;
+        const char* return_semicolon = target == nullptr ? nullptr : strchr(target, ';');
+        REQUIRE(server_start != nullptr);
+        REQUIRE(server_close != nullptr);
+        REQUIRE(listen_start != nullptr);
+        REQUIRE(listen_value != nullptr);
+        REQUIRE(listen_semicolon != nullptr);
+        REQUIRE(root_start != nullptr);
+        REQUIRE(root_close != nullptr);
+        REQUIRE(root_path != nullptr);
+        REQUIRE(proxy_start != nullptr);
+        REQUIRE(proxy_semicolon != nullptr);
+        REQUIRE(exact_start != nullptr);
+        REQUIRE(exact_close != nullptr);
+        REQUIRE(exact_path != nullptr);
+        REQUIRE(return_start != nullptr);
+        REQUIRE(status != nullptr);
+        REQUIRE(target != nullptr);
+        REQUIRE(authority != nullptr);
+        REQUIRE(target_path != nullptr);
+        REQUIRE(return_semicolon != nullptr);
+
+        const auto offset = [&](const char* pointer) { return static_cast<u32>(pointer - source); };
+        const auto line = [&](const char* pointer) {
+            u32 result = 1u;
+            for (const char* cursor = source; cursor != pointer; ++cursor) {
+                if (*cursor == '\n') result++;
+            }
+            return result;
+        };
+        const auto column = [&](const char* pointer) {
+            const char* line_start = pointer;
+            while (line_start != source && line_start[-1] != '\n') line_start--;
+            return static_cast<u32>(pointer - line_start + 1u);
+        };
+        const auto check_span = [&](Span span, const char* start, const char* end) {
+            CHECK_EQ(span.start, offset(start));
+            CHECK_EQ(span.end, offset(end));
+            CHECK_EQ(span.line, line(start));
+            CHECK_EQ(span.col, column(start));
+        };
+
+        check_span(server.span, server_start, server_close + 1u);
+        CHECK_EQ(server.span.start, 0u);
+        CHECK_EQ(server.span.end, len - 1u);
+        CHECK_EQ(server.span.line, 1u);
+        CHECK_EQ(server.span.col, 1u);
+
+        CHECK(listener.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(listener.ipv4_host, 0x7f000001u);
+        CHECK_EQ(listener.port, 8080u);
+        CHECK(listener.value.eq(lit_str("127.0.0.1:8080")));
+        CHECK_EQ(listener.value.ptr, listen_value);
+        check_span(listener.value_span, listen_value, listen_semicolon);
+        check_span(listener.span, listen_start, listen_semicolon + 1u);
+        CHECK_EQ(listener.span.line, 2u);
+        CHECK_EQ(listener.span.col, 3u);
+        CHECK_EQ(listener.value_span.line, 2u);
+        CHECK_EQ(listener.value_span.col, 10u);
+
+        CHECK(root.path.eq(lit_str("/")));
+        CHECK_EQ(root.path.ptr, root_path);
+        check_span(root.path_span, root_path, root_path + 1u);
+        check_span(root.span, root_start, root_close + 1u);
+        CHECK_EQ(root.span.line, root_line);
+        CHECK_EQ(root.span.col, 3u);
+        CHECK_EQ(root.path_span.line, root_line);
+        CHECK_EQ(root.path_span.col, column(root_path));
+        CHECK_EQ(proxy.address[0], 127u);
+        CHECK_EQ(proxy.address[1], 0u);
+        CHECK_EQ(proxy.address[2], 0u);
+        CHECK_EQ(proxy.address[3], 1u);
+        CHECK_EQ(proxy.port, 9000u);
+        CHECK_FALSE(proxy.has_uri);
+        CHECK_EQ(proxy.uri.ptr, nullptr);
+        CHECK_EQ(proxy.uri.len, 0u);
+        CHECK_EQ(proxy.uri_span.start, 0u);
+        CHECK_EQ(proxy.uri_span.end, 0u);
+        check_span(proxy.span, proxy_start, proxy_semicolon + 1u);
+        CHECK_EQ(proxy.span.line, root_line);
+        CHECK_EQ(proxy.span.col, column(proxy_start));
+
+        REQUIRE(exact.present);
+        CHECK(exact.path.eq(lit_str("/old")));
+        CHECK_EQ(exact.path.ptr, exact_path);
+        check_span(exact.path_span, exact_path, exact_path + 4u);
+        check_span(exact.span, exact_start, exact_close + 1u);
+        CHECK_EQ(exact.span.line, exact_line);
+        CHECK_EQ(exact.span.col, 3u);
+        CHECK_EQ(exact.path_span.line, exact_line);
+        CHECK_EQ(response.status, 302u);
+        CHECK(response.status_lexeme.eq(lit_str("302")));
+        CHECK_EQ(response.status_lexeme.ptr, status);
+        check_span(response.status_span, status, status + 3u);
+        CHECK(response.target.eq(lit_str("http://redirect.example/new")));
+        CHECK_EQ(response.target.ptr, target);
+        check_span(response.target_span, target, target + 27u);
+        CHECK(response.authority.eq(lit_str("redirect.example")));
+        CHECK_EQ(response.authority.ptr, authority);
+        check_span(response.authority_span, authority, authority + 16u);
+        CHECK(response.path.eq(lit_str("/new")));
+        CHECK_EQ(response.path.ptr, target_path);
+        check_span(response.path_span, target_path, target_path + 4u);
+        check_span(response.span, return_start, return_semicolon + 1u);
+        CHECK_EQ(response.span.line, exact_line);
+        CHECK_EQ(response.span.col, column(return_start));
+        CHECK_EQ(response.status_span.line, exact_line);
+        CHECK_EQ(response.target_span.line, exact_line);
+        // The model represents the fixed HTTP scheme and query-discard profile
+        // through the complete query-free target plus its authority/path views.
+        CHECK((Str{response.target.ptr, 7u}.eq(lit_str("http://"))));
+        CHECK_EQ(memchr(response.target.ptr, '?', response.target.len), nullptr);
+
+        CHECK_FALSE(server.exact_local_return.present);
+        CHECK_FALSE(server.exact_no_content_return.present);
+        CHECK(server.pre_route_trace.profile ==
+              nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+        CHECK_EQ(server.pre_route_trace.span.start, server.span.start);
+        CHECK_EQ(server.pre_route_trace.span.end, server.span.end);
+        CHECK_EQ(server.pre_route_trace.span.line, server.span.line);
+        CHECK_EQ(server.pre_route_trace.span.col, server.span.col);
+
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(source);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(listener.value.ptr) - listener.value_span.start,
+                 source_base);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(root.path.ptr) - root.path_span.start, source_base);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(exact.path.ptr) - exact.path_span.start, source_base);
+        CHECK_EQ(
+            reinterpret_cast<uintptr_t>(response.status_lexeme.ptr) - response.status_span.start,
+            source_base);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(response.target.ptr) - response.target_span.start,
+                 source_base);
+        CHECK_EQ(
+            reinterpret_cast<uintptr_t>(response.authority.ptr) - response.authority_span.start,
+            source_base);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(response.path.ptr) - response.path_span.start,
+                 source_base);
+        CHECK_GE(listener.value_span.start, listener.span.start);
+        CHECK_LE(listener.value_span.end, listener.span.end);
+        CHECK_GE(root.path_span.start, root.span.start);
+        CHECK_LE(proxy.span.end, root.span.end);
+        CHECK_GE(exact.path_span.start, exact.span.start);
+        CHECK_GE(response.span.start, exact.path_span.end);
+        CHECK_LE(response.span.end, exact.span.end);
+        CHECK_GT(response.status_span.start, response.span.start);
+        CHECK_GT(response.target_span.start, response.status_span.end);
+        CHECK_LT(response.target_span.end, response.span.end);
+        CHECK_GE(response.authority_span.start, response.target_span.start);
+        CHECK_LE(response.path_span.end, response.target_span.end);
+
+        const auto expect_rejected = [&](const nginx::Server& candidate,
+                                         FrontendError code,
+                                         Str detail,
+                                         Span expected_span) {
+            const auto lowered = nginx::lower_to_rut(candidate);
+            REQUIRE_FALSE(lowered);
+            CHECK_EQ(lowered.error().code, code);
+            CHECK(lowered.error().detail.eq(detail));
+            CHECK_EQ(lowered.error().span.start, expected_span.start);
+            CHECK_EQ(lowered.error().span.end, expected_span.end);
+            CHECK_EQ(lowered.error().span.line, expected_span.line);
+            CHECK_EQ(lowered.error().span.col, expected_span.col);
+        };
+        const auto expect_unsupported =
+            [&](const nginx::Server& candidate, Str detail, Span expected_span) {
+                expect_rejected(candidate, FrontendError::UnsupportedSyntax, detail, expected_span);
+            };
+        expect_unsupported(
+            server, lit_str("exact listen requires the minimal root proxy profile"), listener.span);
+
+        std::vector<char> independent_source(source, source + len);
+        auto forged = server;
+        forged.listen.value.ptr = independent_source.data() + forged.listen.value_span.start;
+        CHECK_NE(forged.listen.value.ptr, server.listen.value.ptr);
+        expect_unsupported(
+            forged, lit_str("invalid listen source provenance"), forged.listen.value_span);
+
+        forged = server;
+        forged.location.path.ptr = independent_source.data() + forged.location.path_span.start;
+        CHECK_NE(forged.location.path.ptr, server.location.path.ptr);
+        // The redirect validator derives its source base from the fallback.
+        // Moving only that borrow therefore makes the retained exact path the
+        // first field that disagrees with the derived base.
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect location path provenance"),
+                           forged.exact_absolute_redirect.path_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.path.ptr =
+            independent_source.data() + forged.exact_absolute_redirect.path_span.start;
+        CHECK_NE(forged.exact_absolute_redirect.path.ptr, server.exact_absolute_redirect.path.ptr);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect location path provenance"),
+                           forged.exact_absolute_redirect.path_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.target.ptr =
+            independent_source.data() + forged.exact_absolute_redirect.response.target_span.start;
+        CHECK_NE(forged.exact_absolute_redirect.response.target.ptr,
+                 server.exact_absolute_redirect.response.target.ptr);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect target provenance"),
+                           forged.exact_absolute_redirect.response.target_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.status_lexeme.ptr =
+            independent_source.data() + forged.exact_absolute_redirect.response.status_span.start;
+        CHECK_NE(forged.exact_absolute_redirect.response.status_lexeme.ptr,
+                 server.exact_absolute_redirect.response.status_lexeme.ptr);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect status provenance"),
+                           forged.exact_absolute_redirect.response.status_span);
+
+        forged = server;
+        forged.listen.address = ListenerAddress::IPv4Wildcard;
+        CHECK(forged.listen.address != server.listen.address);
+        expect_unsupported(forged, lit_str("invalid model listen address"), forged.listen.span);
+
+        forged = server;
+        forged.listen.ipv4_host = 0u;
+        CHECK_NE(forged.listen.ipv4_host, server.listen.ipv4_host);
+        expect_unsupported(forged, lit_str("invalid model listen address"), forged.listen.span);
+
+        forged = server;
+        forged.listen.port = 8081u;
+        CHECK_NE(forged.listen.port, server.listen.port);
+        expect_unsupported(
+            forged, lit_str("invalid exact listen endpoint model"), forged.listen.value_span);
+
+        forged = server;
+        forged.location.proxy_pass.has_uri = true;
+        forged.location.proxy_pass.uri = lit_str("/");
+        forged.location.proxy_pass.uri_span = forged.location.proxy_pass.span;
+        REQUIRE(forged.location.proxy_pass.has_uri);
+        expect_unsupported(
+            forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
+
+        // Proxy address and non-zero port are semantic values, not source
+        // borrows in the current model. These are valid alternate upstreams,
+        // so they must retain the exact-listener composition guard rather than
+        // be mislabeled as endpoint-provenance failures.
+        forged = server;
+        forged.location.proxy_pass.address[0] = 126u;
+        CHECK_NE(forged.location.proxy_pass.address[0], server.location.proxy_pass.address[0]);
+        expect_unsupported(forged,
+                           lit_str("exact listen requires the minimal root proxy profile"),
+                           forged.listen.span);
+
+        forged = server;
+        forged.location.proxy_pass.port = 9001u;
+        CHECK_NE(forged.location.proxy_pass.port, server.location.proxy_pass.port);
+        expect_unsupported(forged,
+                           lit_str("exact listen requires the minimal root proxy profile"),
+                           forged.listen.span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.status = 303u;
+        CHECK_NE(forged.exact_absolute_redirect.response.status,
+                 server.exact_absolute_redirect.response.status);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect status"),
+                           forged.exact_absolute_redirect.response.status_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.status = 301u;
+        CHECK_NE(forged.exact_absolute_redirect.response.status,
+                 server.exact_absolute_redirect.response.status);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect status lexeme"),
+                           forged.exact_absolute_redirect.response.status_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.target.len--;
+        CHECK_NE(forged.exact_absolute_redirect.response.target.len,
+                 server.exact_absolute_redirect.response.target.len);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect target provenance"),
+                           forged.exact_absolute_redirect.response.target_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.authority.ptr++;
+        CHECK_NE(forged.exact_absolute_redirect.response.authority.ptr,
+                 server.exact_absolute_redirect.response.authority.ptr);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect authority provenance"),
+                           forged.exact_absolute_redirect.response.authority_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.path.ptr--;
+        CHECK_NE(forged.exact_absolute_redirect.response.path.ptr,
+                 server.exact_absolute_redirect.response.path.ptr);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect target path provenance"),
+                           forged.exact_absolute_redirect.response.path_span);
+
+        forged = server;
+        forged.listen.value_span.end--;
+        CHECK_NE(forged.listen.value_span.end, server.listen.value_span.end);
+        expect_unsupported(
+            forged, lit_str("invalid listen source provenance"), forged.listen.value_span);
+
+        forged = server;
+        forged.exact_absolute_redirect.span = {};
+        expect_unsupported(
+            forged, lit_str("invalid exact absolute redirect location span"), forged.span);
+
+        forged = server;
+        forged.exact_absolute_redirect.response.status_span.end++;
+        CHECK_NE(forged.exact_absolute_redirect.response.status_span.end,
+                 server.exact_absolute_redirect.response.status_span.end);
+        expect_unsupported(forged,
+                           lit_str("invalid exact absolute redirect status span"),
+                           forged.exact_absolute_redirect.response.status_span);
+
+        char local_source[] =
+            "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+            "location = /static { return 200 \"ok\"; } }";
+        const auto local = nginx::parse({local_source, sizeof(local_source) - 1u});
+        REQUIRE(local);
+        forged = server;
+        forged.exact_local_return = local.value().exact_local_return;
+        REQUIRE(forged.exact_local_return.present);
+        expect_unsupported(forged,
+                           lit_str("multiple exact semantic actions are unsupported"),
+                           forged.exact_local_return.span);
+
+        char no_content_source[] =
+            "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+            "location = /empty { return 204; } }";
+        const auto no_content = nginx::parse({no_content_source, sizeof(no_content_source) - 1u});
+        REQUIRE(no_content);
+        forged = server;
+        forged.exact_no_content_return = no_content.value().exact_no_content_return;
+        REQUIRE(forged.exact_no_content_return.present);
+        expect_unsupported(forged,
+                           lit_str("multiple exact semantic actions are unsupported"),
+                           forged.exact_absolute_redirect.span);
+
+        const nginx::Server retained = server;
+        const Span retained_server_span = server.span;
+        const Span retained_listener_span = listener.span;
+        const Span retained_listener_value_span = listener.value_span;
+        const Span retained_root_span = root.span;
+        const Span retained_root_path_span = root.path_span;
+        const Span retained_proxy_span = proxy.span;
+        const Span retained_exact_span = exact.span;
+        const Span retained_exact_path_span = exact.path_span;
+        const Span retained_response_span = response.span;
+        const Span retained_status_span = response.status_span;
+        const Span retained_target_span = response.target_span;
+        const Span retained_authority_span = response.authority_span;
+        const Span retained_target_path_span = response.path_span;
+        memset(source, 'x', len);
+        CHECK(retained.listen.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(retained.listen.ipv4_host, 0x7f000001u);
+        CHECK_EQ(retained.listen.port, 8080u);
+        CHECK_EQ(retained.location.path.len, 1u);
+        CHECK_EQ(retained.location.proxy_pass.address[0], 127u);
+        CHECK_EQ(retained.location.proxy_pass.address[1], 0u);
+        CHECK_EQ(retained.location.proxy_pass.address[2], 0u);
+        CHECK_EQ(retained.location.proxy_pass.address[3], 1u);
+        CHECK_EQ(retained.location.proxy_pass.port, 9000u);
+        CHECK_FALSE(retained.location.proxy_pass.has_uri);
+        CHECK(retained.exact_absolute_redirect.present);
+        CHECK_EQ(retained.exact_absolute_redirect.path.len, 4u);
+        CHECK_EQ(retained.exact_absolute_redirect.response.status, 302u);
+        CHECK_EQ(retained.exact_absolute_redirect.response.status_lexeme.len, 3u);
+        CHECK_EQ(retained.exact_absolute_redirect.response.target.len, 27u);
+        CHECK_EQ(retained.exact_absolute_redirect.response.authority.len, 16u);
+        CHECK_EQ(retained.exact_absolute_redirect.response.path.len, 4u);
+        CHECK_FALSE(retained.exact_local_return.present);
+        CHECK_FALSE(retained.exact_no_content_return.present);
+        const auto check_retained_span = [&](Span actual, Span expected) {
+            CHECK_EQ(actual.start, expected.start);
+            CHECK_EQ(actual.end, expected.end);
+            CHECK_EQ(actual.line, expected.line);
+            CHECK_EQ(actual.col, expected.col);
+        };
+        check_retained_span(retained.span, retained_server_span);
+        check_retained_span(retained.listen.span, retained_listener_span);
+        check_retained_span(retained.listen.value_span, retained_listener_value_span);
+        check_retained_span(retained.location.span, retained_root_span);
+        check_retained_span(retained.location.path_span, retained_root_path_span);
+        check_retained_span(retained.location.proxy_pass.span, retained_proxy_span);
+        check_retained_span(retained.exact_absolute_redirect.span, retained_exact_span);
+        check_retained_span(retained.exact_absolute_redirect.path_span, retained_exact_path_span);
+        check_retained_span(retained.exact_absolute_redirect.response.span, retained_response_span);
+        check_retained_span(retained.exact_absolute_redirect.response.status_span,
+                            retained_status_span);
+        check_retained_span(retained.exact_absolute_redirect.response.target_span,
+                            retained_target_span);
+        check_retained_span(retained.exact_absolute_redirect.response.authority_span,
+                            retained_authority_span);
+        check_retained_span(retained.exact_absolute_redirect.response.path_span,
+                            retained_target_path_span);
+        CHECK_EQ(retained.pre_route_trace.span.start, retained_server_span.start);
+        CHECK_EQ(retained.pre_route_trace.span.end, retained_server_span.end);
+        // Every Str above is now dangling by design; only scalar lengths and
+        // spans are inspected after this explicit lifetime boundary.
+    };
+
+    check(exact_then_root, sizeof(exact_then_root) - 1u, 3u, 4u);
+    check(root_then_exact, sizeof(root_then_exact) - 1u, 4u, 3u);
+
+    static constexpr u32 kWildcardListenPrefixLen = sizeof("listen :") - 1u;
+    static constexpr u32 kExactListenPrefixLen = sizeof("listen 127.0.0.1:") - 1u;
+    static constexpr u32 kExactListenerDelta = kExactListenPrefixLen - kWildcardListenPrefixLen;
+    static_assert(kWildcardListenPrefixLen == 8u);
+    static_assert(kExactListenPrefixLen == 17u);
+    static_assert(kExactListenerDelta == 9u);
+    static_assert(nginx::RutSource::kCapacity == 5937u);
+
+    const auto check_wildcard_at_length = [&](Str source, u32 expected_length, u32& actual_length) {
+        const auto parsed = nginx::parse(source);
+        REQUIRE(parsed);
+        CHECK(parsed.value().listen.address == ListenerAddress::IPv4Wildcard);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, expected_length);
+        actual_length = lowered.value().len;
+        CHECK(lowered.value().view().slice(0u, kWildcardListenPrefixLen).eq(lit_str("listen :")));
+    };
+    const auto expect_exact_redirect_guard = [&](Str source,
+                                                 u16 expected_status,
+                                                 u16 expected_listener_port,
+                                                 u32 expected_upstream_ipv4,
+                                                 u16 expected_upstream_port) {
+        const auto parsed = nginx::parse(source);
+        REQUIRE(parsed);
+        CHECK(parsed.value().listen.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(parsed.value().listen.ipv4_host, 0x7f000001u);
+        CHECK_EQ(parsed.value().listen.port, expected_listener_port);
+        CHECK_EQ(parsed.value().exact_absolute_redirect.response.status, expected_status);
+        const auto& address = parsed.value().location.proxy_pass.address;
+        const u32 upstream_ipv4 = static_cast<u32>(address[0]) << 24u |
+                                  static_cast<u32>(address[1]) << 16u |
+                                  static_cast<u32>(address[2]) << 8u | static_cast<u32>(address[3]);
+        CHECK_EQ(upstream_ipv4, expected_upstream_ipv4);
+        CHECK_EQ(parsed.value().location.proxy_pass.port, expected_upstream_port);
+        CHECK_FALSE(parsed.value().location.proxy_pass.has_uri);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(
+            lit_str("exact listen requires the minimal root proxy profile")));
+        CHECK_EQ(lowered.error().span.start, parsed.value().listen.span.start);
+        CHECK_EQ(lowered.error().span.end, parsed.value().listen.span.end);
+        CHECK_EQ(lowered.error().span.line, parsed.value().listen.span.line);
+        CHECK_EQ(lowered.error().span.col, parsed.value().listen.span.col);
+    };
+
+    static constexpr char kRepresentativeWildcard302[] =
+        "server { listen 8080; location = /old { return 302 "
+        "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kRepresentativeExact302[] =
+        "server { listen 127.0.0.1:8080; location = /old { return 302 "
+        "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
+    u32 representative_wildcard_302 = 0u;
+    check_wildcard_at_length({kRepresentativeWildcard302, sizeof(kRepresentativeWildcard302) - 1u},
+                             5904u,
+                             representative_wildcard_302);
+    const u32 representative_exact_302 = representative_wildcard_302 + kExactListenerDelta;
+    CHECK_EQ(representative_exact_302, 5913u);
+    CHECK_LT(representative_exact_302, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 24u);
+    expect_exact_redirect_guard({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
+                                302u,
+                                8080u,
+                                0x7f000001u,
+                                9000u);
+
+    static constexpr char kMaximumWildcard302[] =
+        "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
+        "location = /old { return 302 http://redirect.example/new; } }";
+    static constexpr char kMaximumExact302[] =
+        "server { listen 127.0.0.1:65535; location / { proxy_pass "
+        "http://255.255.255.255:65535; } location = /old { return 302 "
+        "http://redirect.example/new; } }";
+    u32 maximum_wildcard_302 = 0u;
+    check_wildcard_at_length(
+        {kMaximumWildcard302, sizeof(kMaximumWildcard302) - 1u}, 5912u, maximum_wildcard_302);
+    const u32 maximum_exact_302 = maximum_wildcard_302 + kExactListenerDelta;
+    CHECK_EQ(maximum_exact_302, 5921u);
+    CHECK_LT(maximum_exact_302, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 16u);
+    expect_exact_redirect_guard(
+        {kMaximumExact302, sizeof(kMaximumExact302) - 1u}, 302u, 65535u, 0xffffffffu, 65535u);
+
+    static constexpr char kRepresentativeWildcard301[] =
+        "server { listen 8080; location = /old { return 301 "
+        "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kRepresentativeExact301[] =
+        "server { listen 127.0.0.1:8080; location = /old { return 301 "
+        "http://redirect.example/new; } location / { proxy_pass http://127.0.0.1:9000; } }";
+    u32 representative_wildcard_301 = 0u;
+    check_wildcard_at_length({kRepresentativeWildcard301, sizeof(kRepresentativeWildcard301) - 1u},
+                             5928u,
+                             representative_wildcard_301);
+    const u32 representative_exact_301 = representative_wildcard_301 + kExactListenerDelta;
+    CHECK_EQ(representative_exact_301, nginx::RutSource::kCapacity);
+    CHECK_FALSE(representative_exact_301 < nginx::RutSource::kCapacity);
+    expect_exact_redirect_guard({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
+                                301u,
+                                8080u,
+                                0x7f000001u,
+                                9000u);
+
+    static constexpr char kMaximumWildcard301[] =
+        "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
+        "location = /old { return 301 http://redirect.example/new; } }";
+    static constexpr char kMaximumExact301[] =
+        "server { listen 127.0.0.1:65535; location / { proxy_pass "
+        "http://255.255.255.255:65535; } location = /old { return 301 "
+        "http://redirect.example/new; } }";
+    u32 maximum_wildcard_301 = 0u;
+    check_wildcard_at_length(
+        {kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u}, 5936u, maximum_wildcard_301);
+    const u32 maximum_exact_301 = maximum_wildcard_301 + kExactListenerDelta;
+    CHECK_EQ(maximum_exact_301, 5945u);
+    CHECK_EQ(maximum_exact_301 + 1u, 5946u);
+    CHECK_GT(maximum_exact_301, nginx::RutSource::kCapacity);
+    expect_exact_redirect_guard(
+        {kMaximumExact301, sizeof(kMaximumExact301) - 1u}, 301u, 65535u, 0xffffffffu, 65535u);
+
+    // Isolate the existing invalid-upstream-port diagnostic with a coherent
+    // wildcard source; the exact composition guard intentionally precedes it.
+    const auto wildcard_for_port =
+        nginx::parse({kRepresentativeWildcard302, sizeof(kRepresentativeWildcard302) - 1u});
+    REQUIRE(wildcard_for_port);
+    auto zero_upstream_port = wildcard_for_port.value();
+    zero_upstream_port.location.proxy_pass.port = 0u;
+    const auto rejected_zero_port = nginx::lower_to_rut(zero_upstream_port);
+    REQUIRE_FALSE(rejected_zero_port);
+    CHECK_EQ(rejected_zero_port.error().code, FrontendError::InvalidInteger);
+    CHECK(rejected_zero_port.error().detail.eq(lit_str("invalid model upstream port")));
+    CHECK_EQ(rejected_zero_port.error().span.start,
+             zero_upstream_port.location.proxy_pass.span.start);
+    CHECK_EQ(rejected_zero_port.error().span.end, zero_upstream_port.location.proxy_pass.span.end);
+    CHECK_EQ(rejected_zero_port.error().span.line,
+             zero_upstream_port.location.proxy_pass.span.line);
+    CHECK_EQ(rejected_zero_port.error().span.col, zero_upstream_port.location.proxy_pass.span.col);
+}
+
 TEST(nginx_parser, rejects_non_loopback_and_malformed_exact_listen_endpoints) {
     struct Rejection {
         const char* fragment;
