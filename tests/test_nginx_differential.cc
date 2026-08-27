@@ -13500,6 +13500,52 @@ static std::string canonical_generated_bodyful_exact_route(const char* path, con
            std::string(body) + "\"\n}) }\n";
 }
 
+static constexpr char kCanonicalGeneratedNginxRootGetForward[] =
+    "route GET \"/\" {\n"
+    "    return forward(nginx_upstream, request_policy: {\n"
+    "            version: \"HTTP/1.1\",\n"
+    "            host: \"upstream\",\n"
+    "            connection: \"omit\",\n"
+    "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+    "\"Upgrade\"]\n"
+    "        },\n"
+    "        response_policy: {\n"
+    "            version: \"HTTP/1.1\",\n"
+    "            framing: \"content_length\",\n"
+    "            connection: \"request\",\n"
+    "            server: \"nginx/1.29.7\",\n"
+    "            date: \"current\",\n"
+    "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+    "        },\n"
+    "        failure_policy: {\n"
+    "            version: \"HTTP/1.1\",\n"
+    "            status: 502,\n"
+    "            reason: \"Bad Gateway\",\n"
+    "            content_type: \"text/html\",\n"
+    "            server: \"nginx/1.29.7\",\n"
+    "            date: \"current\",\n"
+    "            connection: \"request\",\n"
+    "            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>"
+    "\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>"
+    "\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+    "        },\n"
+    "        timeout_failure_policy: {\n"
+    "            version: \"HTTP/1.1\",\n"
+    "            status: 504,\n"
+    "            reason: \"Gateway Time-out\",\n"
+    "            content_type: \"text/html\",\n"
+    "            server: \"nginx/1.29.7\",\n"
+    "            date: \"current\",\n"
+    "            connection: \"request\",\n"
+    "            body: b\"<html>\\r\\n<head><title>504 Gateway Time-out</title></head>\\r\\n"
+    "<body>\\r\\n<center><h1>504 Gateway Time-out</h1></center>\\r\\n<hr><center>nginx/1.29.7"
+    "</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+    "        },\n"
+    "        response_read_timeout: 60s,\n"
+    "        response_buffering: \"complete_content_length\"\n"
+    "    )\n"
+    "}\n";
+
 static size_t count_source_literal(const std::string& source, const std::string& literal) {
     size_t count = 0;
     for (size_t offset = 0;;) {
@@ -13580,7 +13626,12 @@ static bool validate_bodyful_normalized_generated_source(const std::string& sour
     const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
     const std::string backend =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
+    static constexpr char kDeadlineBuffering[] =
+        "        response_read_timeout: 60s,\n"
+        "        response_buffering: \"complete_content_length\"\n";
     if (count_source_literal(source, exact_route) != 1u ||
+        count_source_literal(source, kCanonicalGeneratedNginxRootGetForward) != 1u ||
+        count_source_literal(source, kDeadlineBuffering) != 1u ||
         count_source_literal(source, "route exact ") != 1u ||
         count_source_literal(source, "route exact slash_normalized \"/a/b\"") != 1u ||
         count_source_literal(source, "route HEAD \"/\" {") != 1u ||
@@ -13678,6 +13729,9 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
     };
     const std::string selector = "route exact slash_normalized \"/a/b\"";
     const std::string complete = canonical_generated_bodyful_exact_route("/a/b", "ok");
+    static constexpr char kDeadlineBuffering[] =
+        "        response_read_timeout: 60s,\n"
+        "        response_buffering: \"complete_content_length\"\n";
     if (!validate_bodyful_normalized_generated_source(canonical, kFrontend, kBackend, error) ||
         !rejects_source(replace_once(canonical, selector, "route exact \"/a/b\"")) ||
         !rejects_source(canonical + complete) ||
@@ -13688,7 +13742,16 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
         !rejects_source(canonical + "route exact slash_normalized \"/a/b?x=1\" {}\n") ||
         !rejects_source(canonical + "if Host == \"bodyful-normalized.example\" {}\n") ||
         !rejects_source(canonical + "# nginx_compat runtime workaround\n") ||
-        !rejects_source(replace_once(canonical, "status: 200", "status: 204"))) {
+        !rejects_source(replace_once(canonical, "status: 200", "status: 204")) ||
+        !rejects_source(replace_once(canonical, kCanonicalGeneratedNginxRootGetForward, "")) ||
+        !rejects_source(
+            replace_once(canonical, "response_read_timeout: 60s", "response_read_timeout: 61s")) ||
+        !rejects_source(replace_once(canonical,
+                                     "response_buffering: \"complete_content_length\"",
+                                     "response_buffering: \"none\"")) ||
+        !rejects_source(canonical + kCanonicalGeneratedNginxRootGetForward) ||
+        !rejects_source(replace_once(
+            canonical, kDeadlineBuffering, std::string(kDeadlineBuffering) + kDeadlineBuffering))) {
         error = "#331 Stage 3 generated source mutation self-check failed";
         return false;
     }
@@ -13728,6 +13791,113 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
         !rejects_access(replace_once(access, " nginx_upstream ", " other_upstream ")) ||
         !rejects_access(replace_once(access, " s=0\n", " s=1\n"))) {
         error = "#331 Stage 3 generated access mutation self-check failed";
+        return false;
+    }
+    return true;
+}
+
+struct BodyfulNormalized201BlockerEvidence {
+    u32 accepts = 0u;
+    u32 requests = 0u;
+    u32 sends = 0u;
+    bool live_at_observation = false;
+    bool listener_failed = false;
+    bool send_succeeded = false;
+    bool send_failed = false;
+    bool clean_shutdown = false;
+    bool connection_closed = false;
+    std::vector<std::vector<char>> history;
+};
+
+static bool validate_bodyful_normalized_201_blocker_evidence(
+    const BodyfulNormalized201BlockerEvidence& evidence, u16 backend_port, std::string& error) {
+    const std::string expected =
+        "GET /a/b/ HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<char> expected_request(expected.begin(), expected.end());
+    if (backend_port == 0u || evidence.accepts != 1u || evidence.requests != 1u ||
+        evidence.sends != 1u || !evidence.live_at_observation || evidence.listener_failed ||
+        !evidence.send_succeeded || evidence.send_failed || !evidence.clean_shutdown ||
+        !evidence.connection_closed || evidence.history.size() != 1u ||
+        evidence.history[0] != expected_request) {
+        error =
+            "bounded 201 blocker observation lacked one live clean byte-exact /a/b/ upstream "
+            "episode";
+        return false;
+    }
+    return true;
+}
+
+static bool run_bodyful_normalized_201_blocker_evidence_self_checks(std::string& error) {
+    static constexpr u16 kBackend = 54331u;
+    const std::string request =
+        "GET /a/b/ HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kBackend) + "\r\n\r\n";
+    BodyfulNormalized201BlockerEvidence baseline;
+    baseline.accepts = 1u;
+    baseline.requests = 1u;
+    baseline.sends = 1u;
+    baseline.live_at_observation = true;
+    baseline.send_succeeded = true;
+    baseline.clean_shutdown = true;
+    baseline.connection_closed = true;
+    baseline.history.emplace_back(request.begin(), request.end());
+    if (!validate_bodyful_normalized_201_blocker_evidence(baseline, kBackend, error)) return false;
+    const auto rejects = [&](BodyfulNormalized201BlockerEvidence changed, const char* name) {
+        std::string detail;
+        if (!validate_bodyful_normalized_201_blocker_evidence(changed, kBackend, detail))
+            return true;
+        error = std::string("#333 upstream evidence mutation accepted: ") + name;
+        return false;
+    };
+    BodyfulNormalized201BlockerEvidence changed = baseline;
+    changed.accepts = 2u;
+    if (!rejects(changed, "retry-accept")) return false;
+    changed = baseline;
+    changed.requests = 0u;
+    if (!rejects(changed, "missing-request")) return false;
+    changed = baseline;
+    changed.sends = 2u;
+    if (!rejects(changed, "duplicate-send")) return false;
+    changed = baseline;
+    changed.live_at_observation = false;
+    if (!rejects(changed, "dead-recorder")) return false;
+    changed = baseline;
+    changed.listener_failed = true;
+    if (!rejects(changed, "listener-failure")) return false;
+    changed = baseline;
+    changed.send_succeeded = false;
+    if (!rejects(changed, "missing-send-success")) return false;
+    changed = baseline;
+    changed.send_failed = true;
+    if (!rejects(changed, "failed-send")) return false;
+    changed = baseline;
+    changed.clean_shutdown = false;
+    if (!rejects(changed, "unclean-upstream-shutdown")) return false;
+    changed = baseline;
+    changed.connection_closed = false;
+    if (!rejects(changed, "unclosed-upstream")) return false;
+    changed = baseline;
+    changed.history.clear();
+    if (!rejects(changed, "missing-history")) return false;
+    changed = baseline;
+    changed.history.push_back(changed.history[0]);
+    if (!rejects(changed, "retry-history")) return false;
+    changed = baseline;
+    changed.history[0][4] = 'c';
+    if (!rejects(changed, "wrong-target")) return false;
+    changed = baseline;
+    static constexpr char kPort[] = "54331";
+    const auto port = std::search(
+        changed.history[0].begin(), changed.history[0].end(), kPort, kPort + sizeof(kPort) - 1u);
+    if (port == changed.history[0].end()) {
+        error = "#333 self-check fixture lacked canonical Host port";
+        return false;
+    }
+    *(port + sizeof(kPort) - 2u) = '2';
+    if (!rejects(changed, "wrong-host")) return false;
+    u16 zero_port = 0u;
+    std::string detail;
+    if (validate_bodyful_normalized_201_blocker_evidence(baseline, zero_port, detail)) {
+        error = "#333 zero backend-port mutation accepted";
         return false;
     }
     return true;
@@ -14022,20 +14192,67 @@ static bool capture_generated_bodyful_normalized_exact_side(
     for (size_t i = 3u; i < targets.size(); i++) {
         const u32 expected = static_cast<u32>(i - 2u);
         if (!request(i, kBodyfulNormalizedFallbackResponseNormalized)) {
+            const std::string downstream_error = error;
+            if (i != 3u || !observation.wires[i].empty() ||
+                downstream_error.find("response ended before Content-Length body size=0 wire=") ==
+                    std::string::npos) {
+                return false;
+            }
             const auto evidence_deadline =
                 std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (std::chrono::steady_clock::now() < evidence_deadline &&
                    (fallback.accepted.load(std::memory_order_acquire) < expected ||
                     fallback.requests.load(std::memory_order_acquire) < expected ||
-                    fallback.response_send_all_calls.load(std::memory_order_acquire) < expected))
+                    fallback.response_send_all_calls.load(std::memory_order_acquire) < expected ||
+                    !fallback.response_send_succeeded.load(std::memory_order_acquire) ||
+                    !fallback.response_clean_shutdown.load(std::memory_order_acquire) ||
+                    !fallback.response_connection_closed.load(std::memory_order_acquire)))
                 usleep(1000);
-            error +=
-                " upstream_accepts=" +
-                std::to_string(fallback.accepted.load(std::memory_order_acquire)) +
-                " upstream_requests=" +
-                std::to_string(fallback.requests.load(std::memory_order_acquire)) +
-                " upstream_sends=" +
-                std::to_string(fallback.response_send_all_calls.load(std::memory_order_acquire));
+            bool live_clean = false;
+            const auto no_retry_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < no_retry_deadline) {
+                if (poll_child(runtime.child) || !recorder_live(fallback) ||
+                    fallback.accepted.load(std::memory_order_acquire) != 1u ||
+                    fallback.requests.load(std::memory_order_acquire) != 1u ||
+                    fallback.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                    !fallback.response_send_succeeded.load(std::memory_order_acquire) ||
+                    fallback.response_send_failed.load(std::memory_order_acquire) ||
+                    !fallback.response_clean_shutdown.load(std::memory_order_acquire) ||
+                    !fallback.response_connection_closed.load(std::memory_order_acquire)) {
+                    error =
+                        "#331 Stage 3 zero-byte close lacked bounded live clean one-episode "
+                        "causal evidence";
+                    return false;
+                }
+                live_clean = true;
+                usleep(5000);
+            }
+            fallback.stop();
+            fallback_guard.value = nullptr;
+            BodyfulNormalized201BlockerEvidence evidence;
+            evidence.accepts = fallback.accepted.load(std::memory_order_acquire);
+            evidence.requests = fallback.requests.load(std::memory_order_acquire);
+            evidence.sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+            evidence.live_at_observation = live_clean;
+            evidence.listener_failed = fallback.listener_failed.load(std::memory_order_acquire);
+            evidence.send_succeeded =
+                fallback.response_send_succeeded.load(std::memory_order_acquire);
+            evidence.send_failed = fallback.response_send_failed.load(std::memory_order_acquire);
+            evidence.clean_shutdown =
+                fallback.response_clean_shutdown.load(std::memory_order_acquire);
+            evidence.connection_closed =
+                fallback.response_connection_closed.load(std::memory_order_acquire);
+            evidence.history = fallback.history;
+            std::string causal_error;
+            if (!validate_bodyful_normalized_201_blocker_evidence(
+                    evidence, backend_port, causal_error)) {
+                error = "#331 Stage 3 could not attribute zero-byte close to #333: " + causal_error;
+                return false;
+            }
+            error = downstream_error +
+                    " #333_causal_upstream=accepts:1,requests:1,send_all_calls:1,send_success:1,"
+                    "send_failure:0,live_clean:1,history:/a/b/@canonical_host,no_retry:1";
             return false;
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -23861,12 +24078,19 @@ int main(int argc, char** argv) {
                       << "\n";
             return 1;
         }
+        if (converter_bodyful_normalized_exact_differential &&
+            !run_bodyful_normalized_201_blocker_evidence_self_checks(parser_error)) {
+            std::cerr << "FAIL [#333 upstream blocker-evidence self-check]: " << parser_error
+                      << "\n";
+            return 1;
+        }
     }
     if (converter_exact_local_return204_differential ||
         converter_exact_local_return204_query_differential ||
         converter_bounded_no_content_path_differential ||
         converter_trailing_slash_no_content_differential ||
-        converter_max_boundary_no_content_differential) {
+        converter_max_boundary_no_content_differential ||
+        converter_bodyful_normalized_exact_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
