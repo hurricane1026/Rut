@@ -31210,6 +31210,979 @@ static void dump_exact_loopback_bodyful_observation(
         dump_log(observation.access_path, "#349 nginx access log");
 }
 
+struct ExactLoopbackReturn302Observation {
+    std::string side;
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
+    std::string access_scope;
+    std::string config;
+    u16 frontend_port = 0;
+    u16 backend_port = 0;
+    u16 negative_port = 0;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> forward_history;
+    std::vector<std::string> access_records;
+    u32 forward_accepts = 0;
+    u32 forward_requests = 0;
+    u32 forward_sends = 0;
+    bool negative_guard_stream = false;
+    bool negative_guard_cloexec = false;
+    bool negative_guard_non_listening = false;
+    bool negative_guard_blocked_wildcard_bind = false;
+    bool readiness_quiet = false;
+    bool negative_probe_before_failed = false;
+    bool negative_probe_before_quiet = false;
+    bool redirect_upstream_quiet = false;
+    bool negative_probe_after_failed = false;
+    bool negative_probe_after_quiet = false;
+    bool clean_lifecycle = false;
+    bool eof_proven[5]{};
+};
+
+static std::string make_exact_loopback_return302_config(u16 frontend_port,
+                                                        u16 backend_port,
+                                                        bool exact_first,
+                                                        const std::string& access_scope,
+                                                        const std::string& access_path) {
+    const std::string listener = "    listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
+    const std::string exact = "    location = /old { return 302 http://redirect.example/new; }\n";
+    const std::string root =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "error_log stderr notice;\n"
+           "events {}\n"
+           "http {\n"
+           "  log_format exact_loopback_return302 '" +
+           access_scope +
+           " raw=\"$request\" status=$status request_size=$request_length response_size="
+           "$bytes_sent host=\"$host\" upstream_addr=\"$upstream_addr\" upstream_status="
+           "$upstream_status';\n"
+           "  access_log " +
+           access_path +
+           " exact_loopback_return302;\n"
+           "  server {\n" +
+           listener + (exact_first ? exact + root : root + exact) +
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_exact_loopback_return302_config(const std::string& config,
+                                                     u16 frontend_port,
+                                                     u16 backend_port,
+                                                     bool exact_first,
+                                                     const std::string& access_scope,
+                                                     const std::string& access_path,
+                                                     std::string& error) {
+    const std::string expected = make_exact_loopback_return302_config(
+        frontend_port, backend_port, exact_first, access_scope, access_path);
+    const std::string listener = "    listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
+    const std::string exact = "    location = /old { return 302 http://redirect.example/new; }\n";
+    const std::string root =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    if (access_scope.empty() || access_path.empty() || config != expected ||
+        count_text(config, "server {") != 1u || count_text(config, "listen ") != 1u ||
+        count_text(config, listener) != 1u || count_text(config, "location = /old") != 1u ||
+        count_text(config, exact) != 1u || count_text(config, "location /") != 1u ||
+        count_text(config, root) != 1u || count_text(config, "return 302 ") != 1u ||
+        count_text(config, "proxy_pass ") != 1u || count_text(config, access_scope) != 1u ||
+        count_text(config, "  access_log " + access_path + " exact_loopback_return302;\n") != 1u) {
+        error =
+            "#350 config was not the complete canonical exact-listener/fixed-302/root-proxy "
+            "harness in the requested declaration order";
+        return false;
+    }
+    return true;
+}
+
+static std::vector<std::string> exact_loopback_return302_expected_access(const std::string& scope,
+                                                                         u16 backend_port) {
+    const std::string upstream = "127.0.0.1:" + std::to_string(backend_port);
+    return {
+        scope + " raw=\"GET /old HTTP/1.1\" status=302 request_size=" +
+            std::to_string(sizeof(kExactAbsoluteRedirectCloseRequest) - 1u) +
+            " response_size=342 host=\"redirect-source.example\" upstream_addr=\"-\" "
+            "upstream_status=-",
+        scope + " raw=\"GET /old HTTP/1.1\" status=302 request_size=" +
+            std::to_string(sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u) +
+            " response_size=342 host=\"alternate-redirect-source.example\" "
+            "upstream_addr=\"-\" upstream_status=-",
+        scope + " raw=\"GET /old?x=1 HTTP/1.1\" status=302 request_size=" +
+            std::to_string(sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u) +
+            " response_size=342 host=\"redirect-source.example\" upstream_addr=\"-\" "
+            "upstream_status=-",
+        scope + " raw=\"GET /old/ HTTP/1.1\" status=200 request_size=" +
+            std::to_string(sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u) +
+            " response_size=118 host=\"redirect-source.example\" upstream_addr=\"" + upstream +
+            "\" upstream_status=200",
+        scope + " raw=\"GET / HTTP/1.1\" status=200 request_size=" +
+            std::to_string(sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u) +
+            " response_size=118 host=\"redirect-source.example\" upstream_addr=\"" + upstream +
+            "\" upstream_status=200",
+    };
+}
+
+static bool parse_exact_loopback_return302_access(const std::string& contents,
+                                                  const std::string& scope,
+                                                  u16 backend_port,
+                                                  std::vector<std::string>& records,
+                                                  std::string& error) {
+    if (!split_exact_complete_log(contents, 5u, "#350 nginx-only access log", records, error))
+        return false;
+    if (records != exact_loopback_return302_expected_access(scope, backend_port)) {
+        error =
+            "#350 access log did not contain exactly five ordered complete "
+            "raw/status/request-size/response-size/host/upstream records";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_exact_loopback_return302_observation(
+    const ExactLoopbackReturn302Observation& observation, std::string& error) {
+    if (observation.side != "pinned-nginx" ||
+        (observation.order != "exact-before-root" && observation.order != "root-before-exact")) {
+        error = "#350 observation lost its nginx-only side or bounded declaration order";
+        return false;
+    }
+    const bool exact_first = observation.order == "exact-before-root";
+    if (!validate_exact_loopback_return302_config(observation.config,
+                                                  observation.frontend_port,
+                                                  observation.backend_port,
+                                                  exact_first,
+                                                  observation.access_scope,
+                                                  observation.access_path,
+                                                  error))
+        return false;
+    if (observation.frontend_port == 0u || observation.backend_port == 0u ||
+        observation.frontend_port == observation.backend_port ||
+        observation.negative_port != observation.frontend_port ||
+        !observation.negative_guard_stream || !observation.negative_guard_cloexec ||
+        !observation.negative_guard_non_listening ||
+        !observation.negative_guard_blocked_wildcard_bind || !observation.readiness_quiet ||
+        !observation.negative_probe_before_failed || !observation.negative_probe_before_quiet ||
+        !observation.redirect_upstream_quiet || !observation.negative_probe_after_failed ||
+        !observation.negative_probe_after_quiet || !observation.clean_lifecycle) {
+        error =
+            "#350 observation did not prove persistent exact .1 scope, causal .2 wildcard "
+            "exclusion, quiet refusal probes and a clean lifecycle";
+        return false;
+    }
+    if (observation.wires.size() != 5u || observation.forward_history.size() != 2u ||
+        observation.access_records.size() != 5u || observation.forward_accepts != 2u ||
+        observation.forward_requests != 2u || observation.forward_sends != 2u) {
+        error =
+            "#350 observation did not retain its exact five responses, two forward episodes "
+            "and five access records";
+        return false;
+    }
+    for (bool eof : observation.eof_proven) {
+        if (!eof) {
+            error = "#350 one request did not prove a zero-tail EOF";
+            return false;
+        }
+    }
+    std::string detail;
+    for (size_t i = 0u; i < observation.wires.size(); i++) {
+        const char* expected =
+            i < 3u ? kExactAbsoluteRedirect302ResponseNormalized : kSuccessResponseNormalized;
+        const size_t expected_size = i < 3u ? 342u : 118u;
+        if (observation.wires[i].size() != expected_size ||
+            !validate_exact_normalized_response(observation.wires[i], expected, detail)) {
+            error = "#350 vector " + std::to_string(i + 1u) +
+                    " lost its exact Date-normalized status/reason/header/body/close/EOF wire: " +
+                    detail;
+            return false;
+        }
+    }
+    const std::string expected_slash =
+        "GET /old/ HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(observation.backend_port) +
+        "\r\n\r\n";
+    const std::string expected_root =
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(observation.backend_port) +
+        "\r\n\r\n";
+    if (observation.forward_history[0] !=
+            std::vector<char>(expected_slash.begin(), expected_slash.end()) ||
+        observation.forward_history[1] !=
+            std::vector<char>(expected_root.begin(), expected_root.end())) {
+        error =
+            "#350 fallback upstream history lost its exact method/URI/rebuilt-Host/"
+            "omitted-Connection wires or order";
+        return false;
+    }
+    std::vector<std::string> parsed;
+    std::string contents;
+    for (const auto& record : observation.access_records) contents += record + "\n";
+    if (!parse_exact_loopback_return302_access(
+            contents, observation.access_scope, observation.backend_port, parsed, error) ||
+        parsed != observation.access_records)
+        return false;
+    return true;
+}
+
+static bool validate_exact_loopback_return302_pair(
+    const ExactLoopbackReturn302Observation (&observations)[2], std::string& error) {
+    if (observations[0].side != "pinned-nginx" || observations[1].side != "pinned-nginx" ||
+        observations[0].order != "exact-before-root" ||
+        observations[1].order != "root-before-exact") {
+        error = "#350 pair did not retain exactly listen/exact/root and listen/root/exact";
+        return false;
+    }
+    for (const auto& observation : observations)
+        if (!validate_exact_loopback_return302_observation(observation, error)) return false;
+    const std::string* resources[] = {&observations[0].temp_path,
+                                      &observations[0].config_path,
+                                      &observations[0].log_path,
+                                      &observations[0].access_path,
+                                      &observations[0].process_identity,
+                                      &observations[0].access_scope,
+                                      &observations[1].temp_path,
+                                      &observations[1].config_path,
+                                      &observations[1].log_path,
+                                      &observations[1].access_path,
+                                      &observations[1].process_identity,
+                                      &observations[1].access_scope};
+    for (size_t i = 0u; i < std::size(resources); i++) {
+        if (resources[i]->empty()) {
+            error = "#350 pair omitted a resource identity";
+            return false;
+        }
+        for (size_t j = i + 1u; j < std::size(resources); j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#350 declaration-order sides shared a resource identity";
+                return false;
+            }
+        }
+    }
+    const u16 ports[] = {observations[0].frontend_port,
+                         observations[0].backend_port,
+                         observations[1].frontend_port,
+                         observations[1].backend_port};
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        for (size_t j = i + 1u; j < std::size(ports); j++) {
+            if (ports[i] == ports[j]) {
+                error = "#350 sides shared one of the four reserved port numbers";
+                return false;
+            }
+        }
+    }
+    for (size_t vector = 0u; vector < 5u; vector++) {
+        std::vector<char> left = observations[0].wires[vector];
+        std::vector<char> right = observations[1].wires[vector];
+        if (!normalize_date(left) || !normalize_date(right) || left != right) {
+            error =
+                "#350 declaration order changed normalized vector " + std::to_string(vector + 1u);
+            return false;
+        }
+    }
+    const auto canonical_history = [](const ExactLoopbackReturn302Observation& observation) {
+        std::string result;
+        const std::string port = std::to_string(observation.backend_port);
+        for (const auto& wire : observation.forward_history) {
+            std::string text(wire.begin(), wire.end());
+            const size_t offset = text.find(port);
+            if (offset == std::string::npos ||
+                text.find(port, offset + port.size()) != std::string::npos)
+                return std::string{};
+            text.replace(offset, port.size(), "BACKEND");
+            result += text;
+        }
+        return result;
+    };
+    const std::string canonical = canonical_history(observations[0]);
+    if (canonical.empty() || canonical != canonical_history(observations[1])) {
+        error = "#350 declaration order changed canonical upstream history";
+        return false;
+    }
+    return true;
+}
+
+static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) {
+    static constexpr u16 kPorts[] = {44201u, 44202u, 44203u, 44204u};
+    const auto replace_unique =
+        [&](std::string value, const std::string& from, const std::string& to, const char* label) {
+            const size_t offset = from.empty() ? std::string::npos : value.find(from);
+            if (from.empty() || from == to || offset == std::string::npos ||
+                value.find(from, offset + from.size()) != std::string::npos) {
+                error = std::string("#350 self-check mutation was not unique/non-no-op: ") + label;
+                return std::string{};
+            }
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    const auto make_valid = [&](size_t side) {
+        ExactLoopbackReturn302Observation observation;
+        observation.side = "pinned-nginx";
+        observation.order = side == 0u ? "exact-before-root" : "root-before-exact";
+        observation.temp_path = "/tmp/350-side-" + std::to_string(side);
+        observation.config_path = observation.temp_path + "/nginx.conf";
+        observation.log_path = observation.temp_path + "/nginx.log";
+        observation.access_path = observation.temp_path + "/access.log";
+        observation.process_identity = "rut-nginx-350-self-" + std::to_string(side);
+        observation.access_scope = "rut-nginx-350-self-scope-" + std::to_string(side);
+        observation.frontend_port = kPorts[side * 2u];
+        observation.backend_port = kPorts[side * 2u + 1u];
+        observation.negative_port = observation.frontend_port;
+        observation.config = make_exact_loopback_return302_config(observation.frontend_port,
+                                                                  observation.backend_port,
+                                                                  side == 0u,
+                                                                  observation.access_scope,
+                                                                  observation.access_path);
+        const char* expected[] = {kExactAbsoluteRedirect302ResponseNormalized,
+                                  kExactAbsoluteRedirect302ResponseNormalized,
+                                  kExactAbsoluteRedirect302ResponseNormalized,
+                                  kSuccessResponseNormalized,
+                                  kSuccessResponseNormalized};
+        for (const char* wire : expected) {
+            std::string dated(wire);
+            const size_t date = dated.find("XXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+            if (date != std::string::npos)
+                dated.replace(date, 29u, "Tue, 01 Jan 2030 00:00:00 GMT");
+            observation.wires.emplace_back(dated.begin(), dated.end());
+        }
+        const std::string slash =
+            "GET /old/ HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(observation.backend_port) +
+            "\r\n\r\n";
+        const std::string root =
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(observation.backend_port) +
+            "\r\n\r\n";
+        observation.forward_history = {std::vector<char>(slash.begin(), slash.end()),
+                                       std::vector<char>(root.begin(), root.end())};
+        observation.access_records = exact_loopback_return302_expected_access(
+            observation.access_scope, observation.backend_port);
+        observation.forward_accepts = observation.forward_requests = observation.forward_sends = 2u;
+        observation.negative_guard_stream = true;
+        observation.negative_guard_cloexec = true;
+        observation.negative_guard_non_listening = true;
+        observation.negative_guard_blocked_wildcard_bind = true;
+        observation.readiness_quiet = true;
+        observation.negative_probe_before_failed = true;
+        observation.negative_probe_before_quiet = true;
+        observation.redirect_upstream_quiet = true;
+        observation.negative_probe_after_failed = true;
+        observation.negative_probe_after_quiet = true;
+        observation.clean_lifecycle = true;
+        std::fill(std::begin(observation.eof_proven), std::end(observation.eof_proven), true);
+        return observation;
+    };
+    ExactLoopbackReturn302Observation valid[2] = {make_valid(0u), make_valid(1u)};
+    if (!validate_exact_loopback_return302_pair(valid, error)) return false;
+
+    const auto rejects_config = [&](const char* label, const std::string& candidate) {
+        std::string detail;
+        if (!candidate.empty() && candidate != valid[0].config &&
+            !validate_exact_loopback_return302_config(candidate,
+                                                      valid[0].frontend_port,
+                                                      valid[0].backend_port,
+                                                      true,
+                                                      valid[0].access_scope,
+                                                      valid[0].access_path,
+                                                      detail))
+            return true;
+        error = std::string("#350 config mutation was accepted: ") + label;
+        return false;
+    };
+    const std::pair<const char*, std::string> config_mutations[] = {
+        {"listener",
+         replace_unique(valid[0].config, "listen 127.0.0.1:44201", "listen :44201", "listener")},
+        {"address",
+         replace_unique(valid[0].config, "127.0.0.1:44201", "127.0.0.2:44201", "address")},
+        {"action-status",
+         replace_unique(valid[0].config, "return 302 ", "return 301 ", "action-status")},
+        {"action-location",
+         replace_unique(valid[0].config,
+                        "http://redirect.example/new",
+                        "http://redirect.example/old",
+                        "action-location")},
+        {"order",
+         make_exact_loopback_return302_config(valid[0].frontend_port,
+                                              valid[0].backend_port,
+                                              false,
+                                              valid[0].access_scope,
+                                              valid[0].access_path)},
+        {"extra-directive",
+         replace_unique(
+             valid[0].config, "http {\n", "http {\n  server_tokens off;\n", "extra-directive")}};
+    for (const auto& mutation : config_mutations)
+        if (!rejects_config(mutation.first, mutation.second)) return false;
+
+    const auto rejects_observation = [&](const char* label,
+                                         const ExactLoopbackReturn302Observation& candidate) {
+        std::string detail;
+        if (!validate_exact_loopback_return302_observation(candidate, detail)) return true;
+        error = std::string("#350 observation mutation was accepted: ") + label;
+        return false;
+    };
+    const auto rejects_pair = [&](const char* label,
+                                  const ExactLoopbackReturn302Observation(&candidate)[2]) {
+        std::string detail;
+        if (!validate_exact_loopback_return302_pair(candidate, detail)) return true;
+        error = std::string("#350 pair mutation was accepted: ") + label;
+        return false;
+    };
+    const auto mutate_wire = [&](const std::vector<char>& wire,
+                                 const std::string& from,
+                                 const std::string& to,
+                                 const char* label) {
+        const std::string text(wire.begin(), wire.end());
+        const std::string changed = replace_unique(text, from, to, label);
+        return std::vector<char>(changed.begin(), changed.end());
+    };
+    ExactLoopbackReturn302Observation mutated[2] = {valid[0], valid[1]};
+    mutated[0].wires[0] = mutate_wire(
+        mutated[0].wires[0], "302 Moved Temporarily", "301 Moved Temporarily", "status");
+    if (mutated[0].wires[0].empty() || !rejects_observation("status", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].wires[0] =
+        mutate_wire(mutated[0].wires[0], "Moved Temporarily", "Moved PermanentlX", "reason");
+    if (mutated[0].wires[0].empty() || !rejects_observation("reason", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].wires[0] = mutate_wire(mutated[0].wires[0],
+                                      "Location: http://redirect.example/new",
+                                      "Location: http://redirect.example/old",
+                                      "location");
+    if (mutated[0].wires[0].empty() || !rejects_observation("location", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].wires[2] = mutate_wire(mutated[0].wires[2],
+                                      "Location: http://redirect.example/new",
+                                      "Location: http://redirect.example/new?x=1",
+                                      "query-discard");
+    if (mutated[0].wires[2].empty() || !rejects_observation("query-discard", mutated[0]))
+        return false;
+    mutated[0] = valid[0];
+    mutated[0].wires[1] =
+        mutate_wire(mutated[0].wires[1], "<h1>302 Found", "<h1>302 FounX", "alternate-host-body");
+    if (mutated[0].wires[1].empty() || !rejects_observation("host-independent", mutated[0]))
+        return false;
+    mutated[0] = valid[0];
+    mutated[0].wires[0] = mutate_wire(mutated[0].wires[0],
+                                      "Connection: close\r\nLocation: http://redirect.example/new",
+                                      "Location: http://redirect.example/new\r\nConnection: close",
+                                      "header-order");
+    if (mutated[0].wires[0].empty() || !rejects_observation("header-order", mutated[0]))
+        return false;
+    mutated[0] = valid[0];
+    mutated[0].eof_proven[0] = false;
+    if (!rejects_observation("eof", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].redirect_upstream_quiet = false;
+    if (!rejects_observation("redirect-zero-upstream", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].forward_history[0] = mutate_wire(mutated[0].forward_history[0],
+                                                "\r\n\r\n",
+                                                "\r\nConnection: close\r\n\r\n",
+                                                "upstream-Connection");
+    if (mutated[0].forward_history[0].empty() ||
+        !rejects_observation("upstream-Connection", mutated[0]))
+        return false;
+    mutated[0] = valid[0];
+    mutated[0].forward_history[0] = mutate_wire(
+        mutated[0].forward_history[0], "GET /old/ HTTP/1.1", "GET /new/ HTTP/1.1", "upstream-uri");
+    if (mutated[0].forward_history[0].empty() || !rejects_observation("upstream-uri", mutated[0]))
+        return false;
+    mutated[0] = valid[0];
+    mutated[0].forward_accepts = mutated[0].forward_requests = mutated[0].forward_sends = 3u;
+    mutated[0].forward_history.push_back(mutated[0].forward_history.back());
+    if (!rejects_observation("retry", mutated[0])) return false;
+    mutated[0] = valid[0];
+    mutated[0].forward_accepts = mutated[0].forward_requests = mutated[0].forward_sends = 1u;
+    mutated[0].forward_history.pop_back();
+    if (!rejects_observation("missing-root-episode", mutated[0])) return false;
+
+    struct AccessMutation {
+        const char* label;
+        size_t record;
+        const char* from;
+        const char* to;
+    };
+    const AccessMutation access_mutations[] = {
+        {"redirect-target", 0u, "raw=\"GET /old HTTP/1.1\"", "raw=\"GET /new HTTP/1.1\""},
+        {"redirect-status", 0u, " status=302 ", " status=301 "},
+        {"redirect-request-size", 0u, " request_size=71 ", " request_size=70 "},
+        {"redirect-response-size", 0u, " response_size=342 ", " response_size=341 "},
+        {"redirect-host",
+         1u,
+         "host=\"alternate-redirect-source.example\"",
+         "host=\"mutated--redirect-source.example\""},
+        {"fallback-target", 4u, "raw=\"GET / HTTP/1.1\"", "raw=\"GET /x HTTP/1.1\""},
+        {"fallback-status", 3u, " status=200 ", " status=201 "},
+        {"fallback-upstream-address",
+         3u,
+         "upstream_addr=\"127.0.0.1:44202\"",
+         "upstream_addr=\"127.0.0.2:44202\""},
+        {"fallback-upstream", 3u, " upstream_status=200", " upstream_status=201"}};
+    for (const auto& mutation : access_mutations) {
+        std::vector<std::string> candidate_records = valid[0].access_records;
+        candidate_records[mutation.record] = replace_unique(
+            candidate_records[mutation.record], mutation.from, mutation.to, mutation.label);
+        std::string candidate;
+        for (const auto& record : candidate_records) candidate += record + "\n";
+        std::vector<std::string> parsed;
+        std::string detail;
+        if (candidate_records[mutation.record].empty() ||
+            parse_exact_loopback_return302_access(
+                candidate, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+            error = std::string("#350 access mutation was accepted: ") + mutation.label;
+            return false;
+        }
+    }
+    std::vector<std::string> swapped = valid[0].access_records;
+    std::swap(swapped[0], swapped[1]);
+    std::string swapped_access;
+    for (const auto& record : swapped) swapped_access += record + "\n";
+    std::vector<std::string> parsed;
+    std::string detail;
+    if (parse_exact_loopback_return302_access(
+            swapped_access, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+        error = "#350 access-order mutation was accepted";
+        return false;
+    }
+    std::string missing_access;
+    for (size_t i = 0u; i < 4u; i++) missing_access += valid[0].access_records[i] + "\n";
+    if (parse_exact_loopback_return302_access(
+            missing_access, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+        error = "#350 missing-access-record mutation was accepted";
+        return false;
+    }
+
+    const std::pair<const char*, bool ExactLoopbackReturn302Observation::*> flags[] = {
+        {"guard-stream", &ExactLoopbackReturn302Observation::negative_guard_stream},
+        {"guard-cloexec", &ExactLoopbackReturn302Observation::negative_guard_cloexec},
+        {"guard-non-listening", &ExactLoopbackReturn302Observation::negative_guard_non_listening},
+        {"wildcard-causality",
+         &ExactLoopbackReturn302Observation::negative_guard_blocked_wildcard_bind},
+        {"readiness", &ExactLoopbackReturn302Observation::readiness_quiet},
+        {"negative-before", &ExactLoopbackReturn302Observation::negative_probe_before_failed},
+        {"negative-before-quiet", &ExactLoopbackReturn302Observation::negative_probe_before_quiet},
+        {"negative-after", &ExactLoopbackReturn302Observation::negative_probe_after_failed},
+        {"negative-after-quiet", &ExactLoopbackReturn302Observation::negative_probe_after_quiet},
+        {"lifecycle", &ExactLoopbackReturn302Observation::clean_lifecycle}};
+    for (const auto& mutation : flags) {
+        mutated[0] = valid[0];
+        mutated[0].*(mutation.second) = false;
+        if (!rejects_observation(mutation.first, mutated[0])) return false;
+    }
+    mutated[0] = valid[0];
+    mutated[0].side = "converter-generated-rut";
+    if (!rejects_pair("side", mutated)) return false;
+    mutated[0] = valid[0];
+    mutated[0].order = "root-before-exact";
+    if (!rejects_pair("order", mutated)) return false;
+    mutated[0] = valid[0];
+    mutated[0].temp_path = mutated[1].temp_path;
+    if (!rejects_pair("resource", mutated)) return false;
+    mutated[0] = valid[0];
+    mutated[0].frontend_port = mutated[1].frontend_port;
+    mutated[0].negative_port = mutated[0].frontend_port;
+    mutated[0].config = make_exact_loopback_return302_config(mutated[0].frontend_port,
+                                                             mutated[0].backend_port,
+                                                             true,
+                                                             mutated[0].access_scope,
+                                                             mutated[0].access_path);
+    if (!validate_exact_loopback_return302_observation(mutated[0], error) ||
+        !rejects_pair("shared-port", mutated))
+        return false;
+    return true;
+}
+
+static bool capture_pinned_exact_loopback_return302_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& process_identity,
+    bool exact_first,
+    ExactLoopbackReturn302Observation& observation,
+    std::string& error,
+    int* frontend_reservation,
+    int* negative_reservation,
+    int* backend_reservation) {
+    if (frontend_reservation == nullptr || negative_reservation == nullptr ||
+        backend_reservation == nullptr || *frontend_reservation < 0 || *negative_reservation < 0 ||
+        *backend_reservation < 0 ||
+        !validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#350"))
+        return false;
+    struct Vector {
+        const char* label;
+        const char* request;
+        size_t request_size;
+        const char* response;
+    };
+    static constexpr Vector kVectors[] = {
+        {"GET /old",
+         kExactAbsoluteRedirectCloseRequest,
+         sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old alternate Host",
+         kExactAbsoluteRedirectAlternateHostCloseRequest,
+         sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old?x=1",
+         kExactAbsoluteRedirectQueryCloseRequest,
+         sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+         kExactAbsoluteRedirect302ResponseNormalized},
+        {"GET /old/",
+         kExactAbsoluteRedirectSlashNeighborCloseRequest,
+         sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+         kSuccessResponseNormalized},
+        {"GET /",
+         kExactAbsoluteRedirectRootNeighborCloseRequest,
+         sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
+         kSuccessResponseNormalized}};
+    for (const auto& vector : kVectors) {
+        const std::string request(vector.request, vector.request_size);
+        const size_t end = request.find("\r\n\r\n");
+        if (request.rfind("GET /", 0u) != 0u ||
+            request.find(" HTTP/1.1\r\n") == std::string::npos ||
+            request.find("\r\nConnection: close\r\n") == std::string::npos ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.find("\r\nTE:") != std::string::npos ||
+            request.find("\r\nExpect:") != std::string::npos ||
+            request.find("\r\nUpgrade:") != std::string::npos || end == std::string::npos ||
+            end + 4u != request.size()) {
+            error = std::string(
+                        "#350 request escaped the fresh bodyless explicit-close H1.1 "
+                        "GET domain: ") +
+                    vector.label;
+            return false;
+        }
+    }
+
+    observation = ExactLoopbackReturn302Observation{};
+    observation.side = "pinned-nginx";
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.access_path = temp.nginx_access_log;
+    observation.process_identity = process_identity;
+    observation.access_scope = "rut-nginx-350-exact-loopback-302-" + observation.order + "-" +
+                               std::to_string(frontend_port);
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+    observation.negative_port = frontend_port;
+    observation.negative_guard_stream = true;
+    observation.negative_guard_cloexec = true;
+    observation.negative_guard_non_listening = true;
+    observation.config = make_exact_loopback_return302_config(frontend_port,
+                                                              backend_port,
+                                                              exact_first,
+                                                              observation.access_scope,
+                                                              observation.access_path);
+    if (!validate_exact_loopback_return302_config(observation.config,
+                                                  frontend_port,
+                                                  backend_port,
+                                                  exact_first,
+                                                  observation.access_scope,
+                                                  observation.access_path,
+                                                  error) ||
+        !write_file(temp.nginx_config, observation.config.data(), observation.config.size())) {
+        if (error.empty()) error = "#350 failed to persist the exact canonical nginx config";
+        return false;
+    }
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 2u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#350 recorder could not bind the reserved backend port";
+        return false;
+    }
+    ChildGuard nginx;
+    DockerGuard docker(process_identity);
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!exact_loopback_guard_blocks_wildcard_bind(
+            *negative_reservation, frontend_port, error, "#350"))
+        return false;
+    observation.negative_guard_blocked_wildcard_bind = true;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      process_identity,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = "#350 pinned nginx failed before readiness";
+        return false;
+    }
+    const auto recorder_live = [&] {
+        return backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live() && std::chrono::steady_clock::now() < recorder_deadline) {
+        if (poll_child(nginx.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#350 nginx/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live()) {
+        error = "#350 recorder readiness timed out";
+        return false;
+    }
+    const auto access_count_is = [&](u32 expected) {
+        u32 actual = 0u;
+        return count_exact_loopback_access_records(
+                   temp.nginx_access_log, observation.access_scope, actual) &&
+               actual == expected;
+    };
+    const auto wait_access_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!access_count_is(expected) && std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx.child) || !recorder_live()) return false;
+            usleep(1000);
+        }
+        return access_count_is(expected);
+    };
+    const auto observe_count = [&](u32 expected, std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(nginx.child) || !recorder_live() ||
+                backend.accepted.load(std::memory_order_acquire) != expected ||
+                backend.requests.load(std::memory_order_acquire) != expected ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != expected)
+                return false;
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto wait_episode_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline && !poll_child(nginx.child) &&
+               recorder_live()) {
+            const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+            const u32 requests = backend.requests.load(std::memory_order_acquire);
+            const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) return false;
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    const auto send_vector = [&](size_t index) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        observation.wires.emplace_back();
+        std::string detail;
+        if (client.fd < 0 ||
+            !send_all(client.fd, kVectors[index].request, kVectors[index].request_size) ||
+            !read_response(client.fd, observation.wires.back(), detail) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(
+                observation.wires.back(), kVectors[index].response, detail)) {
+            error = std::string("#350 ") + kVectors[index].label +
+                    " response/zero-tail/EOF mismatch: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        observation.eof_proven[index] = true;
+        if (poll_child(nginx.child)) {
+            error = std::string("#350 pinned nginx exited after ") + kVectors[index].label;
+            return false;
+        }
+        return true;
+    };
+
+    if (!observe_count(0u, std::chrono::milliseconds(100)) || !access_count_is(0u)) {
+        error = "#350 readiness introduced an access/upstream side effect";
+        return false;
+    }
+    observation.readiness_quiet = true;
+    if (!exact_loopback_negative_connect_fails(frontend_port, error, "#350")) return false;
+    observation.negative_probe_before_failed = true;
+    if (!observe_count(0u, std::chrono::milliseconds(150)) || !access_count_is(0u)) {
+        error = "#350 pre-request .2 probe changed access/upstream inventory";
+        return false;
+    }
+    observation.negative_probe_before_quiet = true;
+    for (size_t i = 0u; i < 3u; i++) {
+        if (!send_vector(i) || !observe_count(0u, std::chrono::milliseconds(150)) ||
+            !wait_access_count(static_cast<u32>(i + 1u))) {
+            if (error.empty())
+                error = "#350 redirect vector caused upstream or access inventory mismatch";
+            return false;
+        }
+    }
+    if (!observe_count(0u, std::chrono::milliseconds(500)) || !access_count_is(3u)) {
+        error = "#350 redirect epoch did not settle with live zero upstream and three accesses";
+        return false;
+    }
+    observation.redirect_upstream_quiet = true;
+    for (size_t i = 3u; i < 5u; i++) {
+        const u32 expected_episodes = static_cast<u32>(i - 2u);
+        if (!send_vector(i) || !wait_episode_count(expected_episodes) ||
+            !observe_count(expected_episodes, std::chrono::milliseconds(250)) ||
+            !wait_access_count(static_cast<u32>(i + 1u))) {
+            if (error.empty())
+                error = "#350 fallback vector did not produce exactly one new forward episode";
+            return false;
+        }
+    }
+    if (!observe_count(2u, std::chrono::milliseconds(500)) || !access_count_is(5u)) {
+        error = "#350 fallback epoch did not settle at two episodes/five accesses with no retry";
+        return false;
+    }
+    if (!exact_loopback_negative_connect_fails(frontend_port, error, "#350")) return false;
+    observation.negative_probe_after_failed = true;
+    if (!observe_count(2u, std::chrono::milliseconds(300)) || !access_count_is(5u)) {
+        error = "#350 post-request .2 probe changed access/upstream inventory";
+        return false;
+    }
+    observation.negative_probe_after_quiet = true;
+    if (!validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#350") ||
+        !stop_child(nginx.child) || !docker.remove()) {
+        if (error.empty()) error = "#350 pinned nginx/container did not stop cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 2u || observation.forward_requests != 2u ||
+        observation.forward_sends != 2u || observation.forward_history.size() != 2u ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire)) {
+        error = "#350 recorder did not settle at exactly two clean episodes/no retry";
+        return false;
+    }
+    std::string access_contents;
+    std::string error_contents;
+    if (!read_exact_return204_log(
+            temp.nginx_access_log, "#350 nginx access log", access_contents, error) ||
+        !parse_exact_loopback_return302_access(access_contents,
+                                               observation.access_scope,
+                                               backend_port,
+                                               observation.access_records,
+                                               error) ||
+        !read_exact_return204_log(temp.nginx_log, "#350 nginx error log", error_contents, error))
+        return false;
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (error_contents.find(severity) != std::string::npos) {
+            error = std::string("#350 nginx error log contained ") + severity;
+            return false;
+        }
+    }
+    observation.clean_lifecycle = true;
+    return validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#350") &&
+           validate_exact_loopback_return302_observation(observation, error);
+}
+
+static bool run_pinned_exact_loopback_return302_oracle(
+    const std::string& container_prefix,
+    ExactLoopbackReturn302Observation (&observations)[2],
+    std::string& error) {
+    ExactLoopbackReservations reservations;
+    u16 ports[4]{};
+    if (!reservations.reserve_side(0u, ports[0], ports[1]) ||
+        !reservations.reserve_side(3u, ports[2], ports[3])) {
+        error = "#350 could not hold both .1/.2 frontend pairs and both .1 backends";
+        return false;
+    }
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        for (size_t j = i + 1u; j < std::size(ports); j++) {
+            if (ports[i] == ports[j]) {
+                error = "#350 six held sockets did not yield four unique ports";
+                return false;
+            }
+        }
+    }
+    if (!validate_exact_loopback_guard_fd(reservations.fds[1], ports[0], error, "#350") ||
+        !validate_exact_loopback_guard_fd(reservations.fds[4], ports[2], error, "#350"))
+        return false;
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].nginx_config ||
+        temps[0].nginx_log == temps[1].nginx_log ||
+        temps[0].nginx_access_log == temps[1].nginx_access_log) {
+        error = "#350 could not create isolated declaration-order resources";
+        return false;
+    }
+    if (!capture_pinned_exact_loopback_return302_side(ports[0],
+                                                      ports[1],
+                                                      temps[0],
+                                                      container_prefix + "-exact-first",
+                                                      true,
+                                                      observations[0],
+                                                      error,
+                                                      &reservations.fds[0],
+                                                      &reservations.fds[1],
+                                                      &reservations.fds[2]) ||
+        !capture_pinned_exact_loopback_return302_side(ports[2],
+                                                      ports[3],
+                                                      temps[1],
+                                                      container_prefix + "-root-first",
+                                                      false,
+                                                      observations[1],
+                                                      error,
+                                                      &reservations.fds[3],
+                                                      &reservations.fds[4],
+                                                      &reservations.fds[5]))
+        return false;
+    if (reservations.fds[0] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        reservations.fds[5] >= 0 || reservations.fds[1] < 0 || reservations.fds[4] < 0 ||
+        !validate_exact_loopback_guard_fd(reservations.fds[1], ports[0], error, "#350") ||
+        !validate_exact_loopback_guard_fd(reservations.fds[4], ports[2], error, "#350")) {
+        if (error.empty())
+            error = "#350 captures did not consume four handoffs while retaining both .2 guards";
+        return false;
+    }
+    return validate_exact_loopback_return302_pair(observations, error);
+}
+
+static void dump_exact_loopback_return302_observation(
+    const ExactLoopbackReturn302Observation& observation) {
+    std::cerr << "#350 " << observation.side << " order=" << observation.order
+              << " frontend=" << observation.frontend_port
+              << " backend=" << observation.backend_port
+              << " upstream=" << observation.forward_accepts << "/" << observation.forward_requests
+              << "/" << observation.forward_sends << " access=" << observation.access_records.size()
+              << "\n";
+    for (size_t i = 0u; i < observation.wires.size(); i++) {
+        const std::string label = "#350 response " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.wires[i]);
+    }
+    for (size_t i = 0u; i < observation.forward_history.size(); i++) {
+        const std::string label = "#350 upstream " + std::to_string(i + 1u);
+        dump_wire(label.c_str(), observation.forward_history[i]);
+    }
+    if (!observation.config_path.empty()) dump_log(observation.config_path, "#350 nginx config");
+    if (!observation.log_path.empty()) dump_log(observation.log_path, "#350 nginx error log");
+    if (!observation.access_path.empty())
+        dump_log(observation.access_path, "#350 nginx access log");
+}
+
 static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword) {
     const std::string prefix = std::string(keyword) + " ";
     return (source.rfind(prefix, 0u) == 0u ? 1u : 0u) + count_text(source, "\n" + prefix);
@@ -34911,6 +35884,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return204-oracle") == 0;
     const bool exact_loopback_bodyful_return_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-bodyful-return-oracle") == 0;
+    const bool exact_loopback_return302_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return302-oracle") == 0;
     const bool converter_wildcard_listen_differential =
         argc == 3 && strcmp(argv[1], "--converter-wildcard-listen-differential") == 0;
     const bool converter_asterisk_wildcard_listen_differential =
@@ -35022,7 +35997,7 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
-         !converter_wildcard_listen_differential &&
+         !exact_loopback_return302_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
          !converter_exact_loopback_listen_differential &&
          !converter_exact_loopback_return204_differential &&
@@ -35126,6 +36101,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-exact-loopback-return204-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-bodyful-return-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-exact-loopback-return302-oracle\n"
                      "   or: test_nginx_differential --converter-wildcard-listen-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
@@ -35451,6 +36428,14 @@ int main(int argc, char** argv) {
         if (converter_exact_loopback_bodyful_return_differential &&
             !run_exact_loopback_bodyful_four_way_self_checks(self_check_error)) {
             std::cerr << "FAIL [#349 generated/four-side self-check]: " << self_check_error << "\n";
+            return 1;
+        }
+    }
+    if (exact_loopback_return302_oracle) {
+        std::string self_check_error;
+        if (!run_exact_loopback_return302_oracle_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#350 exact-loopback fixed-302 oracle self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
     }
@@ -35909,6 +36894,43 @@ int main(int argc, char** argv) {
                "excludes redirects, other paths/body boundaries, addresses/options/listeners/"
                "servers, queries, methods/bodies/framing, reuse/pipeline/retries/failures, H1.0, "
                "H2 and TLS)\n";
+        return 0;
+    }
+
+    if (exact_loopback_return302_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-350-exact-loopback-return302-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackReturn302Observation observations[2];
+        std::string oracle_error;
+        if (!run_pinned_exact_loopback_return302_oracle(
+                container_prefix, observations, oracle_error)) {
+            std::cerr << "FAIL [#350 pinned nginx-only exact-loopback return302 oracle]: "
+                      << oracle_error << "\n";
+            dump_exact_loopback_return302_observation(observations[0]);
+            dump_exact_loopback_return302_observation(observations[1]);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #350 pinned nginx 1.29.7 nginx-only oracle proves exact listen "
+               "127.0.0.1:<port>, exact /old fixed absolute return 302 and the minimal root "
+               "proxy in exactly listen/exact/root and listen/root/exact orders. Six initially "
+               "held CLOEXEC non-listening sockets supplied four unique ports; each .1 handoff "
+               "retained a same-port .2 guard that causally rejected wildcard bind with "
+               "EADDRINUSE and refused bounded probes before/after all requests without changing "
+               "access/upstream inventories. Fresh GET /old with canonical and alternate Host, "
+               "plus GET /old?x=1, emitted the same exact Date-normalized 342-byte 302 Moved "
+               "Temporarily/CL145/title-H1 302 Found/fixed-Location/close/EOF wire, discarded the "
+               "query, ignored Host for Location and kept the live upstream at zero. GET /old/ "
+               "and GET / each produced one byte-exact Host-rebuilt, Connection-omitted upstream "
+               "request, one response, no third/retry, and the exact Date-normalized 118-byte "
+               "200/CL2/ok/close/EOF wire. Each side produced exactly five ordered strict real "
+               "access records and no warn-or-higher log (#350 Stage 1 nginx-only; no parser, "
+               "converter, generated-RUT or behavior-equivalence claim; status 301 remains "
+               "blocked by #351; excludes relative/variable redirects, other targets/statuses/"
+               "addresses/options/listeners/servers, methods/bodies/framing/query shapes, reuse/"
+               "pipeline/failures, H1.0, H2 and TLS; #279/#347 are not implemented)\n";
         return 0;
     }
 
