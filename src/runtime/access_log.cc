@@ -215,8 +215,6 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
                 w += copy_str(line + w, kUnavailable);
             break;
         case AccessLogTargetState::Invalid:
-            invalid_target();
-            break;
         default:
             invalid_target();
             break;

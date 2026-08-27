@@ -1833,7 +1833,6 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
                         entry.target_state = AccessLogTargetState::Unavailable;
                     break;
                 case AccessLogTargetState::Invalid:
-                    break;
                 case AccessLogTargetState::LegacyNullTerminated:
                 default:
                     break;
