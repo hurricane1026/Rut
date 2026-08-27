@@ -314,7 +314,8 @@ FrontendResult<bool> validate_listener(const Server& server,
                                    sizeof(kExactLoopbackPrefix) - 1u,
                                    listener.port))
         return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
-    if (proxy_profile != ProxyLocationProfile::RootWithoutUri || has_exact_absolute_redirect)
+    if (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
+        (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u))
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
     return true;

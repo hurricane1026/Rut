@@ -957,6 +957,215 @@ TEST(serve_loader, nginx_exact_loopback_bodyful_output_is_owned_and_reuses_clean
     std::filesystem::remove(path);
 }
 
+TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cleanly) {
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>302 Found</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>302 Found</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kRedirectBody) - 1u == 145u);
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_302";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8084; "
+            "location = /old { return 302 http://redirect.example/new; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 5913u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    const auto check_root_inventory = [&](u16 expected_backend_port) {
+        REQUIRE_EQ(program.config.route_count, 3u);
+        u32 head_count = 0u;
+        u32 get_count = 0u;
+        u32 any_count = 0u;
+        for (u32 i = 0u; i < program.config.route_count; i++) {
+            const RouteEntry& route = program.config.routes[i];
+            CHECK_EQ(route.path_len, 1u);
+            CHECK_EQ(route.path[0], '/');
+            CHECK(route.action == RouteAction::JitHandler);
+            CHECK_FALSE(route.needs_req_body);
+            if (route.method == kRouteMethodHead) head_count++;
+            if (route.method == kRouteMethodGet) get_count++;
+            if (route.method == kRouteMethodAny) any_count++;
+        }
+        CHECK_EQ(head_count, 1u);
+        CHECK_EQ(get_count, 1u);
+        CHECK_EQ(any_count, 1u);
+        static constexpr u8 kRoot[] = {'/'};
+        const RouteEntry* head = program.config.match(kRoot, 1u, kRouteMethodHead);
+        const RouteEntry* get = program.config.match(kRoot, 1u, kRouteMethodGet);
+        const RouteEntry* post = program.config.match(kRoot, 1u, kRouteMethodPost);
+        REQUIRE(head != nullptr);
+        REQUIRE(get != nullptr);
+        REQUIRE(post != nullptr);
+        CHECK_EQ(head->method, kRouteMethodHead);
+        CHECK_EQ(get->method, kRouteMethodGet);
+        CHECK_EQ(post->method, kRouteMethodAny);
+        CHECK_NE(head, get);
+        CHECK_NE(head, post);
+        CHECK_NE(get, post);
+
+        REQUIRE_EQ(program.config.upstream_count, 1u);
+        const UpstreamTarget& upstream = program.config.upstreams[0];
+        CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+        REQUIRE_EQ(upstream.addr_count, 1u);
+        CHECK_EQ(upstream.addrs[0].sin_family, AF_INET);
+        CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0x7f000001u);
+        CHECK_EQ(ntohs(upstream.addrs[0].sin_port), expected_backend_port);
+    };
+    const auto find_linked_redirect_policy_id = [&](u16& policy_id) {
+        policy_id = 0u;
+        u32 redirect_returns = 0u;
+        for (u32 i = 0u; i < program.rir.module.func_count; i++) {
+            const auto& function = program.rir.module.functions[i];
+            if (function.http_method != kRouteMethodGet || !function.route_pattern.eq(lit_str("/")))
+                continue;
+            for (u32 block = 0u; block < function.block_count; block++) {
+                for (u32 instruction = 0u; instruction < function.blocks[block].inst_count;
+                     instruction++) {
+                    const auto& inst = function.blocks[block].insts[instruction];
+                    if (inst.op != rir::Opcode::RetRedirect) continue;
+                    redirect_returns++;
+                    REQUIRE_GT(inst.imm.i32_val, 0);
+                    REQUIRE_LE(static_cast<u32>(inst.imm.i32_val),
+                               program.rir.module.redirect_policy_count);
+                    policy_id = static_cast<u16>(inst.imm.i32_val);
+                }
+            }
+        }
+        REQUIRE_EQ(redirect_returns, 1u);
+        REQUIRE_NE(policy_id, 0u);
+        REQUIRE(program.config.redirect_policy_id_is_valid(policy_id));
+    };
+    const auto check_redirect = [&](u16 policy_id) {
+        REQUIRE(program.config.redirect_policy_id_is_valid(policy_id));
+        const auto& policy = program.config.redirect_policies[policy_id - 1u];
+        CHECK(program.config.redirect_policy_strings_are_owned(policy));
+        CHECK(policy.scheme == RedirectPolicyScheme::Http);
+        CHECK(policy.authority == RedirectPolicyAuthority::Static);
+        CHECK(policy.port == RedirectPolicyPort::Omit);
+        CHECK(policy.path == RedirectPolicyPath::Static);
+        CHECK(policy.query == RedirectPolicyQuery::Discard);
+        CHECK(policy.date == RedirectPolicyDate::Current);
+        CHECK(policy.connection == RedirectPolicyConnection::Close);
+        CHECK(policy.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation);
+        CHECK_EQ(policy.status_code, 302u);
+        CHECK(policy.reason.eq(lit_str("Moved Temporarily")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.content_type.eq(lit_str("text/html")));
+        CHECK(policy.static_authority.eq(lit_str("redirect.example")));
+        CHECK(policy.target_path.eq(lit_str("/new")));
+        CHECK(policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u}));
+    };
+
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8084u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    CHECK_NE(program.config.pre_route_policy_id(kRouteMethodTrace), 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodOptions], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodConnect], 0u);
+    CHECK_NE(program.config.unmatched_policy_ids[kRouteMethodAny], 0u);
+    REQUIRE_EQ(program.rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+    check_root_inventory(9000u);
+    u16 redirect_policy_id = 0u;
+    find_linked_redirect_policy_id(redirect_policy_id);
+    check_redirect(redirect_policy_id);
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8084u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_root_inventory(9000u);
+    check_redirect(redirect_policy_id);
+
+    program.destroy();
+    CHECK_FALSE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_bytes_used, 0u);
+
+    {
+        char nginx_source[] =
+            "server { listen *:8085; "
+            "location / { proxy_pass http://127.0.0.1:9001; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'z', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8085u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.rir.module.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_bytes_used, 0u);
+    for (const auto& stale : program.config.redirect_policies) {
+        CHECK(stale.scheme == RedirectPolicyScheme::Invalid);
+        CHECK(stale.authority == RedirectPolicyAuthority::Invalid);
+        CHECK(stale.port == RedirectPolicyPort::Invalid);
+        CHECK(stale.path == RedirectPolicyPath::Invalid);
+        CHECK(stale.query == RedirectPolicyQuery::Invalid);
+        CHECK(stale.date == RedirectPolicyDate::Invalid);
+        CHECK(stale.connection == RedirectPolicyConnection::Invalid);
+        CHECK(stale.header_order == RedirectPolicyHeaderOrder::Invalid);
+        CHECK_EQ(stale.status_code, 0u);
+        CHECK(stale.reason.ptr == nullptr);
+        CHECK_EQ(stale.reason.len, 0u);
+        CHECK(stale.server.ptr == nullptr);
+        CHECK_EQ(stale.server.len, 0u);
+        CHECK(stale.content_type.ptr == nullptr);
+        CHECK_EQ(stale.content_type.len, 0u);
+        CHECK(stale.static_authority.ptr == nullptr);
+        CHECK_EQ(stale.static_authority.len, 0u);
+        CHECK(stale.target_path.ptr == nullptr);
+        CHECK_EQ(stale.target_path.len, 0u);
+        CHECK(stale.body.ptr == nullptr);
+        CHECK_EQ(stale.body.len, 0u);
+    }
+    check_root_inventory(9001u);
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
     const struct {
         const char* name;

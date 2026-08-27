@@ -10538,8 +10538,13 @@ TEST(nginx_parser,
             [&](const nginx::Server& candidate, Str detail, Span expected_span) {
                 expect_rejected(candidate, FrontendError::UnsupportedSyntax, detail, expected_span);
             };
-        expect_unsupported(
-            server, lit_str("exact listen requires the minimal root proxy profile"), listener.span);
+        const auto accepted = nginx::lower_to_rut(server);
+        REQUIRE(accepted);
+        CHECK_EQ(accepted.value().len, 5913u);
+        CHECK(accepted.value()
+                  .view()
+                  .slice(0u, strlen("listen 127.0.0.1:8080\n"))
+                  .eq(lit_str("listen 127.0.0.1:8080\n")));
 
         std::vector<char> independent_source(source, source + len);
         auto forged = server;
@@ -10609,22 +10614,22 @@ TEST(nginx_parser,
             forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
 
         // Proxy address and non-zero port are semantic values, not source
-        // borrows in the current model. These are valid alternate upstreams,
-        // so they must retain the exact-listener composition guard rather than
-        // be mislabeled as endpoint-provenance failures.
+        // borrows in the current model. These are valid alternate upstreams;
+        // the generic exact-listener composition must not hard-code the oracle
+        // endpoint merely to admit status 302.
         forged = server;
         forged.location.proxy_pass.address[0] = 126u;
         CHECK_NE(forged.location.proxy_pass.address[0], server.location.proxy_pass.address[0]);
-        expect_unsupported(forged,
-                           lit_str("exact listen requires the minimal root proxy profile"),
-                           forged.listen.span);
+        const auto alternate_address = nginx::lower_to_rut(forged);
+        REQUIRE(alternate_address);
+        CHECK(strstr(alternate_address.value().data, "126.0.0.1:9000") != nullptr);
 
         forged = server;
         forged.location.proxy_pass.port = 9001u;
         CHECK_NE(forged.location.proxy_pass.port, server.location.proxy_pass.port);
-        expect_unsupported(forged,
-                           lit_str("exact listen requires the minimal root proxy profile"),
-                           forged.listen.span);
+        const auto alternate_port = nginx::lower_to_rut(forged);
+        REQUIRE(alternate_port);
+        CHECK(strstr(alternate_port.value().data, "127.0.0.1:9001") != nullptr);
 
         forged = server;
         forged.exact_absolute_redirect.response.status = 303u;
@@ -10793,11 +10798,12 @@ TEST(nginx_parser,
         actual_length = lowered.value().len;
         CHECK(lowered.value().view().slice(0u, kWildcardListenPrefixLen).eq(lit_str("listen :")));
     };
-    const auto expect_exact_redirect_guard = [&](Str source,
-                                                 u16 expected_status,
-                                                 u16 expected_listener_port,
-                                                 u32 expected_upstream_ipv4,
-                                                 u16 expected_upstream_port) {
+    const auto check_exact_redirect = [&](Str source,
+                                          u16 expected_status,
+                                          u16 expected_listener_port,
+                                          u32 expected_upstream_ipv4,
+                                          u16 expected_upstream_port,
+                                          u32 expected_length) {
         const auto parsed = nginx::parse(source);
         REQUIRE(parsed);
         CHECK(parsed.value().listen.address == ListenerAddress::IPv4Exact);
@@ -10812,14 +10818,25 @@ TEST(nginx_parser,
         CHECK_EQ(parsed.value().location.proxy_pass.port, expected_upstream_port);
         CHECK_FALSE(parsed.value().location.proxy_pass.has_uri);
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(
-            lit_str("exact listen requires the minimal root proxy profile")));
-        CHECK_EQ(lowered.error().span.start, parsed.value().listen.span.start);
-        CHECK_EQ(lowered.error().span.end, parsed.value().listen.span.end);
-        CHECK_EQ(lowered.error().span.line, parsed.value().listen.span.line);
-        CHECK_EQ(lowered.error().span.col, parsed.value().listen.span.col);
+        if (expected_status == 302u) {
+            REQUIRE(lowered);
+            CHECK_EQ(lowered.value().len, expected_length);
+            CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+            CHECK(lowered.value()
+                      .view()
+                      .slice(0u, strlen("listen 127.0.0.1:"))
+                      .eq(lit_str("listen 127.0.0.1:")));
+        } else {
+            REQUIRE_EQ(expected_status, 301u);
+            REQUIRE_FALSE(lowered);
+            CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+            CHECK(lowered.error().detail.eq(
+                lit_str("exact listen requires the minimal root proxy profile")));
+            CHECK_EQ(lowered.error().span.start, parsed.value().listen.span.start);
+            CHECK_EQ(lowered.error().span.end, parsed.value().listen.span.end);
+            CHECK_EQ(lowered.error().span.line, parsed.value().listen.span.line);
+            CHECK_EQ(lowered.error().span.col, parsed.value().listen.span.col);
+        }
     };
 
     static constexpr char kRepresentativeWildcard302[] =
@@ -10836,11 +10853,12 @@ TEST(nginx_parser,
     CHECK_EQ(representative_exact_302, 5913u);
     CHECK_LT(representative_exact_302, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 24u);
-    expect_exact_redirect_guard({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
-                                302u,
-                                8080u,
-                                0x7f000001u,
-                                9000u);
+    check_exact_redirect({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
+                         302u,
+                         8080u,
+                         0x7f000001u,
+                         9000u,
+                         5913u);
 
     static constexpr char kMaximumWildcard302[] =
         "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
@@ -10856,8 +10874,12 @@ TEST(nginx_parser,
     CHECK_EQ(maximum_exact_302, 5921u);
     CHECK_LT(maximum_exact_302, nginx::RutSource::kCapacity);
     CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 16u);
-    expect_exact_redirect_guard(
-        {kMaximumExact302, sizeof(kMaximumExact302) - 1u}, 302u, 65535u, 0xffffffffu, 65535u);
+    check_exact_redirect({kMaximumExact302, sizeof(kMaximumExact302) - 1u},
+                         302u,
+                         65535u,
+                         0xffffffffu,
+                         65535u,
+                         5921u);
 
     static constexpr char kRepresentativeWildcard301[] =
         "server { listen 8080; location = /old { return 301 "
@@ -10872,11 +10894,12 @@ TEST(nginx_parser,
     const u32 representative_exact_301 = representative_wildcard_301 + kExactListenerDelta;
     CHECK_EQ(representative_exact_301, nginx::RutSource::kCapacity);
     CHECK_FALSE(representative_exact_301 < nginx::RutSource::kCapacity);
-    expect_exact_redirect_guard({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
-                                301u,
-                                8080u,
-                                0x7f000001u,
-                                9000u);
+    check_exact_redirect({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
+                         301u,
+                         8080u,
+                         0x7f000001u,
+                         9000u,
+                         0u);
 
     static constexpr char kMaximumWildcard301[] =
         "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
@@ -10892,8 +10915,8 @@ TEST(nginx_parser,
     CHECK_EQ(maximum_exact_301, 5945u);
     CHECK_EQ(maximum_exact_301 + 1u, 5946u);
     CHECK_GT(maximum_exact_301, nginx::RutSource::kCapacity);
-    expect_exact_redirect_guard(
-        {kMaximumExact301, sizeof(kMaximumExact301) - 1u}, 301u, 65535u, 0xffffffffu, 65535u);
+    check_exact_redirect(
+        {kMaximumExact301, sizeof(kMaximumExact301) - 1u}, 301u, 65535u, 0xffffffffu, 65535u, 0u);
 
     // Isolate the existing invalid-upstream-port diagnostic with a coherent
     // wildcard source; the exact composition guard intentionally precedes it.
@@ -11840,22 +11863,28 @@ TEST(nginx_converter, exact_loopback_listen_has_bounded_ordinary_rut_golden_and_
     CHECK(rejected.error().detail.eq(
         lit_str("exact listen requires the minimal root proxy profile")));
 
-    const char* const exact_action_sources[] = {
+    static constexpr char kExact301[] =
         "server { listen 127.0.0.1:8080; "
         "location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /old { return 301 http://redirect.example/new; } }",
+        "location = /old { return 301 http://redirect.example/new; } }";
+    const auto exact_301 = nginx::parse({kExact301, sizeof(kExact301) - 1u});
+    REQUIRE(exact_301);
+    rejected = nginx::lower_to_rut(exact_301.value());
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(
+        lit_str("exact listen requires the minimal root proxy profile")));
+    CHECK_EQ(rejected.error().span.start, exact_301.value().listen.span.start);
+    CHECK_EQ(rejected.error().span.end, exact_301.value().listen.span.end);
+
+    static constexpr char kExact302[] =
         "server { listen 127.0.0.1:8080; "
         "location / { proxy_pass http://127.0.0.1:9000; } "
-        "location = /old { return 302 http://redirect.example/new; } }",
-    };
-    for (const char* source : exact_action_sources) {
-        const auto exact_action = nginx::parse({source, static_cast<u32>(strlen(source))});
-        REQUIRE(exact_action);
-        rejected = nginx::lower_to_rut(exact_action.value());
-        REQUIRE_FALSE(rejected);
-        CHECK(rejected.error().detail.eq(
-            lit_str("exact listen requires the minimal root proxy profile")));
-    }
+        "location = /old { return 302 http://redirect.example/new; } }";
+    const auto exact_302 = nginx::parse({kExact302, sizeof(kExact302) - 1u});
+    REQUIRE(exact_302);
+    const auto accepted_302 = nginx::lower_to_rut(exact_302.value());
+    REQUIRE(accepted_302);
+    CHECK_EQ(accepted_302.value().len, 5913u);
 
     static constexpr char kNonRootBodyful[] =
         "server { listen 127.0.0.1:8080; "
@@ -12385,6 +12414,351 @@ TEST(nginx_converter, issue349_exact_loopback_bodyful_has_canonical_ordinary_rut
     CHECK(hir_policy.content_type.eq(lit_str("text/plain")));
     CHECK(hir_policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
     CHECK(hir_policy.body.eq(lit_str("successor-static")));
+}
+
+TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_golden) {
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>302 Found</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>302 Found</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kRedirectBody) - 1u == 145u);
+    static constexpr char kRedirectPrefix[] =
+        "route GET \"/\" {\n"
+        "    if req.pathOnly == \"/old\" {\n"
+        "        return redirect({scheme: \"http\", authority: \"static\", static_authority: "
+        "\"redirect.example\", port: \"omit\",\n"
+        "            path: \"static\", query: \"discard\", date: \"current\", connection: "
+        "\"close\",\n"
+        "            header_order: \"connection_then_location\", status: 302, reason: \"Moved "
+        "Temporarily\",\n"
+        "            server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: "
+        "\"/new\", body: b\"<html>\\r\\n"
+        "<head><title>302 Found</title></head>\\r\\n"
+        "<body>\\r\\n"
+        "<center><h1>302 Found</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n"
+        "</body>\\r\\n"
+        "</html>\\r\\n\"})\n"
+        "    } else {\n"
+        "        return ";
+    char exact_first[] =
+        "server { listen 127.0.0.1:8080; "
+        "location = /old { return 302 http://redirect.example/new; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    char root_first[] =
+        "server { listen 127.0.0.1:8080; "
+        "location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 302 http://redirect.example/new; } }";
+    char wildcard_first[] =
+        "server { listen 8080; location = /old { return 302 http://redirect.example/new; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    char wildcard_root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /old { return 302 http://redirect.example/new; } }";
+
+    const auto lower = [](char* source, u32 len) -> FrontendResult<nginx::RutSource> {
+        const auto parsed = nginx::parse({source, len});
+        if (!parsed) return core::make_unexpected(parsed.error());
+        return nginx::lower_to_rut(parsed.value());
+    };
+    const auto exact_a = lower(exact_first, sizeof(exact_first) - 1u);
+    const auto exact_b = lower(root_first, sizeof(root_first) - 1u);
+    const auto wildcard_a = lower(wildcard_first, sizeof(wildcard_first) - 1u);
+    const auto wildcard_b = lower(wildcard_root_first, sizeof(wildcard_root_first) - 1u);
+    REQUIRE(exact_a);
+    REQUIRE(exact_b);
+    REQUIRE(wildcard_a);
+    REQUIRE(wildcard_b);
+    CHECK_EQ(exact_a.value().len, 5913u);
+    CHECK_EQ(exact_b.value().len, 5913u);
+    CHECK_EQ(wildcard_a.value().len, 5904u);
+    CHECK_EQ(wildcard_b.value().len, 5904u);
+    const std::string exact(exact_a.value().data, exact_a.value().len);
+    const std::string exact_other(exact_b.value().data, exact_b.value().len);
+    const std::string wildcard(wildcard_a.value().data, wildcard_a.value().len);
+    const std::string wildcard_other(wildcard_b.value().data, wildcard_b.value().len);
+    REQUIRE_EQ(exact, exact_other);
+    REQUIRE_EQ(wildcard, wildcard_other);
+    std::string wildcard_as_exact = wildcard;
+    REQUIRE_EQ(wildcard_as_exact.rfind("listen :8080\n", 0u), 0u);
+    wildcard_as_exact.replace(0u, strlen("listen :8080"), "listen 127.0.0.1:8080");
+    REQUIRE_EQ(wildcard_as_exact, exact);
+
+    memset(exact_first, 'x', sizeof(exact_first) - 1u);
+    memset(root_first, 'y', sizeof(root_first) - 1u);
+    memset(wildcard_first, 'z', sizeof(wildcard_first) - 1u);
+    memset(wildcard_root_first, 'w', sizeof(wildcard_root_first) - 1u);
+    CHECK_EQ(std::string(exact_a.value().data, exact_a.value().len), exact);
+    CHECK_EQ(std::string(exact_b.value().data, exact_b.value().len), exact);
+
+    static constexpr char kMaximumExact[] =
+        "server { listen 127.0.0.1:65535; location / { proxy_pass "
+        "http://255.255.255.255:65535; } location = /old { return 302 "
+        "http://redirect.example/new; } }";
+    static constexpr char kMaximumWildcard[] =
+        "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
+        "location = /old { return 302 http://redirect.example/new; } }";
+    const auto maximum_exact_parsed = nginx::parse({kMaximumExact, sizeof(kMaximumExact) - 1u});
+    const auto maximum_wildcard_parsed =
+        nginx::parse({kMaximumWildcard, sizeof(kMaximumWildcard) - 1u});
+    REQUIRE(maximum_exact_parsed);
+    REQUIRE(maximum_wildcard_parsed);
+    const auto maximum_exact = nginx::lower_to_rut(maximum_exact_parsed.value());
+    const auto maximum_wildcard = nginx::lower_to_rut(maximum_wildcard_parsed.value());
+    REQUIRE(maximum_exact);
+    REQUIRE(maximum_wildcard);
+    CHECK_EQ(maximum_exact.value().len, 5921u);
+    CHECK_EQ(maximum_wildcard.value().len, 5912u);
+    CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 16u);
+    std::string maximum_wildcard_as_exact(maximum_wildcard.value().data,
+                                          maximum_wildcard.value().len);
+    maximum_wildcard_as_exact.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
+    CHECK_EQ(maximum_wildcard_as_exact,
+             std::string(maximum_exact.value().data, maximum_exact.value().len));
+
+    const auto listener_is_canonical = [](const std::string& candidate) {
+        return candidate.rfind("listen 127.0.0.1:8080\n", 0u) == 0u &&
+               count_text(candidate, "listen 127.0.0.1:8080\n") == 1u &&
+               ((candidate.rfind("listen ", 0u) == 0u ? 1u : 0u) +
+                count_text(candidate, "\nlisten ")) == 1u &&
+               candidate.find("listen :") == std::string::npos &&
+               candidate.find("127.0.0.2") == std::string::npos;
+    };
+    const auto upstream_is_canonical = [](const std::string& candidate) {
+        return count_upstream_declarations(candidate) == 1u &&
+               count_text(candidate, "upstream nginx_upstream at \"127.0.0.1:9000\"\n") == 1u;
+    };
+    const auto pre_route_is_canonical = [](const std::string& candidate) {
+        const size_t begin = candidate.find("pre_route TRACE {");
+        const size_t end = candidate.find("}) }\n", begin);
+        return begin != std::string::npos && end != std::string::npos &&
+               ((candidate.rfind("pre_route ", 0u) == 0u ? 1u : 0u) +
+                count_text(candidate, "\npre_route ")) == 1u &&
+               count_text(candidate, "pre_route TRACE { return local_response({\n") == 1u &&
+               count_text(candidate.substr(begin, end - begin), "status: 405") == 1u &&
+               count_text(candidate.substr(begin, end - begin), "reason: \"Not Allowed\"") == 1u;
+    };
+    const auto redirect_is_canonical = [](const std::string& candidate) {
+        return count_text(candidate, kRedirectPrefix) == 1u &&
+               count_text(candidate, "if req.pathOnly == \"/old\"") == 1u &&
+               count_text(candidate, "return redirect({") == 1u &&
+               count_text(candidate, "query: \"discard\"") == 1u &&
+               count_text(candidate, "status: 302, reason: \"Moved Temporarily\"") == 1u &&
+               count_text(candidate, "static_authority: \"redirect.example\"") == 1u &&
+               count_text(candidate, "target_path: \"/new\"") == 1u;
+    };
+    const auto root_is_canonical = [](const std::string& candidate) {
+        return count_route_declarations(candidate) == 3u &&
+               count_text(candidate, "route HEAD \"/\" {") == 1u &&
+               count_text(candidate, "route GET \"/\" {") == 1u &&
+               count_text(candidate, "\nroute \"/\" {") == 1u &&
+               count_text(candidate, "return forward(nginx_upstream, request_policy: {") == 3u &&
+               count_text(candidate, "    } else {\n        return forward(") == 1u;
+    };
+    const auto has_no_nginx_hook = [](const std::string& candidate) {
+        return candidate.find("nginx.conf") == std::string::npos &&
+               candidate.find("nginx::") == std::string::npos &&
+               candidate.find("nginx_compat") == std::string::npos &&
+               candidate.find("workaround") == std::string::npos &&
+               candidate.find("bind_address") == std::string::npos;
+    };
+    const auto source_is_canonical = [&](const std::string& candidate) {
+        return listener_is_canonical(candidate) && upstream_is_canonical(candidate) &&
+               pre_route_is_canonical(candidate) && redirect_is_canonical(candidate) &&
+               root_is_canonical(candidate) && has_no_nginx_hook(candidate);
+    };
+    CHECK(listener_is_canonical(exact));
+    CHECK(upstream_is_canonical(exact));
+    CHECK(pre_route_is_canonical(exact));
+    CHECK_EQ(count_text(exact, kRedirectPrefix), 1u);
+    CHECK_EQ(count_text(exact, "if req.pathOnly == \"/old\""), 1u);
+    CHECK_EQ(count_text(exact, "return redirect({"), 1u);
+    CHECK_EQ(count_text(exact, "query: \"discard\""), 1u);
+    CHECK_EQ(count_text(exact, "status: 302, reason: \"Moved Temporarily\""), 1u);
+    CHECK_EQ(count_text(exact, "static_authority: \"redirect.example\""), 1u);
+    CHECK_EQ(count_text(exact, "target_path: \"/new\""), 1u);
+    CHECK(redirect_is_canonical(exact));
+    CHECK(root_is_canonical(exact));
+    CHECK(has_no_nginx_hook(exact));
+    REQUIRE(source_is_canonical(exact));
+
+    const auto replace_unique = [&](std::string candidate, Str from, Str to) {
+        const std::string needle(from.ptr, from.len);
+        const size_t offset = candidate.find(needle);
+        if (needle.empty() || from.eq(to) || offset == std::string::npos ||
+            candidate.find(needle, offset + needle.size()) != std::string::npos) {
+            CHECK(false);
+            return std::string{};
+        }
+        candidate.replace(offset, needle.size(), to.ptr, to.len);
+        CHECK_NE(candidate, exact);
+        return candidate;
+    };
+    const auto check_isolated = [&](const std::string& candidate,
+                                    bool listener_ok,
+                                    bool upstream_ok,
+                                    bool redirect_ok,
+                                    bool root_ok) {
+        REQUIRE_FALSE(candidate.empty());
+        CHECK_EQ(listener_is_canonical(candidate), listener_ok);
+        CHECK_EQ(upstream_is_canonical(candidate), upstream_ok);
+        CHECK(pre_route_is_canonical(candidate));
+        CHECK_EQ(redirect_is_canonical(candidate), redirect_ok);
+        CHECK_EQ(root_is_canonical(candidate), root_ok);
+        CHECK(has_no_nginx_hook(candidate));
+        CHECK_FALSE(source_is_canonical(candidate));
+    };
+    check_isolated(
+        replace_unique(
+            exact, lit_str("listen 127.0.0.1:8080\n"), lit_str("listen 127.0.0.2:8080\n")),
+        false,
+        true,
+        true,
+        true);
+    check_isolated(replace_unique(exact, lit_str("127.0.0.1:9000"), lit_str("127.0.0.1:9001")),
+                   true,
+                   false,
+                   true,
+                   true);
+    check_isolated(
+        replace_unique(exact, lit_str("return redirect({"), lit_str("return redirecX({")),
+        true,
+        true,
+        false,
+        true);
+    check_isolated(replace_unique(exact,
+                                  lit_str("status: 302, reason: \"Moved Temporarily\""),
+                                  lit_str("status: 301, reason: \"Moved Temporarily\"")),
+                   true,
+                   true,
+                   false,
+                   true);
+    check_isolated(replace_unique(exact,
+                                  lit_str("static_authority: \"redirect.example\""),
+                                  lit_str("static_authority: \"redirect.invalid\"")),
+                   true,
+                   true,
+                   false,
+                   true);
+    check_isolated(
+        replace_unique(exact, lit_str("target_path: \"/new\""), lit_str("target_path: \"/old\"")),
+        true,
+        true,
+        false,
+        true);
+    check_isolated(
+        replace_unique(exact, lit_str("query: \"discard\""), lit_str("query: \"preserve_raw\"")),
+        true,
+        true,
+        false,
+        true);
+    check_isolated(replace_unique(exact,
+                                  lit_str("    } else {\n        return forward("),
+                                  lit_str("    } else {\n        return forwarX(")),
+                   true,
+                   true,
+                   true,
+                   false);
+
+    const std::string hook = exact + "// nginx_compat workaround marker\n";
+    REQUIRE_NE(hook, exact);
+    CHECK(listener_is_canonical(hook));
+    CHECK(upstream_is_canonical(hook));
+    CHECK(pre_route_is_canonical(hook));
+    CHECK(redirect_is_canonical(hook));
+    CHECK(root_is_canonical(hook));
+    CHECK_FALSE(has_no_nginx_hook(hook));
+    CHECK_FALSE(source_is_canonical(hook));
+    const auto hook_lexed = lex({hook.data(), static_cast<u32>(hook.size())});
+    REQUIRE(hook_lexed);
+    const auto hook_ast = parse_file(hook_lexed.value());
+    REQUIRE(hook_ast);
+    delete hook_ast.value();
+
+    const std::string harmless = exact + "// canonical byte equality witness\n";
+    REQUIRE_NE(harmless, exact);
+    REQUIRE(source_is_canonical(harmless));
+    const auto harmless_lexed = lex({harmless.data(), static_cast<u32>(harmless.size())});
+    REQUIRE(harmless_lexed);
+    const auto harmless_ast = parse_file(harmless_lexed.value());
+    REQUIRE(harmless_ast);
+    delete harmless_ast.value();
+
+    const auto lexed = lex({exact.data(), static_cast<u32>(exact.size())});
+    REQUIRE(lexed);
+    const auto parsed = parse_file(lexed.value());
+    REQUIRE(parsed);
+    std::unique_ptr<AstFile> ast(parsed.value());
+    REQUIRE_GT(ast->items.len, 0u);
+    REQUIRE(ast->items[0].kind == AstItemKind::Listen);
+    CHECK(ast->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(ast->items[0].listen.ipv4_host, 0x7f000001u);
+    CHECK_EQ(ast->items[0].listen.port, 8080u);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    const AstRouteDecl* ast_get = nullptr;
+    for (u32 i = 0u; i < ast->items.len; i++) {
+        if (ast->items[i].kind == AstItemKind::Route &&
+            ast->items[i].route.method == static_cast<u8>(TokenType::KwGet) &&
+            ast->items[i].route.path.eq(lit_str("/")))
+            ast_get = &ast->items[i].route;
+    }
+    REQUIRE(ast_get != nullptr);
+    REQUIRE_EQ(ast_get->statements.len, 1u);
+    REQUIRE(ast_get->statements[0] != nullptr);
+    const AstStatement& ast_if = *ast_get->statements[0];
+    REQUIRE(ast_if.kind == AstStmtKind::If);
+    REQUIRE(ast_if.then_stmt != nullptr);
+    REQUIRE(ast_if.else_stmt != nullptr);
+    REQUIRE(ast_if.then_stmt->kind == AstStmtKind::Redirect);
+    REQUIRE(ast_if.then_stmt->has_redirect_policy);
+    REQUIRE_NE(ast_if.then_stmt->redirect_policy_id, 0u);
+    REQUIRE_LE(ast_if.then_stmt->redirect_policy_id, ast->redirect_policies.len);
+    REQUIRE(ast_if.else_stmt->kind == AstStmtKind::ForwardUpstream);
+    const auto& ast_policy = ast->redirect_policies[ast_if.then_stmt->redirect_policy_id - 1u];
+    CHECK_EQ(ast_policy.status_code, 302u);
+    CHECK(ast_policy.reason.eq(lit_str("Moved Temporarily")));
+    CHECK(ast_policy.static_authority.eq(lit_str("redirect.example")));
+    CHECK(ast_policy.target_path.eq(lit_str("/new")));
+    CHECK(ast_policy.query == RedirectPolicyQuery::Discard);
+    CHECK(ast_policy.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK(ast_policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u}));
+
+    const auto analyzed = analyze_file(*ast);
+    REQUIRE(analyzed);
+    std::unique_ptr<HirModule> hir(analyzed.value());
+    REQUIRE(hir->has_listener);
+    CHECK(hir->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(hir->listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(hir->listener.port, 8080u);
+    REQUIRE_EQ(hir->routes.len, 3u);
+    const HirRoute* hir_get = nullptr;
+    for (u32 i = 0u; i < hir->routes.len; i++) {
+        if (hir->routes[i].method == kRouteMethodGet && hir->routes[i].path.eq(lit_str("/")))
+            hir_get = &hir->routes[i];
+    }
+    REQUIRE(hir_get != nullptr);
+    REQUIRE(hir_get->control.kind == HirControlKind::If);
+    REQUIRE(hir_get->control.cond.kind == HirExprKind::Eq);
+    REQUIRE(hir_get->control.cond.rhs != nullptr);
+    CHECK(hir_get->control.cond.rhs->kind == HirExprKind::StrLit);
+    CHECK(hir_get->control.cond.rhs->str_value.eq(lit_str("/old")));
+    REQUIRE(hir_get->control.then_term.kind == HirTerminatorKind::Redirect);
+    const u16 hir_policy_id = hir_get->control.then_term.redirect_policy_id;
+    REQUIRE_NE(hir_policy_id, 0u);
+    REQUIRE_LE(hir_policy_id, hir->redirect_policies.len);
+    REQUIRE(hir_get->control.else_term.kind == HirTerminatorKind::ForwardUpstream);
+    const auto& hir_policy = hir->redirect_policies[hir_policy_id - 1u];
+    CHECK_EQ(hir_policy.status_code, 302u);
+    CHECK(hir_policy.reason.eq(lit_str("Moved Temporarily")));
+    CHECK(hir_policy.static_authority.eq(lit_str("redirect.example")));
+    CHECK(hir_policy.target_path.eq(lit_str("/new")));
+    CHECK(hir_policy.query == RedirectPolicyQuery::Discard);
+    CHECK(hir_policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u}));
 }
 
 TEST(nginx_converter, explicit_ipv4_wildcard_listener_survives_frontend_lifetimes) {
