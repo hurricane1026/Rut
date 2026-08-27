@@ -446,6 +446,8 @@ FrontendResult<bool> validate_exact_absolute_redirect(const Server& server) {
     return true;
 }
 
+bool exact_local_return_path_is_clean(Str path);
+
 FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
     const ExactNoContentReturnLocation& location = server.exact_no_content_return;
     const NoContentReturn& response = location.response;
@@ -459,7 +461,7 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
     // This validator is the first dynamic-borrow boundary in lower_to_rut. All
     // scalar bounds, nested structure, source arithmetic, and cross-action
     // inventory are therefore checked before any model byte is inspected.
-    if (location.path.len != 7u || location.path.len > kMaxExactLocalReturnPathLen)
+    if (location.path.len < 2u || location.path.len > kMaxExactLocalReturnPathLen)
         return unsupported(is_valid_span(location.path_span) ? location.path_span
                                                              : exact_no_content_return_span(server),
                            lit_str("invalid bounded exact no-content return path model"));
@@ -550,16 +552,16 @@ FrontendResult<bool> validate_exact_no_content_return(const Server& server) {
     // Byte reads begin only after the common source base and every relevant
     // source position have been proven. Pin both semantic literals and the
     // directive delimiters so forged subspans cannot manufacture a valid action.
-    if (!eq(location.path, "/static", 7u))
+    if (!exact_local_return_path_is_clean(location.path) || eq(location.path, "/old", 4u))
         return unsupported(location.path_span,
-                           lit_str("invalid exact no-content return location path"));
+                           lit_str("exact local return path is outside the bounded clean profile"));
     if (!eq(fallback.path, "/", 1u))
         return unsupported(fallback.path_span,
                            lit_str("invalid exact no-content return fallback path"));
 
     // Reconstruct only this bounded exact-location shell with a trusted-source
     // cursor. Every cursor limit is one of the nested spans proven above. This
-    // prevents a forged model from borrowing valid `/static` and `return 204;`
+    // prevents a forged model from borrowing a clean path and `return 204;`
     // interiors out of a comment or a different lexical container.
     const u32 location_prefix_len = location.path_span.start - location.span.start;
     if (location_prefix_len <= 8u)
@@ -1161,8 +1163,13 @@ bool put_exact_local_return(Writer& writer, Str path, Str body) {
            writer.put_cstr("\"\n}) }\n");
 }
 
-bool put_exact_no_content_return(Writer& writer) {
-    return writer.put_cstr("route exact GET \"/static\" { return local_response({\n") &&
+bool put_exact_no_content_return(Writer& writer, Str path) {
+    // validate_exact_no_content_return has already proven the complete path
+    // borrow and clean grammar before this final-byte view selection.
+    const bool slash_normalized = path.ptr[path.len - 1u] == '/';
+    return writer.put_cstr(slash_normalized ? "route exact slash_normalized GET \""
+                                            : "route exact GET \"") &&
+           writer.put(path) && writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
                "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
                "\"nginx/1.29.7\",\n") &&
@@ -1263,7 +1270,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
              !put_exact_local_return(writer,
                                      server.exact_local_return.path,
                                      server.exact_local_return.response.body)) ||
-            (exact_no_content_return.value() && !put_exact_no_content_return(writer)))
+            (exact_no_content_return.value() &&
+             !put_exact_no_content_return(writer, server.exact_no_content_return.path)))
             return fail_overflow();
         return output;
     }

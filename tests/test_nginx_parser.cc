@@ -3023,14 +3023,20 @@ static nginx::Server api_server() {
     return server;
 }
 
-TEST(nginx_converter, rejects_newly_modeled_no_content_paths_before_emission) {
+TEST(nginx_converter, lowers_bounded_clean_exact_no_content_paths) {
     struct Vector {
         const char* path;
-        Str detail;
+        const char* route;
+        u32 expected_length;
     };
     const Vector vectors[] = {
-        {"/healthz", lit_str("invalid bounded exact no-content return path model")},
-        {"/status", lit_str("invalid exact no-content return location path")},
+        {"/x", "route exact GET \"/x\" { return local_response({", 5534u},
+        {"/healthz", "route exact GET \"/healthz\" { return local_response({", 5540u},
+        {"/status", "route exact GET \"/status\" { return local_response({", 5539u},
+        {"/health/check", "route exact GET \"/health/check\" { return local_response({", 5545u},
+        {"/health/check/",
+         "route exact slash_normalized GET \"/health/check/\" { return local_response({",
+         5563u},
     };
     for (const auto& vector : vectors) {
         char source[256]{};
@@ -3048,12 +3054,24 @@ TEST(nginx_converter, rejects_newly_modeled_no_content_paths_before_emission) {
             {vector.path, static_cast<u32>(strlen(vector.path))}));
 
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(vector.detail));
-        CHECK_EQ(lowered.error().span.start,
-                 parsed.value().exact_no_content_return.path_span.start);
-        CHECK_EQ(lowered.error().span.end, parsed.value().exact_no_content_return.path_span.end);
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, vector.expected_length);
+        const char* route = strstr(lowered.value().data, vector.route);
+        REQUIRE(route != nullptr);
+        CHECK(strstr(route + 1, vector.route) == nullptr);
+        CHECK(strstr(route, "status: 204, reason: \"No Content\"") != nullptr);
+        CHECK(strstr(route, "content_type: \"\", connection: \"request\"") != nullptr);
+        CHECK(strstr(route, "head_mode: \"suppress_body\", body: b\"\"") != nullptr);
+        CHECK(strstr(lowered.value().data, "nginx.conf") == nullptr);
+        CHECK(strstr(lowered.value().data, "proxy_pass") == nullptr);
+        const auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        const auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast.value()->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(ast.value()->exact_strict_local_response_bindings[0].path_len,
+                 strlen(vector.path));
+        delete ast.value();
     }
 }
 
@@ -3353,7 +3371,11 @@ TEST(nginx_converter, exact_no_content_return_rejects_mutated_source_literals_an
         u8 span_kind;
     };
     const Mutation mutations[] = {
-        {"/static", 1u, 'x', lit_str("invalid exact no-content return location path"), 0u},
+        {"/static",
+         1u,
+         '%',
+         lit_str("exact local return path is outside the bounded clean profile"),
+         0u},
         {"location / {", 9u, 'x', lit_str("invalid exact no-content return fallback path"), 3u},
         {"204", 2u, '5', lit_str("invalid exact no-content return status literal"), 1u},
         {"return", 0u, 'x', lit_str("invalid exact no-content return directive delimiter"), 2u},
@@ -3400,6 +3422,26 @@ TEST(nginx_converter, exact_no_content_return_rejects_mutated_source_literals_an
         CHECK_EQ(lowered.error().span.end,
                  parsed.value().exact_no_content_return.response.span.end);
     }
+
+    // `/old` remains reserved for the distinct absolute-redirect semantic
+    // action even if a forged caller mutates a genuinely parsed clean path.
+    char reserved_source[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /xld { return 204; } }";
+    const auto reserved_model = nginx::parse({reserved_source, sizeof(reserved_source) - 1u});
+    REQUIRE(reserved_model);
+    char* reserved_path = strstr(reserved_source, "/xld");
+    REQUIRE(reserved_path != nullptr);
+    reserved_path[1] = 'o';
+    const auto reserved_lowered = nginx::lower_to_rut(reserved_model.value());
+    REQUIRE_FALSE(reserved_lowered);
+    CHECK_EQ(reserved_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(reserved_lowered.error().detail.eq(
+        lit_str("exact local return path is outside the bounded clean profile")));
+    CHECK_EQ(reserved_lowered.error().span.start,
+             reserved_model.value().exact_no_content_return.path_span.start);
+    CHECK_EQ(reserved_lowered.error().span.end,
+             reserved_model.value().exact_no_content_return.path_span.end);
 }
 
 TEST(nginx_converter, exact_no_content_return_rejects_forged_location_shell) {
@@ -5082,6 +5124,70 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     CHECK(strstr(no_content_root.value().data, "nginx.conf") == nullptr);
     CHECK(strstr(no_content_root.value().data, "proxy_pass") == nullptr);
 
+    // The generalized bodyless action substitutes only the validated path in
+    // the same ordinary-RUT binding. Pin the entire generated program for both
+    // nginx declaration orders and for a comment/whitespace-equivalent source.
+    static constexpr char kHealthzNoContentExactGolden[] =
+        "route exact GET \"/healthz\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    nginx::RutSource healthz_no_content_golden{};
+    memcpy(healthz_no_content_golden.data, kExpected, sizeof(kExpected) - 1u);
+    memcpy(healthz_no_content_golden.data + sizeof(kExpected) - 1u,
+           kHealthzNoContentExactGolden,
+           sizeof(kHealthzNoContentExactGolden) - 1u);
+    healthz_no_content_golden.len =
+        static_cast<u32>(sizeof(kExpected) + sizeof(kHealthzNoContentExactGolden) - 2u);
+    const char healthz_no_content_root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /healthz { return 204; } }";
+    const char healthz_no_content_exact_first[] =
+        "server { listen 8080; location = /healthz { return 204; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const char healthz_no_content_formatted[] =
+        "# equivalent source\nserver {\n  listen 8080;\n"
+        "  location = /healthz # exact path\n  { return # action\n 204 ; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n}\n";
+    for (const char* source : {healthz_no_content_root_first,
+                               healthz_no_content_exact_first,
+                               healthz_no_content_formatted}) {
+        const auto model = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(model);
+        const auto lowered = nginx::lower_to_rut(model.value());
+        REQUIRE(lowered);
+        CHECK(lowered.value().view().eq(healthz_no_content_golden.view()));
+        CHECK_EQ(lowered.value().len, 5540u);
+    }
+
+    struct CleanNoContentGolden {
+        const char* path;
+        const char* selector;
+        u32 length;
+    };
+    const CleanNoContentGolden clean_no_content_goldens[] = {
+        {"/health/check", "route exact GET \"/health/check\"", 5545u},
+        {"/health/check/", "route exact slash_normalized GET \"/health/check/\"", 5563u},
+    };
+    for (const auto& vector : clean_no_content_goldens) {
+        char source[256]{};
+        const int source_len = snprintf(source,
+                                        sizeof(source),
+                                        "server { listen 8080; location / { proxy_pass "
+                                        "http://127.0.0.1:9000; } location = %s { return 204; } }",
+                                        vector.path);
+        REQUIRE_GT(source_len, 0);
+        REQUIRE_LT(static_cast<u32>(source_len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(source_len)});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, vector.length);
+        CHECK(strstr(lowered.value().data, vector.selector) != nullptr);
+    }
+
     // The complete /healthz source is a fixed root-program golden plus this
     // independently fixed exact binding. Both declaration orders must match
     // every byte, not merely the exact-route suffix.
@@ -5544,6 +5650,56 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
     delete ast.value();
 }
 
+TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source_capacity) {
+    static_assert(nginx::kMaxExactLocalReturnPathLen == 62u);
+    static_assert(nginx::RutSource::kCapacity == 5937u);
+    char paths[2][nginx::kMaxExactLocalReturnPathLen + 1u]{};
+    paths[0][0] = '/';
+    paths[1][0] = '/';
+    for (u32 i = 1; i < nginx::kMaxExactLocalReturnPathLen; i++) {
+        paths[0][i] = 'a';
+        paths[1][i] = i + 1u == nginx::kMaxExactLocalReturnPathLen ? '/' : 'b';
+    }
+    const u32 expected_lengths[] = {5602u, 5619u};
+    const u32 expected_headroom[] = {335u, 318u};
+    const char* expected_selectors[] = {"route exact GET \"/aaaa",
+                                        "route exact slash_normalized GET \"/bbbb"};
+    for (u32 vector = 0; vector < 2u; vector++) {
+        char source[256]{};
+        const int source_len = snprintf(source,
+                                        sizeof(source),
+                                        "server { listen 8080; location / { proxy_pass "
+                                        "http://127.0.0.1:9000; } location = %s { return 204; } }",
+                                        paths[vector]);
+        REQUIRE_GT(source_len, 0);
+        REQUIRE_LT(static_cast<u32>(source_len), static_cast<u32>(sizeof(source)));
+        const auto parsed = nginx::parse({source, static_cast<u32>(source_len)});
+        REQUIRE(parsed);
+        REQUIRE_EQ(parsed.value().exact_no_content_return.path.len,
+                   nginx::kMaxExactLocalReturnPathLen);
+        auto model = parsed.value();
+        model.listen.port = 65535;
+        model.location.proxy_pass.port = 65535;
+        for (u32 i = 0; i < 4; i++) model.location.proxy_pass.address[i] = 255;
+        const auto lowered = nginx::lower_to_rut(model);
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, expected_lengths[vector]);
+        CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, expected_headroom[vector]);
+        CHECK(strstr(lowered.value().data, expected_selectors[vector]) != nullptr);
+        const auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        const auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast.value()->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(ast.value()->exact_strict_local_response_bindings[0].path_len,
+                 nginx::kMaxExactLocalReturnPathLen);
+        CHECK_EQ(ast.value()->exact_strict_local_response_bindings[0].path_view,
+                 vector == 0u ? ExactPathView::Raw : ExactPathView::SlashNormalized);
+        delete ast.value();
+    }
+}
+
 TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) {
     char source[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
@@ -5831,6 +5987,127 @@ TEST(nginx_converter, emitted_no_content_source_reaches_independent_owned_runtim
     CHECK(outside_generated_source(policy.content_type));
     CHECK(outside_destroyed_sources(policy.body));
     CHECK(outside_generated_source(policy.body));
+}
+
+TEST(nginx_converter, emitted_healthz_no_content_is_owned_in_either_declaration_order) {
+    static constexpr char kSources[][160] = {
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/healthz { return 204; } }",
+        "server { listen 8080; location = /healthz { return 204; } location / { proxy_pass "
+        "http://127.0.0.1:9000; } }",
+    };
+    for (const auto& original : kSources) {
+        auto populated = std::make_unique<RouteConfig>();
+        uintptr_t nginx_begin = 0;
+        uintptr_t nginx_end = 0;
+        uintptr_t rut_begin = 0;
+        uintptr_t rut_end = 0;
+        {
+            char nginx_source[sizeof(original)]{};
+            memcpy(nginx_source, original, sizeof(original));
+            nginx_begin = reinterpret_cast<uintptr_t>(nginx_source);
+            nginx_end = nginx_begin + sizeof(nginx_source);
+            const auto parsed =
+                nginx::parse({nginx_source, static_cast<u32>(strlen(nginx_source))});
+            REQUIRE(parsed);
+            auto lowered = nginx::lower_to_rut(parsed.value());
+            REQUIRE(lowered);
+            rut_begin = reinterpret_cast<uintptr_t>(lowered.value().data);
+            rut_end = rut_begin + sizeof(lowered.value().data);
+            CHECK(strstr(lowered.value().data, "route exact GET \"/healthz\"") != nullptr);
+            memset(nginx_source, 'x', sizeof(nginx_source));
+
+            const auto lexed = lex(lowered.value().view());
+            REQUIRE(lexed);
+            const auto ast = parse_file(lexed.value());
+            REQUIRE(ast);
+            std::unique_ptr<AstFile> ast_owned(ast.value());
+            REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+            REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 5u);
+            const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
+            CHECK_EQ(ast_binding.method, kRouteMethodGet);
+            CHECK_EQ(ast_binding.path_view, ExactPathView::Raw);
+            CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/healthz"))));
+            CHECK_EQ(
+                strict_local_response_policy_profile(ast_owned->strict_local_response_policies[4]),
+                StrictLocalResponseProfile::NoContent204);
+
+            const auto hir = analyze_file(*ast_owned);
+            REQUIRE(hir);
+            std::unique_ptr<HirModule> hir_owned(hir.value());
+            REQUIRE_EQ(hir_owned->routes.len, 3u);
+            REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
+            CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+            CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].path_view,
+                     ExactPathView::Raw);
+
+            const auto mir = build_mir(*hir_owned);
+            REQUIRE(mir);
+            std::unique_ptr<MirModule> mir_owned(mir.value());
+            REQUIRE_EQ(mir_owned->functions.len, 3u);
+            REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
+            CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+            CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].path_view,
+                     ExactPathView::Raw);
+
+            FrontendRirModule rir{};
+            RirGuard rir_guard{rir};
+            REQUIRE(lower_to_rir(*mir_owned, rir));
+            REQUIRE(rir::verify_module(rir.module).ok);
+            REQUIRE_EQ(rir.module.func_count, 3u);
+            REQUIRE_EQ(rir.module.upstream_count, 1u);
+            REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
+            REQUIRE_EQ(rir.module.strict_local_response_policy_count, 5u);
+            CHECK_EQ(rir.module.exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+            CHECK_EQ(rir.module.exact_strict_local_response_bindings[0].path_view,
+                     ExactPathView::Raw);
+            char printed_storage[65536]{};
+            rir::PrintBuf printed;
+            printed.init(printed_storage, sizeof(printed_storage), -1);
+            rir::print_module(printed, rir.module);
+            REQUIRE_FALSE(printed.overflow);
+            const std::string printed_text(printed.data, printed.len);
+            CHECK_NE(printed_text.find("exact:\n  GET \"/healthz\" -> local_response#5"),
+                     std::string::npos);
+            CHECK_NE(printed_text.find("status=204, reason=\"No Content\""), std::string::npos);
+            REQUIRE(populate_route_config(*populated, rir.module));
+            memset(lowered.value().data, 'y', sizeof(lowered.value().data));
+        }
+
+        REQUIRE(populated->strict_local_response_table_is_valid());
+        REQUIRE_EQ(populated->route_count, 0u);
+        REQUIRE_EQ(populated->upstream_count, 1u);
+        CHECK_EQ(ntohs(populated->upstreams[0].addrs[0].sin_port), 9000u);
+        REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+        const auto& binding = populated->exact_strict_local_response_bindings[0];
+        CHECK_EQ(binding.method, kRouteMethodGet);
+        CHECK_EQ(binding.path_view, ExactPathView::Raw);
+        CHECK((Str{binding.path, binding.path_len}.eq(lit_str("/healthz"))));
+        const u16 policy_id =
+            populated->match_exact_strict_local_response(lit_str("/healthz?x=1"), kRouteMethodGet);
+        REQUIRE_NE(policy_id, 0u);
+        CHECK_EQ(
+            populated->match_exact_strict_local_response(lit_str("/healthz"), kRouteMethodHead),
+            0u);
+        CHECK_EQ(
+            populated->match_exact_strict_local_response(lit_str("/healthz/"), kRouteMethodGet),
+            0u);
+        CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/health"), kRouteMethodGet),
+                 0u);
+        CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/"), kRouteMethodGet), 0u);
+        REQUIRE(populated->strict_local_response_policy_id_is_owned(policy_id));
+        const auto& policy = populated->strict_local_response_policies[policy_id - 1u];
+        CHECK_EQ(strict_local_response_policy_profile(policy),
+                 StrictLocalResponseProfile::NoContent204);
+        CHECK_EQ(policy.status_code, 204u);
+        CHECK(policy.reason.eq(lit_str("No Content")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.content_type.empty());
+        CHECK(policy.body.empty());
+        const uintptr_t path_address = reinterpret_cast<uintptr_t>(binding.path);
+        CHECK(path_address < nginx_begin || path_address >= nginx_end);
+        CHECK(path_address < rut_begin || path_address >= rut_end);
+    }
 }
 
 TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
