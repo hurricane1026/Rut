@@ -6453,19 +6453,32 @@ static bool generated_exact_return204_source_is_query_free(const std::string& so
            source.find("query-return204.example") == std::string::npos;
 }
 
+static bool generated_exact_return204_source_has_normalized_static_selector(
+    const std::string& source) {
+    const std::string normalized = "route exact slash_normalized GET \"/static\"";
+    const size_t offset = source.find(normalized);
+    return offset != std::string::npos &&
+           source.find(normalized, offset + normalized.size()) == std::string::npos &&
+           source.find("route exact GET \"/static\"") == std::string::npos;
+}
+
 static bool run_converter_exact_return204_source_validation_self_checks(std::string& error) {
     static constexpr char kCanonical[] =
         "listen :54321\n"
-        "route exact GET \"/static\" { return local_response({ status: 204 }) }\n"
+        "route exact slash_normalized GET \"/static\" { return local_response({ status: 204 }) }\n"
         "route GET \"/\" { return forward(nginx_upstream) }\n";
     const std::string query_route =
         std::string(kCanonical) + "route exact GET \"/static?x=1\" { return response() }\n";
     const std::string host_predicate =
         std::string(kCanonical) + "if host == \"query-return204.example\" { return response() }\n";
+    const std::string raw_selector =
+        std::string(kCanonical) + "route exact GET \"/static\" { return response() }\n";
     if (!generated_exact_return204_source_is_query_free(kCanonical) ||
+        !generated_exact_return204_source_has_normalized_static_selector(kCanonical) ||
         generated_exact_return204_source_is_query_free(query_route) ||
-        generated_exact_return204_source_is_query_free(host_predicate)) {
-        error = "#325 generated source query-specific route/host mutation was not rejected";
+        generated_exact_return204_source_is_query_free(host_predicate) ||
+        generated_exact_return204_source_has_normalized_static_selector(raw_selector)) {
+        error = "#325 generated source query/selector/host mutation was not rejected";
         return false;
     }
     return true;
@@ -7322,13 +7335,15 @@ static bool capture_generated_exact_local_return204_order(
         }
     };
     const std::string exact_tuple =
-        "route exact GET \"/static\" { return local_response({\n"
+        "route exact slash_normalized GET \"/static\" { return local_response({\n"
         "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
         "  date: \"current\", content_type: \"\", connection: \"request\",\n"
         "  head_mode: \"suppress_body\", body: b\"\"\n"
         "}) }\n";
-    if (count_literal(exact_tuple) != 1u || count_literal("route exact GET \"/static\"") != 1u ||
+    if (count_literal(exact_tuple) != 1u ||
+        count_literal("route exact slash_normalized GET \"/static\"") != 1u ||
+        count_literal("route exact GET \"/static\"") != 0u || count_literal("route exact ") != 1u ||
         count_literal("route HEAD \"/\" {") != 1u || count_literal("route GET \"/\" {") != 1u ||
         count_literal("route \"/\" {") != 1u ||
         count_literal("return forward(nginx_upstream") != 3u ||
@@ -7345,6 +7360,7 @@ static bool capture_generated_exact_local_return204_order(
         generated_source.find("nginx::") != std::string::npos ||
         generated_source.find("nginx_compat") != std::string::npos ||
         !generated_exact_return204_source_is_query_free(generated_source) ||
+        !generated_exact_return204_source_has_normalized_static_selector(generated_source) ||
         !write_file(temp.source, generated.ptr, generated.len)) {
         error =
             "#324 output was not exactly one public strict /static selector plus the canonical "
@@ -7870,7 +7886,7 @@ static bool validate_bounded_no_content_generated_source(const std::string& sour
                                                          u16 backend_port,
                                                          std::string& error) {
     const std::string exact_tuple =
-        "route exact GET \"/healthz\" { return local_response({\n"
+        "route exact slash_normalized GET \"/healthz\" { return local_response({\n"
         "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
         "\"nginx/1.29.7\",\n"
         "  date: \"current\", content_type: \"\", connection: \"request\",\n"
@@ -7880,7 +7896,9 @@ static bool validate_bounded_no_content_generated_source(const std::string& sour
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
     const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
     if (count_text(source, exact_tuple) != 1u ||
-        count_text(source, "route exact GET \"/healthz\"") != 1u ||
+        count_text(source, "route exact slash_normalized GET \"/healthz\"") != 1u ||
+        count_text(source, "route exact GET \"/healthz\"") != 0u ||
+        count_text(source, "route exact ") != 1u ||
         count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u ||
@@ -8012,6 +8030,9 @@ static bool run_bounded_no_content_differential_parser_self_checks(std::string& 
     };
     if (!validate_bounded_no_content_generated_source(canonical, 54320u, 54321u, error) ||
         !rejects_source(canonical + "route exact GET \"/healthz?x=1\" { return response() }\n") ||
+        !rejects_source(replace(canonical,
+                                "route exact slash_normalized GET \"/healthz\"",
+                                "route exact GET \"/healthz\"")) ||
         !rejects_source(canonical + "if host == \"healthz-return204.example\" {}\n") ||
         !rejects_source(replace(canonical, "status: 204", "status: 200"))) {
         error = "#328 generated source mutation self-check failed";

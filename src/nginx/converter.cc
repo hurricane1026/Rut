@@ -1164,12 +1164,11 @@ bool put_exact_local_return(Writer& writer, Str path, Str body) {
 }
 
 bool put_exact_no_content_return(Writer& writer, Str path) {
-    // validate_exact_no_content_return has already proven the complete path
-    // borrow and clean grammar before this final-byte view selection.
-    const bool slash_normalized = path.ptr[path.len - 1u] == '/';
-    return writer.put_cstr(slash_normalized ? "route exact slash_normalized GET \""
-                                            : "route exact GET \"") &&
-           writer.put(path) && writer.put_cstr("\" { return local_response({\n") &&
+    // validate_exact_no_content_return has already proven that the complete
+    // borrowed config key is a slash-normalization fixed point. Use the public
+    // normalized view to model nginx's default normalized-URI exact selection.
+    return writer.put_cstr("route exact slash_normalized GET \"") && writer.put(path) &&
+           writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
                "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
                "\"nginx/1.29.7\",\n") &&
