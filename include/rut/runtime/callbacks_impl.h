@@ -8578,20 +8578,9 @@ inline bool strict_response_forbidden(Str name) {
         response_policy_name_eq(name, "proxy-connection", 16) ||
         response_policy_name_eq(name, "location", 8) ||
         response_policy_name_eq(name, "refresh", 7) ||
-        response_policy_name_eq(name, "content-type", 12) ||
         response_policy_name_eq(name, "last-modified", 13))
         return true;
     if (name.len >= 8 && http_header_name_eq_ci(name.ptr, 8, "x-accel-", 8)) return true;
-    return false;
-}
-
-inline bool response_policy_hides(const ForwardResponsePolicySpec& policy, Str name) {
-    for (u32 i = 0; i < policy.hide_header_count; i++) {
-        const Str hidden = policy.hide_headers[i];
-        if (hidden.len == name.len &&
-            http_header_name_eq_ci(hidden.ptr, hidden.len, name.ptr, name.len))
-            return true;
-    }
     return false;
 }
 
@@ -8895,13 +8884,22 @@ inline bool build_strict_response_headers(Connection& conn,
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
     }
     u32 connection_count = 0;
+    u32 content_type_count = 0;
+    Str content_type{};
     for (u32 i = 0; i < resp.header_count; i++) {
-        const Str name = resp.headers[i].name;
+        const Header& header = resp.headers[i];
+        const Str name = header.name;
         if (response_policy_name_eq(name, "connection", 10)) {
             // The policy always synthesizes the sole downstream Connection
             // field. Consume at most one upstream field; duplicate hop-by-hop
             // metadata is ambiguous and remains fail-closed.
             if (++connection_count > 1) return false;
+        } else if (response_policy_name_eq(name, "content-type", 12)) {
+            // Validate the complete typed-field inventory before applying the
+            // hide policy so malformed or duplicate metadata never disappears.
+            if (++content_type_count > 1 || !response_policy_safe_content_type(header.value))
+                return false;
+            content_type = header.value;
         } else if (strict_response_forbidden(name)) {
             return false;
         }
@@ -8922,7 +8920,14 @@ inline bool build_strict_response_headers(Connection& conn,
         return false;
     char date[32];
     const u32 date_len = strict_response_date(date, realtime_us());
-    if (date_len == 0 || !put(date, date_len) || !put_lit("\r\nContent-Length: ")) return false;
+    static constexpr Str kContentTypeName{"Content-Type", 12};
+    const bool emit_content_type =
+        content_type_count == 1 && !response_policy_hides_header(policy, kContentTypeName);
+    if (date_len == 0 || !put(date, date_len) ||
+        (emit_content_type &&
+         (!put_lit("\r\nContent-Type: ") || !put(content_type.ptr, content_type.len))) ||
+        !put_lit("\r\nContent-Length: "))
+        return false;
     const u32 num_len = strict_response_dec(num, resp.content_length);
     if (!put(num, num_len) || !put_lit("\r\nConnection: ")) return false;
     const bool policy_keep_alive =
@@ -8939,7 +8944,8 @@ inline bool build_strict_response_headers(Connection& conn,
             response_policy_name_eq(h.name, "date", 4) ||
             response_policy_name_eq(h.name, "server", 6) ||
             response_policy_name_eq(h.name, "content-length", 14) ||
-            response_policy_hides(policy, h.name))
+            response_policy_name_eq(h.name, "content-type", 12) ||
+            response_policy_hides_header(policy, h.name))
             continue;
         if (!put(h.name.ptr, h.name.len) || !put_lit(": ")) return false;
         u32 start = 0;

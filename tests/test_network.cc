@@ -37730,79 +37730,353 @@ TEST(response_buffering_runtime,
     }
 }
 
+static bool normalize_strict_imf_fixdate_header(u8* data, u32 len);
+
 TEST(response_buffering_runtime,
-     bounded_201_complete_and_fragmented_preserve_reason_status_and_access) {
-    for (const bool fragmented : {false, true}) {
-        ScopedIoUringLoopForRetirement guard;
-        if (!guard.init()) SKIP("io_uring unavailable");
-        auto* loop = guard.loop;
-        AccessLogRing access_log{};
-        access_log.init();
-        loop->access_log = &access_log;
+     bounded_content_type_serializer_is_canonical_bounded_hidden_and_fail_closed) {
+    struct Built {
+        bool ok = false;
+        std::string wire;
+    };
+    const auto build = [](const std::string& origin,
+                          bool hide_content_type = false,
+                          u32 capacity = SlicePool::kSliceSize) -> Built {
+        Built result{};
         RouteConfig config{};
-        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        ForwardResponsePolicySpec policy{};
+        policy.version = ResponsePolicyVersion::Http11;
+        policy.framing = ResponsePolicyFraming::ContentLength;
+        policy.connection = ResponsePolicyConnection::Request;
+        policy.date = ResponsePolicyDate::Current;
+        policy.head_mode = ResponsePolicyHeadMode::Reject;
+        policy.server = {"rut-get-timeout", 15};
+        if (hide_content_type) {
+            policy.hide_headers[0] = {"cOnTeNt-TyPe", 12};
+            policy.hide_header_count = 1;
+        }
+        if (config.add_response_policy(policy) != 1u) return result;
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(origin.data()),
+                         static_cast<u32>(origin.size()),
+                         &response) != ParseStatus::Complete)
+            return result;
+        u8 storage[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = storage;
+        conn.response_header_buf.bind(storage, capacity);
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = false;
+        result.ok = build_strict_response_headers(conn, config, response);
+        if (!result.ok) return result;
+        if (!normalize_strict_imf_fixdate_header(conn.response_header_slice,
+                                                 conn.response_header_buf.len())) {
+            result.ok = false;
+            return result;
+        }
+        result.wire.assign(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                           conn.response_header_buf.len());
+        return result;
+    };
+
+    const auto origin = [](const std::string& content_type) {
+        return std::string("HTTP/1.1 200 OK\r\n") + content_type +
+               "X-Origin: kept\r\nContent-Length: 4\r\n\r\nbody";
+    };
+    static constexpr char kExpectedAbsent[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut-get-timeout\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close\r\n"
+        "X-Origin: kept\r\n\r\n";
+    static constexpr char kExpectedTextPlain[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut-get-timeout\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close\r\n"
+        "X-Origin: kept\r\n\r\n";
+
+    const Built absent = build(origin(""));
+    REQUIRE(absent.ok);
+    CHECK_EQ(absent.wire, std::string(kExpectedAbsent, sizeof(kExpectedAbsent) - 1u));
+    CHECK(absent.wire.find("Content-Type") == std::string::npos);
+
+    const Built mixed = build(origin("cOnTeNt-TyPe:\t text/plain \t\r\n"));
+    REQUIRE(mixed.ok);
+    CHECK_EQ(mixed.wire, std::string(kExpectedTextPlain, sizeof(kExpectedTextPlain) - 1u));
+    CHECK_EQ(mixed.wire.find("Content-Type: text/plain\r\n"),
+             mixed.wire.find("Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n") + 37u);
+    CHECK_LT(mixed.wire.find("Content-Type: text/plain\r\n"),
+             mixed.wire.find("Content-Length: 4\r\n"));
+
+    for (const u32 length : {1u, kMaxForwardResponseContentTypeLen}) {
+        const std::string value(length, 'a');
+        const Built bounded = build(origin("Content-Type: " + value + "\r\n"));
+        REQUIRE(bounded.ok);
+        CHECK(bounded.wire.find("Content-Type: " + value + "\r\n") != std::string::npos);
+    }
+    CHECK_FALSE(build(origin("Content-Type:\r\n")).ok);
+    CHECK_FALSE(build(origin("Content-Type: \t \t\r\n")).ok);
+    CHECK_FALSE(build(origin("Content-Type: " +
+                             std::string(kMaxForwardResponseContentTypeLen + 1u, 'a') + "\r\n"))
+                    .ok);
+    CHECK_FALSE(response_policy_safe_content_type({"a\x01z", 3}));
+    CHECK_FALSE(response_policy_safe_content_type({"a\x7fz", 3}));
+    std::string control = "Content-Type: a";
+    control.push_back(static_cast<char>(0x01));
+    control += "z\r\n";
+    std::string del = "Content-Type: a";
+    del.push_back(static_cast<char>(0x7f));
+    del += "z\r\n";
+    CHECK_FALSE(build(origin(control)).ok);
+    CHECK_FALSE(build(origin(del)).ok);
+    CHECK_FALSE(build(origin("Content-Type: text/plain\r\ncontent-TYPE: text/html\r\n")).ok);
+
+    const Built hidden = build(origin("Content-Type: text/plain\r\n"), true);
+    REQUIRE(hidden.ok);
+    CHECK_EQ(hidden.wire, absent.wire);
+    CHECK_FALSE(build(origin("Content-Type:\r\n"), true).ok);
+    CHECK_FALSE(build(origin(control), true).ok);
+    CHECK_FALSE(build(origin("Content-Type: text/plain\r\nCONTENT-TYPE: text/html\r\n"), true).ok);
+
+    for (const char* forbidden : {"Last-Modified: yesterday\r\n",
+                                  "Location: /elsewhere\r\n",
+                                  "Refresh: 1\r\n",
+                                  "X-Accel-Buffering: no\r\n",
+                                  "Transfer-Encoding: chunked\r\n"})
+        CHECK_FALSE(build(origin(forbidden)).ok);
+
+    const u32 exact_capacity = static_cast<u32>(mixed.wire.size());
+    REQUIRE_GT(exact_capacity, 1u);
+    CHECK(build(origin("Content-Type: text/plain\r\n"), false, exact_capacity).ok);
+    CHECK_FALSE(build(origin("Content-Type: text/plain\r\n"), false, exact_capacity - 1u).ok);
+}
+
+TEST(response_buffering_runtime,
+     complete_content_length_content_type_pinning_rejects_owned_and_origin_forgery) {
+    enum class Mutation : u8 {
+        None,
+        PinnedName,
+        PinnedValue,
+        PinnedDuplicate,
+        PinnedOversized,
+        HiddenNone,
+        HiddenPinnedPresent,
+    };
+    for (const Mutation mutation : {Mutation::None,
+                                    Mutation::PinnedName,
+                                    Mutation::PinnedValue,
+                                    Mutation::PinnedDuplicate,
+                                    Mutation::PinnedOversized,
+                                    Mutation::HiddenNone,
+                                    Mutation::HiddenPinnedPresent}) {
+        const bool hidden =
+            mutation == Mutation::HiddenNone || mutation == Mutation::HiddenPinnedPresent;
+        std::string value = mutation == Mutation::PinnedOversized
+                                ? std::string(kMaxForwardResponseContentTypeLen, 'a')
+                                : std::string("text/plain");
+        const std::string origin =
+            "HTTP/1.1 201 Created\r\nContent-Type: " + value + "\r\nContent-Length: 4\r\n\r\nabcd";
+        RouteConfig config{};
+        ForwardResponsePolicySpec policy{};
+        policy.version = ResponsePolicyVersion::Http11;
+        policy.framing = ResponsePolicyFraming::ContentLength;
+        policy.connection = ResponsePolicyConnection::Request;
+        policy.date = ResponsePolicyDate::Current;
+        policy.head_mode = ResponsePolicyHeadMode::Reject;
+        policy.server = {"rut-get-timeout", 15};
+        if (hidden) {
+            policy.hide_headers[0] = {"CONTENT-type", 12};
+            policy.hide_header_count = 1;
+        }
+        REQUIRE_EQ(config.add_response_policy(policy), 1u);
+        u8 upstream[SlicePool::kSliceSize]{};
+        u8 pinned[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn.response_header_slice = pinned;
+        conn.response_header_buf.bind(pinned, sizeof(pinned));
+        conn.request_config = &config;
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = false;
+        conn.response_read_deadline_upload.downstream_close = true;
+        conn.resp_status = 201;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(origin.data()),
+                                                static_cast<u32>(origin.size())),
+                   origin.size());
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(
+            parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &response),
+            ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(conn, config, response));
+        std::string forged(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                           conn.response_header_buf.len());
+        const std::string canonical = "Content-Type: " + value + "\r\n";
+        if (mutation == Mutation::PinnedName) {
+            const size_t at = forged.find(canonical);
+            REQUIRE_NE(at, std::string::npos);
+            forged[at] = 'c';
+        } else if (mutation == Mutation::PinnedValue) {
+            const size_t at = forged.find(canonical);
+            REQUIRE_NE(at, std::string::npos);
+            forged[at + sizeof("Content-Type: ") - 1u] = static_cast<char>(0x7f);
+        } else if (mutation == Mutation::PinnedDuplicate) {
+            const size_t at = forged.rfind("\r\n");
+            REQUIRE_NE(at, std::string::npos);
+            forged.insert(at, "Content-Type: text/html\r\n");
+        } else if (mutation == Mutation::PinnedOversized) {
+            const size_t at = forged.find(canonical);
+            REQUIRE_NE(at, std::string::npos);
+            forged.insert(at + sizeof("Content-Type: ") - 1u + value.size(), "a");
+        } else if (mutation == Mutation::HiddenPinnedPresent) {
+            const size_t at = forged.find("Content-Length:");
+            REQUIRE_NE(at, std::string::npos);
+            forged.insert(at, "Content-Type: text/plain\r\n");
+        }
+        if (mutation != Mutation::None) {
+            conn.response_header_buf.reset();
+            REQUIRE_EQ(conn.response_header_buf.write(reinterpret_cast<const u8*>(forged.data()),
+                                                      static_cast<u32>(forged.size())),
+                       forged.size());
+        }
+        CHECK_EQ(complete_content_length_raw_origin_matches_pinned(
+                     conn, parser.header_end, response.content_length),
+                 mutation == Mutation::None || mutation == Mutation::HiddenNone);
+    }
+
+    for (const std::string& invalid_origin :
+         {std::string("HTTP/1.1 201 Created\r\nContent-Type:\r\nContent-Length: 4\r\n\r\nabcd"),
+          std::string("HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\ncontent-type: "
+                      "text/html\r\nContent-Length: 4\r\n\r\nabcd"),
+          std::string("HTTP/1.1 201 Created\r\nContent-Type: ") +
+              std::string(kMaxForwardResponseContentTypeLen + 1u, 'a') +
+              "\r\nContent-Length: 4\r\n\r\nabcd"}) {
+        RouteConfig config{};
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::CompleteContentLength));
-        PrebuiltD2Fixture fixture{};
-        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
-        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
-        Connection& conn = *fixture.conn;
-        static constexpr u8 kFirst[] =
-            "HTTP/1.1 201 Created\r\nX-Origin: kept\r\nContent-Length: 4\r\n\r\nab";
-        static constexpr u8 kLast[] = {'c', 'd'};
-        const u32 first_len = sizeof(kFirst) - 1u;
-        REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, first_len), first_len);
-        if (!fragmented)
-            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
-        const u32 admitted_len = conn.upstream_recv_buf.len();
-        const IoEvent first = response_read_copy_event(conn, admitted_len, true, 0, admitted_len);
-        loop->dispatch_batch(&first, 1);
-        REQUIRE_GE(conn.fd, 0);
-        CHECK_EQ(conn.resp_status, 201u);
-        CHECK(buf_has(conn.response_header_buf.data(),
-                      conn.response_header_buf.len(),
-                      "HTTP/1.1 201 Created\r\n"));
-        CHECK(buf_has(
-            conn.response_header_buf.data(), conn.response_header_buf.len(), "X-Origin: kept\r\n"));
-        CHECK_EQ(conn.response_read_deadline_post_commit_phase,
-                 fragmented ? ResponseReadDeadlinePostCommitPhase::Buffering
-                            : ResponseReadDeadlinePostCommitPhase::HeaderSend);
-        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        u8 pinned[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.response_header_slice = pinned;
+        conn.response_header_buf.bind(pinned, sizeof(pinned));
+        conn.response_policy_id = 1;
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(invalid_origin.data()),
+                                static_cast<u32>(invalid_origin.size()),
+                                &response),
+                   ParseStatus::Complete);
+        CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    }
+}
 
-        if (fragmented) {
-            const u32 begin = conn.upstream_recv_buf.len();
-            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
-            const IoEvent last = response_read_copy_event(
-                conn, sizeof(kLast), true, begin, conn.upstream_recv_buf.len());
-            loop->dispatch_batch(&last, 1);
-            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
-                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+TEST(response_buffering_runtime,
+     bounded_content_type_200_and_201_complete_and_fragmented_preserve_wire_and_access) {
+    struct StatusVector {
+        u16 status;
+        const char* status_line;
+    };
+    static constexpr StatusVector kStatuses[] = {{200, "HTTP/1.1 200 OK\r\n"},
+                                                 {201, "HTTP/1.1 201 Created\r\n"}};
+    for (const StatusVector& status : kStatuses) {
+        for (const bool fragmented : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            AccessLogRing access_log{};
+            access_log.init();
+            loop->access_log = &access_log;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+                config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            Connection& conn = *fixture.conn;
+            const std::string first_bytes = std::string(status.status_line) +
+                                            "cOnTeNt-TyPe:\t text/plain \t\r\nX-Origin: kept\r\n"
+                                            "Content-Length: 4\r\n\r\nab";
+            static constexpr u8 kLast[] = {'c', 'd'};
+            const u32 first_len = static_cast<u32>(first_bytes.size());
+            REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(first_bytes.data()),
+                                                    first_len),
+                       first_len);
+            if (!fragmented)
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+            const u32 admitted_len = conn.upstream_recv_buf.len();
+            const IoEvent first =
+                response_read_copy_event(conn, admitted_len, true, 0, admitted_len);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.resp_status, status.status);
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          status.status_line));
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "X-Origin: kept\r\n"));
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "Content-Type: text/plain\r\n"));
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     fragmented ? ResponseReadDeadlinePostCommitPhase::Buffering
+                                : ResponseReadDeadlinePostCommitPhase::HeaderSend);
             REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            const u32 raw_header_end = first_len - 2u;
+            REQUIRE_GT(raw_header_end, 0u);
+            __builtin_memset(conn.upstream_recv_slice, 0xa5, raw_header_end);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+            if (fragmented) {
+                const u32 begin = conn.upstream_recv_buf.len();
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+                const IoEvent last = response_read_copy_event(
+                    conn, sizeof(kLast), true, begin, conn.upstream_recv_buf.len());
+                loop->dispatch_batch(&last, 1);
+                REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                           ResponseReadDeadlinePostCommitPhase::HeaderSend);
+                REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            }
+            CHECK_EQ(conn.resp_status, status.status);
+            const u32 expected_response_size = conn.response_header_buf.len() + 4u;
+            IoEvent header = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::BodySend);
+            CHECK_EQ(conn.resp_status, status.status);
+            CHECK_EQ(conn.response_read_deadline_send_len, 4u);
+            CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
+            IoEvent body = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&body, 1);
+            REQUIRE(conn.upstream_retirement_active);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK_EQ(conn.resp_status, status.status);
+            AccessLogEntry access{};
+            REQUIRE(access_log.pop(access));
+            CHECK_EQ(access.status, status.status);
+            CHECK_EQ(access.resp_size, expected_response_size);
+            AccessLogEntry extra{};
+            CHECK_FALSE(access_log.pop(extra));
+            cleanup_prebuilt_d2(loop, fixture);
         }
-        CHECK_EQ(conn.resp_status, 201u);
-        const u32 expected_response_size = conn.response_header_buf.len() + 4u;
-        IoEvent header = exact_response_deadline_send_event(loop, conn);
-        loop->dispatch_batch(&header, 1);
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
-                   ResponseReadDeadlinePostCommitPhase::BodySend);
-        CHECK_EQ(conn.resp_status, 201u);
-        CHECK_EQ(conn.response_read_deadline_send_len, 4u);
-        CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
-        IoEvent body = exact_response_deadline_send_event(loop, conn);
-        loop->dispatch_batch(&body, 1);
-        REQUIRE(conn.upstream_retirement_active);
-        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
-        REQUIRE(conn.http1_boundary_ready);
-        loop->resume_deferred_http1_boundaries();
-        CHECK_EQ(conn.state, ConnState::ReadingHeader);
-        CHECK_EQ(conn.resp_status, 201u);
-        AccessLogEntry access{};
-        REQUIRE(access_log.pop(access));
-        CHECK_EQ(access.status, 201u);
-        CHECK_EQ(access.resp_size, expected_response_size);
-        AccessLogEntry extra{};
-        CHECK_FALSE(access_log.pop(extra));
-        cleanup_prebuilt_d2(loop, fixture);
     }
 }
 

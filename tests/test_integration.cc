@@ -30906,18 +30906,21 @@ TEST(route, public_ordinary_source_deadline_complete_buffering_preserves_bounded
         "HTTP/1.1 201 Created\r\n"
         "Server: origin\r\n"
         "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Type: text/plain\r\n"
         "X-Origin: fallback\r\n"
         "Content-Length: 8\r\n"
         "Connection: close\r\n\r\n"
         "fallback";
     static constexpr char kExpected[] =
         "HTTP/1.1 201 Created\r\n"
-        "Server: buffered-test\r\n"
+        "Server: nginx/1.29.7\r\n"
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
         "Content-Length: 8\r\n"
         "Connection: close\r\n"
         "X-Origin: fallback\r\n\r\n"
         "fallback";
+    static_assert(sizeof(kExpected) - 1u == 175u);
     RecordingUpstream backend;
     backend.response = kOrigin;
     backend.response_len = sizeof(kOrigin) - 1u;
@@ -30931,7 +30934,7 @@ route GET "/buffered" {
     request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
       strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
     response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "buffered-test",
+      connection: "request", head_mode: "reject", server: "nginx/1.29.7",
       date: "current", hide_headers: ["Date", "Server"] },
     failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
       content_type: "text/plain", server: "buffered-test", date: "current",
@@ -30988,7 +30991,7 @@ route GET "/buffered" {
              ForwardResponseBufferingMode::CompleteContentLength);
     REQUIRE_EQ(program.config.response_policy_count, 1u);
     const auto& owned_response_policy = program.config.response_policies[0];
-    CHECK(owned_response_policy.server.eq({"buffered-test", 13}));
+    CHECK(owned_response_policy.server.eq({"nginx/1.29.7", 12}));
     CHECK_NE(owned_response_policy.server.ptr, program.rir.module.response_policies[0].server.ptr);
     const uintptr_t policy_begin =
         reinterpret_cast<uintptr_t>(program.config.response_policy_bytes);
@@ -31133,7 +31136,7 @@ route GET "/buffered" {
 
     CHECK_EQ(shard.route_config, &program.config);
     CHECK_EQ(shard.active_config, &program.config);
-    CHECK(program.config.response_policies[0].server.eq({"buffered-test", 13}));
+    CHECK(program.config.response_policies[0].server.eq({"nginx/1.29.7", 12}));
 }
 
 TEST(

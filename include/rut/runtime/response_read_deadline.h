@@ -57,6 +57,33 @@ inline bool complete_content_length_response_status_is_admitted(u16 status) {
     return status == 200 || status == 201;
 }
 
+struct CompleteContentLengthContentTypeView {
+    u32 count = 0;
+    Str value{};
+};
+
+inline bool complete_content_length_content_type_view(const ParsedResponse& response,
+                                                      bool require_canonical,
+                                                      CompleteContentLengthContentTypeView* out) {
+    if (out == nullptr) return false;
+    *out = {};
+    static constexpr char kName[] = "Content-Type";
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const Header& header = response.headers[i];
+        if (!http_header_name_eq_ci(header.name.ptr, header.name.len, kName, sizeof(kName) - 1u))
+            continue;
+        if (++out->count > 1 || !response_policy_safe_content_type(header.value)) return false;
+        if (require_canonical &&
+            (header.name.len != sizeof(kName) - 1u ||
+             __builtin_memcmp(header.name.ptr, kName, sizeof(kName) - 1u) != 0 ||
+             header.raw_value.len != header.value.len + 1u || header.raw_value.ptr[0] != ' ' ||
+             __builtin_memcmp(header.raw_value.ptr + 1, header.value.ptr, header.value.len) != 0))
+            return false;
+        out->value = header.value;
+    }
+    return true;
+}
+
 inline bool complete_content_length_pinned_header_matches(const Connection& c, u32 declared_body) {
     if (c.request_config == nullptr ||
         !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
@@ -74,6 +101,11 @@ inline bool complete_content_length_pinned_header_matches(const Connection& c, u
         parsed.headers_truncated || parsed.content_length != declared_body)
         return false;
     const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    CompleteContentLengthContentTypeView content_type{};
+    if (!complete_content_length_content_type_view(parsed, true, &content_type)) return false;
+    static constexpr Str kContentTypeName{"Content-Type", 12};
+    if (response_policy_hides_header(policy, kContentTypeName) && content_type.count != 0)
+        return false;
     u32 server_count = 0;
     u32 connection_count = 0;
     for (u32 i = 0; i < parsed.header_count; ++i) {
@@ -132,7 +164,21 @@ inline bool complete_content_length_raw_origin_matches_pinned(const Connection& 
         (raw.reason.len != 0 &&
          __builtin_memcmp(raw.reason.ptr, pinned.reason.ptr, raw.reason.len) != 0))
         return false;
-    return true;
+    CompleteContentLengthContentTypeView raw_content_type{};
+    CompleteContentLengthContentTypeView pinned_content_type{};
+    if (!complete_content_length_content_type_view(raw, false, &raw_content_type) ||
+        !complete_content_length_content_type_view(pinned, true, &pinned_content_type))
+        return false;
+    const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    static constexpr Str kContentTypeName{"Content-Type", 12};
+    if (response_policy_hides_header(policy, kContentTypeName))
+        return pinned_content_type.count == 0;
+    if (raw_content_type.count != pinned_content_type.count) return false;
+    return raw_content_type.count == 0 ||
+           (raw_content_type.value.len == pinned_content_type.value.len &&
+            __builtin_memcmp(raw_content_type.value.ptr,
+                             pinned_content_type.value.ptr,
+                             raw_content_type.value.len) == 0);
 }
 
 inline bool complete_content_length_pinned_header_is_stable(const Connection& c) {

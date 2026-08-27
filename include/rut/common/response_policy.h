@@ -13,6 +13,7 @@ static constexpr u32 kMaxResponsePolicies = 16;
 static constexpr u32 kMaxResponsePolicyHideHeaders = 8;
 static constexpr u32 kMaxResponsePolicyHeaderNameLen = 64;
 static constexpr u32 kMaxResponsePolicyServerLen = 64;
+static constexpr u32 kMaxForwardResponseContentTypeLen = 128;
 
 enum class ResponsePolicyVersion : u8 {
     Invalid = 0,
@@ -63,6 +64,22 @@ inline bool response_policy_safe_header_name(Str value) {
         if (!is_http_tchar(static_cast<u8>(value.ptr[i]))) return false;
     }
     return true;
+}
+
+inline bool response_policy_safe_content_type(Str value) {
+    static constexpr char kName[] = "Content-Type";
+    return value.ptr != nullptr && value.len != 0 &&
+           value.len <= kMaxForwardResponseContentTypeLen &&
+           validate_response_header(kName, sizeof(kName) - 1u, value.ptr, value.len) ==
+               HttpHeaderValidation::Ok;
+}
+
+inline bool response_policy_hides_header(const ForwardResponsePolicySpec& policy, Str name) {
+    for (u32 i = 0; i < policy.hide_header_count; i++) {
+        const Str hidden = policy.hide_headers[i];
+        if (http_header_name_eq_ci(hidden.ptr, hidden.len, name.ptr, name.len)) return true;
+    }
+    return false;
 }
 
 inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) {
