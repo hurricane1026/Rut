@@ -5294,6 +5294,11 @@ static bool run_pinned_api_non_root_proxy_uri_oracle(
 
 struct BoundedExactLocalPathOracleObservation {
     std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> local_history;
     std::vector<std::vector<char>> forward_history;
@@ -5338,7 +5343,9 @@ static bool capture_pinned_bounded_exact_local_path_order(
     bool exact_first,
     bool no_content_return204,
     BoundedExactLocalPathOracleObservation& observation,
-    std::string& error) {
+    std::string& error,
+    int* frontend_reservation = nullptr,
+    int* backend_reservation = nullptr) {
     static constexpr const char* kTargets[] = {
         "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
     static constexpr bool kLocal[] = {true, true, false, false, false};
@@ -5372,6 +5379,11 @@ static bool capture_pinned_bounded_exact_local_path_order(
 
     observation = BoundedExactLocalPathOracleObservation{};
     observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.access_path = no_content_return204 ? temp.nginx_access_log : temp.nginx_log;
+    observation.process_identity = container_name;
     observation.wires.resize(5);
     const std::string issue = no_content_return204 ? "#328" : "#318";
     const std::string access_prefix =
@@ -5503,6 +5515,10 @@ static bool capture_pinned_bounded_exact_local_path_order(
 
     Recorder local_recorder;
     local_recorder.observe_extra_requests_until_stop = true;
+    if (backend_reservation != nullptr && *backend_reservation >= 0) {
+        close(*backend_reservation);
+        *backend_reservation = -1;
+    }
     if (!local_recorder.setup(backend_port)) {
         error = "failed to start " + issue + " local zero-upstream recorder";
         return false;
@@ -5523,6 +5539,10 @@ static bool capture_pinned_bounded_exact_local_path_order(
         docker_args.push_back(std::string(temp.path) + ":" + std::string(temp.path));
     }
     docker_args.insert(docker_args.end(), {kNginxImage, "nginx", "-g", "daemon off;"});
+    if (frontend_reservation != nullptr && *frontend_reservation >= 0) {
+        close(*frontend_reservation);
+        *frontend_reservation = -1;
+    }
     if (!spawn_child(docker_args, temp.nginx_log, nginx.child)) {
         error = "failed to start pinned nginx for " + issue + " oracle";
         return false;
@@ -7820,6 +7840,883 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
         }
     }
     return true;
+}
+
+static std::string make_bounded_no_content_path_fragment(u16 frontend_port,
+                                                         u16 backend_port,
+                                                         bool exact_first) {
+    const std::string exact_location = "  location = /healthz { return 204; }\n";
+    const std::string root_location =
+        "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) + ";\n" +
+           (exact_first ? exact_location + root_location : root_location + exact_location) + "}\n";
+}
+
+static size_t count_text(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return 0u;
+    size_t count = 0u;
+    for (size_t offset = 0u;;) {
+        offset = text.find(needle, offset);
+        if (offset == std::string::npos) return count;
+        count++;
+        offset += needle.size();
+    }
+}
+
+static bool validate_bounded_no_content_generated_source(const std::string& source,
+                                                         u16 frontend_port,
+                                                         u16 backend_port,
+                                                         std::string& error) {
+    const std::string exact_tuple =
+        "route exact GET \"/healthz\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+        "\"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    const std::string backend =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    if (count_text(source, exact_tuple) != 1u ||
+        count_text(source, "route exact GET \"/healthz\"") != 1u ||
+        count_text(source, "route HEAD \"/\" {") != 1u ||
+        count_text(source, "route GET \"/\" {") != 1u ||
+        count_text(source, "route \"/\" {") != 1u ||
+        count_text(source, "return forward(nginx_upstream") != 3u ||
+        count_text(source, backend) != 1u || count_text(source, listener) != 1u ||
+        source.find("?x=1") != std::string::npos ||
+        source.find("healthz-return204.example") != std::string::npos ||
+        source.find("query-return204.example") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("propagat") != std::string::npos ||
+        source.find("NoContent204") != std::string::npos ||
+        source.find("strict_local_response") != std::string::npos ||
+        source.find("profile") != std::string::npos ||
+        source.find("return 204") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos) {
+        error =
+            "#328 generated source was not one public /healthz NoContent204 tuple plus the "
+            "canonical ordinary root-forward route set";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_bounded_no_content_rut_access_log(const std::string& contents,
+                                                    const size_t request_sizes[5],
+                                                    std::string& error) {
+    static constexpr const char* kTargets[] = {
+        "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(
+            contents, 5u, "converter-generated #328 access log", records, error))
+        return false;
+    for (size_t i = 0u; i < 5u; i++) {
+        std::vector<std::string> fields;
+        const size_t expected_fields = i < 2u ? 9u : 11u;
+        const size_t expected_status = i < 2u ? 204u : 200u;
+        const size_t expected_response = i < 2u ? 105u : 118u;
+        if (!split_space_fields(records[i], fields) || fields.size() != expected_fields ||
+            !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != kTargets[i] ||
+            fields[3] != std::to_string(expected_status) ||
+            !decimal_field_equals(fields[3], expected_status) || !exact_log_duration(fields[4]) ||
+            fields[5] != std::to_string(request_sizes[i]) ||
+            !decimal_field_equals(fields[5], request_sizes[i]) ||
+            fields[6] != std::to_string(expected_response) ||
+            !decimal_field_equals(fields[6], expected_response) || fields[7] != "127.0.0.1" ||
+            (i < 2u && fields[8] != "s=0") ||
+            (i >= 2u && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) ||
+                         fields[10] != "s=0"))) {
+            error = "converter-generated #328 access record " + std::to_string(i + 1u) +
+                    " lost target/order/status/size/outcome: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool canonicalize_unique_port(std::string& source,
+                                     const std::string& needle,
+                                     const char* replacement) {
+    const size_t offset = source.find(needle);
+    if (offset == std::string::npos ||
+        source.find(needle, offset + needle.size()) != std::string::npos)
+        return false;
+    source.replace(offset, needle.size(), replacement);
+    return true;
+}
+
+static bool run_bounded_no_content_differential_parser_self_checks(std::string& error) {
+    static constexpr size_t kSizes[] = {77u, 81u, 49u, 47u, 41u};
+    static constexpr const char* kTargets[] = {
+        "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
+    std::string access;
+    for (size_t i = 0u; i < 5u; i++) {
+        access += "2026-08-26T21:13:05.248Z GET " + std::string(kTargets[i]) + " " +
+                  (i < 2u ? "204" : "200") + " 361us " + std::to_string(kSizes[i]) + " " +
+                  (i < 2u ? "105" : "118") + " 127.0.0.1" +
+                  (i < 2u ? " s=0\n" : " nginx_upstream 243us s=0\n");
+    }
+    const auto rejects_access = [&](const std::string& value) {
+        std::string detail;
+        return !parse_bounded_no_content_rut_access_log(value, kSizes, detail);
+    };
+    const auto replace = [](std::string value, const std::string& from, const std::string& to) {
+        const size_t offset = value.find(from);
+        if (offset == std::string::npos) return std::string{};
+        value.replace(offset, from.size(), to);
+        return value;
+    };
+    std::string swapped = access;
+    const size_t first = swapped.find('\n');
+    const size_t second = swapped.find('\n', first + 1u);
+    swapped.replace(
+        0u, second + 1u, access.substr(first + 1u, second - first) + access.substr(0u, first + 1u));
+    if (!parse_bounded_no_content_rut_access_log(access, kSizes, error) ||
+        !rejects_access(access + access.substr(0u, first + 1u)) ||
+        !rejects_access(access.substr(0u, access.size() - 1u)) || !rejects_access(swapped) ||
+        !rejects_access(replace(access, " 204 ", " 200 ")) ||
+        !rejects_access(replace(access, " 105 ", " 106 ")) ||
+        !rejects_access(replace(access, " /healthz/ ", " /healthz ")) ||
+        !rejects_access(replace(access, " 77 105 ", " 999999999999999999999999999999999 105 ")) ||
+        !rejects_access(replace(access, " 204 ", " 0204 ")) ||
+        !rejects_access(replace(access, " nginx_upstream ", " other_upstream ")) ||
+        !rejects_access(
+            replace(access, " nginx_upstream 243us ", " nginx_upstream not-a-duration ")) ||
+        !rejects_access(replace(access, " s=0\n", " extra s=0\n")) ||
+        !rejects_access(replace(access, " s=0\n", " s=1\n"))) {
+        error = "#328 generated access parser mutation self-check failed";
+        return false;
+    }
+
+    std::string source = make_bounded_no_content_path_fragment(54320u, 54321u, true);
+    const auto parsed = rut::nginx::parse({source.data(), static_cast<u32>(source.size())});
+    if (!parsed) {
+        error = "#328 source self-check fixture did not parse";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) {
+        error = "#328 source self-check fixture did not lower";
+        return false;
+    }
+    const rut::Str view = lowered.value().view();
+    const std::string canonical(view.ptr, view.len);
+    const auto rejects_source = [&](std::string value) {
+        std::string detail;
+        return !validate_bounded_no_content_generated_source(value, 54320u, 54321u, detail);
+    };
+    if (!validate_bounded_no_content_generated_source(canonical, 54320u, 54321u, error) ||
+        !rejects_source(canonical + "route exact GET \"/healthz?x=1\" { return response() }\n") ||
+        !rejects_source(canonical + "if host == \"healthz-return204.example\" {}\n") ||
+        !rejects_source(replace(canonical, "status: 204", "status: 200"))) {
+        error = "#328 generated source mutation self-check failed";
+        return false;
+    }
+    std::string normalized = canonical;
+    if (!canonicalize_unique_port(normalized, "listen :54320", "listen :FRONTEND") ||
+        !canonicalize_unique_port(normalized, "127.0.0.1:54321", "127.0.0.1:BACKEND")) {
+        error = "#328 source port normalization valid self-check failed";
+        return false;
+    }
+    std::string missing = canonical;
+    missing.erase(missing.find("listen :54320"), strlen("listen :54320"));
+    std::string duplicate = canonical + "listen :54320\n";
+    if (canonicalize_unique_port(missing, "listen :54320", "listen :FRONTEND") ||
+        canonicalize_unique_port(duplicate, "listen :54320", "listen :FRONTEND")) {
+        error = "#328 missing/duplicate port normalization mutation was accepted";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_generated_bounded_no_content_path_order(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool exact_first,
+    BoundedExactLocalPathOracleObservation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    static constexpr const char* kTargets[] = {
+        "/healthz", "/healthz?x=1", "/healthz/", "/health", "/"};
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "converter-generated #328 differential requires an executable absolute RUT path";
+        return false;
+    }
+    std::string fragment =
+        make_bounded_no_content_path_fragment(frontend_port, backend_port, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#328 accepted nginx fragment did not traverse the independent parser";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& root = server.location;
+    const auto& proxy = root.proxy_pass;
+    const auto& exact = server.exact_no_content_return;
+    const auto& response = exact.response;
+    const size_t root_location = fragment.find("location / {");
+    const size_t root_path = fragment.find('/', root_location);
+    const size_t exact_location = fragment.find("location = /healthz");
+    const size_t exact_path = fragment.find("/healthz", exact_location);
+    const size_t return_offset = fragment.find("return", exact_location);
+    const size_t status_offset = fragment.find("204", return_offset);
+    const size_t semicolon = fragment.find(';', status_offset);
+    const size_t exact_end = fragment.find('}', semicolon);
+    const uintptr_t source_base = reinterpret_cast<uintptr_t>(fragment.data());
+    const auto same_source = [&](rut::Str value, rut::Span span) {
+        return value.ptr != nullptr && span.end >= span.start &&
+               span.end - span.start == value.len &&
+               reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+    };
+    if (root_location == std::string::npos || root_path == std::string::npos ||
+        exact_location == std::string::npos || exact_path == std::string::npos ||
+        return_offset == std::string::npos || status_offset == std::string::npos ||
+        semicolon == std::string::npos || exact_end == std::string::npos ||
+        server.span.start != 0u || server.span.end != fragment.size() - 1u ||
+        server.listen.port != frontend_port || !root.path.eq(rut::lit_str("/")) ||
+        root.path.ptr != fragment.data() + root_path || !same_source(root.path, root.path_span) ||
+        proxy.has_uri || proxy.address[0] != 127u || proxy.address[1] != 0u ||
+        proxy.address[2] != 0u || proxy.address[3] != 1u || proxy.port != backend_port ||
+        !exact.present || !exact.path.eq(rut::lit_str("/healthz")) ||
+        exact.path.ptr != fragment.data() + exact_path ||
+        !same_source(exact.path, exact.path_span) || exact.span.start != exact_location ||
+        exact.span.end != exact_end + 1u || response.status != 204u ||
+        response.status_span.start != status_offset ||
+        response.status_span.end != status_offset + 3u || response.span.start != return_offset ||
+        response.span.end != semicolon + 1u ||
+        memcmp(fragment.data() + response.status_span.start, "204", 3u) != 0 ||
+        server.exact_local_return.present || server.exact_absolute_redirect.present ||
+        exact.span.start >= exact.path_span.start || exact.path_span.end > response.span.start ||
+        response.span.end >= exact.span.end || root.span.start != root_location) {
+        error = "#328 fragment lost borrowed /healthz path/status provenance or root fallback";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        error = "#328 genuine bounded no-content model failed public ordinary-RUT lowering";
+        return false;
+    }
+    const rut::Str output = lowered.value().view();
+    generated_source.assign(output.ptr, output.len);
+    if (!validate_bounded_no_content_generated_source(
+            generated_source, frontend_port, backend_port, error) ||
+        !write_file(temp.source, output.ptr, output.len))
+        return false;
+    std::fill(fragment.begin(), fragment.end(), '\0');
+    if (!std::all_of(fragment.begin(), fragment.end(), [](char byte) { return byte == '\0'; })) {
+        error = "#328 failed to destroy borrowed nginx fragment after parse/lower";
+        return false;
+    }
+
+    observation = BoundedExactLocalPathOracleObservation{};
+    observation.order = exact_first ? "generated-exact-before-root" : "generated-root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity =
+        std::string(rut_path) + " " + temp.source + " listen:" + std::to_string(frontend_port);
+    observation.wires.resize(5u);
+    std::string requests[5];
+    size_t request_sizes[5]{};
+    for (size_t i = 0u; i < 5u; i++) {
+        requests[i] = std::string("GET ") + kTargets[i] +
+                      " HTTP/1.1\r\nHost: healthz-return204.example\r\nConnection: close\r\n\r\n";
+        request_sizes[i] = requests[i].size();
+        const size_t header = requests[i].find("\r\n\r\n");
+        if (requests[i].rfind(std::string("GET ") + kTargets[i] + " HTTP/1.1\r\n", 0u) != 0u ||
+            requests[i].find('#') != std::string::npos ||
+            requests[i].find("\r\nContent-Length:") != std::string::npos ||
+            requests[i].find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests[i].find("\r\nTE:") != std::string::npos ||
+            requests[i].find("\r\nExpect:") != std::string::npos ||
+            requests[i].find("\r\nUpgrade:") != std::string::npos || header == std::string::npos ||
+            header + 4u != requests[i].size()) {
+            error = "#328 generated request escaped the bounded fresh bodyless H1.1 domain";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* value = nullptr;
+        ~RecorderGuard() {
+            if (value != nullptr) value->stop();
+        }
+    };
+    ChildGuard runtime;
+    if (frontend_reservation != nullptr && *frontend_reservation >= 0) {
+        close(*frontend_reservation);
+        *frontend_reservation = -1;
+    }
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "failed to start converter-generated public RUT for #328";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "converter-generated #328 RUT exited before load/io_uring/listener readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "converter-generated #328 RUT lacked exact public readiness evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "destroyed-after-328-public-load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "failed to overwrite #328 generated source after public load";
+        return false;
+    }
+    std::string destroyed;
+    if (!read_exact_return204_log(
+            temp.source, "#328 destroyed generated source", destroyed, error) ||
+        destroyed != kDestroyed) {
+        error = "#328 generated source overwrite was not exact before behavioral requests";
+        return false;
+    }
+
+    const auto wait_live = [&](Recorder& recorder, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(runtime.child) || !recorder.running.load(std::memory_order_acquire) ||
+                recorder.listener_failed.load(std::memory_order_acquire)) {
+                error = std::string("#328 RUT/recorder failed before ") + phase + " readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#328 recorder readiness timed out: ") + phase;
+        return false;
+    };
+    const auto observe = [&](Recorder& recorder,
+                             u32 expected,
+                             const char* phase,
+                             std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(runtime.child) || !recorder_live(recorder) ||
+                recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error = std::string("#328 unexpected process/upstream state during ") + phase;
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto request = [&](size_t index, const char* expected) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[index].data(), requests[index].size()) ||
+            !(index < 2u ? read_head_response(client.fd, observation.wires[index], detail)
+                         : read_response(client.fd, observation.wires[index], detail)) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(observation.wires[index], expected, detail)) {
+            error = std::string("#328 generated vector ") + kTargets[index] +
+                    " exact response/EOF failed: " + detail;
+            return false;
+        }
+        if (poll_child(runtime.child)) {
+            error = std::string("#328 generated RUT exited after vector ") + kTargets[index] +
+                    " (" + child_status_description(runtime.child) + ")";
+            return false;
+        }
+        return true;
+    };
+
+    Recorder zero;
+    RecorderGuard zero_guard{&zero};
+    zero.observe_extra_requests_until_stop = true;
+    if (backend_reservation != nullptr && *backend_reservation >= 0) {
+        close(*backend_reservation);
+        *backend_reservation = -1;
+    }
+    if (!zero.setup(backend_port)) {
+        error = "#328 generated local recorder could not bind its reserved backend port";
+        return false;
+    }
+    if (!wait_live(zero, "local") ||
+        !observe(zero, 0u, "pre-local zero window", std::chrono::milliseconds(250)))
+        return false;
+    for (size_t i = 0u; i < 2u; i++) {
+        if (!request(i, kExactLocalReturn204ResponseNormalized) ||
+            !observe(zero, 0u, "local vector zero window", std::chrono::milliseconds(250)))
+            return false;
+        const std::string text(observation.wires[i].begin(), observation.wires[i].end());
+        if (observation.wires[i].size() != 105u ||
+            header_end(observation.wires[i]) != observation.wires[i].size() ||
+            text.find("\r\nContent-Type:") != std::string::npos ||
+            text.find("\r\nContent-Length:") != std::string::npos ||
+            text.find("\r\nTransfer-Encoding:") != std::string::npos) {
+            error = "#328 generated strict 204 gained framing, representation, body, or tail";
+            return false;
+        }
+    }
+    if (!observe(zero, 0u, "post-local zero window", std::chrono::milliseconds(500))) return false;
+    zero.stop();
+    zero_guard.value = nullptr;
+    observation.local_accepts = zero.accepted.load(std::memory_order_acquire);
+    observation.local_requests = zero.requests.load(std::memory_order_acquire);
+    observation.local_sends = zero.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = zero.history;
+    if (zero.thread_alive.load(std::memory_order_acquire) ||
+        zero.listener_failed.load(std::memory_order_acquire) || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        zero.response_send_succeeded.load(std::memory_order_acquire) || !zero.history.empty() ||
+        !zero.request.empty()) {
+        error = "#328 generated local recorder did not settle at exact zero with empty history";
+        return false;
+    }
+
+    Recorder fallback;
+    RecorderGuard fallback_guard{&fallback};
+    fallback.observe_extra_requests_until_stop = true;
+    if (!fallback.setup(backend_port, 3u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#328 generated fallback recorder could not bind the released backend port";
+        return false;
+    }
+    if (!wait_live(fallback, "fallback") ||
+        !observe(fallback, 0u, "pre-fallback zero window", std::chrono::milliseconds(100)))
+        return false;
+    for (size_t i = 2u; i < 5u; i++) {
+        if (!request(i, kSuccessResponseNormalized)) return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const u32 expected = static_cast<u32>(i - 1u);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const u32 accepts = fallback.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = fallback.requests.load(std::memory_order_acquire);
+            const u32 sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+            if (poll_child(runtime.child) || !recorder_live(fallback) || accepts > expected ||
+                requests_seen > expected || sends > expected) {
+                error = "#328 generated fallback observed retry/extra request";
+                return false;
+            }
+            if (accepts == expected && requests_seen == expected && sends == expected) break;
+            usleep(1000);
+        }
+        if (fallback.accepted.load(std::memory_order_acquire) != expected ||
+            fallback.requests.load(std::memory_order_acquire) != expected ||
+            fallback.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+            error = "#328 generated fallback timed out awaiting the complete upstream triplet";
+            return false;
+        }
+        if (!observe(fallback, expected, "ordered fallback count", std::chrono::milliseconds(100)))
+            return false;
+    }
+    if (!observe(fallback, 3u, "no-fourth fallback window", std::chrono::milliseconds(500)) ||
+        !stop_child(runtime.child)) {
+        error = "#328 generated RUT did not survive through controlled shutdown";
+        return false;
+    }
+    fallback.stop();
+    fallback_guard.value = nullptr;
+    observation.forward_accepts = fallback.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = fallback.requests.load(std::memory_order_acquire);
+    observation.forward_sends = fallback.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = fallback.history;
+    if (fallback.thread_alive.load(std::memory_order_acquire) ||
+        fallback.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || !fallback.response_send_succeeded.load() ||
+        !fallback.response_clean_shutdown.load() || !fallback.response_connection_closed.load() ||
+        observation.forward_history.size() != 3u) {
+        error = "#328 generated fallback recorder lifecycle/count was incomplete";
+        return false;
+    }
+    for (size_t i = 2u; i < 5u; i++) request_sizes[i] = observation.forward_history[i - 2u].size();
+    for (size_t i = 0u; i < 5u; i++) observation.access_records[i] = 1u;
+    if (!validate_bounded_no_content_path_observation(observation, backend_port, error))
+        return false;
+
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(
+            temp.rut_access_log, "converter-generated #328 access log", access_contents, error) ||
+        !parse_bounded_no_content_rut_access_log(access_contents, request_sizes, error) ||
+        !read_exact_return204_log(
+            temp.rut_log, "converter-generated #328 runtime log", runtime_contents, error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
+        return false;
+    return true;
+}
+
+static std::vector<std::vector<char>> canonicalize_bounded_backend_history(
+    const std::vector<std::vector<char>>& history) {
+    std::vector<std::vector<char>> result = history;
+    for (std::vector<char>& request : result) {
+        std::string text(request.begin(), request.end());
+        static constexpr char kMarker[] = "\r\nHost: 127.0.0.1:";
+        const size_t begin = text.find(kMarker);
+        if (begin == std::string::npos ||
+            text.find(kMarker, begin + sizeof(kMarker) - 1u) != std::string::npos)
+            return {};
+        const size_t digits = begin + sizeof(kMarker) - 1u;
+        const size_t end = text.find("\r\n", digits);
+        if (end == std::string::npos || end == digits) return {};
+        for (size_t i = digits; i < end; i++)
+            if (text[i] < '0' || text[i] > '9') return {};
+        text.replace(digits, end - digits, "BACKEND");
+        request.assign(text.begin(), text.end());
+    }
+    return result;
+}
+
+static bool validate_bounded_no_content_four_way(
+    const BoundedExactLocalPathOracleObservation observations[4],
+    const std::string generated_sources[2],
+    const u16 ports[8],
+    std::string& error) {
+    for (size_t i = 0u; i < 8u; i++) {
+        if (ports[i] == 0u) {
+            error = "#328 four-way validator received a zero dynamic port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#328 four-way validator received duplicate dynamic ports";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!validate_bounded_no_content_path_observation(
+                observations[i], ports[i * 2u + 1u], error))
+            return false;
+        if (observations[i].temp_path.empty() || observations[i].config_path.empty() ||
+            observations[i].log_path.empty() || observations[i].access_path.empty() ||
+            observations[i].process_identity.empty()) {
+            error = "#328 one semantic side lacked complete resource identity";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (observations[i].temp_path == observations[j].temp_path ||
+                observations[i].config_path == observations[j].config_path ||
+                observations[i].log_path == observations[j].log_path ||
+                observations[i].access_path == observations[j].access_path ||
+                observations[i].process_identity == observations[j].process_identity ||
+                observations[i].wires.data() == observations[j].wires.data()) {
+                error = "#328 four semantic sides shared a process/resource identity";
+                return false;
+            }
+        }
+    }
+    std::string canonical[2] = {generated_sources[0], generated_sources[1]};
+    if (!canonicalize_unique_port(
+            canonical[0], "listen :" + std::to_string(ports[4]), "listen :FRONTEND") ||
+        !canonicalize_unique_port(
+            canonical[0], "127.0.0.1:" + std::to_string(ports[5]), "127.0.0.1:BACKEND") ||
+        !canonicalize_unique_port(
+            canonical[1], "listen :" + std::to_string(ports[6]), "listen :FRONTEND") ||
+        !canonicalize_unique_port(
+            canonical[1], "127.0.0.1:" + std::to_string(ports[7]), "127.0.0.1:BACKEND") ||
+        canonical[0] != canonical[1]) {
+        error = "#328 declaration order changed source or port normalization was not exact";
+        return false;
+    }
+    const auto expected_history =
+        canonicalize_bounded_backend_history(observations[0].forward_history);
+    if (expected_history.size() != 3u) {
+        error = "#328 could not canonicalize the exact three-request backend history";
+        return false;
+    }
+    for (size_t side = 0u; side < 4u; side++) {
+        if (canonicalize_bounded_backend_history(observations[side].forward_history) !=
+            expected_history) {
+            error = "#328 four sides differed in ordered port-canonicalized fallback history";
+            return false;
+        }
+    }
+    for (size_t vector = 0u; vector < 5u; vector++) {
+        std::vector<char> baseline = observations[0].wires[vector];
+        if (!normalize_date(baseline)) {
+            error = "#328 pinned baseline Date normalization failed";
+            return false;
+        }
+        for (size_t side = 1u; side < 4u; side++) {
+            std::vector<char> candidate = observations[side].wires[vector];
+            if (!normalize_date(candidate) || candidate != baseline) {
+                error = "#328 four-side Date-normalized wire mismatch at vector " +
+                        std::to_string(vector + 1u);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_bounded_no_content_four_way_self_checks(std::string& error) {
+    u16 ports[8] = {54310u, 54311u, 54312u, 54313u, 54314u, 54315u, 54316u, 54317u};
+    BoundedExactLocalPathOracleObservation values[4];
+    static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    for (size_t side = 0u; side < 4u; side++) {
+        values[side].order = std::to_string(side);
+        values[side].temp_path = "/tmp/328-" + std::to_string(side);
+        values[side].config_path = values[side].temp_path + "/config";
+        values[side].log_path = values[side].temp_path + "/log";
+        values[side].access_path = values[side].temp_path + "/access";
+        values[side].process_identity = "process-" + std::to_string(side);
+        for (size_t vector = 0u; vector < 5u; vector++) {
+            const char* expected =
+                vector < 2u ? kExactLocalReturn204ResponseNormalized : kSuccessResponseNormalized;
+            const size_t size = vector < 2u ? 105u : sizeof(kSuccessResponseNormalized) - 1u;
+            std::vector<char> wire(expected, expected + size);
+            const std::string marker(29u, 'X');
+            const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+            if (date != wire.end()) std::copy_n(kDate, 29u, date);
+            values[side].wires.push_back(std::move(wire));
+            values[side].access_records[vector] = 1u;
+        }
+        values[side].forward_accepts = 3u;
+        values[side].forward_requests = 3u;
+        values[side].forward_sends = 3u;
+        for (const char* target : {"/healthz/", "/health", "/"}) {
+            const std::string request =
+                std::string("GET ") + target +
+                " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[side * 2u + 1u]) +
+                "\r\n\r\n";
+            values[side].forward_history.emplace_back(request.begin(), request.end());
+        }
+    }
+    std::string sources[2];
+    for (size_t i = 0u; i < 2u; i++) {
+        std::string fragment =
+            make_bounded_no_content_path_fragment(ports[4u + i * 2u], ports[5u + i * 2u], i == 0u);
+        const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+        if (!parsed) return false;
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) return false;
+        const rut::Str view = lowered.value().view();
+        sources[i].assign(view.ptr, view.len);
+    }
+    if (!validate_bounded_no_content_four_way(values, sources, ports, error)) return false;
+    const auto rejects = [&](BoundedExactLocalPathOracleObservation mutated[4],
+                             std::string changed_sources[2],
+                             const char* name) {
+        std::string detail;
+        if (!validate_bounded_no_content_four_way(mutated, changed_sources, ports, detail))
+            return true;
+        error = std::string("#328 four-way mutation accepted: ") + name;
+        return false;
+    };
+    BoundedExactLocalPathOracleObservation mutated[4];
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    std::string changed[2] = {sources[0], sources[1]};
+    mutated[1].temp_path = mutated[0].temp_path;
+    if (!rejects(mutated, changed, "resource-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].config_path = mutated[0].config_path;
+    if (!rejects(mutated, changed, "source-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].log_path = mutated[0].log_path;
+    if (!rejects(mutated, changed, "log-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].access_path = mutated[0].access_path;
+    if (!rejects(mutated, changed, "access-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].process_identity = mutated[0].process_identity;
+    if (!rejects(mutated, changed, "process-alias")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].wires[0].back() = 'x';
+    if (!rejects(mutated, changed, "wire")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].wires[0][9] = '5';
+    if (!rejects(mutated, changed, "wire-status")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].access_records[0] = 0u;
+    if (!rejects(mutated, changed, "access-missing")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].access_records[0] = 2u;
+    if (!rejects(mutated, changed, "access-extra")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].local_requests = 1u;
+    if (!rejects(mutated, changed, "local-nonzero")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].local_history.push_back(mutated[3].forward_history[0]);
+    if (!rejects(mutated, changed, "local-history")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].forward_history.push_back(mutated[2].forward_history[0]);
+    if (!rejects(mutated, changed, "fourth/retry")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    changed[1] += "\n# source mismatch";
+    if (!rejects(mutated, changed, "source-mismatch")) return false;
+    changed[1] = sources[1];
+    u16 duplicate_ports[8];
+    std::copy(std::begin(ports), std::end(ports), std::begin(duplicate_ports));
+    duplicate_ports[7] = duplicate_ports[0];
+    std::string detail;
+    if (validate_bounded_no_content_four_way(values, sources, duplicate_ports, detail)) {
+        error = "#328 four-way duplicate-port mutation was accepted";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_bounded_no_content_path_differential(const std::string& container_prefix,
+                                                               const char* rut_path,
+                                                               std::string& error) {
+    struct ReservedPorts {
+        int fds[8];
+
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[8]{};
+    for (size_t i = 0u; i < 8u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#328 could not bind-reserve eight unique four-side ports";
+            return false;
+        }
+    }
+    TempDir temps[4];
+    for (TempDir& temp : temps) {
+        if (!temp.create()) {
+            error = "#328 could not create four independent temporary resource trees";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (strcmp(temps[i].path, temps[j].path) == 0 ||
+                temps[i].nginx_config == temps[j].nginx_config ||
+                temps[i].source == temps[j].source || temps[i].nginx_log == temps[j].nginx_log ||
+                temps[i].rut_log == temps[j].rut_log ||
+                temps[i].nginx_access_log == temps[j].nginx_access_log ||
+                temps[i].rut_access_log == temps[j].rut_access_log) {
+                error = "#328 four sides shared a temp/config/source/log/access identity";
+                return false;
+            }
+        }
+    }
+    BoundedExactLocalPathOracleObservation observations[4];
+    std::string sources[2];
+    const std::string containers[2] = {container_prefix + "-nginx-exact-first",
+                                       container_prefix + "-nginx-root-first"};
+    const auto failed_side = [&](const char* side) {
+        if (error.empty()) error = std::string("#328 ") + side + " side returned no diagnostic";
+        return false;
+    };
+    if (!capture_pinned_bounded_exact_local_path_order(ports[0],
+                                                       ports[1],
+                                                       temps[0],
+                                                       containers[0],
+                                                       true,
+                                                       true,
+                                                       observations[0],
+                                                       error,
+                                                       &reservations.fds[0],
+                                                       &reservations.fds[1]))
+        return failed_side("pinned exact-first");
+    if (!capture_pinned_bounded_exact_local_path_order(ports[2],
+                                                       ports[3],
+                                                       temps[1],
+                                                       containers[1],
+                                                       false,
+                                                       true,
+                                                       observations[1],
+                                                       error,
+                                                       &reservations.fds[2],
+                                                       &reservations.fds[3]))
+        return failed_side("pinned root-first");
+    if (!capture_generated_bounded_no_content_path_order(ports[4],
+                                                         ports[5],
+                                                         temps[2],
+                                                         rut_path,
+                                                         true,
+                                                         observations[2],
+                                                         sources[0],
+                                                         error,
+                                                         &reservations.fds[4],
+                                                         &reservations.fds[5]))
+        return failed_side("generated exact-first");
+    if (!capture_generated_bounded_no_content_path_order(ports[6],
+                                                         ports[7],
+                                                         temps[3],
+                                                         rut_path,
+                                                         false,
+                                                         observations[3],
+                                                         sources[1],
+                                                         error,
+                                                         &reservations.fds[6],
+                                                         &reservations.fds[7]))
+        return failed_side("generated root-first");
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string access_contents;
+        const std::string prefix = "rut-nginx-328-healthz-return204-" + observations[side].order +
+                                   "-" + std::to_string(getpid()) + "-scoped";
+        if (!read_exact_return204_log(temps[side].nginx_access_log,
+                                      "#328 differential pinned access log",
+                                      access_contents,
+                                      error) ||
+            !parse_bounded_no_content_path_access_log(
+                access_contents, prefix, ports[side * 2u + 1u], error))
+            return false;
+        for (u32& access : observations[side].access_records) access = 1u;
+    }
+    return validate_bounded_no_content_four_way(observations, sources, ports, error);
 }
 
 struct NormalizedExactTrailingSlashOracleObservation {
@@ -17911,6 +18808,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
     const bool converter_bounded_exact_local_path_differential =
         argc == 3 && strcmp(argv[1], "--converter-bounded-exact-local-path-differential") == 0;
+    const bool converter_bounded_no_content_path_differential =
+        argc == 3 && strcmp(argv[1], "--converter-bounded-no-content-path-differential") == 0;
     const bool converter_normalized_exact_trailing_slash_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-normalized-exact-trailing-slash-differential") == 0;
@@ -17965,6 +18864,7 @@ int main(int argc, char** argv) {
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_bounded_exact_local_path_differential &&
+         !converter_bounded_no_content_path_differential &&
          !converter_normalized_exact_trailing_slash_differential &&
          !strict_local_response_differential && !converter_root_proxy_trace_differential &&
          !converter_api_proxy_trace_differential &&
@@ -17985,6 +18885,7 @@ int main(int argc, char** argv) {
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
+        (converter_bounded_no_content_path_differential && argv[2][0] != '/') ||
         (converter_normalized_exact_trailing_slash_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_space_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_multiple_space_differential && argv[2][0] != '/') ||
@@ -18035,6 +18936,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-return204-query-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-bounded-no-content-path-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
@@ -18098,7 +19002,7 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
-    if (bounded_no_content_path_oracle) {
+    if (bounded_no_content_path_oracle || converter_bounded_no_content_path_differential) {
         std::string parser_error;
         if (!run_bounded_no_content_path_access_log_self_checks(parser_error)) {
             std::cerr << "FAIL [#328 bounded access-log self-check]: " << parser_error << "\n";
@@ -18112,9 +19016,20 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#328 bounded observation self-check]: " << parser_error << "\n";
             return 1;
         }
+        if (converter_bounded_no_content_path_differential &&
+            !run_bounded_no_content_differential_parser_self_checks(parser_error)) {
+            std::cerr << "FAIL [#328 generated source/access self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (converter_bounded_no_content_path_differential &&
+            !run_bounded_no_content_four_way_self_checks(parser_error)) {
+            std::cerr << "FAIL [#328 four-way validator self-check]: " << parser_error << "\n";
+            return 1;
+        }
     }
     if (converter_exact_local_return204_differential ||
-        converter_exact_local_return204_query_differential) {
+        converter_exact_local_return204_query_differential ||
+        converter_bounded_no_content_path_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -18912,6 +19827,32 @@ int main(int argc, char** argv) {
                "equivalence only; excludes multiple/edge spaces, escapes, variables, controls, "
                "other bodies/statuses/paths/methods/framing, HTTP/1.0, keep-alive/reuse/pipeline, "
                "TLS/H2, other location forms, and multiple servers/listeners)\n";
+        return 0;
+    }
+
+    if (converter_bounded_no_content_path_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-bounded-no-content-path-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_bounded_no_content_path_differential(
+                container_prefix, argv[2], differential_error)) {
+            std::cerr << "FAIL [#328 converter-generated bounded bodyless 204 path differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of bounded exact /healthz return 204 genuinely "
+               "parsed and lowered to port-canonical identical ordinary public RUT, then two "
+               "isolated pinned-nginx and two isolated public-CLI/io_uring sides matched all "
+               "five Date-normalized close/EOF wires: literal and query targets emitted exact "
+               "105-byte bodyless No Content responses with live and settled zero upstream, "
+               "while slash, sibling, and root targets emitted exact 118-byte fallback wires "
+               "and three ordered byte-exact upstream requests with no fourth; all sides proved "
+               "five ordered response-size-accounted access records, clean bounded lifecycle "
+               "logs, unique resources, borrowed nginx-source destruction, and generated-source "
+               "ownership after public load (#328 final bounded behavioral evidence)\n";
         return 0;
     }
 
