@@ -21491,6 +21491,517 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
 }
 
+namespace {
+
+static constexpr char kStaticQueryClientTargetOne[] = "/api/users?x=1";
+static constexpr char kStaticQueryClientTargetTwo[] = "/api/users";
+static constexpr char kStaticQueryUpstreamTargetOne[] = "/v1/?fixed=1users?x=1";
+static constexpr char kStaticQueryUpstreamTargetTwo[] = "/v1/?fixed=1users";
+static constexpr char kStaticQueryClientRequestOne[] =
+    "GET /api/users?x=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryClientRequestTwo[] =
+    "GET /api/users HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryExpectedResponse[] =
+    "HTTP/1.1 201 Created\r\n"
+    "Server: rut-static-query\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 8\r\n"
+    "Connection: close\r\n"
+    "X-Origin: bounded\r\n\r\n"
+    "fallback";
+
+struct StaticQueryTransformEvidence {
+    u32 accepted_count = 0;
+    u32 request_count = 0;
+    u32 access_count = 0;
+    char requests[3][256]{};
+    u32 request_lengths[3]{};
+    u32 request_header_lengths[3]{};
+    u32 response_write_counts[3]{};
+    u64 request_recorded_ns[3]{};
+    u64 response_write_ns[3]{};
+    u64 response_close_ns[3]{};
+    AccessLogEntry access[3]{};
+};
+
+static bool static_query_transform_request_is_exact(const char* actual,
+                                                    u32 actual_len,
+                                                    u16 backend_port,
+                                                    const char* target) {
+    char expected[256]{};
+    const int expected_len = snprintf(expected,
+                                      sizeof(expected),
+                                      "GET %s HTTP/1.1\r\n"
+                                      "Host: 127.0.0.1:%u\r\n"
+                                      "X-Test: one\r\n\r\n",
+                                      target,
+                                      backend_port);
+    return expected_len > 0 && expected_len < static_cast<int>(sizeof(expected)) &&
+           actual_len == static_cast<u32>(expected_len) &&
+           memcmp(actual, expected, static_cast<u32>(expected_len)) == 0;
+}
+
+static bool validate_static_query_transform_evidence(const StaticQueryTransformEvidence& evidence,
+                                                     u16 backend_port) {
+    if (evidence.accepted_count != 2u || evidence.request_count != 2u ||
+        evidence.access_count != 2u)
+        return false;
+    const char* const upstream_targets[] = {kStaticQueryUpstreamTargetOne,
+                                            kStaticQueryUpstreamTargetTwo};
+    const char* const client_targets[] = {kStaticQueryClientTargetOne, kStaticQueryClientTargetTwo};
+    for (u32 i = 0; i < 2; i++) {
+        if (!static_query_transform_request_is_exact(evidence.requests[i],
+                                                     evidence.request_lengths[i],
+                                                     backend_port,
+                                                     upstream_targets[i]) ||
+            evidence.request_header_lengths[i] != evidence.request_lengths[i] ||
+            evidence.response_write_counts[i] != 1u || evidence.request_recorded_ns[i] == 0u ||
+            evidence.response_write_ns[i] < evidence.request_recorded_ns[i] ||
+            evidence.response_close_ns[i] < evidence.response_write_ns[i])
+            return false;
+
+        const AccessLogEntry& access = evidence.access[i];
+        const u32 target_len = static_cast<u32>(strlen(client_targets[i]));
+        if (access.target_state != AccessLogTargetState::Complete ||
+            access.target_length != target_len ||
+            memcmp(access.path, client_targets[i], target_len) != 0 ||
+            access.method != static_cast<u8>(LogHttpMethod::Get) || access.status != 201u ||
+            access.req_size != evidence.request_lengths[i] ||
+            access.resp_size != sizeof(kStaticQueryExpectedResponse) - 1u ||
+            strcmp(access.upstream, "backend") != 0)
+            return false;
+    }
+    if (evidence.request_lengths[2] != 0u || evidence.request_header_lengths[2] != 0u ||
+        evidence.response_write_counts[2] != 0u || evidence.request_recorded_ns[2] != 0u ||
+        evidence.response_write_ns[2] != 0u || evidence.response_close_ns[2] != 0u)
+        return false;
+    for (u32 i = 0; i < sizeof(evidence.requests[2]); i++)
+        if (evidence.requests[2][i] != '\0') return false;
+    return true;
+}
+
+static bool static_query_transform_validator_self_checks() {
+    constexpr u16 kPort = 18080;
+    StaticQueryTransformEvidence valid{};
+    valid.accepted_count = 2u;
+    valid.request_count = 2u;
+    valid.access_count = 2u;
+    const char* const upstream_targets[] = {kStaticQueryUpstreamTargetOne,
+                                            kStaticQueryUpstreamTargetTwo};
+    const char* const client_targets[] = {kStaticQueryClientTargetOne, kStaticQueryClientTargetTwo};
+    for (u32 i = 0; i < 2; i++) {
+        const int len = snprintf(valid.requests[i],
+                                 sizeof(valid.requests[i]),
+                                 "GET %s HTTP/1.1\r\n"
+                                 "Host: 127.0.0.1:%u\r\n"
+                                 "X-Test: one\r\n\r\n",
+                                 upstream_targets[i],
+                                 kPort);
+        if (len <= 0 || len >= static_cast<int>(sizeof(valid.requests[i]))) return false;
+        valid.request_lengths[i] = static_cast<u32>(len);
+        valid.request_header_lengths[i] = static_cast<u32>(len);
+        valid.response_write_counts[i] = 1u;
+        valid.request_recorded_ns[i] = 10u + i * 10u;
+        valid.response_write_ns[i] = 11u + i * 10u;
+        valid.response_close_ns[i] = 12u + i * 10u;
+        valid.access[i].target_state = AccessLogTargetState::Complete;
+        valid.access[i].target_length = static_cast<u16>(strlen(client_targets[i]));
+        memcpy(valid.access[i].path, client_targets[i], valid.access[i].target_length);
+        valid.access[i].method = static_cast<u8>(LogHttpMethod::Get);
+        valid.access[i].status = 201u;
+        valid.access[i].req_size = valid.request_lengths[i];
+        valid.access[i].resp_size = sizeof(kStaticQueryExpectedResponse) - 1u;
+        memcpy(valid.access[i].upstream, "backend", sizeof("backend"));
+    }
+    if (!validate_static_query_transform_evidence(valid, kPort)) return false;
+    const auto rejects = [&](const StaticQueryTransformEvidence& mutation) {
+        return !validate_static_query_transform_evidence(mutation, kPort);
+    };
+
+    StaticQueryTransformEvidence transformed_access = valid;
+    transformed_access.access[0].target_length = sizeof(kStaticQueryUpstreamTargetOne) - 1u;
+    memcpy(transformed_access.access[0].path,
+           kStaticQueryUpstreamTargetOne,
+           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
+    StaticQueryTransformEvidence original_upstream = valid;
+    const char* original_target =
+        strstr(original_upstream.requests[0], kStaticQueryUpstreamTargetOne);
+    if (original_target == nullptr) return false;
+    const u32 original_offset =
+        static_cast<u32>(original_target - static_cast<const char*>(original_upstream.requests[0]));
+    memcpy(original_upstream.requests[0] + original_offset,
+           kStaticQueryClientTargetOne,
+           sizeof(kStaticQueryClientTargetOne) - 1u);
+    original_upstream.request_lengths[0] -=
+        sizeof(kStaticQueryUpstreamTargetOne) - sizeof(kStaticQueryClientTargetOne);
+    original_upstream.request_header_lengths[0] = original_upstream.request_lengths[0];
+    memmove(
+        original_upstream.requests[0] + original_offset + sizeof(kStaticQueryClientTargetOne) - 1u,
+        original_target + sizeof(kStaticQueryUpstreamTargetOne) - 1u,
+        valid.request_lengths[0] - original_offset - sizeof(kStaticQueryUpstreamTargetOne) + 1u);
+    StaticQueryTransformEvidence missing_query = valid;
+    memcpy(strstr(missing_query.requests[0], kStaticQueryUpstreamTargetOne),
+           "/v1/?fixed=1users    ",
+           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
+    StaticQueryTransformEvidence reordered = valid;
+    memcpy(strstr(reordered.requests[0], kStaticQueryUpstreamTargetOne),
+           "/v1/?fixed=1?x=1users",
+           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
+    StaticQueryTransformEvidence missing_suffix = valid;
+    memcpy(strstr(missing_suffix.requests[0], kStaticQueryUpstreamTargetOne),
+           "/v1/?fixed=1         ",
+           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
+    StaticQueryTransformEvidence ampersand = valid;
+    char* client_query = strstr(ampersand.requests[0], "users?x=1");
+    if (client_query == nullptr) return false;
+    client_query[5] = '&';
+    StaticQueryTransformEvidence missing_episode = valid;
+    missing_episode.accepted_count = 1u;
+    StaticQueryTransformEvidence duplicate_send = valid;
+    duplicate_send.response_write_counts[0] = 2u;
+    StaticQueryTransformEvidence extra_episode = valid;
+    extra_episode.request_count = 3u;
+    StaticQueryTransformEvidence nonempty_third = valid;
+    nonempty_third.requests[2][0] = 'G';
+    StaticQueryTransformEvidence missing_access = valid;
+    missing_access.access_count = 1u;
+    StaticQueryTransformEvidence duplicate_access = valid;
+    duplicate_access.access[1] = duplicate_access.access[0];
+    StaticQueryTransformEvidence extra_access = valid;
+    extra_access.access_count = 3u;
+    StaticQueryTransformEvidence reversed_access = valid;
+    const AccessLogEntry saved = reversed_access.access[0];
+    reversed_access.access[0] = reversed_access.access[1];
+    reversed_access.access[1] = saved;
+
+    return rejects(transformed_access) && rejects(original_upstream) && rejects(missing_query) &&
+           rejects(reordered) && rejects(missing_suffix) && rejects(ampersand) &&
+           rejects(missing_episode) && rejects(duplicate_send) && rejects(extra_episode) &&
+           rejects(nonempty_third) && rejects(missing_access) && rejects(duplicate_access) &&
+           rejects(extra_access) && rejects(reversed_access);
+}
+
+}  // namespace
+
+TEST(route, static_query_target_transform_public_source_reaches_iouring_backend_and_access) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    REQUIRE(static_query_transform_validator_self_checks());
+
+    static constexpr char kOrigin[] =
+        "HTTP/1.1 201 Created\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Type: text/plain\r\n"
+        "X-Origin: bounded\r\n"
+        "Content-Length: 8\r\n"
+        "Connection: close\r\n\r\n"
+        "fallback";
+    RecordingUpstream backend;
+    backend.response = kOrigin;
+    backend.response_len = sizeof(kOrigin) - 1u;
+    REQUIRE(backend.setup());
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source_text += R"rut(
+route GET "/api" {
+  return forward(backend,
+    target_transform: { strip_prefix: "/api/", replace_prefix: "/v1/?fixed=1" },
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "rut-static-query", date: "current",
+      hide_headers: ["Date", "Server"] })
+}
+)rut";
+    CHECK_EQ(source_text.find("nginx"), std::string::npos);
+    CHECK_EQ(source_text.find("workaround"), std::string::npos);
+    const size_t first_route = source_text.find("route GET");
+    REQUIRE_NE(first_route, std::string::npos);
+    CHECK_EQ(source_text.find("route GET", first_route + 1u), std::string::npos);
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_static_query_target_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    source.fd = mkstemp(source.path);
+    REQUIRE_GE(source.fd, 0);
+    source.present = true;
+    u32 written = 0;
+    while (written < source_text.size()) {
+        const ssize_t n =
+            write(source.fd, source_text.data() + written, source_text.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        REQUIRE_GT(n, 0);
+        written += static_cast<u32>(n);
+    }
+    REQUIRE_EQ(close(source.fd), 0);
+    source.fd = -1;
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        ~ProgramGuard() { program.destroy(); }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.target_transform_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.target_transform_count, 1u);
+    REQUIRE_EQ(program.config.target_transform_bytes_used, 17u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.response_policy_count, 1u);
+    const auto& rir_transform = program.rir.module.target_transforms[0];
+    const auto& owned_transform = program.config.target_transforms[0];
+    REQUIRE(rir_transform.strip_prefix.eq({"/api/", 5}));
+    REQUIRE(rir_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
+    REQUIRE(owned_transform.strip_prefix.eq({"/api/", 5}));
+    REQUIRE(owned_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
+    CHECK_NE(owned_transform.strip_prefix.ptr, rir_transform.strip_prefix.ptr);
+    CHECK_NE(owned_transform.replace_prefix.ptr, rir_transform.replace_prefix.ptr);
+    CHECK(program.config.response_policies[0].server.eq({"rut-static-query", 16}));
+    bool saw_transform_opcode = false;
+    bool saw_forward_opcode = false;
+    for (u32 bi = 0; bi < program.rir.module.functions[0].block_count; bi++) {
+        const auto& block = program.rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::ReqSetTargetTransform) {
+                saw_transform_opcode = true;
+                CHECK_EQ(block.insts[ii].imm.i32_val, 1);
+            }
+            if (block.insts[ii].op == rir::Opcode::RetForward ||
+                block.insts[ii].op == rir::Opcode::RetForwardBundle)
+                saw_forward_opcode = true;
+        }
+    }
+    REQUIRE(saw_transform_opcode);
+    REQUIRE(saw_forward_opcode);
+    const uintptr_t owned_begin =
+        reinterpret_cast<uintptr_t>(program.config.target_transform_bytes);
+    const uintptr_t owned_end = owned_begin + program.config.target_transform_bytes_used;
+    const uintptr_t replace_begin = reinterpret_cast<uintptr_t>(owned_transform.replace_prefix.ptr);
+    CHECK_GE(replace_begin, owned_begin);
+    CHECK_LE(replace_begin + owned_transform.replace_prefix.len, owned_end);
+
+    // load_rut_program's AST/HIR/MIR owners have already gone out of scope.
+    // Remove every remaining source/compiler byte before the first connection;
+    // only native JIT code and the deeply owned RouteConfig remain live.
+    REQUIRE_EQ(unlink(source.path), 0);
+    source.present = false;
+    CHECK_EQ(access(source.path, F_OK), -1);
+    CHECK_EQ(errno, ENOENT);
+    std::fill(source_text.begin(), source_text.end(), '!');
+    std::string{}.swap(source_text);
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    CHECK_EQ(program.rir.module.func_count, 0u);
+    REQUIRE(program.config.target_transforms[0].strip_prefix.eq({"/api/", 5}));
+    REQUIRE(program.config.target_transforms[0].replace_prefix.eq({"/v1/?fixed=1", 12}));
+
+    Shard<IoUringEventLoop> shard;
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    i32 listen_fd = listen_result.value();
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = listener_context.port;
+    REQUIRE_NE(port, 0u);
+    CHECK_NE(port, backend.port);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE_EQ(shard.loop->capture_ring, capture_ring);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    const char* const client_requests[] = {kStaticQueryClientRequestOne,
+                                           kStaticQueryClientRequestTwo};
+    const u32 client_request_lengths[] = {sizeof(kStaticQueryClientRequestOne) - 1u,
+                                          sizeof(kStaticQueryClientRequestTwo) - 1u};
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    for (u32 i = 0; i < 2; i++) {
+        ClientGuard client{connect_to(port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        REQUIRE(send_all(client.fd, client_requests[i], client_request_lengths[i]));
+        char response[sizeof(kStaticQueryExpectedResponse) + 32u]{};
+        u32 response_len = 0;
+        REQUIRE(read_public_close_response(
+            client.fd, sizeof("fallback") - 1u, response, sizeof(response), response_len));
+        REQUIRE_EQ(response_len, sizeof(kStaticQueryExpectedResponse) - 1u);
+        REQUIRE(normalize_public_date(response, response_len));
+        CHECK_EQ(memcmp(response, kStaticQueryExpectedResponse, response_len), 0);
+        REQUIRE_EQ(close(client.fd), 0);
+        client.fd = -1;
+
+        const u32 expected_count = i + 1u;
+        for (u32 waited = 0; waited < 1000 &&
+                             backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited++)
+            usleep(1000);
+        REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
+        REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), expected_count);
+        REQUIRE_EQ(backend.response_application_write_count[i].load(std::memory_order_acquire), 1u);
+        REQUIRE(backend.running.load(std::memory_order_acquire));
+        REQUIRE(backend.thread_alive.load(std::memory_order_acquire));
+        CHECK_FALSE(backend.listener_failed.load(std::memory_order_acquire));
+        REQUIRE(shard.loop->is_running());
+        REQUIRE_EQ(shard.backend_failure_code(), 0);
+    }
+
+    bool live_quiet = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        live_quiet &= backend.accepted_count.load(std::memory_order_acquire) == 2u;
+        live_quiet &= backend.request_count.load(std::memory_order_acquire) == 2u;
+        live_quiet &= backend.running.load(std::memory_order_acquire);
+        live_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        live_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        live_quiet &= shard.loop->is_running();
+        live_quiet &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(live_quiet);
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    backend.teardown();
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_FALSE(backend.running.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.thread_alive.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.listener_failed.load(std::memory_order_acquire));
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 2u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 4u);
+
+    bool all_connections_settled = true;
+    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+        const Connection& conn = shard.loop->conns[id];
+        all_connections_settled &=
+            conn.fd == -1 && conn.pending_ops == 0 && conn.request_config == nullptr &&
+            conn.upstream_attempts == 0 && conn.retry_req_send_len == 0 &&
+            conn.upstream_retiring_episode == 0 && conn.pipeline_depth == 0 &&
+            conn.pipeline_stash_len == 0 && conn.recv_buf.len() == 0 && conn.send_buf.len() == 0 &&
+            http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
+            conn.response_read_deadline_owner_is_neutral();
+    }
+    CHECK(all_connections_settled);
+
+    StaticQueryTransformEvidence evidence{};
+    evidence.accepted_count = backend.accepted_count.load(std::memory_order_acquire);
+    evidence.request_count = backend.request_count.load(std::memory_order_acquire);
+    REQUIRE_EQ(shard.log_ring->available(), 2u);
+    for (u32 i = 0; i < 2; i++) {
+        REQUIRE(shard.log_ring->pop(evidence.access[i]));
+        evidence.access_count++;
+        REQUIRE_LE(backend.request_history_len[i], sizeof(evidence.requests[i]));
+        memcpy(evidence.requests[i], backend.request_history[i], backend.request_history_len[i]);
+        evidence.request_lengths[i] = backend.request_history_len[i];
+        evidence.request_header_lengths[i] = backend.request_history_header_len[i];
+        evidence.response_write_counts[i] =
+            backend.response_application_write_count[i].load(std::memory_order_acquire);
+        evidence.request_recorded_ns[i] =
+            backend.request_recorded_ns[i].load(std::memory_order_acquire);
+        evidence.response_write_ns[i] =
+            backend.response_last_application_write_completed_ns[i].load(std::memory_order_acquire);
+        evidence.response_close_ns[i] =
+            backend.response_connection_closed_ns[i].load(std::memory_order_acquire);
+    }
+    evidence.request_lengths[2] = backend.request_history_len[2];
+    evidence.request_header_lengths[2] = backend.request_history_header_len[2];
+    evidence.response_write_counts[2] =
+        backend.response_application_write_count[2].load(std::memory_order_acquire);
+    evidence.request_recorded_ns[2] =
+        backend.request_recorded_ns[2].load(std::memory_order_acquire);
+    evidence.response_write_ns[2] =
+        backend.response_last_application_write_completed_ns[2].load(std::memory_order_acquire);
+    evidence.response_close_ns[2] =
+        backend.response_connection_closed_ns[2].load(std::memory_order_acquire);
+    memcpy(evidence.requests[2], backend.request_history[2], sizeof(evidence.requests[2]));
+    AccessLogEntry no_access{};
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+    REQUIRE(validate_static_query_transform_evidence(evidence, backend.port));
+
+    REQUIRE_EQ(capture_ring->available(), 2u);
+    for (u32 i = 0; i < 2; i++) {
+        CaptureEntry capture{};
+        REQUIRE(capture_ring->pop(capture));
+        CHECK_EQ(capture.resp_status, 201u);
+        CHECK_EQ(capture.method, static_cast<u8>(LogHttpMethod::Get));
+        CHECK_EQ(capture.req_content_length, 0u);
+        CHECK_EQ(capture.resp_content_length, sizeof(kStaticQueryExpectedResponse) - 1u);
+        REQUIRE_EQ(capture.raw_header_len, client_request_lengths[i]);
+        CHECK_EQ(memcmp(capture.raw_headers, client_requests[i], client_request_lengths[i]), 0);
+        CHECK_EQ(strcmp(capture.upstream_name, "backend"), 0);
+    }
+    CaptureEntry no_capture{};
+    CHECK_FALSE(capture_ring->pop(no_capture));
+    CHECK_EQ(shard.route_config, &program.config);
+    CHECK_EQ(shard.active_config, &program.config);
+    CHECK(program.config.target_transforms[0].replace_prefix.eq({"/v1/?fixed=1", 12}));
+}
+
 static constexpr char kPublicAccessTargetKey62[] =
     "/A-Z_a.z~9/more_2/"
     "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR";
