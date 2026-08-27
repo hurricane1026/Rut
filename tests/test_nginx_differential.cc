@@ -325,6 +325,32 @@ static constexpr char kSuccessResponseNormalized[] =
     "Content-Length: 2\r\n"
     "Connection: close\r\n"
     "\r\nok";
+static constexpr char kBodyfulNormalizedExactResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\nok";
+static_assert(sizeof(kBodyfulNormalizedExactResponseNormalized) - 1u == 144u);
+static constexpr char kBodyfulNormalizedFallbackBackendResponse[] =
+    "HTTP/1.1 201 Created\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 8\r\n"
+    "X-Origin: fallback\r\n"
+    "Connection: close\r\n"
+    "\r\nfallback";
+static constexpr char kBodyfulNormalizedFallbackResponseNormalized[] =
+    "HTTP/1.1 201 Created\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 8\r\n"
+    "Connection: close\r\n"
+    "X-Origin: fallback\r\n"
+    "\r\nfallback";
+static_assert(sizeof(kBodyfulNormalizedFallbackResponseNormalized) - 1u == 175u);
 static constexpr char kExactLocalReturn204ResponseNormalized[] =
     "HTTP/1.1 204 No Content\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -10529,6 +10555,624 @@ static bool run_pinned_max_boundary_no_content_oracle(
                                           &reservations.fds[3]))
         return false;
     return validate_max_boundary_pair(observations, ports, error);
+}
+
+struct BodyfulNormalizedExactObservation {
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
+    std::vector<std::string> targets;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> local_history;
+    std::vector<std::vector<char>> forward_history;
+    u32 access_records[6]{};
+    u32 local_accepts = 0u;
+    u32 local_requests = 0u;
+    u32 local_sends = 0u;
+    u32 forward_accepts = 0u;
+    u32 forward_requests = 0u;
+    u32 forward_sends = 0u;
+};
+
+static std::vector<std::string> bodyful_normalized_exact_targets() {
+    return {"/a/b", "/a/b?x=1", "/a//b", "/a/b/", "/a/c", "/"};
+}
+
+static bool parse_bodyful_normalized_exact_access_log(
+    const std::string& contents,
+    const std::string& prefix,
+    const BodyfulNormalizedExactObservation& observation,
+    u16 backend_port,
+    std::string& error) {
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 6u, "#331 bounded access log", records, error) ||
+        observation.targets != bodyful_normalized_exact_targets()) {
+        if (error.empty()) error = "#331 access parser lost its exact six-vector inventory";
+        return false;
+    }
+    for (size_t i = 0u; i < records.size(); i++) {
+        const bool local = i < 3u;
+        const std::string expected =
+            prefix + " raw=\"GET " + observation.targets[i] +
+            " HTTP/1.1\" status=" + (local ? "200" : "201") + " bytes=" + (local ? "144" : "175") +
+            " host=\"bodyful-normalized.example\" upstream_addr=\"" +
+            (local ? "-\" upstream_status=-"
+                   : "127.0.0.1:" + std::to_string(backend_port) + "\" upstream_status=201");
+        if (records[i] != expected) {
+            error = "#331 access log lost raw spelling, order, status, size, or upstream evidence";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validate_bodyful_normalized_exact_observation(
+    const BodyfulNormalizedExactObservation& observation, u16 backend_port, std::string& error) {
+    const auto targets = bodyful_normalized_exact_targets();
+    if (observation.targets != targets || observation.wires.size() != targets.size()) {
+        error = "#331 observation lost its exact six-vector inventory";
+        return false;
+    }
+    if (observation.local_accepts != 0u || observation.local_requests != 0u ||
+        observation.local_sends != 0u || !observation.local_history.empty()) {
+        error = "#331 observation lacked settled zero local-upstream evidence";
+        return false;
+    }
+    if (observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || observation.forward_history.size() != 3u) {
+        error = "#331 observation lacked exactly three fallback episodes";
+        return false;
+    }
+    for (u32 count : observation.access_records) {
+        if (count != 1u) {
+            error = "#331 observation lacked exactly six ordered access records";
+            return false;
+        }
+    }
+    const std::vector<char> local(kBodyfulNormalizedExactResponseNormalized,
+                                  kBodyfulNormalizedExactResponseNormalized + 144u);
+    const std::vector<char> fallback(kBodyfulNormalizedFallbackResponseNormalized,
+                                     kBodyfulNormalizedFallbackResponseNormalized + 175u);
+    for (size_t i = 0u; i < observation.wires.size(); i++) {
+        std::vector<char> normalized = observation.wires[i];
+        if (!normalize_date(normalized) || normalized != (i < 3u ? local : fallback)) {
+            error = "#331 observation wire differed from its exact local/fallback baseline";
+            return false;
+        }
+    }
+    std::vector<std::vector<char>> expected_history;
+    for (size_t i = 3u; i < targets.size(); i++) {
+        const std::string request = "GET " + targets[i] +
+                                    " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                    "\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error = "#331 fallback history contained a retry, reorder, or byte mismatch";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_bodyful_normalized_exact_pair(
+    const BodyfulNormalizedExactObservation observations[2],
+    const u16 ports[4],
+    std::string& error) {
+    for (size_t i = 0u; i < 4u; i++) {
+        if (ports[i] == 0u) {
+            error = "#331 pair validator received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#331 declaration-order sides shared a dynamic port";
+                return false;
+            }
+        }
+    }
+    if (observations[0].order != "exact-before-root" ||
+        observations[1].order != "root-before-exact" ||
+        !validate_bodyful_normalized_exact_observation(observations[0], ports[1], error) ||
+        !validate_bodyful_normalized_exact_observation(observations[1], ports[3], error))
+        return false;
+    const std::string* resources[] = {&observations[0].temp_path,
+                                      &observations[0].config_path,
+                                      &observations[0].log_path,
+                                      &observations[0].access_path,
+                                      &observations[0].process_identity,
+                                      &observations[1].temp_path,
+                                      &observations[1].config_path,
+                                      &observations[1].log_path,
+                                      &observations[1].access_path,
+                                      &observations[1].process_identity};
+    for (size_t i = 0u; i < 10u; i++) {
+        if (resources[i]->empty()) {
+            error = "#331 declaration-order resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 10u; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#331 declaration-order resource identities were aliased";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0u; i < 6u; i++) {
+        std::vector<char> left = observations[0].wires[i];
+        std::vector<char> right = observations[1].wires[i];
+        if (!normalize_date(left) || !normalize_date(right) || left != right) {
+            error =
+                "#331 declaration order changed Date-normalized vector " + std::to_string(i + 1u);
+            return false;
+        }
+    }
+    if (canonicalize_bounded_backend_history(observations[0].forward_history) !=
+        canonicalize_bounded_backend_history(observations[1].forward_history)) {
+        error = "#331 declaration order changed canonical fallback history";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_pinned_bodyful_normalized_exact_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    bool exact_first,
+    BodyfulNormalizedExactObservation& observation,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    const auto targets = bodyful_normalized_exact_targets();
+    if (targets.size() != 6u || frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0) {
+        error = "#331 capture received incomplete vectors or port reservations";
+        return false;
+    }
+    observation = BodyfulNormalizedExactObservation{};
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.access_path = temp.nginx_access_log;
+    observation.process_identity = container_name;
+    observation.targets = targets;
+    observation.wires.resize(targets.size());
+    const std::string access_prefix = "rut-nginx-331-bodyful-normalized-" + observation.order +
+                                      "-" + std::to_string(getpid()) + "-scoped";
+    const std::string exact_location = "    location = /a/b { return 200 \"ok\"; }\n";
+    const std::string root_location =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  log_format bodyful_normalized '" +
+        access_prefix +
+        " raw=\"$request\" status=$status bytes=$bytes_sent host=\"$host\" "
+        "upstream_addr=\"$upstream_addr\" upstream_status=$upstream_status';\n"
+        "  access_log " +
+        temp.nginx_access_log +
+        " bodyful_normalized;\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n"
+        "}\n";
+    if (config.find("merge_slashes") != std::string::npos ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#331 failed to write a default-merge-slashes pinned nginx config";
+        return false;
+    }
+    const auto make_request = [](const std::string& target) {
+        return "GET " + target +
+               " HTTP/1.1\r\nHost: bodyful-normalized.example\r\nConnection: close\r\n\r\n";
+    };
+    for (const std::string& target : targets) {
+        const std::string request = make_request(target);
+        const size_t end = request.find("\r\n\r\n");
+        if (request.rfind("GET " + target + " HTTP/1.1\r\n", 0u) != 0u ||
+            request.find('#') != std::string::npos ||
+            request.find("\r\nContent-Length:") != std::string::npos ||
+            request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+            request.find("\r\nTE:") != std::string::npos ||
+            request.find("\r\nExpect:") != std::string::npos ||
+            request.find("\r\nUpgrade:") != std::string::npos || end == std::string::npos ||
+            end + 4u != request.size()) {
+            error = "#331 request escaped the fresh bodyless origin-form GET domain";
+            return false;
+        }
+    }
+
+    ChildGuard nginx;
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_live = [&](Recorder& recorder, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx.child) || !recorder.running.load(std::memory_order_acquire) ||
+                recorder.listener_failed.load(std::memory_order_acquire)) {
+                error = std::string("#331 nginx/recorder failed before ") + phase + " readiness";
+                return false;
+            }
+            if (recorder.thread_alive.load(std::memory_order_acquire)) return true;
+            usleep(1000);
+        }
+        error = std::string("#331 recorder readiness timed out: ") + phase;
+        return false;
+    };
+    const auto observe = [&](Recorder& recorder, u32 expected, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx.child) || !recorder_live(recorder) ||
+                recorder.accepted.load(std::memory_order_acquire) != expected ||
+                recorder.requests.load(std::memory_order_acquire) != expected ||
+                recorder.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                error = std::string("#331 unexpected process/upstream state during ") + phase;
+                return false;
+            }
+            usleep(5000);
+        }
+        return true;
+    };
+    const auto wait_count = [&](Recorder& recorder, u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(nginx.child) || !recorder_live(recorder)) return false;
+            const u32 accepts = recorder.accepted.load(std::memory_order_acquire);
+            const u32 requests = recorder.requests.load(std::memory_order_acquire);
+            const u32 sends = recorder.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests > expected || sends > expected) return false;
+            if (accepts == expected && requests == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    const auto request = [&](size_t index, const char* expected) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        const std::string request_text = make_request(targets[index]);
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, request_text.data(), request_text.size()) ||
+            !read_response(client.fd, observation.wires[index], detail) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(observation.wires[index], expected, detail)) {
+            error = "#331 vector " + targets[index] + " response/EOF failed: " + detail;
+            dump_wire("#331 mismatched response", observation.wires[index]);
+            return false;
+        }
+        const size_t expected_size = index < 3u ? 144u : 175u;
+        if (observation.wires[index].size() != expected_size ||
+            header_end(observation.wires[index]) + (index < 3u ? 2u : 8u) != expected_size ||
+            poll_child(nginx.child)) {
+            error = "#331 vector gained a wrong body length, tail, or process state";
+            return false;
+        }
+        return true;
+    };
+
+    Recorder local;
+    local.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!local.setup(backend_port)) {
+        error = "#331 local recorder could not bind its reserved backend port";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    const std::vector<std::string> docker_args = {"docker",
+                                                  "run",
+                                                  "--pull=never",
+                                                  "--network",
+                                                  "host",
+                                                  "--name",
+                                                  container_name,
+                                                  "-v",
+                                                  temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                                  "-v",
+                                                  std::string(temp.path) + ":" + temp.path,
+                                                  kNginxImage,
+                                                  "nginx",
+                                                  "-g",
+                                                  "daemon off;"};
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child(docker_args, temp.nginx_log, nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error) || !wait_live(local, "local")) {
+        if (error.empty()) error = "#331 failed to start pinned nginx/local recorder";
+        return false;
+    }
+    for (size_t i = 0u; i < 3u; i++) {
+        if (!request(i, kBodyfulNormalizedExactResponseNormalized) ||
+            local.accepted.load(std::memory_order_acquire) != 0u ||
+            local.requests.load(std::memory_order_acquire) != 0u ||
+            local.response_send_all_calls.load(std::memory_order_acquire) != 0u) {
+            error = "#331 normalized exact local vector reached upstream";
+            return false;
+        }
+    }
+    if (!observe(local, 0u, "live local zero-upstream window")) return false;
+    local.stop();
+    observation.local_accepts = local.accepted.load(std::memory_order_acquire);
+    observation.local_requests = local.requests.load(std::memory_order_acquire);
+    observation.local_sends = local.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = local.history;
+    if (local.thread_alive.load(std::memory_order_acquire) ||
+        local.listener_failed.load(std::memory_order_acquire) || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        local.response_send_succeeded.load(std::memory_order_acquire) || !local.history.empty() ||
+        !local.request.empty()) {
+        error = "#331 local recorder did not settle with zero upstream activity";
+        return false;
+    }
+
+    Recorder forward;
+    forward.observe_extra_requests_until_stop = true;
+    if (!forward.setup(backend_port,
+                       3u,
+                       kBodyfulNormalizedFallbackBackendResponse,
+                       sizeof(kBodyfulNormalizedFallbackBackendResponse) - 1u) ||
+        !wait_live(forward, "fallback") || !observe(forward, 0u, "pre-fallback zero window"))
+        return false;
+    for (size_t i = 3u; i < targets.size(); i++) {
+        const u32 expected = static_cast<u32>(i - 2u);
+        if (!request(i, kBodyfulNormalizedFallbackResponseNormalized)) return false;
+        if (!wait_count(forward, expected) ||
+            !observe(forward, expected, "ordered fallback count")) {
+            error = "#331 fallback count/order/retry evidence failed";
+            return false;
+        }
+    }
+    if (!observe(forward, 3u, "live no-fourth-forward window") || !stop_child(nginx.child) ||
+        !docker.remove()) {
+        error = "#331 pinned nginx did not complete cleanly";
+        return false;
+    }
+    forward.stop();
+    observation.forward_accepts = forward.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = forward.requests.load(std::memory_order_acquire);
+    observation.forward_sends = forward.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = forward.history;
+    if (forward.thread_alive.load(std::memory_order_acquire) ||
+        forward.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u ||
+        !forward.response_send_succeeded.load(std::memory_order_acquire) ||
+        !forward.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !forward.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 3u) {
+        error = "#331 fallback recorder lifecycle/count was incomplete";
+        return false;
+    }
+    std::string access_contents;
+    std::string error_contents;
+    if (!read_exact_return204_log(
+            temp.nginx_access_log, "#331 pinned access log", access_contents, error) ||
+        !parse_bodyful_normalized_exact_access_log(
+            access_contents, access_prefix, observation, backend_port, error) ||
+        !read_exact_return204_log(
+            temp.nginx_log, "#331 pinned nginx error log", error_contents, error))
+        return false;
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (error_contents.find(severity) != std::string::npos) {
+            error = std::string("#331 pinned nginx error log contained ") + severity;
+            return false;
+        }
+    }
+    for (u32& count : observation.access_records) count = 1u;
+    return validate_bodyful_normalized_exact_observation(observation, backend_port, error);
+}
+
+static BodyfulNormalizedExactObservation make_bodyful_normalized_exact_self_check(
+    u16 backend_port, const char* order, const char* suffix) {
+    static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    const auto observed = [](const char* normalized, size_t size) {
+        std::vector<char> wire(normalized, normalized + size);
+        const std::string marker(29u, 'X');
+        const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        return wire;
+    };
+    BodyfulNormalizedExactObservation value;
+    value.order = order;
+    value.temp_path = std::string("/tmp/331-") + suffix;
+    value.config_path = value.temp_path + "/nginx.conf";
+    value.log_path = value.temp_path + "/nginx.log";
+    value.access_path = value.temp_path + "/access.log";
+    value.process_identity = std::string("rut-nginx-331-") + suffix;
+    value.targets = bodyful_normalized_exact_targets();
+    for (size_t i = 0u; i < value.targets.size(); i++) {
+        value.wires.push_back(i < 3u
+                                  ? observed(kBodyfulNormalizedExactResponseNormalized, 144u)
+                                  : observed(kBodyfulNormalizedFallbackResponseNormalized, 175u));
+        value.access_records[i] = 1u;
+    }
+    value.forward_accepts = 3u;
+    value.forward_requests = 3u;
+    value.forward_sends = 3u;
+    for (size_t i = 3u; i < value.targets.size(); i++) {
+        const std::string request = "GET " + value.targets[i] +
+                                    " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                    "\r\n\r\n";
+        value.forward_history.emplace_back(request.begin(), request.end());
+    }
+    return value;
+}
+
+static bool run_bodyful_normalized_exact_self_checks(std::string& error) {
+    static constexpr u16 kPorts[] = {54320u, 54321u, 54322u, 54323u};
+    const auto exact =
+        make_bodyful_normalized_exact_self_check(kPorts[1], "exact-before-root", "exact");
+    const auto root =
+        make_bodyful_normalized_exact_self_check(kPorts[3], "root-before-exact", "root");
+    const BodyfulNormalizedExactObservation valid[2] = {exact, root};
+    if (!validate_bodyful_normalized_exact_pair(valid, kPorts, error)) return false;
+    const auto rejects_observation = [&](const char* name,
+                                         BodyfulNormalizedExactObservation value) {
+        std::string detail;
+        if (!validate_bodyful_normalized_exact_observation(value, kPorts[1], detail)) return true;
+        error = std::string("#331 observation mutation accepted: ") + name;
+        return false;
+    };
+    auto changed = exact;
+    changed.wires[2] = exact.wires[3];
+    if (!rejects_observation("doubled-slash-selection", changed)) return false;
+    changed = exact;
+    changed.targets[2] = "/a/b";
+    if (!rejects_observation("missing-doubled-slash", changed)) return false;
+    changed = exact;
+    changed.wires[3] = exact.wires[0];
+    if (!rejects_observation("fallback-selection", changed)) return false;
+    changed = exact;
+    changed.access_records[2] = 0u;
+    if (!rejects_observation("access-count", changed)) return false;
+    changed = exact;
+    changed.forward_requests = 2u;
+    if (!rejects_observation("backend-count", changed)) return false;
+    changed = exact;
+    std::swap(changed.forward_history[0], changed.forward_history[1]);
+    if (!rejects_observation("backend-order", changed)) return false;
+    changed = exact;
+    changed.forward_history.push_back(exact.forward_history[0]);
+    if (!rejects_observation("backend-retry", changed)) return false;
+
+    const auto rejects_pair = [&](BodyfulNormalizedExactObservation values[2], u16 ports[4]) {
+        std::string detail;
+        return !validate_bodyful_normalized_exact_pair(values, ports, detail);
+    };
+    BodyfulNormalizedExactObservation pair[2] = {exact, root};
+    u16 ports[4];
+    std::copy(std::begin(kPorts), std::end(kPorts), std::begin(ports));
+    pair[1].access_path = pair[0].access_path;
+    if (!rejects_pair(pair, ports)) {
+        error = "#331 resource-alias mutation was accepted";
+        return false;
+    }
+    pair[1] = root;
+    ports[3] = ports[0];
+    if (!rejects_pair(pair, ports)) {
+        error = "#331 duplicate-port mutation was accepted";
+        return false;
+    }
+
+    const std::string prefix = "rut-nginx-331-self-check";
+    std::string access;
+    for (size_t i = 0u; i < exact.targets.size(); i++) {
+        const bool local = i < 3u;
+        access +=
+            prefix + " raw=\"GET " + exact.targets[i] +
+            " HTTP/1.1\" status=" + (local ? "200" : "201") + " bytes=" + (local ? "144" : "175") +
+            " host=\"bodyful-normalized.example\" upstream_addr=\"" +
+            (local ? "-\" upstream_status=-" : "127.0.0.1:54321\" upstream_status=201") + "\n";
+    }
+    if (!parse_bodyful_normalized_exact_access_log(access, prefix, exact, kPorts[1], error))
+        return false;
+    const size_t first_end = access.find('\n');
+    const size_t second_end = access.find('\n', first_end + 1u);
+    std::string reordered = access;
+    reordered.replace(
+        0u,
+        second_end + 1u,
+        access.substr(first_end + 1u, second_end - first_end) + access.substr(0u, first_end + 1u));
+    const auto access_rejects = [&](const std::string& value) {
+        std::string detail;
+        return !parse_bodyful_normalized_exact_access_log(value, prefix, exact, kPorts[1], detail);
+    };
+    std::string missing_double = access;
+    const size_t doubled = missing_double.find("/a//b");
+    if (doubled == std::string::npos) {
+        error = "#331 access self-check fixture lacked doubled-slash evidence";
+        return false;
+    }
+    missing_double.erase(doubled + 2u, 1u);
+    if (!access_rejects(access.substr(0u, access.size() - 1u)) ||
+        !access_rejects(access + access.substr(0u, first_end + 1u)) || !access_rejects(reordered) ||
+        !access_rejects(missing_double)) {
+        error = "#331 access count/order/raw-spelling mutation was accepted";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_bodyful_normalized_exact_oracle(
+    const std::string& container_prefix,
+    BodyfulNormalizedExactObservation observations[2],
+    std::string& error) {
+    struct ReservedPorts {
+        int fds[4];
+
+        ReservedPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~ReservedPorts() {
+            for (int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = 0;
+            socklen_t length = sizeof(address);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+                ntohs(address.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(address.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#331 could not bind-reserve four unique declaration-order ports";
+            return false;
+        }
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].nginx_config ||
+        temps[0].nginx_log == temps[1].nginx_log ||
+        temps[0].nginx_access_log == temps[1].nginx_access_log) {
+        error = "#331 could not create two independent pinned resource trees";
+        return false;
+    }
+    if (!capture_pinned_bodyful_normalized_exact_side(ports[0],
+                                                      ports[1],
+                                                      temps[0],
+                                                      container_prefix + "-exact-first",
+                                                      true,
+                                                      observations[0],
+                                                      error,
+                                                      &reservations.fds[0],
+                                                      &reservations.fds[1]) ||
+        !capture_pinned_bodyful_normalized_exact_side(ports[2],
+                                                      ports[3],
+                                                      temps[1],
+                                                      container_prefix + "-root-first",
+                                                      false,
+                                                      observations[1],
+                                                      error,
+                                                      &reservations.fds[2],
+                                                      &reservations.fds[3]))
+        return false;
+    return validate_bodyful_normalized_exact_pair(observations, ports, error);
 }
 
 static std::string make_trailing_slash_no_content_fragment(u16 frontend_port,
@@ -21928,6 +22572,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--trailing-slash-no-content-oracle") == 0;
     const bool max_boundary_no_content_oracle =
         argc == 2 && strcmp(argv[1], "--max-boundary-no-content-oracle") == 0;
+    const bool bodyful_normalized_exact_oracle =
+        argc == 2 && strcmp(argv[1], "--bodyful-normalized-exact-oracle") == 0;
     const bool exact_local_body_space_oracle =
         argc == 2 && strcmp(argv[1], "--exact-local-body-space-oracle") == 0;
     const bool exact_local_body_multiple_space_oracle =
@@ -22003,9 +22649,9 @@ int main(int argc, char** argv) {
          !service_root_proxy_uri_oracle && !bounded_exact_local_path_oracle &&
          !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
          !trailing_slash_no_content_oracle && !max_boundary_no_content_oracle &&
-         !exact_local_body_space_oracle && !exact_local_body_multiple_space_oracle &&
-         !exact_local_return204_oracle && !exact_local_return204_query_oracle &&
-         !converter_exact_local_body_space_differential &&
+         !bodyful_normalized_exact_oracle && !exact_local_body_space_oracle &&
+         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
+         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
@@ -22075,6 +22721,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
                      "   or: test_nginx_differential --trailing-slash-no-content-oracle\n"
                      "   or: test_nginx_differential --max-boundary-no-content-oracle\n"
+                     "   or: test_nginx_differential --bodyful-normalized-exact-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
                      "   or: test_nginx_differential --exact-local-return204-oracle\n"
@@ -22238,6 +22885,13 @@ int main(int argc, char** argv) {
             !run_max_boundary_four_way_self_checks(parser_error)) {
             std::cerr << "FAIL [#330 Stage 4 four-way validator self-check]: " << parser_error
                       << "\n";
+            return 1;
+        }
+    }
+    if (bodyful_normalized_exact_oracle) {
+        std::string parser_error;
+        if (!run_bodyful_normalized_exact_self_checks(parser_error)) {
+            std::cerr << "FAIL [#331 access/observation/pair self-check]: " << parser_error << "\n";
             return 1;
         }
     }
@@ -22838,6 +23492,32 @@ int main(int argc, char** argv) {
                "no-slash and root. Both sides proved exact raw-spelling access accounting, clean "
                "error logs, four simultaneous unique port reservations, and isolated resources "
                "(#330 Stage 1 nginx-only boundary oracle; no converter/RUT equivalence claim)\n";
+        return 0;
+    }
+
+    if (bodyful_normalized_exact_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-bodyful-normalized-exact-" + std::to_string(getpid()) + "-" + source_suffix;
+        BodyfulNormalizedExactObservation observations[2];
+        std::string oracle_error;
+        if (!run_pinned_bodyful_normalized_exact_oracle(
+                container_prefix, observations, oracle_error)) {
+            std::cerr << "FAIL [#331 pinned bodyful normalized exact oracle]: " << oracle_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx 1.29.7 default slash normalization made exact /a/b return "
+               "200 ok declaration-order independent: /a/b, /a/b?x=1, and raw /a//b emitted "
+               "the exact Date-normalized 144-byte text/plain/CL2/close/EOF wire with live and "
+               "settled zero upstream, while /a/b/, /a/c, and / emitted the exact 175-byte "
+               "201/CL8/fallback/close/EOF wire with three ordered byte-exact backend histories "
+               "and no fourth/retry. Both isolated sides proved exact raw-spelling access "
+               "records, clean bounded error logs, and four simultaneous unique port "
+               "reservations (#331 Stage 1 nginx-only oracle; no converter/RUT equivalence "
+               "claim)\n";
         return 0;
     }
 
