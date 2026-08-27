@@ -5295,6 +5295,7 @@ static bool run_pinned_api_non_root_proxy_uri_oracle(
 struct BoundedExactLocalPathOracleObservation {
     std::string order;
     std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> local_history;
     std::vector<std::vector<char>> forward_history;
     u32 access_records[5]{};
     u32 local_accepts = 0;
@@ -5548,6 +5549,7 @@ static bool capture_pinned_bounded_exact_local_path_order(
     observation.local_requests = local_recorder.requests.load(std::memory_order_acquire);
     observation.local_sends =
         local_recorder.response_send_all_calls.load(std::memory_order_acquire);
+    observation.local_history = local_recorder.history;
     if (local_recorder.thread_alive.load(std::memory_order_acquire) ||
         local_recorder.listener_failed.load(std::memory_order_acquire) ||
         observation.local_accepts != 0 || observation.local_requests != 0 ||
@@ -5947,6 +5949,125 @@ static bool run_bounded_no_content_path_wire_self_checks(std::string& error) {
     return true;
 }
 
+static bool validate_bounded_no_content_path_observation(
+    const BoundedExactLocalPathOracleObservation& observation,
+    u16 backend_port,
+    std::string& error) {
+    if (observation.wires.size() != 5u || observation.local_accepts != 0u ||
+        observation.local_requests != 0u || observation.local_sends != 0u ||
+        !observation.local_history.empty()) {
+        error = "#328 observation lacked exact five-vector or zero local-upstream evidence";
+        return false;
+    }
+    if (observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || observation.forward_history.size() != 3u) {
+        error = "#328 observation lacked exact three-episode fallback evidence";
+        return false;
+    }
+    for (u32 access_record : observation.access_records) {
+        if (access_record != 1u) {
+            error = "#328 observation lacked exact five-record access evidence";
+            return false;
+        }
+    }
+
+    const std::vector<char> expected_local(kExactLocalReturn204ResponseNormalized,
+                                           kExactLocalReturn204ResponseNormalized + 105u);
+    const std::vector<char> expected_fallback(
+        kSuccessResponseNormalized,
+        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+    for (size_t i = 0; i < observation.wires.size(); i++) {
+        std::vector<char> normalized = observation.wires[i];
+        if (!normalize_date(normalized) ||
+            normalized != (i < 2u ? expected_local : expected_fallback)) {
+            error = "#328 observation response wire was not the exact 204/fallback baseline";
+            return false;
+        }
+    }
+
+    static constexpr const char* kFallbackTargets[] = {"/healthz/", "/health", "/"};
+    std::vector<std::vector<char>> expected_history;
+    expected_history.reserve(3u);
+    for (const char* target : kFallbackTargets) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error = "#328 observation fallback history contained a retry, reorder, or wire mismatch";
+        return false;
+    }
+    return true;
+}
+
+static bool run_bounded_no_content_path_observation_self_checks(std::string& error) {
+    static constexpr u16 kBackendPort = 54321u;
+    static constexpr char kObservedDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    const auto observed_wire = [](const char* normalized, size_t size) {
+        std::vector<char> wire(normalized, normalized + size);
+        const std::string marker(29u, 'X');
+        const auto offset = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        if (offset != wire.end()) std::copy_n(kObservedDate, 29u, offset);
+        return wire;
+    };
+    BoundedExactLocalPathOracleObservation valid;
+    valid.order = "exact-before-root";
+    valid.wires = {
+        observed_wire(kExactLocalReturn204ResponseNormalized, 105u),
+        observed_wire(kExactLocalReturn204ResponseNormalized, 105u),
+        observed_wire(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u),
+        observed_wire(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u),
+        observed_wire(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u)};
+    valid.forward_accepts = 3u;
+    valid.forward_requests = 3u;
+    valid.forward_sends = 3u;
+    for (u32& access_record : valid.access_records) access_record = 1u;
+    for (const char* target : {"/healthz/", "/health", "/"}) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\n" +
+                                    "Host: 127.0.0.1:" + std::to_string(kBackendPort) + "\r\n\r\n";
+        valid.forward_history.emplace_back(request.begin(), request.end());
+    }
+    if (!validate_bounded_no_content_path_observation(valid, kBackendPort, error)) return false;
+
+    const auto require_rejection = [&](const char* name,
+                                       const BoundedExactLocalPathOracleObservation& mutated) {
+        std::string detail;
+        if (!validate_bounded_no_content_path_observation(mutated, kBackendPort, detail))
+            return true;
+        error = std::string("#328 observation mutation accepted: ") + name;
+        return false;
+    };
+    const std::vector<char> retry = valid.forward_history.front();
+    BoundedExactLocalPathOracleObservation mutated = valid;
+    mutated.local_accepts = 1u;
+    if (!require_rejection("local-accept", mutated)) return false;
+    mutated = valid;
+    mutated.local_requests = 1u;
+    if (!require_rejection("local-request", mutated)) return false;
+    mutated = valid;
+    mutated.local_sends = 1u;
+    if (!require_rejection("local-send", mutated)) return false;
+    mutated = valid;
+    mutated.local_history.push_back(retry);
+    if (!require_rejection("local-history", mutated)) return false;
+    mutated = valid;
+    mutated.forward_accepts = 4u;
+    if (!require_rejection("fallback-accept", mutated)) return false;
+    mutated = valid;
+    mutated.forward_requests = 4u;
+    if (!require_rejection("fallback-request", mutated)) return false;
+    mutated = valid;
+    mutated.forward_sends = 4u;
+    if (!require_rejection("fallback-send", mutated)) return false;
+    mutated = valid;
+    mutated.forward_history.push_back(retry);
+    if (!require_rejection("fourth-forward", mutated)) return false;
+    mutated = valid;
+    mutated.forward_history[1] = retry;
+    if (!require_rejection("fallback-retry", mutated)) return false;
+    return true;
+}
+
 static bool run_pinned_bounded_no_content_path_oracle(
     const std::string& container_prefix,
     BoundedExactLocalPathOracleObservation& exact_first,
@@ -6028,30 +6149,10 @@ static bool run_pinned_bounded_no_content_path_oracle(
         root_first.access_records[i] = 1;
     }
 
-    const std::vector<char> expected_local(kExactLocalReturn204ResponseNormalized,
-                                           kExactLocalReturn204ResponseNormalized + 105u);
-    const std::vector<char> expected_fallback(
-        kSuccessResponseNormalized,
-        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
     for (const BoundedExactLocalPathOracleObservation* observation : {&exact_first, &root_first}) {
-        if (observation->wires.size() != 5u || observation->forward_history.size() != 3u ||
-            observation->local_accepts != 0 || observation->local_requests != 0 ||
-            observation->local_sends != 0 || observation->forward_accepts != 3 ||
-            observation->forward_requests != 3 || observation->forward_sends != 3) {
-            error =
-                "#328 order lacked exact five-vector, settled zero-upstream, or three-episode "
-                "evidence";
+        if (!validate_bounded_no_content_path_observation(
+                *observation, observation == &exact_first ? ports[1] : ports[3], error))
             return false;
-        }
-        for (size_t i = 0; i < 5u; i++) {
-            std::vector<char> normalized = observation->wires[i];
-            if (!normalize_date(normalized) ||
-                normalized != (i < 2u ? expected_local : expected_fallback)) {
-                error =
-                    "#328 response wire was not the exact Date-normalized 204/fallback baseline";
-                return false;
-            }
-        }
     }
     const auto canonical_history = [](const std::vector<std::vector<char>>& history) {
         std::vector<std::vector<char>> result = history;
@@ -18005,6 +18106,10 @@ int main(int argc, char** argv) {
         }
         if (!run_bounded_no_content_path_wire_self_checks(parser_error)) {
             std::cerr << "FAIL [#328 bounded wire self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (!run_bounded_no_content_path_observation_self_checks(parser_error)) {
+            std::cerr << "FAIL [#328 bounded observation self-check]: " << parser_error << "\n";
             return 1;
         }
     }
