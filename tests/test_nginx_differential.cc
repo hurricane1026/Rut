@@ -29647,6 +29647,7 @@ struct ExactLoopbackReturn204Observation {
     bool local_upstream_quiet = false;
     bool negative_probe_after_failed = false;
     bool negative_probe_after_quiet = false;
+    bool clean_lifecycle = false;
 };
 
 static constexpr char kExactLoopbackReturn204Host[] = "loopback-return204.example";
@@ -29761,22 +29762,34 @@ static bool parse_exact_loopback_return204_access(const std::string& contents,
     return true;
 }
 
+static bool parse_exact_loopback_return204_rut_access(
+    const std::string& contents,
+    ExactLoopbackReturn204Observation& observation,
+    std::string& error);
+
 static bool validate_exact_loopback_return204_observation(
     const ExactLoopbackReturn204Observation& observation, std::string& error) {
-    if (observation.side != "pinned-nginx" ||
+    if ((observation.side != "pinned-nginx" && observation.side != "converter-generated-rut") ||
         (observation.order != "exact-before-root" && observation.order != "root-before-exact")) {
-        error = "#348 observation lost its pinned-nginx side or declaration order";
+        error = "#348 observation lost its bounded side or declaration order";
         return false;
     }
     const bool exact_first = observation.order == "exact-before-root";
-    if (!validate_exact_loopback_return204_config(observation.config,
-                                                  observation.frontend_port,
-                                                  observation.backend_port,
-                                                  exact_first,
-                                                  observation.access_scope,
-                                                  observation.access_path,
-                                                  error))
+    if (observation.side == "pinned-nginx") {
+        if (!validate_exact_loopback_return204_config(observation.config,
+                                                      observation.frontend_port,
+                                                      observation.backend_port,
+                                                      exact_first,
+                                                      observation.access_scope,
+                                                      observation.access_path,
+                                                      error))
+            return false;
+    } else if (observation.config !=
+               make_exact_loopback_return204_fragment(
+                   observation.frontend_port, observation.backend_port, exact_first)) {
+        error = "#348 generated observation did not retain its exact nginx input fragment";
         return false;
+    }
     if (observation.frontend_port == 0u || observation.backend_port == 0u ||
         observation.frontend_port == observation.backend_port ||
         observation.negative_port != observation.frontend_port ||
@@ -29785,7 +29798,7 @@ static bool validate_exact_loopback_return204_observation(
         !observation.negative_guard_blocked_wildcard_bind || !observation.readiness_quiet ||
         !observation.negative_probe_before_failed || !observation.negative_probe_before_quiet ||
         !observation.local_upstream_quiet || !observation.negative_probe_after_failed ||
-        !observation.negative_probe_after_quiet) {
+        !observation.negative_probe_after_quiet || !observation.clean_lifecycle) {
         error =
             "#348 observation did not prove exact .1 scope with a persistent non-listening .2 "
             "guard and side-effect-free refusal probes";
@@ -29825,21 +29838,35 @@ static bool validate_exact_loopback_return204_observation(
         error = "#348 upstream request line/Host/omitted-Connection wire was not exact";
         return false;
     }
-    if (observation.access_scope.empty() ||
-        observation.local_access_record !=
-            exact_loopback_return204_local_access(observation.access_scope) ||
-        observation.fallback_access_record !=
-            exact_loopback_return204_fallback_access(observation.access_scope,
-                                                     observation.backend_port)) {
+    if (observation.access_scope.empty() || observation.local_access_record.empty() ||
+        observation.fallback_access_record.empty() ||
+        (observation.side == "pinned-nginx" &&
+         (observation.local_access_record !=
+              exact_loopback_return204_local_access(observation.access_scope) ||
+          observation.fallback_access_record !=
+              exact_loopback_return204_fallback_access(observation.access_scope,
+                                                       observation.backend_port)))) {
         error = "#348 observation access inventory was not exact";
         return false;
+    }
+    if (observation.side == "converter-generated-rut") {
+        ExactLoopbackReturn204Observation parsed = observation;
+        const std::string access =
+            observation.local_access_record + "\n" + observation.fallback_access_record + "\n";
+        if (!parse_exact_loopback_return204_rut_access(access, parsed, error) ||
+            parsed.local_access_record != observation.local_access_record ||
+            parsed.fallback_access_record != observation.fallback_access_record) {
+            if (error.empty()) error = "#348 generated access inventory was not exact";
+            return false;
+        }
     }
     return true;
 }
 
 static bool validate_exact_loopback_return204_pair(
     const ExactLoopbackReturn204Observation (&observations)[2], std::string& error) {
-    if (observations[0].order != "exact-before-root" ||
+    if (observations[0].side != "pinned-nginx" || observations[1].side != "pinned-nginx" ||
+        observations[0].order != "exact-before-root" ||
         observations[1].order != "root-before-exact") {
         error = "#348 oracle pair did not retain both accepted declaration orders";
         return false;
@@ -30077,6 +30104,7 @@ static bool run_exact_loopback_return204_oracle_self_checks(std::string& error) 
         value.readiness_quiet = value.negative_probe_before_failed =
             value.negative_probe_before_quiet = value.local_upstream_quiet =
                 value.negative_probe_after_failed = value.negative_probe_after_quiet = true;
+        value.clean_lifecycle = true;
     }
     if (!validate_exact_loopback_return204_pair(valid, error)) return false;
     const auto rejects = [&](const char* label,
@@ -30150,6 +30178,9 @@ static bool run_exact_loopback_return204_oracle_self_checks(std::string& error) 
     mutated[0] = valid[0];
     mutated[0].negative_probe_after_quiet = false;
     if (!rejects("negative-after-side-effect", mutated)) return false;
+    mutated[0] = valid[0];
+    mutated[0].clean_lifecycle = false;
+    if (!rejects("clean-lifecycle", mutated)) return false;
     mutated[0] = valid[0];
     mutated[0].temp_path = mutated[1].temp_path;
     if (!rejects("shared-resource", mutated)) return false;
@@ -30435,6 +30466,7 @@ static bool capture_pinned_exact_loopback_return204_side(
             return false;
         }
     }
+    observation.clean_lifecycle = true;
     return validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348") &&
            validate_exact_loopback_return204_observation(observation, error);
 }
@@ -30521,6 +30553,557 @@ static void dump_exact_loopback_return204_observation(
 static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword) {
     const std::string prefix = std::string(keyword) + " ";
     return (source.rfind(prefix, 0u) == 0u ? 1u : 0u) + count_text(source, "\n" + prefix);
+}
+
+static constexpr char kExactLoopbackReturn204Route[] =
+    "route exact slash_normalized GET \"/static\" { return local_response({\n"
+    "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+    "\"nginx/1.29.7\",\n"
+    "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+    "  head_mode: \"suppress_body\", body: b\"\"\n"
+    "}) }\n";
+
+static bool validate_exact_loopback_return204_generated_source(const std::string& source,
+                                                               u16 frontend_port,
+                                                               u16 backend_port,
+                                                               std::string& error) {
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    if (source.rfind(listener, 0u) != 0u || count_text(source, listener) != 1u ||
+        wildcard_listen_source_declarations(source, "listen") != 1u ||
+        count_text(source, upstream) != 1u ||
+        wildcard_listen_source_declarations(source, "upstream") != 1u ||
+        wildcard_listen_source_declarations(source, "pre_route") != 1u ||
+        count_text(source, kStaticQueryCanonicalTraceHook) != 1u ||
+        wildcard_listen_source_declarations(source, "route") != 4u ||
+        count_text(source, kExactLoopbackReturn204Route) != 1u ||
+        count_text(source, "route HEAD \"/\" {\n") != 1u ||
+        count_text(source, "route GET \"/\" {\n") != 1u ||
+        count_text(source, "\nroute \"/\" {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
+        count_text(source, "            host: \"upstream\",\n") != 3u ||
+        count_text(source, "            connection: \"omit\",\n") != 3u ||
+        count_text(source,
+                   "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+                   "\"Expect\", \"Upgrade\"]\n") != 3u ||
+        count_text(source, "        response_policy: {\n") != 3u ||
+        count_text(source, "        failure_policy: {\n") != 3u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 1u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 1u ||
+        wildcard_listen_source_declarations(source, "unmatched") != 3u ||
+        count_text(source, "unmatched OPTIONS {") != 1u ||
+        count_text(source, "unmatched CONNECT {") != 1u ||
+        count_text(source, "\nunmatched {") != 1u || source.find("listen :") != std::string::npos ||
+        source.find("127.0.0.2") != std::string::npos ||
+        source.find("0.0.0.0") != std::string::npos || source.find("*:") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("bind_address") != std::string::npos ||
+        source.find("local_address") != std::string::npos ||
+        source.find("req.listener") != std::string::npos ||
+        source.find("address_condition") != std::string::npos) {
+        error =
+            "#348 generated source was not exactly one ordinary exact listener, one upstream, "
+            "canonical TRACE policy, one exact 204 route and three root-forward routes";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_exact_loopback_return204_rut_access(
+    const std::string& contents,
+    ExactLoopbackReturn204Observation& observation,
+    std::string& error) {
+    std::vector<std::string> records;
+    if (observation.side != "converter-generated-rut" || observation.forward_history.size() != 1u ||
+        !split_exact_complete_log(contents, 2u, "#348 generated RUT access log", records, error))
+        return false;
+    std::vector<std::string> local;
+    std::vector<std::string> fallback;
+    if (!split_space_fields(records[0], local) || local.size() != 9u ||
+        !exact_log_timestamp(local[0]) || local[1] != "GET" || local[2] != "/static" ||
+        !decimal_field_equals(local[3], 204u) || !exact_log_duration(local[4]) ||
+        !decimal_field_equals(local[5], sizeof(kExactLoopbackReturn204LocalRequest) - 1u) ||
+        !decimal_field_equals(local[6], observation.local_wire.size()) || local[7] != "127.0.0.1" ||
+        local[8] != "s=0") {
+        error = "#348 generated local access record lost its exact current-RUT inventory";
+        return false;
+    }
+    // #347 records the known semantic boundary: on a forwarded request RUT's
+    // field 5 is the rewritten upstream wire size, not nginx $request_length.
+    if (!split_space_fields(records[1], fallback) || fallback.size() != 11u ||
+        !exact_log_timestamp(fallback[0]) || fallback[1] != "GET" || fallback[2] != "/" ||
+        !decimal_field_equals(fallback[3], 200u) || !exact_log_duration(fallback[4]) ||
+        !decimal_field_equals(fallback[5], observation.forward_history[0].size()) ||
+        !decimal_field_equals(fallback[6], observation.fallback_wire.size()) ||
+        fallback[7] != "127.0.0.1" || fallback[8] != "nginx_upstream" ||
+        !exact_log_duration(fallback[9]) || fallback[10] != "s=0") {
+        error = "#348 generated fallback access record lost its exact current-RUT inventory";
+        return false;
+    }
+    observation.local_access_record = records[0];
+    observation.fallback_access_record = records[1];
+    return true;
+}
+
+static bool capture_generated_exact_loopback_return204_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& process_identity,
+    bool exact_first,
+    const char* rut_path,
+    ExactLoopbackReturn204Observation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* negative_reservation,
+    int* backend_reservation) {
+    if (frontend_reservation == nullptr || negative_reservation == nullptr ||
+        backend_reservation == nullptr || *frontend_reservation < 0 || *negative_reservation < 0 ||
+        *backend_reservation < 0 || rut_path == nullptr || rut_path[0] != '/' ||
+        access(rut_path, X_OK) != 0 ||
+        !validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348")) {
+        if (error.empty())
+            error = "#348 generated capture requires three held endpoints and absolute RUT";
+        return false;
+    }
+    observation = ExactLoopbackReturn204Observation{};
+    observation.side = "converter-generated-rut";
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity = process_identity;
+    observation.access_scope =
+        "rut-nginx-348-generated-" + observation.order + "-" + std::to_string(frontend_port);
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+    observation.negative_port = frontend_port;
+    observation.negative_guard_stream = true;
+    observation.negative_guard_cloexec = true;
+    observation.negative_guard_non_listening = true;
+    observation.config =
+        make_exact_loopback_return204_fragment(frontend_port, backend_port, exact_first);
+
+    std::string borrowed_fragment = observation.config;
+    {
+        const auto parsed = rut::nginx::parse(
+            {borrowed_fragment.data(), static_cast<u32>(borrowed_fragment.size())});
+        if (!parsed) {
+            error = "#348 exact composition failed the genuine nginx parser";
+            return false;
+        }
+        const auto& server = parsed.value();
+        const std::string listen_value = "127.0.0.1:" + std::to_string(frontend_port);
+        const std::string listen_directive = "listen " + listen_value + ";";
+        const std::string proxy_directive =
+            "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+        const size_t server_offset = borrowed_fragment.find("server {");
+        const size_t server_close = borrowed_fragment.rfind('}');
+        const size_t listen_offset = borrowed_fragment.find(listen_directive);
+        const size_t listen_value_offset = borrowed_fragment.find(listen_value);
+        const size_t root_offset = borrowed_fragment.find("location / {");
+        const size_t root_close = borrowed_fragment.find('}', root_offset);
+        const size_t root_path = borrowed_fragment.find('/', root_offset);
+        const size_t proxy_offset = borrowed_fragment.find(proxy_directive);
+        const size_t exact_offset = borrowed_fragment.find("location = /static");
+        const size_t exact_close = borrowed_fragment.find('}', exact_offset);
+        const size_t exact_path = borrowed_fragment.find("/static", exact_offset);
+        const size_t return_offset = borrowed_fragment.find("return 204;", exact_offset);
+        const size_t status_offset = borrowed_fragment.find("204", return_offset);
+        const u32 exact_line = exact_first ? 3u : 4u;
+        const u32 root_line = exact_first ? 4u : 3u;
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
+        const auto line_of = [&](size_t offset) {
+            return static_cast<u32>(1u + std::count(borrowed_fragment.begin(),
+                                                    borrowed_fragment.begin() + offset,
+                                                    '\n'));
+        };
+        const auto col_of = [&](size_t offset) {
+            const size_t line_start =
+                borrowed_fragment.rfind('\n', offset == 0u ? 0u : offset - 1u);
+            return static_cast<u32>(offset -
+                                    (line_start == std::string::npos ? 0u : line_start + 1u) + 1u);
+        };
+        const auto same_source = [&](rut::Str value, rut::Span span) {
+            return value.ptr != nullptr && span.end >= span.start &&
+                   span.end - span.start == value.len &&
+                   reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+        };
+        if (server_offset == std::string::npos || server_close == std::string::npos ||
+            listen_offset == std::string::npos || listen_value_offset == std::string::npos ||
+            root_offset == std::string::npos || root_close == std::string::npos ||
+            root_path == std::string::npos || proxy_offset == std::string::npos ||
+            exact_offset == std::string::npos || exact_close == std::string::npos ||
+            exact_path == std::string::npos || return_offset == std::string::npos ||
+            status_offset == std::string::npos || server.span.start != server_offset ||
+            server.span.end != server_close + 1u || server.span.line != 1u ||
+            server.span.col != 3u || server.listen.address != rut::ListenerAddress::IPv4Exact ||
+            server.listen.ipv4_host != 0x7f000001u || server.listen.port != frontend_port ||
+            !server.listen.value.eq({listen_value.data(), static_cast<u32>(listen_value.size())}) ||
+            !same_source(server.listen.value, server.listen.value_span) ||
+            server.listen.span.start != listen_offset ||
+            server.listen.span.end != listen_offset + listen_directive.size() ||
+            server.listen.span.line != 2u || server.listen.span.col != 5u ||
+            server.listen.value_span.start != listen_value_offset ||
+            server.listen.value_span.end != listen_value_offset + listen_value.size() ||
+            server.listen.value_span.line != 2u || server.listen.value_span.col != 12u ||
+            !server.location.path.eq(rut::lit_str("/")) ||
+            !same_source(server.location.path, server.location.path_span) ||
+            server.location.path_span.start != root_path ||
+            server.location.path_span.end != root_path + 1u ||
+            server.location.path_span.line != line_of(root_path) ||
+            server.location.path_span.col != col_of(root_path) ||
+            server.location.span.start != root_offset ||
+            server.location.span.end != root_close + 1u || server.location.span.line != root_line ||
+            server.location.span.col != 5u ||
+            server.location.proxy_pass.span.start != proxy_offset ||
+            server.location.proxy_pass.span.end != proxy_offset + proxy_directive.size() ||
+            server.location.proxy_pass.span.line != root_line ||
+            server.location.proxy_pass.span.col != col_of(proxy_offset) ||
+            server.location.proxy_pass.address[0] != 127u ||
+            server.location.proxy_pass.address[1] != 0u ||
+            server.location.proxy_pass.address[2] != 0u ||
+            server.location.proxy_pass.address[3] != 1u ||
+            server.location.proxy_pass.port != backend_port || server.location.proxy_pass.has_uri ||
+            !server.exact_no_content_return.present ||
+            !server.exact_no_content_return.path.eq(rut::lit_str("/static")) ||
+            !same_source(server.exact_no_content_return.path,
+                         server.exact_no_content_return.path_span) ||
+            server.exact_no_content_return.path_span.start != exact_path ||
+            server.exact_no_content_return.path_span.end != exact_path + 7u ||
+            server.exact_no_content_return.path_span.line != line_of(exact_path) ||
+            server.exact_no_content_return.path_span.col != col_of(exact_path) ||
+            server.exact_no_content_return.span.start != exact_offset ||
+            server.exact_no_content_return.span.end != exact_close + 1u ||
+            server.exact_no_content_return.span.line != exact_line ||
+            server.exact_no_content_return.span.col != 5u ||
+            server.exact_no_content_return.response.status != 204u ||
+            server.exact_no_content_return.response.span.start != return_offset ||
+            server.exact_no_content_return.response.span.end != return_offset + 11u ||
+            server.exact_no_content_return.response.span.line != line_of(return_offset) ||
+            server.exact_no_content_return.response.span.col != col_of(return_offset) ||
+            server.exact_no_content_return.response.status_span.start != status_offset ||
+            server.exact_no_content_return.response.status_span.end != status_offset + 3u ||
+            server.exact_no_content_return.response.status_span.line != line_of(status_offset) ||
+            server.exact_no_content_return.response.status_span.col != col_of(status_offset) ||
+            server.pre_route_trace.profile !=
+                rut::nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405 ||
+            server.pre_route_trace.span.start != server.span.start ||
+            server.pre_route_trace.span.end != server.span.end ||
+            server.pre_route_trace.span.line != server.span.line ||
+            server.pre_route_trace.span.col != server.span.col ||
+            server.exact_local_return.present || server.exact_absolute_redirect.present) {
+            error = "#348 genuine model lost exact listener/root/action/common-source provenance";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(server);
+        if (!lowered) {
+            error = "#348 genuine combined model failed ordinary-RUT lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        generated_source.assign(output.ptr, output.len);
+        if (!validate_exact_loopback_return204_generated_source(
+                generated_source, frontend_port, backend_port, error) ||
+            !write_file(temp.source, output.ptr, output.len)) {
+            if (error.empty()) error = "#348 failed to persist generated ordinary RUT";
+            return false;
+        }
+    }
+    std::fill(borrowed_fragment.begin(), borrowed_fragment.end(), '\0');
+    if (!std::all_of(borrowed_fragment.begin(), borrowed_fragment.end(), [](char byte) {
+            return byte == 0;
+        })) {
+        error = "#348 failed to destroy borrowed nginx input before public loading";
+        return false;
+    }
+
+    {
+        rut::LoadedProgram program{};
+        struct ProgramGuard {
+            rut::LoadedProgram* program;
+            ~ProgramGuard() { program->destroy(); }
+        } guard{&program};
+        rut::LoadError load_error{};
+        if (!rut::load_rut_program(
+                temp.source.c_str(), program, load_error, rut::jit::OptLevel::O0)) {
+            char detail[512]{};
+            rut::format_load_error(load_error, detail, sizeof(detail));
+            error = std::string("#348 generated source failed public lex/parse/load: ") + detail;
+            return false;
+        }
+        const auto exact = program.config.match_exact_strict_local_response_views(
+            rut::lit_str("/static"), rut::lit_str("/static"), rut::kRouteMethodGet);
+        u32 head_routes = 0u;
+        u32 get_routes = 0u;
+        u32 any_routes = 0u;
+        bool root_routes_owned = true;
+        for (u32 i = 0u; i < program.config.route_count; i++) {
+            const auto& route = program.config.routes[i];
+            root_routes_owned = root_routes_owned && route.path_len == 1u && route.path[0] == '/' &&
+                                route.action == rut::RouteAction::JitHandler &&
+                                !route.needs_req_body;
+            if (route.method == rut::kRouteMethodHead) head_routes++;
+            if (route.method == rut::kRouteMethodGet) get_routes++;
+            if (route.method == rut::kRouteMethodAny) any_routes++;
+        }
+        if (!program.has_listener || !program.listener.valid() ||
+            program.listener.address != rut::ListenerAddress::IPv4Exact ||
+            program.listener.transport != rut::ListenerTransport::Cleartext ||
+            program.listener.ipv4_host != 0x7f000001u || program.listener.port != frontend_port ||
+            program.rir.module.upstream_count != 1u || program.config.upstream_count != 1u ||
+            program.rir.module.func_count != 3u || program.config.route_count != 3u ||
+            !root_routes_owned || head_routes != 1u || get_routes != 1u || any_routes != 1u ||
+            program.config.exact_strict_local_response_binding_count != 1u ||
+            !program.config.strict_local_response_table_is_valid() ||
+            program.config.pre_route_policy_id(rut::kRouteMethodTrace) == 0u ||
+            program.config.unmatched_policy_ids[rut::kRouteMethodOptions] == 0u ||
+            program.config.unmatched_policy_ids[rut::kRouteMethodConnect] == 0u ||
+            program.config.unmatched_policy_ids[rut::kRouteMethodAny] == 0u ||
+            exact.state != rut::ExactStrictLocalResponseMatchState::Match ||
+            !program.config.strict_local_response_policy_id_is_owned(exact.policy_id) ||
+            program.config.upstreams[0].addr_count != 1u ||
+            ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+            ntohs(program.config.upstreams[0].addrs[0].sin_port) != backend_port) {
+            error = "#348 public load lost owned exact listener/action/root-forward state";
+            return false;
+        }
+        const auto& policy = program.config.strict_local_response_policies[exact.policy_id - 1u];
+        if (rut::strict_local_response_policy_profile(policy) !=
+                rut::StrictLocalResponseProfile::NoContent204 ||
+            policy.status_code != 204u || !policy.reason.eq(rut::lit_str("No Content")) ||
+            !policy.server.eq(rut::lit_str("nginx/1.29.7")) || policy.content_type.len != 0u ||
+            policy.body.len != 0u) {
+            error = "#348 public load changed the normalized exact 204 policy";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#348 generated recorder could not bind its reserved backend port";
+        return false;
+    }
+
+    ChildGuard process;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348") ||
+        !exact_loopback_guard_blocks_wildcard_bind(
+            *negative_reservation, frontend_port, error, "#348") ||
+        !validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348"))
+        return false;
+    observation.negative_guard_blocked_wildcard_bind = true;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     process.child) ||
+        !wait_ready(frontend_port, process.child, error)) {
+        if (error.empty()) error = "#348 generated RUT failed before readiness";
+        return false;
+    }
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live(backend) && std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(process.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#348 generated frontend/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(backend)) {
+        error = "#348 generated recorder readiness timed out";
+        return false;
+    }
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const auto log_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < log_deadline) {
+        if (poll_child(process.child)) {
+            error = "#348 generated RUT exited before public lifecycle evidence";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#348 generated RUT lacked public load/io_uring/listener evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "# source overwritten after public load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "#348 failed to overwrite generated source after readiness";
+        return false;
+    }
+    std::string destroyed_readback;
+    if (!read_exact_return204_log(
+            temp.source, "#348 overwritten source", destroyed_readback, error) ||
+        destroyed_readback != kDestroyed) {
+        error = "#348 generated source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto observe_count = [&](u32 expected, std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        for (;;) {
+            if (poll_child(process.child) || !recorder_live(backend)) return false;
+            if (backend.accepted.load(std::memory_order_acquire) != expected ||
+                backend.requests.load(std::memory_order_acquire) != expected ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != expected)
+                return false;
+            if (std::chrono::steady_clock::now() >= deadline) return true;
+            usleep(5000);
+        }
+    };
+    const auto access_count_is = [&](u32 expected) {
+        u32 records = 0u;
+        return count_complete_access_records(temp.rut_access_log, records) && records == expected;
+    };
+    const auto wait_access_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!access_count_is(expected) && std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process.child) || !recorder_live(backend)) return false;
+            usleep(1000);
+        }
+        return access_count_is(expected);
+    };
+    const auto send_request = [&](const char* name,
+                                  const char* request,
+                                  bool header_only,
+                                  const char* expected,
+                                  std::vector<char>& wire) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, request, strlen(request)) ||
+            !(header_only ? read_head_response(client.fd, wire, detail)
+                          : read_response(client.fd, wire, detail)) ||
+            !read_eof(client.fd, detail) ||
+            !validate_exact_normalized_response(wire, expected, detail)) {
+            error = std::string("#348 generated ") + name + " response/EOF mismatch: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        return !poll_child(process.child);
+    };
+
+    if (!observe_count(0u, std::chrono::milliseconds(100)) || !access_count_is(0u)) {
+        error = "#348 generated readiness introduced an access/upstream side effect";
+        return false;
+    }
+    observation.readiness_quiet = true;
+    if (!exact_loopback_negative_connect_fails(frontend_port, error, "#348")) return false;
+    observation.negative_probe_before_failed = true;
+    if (!observe_count(0u, std::chrono::milliseconds(150)) || !access_count_is(0u)) {
+        error = "#348 generated pre-request .2 probe changed access/upstream inventory";
+        return false;
+    }
+    observation.negative_probe_before_quiet = true;
+    if (!send_request("local 204",
+                      kExactLoopbackReturn204LocalRequest,
+                      true,
+                      kExactLocalReturn204ResponseNormalized,
+                      observation.local_wire) ||
+        !observe_count(0u, std::chrono::milliseconds(500)) || !wait_access_count(1u)) {
+        if (error.empty()) error = "#348 generated local 204 changed upstream/access inventory";
+        return false;
+    }
+    observation.local_upstream_quiet = true;
+    if (!send_request("root fallback",
+                      kExactLoopbackReturn204FallbackRequest,
+                      false,
+                      kSuccessResponseNormalized,
+                      observation.fallback_wire))
+        return false;
+    const auto episode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < episode_deadline && recorder_live(backend) &&
+           !poll_child(process.child)) {
+        const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+        const u32 requests = backend.requests.load(std::memory_order_acquire);
+        const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+        if (accepts > 1u || requests > 1u || sends > 1u ||
+            (accepts == 1u && requests == 1u && sends == 1u))
+            break;
+        usleep(1000);
+    }
+    if (!observe_count(1u, std::chrono::milliseconds(500)) || !wait_access_count(2u)) {
+        error = "#348 generated root fallback did not settle at one episode/two access records";
+        return false;
+    }
+    if (!exact_loopback_negative_connect_fails(frontend_port, error, "#348")) return false;
+    observation.negative_probe_after_failed = true;
+    if (!observe_count(1u, std::chrono::milliseconds(300)) || !access_count_is(2u)) {
+        error = "#348 generated post-request .2 probe changed access/upstream inventory";
+        return false;
+    }
+    observation.negative_probe_after_quiet = true;
+    if (!validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348") ||
+        !stop_child(process.child)) {
+        if (error.empty()) error = "#348 generated RUT did not stop cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(backend) || observation.forward_history.size() != 1u) {
+        error = "#348 generated recorder did not settle at one clean episode/no retry";
+        return false;
+    }
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(
+            temp.rut_access_log, "#348 generated RUT access log", access_contents, error) ||
+        !parse_exact_loopback_return204_rut_access(access_contents, observation, error) ||
+        !read_exact_return204_log(
+            temp.rut_log, "#348 generated RUT runtime log", runtime_contents, error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error) ||
+        !validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#348"))
+        return false;
+    observation.clean_lifecycle = true;
+    return validate_exact_loopback_return204_observation(observation, error);
 }
 
 static bool validate_wildcard_listen_generated_source(
@@ -31817,6 +32400,434 @@ static bool run_converter_wildcard_listen_differential(
     return validate_wildcard_listen_four_way(observations, generated_sources, error, profile);
 }
 
+static bool validate_exact_loopback_return204_four_way(
+    const ExactLoopbackReturn204Observation (&observations)[4],
+    const std::string (&generated_sources)[2],
+    std::string& error) {
+    static constexpr const char* kSides[] = {
+        "pinned-nginx", "pinned-nginx", "converter-generated-rut", "converter-generated-rut"};
+    static constexpr const char* kOrders[] = {
+        "exact-before-root", "root-before-exact", "exact-before-root", "root-before-exact"};
+    u16 ports[8]{};
+    const std::string* resources[24]{};
+    size_t resource_count = 0u;
+    for (size_t side = 0u; side < 4u; side++) {
+        ports[side * 2u] = observations[side].frontend_port;
+        ports[side * 2u + 1u] = observations[side].backend_port;
+        if (observations[side].side != kSides[side] || observations[side].order != kOrders[side] ||
+            !validate_exact_loopback_return204_observation(observations[side], error))
+            return false;
+        for (const std::string* resource : {&observations[side].temp_path,
+                                            &observations[side].config_path,
+                                            &observations[side].log_path,
+                                            &observations[side].access_path,
+                                            &observations[side].process_identity,
+                                            &observations[side].access_scope})
+            resources[resource_count++] = resource;
+    }
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        if (ports[i] == 0u) {
+            error = "#348 four-side endpoint was zero";
+            return false;
+        }
+        for (size_t j = i + 1u; j < std::size(ports); j++) {
+            if (ports[i] == ports[j]) {
+                error = "#348 nginx/generated sides shared a frontend/backend port";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0u; i < resource_count; i++) {
+        if (resources[i]->empty()) {
+            error = "#348 four-side resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < resource_count; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#348 nginx/generated sides shared a resource identity";
+                return false;
+            }
+        }
+    }
+    if (!validate_exact_loopback_return204_generated_source(
+            generated_sources[0], ports[4], ports[5], error) ||
+        !validate_exact_loopback_return204_generated_source(
+            generated_sources[1], ports[6], ports[7], error))
+        return false;
+    std::string canonical_sources[2] = {generated_sources[0], generated_sources[1]};
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string listener = "listen 127.0.0.1:" + std::to_string(ports[4u + side * 2u]);
+        const std::string upstream = "127.0.0.1:" + std::to_string(ports[5u + side * 2u]);
+        if (!canonicalize_unique_port(canonical_sources[side], listener, "listen EXACT:FRONTEND") ||
+            !canonicalize_unique_port(canonical_sources[side], upstream, "EXACT:BACKEND")) {
+            error = "#348 generated source endpoint canonicalization was not unique";
+            return false;
+        }
+    }
+    if (canonical_sources[0] != canonical_sources[1]) {
+        error = "#348 declaration order changed canonical ordinary RUT bytes";
+        return false;
+    }
+    const auto same_normalized = [](const std::vector<char>& lhs, const std::vector<char>& rhs) {
+        std::vector<char> left = lhs;
+        std::vector<char> right = rhs;
+        return normalize_date(left) && normalize_date(right) && left == right;
+    };
+    const auto canonical_upstream = [](const ExactLoopbackReturn204Observation& observation) {
+        if (observation.forward_history.size() != 1u) return std::string{};
+        std::string request(observation.forward_history[0].begin(),
+                            observation.forward_history[0].end());
+        const std::string port = std::to_string(observation.backend_port);
+        const size_t offset = request.find(port);
+        if (offset == std::string::npos ||
+            request.find(port, offset + port.size()) != std::string::npos)
+            return std::string{};
+        request.replace(offset, port.size(), "BACKEND");
+        return request;
+    };
+    const std::string canonical_history = canonical_upstream(observations[0]);
+    for (size_t side = 1u; side < 4u; side++) {
+        if (!same_normalized(observations[0].local_wire, observations[side].local_wire) ||
+            !same_normalized(observations[0].fallback_wire, observations[side].fallback_wire) ||
+            canonical_history.empty() ||
+            canonical_upstream(observations[side]) != canonical_history) {
+            error = "#348 four sides changed a normalized wire or canonical upstream request";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool make_exact_loopback_return204_generated_source(u16 frontend,
+                                                           u16 backend,
+                                                           bool exact_first,
+                                                           std::string& source) {
+    std::string fragment = make_exact_loopback_return204_fragment(frontend, backend, exact_first);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) return false;
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) return false;
+    source.assign(lowered.value().data, lowered.value().len);
+    return true;
+}
+
+static bool run_exact_loopback_return204_four_way_self_checks(std::string& error) {
+    static constexpr u16 kPorts[] = {
+        44101u, 44102u, 44103u, 44104u, 44105u, 44106u, 44107u, 44108u};
+    const auto observed_wire = [](const char* normalized, size_t size) {
+        std::vector<char> wire(normalized, normalized + size);
+        const std::string marker(29u, 'X');
+        const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        static constexpr char kDate[] = "Thu, 27 Aug 2026 01:02:03 GMT";
+        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        return wire;
+    };
+    ExactLoopbackReturn204Observation valid[4];
+    std::string sources[2];
+    for (size_t side = 0u; side < 4u; side++) {
+        auto& value = valid[side];
+        const bool generated = side >= 2u;
+        const bool exact_first = side % 2u == 0u;
+        value.side = generated ? "converter-generated-rut" : "pinned-nginx";
+        value.order = exact_first ? "exact-before-root" : "root-before-exact";
+        value.temp_path = "/tmp/348-four-" + std::to_string(side);
+        value.config_path = value.temp_path + (generated ? "/generated.rut" : "/nginx.conf");
+        value.log_path = value.temp_path + "/runtime.log";
+        value.access_path = value.temp_path + "/access.log";
+        value.process_identity = "348-process-" + std::to_string(side);
+        value.access_scope = "348-scope-" + std::to_string(side);
+        value.frontend_port = kPorts[side * 2u];
+        value.backend_port = kPorts[side * 2u + 1u];
+        value.negative_port = value.frontend_port;
+        value.config = generated ? make_exact_loopback_return204_fragment(
+                                       value.frontend_port, value.backend_port, exact_first)
+                                 : make_exact_loopback_return204_config(value.frontend_port,
+                                                                        value.backend_port,
+                                                                        exact_first,
+                                                                        value.access_scope,
+                                                                        value.access_path);
+        value.local_wire = observed_wire(kExactLocalReturn204ResponseNormalized, 105u);
+        value.fallback_wire =
+            observed_wire(kSuccessResponseNormalized, sizeof(kSuccessResponseNormalized) - 1u);
+        const std::string upstream = exact_loopback_return204_expected_upstream(value.backend_port);
+        value.forward_history.emplace_back(upstream.begin(), upstream.end());
+        value.forward_accepts = value.forward_requests = value.forward_sends = 1u;
+        if (generated) {
+            value.local_access_record =
+                "2026-08-27T01:02:03.004Z GET /static 204 1us " +
+                std::to_string(sizeof(kExactLoopbackReturn204LocalRequest) - 1u) +
+                " 105 127.0.0.1 s=0";
+            value.fallback_access_record = "2026-08-27T01:02:03.005Z GET / 200 2us " +
+                                           std::to_string(value.forward_history[0].size()) +
+                                           " 118 127.0.0.1 nginx_upstream 1us s=0";
+        } else {
+            value.local_access_record = exact_loopback_return204_local_access(value.access_scope);
+            value.fallback_access_record =
+                exact_loopback_return204_fallback_access(value.access_scope, value.backend_port);
+        }
+        value.negative_guard_stream = value.negative_guard_cloexec =
+            value.negative_guard_non_listening = value.negative_guard_blocked_wildcard_bind = true;
+        value.readiness_quiet = value.negative_probe_before_failed =
+            value.negative_probe_before_quiet = value.local_upstream_quiet =
+                value.negative_probe_after_failed = value.negative_probe_after_quiet =
+                    value.clean_lifecycle = true;
+    }
+    if (!make_exact_loopback_return204_generated_source(kPorts[4], kPorts[5], true, sources[0]) ||
+        !make_exact_loopback_return204_generated_source(kPorts[6], kPorts[7], false, sources[1]) ||
+        !validate_exact_loopback_return204_four_way(valid, sources, error))
+        return false;
+    const auto rejects_observation = [&](const char* label,
+                                         const ExactLoopbackReturn204Observation(&candidate)[4]) {
+        std::string detail;
+        if (!validate_exact_loopback_return204_four_way(candidate, sources, detail)) return true;
+        error = std::string("#348 four-way observation mutation was accepted: ") + label;
+        return false;
+    };
+    ExactLoopbackReturn204Observation mutated[4] = {valid[0], valid[1], valid[2], valid[3]};
+#define REJECT_348_FIELD(label, statement)                      \
+    do {                                                        \
+        mutated[2] = valid[2];                                  \
+        statement;                                              \
+        if (!rejects_observation(label, mutated)) return false; \
+    } while (false)
+    REJECT_348_FIELD("side", mutated[2].side = "pinned-nginx");
+    REJECT_348_FIELD("order", mutated[2].order = "root-before-exact");
+    REJECT_348_FIELD("local-wire", mutated[2].local_wire.back() = 'X');
+    REJECT_348_FIELD("fallback-wire", mutated[2].fallback_wire.back() = 'X');
+    REJECT_348_FIELD("upstream-history", mutated[2].forward_history[0].push_back('X'));
+    REJECT_348_FIELD("upstream-count", mutated[2].forward_sends = 2u);
+    REJECT_348_FIELD("guard", mutated[2].negative_guard_non_listening = false);
+    REJECT_348_FIELD("wildcard-causality", mutated[2].negative_guard_blocked_wildcard_bind = false);
+    REJECT_348_FIELD("readiness", mutated[2].readiness_quiet = false);
+    REJECT_348_FIELD("negative-before", mutated[2].negative_probe_before_failed = false);
+    REJECT_348_FIELD("negative-before-effects", mutated[2].negative_probe_before_quiet = false);
+    REJECT_348_FIELD("local-upstream", mutated[2].local_upstream_quiet = false);
+    REJECT_348_FIELD("negative-after", mutated[2].negative_probe_after_failed = false);
+    REJECT_348_FIELD("negative-after-effects", mutated[2].negative_probe_after_quiet = false);
+    REJECT_348_FIELD("lifecycle", mutated[2].clean_lifecycle = false);
+    REJECT_348_FIELD("access-order",
+                     std::swap(mutated[2].local_access_record, mutated[2].fallback_access_record));
+    REJECT_348_FIELD("shared-resource", mutated[2].temp_path = mutated[3].temp_path);
+#undef REJECT_348_FIELD
+    const auto rejects_access_mutation =
+        [&](const char* label, bool local, const std::string& from, const std::string& to) {
+            ExactLoopbackReturn204Observation candidate = valid[2];
+            std::string& record =
+                local ? candidate.local_access_record : candidate.fallback_access_record;
+            const std::string before = record;
+            const size_t offset = record.find(from);
+            if (from.empty() || from == to || offset == std::string::npos ||
+                record.find(from, offset + from.size()) != std::string::npos) {
+                error = std::string("#348 access mutation was not unique: ") + label;
+                return false;
+            }
+            record.replace(offset, from.size(), to);
+            if (record == before) {
+                error = std::string("#348 access mutation was a no-op: ") + label;
+                return false;
+            }
+            const std::string contents =
+                candidate.local_access_record + "\n" + candidate.fallback_access_record + "\n";
+            std::string detail;
+            if (!parse_exact_loopback_return204_rut_access(contents, candidate, detail))
+                return true;
+            error = std::string("#348 direct RUT access parser accepted mutation: ") + label;
+            return false;
+        };
+    const std::string local_sizes =
+        " 1us " + std::to_string(sizeof(kExactLoopbackReturn204LocalRequest) - 1u) + " 105 ";
+    const std::string fallback_sizes =
+        " 2us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ";
+    if (!rejects_access_mutation("local-access-status", true, " 204 ", " 200 ") ||
+        !rejects_access_mutation("local-access-request-size", true, local_sizes, " 1us 1 105 ") ||
+        !rejects_access_mutation("local-access-response-size", true, " 105 ", " 104 ") ||
+        !rejects_access_mutation("local-access-client", true, " 127.0.0.1 s=0", " 127.0.0.2 s=0") ||
+        !rejects_access_mutation("local-access-outcome", true, " s=0", " s=1") ||
+        !rejects_access_mutation("fallback-access-target", false, " GET / 200 ", " GET /x 200 ") ||
+        !rejects_access_mutation(
+            "fallback-access-request-size", false, fallback_sizes, " 2us 1 118 ") ||
+        !rejects_access_mutation(
+            "fallback-access-response-size",
+            false,
+            fallback_sizes,
+            " 2us " + std::to_string(valid[2].forward_history[0].size()) + " 117 ") ||
+        !rejects_access_mutation(
+            "fallback-access-upstream", false, " nginx_upstream ", " other_upstream ") ||
+        !rejects_access_mutation("fallback-access-client",
+                                 false,
+                                 " 127.0.0.1 nginx_upstream ",
+                                 " 127.0.0.2 nginx_upstream ") ||
+        !rejects_access_mutation("fallback-access-outcome", false, " s=0", " s=1"))
+        return false;
+
+    const auto rejects_source_structure = [&](const char* label, const std::string& candidate) {
+        std::string detail;
+        if (!candidate.empty() && candidate != sources[0] &&
+            !validate_exact_loopback_return204_generated_source(
+                candidate, kPorts[4], kPorts[5], detail))
+            return true;
+        error = std::string("#348 direct source structural validator accepted/no-op mutation: ") +
+                label;
+        return false;
+    };
+    const auto replace_once =
+        [&](std::string candidate, const std::string& from, const std::string& to) {
+            const size_t offset = candidate.find(from);
+            if (offset == std::string::npos || from == to ||
+                candidate.find(from, offset + from.size()) != std::string::npos)
+                return std::string{};
+            candidate.replace(offset, from.size(), to);
+            if (candidate == sources[0]) return std::string{};
+            return candidate;
+        };
+    const auto append_once = [&](const std::string& addition) {
+        if (addition.empty() || sources[0].find(addition) != std::string::npos)
+            return std::string{};
+        const std::string candidate = sources[0] + addition;
+        if (candidate == sources[0] || count_text(candidate, addition) != 1u) return std::string{};
+        return candidate;
+    };
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(kPorts[4]);
+    const std::string upstream = "127.0.0.1:" + std::to_string(kPorts[5]);
+    mutated[2] = valid[2];
+    mutated[2].frontend_port = valid[3].frontend_port;
+    mutated[2].negative_port = mutated[2].frontend_port;
+    mutated[2].config = make_exact_loopback_return204_fragment(
+        mutated[2].frontend_port, mutated[2].backend_port, true);
+    std::string shared_port_sources[2] = {
+        replace_once(
+            sources[0], listener, "listen 127.0.0.1:" + std::to_string(mutated[2].frontend_port)),
+        sources[1]};
+    std::string shared_port_error;
+    if (shared_port_sources[0].empty() ||
+        !validate_exact_loopback_return204_observation(mutated[2], shared_port_error) ||
+        !validate_exact_loopback_return204_generated_source(shared_port_sources[0],
+                                                            mutated[2].frontend_port,
+                                                            mutated[2].backend_port,
+                                                            shared_port_error) ||
+        validate_exact_loopback_return204_four_way(
+            mutated, shared_port_sources, shared_port_error)) {
+        error = "#348 isolated shared-port mutation did not reach/reject the uniqueness guard";
+        return false;
+    }
+    mutated[2] = valid[2];
+    std::string changed_trace = kStaticQueryCanonicalTraceHook;
+    const size_t trace_status = changed_trace.find("status: 405");
+    if (trace_status == std::string::npos ||
+        changed_trace.find("status: 405", trace_status + 1u) != std::string::npos) {
+        error = "#348 TRACE self-check fixture lost its unique status";
+        return false;
+    }
+    changed_trace.replace(trace_status, strlen("status: 405"), "status: 400");
+    for (const auto& mutation :
+         {std::pair<const char*, std::string>{
+              "wildcard-listener",
+              replace_once(sources[0], listener, "listen :" + std::to_string(kPorts[4]))},
+          {"wrong-listener-address",
+           replace_once(sources[0], listener, "listen 127.0.0.2:" + std::to_string(kPorts[4]))},
+          {"wrong-upstream", replace_once(sources[0], upstream, "127.0.0.1:1")},
+          {"missing-action", replace_once(sources[0], kExactLoopbackReturn204Route, "")},
+          {"missing-root-route", replace_once(sources[0], "route GET \"/\" {\n", "")},
+          {"wrong-trace", replace_once(sources[0], kStaticQueryCanonicalTraceHook, changed_trace)},
+          {"duplicate-listener", append_once("listen :1\n")},
+          {"extra-root-route", append_once("route \"/extra\" { return 400 }\n")},
+          {"workaround", append_once("# nginx_compat bind_address workaround\n")}}) {
+        if (mutation.second.empty() || !rejects_source_structure(mutation.first, mutation.second))
+            return false;
+    }
+
+    const std::string harmless = append_once("// harmless ordinary RUT formatting witness\n");
+    std::string harmless_error;
+    if (harmless.empty() || !validate_exact_loopback_return204_generated_source(
+                                harmless, kPorts[4], kPorts[5], harmless_error)) {
+        error = "#348 harmless source difference was not structurally accepted: " + harmless_error;
+        return false;
+    }
+    const auto harmless_lexed = rut::lex({harmless.data(), static_cast<u32>(harmless.size())});
+    if (!harmless_lexed) {
+        error = "#348 harmless source difference was not legal ordinary RUT syntax";
+        return false;
+    }
+    const auto harmless_parsed = rut::parse_file(harmless_lexed.value());
+    if (!harmless_parsed) {
+        error = "#348 harmless source difference did not parse as ordinary RUT";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> harmless_ast(harmless_parsed.value());
+    std::string harmless_sources[2] = {harmless, sources[1]};
+    if (harmless == sources[0] ||
+        validate_exact_loopback_return204_four_way(valid, harmless_sources, harmless_error)) {
+        error = "#348 canonical cross-order source equality accepted a harmless byte difference";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_exact_loopback_return204_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    ExactLoopbackReturn204Observation (&observations)[4],
+    std::string (&generated_sources)[2],
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#348 converter differential requires an executable absolute RUT path";
+        return false;
+    }
+    ExactLoopbackReservations reservations;
+    u16 generated_ports[4]{};
+    if (!reservations.reserve_side(0u, generated_ports[0], generated_ports[1]) ||
+        !reservations.reserve_side(3u, generated_ports[2], generated_ports[3])) {
+        error = "#348 could not retain generated .1/.2 frontend pairs and .1 backends";
+        return false;
+    }
+    for (size_t i = 0u; i < std::size(generated_ports); i++) {
+        for (size_t j = i + 1u; j < std::size(generated_ports); j++) {
+            if (generated_ports[i] == generated_ports[j]) {
+                error = "#348 generated sides reserved duplicate port numbers";
+                return false;
+            }
+        }
+    }
+    ExactLoopbackReturn204Observation oracle[2];
+    if (!run_pinned_exact_loopback_return204_oracle(container_prefix, oracle, error)) return false;
+    observations[0] = oracle[0];
+    observations[1] = oracle[1];
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].source == temps[1].source || temps[0].rut_log == temps[1].rut_log ||
+        temps[0].rut_access_log == temps[1].rut_access_log) {
+        error = "#348 could not create isolated generated-side resources";
+        return false;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t base = side * 3u;
+        const size_t port = side * 2u;
+        const std::string identity = std::string(rut_path) + " " + temps[side].source +
+                                     " listen:" + std::to_string(generated_ports[port]);
+        if (!capture_generated_exact_loopback_return204_side(generated_ports[port],
+                                                             generated_ports[port + 1u],
+                                                             temps[side],
+                                                             identity,
+                                                             side == 0u,
+                                                             rut_path,
+                                                             observations[side + 2u],
+                                                             generated_sources[side],
+                                                             error,
+                                                             &reservations.fds[base],
+                                                             &reservations.fds[base + 1u],
+                                                             &reservations.fds[base + 2u]))
+            return false;
+    }
+    if (reservations.fds[0] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        reservations.fds[5] >= 0 || reservations.fds[1] < 0 || reservations.fds[4] < 0 ||
+        !validate_exact_loopback_guard_fd(reservations.fds[1], generated_ports[0], error, "#348") ||
+        !validate_exact_loopback_guard_fd(reservations.fds[4], generated_ports[2], error, "#348")) {
+        if (error.empty()) error = "#348 generated captures did not retain both .2 guards";
+        return false;
+    }
+    return validate_exact_loopback_return204_four_way(observations, generated_sources, error);
+}
+
 static void dump_wildcard_listen_observation(const WildcardListenOracleObservation& observation,
                                              const char* issue = "#342") {
     std::cerr << issue << " side=" << observation.side << " order=" << observation.order
@@ -32470,6 +33481,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-asterisk-wildcard-listen-differential") == 0;
     const bool converter_exact_loopback_listen_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-loopback-listen-differential") == 0;
+    const bool converter_exact_loopback_return204_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-loopback-return204-differential") == 0;
     const bool bounded_exact_local_path_oracle =
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool bounded_no_content_path_oracle =
@@ -32572,7 +33585,8 @@ int main(int argc, char** argv) {
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !exact_loopback_return204_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
-         !converter_exact_loopback_listen_differential && !bounded_exact_local_path_oracle &&
+         !converter_exact_loopback_listen_differential &&
+         !converter_exact_loopback_return204_differential && !bounded_exact_local_path_oracle &&
          !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
          !trailing_slash_no_content_oracle && !max_boundary_no_content_oracle &&
          !bodyful_normalized_exact_oracle && !exact_local_body_space_oracle &&
@@ -32615,6 +33629,7 @@ int main(int argc, char** argv) {
         (converter_wildcard_listen_differential && argv[2][0] != '/') ||
         (converter_asterisk_wildcard_listen_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_listen_differential && argv[2][0] != '/') ||
+        (converter_exact_loopback_return204_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
@@ -32674,6 +33689,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-listen-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-loopback-return204-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
@@ -32962,11 +33980,16 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (exact_loopback_return204_oracle) {
+    if (exact_loopback_return204_oracle || converter_exact_loopback_return204_differential) {
         std::string self_check_error;
         if (!run_exact_loopback_return204_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#348 exact-loopback return204 oracle self-check]: "
                       << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_exact_loopback_return204_differential &&
+            !run_exact_loopback_return204_four_way_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#348 generated/four-side self-check]: " << self_check_error << "\n";
             return 1;
         }
     }
@@ -33013,7 +34036,8 @@ int main(int argc, char** argv) {
         converter_static_query_proxy_uri_differential ||
         converter_zero_suffix_static_query_proxy_uri_differential ||
         converter_wildcard_listen_differential || converter_asterisk_wildcard_listen_differential ||
-        converter_exact_loopback_listen_differential) {
+        converter_exact_loopback_listen_differential ||
+        converter_exact_loopback_return204_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -33497,6 +34521,40 @@ int main(int argc, char** argv) {
                "nginx $request_length and remains tracked by #347; excludes other addresses, "
                "options, listeners/servers, methods, bodies/framing, reuse/pipeline, failures, "
                "H1.0, H2, and TLS)\n";
+        return 0;
+    }
+
+    if (converter_exact_loopback_return204_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-348-exact-loopback-return204-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackReturn204Observation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_exact_loopback_return204_differential(
+                container_prefix, argv[2], observations, generated_sources, differential_error)) {
+            std::cerr << "FAIL [#348 converter exact-loopback return204 differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_exact_loopback_return204_observation(observation);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #348 exact listen 127.0.0.1:<port>, exact GET /static return 204 and "
+               "minimal root proxy in exactly listen/exact/root and listen/root/exact orders "
+               "traversed the genuine borrowed nginx parser/provenance model and converter into "
+               "canonical ordinary RUT. Two isolated pinned-nginx 1.29.7 sides and two "
+               "independently parsed/lowered public-CLI/io_uring RUT sides retained causal "
+               "same-port non-listening .2 guards, refused .2 before/after with zero side "
+               "effects, matched the Date-normalized 105-byte 204/no-body/EOF and 118-byte "
+               "200/CL2/ok/EOF wires, and emitted one byte-exact Host-rebuilt, "
+               "Connection-omitted upstream episode with no retry. Each side had exactly two "
+               "ordered access records and a clean lifecycle; generated owned listener/action/"
+               "root state survived source overwrite (nginx.conf was translated to ordinary "
+               "RUT, never loaded directly; nginx $request_length equivalence is excluded by "
+               "#347; bounded #348 composition only; excludes other listeners/addresses/paths/"
+               "methods/bodies/keep-alive/retries/failures/H1.0/H2/TLS)\n";
         return 0;
     }
 
