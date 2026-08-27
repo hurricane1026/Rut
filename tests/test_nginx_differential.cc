@@ -1,4 +1,7 @@
 #include "downstream_publication_gate.h"
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/parser.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "rut/runtime/io_event.h"
@@ -10,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25870,6 +25874,7 @@ static bool run_converter_normalized_exact_trailing_slash_differential(
 }
 
 struct StaticQueryProxyOracleObservation {
+    std::string side;
     std::string order;
     std::string temp_path;
     std::string config_path;
@@ -25881,6 +25886,8 @@ struct StaticQueryProxyOracleObservation {
     u32 forward_accepts = 0u;
     u32 forward_requests = 0u;
     u32 forward_sends = 0u;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
 };
 
 static constexpr const char* kStaticQueryClientTargets[2] = {
@@ -25905,17 +25912,32 @@ static std::vector<char> static_query_expected_upstream(const char* target, u16 
     return {request.begin(), request.end()};
 }
 
+static std::string make_static_query_proxy_fragment(u16 frontend_port,
+                                                    u16 backend_port,
+                                                    bool listen_first) {
+    const std::string listen = "  listen " + std::to_string(frontend_port) + ";\n";
+    const std::string location =
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "/v1/?fixed=1;\n"
+        "  }\n";
+    return "server {\n" + (listen_first ? listen + location : location + listen) + "}\n";
+}
+
 static bool validate_static_query_proxy_observation(
     const StaticQueryProxyOracleObservation& observation,
     u16 frontend_port,
     u16 backend_port,
     std::string& error) {
-    if ((observation.order != "listen-first" && observation.order != "location-first") ||
+    if ((observation.side != "pinned-nginx" && observation.side != "converter-generated-rut") ||
+        (observation.order != "listen-first" && observation.order != "location-first") ||
         frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        observation.frontend_port != frontend_port || observation.backend_port != backend_port ||
         observation.wires.size() != 2u || observation.forward_history.size() != 2u ||
         observation.forward_accepts != 2u || observation.forward_requests != 2u ||
         observation.forward_sends != 2u) {
-        error = "#339 nginx-only oracle observation lost its exact two-vector inventory";
+        error = "#339 static-query observation lost its exact side/order/two-vector inventory";
         return false;
     }
     const std::vector<char> expected_response(
@@ -25924,14 +25946,16 @@ static bool validate_static_query_proxy_observation(
     for (size_t i = 0u; i < 2u; i++) {
         std::vector<char> normalized = observation.wires[i];
         if (!normalize_date(normalized) || normalized != expected_response) {
-            error = "#339 nginx-only oracle downstream wire mismatch at vector " +
+            error = "#339 static-query observation downstream wire mismatch at vector " +
                     std::to_string(i + 1u);
             return false;
         }
         if (observation.forward_history[i] !=
             static_query_expected_upstream(kStaticQueryUpstreamTargets[i], backend_port)) {
-            error = "#339 nginx-only oracle upstream target/Host/header/order mismatch at vector " +
-                    std::to_string(i + 1u);
+            error =
+                "#339 static-query observation upstream target/Host/header/order mismatch at "
+                "vector " +
+                std::to_string(i + 1u);
             return false;
         }
     }
@@ -25981,7 +26005,8 @@ static bool validate_static_query_proxy_pair(
             }
         }
     }
-    if (observations[0].order != "listen-first" || observations[1].order != "location-first" ||
+    if (observations[0].side != "pinned-nginx" || observations[1].side != "pinned-nginx" ||
+        observations[0].order != "listen-first" || observations[1].order != "location-first" ||
         !validate_static_query_proxy_observation(observations[0], ports[0], ports[1], error) ||
         !validate_static_query_proxy_observation(observations[1], ports[2], ports[3], error))
         return false;
@@ -26050,12 +26075,15 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(u16 
                                                                             bool listen_first) {
     static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
     StaticQueryProxyOracleObservation value;
+    value.side = "pinned-nginx";
     value.order = listen_first ? "listen-first" : "location-first";
     value.temp_path = std::string("/tmp/339-") + (listen_first ? "listen" : "location");
     value.config_path = value.temp_path + "/nginx.conf";
     value.log_path = value.temp_path + "/nginx.log";
     value.access_path = value.temp_path + "/access.log";
     value.process_identity = std::string("process-339-") + value.order;
+    value.frontend_port = frontend_port;
+    value.backend_port = backend_port;
     value.forward_accepts = value.forward_requests = value.forward_sends = 2u;
     for (size_t i = 0u; i < 2u; i++) {
         std::vector<char> wire(
@@ -26265,12 +26293,15 @@ static bool capture_static_query_proxy_oracle_side(u16 frontend_port,
         return false;
     }
     observation = StaticQueryProxyOracleObservation{};
+    observation.side = "pinned-nginx";
     observation.order = listen_first ? "listen-first" : "location-first";
     observation.temp_path = temp.path;
     observation.config_path = temp.nginx_config;
     observation.log_path = temp.nginx_log;
     observation.access_path = temp.nginx_access_log;
     observation.process_identity = process_identity;
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
     observation.wires.resize(2u);
 
     std::vector<std::string> requests;
@@ -26294,15 +26325,8 @@ static bool capture_static_query_proxy_oracle_side(u16 frontend_port,
         }
     }
 
-    const std::string listen = "  listen " + std::to_string(frontend_port) + ";\n";
-    const std::string location =
-        "  location /api/ {\n"
-        "    proxy_pass http://127.0.0.1:" +
-        std::to_string(backend_port) +
-        "/v1/?fixed=1;\n"
-        "  }\n";
     const std::string fragment =
-        "server {\n" + (listen_first ? listen + location : location + listen) + "}\n";
+        make_static_query_proxy_fragment(frontend_port, backend_port, listen_first);
     const std::string scope =
         "rut-nginx-339-static-query-" + observation.order + "-" + std::to_string(getpid());
     const std::string config =
@@ -26591,9 +26615,853 @@ static bool run_pinned_static_query_proxy_oracle(const std::string& container_pr
     return true;
 }
 
+static constexpr char kStaticQueryCanonicalTraceHook[] =
+    "pre_route TRACE { return local_response({\n"
+    "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+    "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+    "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+    "Allowed</title></head>\\r\\n"
+    "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+    "}) }\n";
+
+static bool validate_static_query_proxy_generated_source(const std::string& source,
+                                                         u16 frontend_port,
+                                                         u16 backend_port,
+                                                         std::string& error) {
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kTransform[] =
+        "            strip_prefix: \"/api/\",\n"
+        "            replace_prefix: \"/v1/?fixed=1\"\n";
+    const u32 route_declarations =
+        (source.rfind("route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nroute ");
+    const u32 pre_route_declarations =
+        (source.rfind("pre_route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\npre_route ");
+    if (count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
+        count_text(source, "route \"/api\" {\n") != 1u || route_declarations != 1u ||
+        pre_route_declarations != 1u || count_text(source, kStaticQueryCanonicalTraceHook) != 1u ||
+        count_text(source, "    if req.method == GET && req.pathOnly == \"/api\" {\n") != 1u ||
+        count_text(source, "target_path: \"/api/\"") != 1u ||
+        count_text(source, kTransform) != 1u || count_text(source, "strip_prefix:") != 1u ||
+        count_text(source, "replace_prefix:") != 1u || count_text(source, "/v1/?fixed=1") != 1u ||
+        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
+        count_text(source, "query: \"preserve_raw\"") != 1u ||
+        count_text(source, "host: \"upstream\"") != 1u || count_text(source, "route \"") != 1u ||
+        source.find("\nroute exact ") != std::string::npos ||
+        source.rfind("route exact ", 0u) == 0u ||
+        source.find("route \"/api?") != std::string::npos ||
+        source.find("route \"/api/") != std::string::npos ||
+        source.find("req.host") != std::string::npos ||
+        source.find("req.headers") != std::string::npos ||
+        source.find("route raw") != std::string::npos ||
+        source.find("req.rawTarget") != std::string::npos ||
+        source.find("path: \"raw\"") != std::string::npos ||
+        source.find("set_path:") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos) {
+        error =
+            "#339 generated source was not exactly one ordinary /api route and generic "
+            "/api/ -> /v1/?fixed=1 target transform";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_static_query_proxy_rut_access(
+    const std::string& contents,
+    const StaticQueryProxyOracleObservation& observation,
+    std::string& error) {
+    std::vector<std::string> records;
+    if (observation.side != "converter-generated-rut" || observation.wires.size() != 2u ||
+        observation.forward_history.size() != 2u ||
+        !split_exact_complete_log(
+            contents, 2u, "#339 converter-generated RUT access log", records, error))
+        return false;
+    for (size_t i = 0u; i < 2u; i++) {
+        std::vector<std::string> fields;
+        if (!split_space_fields(records[i], fields) || fields.size() != 11u ||
+            !exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
+            fields[2] != kStaticQueryClientTargets[i] || fields[3] != "200" ||
+            !decimal_field_equals(fields[3], 200u) || !exact_log_duration(fields[4]) ||
+            fields[5] != std::to_string(observation.forward_history[i].size()) ||
+            !decimal_field_equals(fields[5], observation.forward_history[i].size()) ||
+            fields[6] != std::to_string(observation.wires[i].size()) ||
+            !decimal_field_equals(fields[6], observation.wires[i].size()) ||
+            fields[7] != "127.0.0.1" || fields[8] != "nginx_upstream" ||
+            !exact_log_duration(fields[9]) || fields[10] != "s=0") {
+            error = "#339 generated access record " + std::to_string(i + 1u) +
+                    " lost Complete raw-target/order/status/size/upstream evidence: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool capture_generated_static_query_proxy_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& process_identity,
+    bool listen_first,
+    const char* rut_path,
+    StaticQueryProxyOracleObservation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    if (frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0 || rut_path == nullptr ||
+        rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#339 generated capture requires held endpoint reservations and an executable RUT";
+        return false;
+    }
+    observation = StaticQueryProxyOracleObservation{};
+    observation.side = "converter-generated-rut";
+    observation.order = listen_first ? "listen-first" : "location-first";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.source;
+    observation.log_path = temp.rut_log;
+    observation.access_path = temp.rut_access_log;
+    observation.process_identity = process_identity;
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+    observation.wires.resize(2u);
+
+    std::vector<std::string> requests;
+    for (const char* target : kStaticQueryClientTargets) {
+        requests.push_back(static_query_proxy_request(target));
+        const size_t end = requests.back().find("\r\n\r\n");
+        if (requests.back().rfind(std::string("GET ") + target + " HTTP/1.1\r\n", 0u) != 0u ||
+            requests.back().find("\r\nHost: static-query.example\r\n") == std::string::npos ||
+            requests.back().find("\r\nConnection: close\r\n") == std::string::npos ||
+            requests.back().find("\r\nContent-Length:") != std::string::npos ||
+            requests.back().find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests.back().find("\r\nTE:") != std::string::npos ||
+            requests.back().find("\r\nExpect:") != std::string::npos ||
+            requests.back().find("\r\nUpgrade:") != std::string::npos || end == std::string::npos ||
+            end + 4u != requests.back().size()) {
+            error =
+                "#339 generated request escaped the exact fresh bodyless explicit-close H1.1 "
+                "domain";
+            return false;
+        }
+    }
+
+    std::string borrowed_fragment =
+        make_static_query_proxy_fragment(frontend_port, backend_port, listen_first);
+    {
+        const auto parsed = rut::nginx::parse(
+            {borrowed_fragment.data(), static_cast<u32>(borrowed_fragment.size())});
+        if (!parsed) {
+            error = "#339 exact fragment failed the genuine nginx parser";
+            return false;
+        }
+        const auto& server = parsed.value();
+        const auto& location = server.location;
+        const auto& proxy = location.proxy_pass;
+        const size_t path_offset = borrowed_fragment.find("/api/");
+        const size_t uri_offset = borrowed_fragment.find("/v1/?fixed=1");
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
+        const auto same_source = [&](rut::Str value, rut::Span span) {
+            return value.ptr != nullptr && span.end >= span.start &&
+                   span.end - span.start == value.len &&
+                   reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+        };
+        if (path_offset == std::string::npos || uri_offset == std::string::npos ||
+            server.listen.port != frontend_port || !location.path.eq(rut::lit_str("/api/")) ||
+            location.path.ptr != borrowed_fragment.data() + path_offset ||
+            !same_source(location.path, location.path_span) || !proxy.has_uri ||
+            !proxy.uri.eq(rut::lit_str("/v1/?fixed=1")) ||
+            proxy.uri.ptr != borrowed_fragment.data() + uri_offset ||
+            !same_source(proxy.uri, proxy.uri_span) || proxy.address[0] != 127u ||
+            proxy.address[1] != 0u || proxy.address[2] != 0u || proxy.address[3] != 1u ||
+            proxy.port != backend_port || server.exact_local_return.present ||
+            server.exact_no_content_return.present || server.exact_absolute_redirect.present) {
+            error = "#339 exact fragment lost borrowed path/static-query URI provenance";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(server);
+        if (!lowered) {
+            error = "#339 genuine semantic model failed ordinary-RUT lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        generated_source.assign(output.ptr, output.len);
+        if (!validate_static_query_proxy_generated_source(
+                generated_source, frontend_port, backend_port, error) ||
+            !write_file(temp.source, output.ptr, output.len))
+            return false;
+    }
+    std::fill(borrowed_fragment.begin(), borrowed_fragment.end(), '\0');
+    if (!std::all_of(borrowed_fragment.begin(), borrowed_fragment.end(), [](char byte) {
+            return byte == 0;
+        })) {
+        error = "#339 failed to destroy borrowed nginx input before public load/runtime";
+        return false;
+    }
+
+    {
+        rut::LoadedProgram program{};
+        struct ProgramGuard {
+            rut::LoadedProgram* program;
+            ~ProgramGuard() { program->destroy(); }
+        } guard{&program};
+        rut::LoadError load_error{};
+        if (!rut::load_rut_program(
+                temp.source.c_str(), program, load_error, rut::jit::OptLevel::O0)) {
+            char detail[512]{};
+            rut::format_load_error(load_error, detail, sizeof(detail));
+            error = std::string("#339 generated source failed public lex/parse/load: ") + detail;
+            return false;
+        }
+        if (!program.has_listener || program.listener.port != frontend_port ||
+            program.rir.module.target_transform_count != 1u ||
+            program.config.target_transform_count != 1u ||
+            !program.config.target_transforms[0].strip_prefix.eq(rut::lit_str("/api/")) ||
+            !program.config.target_transforms[0].replace_prefix.eq(rut::lit_str("/v1/?fixed=1"))) {
+            error = "#339 public load lost listener or its one owned generic target transform";
+            return false;
+        }
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 2u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#339 generated recorder could not bind its reserved backend port";
+        return false;
+    }
+
+    ChildGuard process;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    if (!spawn_child({rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0",
+                      "--access-log",
+                      temp.rut_access_log},
+                     temp.rut_log,
+                     process.child) ||
+        !wait_ready(frontend_port, process.child, error)) {
+        if (error.empty()) error = "#339 converter-generated RUT failed before readiness";
+        return false;
+    }
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live(backend) && std::chrono::steady_clock::now() < recorder_deadline) {
+        if (poll_child(process.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#339 generated frontend/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(backend)) {
+        error = "#339 generated recorder readiness timed out";
+        return false;
+    }
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const auto log_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < log_deadline) {
+        if (poll_child(process.child)) {
+            error = "#339 generated RUT exited before public load/io_uring/listener evidence";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#339 generated RUT lacked exact public load/io_uring/listener evidence";
+        return false;
+    }
+    static constexpr char kDestroyed[] = "destroyed-after-339-rut-load\n";
+    if (!write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u)) {
+        error = "#339 failed to overwrite generated source after runtime load";
+        return false;
+    }
+    std::string destroyed_readback;
+    if (!read_exact_return204_log(
+            temp.source, "#339 destroyed generated source", destroyed_readback, error) ||
+        destroyed_readback != kDestroyed) {
+        error = "#339 generated source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto observe_count =
+        [&](u32 expected, const char* phase, std::chrono::milliseconds duration) {
+            const auto deadline = std::chrono::steady_clock::now() + duration;
+            for (;;) {
+                if (poll_child(process.child) || !recorder_live(backend)) {
+                    error = std::string("#339 generated frontend/recorder stopped during ") + phase;
+                    return false;
+                }
+                if (backend.accepted.load(std::memory_order_acquire) != expected ||
+                    backend.requests.load(std::memory_order_acquire) != expected ||
+                    backend.response_send_all_calls.load(std::memory_order_acquire) != expected) {
+                    error = std::string("#339 generated unexpected upstream count during ") + phase;
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) return true;
+                usleep(5000);
+            }
+        };
+    const auto wait_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process.child) || !recorder_live(backend)) return false;
+            const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = backend.requests.load(std::memory_order_acquire);
+            const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests_seen > expected || sends > expected) return false;
+            if (accepts == expected && requests_seen == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    if (!observe_count(0u, "pre-request zero window", std::chrono::milliseconds(100))) return false;
+    for (size_t i = 0u; i < 2u; i++) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[i].data(), requests[i].size()) ||
+            !read_response(client.fd, observation.wires[i], detail) ||
+            !read_eof(client.fd, detail)) {
+            error = "#339 generated vector " + std::string(kStaticQueryClientTargets[i]) +
+                    " response/zero-tail/EOF failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        std::vector<char> normalized = observation.wires[i];
+        const std::vector<char> expected(
+            kSuccessResponseNormalized,
+            kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "#339 generated vector " + std::string(kStaticQueryClientTargets[i]) +
+                    " did not match exact Date-normalized 200/CL2/ok wire";
+            return false;
+        }
+        if (!wait_count(static_cast<u32>(i + 1u)) ||
+            !observe_count(static_cast<u32>(i + 1u),
+                           "ordered transform episode",
+                           std::chrono::milliseconds(100))) {
+            error = "#339 generated transform episode did not settle without retry";
+            return false;
+        }
+    }
+    if (!observe_count(2u, "live no-third/retry window", std::chrono::milliseconds(500)) ||
+        !stop_child(process.child)) {
+        error = "#339 generated frontend did not survive controlled shutdown";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 2u || observation.forward_requests != 2u ||
+        observation.forward_sends != 2u ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire) ||
+        observation.forward_history.size() != 2u) {
+        error = "#339 generated recorder did not settle at exactly two clean episodes";
+        return false;
+    }
+    if (!validate_static_query_proxy_observation(observation, frontend_port, backend_port, error))
+        return false;
+
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(
+            temp.rut_access_log, "#339 generated RUT access log", access_contents, error) ||
+        !parse_static_query_proxy_rut_access(access_contents, observation, error) ||
+        !read_exact_return204_log(
+            temp.rut_log, "#339 generated RUT runtime log", runtime_contents, error) ||
+        !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
+        return false;
+    return true;
+}
+
+static bool validate_static_query_proxy_four_way(
+    const StaticQueryProxyOracleObservation observations[4],
+    const std::string generated_sources[2],
+    std::string& error) {
+    static constexpr const char* kSides[4] = {
+        "pinned-nginx", "pinned-nginx", "converter-generated-rut", "converter-generated-rut"};
+    static constexpr const char* kOrders[4] = {
+        "listen-first", "location-first", "listen-first", "location-first"};
+    u16 ports[8]{};
+    for (size_t side = 0u; side < 4u; side++) {
+        ports[side * 2u] = observations[side].frontend_port;
+        ports[side * 2u + 1u] = observations[side].backend_port;
+        if (observations[side].side != kSides[side] || observations[side].order != kOrders[side] ||
+            !validate_static_query_proxy_observation(
+                observations[side], ports[side * 2u], ports[side * 2u + 1u], error))
+            return false;
+    }
+    for (size_t i = 0u; i < 8u; i++) {
+        if (ports[i] == 0u) {
+            error = "#339 four-side validator received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#339 nginx/generated sides shared a frontend/backend port";
+                return false;
+            }
+        }
+    }
+    if (!validate_static_query_proxy_generated_source(
+            generated_sources[0], ports[4], ports[5], error) ||
+        !validate_static_query_proxy_generated_source(
+            generated_sources[1], ports[6], ports[7], error))
+        return false;
+
+    const std::string* resources[20];
+    size_t resource_count = 0u;
+    for (size_t side = 0u; side < 4u; side++) {
+        const auto& observation = observations[side];
+        for (const std::string* resource : {&observation.temp_path,
+                                            &observation.config_path,
+                                            &observation.log_path,
+                                            &observation.access_path,
+                                            &observation.process_identity})
+            resources[resource_count++] = resource;
+    }
+    for (size_t i = 0u; i < resource_count; i++) {
+        if (resources[i]->empty()) {
+            error = "#339 four-side resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < resource_count; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#339 nginx/generated sides shared a resource identity";
+                return false;
+            }
+        }
+    }
+
+    std::string canonical_sources[2] = {generated_sources[0], generated_sources[1]};
+    for (size_t side = 0u; side < 2u; side++) {
+        if (!canonicalize_unique_port(canonical_sources[side],
+                                      ":" + std::to_string(ports[4u + side * 2u]),
+                                      ":FRONTEND") ||
+            !canonicalize_unique_port(canonical_sources[side],
+                                      "127.0.0.1:" + std::to_string(ports[5u + side * 2u]),
+                                      "127.0.0.1:BACKEND")) {
+            error = "#339 generated source port canonicalization was missing or duplicate";
+            return false;
+        }
+    }
+    if (canonical_sources[0] != canonical_sources[1]) {
+        error = "#339 declaration orders generated different ordinary RUT source bytes";
+        return false;
+    }
+
+    for (size_t vector = 0u; vector < 2u; vector++) {
+        std::vector<char> canonical_wires[4];
+        for (size_t side = 0u; side < 4u; side++) {
+            canonical_wires[side] = observations[side].wires[vector];
+            if (!normalize_date(canonical_wires[side])) {
+                error = "#339 four-side wire lacked one strict Date at vector " +
+                        std::to_string(vector + 1u);
+                return false;
+            }
+        }
+        for (size_t side = 1u; side < 4u; side++) {
+            if (canonical_wires[0] != canonical_wires[side]) {
+                error = "#339 four-side Date-normalized downstream mismatch at vector " +
+                        std::to_string(vector + 1u);
+                return false;
+            }
+        }
+    }
+
+    std::vector<std::string> canonical_histories[4];
+    for (size_t side = 0u; side < 4u; side++) {
+        for (const auto& bytes : observations[side].forward_history) {
+            std::string history(bytes.begin(), bytes.end());
+            if (!canonicalize_unique_port(
+                    history,
+                    "127.0.0.1:" + std::to_string(observations[side].backend_port),
+                    "127.0.0.1:BACKEND")) {
+                error = "#339 four-side backend port canonicalization was missing or duplicate";
+                return false;
+            }
+            canonical_histories[side].push_back(std::move(history));
+        }
+    }
+    for (size_t side = 1u; side < 4u; side++) {
+        if (canonical_histories[0] != canonical_histories[side]) {
+            error = "#339 nginx/generated canonical upstream histories differed";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_static_query_proxy_differential_self_checks(std::string& error) {
+    static constexpr u16 kPorts[8] = {
+        54500u, 54501u, 54502u, 54503u, 54504u, 54505u, 54506u, 54507u};
+    StaticQueryProxyOracleObservation values[4] = {
+        make_static_query_proxy_self_check(kPorts[0], kPorts[1], true),
+        make_static_query_proxy_self_check(kPorts[2], kPorts[3], false),
+        make_static_query_proxy_self_check(kPorts[4], kPorts[5], true),
+        make_static_query_proxy_self_check(kPorts[6], kPorts[7], false)};
+    for (size_t side = 2u; side < 4u; side++) {
+        values[side].side = "converter-generated-rut";
+        values[side].temp_path = "/tmp/339-rut-" + values[side].order;
+        values[side].config_path = values[side].temp_path + "/generated.rut";
+        values[side].log_path = values[side].temp_path + "/rut.log";
+        values[side].access_path = values[side].temp_path + "/rut-access.log";
+        values[side].process_identity = "process-339-rut-" + values[side].order;
+    }
+
+    std::string sources[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string input = make_static_query_proxy_fragment(
+            kPorts[4u + side * 2u], kPorts[5u + side * 2u], side == 0u);
+        const auto parsed = rut::nginx::parse({input.data(), static_cast<u32>(input.size())});
+        if (!parsed) {
+            error = "#339 self-check fixture failed genuine nginx parsing";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            error = "#339 self-check fixture failed genuine ordinary-RUT lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        sources[side].assign(output.ptr, output.len);
+    }
+    if (!validate_static_query_proxy_four_way(values, sources, error)) return false;
+
+    const auto unique_replace = [&](const std::string& canonical,
+                                    const std::string& from,
+                                    const std::string& to,
+                                    std::string& candidate,
+                                    const char* name) {
+        const size_t first = canonical.find(from);
+        if (from.empty() || from == to || first == std::string::npos ||
+            canonical.find(from, first + from.size()) != std::string::npos) {
+            error = std::string("#339 unique mutation precondition failed: ") + name;
+            return false;
+        }
+        candidate = canonical;
+        candidate.replace(first, from.size(), to);
+        if (candidate == canonical) {
+            error =
+                std::string("#339 unique mutation did not change its canonical fixture: ") + name;
+            return false;
+        }
+        return true;
+    };
+
+    const auto rejects_four_way = [&](StaticQueryProxyOracleObservation mutated[4],
+                                      const std::string changed_sources[2],
+                                      const char* name) {
+        std::string detail;
+        if (!validate_static_query_proxy_four_way(mutated, changed_sources, detail)) return true;
+        error = std::string("#339 four-side mutation accepted: ") + name;
+        return false;
+    };
+    StaticQueryProxyOracleObservation mutated[4];
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[2].wires[0].back() = 'X';
+    if (!rejects_four_way(mutated, sources, "nginx-generated-wire-mismatch")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].forward_history[0] = static_query_expected_upstream("/v1/?fixed=1users", kPorts[7]);
+    if (!rejects_four_way(mutated, sources, "cross-side-query-loss")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].temp_path = mutated[0].temp_path;
+    if (!rejects_four_way(mutated, sources, "cross-side-resource-sharing")) return false;
+
+    // Keep every single-side and source-shape gate valid while introducing a
+    // duplicate frontend port. The four-way rejection therefore reaches the
+    // all-eight-port uniqueness check instead of failing on stale Host/source
+    // evidence first.
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[3].frontend_port = mutated[0].frontend_port;
+    std::string shared_port_sources[2] = {sources[0], sources[1]};
+    if (!unique_replace(sources[1],
+                        "listen :" + std::to_string(kPorts[6]) + "\n",
+                        "listen :" + std::to_string(kPorts[0]) + "\n",
+                        shared_port_sources[1],
+                        "shared-frontend-port-source"))
+        return false;
+    std::string mutation_detail;
+    if (!validate_static_query_proxy_observation(
+            mutated[3], mutated[3].frontend_port, mutated[3].backend_port, mutation_detail)) {
+        error = "#339 shared-port mutation did not preserve its single-side evidence: " +
+                mutation_detail;
+        return false;
+    }
+    if (!validate_static_query_proxy_generated_source(shared_port_sources[1],
+                                                      mutated[3].frontend_port,
+                                                      mutated[3].backend_port,
+                                                      mutation_detail)) {
+        error = "#339 shared-port mutation did not preserve its generated-source gate: " +
+                mutation_detail;
+        return false;
+    }
+    if (!rejects_four_way(mutated, shared_port_sources, "cross-side-port-sharing")) return false;
+
+    const auto rejects_source = [&](const std::string& source, const char* name) {
+        if (source == sources[0]) {
+            error = std::string("#339 source mutation was identical to canonical: ") + name;
+            return false;
+        }
+        std::string changed[2] = {source, sources[1]};
+        std::copy(std::begin(values), std::end(values), std::begin(mutated));
+        return rejects_four_way(mutated, changed, name);
+    };
+    const auto rejects_unique_source_mutation =
+        [&](const std::string& from, const std::string& to, const char* name) {
+            std::string candidate;
+            return unique_replace(sources[0], from, to, candidate, name) &&
+                   rejects_source(candidate, name);
+        };
+    static constexpr char kPreRouteMutation[] =
+        "pre_route OPTIONS { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: \"pre\",\n"
+        "  date: \"current\", content_type: \"\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    std::string pre_route_source;
+    if (!unique_replace(sources[0],
+                        kStaticQueryCanonicalTraceHook,
+                        std::string(kStaticQueryCanonicalTraceHook) + kPreRouteMutation,
+                        pre_route_source,
+                        "real-pre-route-hook"))
+        return false;
+    const u32 canonical_pre_routes = (sources[0].rfind("pre_route ", 0u) == 0u ? 1u : 0u) +
+                                     count_text(sources[0], "\npre_route ");
+    if (canonical_pre_routes != 1u ||
+        count_text(sources[0], kStaticQueryCanonicalTraceHook) != 1u ||
+        count_text(pre_route_source, kStaticQueryCanonicalTraceHook) != 1u ||
+        count_text(pre_route_source, "\npre_route OPTIONS { return local_response({\n") != 1u ||
+        pre_route_source.find("# pre_route") != std::string::npos) {
+        error = "#339 pre_route mutation was not one real line-anchored language hook";
+        return false;
+    }
+    const auto pre_route_lexed =
+        rut::lex({pre_route_source.data(), static_cast<u32>(pre_route_source.size())});
+    if (!pre_route_lexed) {
+        error = "#339 complete OPTIONS pre_route mutation failed in-memory RUT lexing";
+        return false;
+    }
+    const auto pre_route_ast = rut::parse_file(pre_route_lexed.value());
+    if (!pre_route_ast) {
+        const auto& diagnostic = pre_route_ast.error();
+        error = "#339 complete OPTIONS pre_route mutation failed in-memory RUT parsing at " +
+                std::to_string(diagnostic.span.line) + ":" + std::to_string(diagnostic.span.col) +
+                " code=" + std::to_string(static_cast<u32>(diagnostic.code));
+        if (diagnostic.detail.ptr != nullptr && diagnostic.detail.len != 0u)
+            error += " detail=" + std::string(diagnostic.detail.ptr, diagnostic.detail.len);
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> pre_route_ast_owned(pre_route_ast.value());
+    if (pre_route_ast_owned->pre_route_policy_ids[rut::kRouteMethodTrace] == 0u ||
+        pre_route_ast_owned->pre_route_policy_ids[rut::kRouteMethodOptions] == 0u) {
+        error = "#339 parsed pre_route mutation lost its distinct TRACE/OPTIONS policy tuples";
+        return false;
+    }
+    const auto pre_route_hir = rut::analyze_file(*pre_route_ast_owned);
+    if (!pre_route_hir) {
+        error = "#339 complete OPTIONS pre_route mutation failed in-memory RUT analysis";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> pre_route_hir_owned(pre_route_hir.value());
+    if (pre_route_hir_owned->pre_route_policy_ids[rut::kRouteMethodTrace] == 0u ||
+        pre_route_hir_owned->pre_route_policy_ids[rut::kRouteMethodOptions] == 0u) {
+        error = "#339 analyzed pre_route mutation lost its distinct TRACE/OPTIONS policy tuples";
+        return false;
+    }
+    if (!rejects_source(sources[0] + "route \"/extra\" { return response() }\n", "extra-route") ||
+        !rejects_source(sources[0] + "route exact GET \"/api/users?x=1\" { return response() }\n",
+                        "raw-exact-route") ||
+        !rejects_unique_source_mutation("replace_prefix: \"/v1/?fixed=1\"",
+                                        "replace_prefix: \"/v1/?fixed=2\"",
+                                        "wrong-replacement") ||
+        !rejects_unique_source_mutation(
+            "query: \"preserve_raw\"", "query: \"drop\"", "query-drop") ||
+        !rejects_source(pre_route_source, "real-pre-route-hook"))
+        return false;
+
+    std::string access;
+    for (size_t i = 0u; i < 2u; i++) {
+        access += "2026-08-26T21:13:05.248Z GET " + std::string(kStaticQueryClientTargets[i]) +
+                  " 200 361us " + std::to_string(values[2].forward_history[i].size()) + " " +
+                  std::to_string(values[2].wires[i].size()) +
+                  " 127.0.0.1 nginx_upstream 243us s=0\n";
+    }
+    if (!parse_static_query_proxy_rut_access(access, values[2], error)) return false;
+    const size_t first_end = access.find('\n');
+    if (first_end == std::string::npos) {
+        error = "#339 generated access self-check fixture was malformed";
+        return false;
+    }
+    const std::string first = access.substr(0u, first_end + 1u);
+    const std::string second = access.substr(first_end + 1u);
+    const auto rejects_access = [&](const std::string& candidate, const char* name) {
+        if (candidate == access) {
+            error = std::string("#339 access mutation was identical to canonical: ") + name;
+            return false;
+        }
+        std::string detail;
+        if (!parse_static_query_proxy_rut_access(candidate, values[2], detail)) return true;
+        error = std::string("#339 generated access mutation accepted: ") + name;
+        return false;
+    };
+    const auto rejects_first_record_mutation =
+        [&](const std::string& from, const std::string& to, const char* name) {
+            std::string changed_first;
+            if (!unique_replace(first, from, to, changed_first, name)) return false;
+            return rejects_access(changed_first + second, name);
+        };
+    const std::string first_sizes = " 361us " +
+                                    std::to_string(values[2].forward_history[0].size()) + " " +
+                                    std::to_string(values[2].wires[0].size()) + " 127.0.0.1";
+    const std::string wrong_response_sizes =
+        " 361us " + std::to_string(values[2].forward_history[0].size()) + " " +
+        std::to_string(values[2].wires[0].size() + 1u) + " 127.0.0.1";
+    if (!rejects_access(second, "missing-access") ||
+        !rejects_access(first + first, "duplicate-access") ||
+        !rejects_access(access + first, "extra-access") ||
+        !rejects_access(second + first, "reordered-access") ||
+        !rejects_first_record_mutation(
+            "GET /api/users?x=1 200", "GET /api/users 200", "raw-query-loss") ||
+        !rejects_first_record_mutation(
+            "/api/users?x=1 200 ", "/api/users?x=1 502 ", "wrong-http-status") ||
+        !rejects_first_record_mutation(first_sizes, wrong_response_sizes, "wrong-response-size") ||
+        !rejects_first_record_mutation(" nginx_upstream ", " other_upstream ", "wrong-upstream") ||
+        !rejects_first_record_mutation(" s=0\n", " s=1\n", "failed-stream"))
+        return false;
+    return true;
+}
+
+static bool run_converter_static_query_proxy_uri_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    StaticQueryProxyOracleObservation observations[4],
+    std::string generated_sources[2],
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#339 converter differential requires an executable absolute RUT path";
+        return false;
+    }
+    struct Reservations {
+        int fds[4];
+        Reservations() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~Reservations() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 generated_ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, generated_ports[i])) {
+            error = "#339 could not simultaneously bind-reserve four generated-side ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (generated_ports[i] == generated_ports[j]) {
+                error = "#339 generated sides bind-reserved duplicate ports";
+                return false;
+            }
+        }
+    }
+
+    // Keep all four generated ports bound while the oracle reserves and runs
+    // its four ports. This makes all eight four-side endpoint identities
+    // mutually exclusive rather than relying on sequential port allocation.
+    if (!run_pinned_static_query_proxy_oracle(
+            container_prefix, observations[0], observations[1], error))
+        return false;
+
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].source == temps[1].source || temps[0].rut_log == temps[1].rut_log ||
+        temps[0].rut_access_log == temps[1].rut_access_log) {
+        error = "#339 could not create independent generated-order resource trees";
+        return false;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t port = side * 2u;
+        const std::string identity = std::string(rut_path) + " " + temps[side].source +
+                                     " listen:" + std::to_string(generated_ports[port]);
+        if (!capture_generated_static_query_proxy_side(generated_ports[port],
+                                                       generated_ports[port + 1u],
+                                                       temps[side],
+                                                       identity,
+                                                       side == 0u,
+                                                       rut_path,
+                                                       observations[side + 2u],
+                                                       generated_sources[side],
+                                                       error,
+                                                       &reservations.fds[port],
+                                                       &reservations.fds[port + 1u]))
+            return false;
+    }
+    return validate_static_query_proxy_four_way(observations, generated_sources, error);
+}
+
 static void dump_static_query_proxy_oracle_observation(
     const StaticQueryProxyOracleObservation& observation) {
-    std::cerr << "#339 nginx-only static-query order=" << observation.order
+    std::cerr << "#339 " << observation.side << " static-query order=" << observation.order
               << " upstream=" << observation.forward_accepts << "/" << observation.forward_requests
               << "/" << observation.forward_sends << "\n";
     for (size_t i = 0u; i < observation.wires.size(); i++) {
@@ -26665,6 +27533,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-exact-local-return204-query-differential") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
+    const bool converter_static_query_proxy_uri_differential =
+        argc == 3 && strcmp(argv[1], "--converter-static-query-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
     const bool converter_max_proxy_prefix_differential =
@@ -26735,6 +27605,7 @@ int main(int argc, char** argv) {
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
          !converter_api_non_root_proxy_uri_differential &&
+         !converter_static_query_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_max_proxy_prefix_differential &&
          !converter_max_proxy_replacement_differential &&
@@ -26761,6 +27632,7 @@ int main(int argc, char** argv) {
         (converter_root_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
+        (converter_static_query_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
@@ -26839,6 +27711,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-static-query-proxy-uri-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-service-root-proxy-uri-differential "
@@ -27007,10 +27882,16 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (static_query_proxy_uri_oracle) {
+    if (static_query_proxy_uri_oracle || converter_static_query_proxy_uri_differential) {
         std::string self_check_error;
         if (!run_static_query_proxy_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#339 nginx-only static-query oracle self-check]: "
+                      << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_static_query_proxy_uri_differential &&
+            !run_static_query_proxy_differential_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#339 generated-source/access/four-side self-check]: "
                       << self_check_error << "\n";
             return 1;
         }
@@ -27046,7 +27927,8 @@ int main(int argc, char** argv) {
         converter_trailing_slash_no_content_differential ||
         converter_max_boundary_no_content_differential ||
         converter_bodyful_normalized_exact_differential ||
-        converter_max_proxy_prefix_differential || converter_max_proxy_replacement_differential) {
+        converter_max_proxy_prefix_differential || converter_max_proxy_replacement_differential ||
+        converter_static_query_proxy_uri_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -27606,6 +28488,42 @@ int main(int argc, char** argv) {
                "nginx-only oracle; no converter, generated-RUT, or runtime equivalence claim; "
                "excludes other queries, empty configured query, variables, percent encoding, "
                "methods, bodies, reuse, retries, H2, and TLS)\n";
+        return 0;
+    }
+
+    if (converter_static_query_proxy_uri_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-static-query-proxy-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        StaticQueryProxyOracleObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_static_query_proxy_uri_differential(
+                container_prefix, argv[2], observations, generated_sources, differential_error)) {
+            std::cerr << "FAIL [#339 converter-generated static-query proxy URI differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_static_query_proxy_oracle_observation(observation);
+            return 1;
+        }
+        std::cerr
+            << "PASS: both declaration orders of the exact /api/ nginx fragment with literal "
+               "proxy_pass replacement /v1/?fixed=1 traversed the genuine parser/provenance "
+               "model/converter into independently generated ordinary RUT with exactly one "
+               "generic target transform; two isolated pinned-nginx 1.29.7 sides and two "
+               "isolated public-CLI/io_uring RUT sides matched /api/users?x=1 -> "
+               "/v1/?fixed=1users?x=1 and /api/users -> /v1/?fixed=1users as byte-exact "
+               "Host-rebuilt, Connection-omitted ordered upstream histories, exact "
+               "Date-normalized 200/CL2/ok/close/zero-tail/EOF downstream wires, and exactly "
+               "two clean episodes with no third/retry; each side independently retained both "
+               "ordered original raw ingress targets through strict access-log capture, all "
+               "eight ports and all resource/process identities were disjoint, and generated "
+               "AST/RUT source/public-loader RIR ownership plus post-load source destruction "
+               "were exercised (#339 bounded converter equivalence only; excludes other static-"
+               "query grammar, empty configured query, variables, percent encoding, fragments, "
+               "other locations/methods, bodies/framing, reuse/pipeline, retries/failures, H2, "
+               "and TLS)\n";
         return 0;
     }
 
