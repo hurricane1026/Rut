@@ -17276,6 +17276,1079 @@ static bool run_converter_max_proxy_prefix_differential(const std::string& conta
     return validate_max_proxy_prefix_pair(observations, generated_source, ports, error);
 }
 
+static const std::string& max_proxy_replacement() {
+    static const std::string value = "/" + std::string(126u, 'R') + "/";
+    return value;
+}
+
+static std::string max_proxy_replacement_route_key() {
+    return "/api";
+}
+
+static std::vector<std::string> max_proxy_replacement_targets() {
+    return {"/api/", "/api/x", "/api/x?y=1", "/api", "/api?x=1"};
+}
+
+static std::string make_max_proxy_replacement_fragment(u16 frontend_port,
+                                                       const char* address,
+                                                       u16 backend_port) {
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) +
+           ";\n"
+           "  location " +
+           "/api/" +
+           " {\n"
+           "    proxy_pass http://" +
+           address + ":" + std::to_string(backend_port) + max_proxy_replacement() +
+           ";\n"
+           "  }\n"
+           "}\n";
+}
+
+struct MaxProxyReplacementObservation {
+    std::string side;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string access_path;
+    std::string process_identity;
+    std::vector<std::string> targets;
+    std::vector<size_t> request_sizes;
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> forward_history;
+    u32 forward_accepts = 0u;
+    u32 forward_requests = 0u;
+    u32 forward_sends = 0u;
+};
+
+static bool validate_max_proxy_replacement_generated_source(const std::string& source,
+                                                            u16 frontend_port,
+                                                            const char* address,
+                                                            u16 backend_port,
+                                                            std::string& error) {
+    const std::string& replacement = max_proxy_replacement();
+    const std::string route = max_proxy_replacement_route_key();
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string backend = "upstream nginx_upstream at \"" + std::string(address) + ":" +
+                                std::to_string(backend_port) + "\"";
+    const std::string route_binding = "route \"" + route + "\" {\n";
+    const std::string redirect_condition =
+        "    if req.method == GET && req.pathOnly == \"" + route + "\" {\n";
+    const std::string redirect_target = "target_path: \"/api/\"";
+    const std::string transform =
+        "            strip_prefix: \"/api/\",\n"
+        "            replace_prefix: \"" +
+        replacement + "\"";
+    if (count_text(source, listener) != 1u || count_text(source, backend) != 1u ||
+        count_text(source, route_binding) != 1u || count_text(source, "route \"") != 1u ||
+        count_text(source, redirect_condition) != 1u || count_text(source, redirect_target) != 1u ||
+        count_text(source, transform) != 1u || count_text(source, "strip_prefix:") != 1u ||
+        count_text(source, "replace_prefix:") != 1u || count_text(source, replacement) != 1u ||
+        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
+        count_text(source, "query: \"preserve_raw\"") != 1u ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos) {
+        error =
+            "#336 generated source was not exactly one /api route, slash redirect, and "
+            "128-byte replacement transform";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_max_proxy_replacement_nginx_access(
+    const std::string& contents,
+    const std::string& scope,
+    const MaxProxyReplacementObservation& observation,
+    u16 backend_port,
+    std::string& error) {
+    std::vector<std::string> records;
+    if (observation.targets != max_proxy_replacement_targets() ||
+        observation.request_sizes.size() != 5u || observation.wires.size() != 5u ||
+        !split_exact_complete_log(contents, 5u, "#336 pinned nginx access log", records, error))
+        return false;
+    for (size_t i = 0u; i < 5u; i++) {
+        const bool forward = i < 3u;
+        size_t cursor = 0u;
+        const auto take = [&](const std::string& expected) {
+            if (records[i].compare(cursor, expected.size(), expected) != 0) return false;
+            cursor += expected.size();
+            return true;
+        };
+        const std::string expected =
+            scope + " raw=\"GET " + observation.targets[i] +
+            " HTTP/1.1\" status=" + (forward ? "200" : "301") +
+            " request_size=" + std::to_string(observation.request_sizes[i]) +
+            " response_size=" + std::to_string(observation.wires[i].size()) +
+            " host=\"client.example\" upstream_addr=\"" +
+            (forward ? "127.0.0.1:" + std::to_string(backend_port) : "-") +
+            "\" upstream_status=" + (forward ? "200" : "-");
+        if (!take(expected) || cursor != records[i].size()) {
+            error =
+                "#336 pinned access record " + std::to_string(i + 1u) +
+                " lost raw target/order/status/request/response/upstream evidence: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_max_proxy_replacement_rut_access(
+    const std::string& contents,
+    const MaxProxyReplacementObservation& observation,
+    std::string& error) {
+    std::vector<std::string> records;
+    if (observation.targets != max_proxy_replacement_targets() ||
+        observation.request_sizes.size() != 5u || observation.wires.size() != 5u ||
+        !split_exact_complete_log(
+            contents, 5u, "#336 converter-generated RUT access log", records, error))
+        return false;
+    for (size_t i = 0u; i < 5u; i++) {
+        const bool forward = i < 3u;
+        std::vector<std::string> fields;
+        const size_t expected_fields = forward ? 11u : 9u;
+        const size_t expected_status = forward ? 200u : 301u;
+        if (!split_space_fields(records[i], fields) || fields.size() != expected_fields ||
+            !exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
+            fields[2] != observation.targets[i] || fields[3] != std::to_string(expected_status) ||
+            !decimal_field_equals(fields[3], expected_status) || !exact_log_duration(fields[4]) ||
+            fields[5] != std::to_string(observation.request_sizes[i]) ||
+            !decimal_field_equals(fields[5], observation.request_sizes[i]) ||
+            fields[6] != std::to_string(observation.wires[i].size()) ||
+            !decimal_field_equals(fields[6], observation.wires[i].size()) ||
+            fields[7] != "127.0.0.1" || (forward && fields[8] != "nginx_upstream") ||
+            (forward && !exact_log_duration(fields[9])) || fields[forward ? 10u : 8u] != "s=0") {
+            error = "#336 generated access record " + std::to_string(i + 1u) +
+                    " lost Complete target/order/status/size/upstream evidence: " + records[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validate_max_proxy_replacement_observation(
+    const MaxProxyReplacementObservation& observation,
+    u16 frontend_port,
+    u16 backend_port,
+    std::string& error) {
+    const auto expected_targets = max_proxy_replacement_targets();
+    if (max_proxy_replacement().size() != 128u || max_proxy_replacement_route_key() != "/api" ||
+        expected_targets[0].size() != 5u || expected_targets[1].size() != 6u ||
+        expected_targets[2].size() != 10u || expected_targets[3].size() != 4u ||
+        expected_targets[4].size() != 8u || max_proxy_replacement().size() + 1u != 129u ||
+        max_proxy_replacement().size() + 5u != 133u || observation.targets != expected_targets ||
+        observation.request_sizes.size() != 5u || observation.wires.size() != 5u ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || observation.forward_history.size() != 3u) {
+        error = "#336 observation lost its exact /api inventory or three growth episodes";
+        return false;
+    }
+    for (size_t i = 0u; i < 5u; i++) {
+        const size_t expected_access_request_size =
+            observation.side == "converter-generated-rut" && i < 3u
+                ? observation.forward_history[i].size()
+                : api_request(observation.targets[i].c_str()).size();
+        if (observation.request_sizes[i] != expected_access_request_size) {
+            error = "#336 observation request-size inventory was inconsistent";
+            return false;
+        }
+        std::vector<char> normalized = observation.wires[i];
+        const std::vector<char> expected =
+            i < 3u ? std::vector<char>(
+                         kSuccessResponseNormalized,
+                         kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                   : expected_clean_proxy_location_redirect(
+                         frontend_port, "/api/", i == 3u ? "" : "?x=1");
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "#336 observation wire/Location mismatch at vector " + std::to_string(i + 1u);
+            return false;
+        }
+    }
+    std::vector<std::vector<char>> expected_history;
+    const std::string transformed_targets[] = {
+        max_proxy_replacement(), max_proxy_replacement() + "x", max_proxy_replacement() + "x?y=1"};
+    if (transformed_targets[0].size() != 128u || transformed_targets[1].size() != 129u ||
+        transformed_targets[2].size() != 133u) {
+        error = "#336 transformed target inventory was not exactly 128/129/133 bytes";
+        return false;
+    }
+    for (const std::string& target : transformed_targets) {
+        const std::string request = std::string("GET ") + target +
+                                    " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                    "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error = "#336 growth transform history contained truncation, off-by-one, retry, or reorder";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_max_proxy_replacement_side(u16 frontend_port,
+                                               u16 backend_port,
+                                               TempDir& temp,
+                                               const std::string& process_identity,
+                                               const char* rut_path,
+                                               bool pinned_nginx,
+                                               MaxProxyReplacementObservation& observation,
+                                               std::string& generated_source,
+                                               std::string& error,
+                                               int* frontend_reservation,
+                                               int* backend_reservation) {
+    if (frontend_reservation == nullptr || backend_reservation == nullptr ||
+        *frontend_reservation < 0 || *backend_reservation < 0 ||
+        (!pinned_nginx &&
+         (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0))) {
+        error = "#336 capture requires held endpoint reservations and an executable public RUT";
+        return false;
+    }
+    observation = MaxProxyReplacementObservation{};
+    observation.side = pinned_nginx ? "pinned-nginx" : "converter-generated-rut";
+    observation.temp_path = temp.path;
+    observation.config_path = pinned_nginx ? temp.nginx_config : temp.source;
+    observation.log_path = pinned_nginx ? temp.nginx_log : temp.rut_log;
+    observation.access_path = pinned_nginx ? temp.nginx_access_log : temp.rut_access_log;
+    observation.process_identity = process_identity;
+    observation.targets = max_proxy_replacement_targets();
+    observation.wires.resize(5u);
+    observation.request_sizes.resize(5u);
+    std::vector<std::string> requests(5u);
+    for (size_t i = 0u; i < 5u; i++) {
+        requests[i] = api_request(observation.targets[i].c_str());
+        observation.request_sizes[i] = requests[i].size();
+        const size_t end = requests[i].find("\r\n\r\n");
+        if (requests[i].rfind("GET " + observation.targets[i] + " HTTP/1.1\r\n", 0u) != 0u ||
+            requests[i].find("\r\nHost: client.example\r\n") == std::string::npos ||
+            requests[i].find("\r\nConnection: close\r\n") == std::string::npos ||
+            requests[i].find("\r\nContent-Length:") != std::string::npos ||
+            requests[i].find("\r\nTransfer-Encoding:") != std::string::npos ||
+            requests[i].find("\r\nTE:") != std::string::npos ||
+            requests[i].find("\r\nExpect:") != std::string::npos ||
+            requests[i].find("\r\nUpgrade:") != std::string::npos || end == std::string::npos ||
+            end + 4u != requests[i].size()) {
+            error = "#336 request escaped the fresh bodyless explicit-close H1.1 GET domain";
+            return false;
+        }
+    }
+
+    const std::string access_scope =
+        "rut-nginx-336-max-replacement-" + observation.side + "-" + std::to_string(getpid());
+    std::string borrowed_fragment =
+        make_max_proxy_replacement_fragment(frontend_port, "127.0.0.1", backend_port);
+    if (pinned_nginx) {
+        const std::string config =
+            "error_log " + temp.nginx_log +
+            " notice;\nevents {}\nhttp {\n"
+            "  log_format max_proxy_replacement '" +
+            access_scope +
+            " raw=\"$request\" status=$status request_size=$request_length "
+            "response_size=$bytes_sent host=\"$host\" upstream_addr=\"$upstream_addr\" "
+            "upstream_status=$upstream_status';\n"
+            "  access_log " +
+            temp.nginx_access_log + " max_proxy_replacement;\n" + borrowed_fragment + "}\n";
+        if (!write_file(temp.nginx_config, config.data(), config.size())) {
+            error = "#336 failed to write pinned nginx maximum-replacement config";
+            return false;
+        }
+    } else {
+        const auto parsed = rut::nginx::parse(
+            {borrowed_fragment.data(), static_cast<u32>(borrowed_fragment.size())});
+        if (!parsed) {
+            error = "#336 accepted fragment did not traverse the independent nginx parser";
+            return false;
+        }
+        const auto& server = parsed.value();
+        const auto& location = server.location;
+        const auto& proxy = location.proxy_pass;
+        const size_t location_offset = borrowed_fragment.find("location ");
+        const size_t path_offset = borrowed_fragment.find("/api/", location_offset);
+        const size_t proxy_offset = borrowed_fragment.find("proxy_pass", path_offset);
+        const size_t uri_offset =
+            borrowed_fragment.find(max_proxy_replacement(), proxy_offset + strlen("proxy_pass"));
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
+        const auto same_source = [&](rut::Str value, rut::Span span) {
+            return value.ptr != nullptr && span.end >= span.start &&
+                   span.end - span.start == value.len &&
+                   reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
+        };
+        if (location_offset == std::string::npos || path_offset == std::string::npos ||
+            proxy_offset == std::string::npos || uri_offset == std::string::npos ||
+            server.listen.port != frontend_port || location.path.len != 5u ||
+            !location.path.eq(rut::lit_str("/api/")) ||
+            location.path.ptr != borrowed_fragment.data() + path_offset ||
+            !same_source(location.path, location.path_span) || !proxy.has_uri ||
+            proxy.uri.len != 128u || !proxy.uri.eq({max_proxy_replacement().data(), 128u}) ||
+            !same_source(proxy.uri, proxy.uri_span) ||
+            proxy.uri.ptr != borrowed_fragment.data() + uri_offset || proxy.address[0] != 127u ||
+            proxy.address[1] != 0u || proxy.address[2] != 0u || proxy.address[3] != 1u ||
+            proxy.port != backend_port || server.exact_local_return.present ||
+            server.exact_no_content_return.present || server.exact_absolute_redirect.present) {
+            error = "#336 fragment lost its borrowed /api path/128-byte URI provenance";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(server);
+        if (!lowered) {
+            error = "#336 genuine maximum-replacement semantic model failed ordinary-RUT lowering";
+            return false;
+        }
+        const rut::Str output = lowered.value().view();
+        generated_source.assign(output.ptr, output.len);
+        if (!validate_max_proxy_replacement_generated_source(
+                generated_source, frontend_port, "127.0.0.1", backend_port, error) ||
+            !write_file(temp.source, output.ptr, output.len))
+            return false;
+    }
+    std::fill(borrowed_fragment.begin(), borrowed_fragment.end(), '\0');
+    if (!std::all_of(borrowed_fragment.begin(), borrowed_fragment.end(), [](char byte) {
+            return byte == 0;
+        })) {
+        error = "#336 failed to destroy the borrowed nginx fragment before runtime use";
+        return false;
+    }
+
+    const auto recorder_live = [](const Recorder& recorder) {
+        return recorder.running.load(std::memory_order_acquire) &&
+               recorder.thread_alive.load(std::memory_order_acquire) &&
+               !recorder.listener_failed.load(std::memory_order_acquire);
+    };
+    struct RecorderGuard {
+        Recorder* recorder = nullptr;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    close(*backend_reservation);
+    *backend_reservation = -1;
+    if (!backend.setup(backend_port, 3u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "#336 recorder could not bind its reserved backend port";
+        return false;
+    }
+    ChildGuard process;
+    DockerGuard docker(process_identity);
+    docker.active = pinned_nginx;
+    close(*frontend_reservation);
+    *frontend_reservation = -1;
+    bool spawned = false;
+    if (pinned_nginx) {
+        spawned = spawn_child({"docker",
+                               "run",
+                               "--pull=never",
+                               "--network",
+                               "host",
+                               "--name",
+                               process_identity,
+                               "-v",
+                               temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                               "-v",
+                               std::string(temp.path) + ":" + temp.path,
+                               kNginxImage,
+                               "nginx",
+                               "-g",
+                               "daemon off;"},
+                              temp.nginx_log,
+                              process.child);
+    } else {
+        spawned = spawn_child({rut_path,
+                               temp.source,
+                               "--shards",
+                               "1",
+                               "--no-pin",
+                               "--drain",
+                               "0",
+                               "--access-log",
+                               temp.rut_access_log},
+                              temp.rut_log,
+                              process.child);
+    }
+    if (!spawned || !wait_ready(frontend_port, process.child, error)) {
+        if (error.empty()) error = "#336 frontend failed before readiness";
+        return false;
+    }
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder_live(backend) && std::chrono::steady_clock::now() < recorder_deadline) {
+        if (poll_child(process.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+            error = "#336 frontend/recorder failed before readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!recorder_live(backend)) {
+        error = "#336 recorder readiness timed out";
+        return false;
+    }
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+    if (!pinned_nginx) {
+        const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+                !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listener.c_str())) &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process.child)) {
+                error = "#336 RUT exited before exact public load/backend/listener evidence";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) {
+            error = "#336 RUT lacked exact public load/io_uring/listener evidence";
+            return false;
+        }
+    }
+    const std::string destroyed =
+        pinned_nginx ? "destroyed-after-336-nginx-load\n" : "destroyed-after-336-rut-load\n";
+    const std::string& destroyed_path = pinned_nginx ? temp.nginx_config : temp.source;
+    if (!write_file(destroyed_path, destroyed.data(), destroyed.size())) {
+        error = "#336 failed to overwrite the loaded frontend source";
+        return false;
+    }
+    std::string readback;
+    if (!read_exact_return204_log(destroyed_path, "#336 destroyed source", readback, error) ||
+        readback != destroyed) {
+        error = "#336 source overwrite/readback was not exact";
+        return false;
+    }
+
+    const auto observe_count =
+        [&](u32 expected, const char* phase, std::chrono::milliseconds duration) {
+            const auto deadline = std::chrono::steady_clock::now() + duration;
+            for (;;) {
+                if (poll_child(process.child) || !recorder_live(backend)) {
+                    error = std::string("#336 frontend/recorder stopped during ") + phase;
+                    return false;
+                }
+                const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+                const u32 requests_seen = backend.requests.load(std::memory_order_acquire);
+                const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+                if (accepts != expected || requests_seen != expected || sends != expected) {
+                    error = std::string("#336 unexpected upstream count during ") + phase;
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) return true;
+                usleep(5000);
+            }
+        };
+    const auto wait_count = [&](u32 expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process.child) || !recorder_live(backend)) return false;
+            const u32 accepts = backend.accepted.load(std::memory_order_acquire);
+            const u32 requests_seen = backend.requests.load(std::memory_order_acquire);
+            const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+            if (accepts > expected || requests_seen > expected || sends > expected) return false;
+            if (accepts == expected && requests_seen == expected && sends == expected) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    if (!observe_count(0u, "pre-request zero window", std::chrono::milliseconds(100))) return false;
+    for (size_t i = 0u; i < 5u; i++) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 || !send_all(client.fd, requests[i].data(), requests[i].size()) ||
+            !read_response(client.fd, observation.wires[i], detail) ||
+            !read_eof(client.fd, detail)) {
+            error = "#336 vector " + observation.targets[i] + " response/EOF failed: " + detail;
+            return false;
+        }
+        std::vector<char> normalized = observation.wires[i];
+        const std::vector<char> expected =
+            i < 3u ? std::vector<char>(
+                         kSuccessResponseNormalized,
+                         kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                   : expected_clean_proxy_location_redirect(
+                         frontend_port, "/api/", i == 3u ? "" : "?x=1");
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "#336 vector " + observation.targets[i] +
+                    " exact Date-normalized wire/Location mismatch";
+            return false;
+        }
+        if (i < 3u) {
+            if (!wait_count(static_cast<u32>(i + 1u)) ||
+                !observe_count(static_cast<u32>(i + 1u),
+                               "ordered transform episode",
+                               std::chrono::milliseconds(100))) {
+                error = "#336 transform episode did not settle without retry";
+                return false;
+            }
+        } else if (!observe_count(3u,
+                                  i == 3u ? "live first redirect zero-upstream"
+                                          : "live second redirect zero-upstream",
+                                  std::chrono::milliseconds(250))) {
+            return false;
+        }
+    }
+    if (!observe_count(3u, "live no-fourth/retry window", std::chrono::milliseconds(500)) ||
+        !stop_child(process.child)) {
+        error = "#336 frontend did not survive through controlled shutdown";
+        return false;
+    }
+    if (pinned_nginx && !docker.remove()) {
+        error = "#336 docker rm -f failed after pinned nginx capture";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
+    observation.forward_requests = backend.requests.load(std::memory_order_acquire);
+    observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.forward_history = backend.history;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || !backend.response_send_succeeded.load() ||
+        !backend.response_clean_shutdown.load() || !backend.response_connection_closed.load() ||
+        observation.forward_history.size() != 3u) {
+        error = "#336 recorder lifecycle/count/history was not exactly three clean episodes";
+        return false;
+    }
+    if (!pinned_nginx) {
+        for (size_t i = 0u; i < 3u; i++)
+            observation.request_sizes[i] = observation.forward_history[i].size();
+    }
+    if (!validate_max_proxy_replacement_observation(
+            observation, frontend_port, backend_port, error))
+        return false;
+    std::string access_contents;
+    std::string runtime_contents;
+    if (!read_exact_return204_log(
+            observation.access_path, "#336 access log", access_contents, error))
+        return false;
+    if (pinned_nginx) {
+        if (!parse_max_proxy_replacement_nginx_access(
+                access_contents, access_scope, observation, backend_port, error) ||
+            !read_exact_return204_log(
+                temp.nginx_log, "#336 nginx error log", runtime_contents, error))
+            return false;
+        for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+            if (runtime_contents.find(severity) != std::string::npos) {
+                error = std::string("#336 nginx error log contained ") + severity;
+                return false;
+            }
+        }
+    } else if (!parse_max_proxy_replacement_rut_access(access_contents, observation, error) ||
+               !read_exact_return204_log(
+                   temp.rut_log, "#336 RUT runtime log", runtime_contents, error) ||
+               !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error)) {
+        return false;
+    }
+    return true;
+}
+
+static bool validate_max_proxy_replacement_pair(
+    const MaxProxyReplacementObservation observations[2],
+    const std::string& generated_source,
+    const u16 ports[4],
+    std::string& error) {
+    for (size_t i = 0u; i < 4u; i++) {
+        if (ports[i] == 0u) {
+            error = "#336 pair validator received a zero port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#336 pair validator received duplicate ports";
+                return false;
+            }
+        }
+    }
+    if (observations[0].side != "pinned-nginx" ||
+        observations[1].side != "converter-generated-rut" ||
+        !validate_max_proxy_replacement_observation(observations[0], ports[0], ports[1], error) ||
+        !validate_max_proxy_replacement_observation(observations[1], ports[2], ports[3], error) ||
+        !validate_max_proxy_replacement_generated_source(
+            generated_source, ports[2], "127.0.0.1", ports[3], error))
+        return false;
+    const std::string* resources[] = {&observations[0].temp_path,
+                                      &observations[0].config_path,
+                                      &observations[0].log_path,
+                                      &observations[0].access_path,
+                                      &observations[0].process_identity,
+                                      &observations[1].temp_path,
+                                      &observations[1].config_path,
+                                      &observations[1].log_path,
+                                      &observations[1].access_path,
+                                      &observations[1].process_identity};
+    for (size_t i = 0u; i < 10u; i++) {
+        if (resources[i]->empty()) {
+            error = "#336 resource identity was empty";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 10u; j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#336 pinned/generated resources were aliased";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0u; i < 5u; i++) {
+        std::vector<char> pinned = observations[0].wires[i];
+        std::vector<char> generated = observations[1].wires[i];
+        if (!normalize_date(pinned) || !normalize_date(generated)) {
+            error = "#336 pinned/generated wire lacked one strict Date at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+        if (i >= 3u) {
+            std::string pinned_text(pinned.begin(), pinned.end());
+            std::string generated_text(generated.begin(), generated.end());
+            if (!canonicalize_unique_port(pinned_text,
+                                          "client.example:" + std::to_string(ports[0]),
+                                          "client.example:FRONTEND") ||
+                !canonicalize_unique_port(generated_text,
+                                          "client.example:" + std::to_string(ports[2]),
+                                          "client.example:FRONTEND")) {
+                error = "#336 redirect frontend-port canonicalization was missing or duplicate";
+                return false;
+            }
+            pinned.assign(pinned_text.begin(), pinned_text.end());
+            generated.assign(generated_text.begin(), generated_text.end());
+        }
+        if (pinned != generated) {
+            error = "#336 pinned/generated Date-normalized wire mismatch at vector " +
+                    std::to_string(i + 1u);
+            return false;
+        }
+    }
+    std::vector<std::string> histories[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        for (const auto& bytes : observations[side].forward_history) {
+            std::string history(bytes.begin(), bytes.end());
+            if (!canonicalize_unique_port(history,
+                                          "127.0.0.1:" + std::to_string(ports[side * 2u + 1u]),
+                                          "127.0.0.1:BACKEND")) {
+                error = "#336 backend port canonicalization was missing or duplicate";
+                return false;
+            }
+            histories[side].push_back(std::move(history));
+        }
+    }
+    if (histories[0] != histories[1]) {
+        error = "#336 pinned/generated ordered backend histories differed";
+        return false;
+    }
+    return true;
+}
+
+static MaxProxyReplacementObservation make_max_proxy_replacement_self_check(u16 frontend_port,
+                                                                            u16 backend_port,
+                                                                            bool generated) {
+    static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    MaxProxyReplacementObservation value;
+    value.side = generated ? "converter-generated-rut" : "pinned-nginx";
+    value.temp_path = std::string("/tmp/336-") + (generated ? "rut" : "nginx");
+    value.config_path = value.temp_path + (generated ? "/generated.rut" : "/nginx.conf");
+    value.log_path = value.temp_path + "/runtime.log";
+    value.access_path = value.temp_path + "/access.log";
+    value.process_identity = std::string("process-336-") + (generated ? "rut" : "nginx");
+    value.targets = max_proxy_replacement_targets();
+    value.forward_accepts = value.forward_requests = value.forward_sends = 3u;
+    for (size_t i = 0u; i < 5u; i++) {
+        value.request_sizes.push_back(api_request(value.targets[i].c_str()).size());
+        std::vector<char> wire =
+            i < 3u ? std::vector<char>(
+                         kSuccessResponseNormalized,
+                         kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                   : expected_clean_proxy_location_redirect(
+                         frontend_port, "/api/", i == 3u ? "" : "?x=1");
+        const std::string marker(29u, 'X');
+        const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        value.wires.push_back(std::move(wire));
+    }
+    for (const std::string& target : {max_proxy_replacement(),
+                                      max_proxy_replacement() + "x",
+                                      max_proxy_replacement() + "x?y=1"}) {
+        const std::string request = std::string("GET ") + target +
+                                    " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                    "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        value.forward_history.emplace_back(request.begin(), request.end());
+    }
+    if (generated) {
+        for (size_t i = 0u; i < 3u; i++) value.request_sizes[i] = value.forward_history[i].size();
+    }
+    return value;
+}
+
+static bool run_max_proxy_replacement_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {54360u, 54361u, 54362u, 54363u};
+    MaxProxyReplacementObservation values[2] = {
+        make_max_proxy_replacement_self_check(kPorts[0], kPorts[1], false),
+        make_max_proxy_replacement_self_check(kPorts[2], kPorts[3], true)};
+    std::string fragment = make_max_proxy_replacement_fragment(kPorts[2], "127.0.0.1", kPorts[3]);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#336 self-check fragment did not parse";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) {
+        error = "#336 self-check fragment did not lower";
+        return false;
+    }
+    const rut::Str source_view = lowered.value().view();
+    const std::string source(source_view.ptr, source_view.len);
+    if (!validate_max_proxy_replacement_pair(values, source, kPorts, error)) return false;
+    const auto rejects_pair = [&](MaxProxyReplacementObservation mutated[2],
+                                  const std::string& changed_source,
+                                  const u16 changed_ports[4],
+                                  const char* name) {
+        std::string detail;
+        if (!validate_max_proxy_replacement_pair(mutated, changed_source, changed_ports, detail))
+            return true;
+        error = std::string("#336 pair mutation accepted: ") + name;
+        return false;
+    };
+    MaxProxyReplacementObservation mutated[2];
+    u16 changed_ports[4];
+    const auto sync_generated_request_sizes = [](MaxProxyReplacementObservation& value) {
+        if (value.forward_history.size() < 3u || value.request_sizes.size() < 3u) return false;
+        for (size_t i = 0u; i < 3u; i++) value.request_sizes[i] = value.forward_history[i].size();
+        return true;
+    };
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].wires[1] = mutated[1].wires[3];
+    if (!rejects_pair(mutated, source, kPorts, "mirror-clamp-route-miss")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].wires[1].assign(
+        kOptionsStarResponseNormalized,
+        kOptionsStarResponseNormalized + sizeof(kOptionsStarResponseNormalized) - 1u);
+    mutated[1].forward_accepts = mutated[1].forward_requests = mutated[1].forward_sends = 0u;
+    mutated[1].forward_history.clear();
+    if (!rejects_pair(mutated, source, kPorts, "growth-became-400-with-zero-backend")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].targets[1] = max_proxy_replacement() + "x";
+    if (!rejects_pair(mutated, source, kPorts, "raw-access-replaced-by-upstream-target"))
+        return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[1].erase(mutated[1].forward_history[1].begin() + 4u + 128u);
+    if (!sync_generated_request_sizes(mutated[1])) return false;
+    if (!rejects_pair(mutated, source, kPorts, "129-byte-transform-truncated-to-128")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[2].erase(mutated[1].forward_history[2].begin() + 4u + 129u,
+                                        mutated[1].forward_history[2].begin() + 4u + 133u);
+    if (!sync_generated_request_sizes(mutated[1])) return false;
+    if (!rejects_pair(mutated, source, kPorts, "removed-forward-query")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[2].erase(mutated[1].forward_history[2].begin() + 4u + 128u,
+                                        mutated[1].forward_history[2].begin() + 4u + 133u);
+    if (!sync_generated_request_sizes(mutated[1])) return false;
+    if (!rejects_pair(mutated, source, kPorts, "133-byte-transform-truncated-to-128")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[1].insert(mutated[1].forward_history[1].begin() + 4u + 128u, '/');
+    if (!sync_generated_request_sizes(mutated[1])) return false;
+    if (!rejects_pair(mutated, source, kPorts, "transform-extra-separator")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    std::swap(mutated[1].forward_history[2][4u + 64u], mutated[1].forward_history[2][4u + 129u]);
+    if (!sync_generated_request_sizes(mutated[1]) ||
+        !rejects_pair(mutated, source, kPorts, "query-delimiter-moved-inside-replacement"))
+        return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history[2][4u + 131u] = '%';
+    mutated[1].forward_history[2].insert(mutated[1].forward_history[2].begin() + 4u + 132u,
+                                         {'3', 'D'});
+    if (!sync_generated_request_sizes(mutated[1]) ||
+        !rejects_pair(mutated, source, kPorts, "query-bytes-percent-encoded"))
+        return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    std::swap(mutated[1].forward_history[0], mutated[1].forward_history[1]);
+    if (!sync_generated_request_sizes(mutated[1])) return false;
+    if (!rejects_pair(mutated, source, kPorts, "backend-order")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].forward_history.push_back(mutated[1].forward_history[0]);
+    mutated[1].forward_accepts++;
+    mutated[1].forward_requests++;
+    mutated[1].forward_sends++;
+    if (!rejects_pair(mutated, source, kPorts, "fourth-retry")) return false;
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].wires[4] = mutated[1].wires[3];
+    if (!rejects_pair(mutated, source, kPorts, "query-location")) return false;
+    for (size_t resource = 0u; resource < 5u; resource++) {
+        std::copy(std::begin(values), std::end(values), std::begin(mutated));
+        std::string* left[] = {&mutated[0].temp_path,
+                               &mutated[0].config_path,
+                               &mutated[0].log_path,
+                               &mutated[0].access_path,
+                               &mutated[0].process_identity};
+        std::string* right[] = {&mutated[1].temp_path,
+                                &mutated[1].config_path,
+                                &mutated[1].log_path,
+                                &mutated[1].access_path,
+                                &mutated[1].process_identity};
+        *right[resource] = *left[resource];
+        if (!rejects_pair(mutated, source, kPorts, "resource-alias")) return false;
+    }
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    std::copy(std::begin(kPorts), std::end(kPorts), std::begin(changed_ports));
+    changed_ports[3] = changed_ports[0];
+    if (!rejects_pair(mutated, source, changed_ports, "duplicate-port")) return false;
+    changed_ports[3] = kPorts[3];
+    changed_ports[0] = 0u;
+    if (!rejects_pair(mutated, source, changed_ports, "zero-port")) return false;
+
+    const auto replace_once =
+        [](std::string value, const std::string& from, const std::string& to) {
+            const size_t offset = value.find(from);
+            if (offset == std::string::npos) return value;
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    const std::string route = max_proxy_replacement_route_key();
+    const std::string& replacement = max_proxy_replacement();
+    const auto rejects_source = [&](const std::string& value) {
+        std::string detail;
+        return !validate_max_proxy_replacement_generated_source(
+            value, kPorts[2], "127.0.0.1", kPorts[3], detail);
+    };
+    if (!rejects_source(replace_once(source,
+                                     "route \"" + route + "\" {",
+                                     "route \"" + route.substr(0u, route.size() - 1u) + "\" {")) ||
+        !rejects_source(source + "route \"" + route + "\" { return response() }\n") ||
+        !rejects_source(
+            replace_once(source, "strip_prefix: \"/api/\"", "strip_prefix: \"/api\"")) ||
+        !rejects_source(source + "# strip_prefix: \"/api/\"\n") ||
+        !rejects_source(replace_once(
+            source,
+            "replace_prefix: \"" + replacement + "\"",
+            "replace_prefix: \"" + replacement.substr(0u, replacement.size() - 2u) + "/\"")) ||
+        !rejects_source(replace_once(
+            source,
+            "replace_prefix: \"" + replacement + "\"",
+            "replace_prefix: \"" + replacement.substr(0u, replacement.size() - 1u) + "R/\"")) ||
+        !rejects_source(replace_once(
+            source,
+            "replace_prefix: \"" + replacement + "\"",
+            "replace_prefix: \"" + replacement.substr(0u, replacement.size() - 1u) + "\"")) ||
+        !rejects_source(source + "# replace_prefix: \"" + replacement + "\"\n") ||
+        !rejects_source(replace_once(
+            source, "target_path: \"/api/\"", "target_path: \"" + replacement + "\"")) ||
+        !rejects_source(source + "# target_path: \"/api/\"\n") ||
+        !rejects_source(replace_once(source, "query: \"preserve_raw\"", "query: \"drop\""))) {
+        error = "#336 generated-source route/strip/redirect mutation self-check failed";
+        return false;
+    }
+
+    const auto build_access_fixture = [&](bool nginx) {
+        std::string access;
+        for (size_t i = 0u; i < 5u; i++) {
+            const bool forward = i < 3u;
+            if (nginx) {
+                access += "scope raw=\"GET " + values[0].targets[i] +
+                          " HTTP/1.1\" status=" + (forward ? "200" : "301") +
+                          " request_size=" + std::to_string(values[0].request_sizes[i]) +
+                          " response_size=" + std::to_string(values[0].wires[i].size()) +
+                          " host=\"client.example\" upstream_addr=\"" +
+                          (forward ? "127.0.0.1:" + std::to_string(kPorts[1]) : "-") +
+                          "\" upstream_status=" + (forward ? "200" : "-") + "\n";
+            } else {
+                access += "2026-08-26T21:13:05.248Z GET " + values[1].targets[i] + " " +
+                          (forward ? "200" : "301") + " 361us " +
+                          std::to_string(values[1].request_sizes[i]) + " " +
+                          std::to_string(values[1].wires[i].size()) + " 127.0.0.1" +
+                          (forward ? " nginx_upstream 243us s=0\n" : " s=0\n");
+            }
+        }
+        return access;
+    };
+    const std::string nginx_access = build_access_fixture(true);
+    const std::string rut_access = build_access_fixture(false);
+    const auto rejects_nginx_access = [&](const std::string& value) {
+        std::string detail;
+        return !parse_max_proxy_replacement_nginx_access(
+            value, "scope", values[0], kPorts[1], detail);
+    };
+    const auto rejects_rut_access = [&](const std::string& value) {
+        std::string detail;
+        return !parse_max_proxy_replacement_rut_access(value, values[1], detail);
+    };
+    const size_t first = rut_access.find('\n');
+    const size_t second = rut_access.find('\n', first + 1u);
+    const size_t nginx_first = nginx_access.find('\n');
+    std::string swapped = rut_access;
+    swapped.replace(
+        0u,
+        second + 1u,
+        rut_access.substr(first + 1u, second - first) + rut_access.substr(0u, first + 1u));
+    const std::string longest_target = values[1].targets[2];
+    if (!parse_max_proxy_replacement_nginx_access(
+            nginx_access, "scope", values[0], kPorts[1], error) ||
+        !parse_max_proxy_replacement_rut_access(rut_access, values[1], error) ||
+        !rejects_nginx_access(nginx_access +
+                              nginx_access.substr(0u, nginx_access.find('\n') + 1u)) ||
+        !rejects_nginx_access(nginx_access.substr(nginx_first + 1u)) ||
+        !rejects_nginx_access(nginx_access.substr(0u, nginx_access.size() - 1u)) ||
+        !rejects_nginx_access(replace_once(nginx_access, " status=200 ", " status=0200 ")) ||
+        !rejects_nginx_access(
+            replace_once(nginx_access, " response_size=118 ", " response_size=119 ")) ||
+        !rejects_nginx_access(
+            replace_once(nginx_access, longest_target, longest_target.substr(0u, 9u))) ||
+        !rejects_nginx_access(replace_once(nginx_access, "/api/x", replacement + "x")) ||
+        !rejects_rut_access(rut_access + rut_access.substr(0u, first + 1u)) ||
+        !rejects_rut_access(rut_access.substr(first + 1u)) ||
+        !rejects_rut_access(rut_access.substr(0u, rut_access.size() - 1u)) ||
+        !rejects_rut_access(swapped) ||
+        !rejects_rut_access(
+            replace_once(rut_access, longest_target, longest_target.substr(0u, 9u))) ||
+        !rejects_rut_access(replace_once(rut_access, "/api/x", replacement + "x")) ||
+        !rejects_rut_access(replace_once(rut_access, " 200 ", " 0200 ")) ||
+        !rejects_rut_access(
+            replace_once(rut_access,
+                         " " + std::to_string(values[1].request_sizes[0]) + " 118 127.0.0.1",
+                         " " + std::to_string(values[1].request_sizes[0]) + " 119 127.0.0.1")) ||
+        !rejects_rut_access(replace_once(rut_access,
+                                         " " + std::to_string(values[1].request_sizes[0]) + " 118 ",
+                                         " 999999999999999999999999999999999 118 ")) ||
+        !rejects_rut_access(replace_once(rut_access, " nginx_upstream ", " other_upstream ")) ||
+        !rejects_rut_access(replace_once(
+            rut_access, " nginx_upstream 243us s=0", " nginx_upstream invalid-duration s=0")) ||
+        !rejects_rut_access(replace_once(rut_access, " s=0\n", " s=1\n"))) {
+        error = "#336 nginx/RUT access parser mutation self-check failed";
+        return false;
+    }
+
+    std::string maximum_fragment =
+        make_max_proxy_replacement_fragment(65535u, "255.255.255.255", 65535u);
+    const auto maximum_parsed =
+        rut::nginx::parse({maximum_fragment.data(), static_cast<u32>(maximum_fragment.size())});
+    if (!maximum_parsed) {
+        error = "#336 maximum ports/IP fragment did not parse";
+        return false;
+    }
+    const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
+    if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
+        rut::nginx::RutSource::kCapacity != 5937u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/5937 bytes";
+        return false;
+    }
+    const rut::Str maximum_source_view = maximum_lowered.value().view();
+    const std::string maximum_source(maximum_source_view.ptr, maximum_source_view.len);
+    if (!validate_max_proxy_replacement_generated_source(
+            maximum_source, 65535u, "255.255.255.255", 65535u, error))
+        return false;
+    TempDir maximum_temp;
+    if (!maximum_temp.create() ||
+        !write_file(maximum_temp.source, maximum_source.data(), maximum_source.size())) {
+        error = "#336 could not persist the maximum source for public loader proof";
+        return false;
+    }
+    rut::LoadedProgram maximum_program{};
+    struct LoadedProgramGuard {
+        rut::LoadedProgram* program;
+        ~LoadedProgramGuard() { program->destroy(); }
+    } maximum_guard{&maximum_program};
+    rut::LoadError load_error{};
+    if (!rut::load_rut_program(
+            maximum_temp.source.c_str(), maximum_program, load_error, rut::jit::OptLevel::O0)) {
+        char detail[512]{};
+        rut::format_load_error(load_error, detail, sizeof(detail));
+        error =
+            std::string("#336 maximum generated source failed public lex/parse/load: ") + detail;
+        return false;
+    }
+    if (!maximum_program.has_listener || maximum_program.listener.port != 65535u) {
+        error = "#336 maximum public load lost its 65535 listener ownership";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_max_proxy_replacement_differential(const std::string& container_prefix,
+                                                             const char* rut_path,
+                                                             std::string& error) {
+    struct Reservations {
+        int fds[4];
+        Reservations() { std::fill(std::begin(fds), std::end(fds), -1); }
+        ~Reservations() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+        bool reserve(size_t index, u16& port) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            socklen_t len = sizeof(addr);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+                getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+                ntohs(addr.sin_port) == 0u) {
+                close(fd);
+                return false;
+            }
+            fds[index] = fd;
+            port = ntohs(addr.sin_port);
+            return true;
+        }
+    } reservations;
+    u16 ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve(i, ports[i])) {
+            error = "#336 could not simultaneously bind-reserve four ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < 4u; i++) {
+        for (size_t j = i + 1u; j < 4u; j++) {
+            if (ports[i] == ports[j]) {
+                error = "#336 reserved duplicate ports";
+                return false;
+            }
+        }
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].source || temps[0].nginx_log == temps[1].rut_log ||
+        temps[0].nginx_access_log == temps[1].rut_access_log) {
+        error = "#336 could not create isolated pinned/generated resource trees";
+        return false;
+    }
+    MaxProxyReplacementObservation observations[2];
+    std::string generated_source;
+    const std::string nginx_identity = container_prefix + "-nginx";
+    const std::string rut_identity =
+        std::string(rut_path) + " " + temps[1].source + " listen:" + std::to_string(ports[2]);
+    if (!capture_max_proxy_replacement_side(ports[0],
+                                            ports[1],
+                                            temps[0],
+                                            nginx_identity,
+                                            rut_path,
+                                            true,
+                                            observations[0],
+                                            generated_source,
+                                            error,
+                                            &reservations.fds[0],
+                                            &reservations.fds[1]) ||
+        !capture_max_proxy_replacement_side(ports[2],
+                                            ports[3],
+                                            temps[1],
+                                            rut_identity,
+                                            rut_path,
+                                            false,
+                                            observations[1],
+                                            generated_source,
+                                            error,
+                                            &reservations.fds[2],
+                                            &reservations.fds[3]))
+        return false;
+    return validate_max_proxy_replacement_pair(observations, generated_source, ports, error);
+}
+
 static bool capture_api_invalid_case(u16 frontend_port,
                                      u16 backend_port,
                                      const std::string& source_path,
@@ -24754,6 +25827,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-service-root-proxy-uri-differential") == 0;
     const bool converter_max_proxy_prefix_differential =
         argc == 3 && strcmp(argv[1], "--converter-max-proxy-prefix-differential") == 0;
+    const bool converter_max_proxy_replacement_differential =
+        argc == 3 && strcmp(argv[1], "--converter-max-proxy-replacement-differential") == 0;
     const bool converter_bounded_exact_local_path_differential =
         argc == 3 && strcmp(argv[1], "--converter-bounded-exact-local-path-differential") == 0;
     const bool converter_bounded_no_content_path_differential =
@@ -24819,6 +25894,7 @@ int main(int argc, char** argv) {
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_max_proxy_prefix_differential &&
+         !converter_max_proxy_replacement_differential &&
          !converter_bounded_exact_local_path_differential &&
          !converter_bounded_no_content_path_differential &&
          !converter_trailing_slash_no_content_differential &&
@@ -24844,6 +25920,7 @@ int main(int argc, char** argv) {
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
+        (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
         (converter_bounded_exact_local_path_differential && argv[2][0] != '/') ||
         (converter_bounded_no_content_path_differential && argv[2][0] != '/') ||
         (converter_trailing_slash_no_content_differential && argv[2][0] != '/') ||
@@ -24923,6 +26000,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-max-proxy-prefix-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-max-proxy-replacement-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-bounded-exact-local-path-differential "
@@ -25074,6 +26154,14 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (converter_max_proxy_replacement_differential) {
+        std::string parser_error;
+        if (!run_max_proxy_replacement_self_checks(parser_error)) {
+            std::cerr << "FAIL [#336 source/access/observation/pair self-check]: " << parser_error
+                      << "\n";
+            return 1;
+        }
+    }
     if (bodyful_normalized_exact_oracle || converter_bodyful_normalized_exact_differential) {
         std::string parser_error;
         if (!run_bodyful_normalized_exact_self_checks(parser_error)) {
@@ -25105,7 +26193,7 @@ int main(int argc, char** argv) {
         converter_trailing_slash_no_content_differential ||
         converter_max_boundary_no_content_differential ||
         converter_bodyful_normalized_exact_differential ||
-        converter_max_proxy_prefix_differential) {
+        converter_max_proxy_prefix_differential || converter_max_proxy_replacement_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
@@ -26254,6 +27342,30 @@ int main(int argc, char** argv) {
                "query-preserving 301 redirects with live/settled zero extra upstream work, full "
                "62/63/64/66/68-byte access targets, isolated resources, and controlled lifecycle "
                "evidence (#335 bounded cleartext explicit-close H1.1 GET slice only)\n";
+        return 0;
+    }
+
+    if (converter_max_proxy_replacement_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-max-proxy-replacement-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_max_proxy_replacement_differential(
+                container_prefix, argv[2], differential_error)) {
+            std::cerr << "FAIL [#336 converter maximum replacement-growth differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: fixed /api/ proxy_pass with an exact 128-byte replacement URI passed "
+               "through the independent nginx parser/provenance model/converter into ordinary "
+               "RUT and the public CLI; pinned nginx 1.29.7 and generated RUT matched five exact "
+               "Date-normalized wires/EOF, ordered complete 128/129/133-byte backend targets, "
+               "rebuilt Host and duplicate-header evidence, two query-preserving 301 redirects "
+               "with live/settled zero extra upstream work, Complete raw-client access targets, "
+               "isolated resources, and controlled lifecycle evidence (#336 bounded cleartext "
+               "explicit-close H1.1 GET slice only)\n";
         return 0;
     }
 
