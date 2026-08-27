@@ -30899,6 +30899,243 @@ TEST(
     }
 }
 
+TEST(route, public_ordinary_source_deadline_complete_buffering_preserves_bounded_201_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kOrigin[] =
+        "HTTP/1.1 201 Created\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "X-Origin: fallback\r\n"
+        "Content-Length: 8\r\n"
+        "Connection: close\r\n\r\n"
+        "fallback";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 201 Created\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 8\r\n"
+        "Connection: close\r\n"
+        "X-Origin: fallback\r\n\r\n"
+        "fallback";
+    RecordingUpstream backend;
+    backend.response = kOrigin;
+    backend.response_len = sizeof(kOrigin) - 1u;
+    REQUIRE(backend.setup());
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source_text += R"rut(
+route GET "/buffered" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "buffered-test",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "buffered-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: "complete_content_length")
+}
+)rut";
+    struct TempSource {
+        char path[64] = "/tmp/rut_bounded_201_loader_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    source.fd = mkstemp(source.path);
+    REQUIRE_GE(source.fd, 0);
+    source.present = true;
+    u32 source_written = 0;
+    while (source_written < source_text.size()) {
+        const ssize_t written = write(
+            source.fd, source_text.data() + source_written, source_text.size() - source_written);
+        if (written < 0 && errno == EINTR) continue;
+        REQUIRE_GT(written, 0);
+        source_written += static_cast<u32>(written);
+    }
+    REQUIRE_EQ(close(source.fd), 0);
+    source.fd = -1;
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        ~ProgramGuard() { program.destroy(); }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(program.config.response_policy_count, 1u);
+    const auto& owned_response_policy = program.config.response_policies[0];
+    CHECK(owned_response_policy.server.eq({"buffered-test", 13}));
+    CHECK_NE(owned_response_policy.server.ptr, program.rir.module.response_policies[0].server.ptr);
+    const uintptr_t policy_begin =
+        reinterpret_cast<uintptr_t>(program.config.response_policy_bytes);
+    const uintptr_t policy_end = policy_begin + program.config.response_policy_bytes_used;
+    const uintptr_t server_begin = reinterpret_cast<uintptr_t>(owned_response_policy.server.ptr);
+    CHECK_GE(server_begin, policy_begin);
+    CHECK_LE(server_begin + owned_response_policy.server.len, policy_end);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK_EQ(program.config.routes[0].method, kRouteMethodGet);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), backend.port);
+
+    REQUIRE_EQ(unlink(source.path), 0);
+    source.present = false;
+    CHECK_EQ(access(source.path, F_OK), -1);
+    CHECK_EQ(errno, ENOENT);
+    std::string{}.swap(source_text);
+    CHECK(source_text.empty());
+
+    Shard<IoUringEventLoop> shard;
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    i32 listen_fd = listen_result.value();
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = listener_context.port;
+    REQUIRE_NE(port, 0u);
+    CHECK_NE(port, backend.port);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.owns_listen_fd = true;
+    listen_fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE_EQ(shard.loop->capture_ring, capture_ring);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 3);
+    static constexpr char kRequest[] =
+        "GET /buffered?case=bounded-201 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+    char response[sizeof(kExpected) + 32u]{};
+    u32 response_len = 0u;
+    const u32 expected_len = sizeof(kExpected) - 1u;
+    while (response_len < expected_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 500);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_len);
+    CHECK_EQ(memcmp(response, kExpected, expected_len), 0);
+    char tail[8]{};
+    REQUIRE_EQ(recv_timeout(client.fd, tail, sizeof(tail), 500), 0);
+
+    for (u32 waited = 0;
+         waited < 1000 && backend.request_count.load(std::memory_order_acquire) < 1u;
+         waited++)
+        usleep(1000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 1u);
+    char expected_request[256]{};
+    const int expected_request_len = snprintf(expected_request,
+                                              sizeof(expected_request),
+                                              "GET /buffered?case=bounded-201 HTTP/1.1\r\n"
+                                              "Host: 127.0.0.1:%u\r\n\r\n",
+                                              backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    static constexpr char kTarget[] = "/buffered?case=bounded-201";
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+    AccessLogEntry access{};
+    AccessLogEntry no_access{};
+    REQUIRE(shard.log_ring->pop(access));
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+    CHECK_EQ(access.status, 201u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access.resp_size, expected_len);
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    REQUIRE_EQ(access.target_length, sizeof(kTarget) - 1u);
+    CHECK_EQ(memcmp(access.path, kTarget, sizeof(kTarget) - 1u), 0);
+    CHECK_EQ(strcmp(access.upstream, "backend"), 0);
+
+    REQUIRE_EQ(capture_ring->available(), 1u);
+    CaptureEntry capture{};
+    CaptureEntry no_capture{};
+    REQUIRE(capture_ring->pop(capture));
+    CHECK_FALSE(capture_ring->pop(no_capture));
+    CHECK_EQ(capture.resp_status, 201u);
+    CHECK_EQ(capture.resp_content_length, expected_len);
+    CHECK_EQ(capture.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(capture.req_content_length, 0u);
+    REQUIRE_EQ(capture.raw_header_len, sizeof(kRequest) - 1u);
+    CHECK_EQ(memcmp(capture.raw_headers, kRequest, sizeof(kRequest) - 1u), 0);
+    CHECK_EQ(strcmp(capture.upstream_name, "backend"), 0);
+
+    CHECK_EQ(shard.route_config, &program.config);
+    CHECK_EQ(shard.active_config, &program.config);
+    CHECK(program.config.response_policies[0].server.eq({"buffered-test", 13}));
+}
+
 TEST(
     route,
     public_ordinary_source_complete_content_length_buffering_fixed_request_policy_explicit_close_inactivity_emits_pinned_header_only_iouring) {

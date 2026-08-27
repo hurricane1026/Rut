@@ -9300,9 +9300,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             config->failure_policies[conn.timeout_failure_policy_id - 1].head_mode ==
                 FailurePolicyHeadMode::Reject;
         const bool strict_common =
-            owner_exact && resp.version == HttpVersion::Http11 && resp.status_code == 200 &&
-            resp.content_length_count == 1 && resp.has_content_length && !resp.chunked &&
-            !resp.headers_truncated && resp_parser.header_end <= conn.upstream_recv_buf.len() &&
+            owner_exact && resp.version == HttpVersion::Http11 && resp.content_length_count == 1 &&
+            resp.has_content_length && !resp.chunked && !resp.headers_truncated &&
+            resp_parser.header_end <= conn.upstream_recv_buf.len() &&
             conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
             (fixed_upload ? conn.req_body_mode == BodyMode::ContentLength &&
                                 conn.req_body_remaining == 0 && conn.request_body_fully_buffered
@@ -9317,10 +9317,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             strict_response_upload_ready(conn);
         const u32 raw_header_end = resp_parser.header_end;
         const u32 raw_total = conn.upstream_recv_buf.len();
-        const bool strict_cl0 =
-            strict_common && resp.content_length == 0 && raw_header_end == raw_total;
+        const bool strict_cl0 = strict_common && resp.status_code == 200 &&
+                                resp.content_length == 0 && raw_header_end == raw_total;
         const bool strict_positive_complete_buffering =
             strict_common &&
+            complete_content_length_response_status_is_admitted(resp.status_code) &&
             explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
             (fixed_upload
                  ? complete_content_length_fixed_upload_materialization_is_stable(
@@ -9337,7 +9338,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
             raw_total - raw_header_end <= resp.content_length;
         const bool strict_positive_streaming_get =
-            strict_common && !fixed_upload &&
+            strict_common && resp.status_code == 200 && !fixed_upload &&
             explicit_buffering == ForwardResponseBufferingMode::None &&
             explicit_method == static_cast<u8>(LogHttpMethod::Get) && resp.content_length > 0 &&
             raw_header_end <= conn.upstream_recv_buf.capacity() &&
@@ -9351,7 +9352,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
         // The origin frame is fully proven before any downstream response
         // status/header/persistence byte is materialized.
-        conn.resp_status = 200;
+        conn.resp_status = resp.status_code;
         if (!build_strict_response_headers(conn, *config, resp)) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
@@ -9364,7 +9365,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const u32 output_len = conn.response_header_buf.len();
         if (output_parser.parse(conn.response_header_buf.data(), output_len, &output_response) !=
                 ParseStatus::Complete ||
-            output_response.version != HttpVersion::Http11 || output_response.status_code != 200 ||
+            output_response.version != HttpVersion::Http11 ||
+            output_response.status_code != resp.status_code ||
+            output_response.status_code != conn.resp_status ||
+            output_response.reason.len != resp.reason.len ||
+            (resp.reason.len != 0 &&
+             __builtin_memcmp(output_response.reason.ptr, resp.reason.ptr, resp.reason.len) != 0) ||
             output_response.content_length_count != 1 ||
             output_response.content_length != resp.content_length || output_response.chunked ||
             output_parser.header_end != output_len) {
@@ -9409,7 +9415,6 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 loop->close_conn(conn);
                 return;
             }
-            conn.resp_status = 200;
             conn.resp_body_mode = BodyMode::ContentLength;
             conn.resp_body_remaining = resp.content_length;
             conn.resp_body_sent = conn.response_header_buf.len();

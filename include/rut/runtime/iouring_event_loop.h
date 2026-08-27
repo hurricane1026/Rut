@@ -2528,7 +2528,8 @@ public:
             raw_header_end > c.upstream_recv_buf.len() ||
             declared_body > c.upstream_recv_buf.capacity() - raw_header_end ||
             c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
-            c.response_header_buf.len() > c.response_header_buf.capacity())
+            c.response_header_buf.len() > c.response_header_buf.capacity() ||
+            !complete_content_length_raw_origin_matches_pinned(c, raw_header_end, declared_body))
             return false;
         const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
         if (initial_body > declared_body) return false;
@@ -2636,7 +2637,6 @@ public:
         c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
-        c.resp_status = 200;
         c.resp_body_mode = BodyMode::ContentLength;
         c.resp_body_remaining = body_to_send;
         c.resp_body_sent = c.response_header_buf.len();

@@ -37731,9 +37731,262 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime,
+     bounded_201_complete_and_fragmented_preserve_reason_status_and_access) {
+    for (const bool fragmented : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        AccessLogRing access_log{};
+        access_log.init();
+        loop->access_log = &access_log;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kFirst[] =
+            "HTTP/1.1 201 Created\r\nX-Origin: kept\r\nContent-Length: 4\r\n\r\nab";
+        static constexpr u8 kLast[] = {'c', 'd'};
+        const u32 first_len = sizeof(kFirst) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, first_len), first_len);
+        if (!fragmented)
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+        const u32 admitted_len = conn.upstream_recv_buf.len();
+        const IoEvent first = response_read_copy_event(conn, admitted_len, true, 0, admitted_len);
+        loop->dispatch_batch(&first, 1);
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 201u);
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "HTTP/1.1 201 Created\r\n"));
+        CHECK(buf_has(
+            conn.response_header_buf.data(), conn.response_header_buf.len(), "X-Origin: kept\r\n"));
+        CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                 fragmented ? ResponseReadDeadlinePostCommitPhase::Buffering
+                            : ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+        if (fragmented) {
+            const u32 begin = conn.upstream_recv_buf.len();
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+            const IoEvent last = response_read_copy_event(
+                conn, sizeof(kLast), true, begin, conn.upstream_recv_buf.len());
+            loop->dispatch_batch(&last, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        }
+        CHECK_EQ(conn.resp_status, 201u);
+        const u32 expected_response_size = conn.response_header_buf.len() + 4u;
+        IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        CHECK_EQ(conn.resp_status, 201u);
+        CHECK_EQ(conn.response_read_deadline_send_len, 4u);
+        CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
+        IoEvent body = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&body, 1);
+        REQUIRE(conn.upstream_retirement_active);
+        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        REQUIRE(conn.http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_EQ(conn.resp_status, 201u);
+        AccessLogEntry access{};
+        REQUIRE(access_log.pop(access));
+        CHECK_EQ(access.status, 201u);
+        CHECK_EQ(access.resp_size, expected_response_size);
+        AccessLogEntry extra{};
+        CHECK_FALSE(access_log.pop(extra));
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
+     direct_complete_buffering_begin_rejects_status_or_pinned_header_forgery) {
+    enum class Mutation : u8 {
+        None,
+        Scalar,
+        PinnedStatus,
+        ScalarAndPinnedStatus,
+        PinnedReason,
+        RawStatus,
+        RawReason,
+        RawContentLength,
+        RawHeaderBoundary,
+    };
+    for (const Mutation mutation : {Mutation::None,
+                                    Mutation::Scalar,
+                                    Mutation::PinnedStatus,
+                                    Mutation::ScalarAndPinnedStatus,
+                                    Mutation::PinnedReason,
+                                    Mutation::RawStatus,
+                                    Mutation::RawReason,
+                                    Mutation::RawContentLength,
+                                    Mutation::RawHeaderBoundary}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kOrigin[] = "HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nabcd";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                   sizeof(kOrigin) - 1u);
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(parser.parse(kOrigin, sizeof(kOrigin) - 1u, &response), ParseStatus::Complete);
+        REQUIRE_EQ(response.status_code, 201u);
+        REQUIRE_EQ(response.content_length, 4u);
+        conn.resp_status = response.status_code;
+        REQUIRE(build_strict_response_headers(conn, config, response));
+        loop->timer.remove(&conn);
+        conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+        static constexpr u32 kStatusLast = sizeof("HTTP/1.1 20") - 1u;
+        static constexpr u32 kReasonFirst = sizeof("HTTP/1.1 201 ") - 1u;
+        static constexpr u32 kContentLengthDigit =
+            sizeof("HTTP/1.1 201 Created\r\nContent-Length: ") - 1u;
+        u32 raw_header_end = parser.header_end;
+        if (mutation == Mutation::Scalar) {
+            conn.resp_status = 200u;
+        } else if (mutation == Mutation::PinnedStatus ||
+                   mutation == Mutation::ScalarAndPinnedStatus) {
+            REQUIRE_GT(conn.response_header_buf.len(), kStatusLast);
+            REQUIRE_EQ(conn.response_header_buf.data()[kStatusLast], static_cast<u8>('1'));
+            conn.response_header_slice[kStatusLast] =
+                mutation == Mutation::PinnedStatus ? static_cast<u8>('2') : static_cast<u8>('0');
+            if (mutation == Mutation::ScalarAndPinnedStatus) conn.resp_status = 200u;
+        } else if (mutation == Mutation::PinnedReason) {
+            REQUIRE_GT(conn.response_header_buf.len(), kReasonFirst);
+            REQUIRE_EQ(conn.response_header_buf.data()[kReasonFirst], static_cast<u8>('C'));
+            conn.response_header_slice[kReasonFirst] = static_cast<u8>('X');
+        } else if (mutation == Mutation::RawStatus) {
+            REQUIRE_EQ(conn.upstream_recv_buf.data()[kStatusLast], static_cast<u8>('1'));
+            conn.upstream_recv_slice[kStatusLast] = static_cast<u8>('2');
+        } else if (mutation == Mutation::RawReason) {
+            REQUIRE_EQ(conn.upstream_recv_buf.data()[kReasonFirst], static_cast<u8>('C'));
+            conn.upstream_recv_slice[kReasonFirst] = static_cast<u8>('X');
+        } else if (mutation == Mutation::RawContentLength) {
+            REQUIRE_EQ(conn.upstream_recv_buf.data()[kContentLengthDigit], static_cast<u8>('4'));
+            conn.upstream_recv_slice[kContentLengthDigit] = static_cast<u8>('5');
+        } else if (mutation == Mutation::RawHeaderBoundary) {
+            REQUIRE_GT(raw_header_end, 1u);
+            --raw_header_end;
+        }
+        const IoEvent event =
+            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+        const bool began = loop->begin_complete_content_length_buffering(
+            conn, event, raw_header_end, response.content_length);
+        CHECK_EQ(began, mutation == Mutation::None);
+        if (mutation == Mutation::None) {
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.resp_status, 201u);
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+        } else {
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::None);
+            CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        }
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, bounded_201_completion_wins_same_batch_timeout_in_either_order) {
+    for (const bool timeout_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kFirst[] = "HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\na";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
+        const IoEvent first =
+            response_read_copy_event(conn, sizeof(kFirst) - 1u, true, 0, sizeof(kFirst) - 1u);
+        loop->dispatch_batch(&first, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.resp_status, 201u);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+
+        const u32 begin = conn.upstream_recv_buf.len();
+        static constexpr u8 kRest[] = {'b', 'c'};
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kRest, sizeof(kRest)), sizeof(kRest));
+        const IoEvent completion = response_read_copy_event(
+            conn, sizeof(kRest), true, begin, conn.upstream_recv_buf.len());
+        loop->timer.remove(&conn);
+        loop->timer.add(&conn, 0);
+        const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+        const IoEvent batch[2] = {timeout_first ? timeout : completion,
+                                  timeout_first ? completion : timeout};
+        loop->dispatch_batch(batch, 2);
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                 ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 3u);
+        CHECK_EQ(conn.resp_status, 201u);
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "HTTP/1.1 201 Created\r\n"));
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, bounded_201_remains_rejected_for_cl0_and_immediate_streaming) {
+    struct Vector {
+        ForwardResponseBufferingMode buffering;
+        const char* response;
+    };
+    static constexpr Vector kVectors[] = {
+        {ForwardResponseBufferingMode::CompleteContentLength,
+         "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"},
+        {ForwardResponseBufferingMode::None, "HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nx"},
+    };
+    for (const Vector& vector : kVectors) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config, 5, vector.buffering));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 len = static_cast<u32>(strlen(vector.response));
+        REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(vector.response), len),
+                   len);
+        const IoEvent event = response_read_copy_event(conn, len, true, 0, len);
+        loop->dispatch_batch(&event, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
      unsupported_response_framing_and_status_fail_before_downstream_commit) {
     static constexpr const char* kResponses[] = {
-        "HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 202 Accepted\r\nContent-Length: 1\r\n\r\nx",
         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
         "HTTP/1.1 200 OK\r\n\r\nx",
