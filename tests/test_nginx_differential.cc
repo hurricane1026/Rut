@@ -31444,7 +31444,69 @@ static void dump_exact_loopback_bodyful_observation(
         dump_log(observation.access_path, "#349 nginx access log");
 }
 
-struct ExactLoopbackReturn302Observation {
+struct ExactLoopbackFixedRedirectProfile {
+    u16 status;
+    const char* issue;
+    const char* log_format;
+    const char* normalized_response;
+    u32 response_size;
+    u32 body_size;
+    const char* reason;
+    const char* title;
+    const char* source_body;
+    const char* body;
+    u32 representative_source_size;
+};
+
+static constexpr char kExactLoopbackFixedRedirect301SourceBody[] =
+    "body: b\"<html>\\r\\n<head><title>301 Moved Permanently</title></head>\\r\\n<body>\\r\\n"
+    "<center><h1>301 Moved Permanently</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>"
+    "\\r\\n</body>\\r\\n</html>\\r\\n\"";
+static constexpr char kExactLoopbackFixedRedirect302SourceBody[] =
+    "body: b\"<html>\\r\\n<head><title>302 Found</title></head>\\r\\n<body>\\r\\n"
+    "<center><h1>302 Found</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n</html>\\r\\n\"";
+static constexpr char kExactLoopbackFixedRedirect301Body[] =
+    "<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n"
+    "<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n</html>\r\n";
+static constexpr char kExactLoopbackFixedRedirect302Body[] =
+    "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n"
+    "<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n</html>\r\n";
+
+static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect301Profile{
+    301u,
+    "#351",
+    "exact_loopback_return301",
+    kExactAbsoluteRedirectResponseNormalized,
+    366u,
+    169u,
+    "Moved Permanently",
+    "301 Moved Permanently",
+    kExactLoopbackFixedRedirect301SourceBody,
+    kExactLoopbackFixedRedirect301Body,
+    5937u};
+static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect302Profile{
+    302u,
+    "#350",
+    "exact_loopback_return302",
+    kExactAbsoluteRedirect302ResponseNormalized,
+    342u,
+    145u,
+    "Moved Temporarily",
+    "302 Found",
+    kExactLoopbackFixedRedirect302SourceBody,
+    kExactLoopbackFixedRedirect302Body,
+    5913u};
+
+static const ExactLoopbackFixedRedirectProfile* exact_loopback_fixed_redirect_profile(u16 status) {
+    if (status == 301u) return &kExactLoopbackFixedRedirect301Profile;
+    if (status == 302u) return &kExactLoopbackFixedRedirect302Profile;
+    return nullptr;
+}
+
+struct ExactLoopbackFixedRedirectObservation {
     std::string side;
     std::string order;
     std::string temp_path;
@@ -31454,6 +31516,7 @@ struct ExactLoopbackReturn302Observation {
     std::string process_identity;
     std::string access_scope;
     std::string config;
+    u16 redirect_status = 0;
     u16 frontend_port = 0;
     u16 backend_port = 0;
     u16 negative_port = 0;
@@ -31478,75 +31541,93 @@ struct ExactLoopbackReturn302Observation {
     bool eof_proven[5]{};
 };
 
-static std::string make_exact_loopback_return302_config(u16 frontend_port,
-                                                        u16 backend_port,
-                                                        bool exact_first,
-                                                        const std::string& access_scope,
-                                                        const std::string& access_path) {
+static std::string make_exact_loopback_fixed_redirect_config(u16 frontend_port,
+                                                             u16 backend_port,
+                                                             bool exact_first,
+                                                             const std::string& access_scope,
+                                                             const std::string& access_path,
+                                                             u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return {};
     const std::string listener = "    listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
-    const std::string exact = "    location = /old { return 302 http://redirect.example/new; }\n";
+    const std::string exact = "    location = /old { return " + std::to_string(redirect_status) +
+                              " http://redirect.example/new; }\n";
     const std::string root =
         "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
     return "error_log stderr notice;\n"
            "events {}\n"
            "http {\n"
-           "  log_format exact_loopback_return302 '" +
-           access_scope +
+           "  log_format " +
+           std::string(profile->log_format) + " '" + access_scope +
            " raw=\"$request\" status=$status request_size=$request_length response_size="
            "$bytes_sent host=\"$host\" upstream_addr=\"$upstream_addr\" upstream_status="
            "$upstream_status';\n"
            "  access_log " +
-           access_path +
-           " exact_loopback_return302;\n"
+           access_path + " " + profile->log_format +
+           ";\n"
            "  server {\n" +
            listener + (exact_first ? exact + root : root + exact) +
            "  }\n"
            "}\n";
 }
 
-static bool validate_exact_loopback_return302_config(const std::string& config,
-                                                     u16 frontend_port,
-                                                     u16 backend_port,
-                                                     bool exact_first,
-                                                     const std::string& access_scope,
-                                                     const std::string& access_path,
-                                                     std::string& error) {
-    const std::string expected = make_exact_loopback_return302_config(
-        frontend_port, backend_port, exact_first, access_scope, access_path);
+static bool validate_exact_loopback_fixed_redirect_config(const std::string& config,
+                                                          u16 frontend_port,
+                                                          u16 backend_port,
+                                                          bool exact_first,
+                                                          const std::string& access_scope,
+                                                          const std::string& access_path,
+                                                          std::string& error,
+                                                          u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
+    const std::string expected = make_exact_loopback_fixed_redirect_config(
+        frontend_port, backend_port, exact_first, access_scope, access_path, redirect_status);
     const std::string listener = "    listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
-    const std::string exact = "    location = /old { return 302 http://redirect.example/new; }\n";
+    const std::string exact = "    location = /old { return " + std::to_string(redirect_status) +
+                              " http://redirect.example/new; }\n";
     const std::string root =
         "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
     if (access_scope.empty() || access_path.empty() || config != expected ||
         count_text(config, "server {") != 1u || count_text(config, "listen ") != 1u ||
         count_text(config, listener) != 1u || count_text(config, "location = /old") != 1u ||
         count_text(config, exact) != 1u || count_text(config, "location /") != 1u ||
-        count_text(config, root) != 1u || count_text(config, "return 302 ") != 1u ||
+        count_text(config, root) != 1u ||
+        count_text(config, "return " + std::to_string(redirect_status) + " ") != 1u ||
         count_text(config, "proxy_pass ") != 1u || count_text(config, access_scope) != 1u ||
-        count_text(config, "  access_log " + access_path + " exact_loopback_return302;\n") != 1u) {
-        error =
-            "#350 config was not the complete canonical exact-listener/fixed-302/root-proxy "
-            "harness in the requested declaration order";
+        count_text(config, "  access_log " + access_path + " " + profile->log_format + ";\n") !=
+            1u) {
+        error = std::string(profile->issue) +
+                " config was not the complete canonical exact-listener/fixed-" +
+                std::to_string(redirect_status) +
+                "/root-proxy harness in the requested declaration order";
         return false;
     }
     return true;
 }
 
-static std::vector<std::string> exact_loopback_return302_expected_access(const std::string& scope,
-                                                                         u16 backend_port) {
+static std::vector<std::string> exact_loopback_fixed_redirect_expected_access(
+    const std::string& scope, u16 backend_port, u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return {};
     const std::string upstream = "127.0.0.1:" + std::to_string(backend_port);
+    const std::string status = std::to_string(redirect_status);
+    const std::string response_size = std::to_string(profile->response_size);
     return {
-        scope + " raw=\"GET /old HTTP/1.1\" status=302 request_size=" +
-            std::to_string(sizeof(kExactAbsoluteRedirectCloseRequest) - 1u) +
-            " response_size=342 host=\"redirect-source.example\" upstream_addr=\"-\" "
+        scope + " raw=\"GET /old HTTP/1.1\" status=" + status +
+            " request_size=" + std::to_string(sizeof(kExactAbsoluteRedirectCloseRequest) - 1u) +
+            " response_size=" + response_size +
+            " host=\"redirect-source.example\" upstream_addr=\"-\" "
             "upstream_status=-",
-        scope + " raw=\"GET /old HTTP/1.1\" status=302 request_size=" +
+        scope + " raw=\"GET /old HTTP/1.1\" status=" + status + " request_size=" +
             std::to_string(sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u) +
-            " response_size=342 host=\"alternate-redirect-source.example\" "
+            " response_size=" + response_size +
+            " host=\"alternate-redirect-source.example\" "
             "upstream_addr=\"-\" upstream_status=-",
-        scope + " raw=\"GET /old?x=1 HTTP/1.1\" status=302 request_size=" +
+        scope + " raw=\"GET /old?x=1 HTTP/1.1\" status=" + status + " request_size=" +
             std::to_string(sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u) +
-            " response_size=342 host=\"redirect-source.example\" upstream_addr=\"-\" "
+            " response_size=" + response_size +
+            " host=\"redirect-source.example\" upstream_addr=\"-\" "
             "upstream_status=-",
         scope + " raw=\"GET /old/ HTTP/1.1\" status=200 request_size=" +
             std::to_string(sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u) +
@@ -31559,37 +31640,47 @@ static std::vector<std::string> exact_loopback_return302_expected_access(const s
     };
 }
 
-static bool parse_exact_loopback_return302_access(const std::string& contents,
-                                                  const std::string& scope,
-                                                  u16 backend_port,
-                                                  std::vector<std::string>& records,
-                                                  std::string& error) {
-    if (!split_exact_complete_log(contents, 5u, "#350 nginx-only access log", records, error))
-        return false;
-    if (records != exact_loopback_return302_expected_access(scope, backend_port)) {
-        error =
-            "#350 access log did not contain exactly five ordered complete "
-            "raw/status/request-size/response-size/host/upstream records";
+static bool parse_exact_loopback_fixed_redirect_access(const std::string& contents,
+                                                       const std::string& scope,
+                                                       u16 backend_port,
+                                                       std::vector<std::string>& records,
+                                                       std::string& error,
+                                                       u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
+    const std::string label = std::string(profile->issue) + " nginx-only access log";
+    if (!split_exact_complete_log(contents, 5u, label.c_str(), records, error)) return false;
+    if (records !=
+        exact_loopback_fixed_redirect_expected_access(scope, backend_port, redirect_status)) {
+        error = std::string(profile->issue) +
+                " access log did not contain exactly five ordered complete "
+                "raw/status/request-size/response-size/host/upstream records";
         return false;
     }
     return true;
 }
 
-static bool validate_exact_loopback_return302_observation(
-    const ExactLoopbackReturn302Observation& observation, std::string& error) {
+static bool validate_exact_loopback_fixed_redirect_observation(
+    const ExactLoopbackFixedRedirectObservation& observation, std::string& error) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(observation.redirect_status);
+    if (profile == nullptr) {
+        error = "observation has unsupported fixed redirect status";
+        return false;
+    }
     if (observation.side != "pinned-nginx" ||
         (observation.order != "exact-before-root" && observation.order != "root-before-exact")) {
         error = "#350 observation lost its nginx-only side or bounded declaration order";
         return false;
     }
     const bool exact_first = observation.order == "exact-before-root";
-    if (!validate_exact_loopback_return302_config(observation.config,
-                                                  observation.frontend_port,
-                                                  observation.backend_port,
-                                                  exact_first,
-                                                  observation.access_scope,
-                                                  observation.access_path,
-                                                  error))
+    if (!validate_exact_loopback_fixed_redirect_config(observation.config,
+                                                       observation.frontend_port,
+                                                       observation.backend_port,
+                                                       exact_first,
+                                                       observation.access_scope,
+                                                       observation.access_path,
+                                                       error,
+                                                       observation.redirect_status))
         return false;
     if (observation.frontend_port == 0u || observation.backend_port == 0u ||
         observation.frontend_port == observation.backend_port ||
@@ -31621,9 +31712,8 @@ static bool validate_exact_loopback_return302_observation(
     }
     std::string detail;
     for (size_t i = 0u; i < observation.wires.size(); i++) {
-        const char* expected =
-            i < 3u ? kExactAbsoluteRedirect302ResponseNormalized : kSuccessResponseNormalized;
-        const size_t expected_size = i < 3u ? 342u : 118u;
+        const char* expected = i < 3u ? profile->normalized_response : kSuccessResponseNormalized;
+        const size_t expected_size = i < 3u ? profile->response_size : 118u;
         if (observation.wires[i].size() != expected_size ||
             !validate_exact_normalized_response(observation.wires[i], expected, detail)) {
             error = "#350 vector " + std::to_string(i + 1u) +
@@ -31650,15 +31740,24 @@ static bool validate_exact_loopback_return302_observation(
     std::vector<std::string> parsed;
     std::string contents;
     for (const auto& record : observation.access_records) contents += record + "\n";
-    if (!parse_exact_loopback_return302_access(
-            contents, observation.access_scope, observation.backend_port, parsed, error) ||
+    if (!parse_exact_loopback_fixed_redirect_access(contents,
+                                                    observation.access_scope,
+                                                    observation.backend_port,
+                                                    parsed,
+                                                    error,
+                                                    observation.redirect_status) ||
         parsed != observation.access_records)
         return false;
     return true;
 }
 
-static bool validate_exact_loopback_return302_pair(
-    const ExactLoopbackReturn302Observation (&observations)[2], std::string& error) {
+static bool validate_exact_loopback_fixed_redirect_pair(
+    const ExactLoopbackFixedRedirectObservation (&observations)[2], std::string& error) {
+    if (observations[0].redirect_status == 0u ||
+        observations[0].redirect_status != observations[1].redirect_status) {
+        error = "exact-loopback redirect pair mixed profiles";
+        return false;
+    }
     if (observations[0].side != "pinned-nginx" || observations[1].side != "pinned-nginx" ||
         observations[0].order != "exact-before-root" ||
         observations[1].order != "root-before-exact") {
@@ -31666,7 +31765,7 @@ static bool validate_exact_loopback_return302_pair(
         return false;
     }
     for (const auto& observation : observations)
-        if (!validate_exact_loopback_return302_observation(observation, error)) return false;
+        if (!validate_exact_loopback_fixed_redirect_observation(observation, error)) return false;
     const std::string* resources[] = {&observations[0].temp_path,
                                       &observations[0].config_path,
                                       &observations[0].log_path,
@@ -31712,7 +31811,7 @@ static bool validate_exact_loopback_return302_pair(
             return false;
         }
     }
-    const auto canonical_history = [](const ExactLoopbackReturn302Observation& observation) {
+    const auto canonical_history = [](const ExactLoopbackFixedRedirectObservation& observation) {
         std::string result;
         const std::string port = std::to_string(observation.backend_port);
         for (const auto& wire : observation.forward_history) {
@@ -31734,7 +31833,12 @@ static bool validate_exact_loopback_return302_pair(
     return true;
 }
 
-static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) {
+static bool run_exact_loopback_fixed_redirect_oracle_self_checks(std::string& error,
+                                                                 u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
+    const std::string status = std::to_string(redirect_status);
+    const std::string alternate_status = redirect_status == 301u ? "302" : "301";
     static constexpr u16 kPorts[] = {44201u, 44202u, 44203u, 44204u};
     const auto replace_unique =
         [&](std::string value, const std::string& from, const std::string& to, const char* label) {
@@ -31748,7 +31852,8 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
             return value;
         };
     const auto make_valid = [&](size_t side) {
-        ExactLoopbackReturn302Observation observation;
+        ExactLoopbackFixedRedirectObservation observation;
+        observation.redirect_status = redirect_status;
         observation.side = "pinned-nginx";
         observation.order = side == 0u ? "exact-before-root" : "root-before-exact";
         observation.temp_path = "/tmp/350-side-" + std::to_string(side);
@@ -31760,14 +31865,15 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         observation.frontend_port = kPorts[side * 2u];
         observation.backend_port = kPorts[side * 2u + 1u];
         observation.negative_port = observation.frontend_port;
-        observation.config = make_exact_loopback_return302_config(observation.frontend_port,
-                                                                  observation.backend_port,
-                                                                  side == 0u,
-                                                                  observation.access_scope,
-                                                                  observation.access_path);
-        const char* expected[] = {kExactAbsoluteRedirect302ResponseNormalized,
-                                  kExactAbsoluteRedirect302ResponseNormalized,
-                                  kExactAbsoluteRedirect302ResponseNormalized,
+        observation.config = make_exact_loopback_fixed_redirect_config(observation.frontend_port,
+                                                                       observation.backend_port,
+                                                                       side == 0u,
+                                                                       observation.access_scope,
+                                                                       observation.access_path,
+                                                                       redirect_status);
+        const char* expected[] = {profile->normalized_response,
+                                  profile->normalized_response,
+                                  profile->normalized_response,
                                   kSuccessResponseNormalized,
                                   kSuccessResponseNormalized};
         for (const char* wire : expected) {
@@ -31785,8 +31891,8 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
             "\r\n\r\n";
         observation.forward_history = {std::vector<char>(slash.begin(), slash.end()),
                                        std::vector<char>(root.begin(), root.end())};
-        observation.access_records = exact_loopback_return302_expected_access(
-            observation.access_scope, observation.backend_port);
+        observation.access_records = exact_loopback_fixed_redirect_expected_access(
+            observation.access_scope, observation.backend_port, redirect_status);
         observation.forward_accepts = observation.forward_requests = observation.forward_sends = 2u;
         observation.negative_guard_stream = true;
         observation.negative_guard_cloexec = true;
@@ -31802,19 +31908,20 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         std::fill(std::begin(observation.eof_proven), std::end(observation.eof_proven), true);
         return observation;
     };
-    ExactLoopbackReturn302Observation valid[2] = {make_valid(0u), make_valid(1u)};
-    if (!validate_exact_loopback_return302_pair(valid, error)) return false;
+    ExactLoopbackFixedRedirectObservation valid[2] = {make_valid(0u), make_valid(1u)};
+    if (!validate_exact_loopback_fixed_redirect_pair(valid, error)) return false;
 
     const auto rejects_config = [&](const char* label, const std::string& candidate) {
         std::string detail;
         if (!candidate.empty() && candidate != valid[0].config &&
-            !validate_exact_loopback_return302_config(candidate,
-                                                      valid[0].frontend_port,
-                                                      valid[0].backend_port,
-                                                      true,
-                                                      valid[0].access_scope,
-                                                      valid[0].access_path,
-                                                      detail))
+            !validate_exact_loopback_fixed_redirect_config(candidate,
+                                                           valid[0].frontend_port,
+                                                           valid[0].backend_port,
+                                                           true,
+                                                           valid[0].access_scope,
+                                                           valid[0].access_path,
+                                                           detail,
+                                                           redirect_status))
             return true;
         error = std::string("#350 config mutation was accepted: ") + label;
         return false;
@@ -31825,18 +31932,22 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         {"address",
          replace_unique(valid[0].config, "127.0.0.1:44201", "127.0.0.2:44201", "address")},
         {"action-status",
-         replace_unique(valid[0].config, "return 302 ", "return 301 ", "action-status")},
+         replace_unique(valid[0].config,
+                        "return " + status + " ",
+                        "return " + alternate_status + " ",
+                        "action-status")},
         {"action-location",
          replace_unique(valid[0].config,
                         "http://redirect.example/new",
                         "http://redirect.example/old",
                         "action-location")},
         {"order",
-         make_exact_loopback_return302_config(valid[0].frontend_port,
-                                              valid[0].backend_port,
-                                              false,
-                                              valid[0].access_scope,
-                                              valid[0].access_path)},
+         make_exact_loopback_fixed_redirect_config(valid[0].frontend_port,
+                                                   valid[0].backend_port,
+                                                   false,
+                                                   valid[0].access_scope,
+                                                   valid[0].access_path,
+                                                   redirect_status)},
         {"extra-directive",
          replace_unique(
              valid[0].config, "http {\n", "http {\n  server_tokens off;\n", "extra-directive")}};
@@ -31844,16 +31955,16 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         if (!rejects_config(mutation.first, mutation.second)) return false;
 
     const auto rejects_observation = [&](const char* label,
-                                         const ExactLoopbackReturn302Observation& candidate) {
+                                         const ExactLoopbackFixedRedirectObservation& candidate) {
         std::string detail;
-        if (!validate_exact_loopback_return302_observation(candidate, detail)) return true;
+        if (!validate_exact_loopback_fixed_redirect_observation(candidate, detail)) return true;
         error = std::string("#350 observation mutation was accepted: ") + label;
         return false;
     };
     const auto rejects_pair = [&](const char* label,
-                                  const ExactLoopbackReturn302Observation(&candidate)[2]) {
+                                  const ExactLoopbackFixedRedirectObservation(&candidate)[2]) {
         std::string detail;
-        if (!validate_exact_loopback_return302_pair(candidate, detail)) return true;
+        if (!validate_exact_loopback_fixed_redirect_pair(candidate, detail)) return true;
         error = std::string("#350 pair mutation was accepted: ") + label;
         return false;
     };
@@ -31865,13 +31976,18 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         const std::string changed = replace_unique(text, from, to, label);
         return std::vector<char>(changed.begin(), changed.end());
     };
-    ExactLoopbackReturn302Observation mutated[2] = {valid[0], valid[1]};
-    mutated[0].wires[0] = mutate_wire(
-        mutated[0].wires[0], "302 Moved Temporarily", "301 Moved Temporarily", "status");
+    ExactLoopbackFixedRedirectObservation mutated[2] = {valid[0], valid[1]};
+    const std::string response_status_line = "HTTP/1.1 " + status + " " + profile->reason + "\r\n";
+    mutated[0].wires[0] = mutate_wire(mutated[0].wires[0],
+                                      response_status_line,
+                                      "HTTP/1.1 399 " + std::string(profile->reason) + "\r\n",
+                                      "status");
     if (mutated[0].wires[0].empty() || !rejects_observation("status", mutated[0])) return false;
     mutated[0] = valid[0];
-    mutated[0].wires[0] =
-        mutate_wire(mutated[0].wires[0], "Moved Temporarily", "Moved PermanentlX", "reason");
+    mutated[0].wires[0] = mutate_wire(mutated[0].wires[0],
+                                      response_status_line,
+                                      "HTTP/1.1 " + status + " Mutated Redirect\r\n",
+                                      "reason");
     if (mutated[0].wires[0].empty() || !rejects_observation("reason", mutated[0])) return false;
     mutated[0] = valid[0];
     mutated[0].wires[0] = mutate_wire(mutated[0].wires[0],
@@ -31887,8 +32003,10 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
     if (mutated[0].wires[2].empty() || !rejects_observation("query-discard", mutated[0]))
         return false;
     mutated[0] = valid[0];
-    mutated[0].wires[1] =
-        mutate_wire(mutated[0].wires[1], "<h1>302 Found", "<h1>302 FounX", "alternate-host-body");
+    mutated[0].wires[1] = mutate_wire(mutated[0].wires[1],
+                                      std::string("<h1>") + profile->title,
+                                      "<h1>399 Mutated Redirect",
+                                      "alternate-host-body");
     if (mutated[0].wires[1].empty() || !rejects_observation("host-independent", mutated[0]))
         return false;
     mutated[0] = valid[0];
@@ -31929,14 +32047,17 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
     struct AccessMutation {
         const char* label;
         size_t record;
-        const char* from;
-        const char* to;
+        std::string from;
+        std::string to;
     };
     const AccessMutation access_mutations[] = {
         {"redirect-target", 0u, "raw=\"GET /old HTTP/1.1\"", "raw=\"GET /new HTTP/1.1\""},
-        {"redirect-status", 0u, " status=302 ", " status=301 "},
+        {"redirect-status", 0u, " status=" + status + " ", " status=" + alternate_status + " "},
         {"redirect-request-size", 0u, " request_size=71 ", " request_size=70 "},
-        {"redirect-response-size", 0u, " response_size=342 ", " response_size=341 "},
+        {"redirect-response-size",
+         0u,
+         " response_size=" + std::to_string(profile->response_size) + " ",
+         " response_size=" + std::to_string(profile->response_size + 1u) + " "},
         {"redirect-host",
          1u,
          "host=\"alternate-redirect-source.example\"",
@@ -31957,8 +32078,12 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
         std::vector<std::string> parsed;
         std::string detail;
         if (candidate_records[mutation.record].empty() ||
-            parse_exact_loopback_return302_access(
-                candidate, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+            parse_exact_loopback_fixed_redirect_access(candidate,
+                                                       valid[0].access_scope,
+                                                       valid[0].backend_port,
+                                                       parsed,
+                                                       detail,
+                                                       redirect_status)) {
             error = std::string("#350 access mutation was accepted: ") + mutation.label;
             return false;
         }
@@ -31969,31 +32094,42 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
     for (const auto& record : swapped) swapped_access += record + "\n";
     std::vector<std::string> parsed;
     std::string detail;
-    if (parse_exact_loopback_return302_access(
-            swapped_access, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+    if (parse_exact_loopback_fixed_redirect_access(swapped_access,
+                                                   valid[0].access_scope,
+                                                   valid[0].backend_port,
+                                                   parsed,
+                                                   detail,
+                                                   redirect_status)) {
         error = "#350 access-order mutation was accepted";
         return false;
     }
     std::string missing_access;
     for (size_t i = 0u; i < 4u; i++) missing_access += valid[0].access_records[i] + "\n";
-    if (parse_exact_loopback_return302_access(
-            missing_access, valid[0].access_scope, valid[0].backend_port, parsed, detail)) {
+    if (parse_exact_loopback_fixed_redirect_access(missing_access,
+                                                   valid[0].access_scope,
+                                                   valid[0].backend_port,
+                                                   parsed,
+                                                   detail,
+                                                   redirect_status)) {
         error = "#350 missing-access-record mutation was accepted";
         return false;
     }
 
-    const std::pair<const char*, bool ExactLoopbackReturn302Observation::*> flags[] = {
-        {"guard-stream", &ExactLoopbackReturn302Observation::negative_guard_stream},
-        {"guard-cloexec", &ExactLoopbackReturn302Observation::negative_guard_cloexec},
-        {"guard-non-listening", &ExactLoopbackReturn302Observation::negative_guard_non_listening},
+    const std::pair<const char*, bool ExactLoopbackFixedRedirectObservation::*> flags[] = {
+        {"guard-stream", &ExactLoopbackFixedRedirectObservation::negative_guard_stream},
+        {"guard-cloexec", &ExactLoopbackFixedRedirectObservation::negative_guard_cloexec},
+        {"guard-non-listening",
+         &ExactLoopbackFixedRedirectObservation::negative_guard_non_listening},
         {"wildcard-causality",
-         &ExactLoopbackReturn302Observation::negative_guard_blocked_wildcard_bind},
-        {"readiness", &ExactLoopbackReturn302Observation::readiness_quiet},
-        {"negative-before", &ExactLoopbackReturn302Observation::negative_probe_before_failed},
-        {"negative-before-quiet", &ExactLoopbackReturn302Observation::negative_probe_before_quiet},
-        {"negative-after", &ExactLoopbackReturn302Observation::negative_probe_after_failed},
-        {"negative-after-quiet", &ExactLoopbackReturn302Observation::negative_probe_after_quiet},
-        {"lifecycle", &ExactLoopbackReturn302Observation::clean_lifecycle}};
+         &ExactLoopbackFixedRedirectObservation::negative_guard_blocked_wildcard_bind},
+        {"readiness", &ExactLoopbackFixedRedirectObservation::readiness_quiet},
+        {"negative-before", &ExactLoopbackFixedRedirectObservation::negative_probe_before_failed},
+        {"negative-before-quiet",
+         &ExactLoopbackFixedRedirectObservation::negative_probe_before_quiet},
+        {"negative-after", &ExactLoopbackFixedRedirectObservation::negative_probe_after_failed},
+        {"negative-after-quiet",
+         &ExactLoopbackFixedRedirectObservation::negative_probe_after_quiet},
+        {"lifecycle", &ExactLoopbackFixedRedirectObservation::clean_lifecycle}};
     for (const auto& mutation : flags) {
         mutated[0] = valid[0];
         mutated[0].*(mutation.second) = false;
@@ -32011,28 +32147,32 @@ static bool run_exact_loopback_return302_oracle_self_checks(std::string& error) 
     mutated[0] = valid[0];
     mutated[0].frontend_port = mutated[1].frontend_port;
     mutated[0].negative_port = mutated[0].frontend_port;
-    mutated[0].config = make_exact_loopback_return302_config(mutated[0].frontend_port,
-                                                             mutated[0].backend_port,
-                                                             true,
-                                                             mutated[0].access_scope,
-                                                             mutated[0].access_path);
-    if (!validate_exact_loopback_return302_observation(mutated[0], error) ||
+    mutated[0].config = make_exact_loopback_fixed_redirect_config(mutated[0].frontend_port,
+                                                                  mutated[0].backend_port,
+                                                                  true,
+                                                                  mutated[0].access_scope,
+                                                                  mutated[0].access_path,
+                                                                  redirect_status);
+    if (!validate_exact_loopback_fixed_redirect_observation(mutated[0], error) ||
         !rejects_pair("shared-port", mutated))
         return false;
     return true;
 }
 
-static bool capture_pinned_exact_loopback_return302_side(
+static bool capture_pinned_exact_loopback_fixed_redirect_side(
     u16 frontend_port,
     u16 backend_port,
     TempDir& temp,
     const std::string& process_identity,
     bool exact_first,
-    ExactLoopbackReturn302Observation& observation,
+    ExactLoopbackFixedRedirectObservation& observation,
     std::string& error,
     int* frontend_reservation,
     int* negative_reservation,
-    int* backend_reservation) {
+    int* backend_reservation,
+    u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
     if (frontend_reservation == nullptr || negative_reservation == nullptr ||
         backend_reservation == nullptr || *frontend_reservation < 0 || *negative_reservation < 0 ||
         *backend_reservation < 0 ||
@@ -32044,27 +32184,26 @@ static bool capture_pinned_exact_loopback_return302_side(
         size_t request_size;
         const char* response;
     };
-    static constexpr Vector kVectors[] = {
-        {"GET /old",
-         kExactAbsoluteRedirectCloseRequest,
-         sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old alternate Host",
-         kExactAbsoluteRedirectAlternateHostCloseRequest,
-         sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old?x=1",
-         kExactAbsoluteRedirectQueryCloseRequest,
-         sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old/",
-         kExactAbsoluteRedirectSlashNeighborCloseRequest,
-         sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
-         kSuccessResponseNormalized},
-        {"GET /",
-         kExactAbsoluteRedirectRootNeighborCloseRequest,
-         sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
-         kSuccessResponseNormalized}};
+    const Vector kVectors[] = {{"GET /old",
+                                kExactAbsoluteRedirectCloseRequest,
+                                sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old alternate Host",
+                                kExactAbsoluteRedirectAlternateHostCloseRequest,
+                                sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old?x=1",
+                                kExactAbsoluteRedirectQueryCloseRequest,
+                                sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old/",
+                                kExactAbsoluteRedirectSlashNeighborCloseRequest,
+                                sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+                                kSuccessResponseNormalized},
+                               {"GET /",
+                                kExactAbsoluteRedirectRootNeighborCloseRequest,
+                                sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
+                                kSuccessResponseNormalized}};
     for (const auto& vector : kVectors) {
         const std::string request(vector.request, vector.request_size);
         const size_t end = request.find("\r\n\r\n");
@@ -32085,7 +32224,9 @@ static bool capture_pinned_exact_loopback_return302_side(
         }
     }
 
-    observation = ExactLoopbackReturn302Observation{};
+    observation = ExactLoopbackFixedRedirectObservation{};
+    observation.redirect_status = redirect_status;
+    observation.redirect_status = redirect_status;
     observation.side = "pinned-nginx";
     observation.order = exact_first ? "exact-before-root" : "root-before-exact";
     observation.temp_path = temp.path;
@@ -32093,7 +32234,8 @@ static bool capture_pinned_exact_loopback_return302_side(
     observation.log_path = temp.nginx_log;
     observation.access_path = temp.nginx_access_log;
     observation.process_identity = process_identity;
-    observation.access_scope = "rut-nginx-350-exact-loopback-302-" + observation.order + "-" +
+    observation.access_scope = "rut-nginx-" + std::string(profile->issue + 1) + "-exact-loopback-" +
+                               std::to_string(redirect_status) + "-" + observation.order + "-" +
                                std::to_string(frontend_port);
     observation.frontend_port = frontend_port;
     observation.backend_port = backend_port;
@@ -32101,18 +32243,20 @@ static bool capture_pinned_exact_loopback_return302_side(
     observation.negative_guard_stream = true;
     observation.negative_guard_cloexec = true;
     observation.negative_guard_non_listening = true;
-    observation.config = make_exact_loopback_return302_config(frontend_port,
-                                                              backend_port,
-                                                              exact_first,
-                                                              observation.access_scope,
-                                                              observation.access_path);
-    if (!validate_exact_loopback_return302_config(observation.config,
-                                                  frontend_port,
-                                                  backend_port,
-                                                  exact_first,
-                                                  observation.access_scope,
-                                                  observation.access_path,
-                                                  error) ||
+    observation.config = make_exact_loopback_fixed_redirect_config(frontend_port,
+                                                                   backend_port,
+                                                                   exact_first,
+                                                                   observation.access_scope,
+                                                                   observation.access_path,
+                                                                   redirect_status);
+    if (!validate_exact_loopback_fixed_redirect_config(observation.config,
+                                                       frontend_port,
+                                                       backend_port,
+                                                       exact_first,
+                                                       observation.access_scope,
+                                                       observation.access_path,
+                                                       error,
+                                                       redirect_status) ||
         !write_file(temp.nginx_config, observation.config.data(), observation.config.size())) {
         if (error.empty()) error = "#350 failed to persist the exact canonical nginx config";
         return false;
@@ -32316,11 +32460,12 @@ static bool capture_pinned_exact_loopback_return302_side(
     std::string error_contents;
     if (!read_exact_return204_log(
             temp.nginx_access_log, "#350 nginx access log", access_contents, error) ||
-        !parse_exact_loopback_return302_access(access_contents,
-                                               observation.access_scope,
-                                               backend_port,
-                                               observation.access_records,
-                                               error) ||
+        !parse_exact_loopback_fixed_redirect_access(access_contents,
+                                                    observation.access_scope,
+                                                    backend_port,
+                                                    observation.access_records,
+                                                    error,
+                                                    redirect_status) ||
         !read_exact_return204_log(temp.nginx_log, "#350 nginx error log", error_contents, error))
         return false;
     for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
@@ -32331,13 +32476,14 @@ static bool capture_pinned_exact_loopback_return302_side(
     }
     observation.clean_lifecycle = true;
     return validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#350") &&
-           validate_exact_loopback_return302_observation(observation, error);
+           validate_exact_loopback_fixed_redirect_observation(observation, error);
 }
 
-static bool run_pinned_exact_loopback_return302_oracle(
+static bool run_pinned_exact_loopback_fixed_redirect_oracle(
     const std::string& container_prefix,
-    ExactLoopbackReturn302Observation (&observations)[2],
-    std::string& error) {
+    ExactLoopbackFixedRedirectObservation (&observations)[2],
+    std::string& error,
+    u16 redirect_status = 302u) {
     ExactLoopbackReservations reservations;
     u16 ports[4]{};
     if (!reservations.reserve_side(0u, ports[0], ports[1]) ||
@@ -32364,26 +32510,28 @@ static bool run_pinned_exact_loopback_return302_oracle(
         error = "#350 could not create isolated declaration-order resources";
         return false;
     }
-    if (!capture_pinned_exact_loopback_return302_side(ports[0],
-                                                      ports[1],
-                                                      temps[0],
-                                                      container_prefix + "-exact-first",
-                                                      true,
-                                                      observations[0],
-                                                      error,
-                                                      &reservations.fds[0],
-                                                      &reservations.fds[1],
-                                                      &reservations.fds[2]) ||
-        !capture_pinned_exact_loopback_return302_side(ports[2],
-                                                      ports[3],
-                                                      temps[1],
-                                                      container_prefix + "-root-first",
-                                                      false,
-                                                      observations[1],
-                                                      error,
-                                                      &reservations.fds[3],
-                                                      &reservations.fds[4],
-                                                      &reservations.fds[5]))
+    if (!capture_pinned_exact_loopback_fixed_redirect_side(ports[0],
+                                                           ports[1],
+                                                           temps[0],
+                                                           container_prefix + "-exact-first",
+                                                           true,
+                                                           observations[0],
+                                                           error,
+                                                           &reservations.fds[0],
+                                                           &reservations.fds[1],
+                                                           &reservations.fds[2],
+                                                           redirect_status) ||
+        !capture_pinned_exact_loopback_fixed_redirect_side(ports[2],
+                                                           ports[3],
+                                                           temps[1],
+                                                           container_prefix + "-root-first",
+                                                           false,
+                                                           observations[1],
+                                                           error,
+                                                           &reservations.fds[3],
+                                                           &reservations.fds[4],
+                                                           &reservations.fds[5],
+                                                           redirect_status))
         return false;
     if (reservations.fds[0] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
         reservations.fds[5] >= 0 || reservations.fds[1] < 0 || reservations.fds[4] < 0 ||
@@ -32393,11 +32541,11 @@ static bool run_pinned_exact_loopback_return302_oracle(
             error = "#350 captures did not consume four handoffs while retaining both .2 guards";
         return false;
     }
-    return validate_exact_loopback_return302_pair(observations, error);
+    return validate_exact_loopback_fixed_redirect_pair(observations, error);
 }
 
-static void dump_exact_loopback_return302_observation(
-    const ExactLoopbackReturn302Observation& observation) {
+static void dump_exact_loopback_fixed_redirect_observation(
+    const ExactLoopbackFixedRedirectObservation& observation) {
     std::cerr << "#350 " << observation.side << " order=" << observation.order
               << " frontend=" << observation.frontend_port
               << " backend=" << observation.backend_port
@@ -32418,27 +32566,58 @@ static void dump_exact_loopback_return302_observation(
         dump_log(observation.access_path, "#350 nginx access log");
 }
 
-static std::string make_exact_loopback_return302_fragment(u16 frontend_port,
-                                                          u16 backend_port,
-                                                          bool exact_first) {
+static std::string make_exact_loopback_fixed_redirect_fragment(u16 frontend_port,
+                                                               u16 backend_port,
+                                                               bool exact_first,
+                                                               u16 redirect_status = 302u) {
+    if (exact_loopback_fixed_redirect_profile(redirect_status) == nullptr) return {};
     const std::string listener = "  listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
-    const std::string exact = "  location = /old { return 302 http://redirect.example/new; }\n";
+    const std::string exact = "  location = /old { return " + std::to_string(redirect_status) +
+                              " http://redirect.example/new; }\n";
     const std::string root =
         "  location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
     return "server {\n" + listener + (exact_first ? exact + root : root + exact) + "}\n";
 }
 
-static constexpr char kExactLoopbackReturn302SourceBody[] =
-    "body: b\"<html>\\r\\n<head><title>302 Found</title></head>\\r\\n<body>\\r\\n"
-    "<center><h1>302 Found</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n"
-    "</body>\\r\\n</html>\\r\\n\"";
-
 static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword);
 
-static bool validate_exact_loopback_return302_generated_source(const std::string& source,
-                                                               u16 frontend_port,
-                                                               u16 backend_port,
-                                                               std::string& error) {
+static bool make_exact_loopback_fixed_redirect_representative_source(u16 redirect_status,
+                                                                     std::string& source,
+                                                                     std::string& error) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
+    std::string fragment =
+        make_exact_loopback_fixed_redirect_fragment(8080u, 9000u, true, redirect_status);
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = std::string(profile->issue) +
+                " representative source fixture failed genuine nginx parsing";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) {
+        error = std::string(profile->issue) +
+                " representative source fixture failed genuine converter lowering";
+        return false;
+    }
+    source.assign(lowered.value().data, lowered.value().len);
+    if (source.size() != profile->representative_source_size) {
+        error = std::string(profile->issue) + " representative source length was " +
+                std::to_string(source.size()) + ", expected " +
+                std::to_string(profile->representative_source_size);
+        return false;
+    }
+    return true;
+}
+
+static bool validate_exact_loopback_fixed_redirect_generated_source_structure(
+    const std::string& source,
+    u16 frontend_port,
+    u16 backend_port,
+    std::string& error,
+    u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
@@ -32457,9 +32636,11 @@ static bool validate_exact_loopback_return302_generated_source(const std::string
         count_text(source, "authority: \"static\", static_authority: \"redirect.example\"") != 1u ||
         count_text(source, "path: \"static\", query: \"discard\"") != 1u ||
         count_text(source, "header_order: \"connection_then_location\"") != 1u ||
-        count_text(source, "status: 302, reason: \"Moved Temporarily\"") != 1u ||
+        count_text(source,
+                   "status: " + std::to_string(redirect_status) + ", reason: \"" + profile->reason +
+                       "\"") != 1u ||
         count_text(source, "target_path: \"/new\"") != 1u ||
-        count_text(source, kExactLoopbackReturn302SourceBody) != 1u ||
+        count_text(source, profile->source_body) != 1u ||
         count_text(source, "    } else {\n        return forward(nginx_upstream") != 1u ||
         count_text(source, "return forward(nginx_upstream, request_policy: {\n") != 3u ||
         count_text(source, "            host: \"upstream\",\n") != 3u ||
@@ -32483,18 +32664,76 @@ static bool validate_exact_loopback_return302_generated_source(const std::string
         source.find("nginx_compat") != std::string::npos ||
         source.find("workaround") != std::string::npos ||
         source.find("bind_address") != std::string::npos) {
-        error =
-            "#350 generated source was not the canonical ordinary exact-listener/fixed-302/"
-            "root-forward program";
+        error = std::string(profile->issue) +
+                " generated source was not the canonical ordinary exact-listener/fixed-" +
+                std::to_string(redirect_status) + "/root-forward program";
         return false;
     }
     return true;
 }
 
-static bool parse_exact_loopback_return302_rut_access(
+static bool validate_exact_loopback_fixed_redirect_generated_source(const std::string& source,
+                                                                    u16 frontend_port,
+                                                                    u16 backend_port,
+                                                                    std::string& error,
+                                                                    u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr || !validate_exact_loopback_fixed_redirect_generated_source_structure(
+                                  source, frontend_port, backend_port, error, redirect_status))
+        return false;
+
+    std::string canonical = source;
+    const auto canonicalize_endpoint = [&](const std::string& dynamic,
+                                           const std::string& representative) {
+        const size_t offset = dynamic.empty() ? std::string::npos : canonical.find(dynamic);
+        if (offset == std::string::npos ||
+            canonical.find(dynamic, offset + dynamic.size()) != std::string::npos)
+            return false;
+        if (dynamic != representative) {
+            const std::string before = canonical;
+            canonical.replace(offset, dynamic.size(), representative);
+            if (canonical == before) return false;
+        }
+        return true;
+    };
+    const std::string dynamic_listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string representative_listener = "listen 127.0.0.1:8080\n";
+    const std::string dynamic_upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const std::string representative_upstream = "upstream nginx_upstream at \"127.0.0.1:9000\"\n";
+    if (!canonicalize_endpoint(dynamic_listener, representative_listener) ||
+        !canonicalize_endpoint(dynamic_upstream, representative_upstream)) {
+        error = std::string(profile->issue) +
+                " generated source did not contain unique dynamic listener/upstream endpoints";
+        return false;
+    }
+
+    std::string representative;
+    if (!make_exact_loopback_fixed_redirect_representative_source(
+            redirect_status, representative, error) ||
+        !validate_exact_loopback_fixed_redirect_generated_source_structure(
+            representative, 8080u, 9000u, error, redirect_status))
+        return false;
+    if (canonical.size() != profile->representative_source_size) {
+        error = std::string(profile->issue) + " canonical representative source length was " +
+                std::to_string(canonical.size()) + ", expected " +
+                std::to_string(profile->representative_source_size);
+        return false;
+    }
+    if (canonical != representative) {
+        error = std::string(profile->issue) +
+                " generated source bytes differed from genuine representative converter output";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_exact_loopback_fixed_redirect_rut_access(
     const std::string& contents,
-    ExactLoopbackReturn302Observation& observation,
+    ExactLoopbackFixedRedirectObservation& observation,
     std::string& error) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(observation.redirect_status);
+    if (profile == nullptr) return false;
     // The current ordinary-RUT text schema has no Host, upstream socket-address, or upstream
     // status field (#352). Those facts are therefore proven independently by the original
     // request plus byte-exact recorder history, the owned loaded endpoint, and the downstream
@@ -32518,7 +32757,7 @@ static bool parse_exact_loopback_return302_rut_access(
         const u32 response_size = static_cast<u32>(observation.wires[i].size());
         if (!split_space_fields(records[i], fields) || fields.size() != (forwarded ? 11u : 9u) ||
             !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != kTargets[i] ||
-            !decimal_field_equals(fields[3], forwarded ? 200u : 302u) ||
+            !decimal_field_equals(fields[3], forwarded ? 200u : observation.redirect_status) ||
             !exact_log_duration(fields[4]) || !decimal_field_equals(fields[5], request_size) ||
             !decimal_field_equals(fields[6], response_size) || fields[7] != "127.0.0.1" ||
             (forwarded && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) ||
@@ -32535,17 +32774,21 @@ static bool parse_exact_loopback_return302_rut_access(
     return true;
 }
 
-static bool validate_exact_loopback_return302_generated_observation(
-    const ExactLoopbackReturn302Observation& observation, std::string& error) {
+static bool validate_exact_loopback_fixed_redirect_generated_observation(
+    const ExactLoopbackFixedRedirectObservation& observation, std::string& error) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(observation.redirect_status);
+    if (profile == nullptr) return false;
     if (observation.side != "converter-generated-rut" ||
         (observation.order != "exact-before-root" && observation.order != "root-before-exact")) {
         error = "#350 generated observation lost its side or bounded declaration order";
         return false;
     }
     const bool exact_first = observation.order == "exact-before-root";
-    if (observation.config != make_exact_loopback_return302_fragment(observation.frontend_port,
-                                                                     observation.backend_port,
-                                                                     exact_first)) {
+    if (observation.config !=
+        make_exact_loopback_fixed_redirect_fragment(observation.frontend_port,
+                                                    observation.backend_port,
+                                                    exact_first,
+                                                    observation.redirect_status)) {
         error = "#350 generated observation did not retain its exact borrowed nginx fragment";
         return false;
     }
@@ -32578,9 +32821,8 @@ static bool validate_exact_loopback_return302_generated_observation(
     }
     std::string detail;
     for (size_t i = 0u; i < observation.wires.size(); i++) {
-        const char* expected =
-            i < 3u ? kExactAbsoluteRedirect302ResponseNormalized : kSuccessResponseNormalized;
-        const size_t expected_size = i < 3u ? 342u : 118u;
+        const char* expected = i < 3u ? profile->normalized_response : kSuccessResponseNormalized;
+        const size_t expected_size = i < 3u ? profile->response_size : 118u;
         if (observation.wires[i].size() != expected_size ||
             !validate_exact_normalized_response(observation.wires[i], expected, detail)) {
             error = "#350 generated vector " + std::to_string(i + 1u) +
@@ -32601,19 +32843,23 @@ static bool validate_exact_loopback_return302_generated_observation(
         error = "#350 generated upstream history lost exact URI/rebuilt Host/omitted Connection";
         return false;
     }
-    ExactLoopbackReturn302Observation parsed = observation;
+    ExactLoopbackFixedRedirectObservation parsed = observation;
     std::string contents;
     for (const auto& record : observation.access_records) contents += record + "\n";
-    if (!parse_exact_loopback_return302_rut_access(contents, parsed, error) ||
+    if (!parse_exact_loopback_fixed_redirect_rut_access(contents, parsed, error) ||
         parsed.access_records != observation.access_records)
         return false;
     return true;
 }
 
-static bool validate_exact_loopback_return302_four_way(
-    const ExactLoopbackReturn302Observation (&observations)[4],
+static bool validate_exact_loopback_fixed_redirect_four_way(
+    const ExactLoopbackFixedRedirectObservation (&observations)[4],
     const std::string (&generated_sources)[2],
     std::string& error) {
+    if (observations[0].redirect_status == 0u) return false;
+    const u16 redirect_status = observations[0].redirect_status;
+    for (const auto& observation : observations)
+        if (observation.redirect_status != redirect_status) return false;
     static constexpr const char* kSides[] = {
         "pinned-nginx", "pinned-nginx", "converter-generated-rut", "converter-generated-rut"};
     static constexpr const char* kOrders[] = {
@@ -32624,10 +32870,10 @@ static bool validate_exact_loopback_return302_four_way(
             return false;
         }
         if (i < 2u) {
-            if (!validate_exact_loopback_return302_observation(observations[i], error))
+            if (!validate_exact_loopback_fixed_redirect_observation(observations[i], error))
                 return false;
-        } else if (!validate_exact_loopback_return302_generated_observation(observations[i],
-                                                                            error)) {
+        } else if (!validate_exact_loopback_fixed_redirect_generated_observation(observations[i],
+                                                                                 error)) {
             return false;
         }
     }
@@ -32670,10 +32916,11 @@ static bool validate_exact_loopback_return302_four_way(
     std::string canonical_sources[2] = {generated_sources[0], generated_sources[1]};
     for (size_t side = 0u; side < 2u; side++) {
         const auto& observation = observations[side + 2u];
-        if (!validate_exact_loopback_return302_generated_source(generated_sources[side],
-                                                                observation.frontend_port,
-                                                                observation.backend_port,
-                                                                error))
+        if (!validate_exact_loopback_fixed_redirect_generated_source(generated_sources[side],
+                                                                     observation.frontend_port,
+                                                                     observation.backend_port,
+                                                                     error,
+                                                                     redirect_status))
             return false;
         const std::string listener =
             "listen 127.0.0.1:" + std::to_string(observation.frontend_port);
@@ -32699,7 +32946,7 @@ static bool validate_exact_loopback_return302_four_way(
             }
         }
     }
-    const auto canonical_history = [](const ExactLoopbackReturn302Observation& observation) {
+    const auto canonical_history = [](const ExactLoopbackFixedRedirectObservation& observation) {
         std::string result;
         const std::string port = std::to_string(observation.backend_port);
         for (const auto& wire : observation.forward_history) {
@@ -32724,19 +32971,22 @@ static bool validate_exact_loopback_return302_four_way(
     return true;
 }
 
-static bool capture_generated_exact_loopback_return302_side(
+static bool capture_generated_exact_loopback_fixed_redirect_side(
     u16 frontend_port,
     u16 backend_port,
     TempDir& temp,
     const std::string& process_identity,
     bool exact_first,
     const char* rut_path,
-    ExactLoopbackReturn302Observation& observation,
+    ExactLoopbackFixedRedirectObservation& observation,
     std::string& generated_source,
     std::string& error,
     int* frontend_reservation,
     int* negative_reservation,
-    int* backend_reservation) {
+    int* backend_reservation,
+    u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
     if (frontend_reservation == nullptr || negative_reservation == nullptr ||
         backend_reservation == nullptr || *frontend_reservation < 0 || *negative_reservation < 0 ||
         *backend_reservation < 0 || rut_path == nullptr || rut_path[0] != '/' ||
@@ -32745,7 +32995,8 @@ static bool capture_generated_exact_loopback_return302_side(
         if (error.empty()) error = "#350 generated side requires held endpoints and absolute RUT";
         return false;
     }
-    observation = ExactLoopbackReturn302Observation{};
+    observation = ExactLoopbackFixedRedirectObservation{};
+    observation.redirect_status = redirect_status;
     observation.side = "converter-generated-rut";
     observation.order = exact_first ? "exact-before-root" : "root-before-exact";
     observation.temp_path = temp.path;
@@ -32753,16 +33004,16 @@ static bool capture_generated_exact_loopback_return302_side(
     observation.log_path = temp.rut_log;
     observation.access_path = temp.rut_access_log;
     observation.process_identity = process_identity;
-    observation.access_scope =
-        "rut-nginx-350-generated-" + observation.order + "-" + std::to_string(frontend_port);
+    observation.access_scope = "rut-nginx-" + std::string(profile->issue + 1) + "-generated-" +
+                               observation.order + "-" + std::to_string(frontend_port);
     observation.frontend_port = frontend_port;
     observation.backend_port = backend_port;
     observation.negative_port = frontend_port;
     observation.negative_guard_stream = true;
     observation.negative_guard_cloexec = true;
     observation.negative_guard_non_listening = true;
-    observation.config =
-        make_exact_loopback_return302_fragment(frontend_port, backend_port, exact_first);
+    observation.config = make_exact_loopback_fixed_redirect_fragment(
+        frontend_port, backend_port, exact_first, redirect_status);
 
     std::string borrowed_fragment = observation.config;
     {
@@ -32779,7 +33030,9 @@ static bool capture_generated_exact_loopback_return302_side(
         const std::string listen_directive = "listen " + listen_value + ";";
         const std::string proxy_directive =
             "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
-        const std::string return_directive = "return 302 http://redirect.example/new;";
+        const std::string status_lexeme = std::to_string(redirect_status);
+        const std::string return_directive =
+            "return " + status_lexeme + " http://redirect.example/new;";
         const size_t server_start = borrowed_fragment.find("server {");
         const size_t server_close = borrowed_fragment.rfind('}');
         const size_t listen_start = borrowed_fragment.find(listen_directive);
@@ -32792,7 +33045,7 @@ static bool capture_generated_exact_loopback_return302_side(
         const size_t exact_close = borrowed_fragment.find('}', exact_start);
         const size_t exact_path = borrowed_fragment.find("/old", exact_start);
         const size_t return_start = borrowed_fragment.find(return_directive, exact_start);
-        const size_t status_start = borrowed_fragment.find("302", return_start);
+        const size_t status_start = borrowed_fragment.find(status_lexeme, return_start);
         const size_t target_start =
             borrowed_fragment.find("http://redirect.example/new", return_start);
         const size_t authority_start = target_start == std::string::npos
@@ -32858,8 +33111,9 @@ static bool capture_generated_exact_loopback_return302_side(
             redirect.span.end != exact_close + 1u || redirect.span.line != exact_line ||
             redirect.span.col != 3u || redirect.path_span.start != exact_path ||
             redirect.path_span.end != exact_path + 4u || redirect.path_span.line != exact_line ||
-            redirect.path_span.col != col_of(exact_path) || response.status != 302u ||
-            !response.status_lexeme.eq(rut::lit_str("302")) ||
+            redirect.path_span.col != col_of(exact_path) || response.status != redirect_status ||
+            !response.status_lexeme.eq(
+                {status_lexeme.data(), static_cast<u32>(status_lexeme.size())}) ||
             !same_source(response.status_lexeme, response.status_span) ||
             response.status_span.start != status_start ||
             response.status_span.end != status_start + 3u ||
@@ -32898,8 +33152,8 @@ static bool capture_generated_exact_loopback_return302_side(
         }
         const rut::Str output = lowered.value().view();
         generated_source.assign(output.ptr, output.len);
-        if (!validate_exact_loopback_return302_generated_source(
-                generated_source, frontend_port, backend_port, error) ||
+        if (!validate_exact_loopback_fixed_redirect_generated_source(
+                generated_source, frontend_port, backend_port, error, redirect_status) ||
             !write_file(temp.source, output.ptr, output.len)) {
             if (error.empty()) error = "#350 failed to persist generated ordinary RUT";
             return false;
@@ -32979,10 +33233,6 @@ static bool capture_generated_exact_loopback_return302_side(
             return false;
         }
         const auto& policy = program.config.redirect_policies[redirect_policy_id - 1u];
-        static constexpr char kRedirectBody[] =
-            "<html>\r\n<head><title>302 Found</title></head>\r\n<body>\r\n"
-            "<center><h1>302 Found</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
-            "</body>\r\n</html>\r\n";
         if (!program.config.redirect_policy_strings_are_owned(policy) ||
             policy.scheme != rut::RedirectPolicyScheme::Http ||
             policy.authority != rut::RedirectPolicyAuthority::Static ||
@@ -32992,13 +33242,15 @@ static bool capture_generated_exact_loopback_return302_side(
             policy.date != rut::RedirectPolicyDate::Current ||
             policy.connection != rut::RedirectPolicyConnection::Close ||
             policy.header_order != rut::RedirectPolicyHeaderOrder::ConnectionThenLocation ||
-            policy.status_code != 302u || !policy.reason.eq(rut::lit_str("Moved Temporarily")) ||
+            policy.status_code != redirect_status ||
+            !policy.reason.eq({profile->reason, static_cast<u32>(strlen(profile->reason))}) ||
             !policy.server.eq(rut::lit_str("nginx/1.29.7")) ||
             !policy.content_type.eq(rut::lit_str("text/html")) ||
             !policy.static_authority.eq(rut::lit_str("redirect.example")) ||
             !policy.target_path.eq(rut::lit_str("/new")) ||
-            !policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u})) {
-            error = "#350 public load changed the binding-linked fixed-302 policy/body";
+            !policy.body.eq({profile->body, static_cast<u32>(strlen(profile->body))})) {
+            error = std::string(profile->issue) +
+                    " public load changed the binding-linked fixed redirect policy/body";
             return false;
         }
     }
@@ -33136,27 +33388,26 @@ static bool capture_generated_exact_loopback_return302_side(
         size_t request_size;
         const char* expected;
     };
-    static constexpr Vector kVectors[] = {
-        {"GET /old",
-         kExactAbsoluteRedirectCloseRequest,
-         sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old alternate Host",
-         kExactAbsoluteRedirectAlternateHostCloseRequest,
-         sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old?x=1",
-         kExactAbsoluteRedirectQueryCloseRequest,
-         sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
-         kExactAbsoluteRedirect302ResponseNormalized},
-        {"GET /old/",
-         kExactAbsoluteRedirectSlashNeighborCloseRequest,
-         sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
-         kSuccessResponseNormalized},
-        {"GET /",
-         kExactAbsoluteRedirectRootNeighborCloseRequest,
-         sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
-         kSuccessResponseNormalized}};
+    const Vector kVectors[] = {{"GET /old",
+                                kExactAbsoluteRedirectCloseRequest,
+                                sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old alternate Host",
+                                kExactAbsoluteRedirectAlternateHostCloseRequest,
+                                sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old?x=1",
+                                kExactAbsoluteRedirectQueryCloseRequest,
+                                sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+                                profile->normalized_response},
+                               {"GET /old/",
+                                kExactAbsoluteRedirectSlashNeighborCloseRequest,
+                                sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+                                kSuccessResponseNormalized},
+                               {"GET /",
+                                kExactAbsoluteRedirectRootNeighborCloseRequest,
+                                sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u,
+                                kSuccessResponseNormalized}};
     const auto send_vector = [&](size_t index) {
         struct ClientGuard {
             int fd = -1;
@@ -33250,23 +33501,24 @@ static bool capture_generated_exact_loopback_return302_side(
     std::string runtime_contents;
     if (!read_exact_return204_log(
             temp.rut_access_log, "#350 generated RUT access log", access_contents, error) ||
-        !parse_exact_loopback_return302_rut_access(access_contents, observation, error) ||
+        !parse_exact_loopback_fixed_redirect_rut_access(access_contents, observation, error) ||
         !read_exact_return204_log(
             temp.rut_log, "#350 generated RUT runtime log", runtime_contents, error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error) ||
         !validate_exact_loopback_guard_fd(*negative_reservation, frontend_port, error, "#350"))
         return false;
     observation.clean_lifecycle = true;
-    return validate_exact_loopback_return302_generated_observation(observation, error);
+    return validate_exact_loopback_fixed_redirect_generated_observation(observation, error);
 }
 
-static bool make_exact_loopback_return302_generated_source(u16 frontend_port,
-                                                           u16 backend_port,
-                                                           bool exact_first,
-                                                           std::string& source,
-                                                           std::string& error) {
-    std::string fragment =
-        make_exact_loopback_return302_fragment(frontend_port, backend_port, exact_first);
+static bool make_exact_loopback_fixed_redirect_generated_source(u16 frontend_port,
+                                                                u16 backend_port,
+                                                                bool exact_first,
+                                                                std::string& source,
+                                                                std::string& error,
+                                                                u16 redirect_status = 302u) {
+    std::string fragment = make_exact_loopback_fixed_redirect_fragment(
+        frontend_port, backend_port, exact_first, redirect_status);
     const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
     if (!parsed) {
         error = "#350 source fixture failed genuine nginx parsing";
@@ -33278,11 +33530,14 @@ static bool make_exact_loopback_return302_generated_source(u16 frontend_port,
         return false;
     }
     source.assign(lowered.value().data, lowered.value().len);
-    return validate_exact_loopback_return302_generated_source(
-        source, frontend_port, backend_port, error);
+    return validate_exact_loopback_fixed_redirect_generated_source(
+        source, frontend_port, backend_port, error, redirect_status);
 }
 
-static bool run_exact_loopback_return302_four_way_self_checks(std::string& error) {
+static bool run_exact_loopback_fixed_redirect_four_way_self_checks(std::string& error,
+                                                                   u16 redirect_status = 302u) {
+    const auto* profile = exact_loopback_fixed_redirect_profile(redirect_status);
+    if (profile == nullptr) return false;
     static constexpr u16 kPorts[] = {
         44301u, 44302u, 44303u, 44304u, 44305u, 44306u, 44307u, 44308u};
     const auto replace_unique =
@@ -33297,13 +33552,14 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
             return value;
         };
     std::string sources[2];
-    if (!make_exact_loopback_return302_generated_source(
-            kPorts[4], kPorts[5], true, sources[0], error) ||
-        !make_exact_loopback_return302_generated_source(
-            kPorts[6], kPorts[7], false, sources[1], error))
+    if (!make_exact_loopback_fixed_redirect_generated_source(
+            kPorts[4], kPorts[5], true, sources[0], error, redirect_status) ||
+        !make_exact_loopback_fixed_redirect_generated_source(
+            kPorts[6], kPorts[7], false, sources[1], error, redirect_status))
         return false;
     const auto make_observation = [&](size_t side) {
-        ExactLoopbackReturn302Observation observation;
+        ExactLoopbackFixedRedirectObservation observation;
+        observation.redirect_status = redirect_status;
         observation.side = side < 2u ? "pinned-nginx" : "converter-generated-rut";
         observation.order = side % 2u == 0u ? "exact-before-root" : "root-before-exact";
         observation.temp_path = "/tmp/350-four-side-" + std::to_string(side);
@@ -33316,16 +33572,19 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         observation.backend_port = kPorts[side * 2u + 1u];
         observation.negative_port = observation.frontend_port;
         observation.config =
-            side < 2u ? make_exact_loopback_return302_config(observation.frontend_port,
-                                                             observation.backend_port,
-                                                             side == 0u,
-                                                             observation.access_scope,
-                                                             observation.access_path)
-                      : make_exact_loopback_return302_fragment(
-                            observation.frontend_port, observation.backend_port, side == 2u);
-        const char* expected[] = {kExactAbsoluteRedirect302ResponseNormalized,
-                                  kExactAbsoluteRedirect302ResponseNormalized,
-                                  kExactAbsoluteRedirect302ResponseNormalized,
+            side < 2u ? make_exact_loopback_fixed_redirect_config(observation.frontend_port,
+                                                                  observation.backend_port,
+                                                                  side == 0u,
+                                                                  observation.access_scope,
+                                                                  observation.access_path,
+                                                                  redirect_status)
+                      : make_exact_loopback_fixed_redirect_fragment(observation.frontend_port,
+                                                                    observation.backend_port,
+                                                                    side == 2u,
+                                                                    redirect_status);
+        const char* expected[] = {profile->normalized_response,
+                                  profile->normalized_response,
+                                  profile->normalized_response,
                                   kSuccessResponseNormalized,
                                   kSuccessResponseNormalized};
         for (const char* wire : expected) {
@@ -33344,8 +33603,8 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         observation.forward_history = {std::vector<char>(slash.begin(), slash.end()),
                                        std::vector<char>(root.begin(), root.end())};
         if (side < 2u) {
-            observation.access_records = exact_loopback_return302_expected_access(
-                observation.access_scope, observation.backend_port);
+            observation.access_records = exact_loopback_fixed_redirect_expected_access(
+                observation.access_scope, observation.backend_port, redirect_status);
         } else {
             static constexpr const char* kTargets[] = {"/old", "/old", "/old?x=1", "/old/", "/"};
             static constexpr u32 kRequestSizes[] = {
@@ -33359,9 +33618,9 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
                               : kRequestSizes[i];
                 observation.access_records.push_back(
                     "2030-01-01T00:00:00.000Z GET " + std::string(kTargets[i]) + " " +
-                    (forwarded ? "200" : "302") + " 1us " + std::to_string(field5) + " " +
-                    std::to_string(observation.wires[i].size()) + " 127.0.0.1" +
-                    (forwarded ? " nginx_upstream 2us s=0" : " s=0"));
+                    (forwarded ? "200" : std::to_string(redirect_status)) + " 1us " +
+                    std::to_string(field5) + " " + std::to_string(observation.wires[i].size()) +
+                    " 127.0.0.1" + (forwarded ? " nginx_upstream 2us s=0" : " s=0"));
             }
         }
         observation.forward_accepts = observation.forward_requests = observation.forward_sends = 2u;
@@ -33380,15 +33639,15 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         std::fill(std::begin(observation.eof_proven), std::end(observation.eof_proven), true);
         return observation;
     };
-    ExactLoopbackReturn302Observation valid[4] = {
+    ExactLoopbackFixedRedirectObservation valid[4] = {
         make_observation(0u), make_observation(1u), make_observation(2u), make_observation(3u)};
-    if (!validate_exact_loopback_return302_four_way(valid, sources, error)) return false;
+    if (!validate_exact_loopback_fixed_redirect_four_way(valid, sources, error)) return false;
 
     const auto source_rejects = [&](const char* label, const std::string& candidate) {
         std::string detail;
         if (!candidate.empty() && candidate != sources[0] &&
-            !validate_exact_loopback_return302_generated_source(
-                candidate, kPorts[4], kPorts[5], detail))
+            !validate_exact_loopback_fixed_redirect_generated_source(
+                candidate, kPorts[4], kPorts[5], detail, redirect_status))
             return true;
         error = std::string("#350 source validator accepted mutation: ") + label;
         return false;
@@ -33411,10 +33670,11 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         {"primitive",
          replace_unique(sources[0], "return redirect({", "return redirecX({", "primitive")},
         {"status",
-         replace_unique(sources[0],
-                        "status: 302, reason: \"Moved Temporarily\"",
-                        "status: 301, reason: \"Moved Temporarily\"",
-                        "status")},
+         replace_unique(
+             sources[0],
+             "status: " + std::to_string(redirect_status) + ", reason: \"" + profile->reason + "\"",
+             "status: 399, reason: \"" + std::string(profile->reason) + "\"",
+             "status")},
         {"location",
          replace_unique(sources[0],
                         "static_authority: \"redirect.example\"",
@@ -33430,7 +33690,11 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
                         "header_order: \"connection_then_location\"",
                         "header_order: \"location_then_connection\"",
                         "header-order")},
-        {"body", replace_unique(sources[0], "<h1>302 Found</h1>", "<h1>302 FounX</h1>", "body")},
+        {"body",
+         replace_unique(sources[0],
+                        std::string("<h1>") + profile->title + "</h1>",
+                        "<h1>399 Mutated Redirect</h1>",
+                        "body")},
         {"root",
          replace_unique(sources[0],
                         "    } else {\n        return forward(nginx_upstream",
@@ -33442,22 +33706,33 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
 
     const auto access_rejects =
         [&](const char* label, size_t record, const std::string& from, const std::string& to) {
-            ExactLoopbackReturn302Observation candidate = valid[2];
+            ExactLoopbackFixedRedirectObservation candidate = valid[2];
             candidate.access_records[record] =
                 replace_unique(candidate.access_records[record], from, to, label);
             if (candidate.access_records[record].empty()) return false;
             std::string contents;
             for (const auto& line : candidate.access_records) contents += line + "\n";
             std::string detail;
-            if (!parse_exact_loopback_return302_rut_access(contents, candidate, detail))
+            if (!parse_exact_loopback_fixed_redirect_rut_access(contents, candidate, detail))
                 return true;
             error = std::string("#350 generated access parser accepted mutation: ") + label;
             return false;
         };
-    if (!access_rejects("redirect-target", 0u, " GET /old 302 ", " GET /new 302 ") ||
-        !access_rejects("redirect-status", 0u, " /old 302 ", " /old 301 ") ||
-        !access_rejects("redirect-field5", 0u, " 1us 71 342 ", " 1us 70 342 ") ||
-        !access_rejects("redirect-response", 0u, " 342 127.0.0.1 ", " 341 127.0.0.1 ") ||
+    const std::string status = std::to_string(redirect_status);
+    const std::string alternate_status = redirect_status == 301u ? "302" : "301";
+    const std::string response_size = std::to_string(profile->response_size);
+    if (!access_rejects(
+            "redirect-target", 0u, " GET /old " + status + " ", " GET /new " + status + " ") ||
+        !access_rejects(
+            "redirect-status", 0u, " /old " + status + " ", " /old " + alternate_status + " ") ||
+        !access_rejects("redirect-field5",
+                        0u,
+                        " 1us 71 " + response_size + " ",
+                        " 1us 70 " + response_size + " ") ||
+        !access_rejects("redirect-response",
+                        0u,
+                        " " + response_size + " 127.0.0.1 ",
+                        " " + std::to_string(profile->response_size + 1u) + " 127.0.0.1 ") ||
         !access_rejects("redirect-client", 0u, " 127.0.0.1 s=0", " 127.0.0.2 s=0") ||
         !access_rejects("redirect-outcome", 0u, " s=0", " s=1") ||
         !access_rejects("forward-target", 3u, " GET /old/ 200 ", " GET /new/ 200 ") ||
@@ -33473,24 +33748,24 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         !access_rejects("forward-outcome", 3u, " s=0", " s=1"))
         return false;
     {
-        ExactLoopbackReturn302Observation candidate = valid[2];
+        ExactLoopbackFixedRedirectObservation candidate = valid[2];
         std::swap(candidate.access_records[0], candidate.access_records[1]);
         std::string reordered;
         for (const auto& line : candidate.access_records) reordered += line + "\n";
         std::string incomplete;
         for (size_t i = 0u; i < 4u; i++) incomplete += valid[2].access_records[i] + "\n";
         std::string detail;
-        if (parse_exact_loopback_return302_rut_access(reordered, candidate, detail) ||
-            parse_exact_loopback_return302_rut_access(incomplete, candidate, detail)) {
+        if (parse_exact_loopback_fixed_redirect_rut_access(reordered, candidate, detail) ||
+            parse_exact_loopback_fixed_redirect_rut_access(incomplete, candidate, detail)) {
             error = "#350 generated access parser accepted reordered/incomplete inventory";
             return false;
         }
     }
 
     const auto direct_rejects = [&](const char* label,
-                                    const ExactLoopbackReturn302Observation& candidate) {
+                                    const ExactLoopbackFixedRedirectObservation& candidate) {
         std::string detail;
-        if (!validate_exact_loopback_return302_generated_observation(candidate, detail))
+        if (!validate_exact_loopback_fixed_redirect_generated_observation(candidate, detail))
             return true;
         error = std::string("#350 generated observation accepted mutation: ") + label;
         return false;
@@ -33503,9 +33778,11 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         const std::string changed = replace_unique(text, from, to, label);
         return std::vector<char>(changed.begin(), changed.end());
     };
-    ExactLoopbackReturn302Observation candidate = valid[2];
-    candidate.wires[0] = mutate_wire(
-        candidate.wires[0], "302 Moved Temporarily", "301 Moved Temporarily", "wire-status");
+    ExactLoopbackFixedRedirectObservation candidate = valid[2];
+    candidate.wires[0] = mutate_wire(candidate.wires[0],
+                                     "HTTP/1.1 " + status + " " + profile->reason + "\r\n",
+                                     "HTTP/1.1 399 " + std::string(profile->reason) + "\r\n",
+                                     "wire-status");
     if (candidate.wires[0].empty() || !direct_rejects("wire-status", candidate)) return false;
     candidate = valid[2];
     candidate.wires[0] = mutate_wire(candidate.wires[0],
@@ -33520,8 +33797,10 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
                                      "wire-query");
     if (candidate.wires[2].empty() || !direct_rejects("wire-query", candidate)) return false;
     candidate = valid[2];
-    candidate.wires[0] =
-        mutate_wire(candidate.wires[0], "<h1>302 Found", "<h1>302 FounX", "wire-body");
+    candidate.wires[0] = mutate_wire(candidate.wires[0],
+                                     std::string("<h1>") + profile->title,
+                                     "<h1>399 Mutated Redirect",
+                                     "wire-body");
     if (candidate.wires[0].empty() || !direct_rejects("wire-body", candidate)) return false;
     candidate = valid[2];
     candidate.wires[0] = mutate_wire(candidate.wires[0],
@@ -33540,17 +33819,17 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
     candidate.forward_accepts = candidate.forward_requests = candidate.forward_sends = 3u;
     candidate.forward_history.push_back(candidate.forward_history.back());
     if (!direct_rejects("retry", candidate)) return false;
-    const std::pair<const char*, bool ExactLoopbackReturn302Observation::*> flags[] = {
-        {"redirect-zero", &ExactLoopbackReturn302Observation::redirect_upstream_quiet},
-        {"guard", &ExactLoopbackReturn302Observation::negative_guard_non_listening},
-        {"wildcard", &ExactLoopbackReturn302Observation::negative_guard_blocked_wildcard_bind},
-        {"readiness", &ExactLoopbackReturn302Observation::readiness_quiet},
-        {"pre-probe", &ExactLoopbackReturn302Observation::negative_probe_before_failed},
-        {"pre-quiet", &ExactLoopbackReturn302Observation::negative_probe_before_quiet},
-        {"post-probe", &ExactLoopbackReturn302Observation::negative_probe_after_failed},
-        {"post-quiet", &ExactLoopbackReturn302Observation::negative_probe_after_quiet},
-        {"lifecycle", &ExactLoopbackReturn302Observation::clean_lifecycle},
-        {"source-lifetime", &ExactLoopbackReturn302Observation::source_lifetime_proven}};
+    const std::pair<const char*, bool ExactLoopbackFixedRedirectObservation::*> flags[] = {
+        {"redirect-zero", &ExactLoopbackFixedRedirectObservation::redirect_upstream_quiet},
+        {"guard", &ExactLoopbackFixedRedirectObservation::negative_guard_non_listening},
+        {"wildcard", &ExactLoopbackFixedRedirectObservation::negative_guard_blocked_wildcard_bind},
+        {"readiness", &ExactLoopbackFixedRedirectObservation::readiness_quiet},
+        {"pre-probe", &ExactLoopbackFixedRedirectObservation::negative_probe_before_failed},
+        {"pre-quiet", &ExactLoopbackFixedRedirectObservation::negative_probe_before_quiet},
+        {"post-probe", &ExactLoopbackFixedRedirectObservation::negative_probe_after_failed},
+        {"post-quiet", &ExactLoopbackFixedRedirectObservation::negative_probe_after_quiet},
+        {"lifecycle", &ExactLoopbackFixedRedirectObservation::clean_lifecycle},
+        {"source-lifetime", &ExactLoopbackFixedRedirectObservation::source_lifetime_proven}};
     for (const auto& mutation : flags) {
         candidate = valid[2];
         candidate.*(mutation.second) = false;
@@ -33558,15 +33837,15 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
     }
 
     const auto four_way_rejects = [&](const char* label,
-                                      const ExactLoopbackReturn302Observation(&values)[4],
+                                      const ExactLoopbackFixedRedirectObservation(&values)[4],
                                       const std::string(&candidate_sources)[2]) {
         std::string detail;
-        if (!validate_exact_loopback_return302_four_way(values, candidate_sources, detail))
+        if (!validate_exact_loopback_fixed_redirect_four_way(values, candidate_sources, detail))
             return true;
         error = std::string("#350 four-way validator accepted mutation: ") + label;
         return false;
     };
-    ExactLoopbackReturn302Observation mutated[4] = {valid[0], valid[1], valid[2], valid[3]};
+    ExactLoopbackFixedRedirectObservation mutated[4] = {valid[0], valid[1], valid[2], valid[3]};
     mutated[2].side = "pinned-nginx";
     if (!four_way_rejects("side", mutated, sources)) return false;
     mutated[2] = valid[2];
@@ -33578,25 +33857,29 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
     mutated[2] = valid[2];
     mutated[2].frontend_port = valid[3].frontend_port;
     mutated[2].negative_port = mutated[2].frontend_port;
-    mutated[2].config = make_exact_loopback_return302_fragment(
-        mutated[2].frontend_port, mutated[2].backend_port, true);
+    mutated[2].config = make_exact_loopback_fixed_redirect_fragment(
+        mutated[2].frontend_port, mutated[2].backend_port, true, redirect_status);
     const std::string old_listener = "listen 127.0.0.1:" + std::to_string(valid[2].frontend_port);
     const std::string new_listener = "listen 127.0.0.1:" + std::to_string(mutated[2].frontend_port);
     std::string shared_sources[2] = {
         replace_unique(sources[0], old_listener, new_listener, "shared-port-source"), sources[1]};
     std::string detail;
     if (shared_sources[0].empty() ||
-        !validate_exact_loopback_return302_generated_observation(mutated[2], detail) ||
-        !validate_exact_loopback_return302_generated_source(
-            shared_sources[0], mutated[2].frontend_port, mutated[2].backend_port, detail) ||
-        validate_exact_loopback_return302_four_way(mutated, shared_sources, detail)) {
+        !validate_exact_loopback_fixed_redirect_generated_observation(mutated[2], detail) ||
+        !validate_exact_loopback_fixed_redirect_generated_source(shared_sources[0],
+                                                                 mutated[2].frontend_port,
+                                                                 mutated[2].backend_port,
+                                                                 detail,
+                                                                 redirect_status) ||
+        validate_exact_loopback_fixed_redirect_four_way(mutated, shared_sources, detail)) {
         error = "#350 shared-port mutation did not isolate four-way uniqueness";
         return false;
     }
-    const std::string harmless = sources[0] + "// harmless ordinary RUT equality witness\n";
-    if (!validate_exact_loopback_return302_generated_source(
-            harmless, kPorts[4], kPorts[5], detail)) {
-        error = "#350 harmless source failed structural validation: " + detail;
+    const std::string harmless = sources[0] + "\n";
+    if (harmless.size() != sources[0].size() + 1u || harmless == sources[0] ||
+        !validate_exact_loopback_fixed_redirect_generated_source_structure(
+            harmless, kPorts[4], kPorts[5], detail, redirect_status)) {
+        error = "#350 harmless length witness failed structural validation: " + detail;
         return false;
     }
     const auto lexed = rut::lex({harmless.data(), static_cast<u32>(harmless.size())});
@@ -33610,17 +33893,25 @@ static bool run_exact_loopback_return302_four_way_self_checks(std::string& error
         return false;
     }
     std::unique_ptr<rut::AstFile> ast(parsed.value());
+    detail.clear();
+    if (validate_exact_loopback_fixed_redirect_generated_source(
+            harmless, kPorts[4], kPorts[5], detail, redirect_status) ||
+        detail.find("canonical representative source length") == std::string::npos) {
+        error = "#350 harmless length witness did not isolate canonical source length: " + detail;
+        return false;
+    }
     std::string harmless_sources[2] = {harmless, sources[1]};
-    if (!four_way_rejects("canonical-equality", valid, harmless_sources)) return false;
+    if (!four_way_rejects("canonical-source", valid, harmless_sources)) return false;
     return true;
 }
 
-static bool run_converter_exact_loopback_return302_differential(
+static bool run_converter_exact_loopback_fixed_redirect_differential(
     const std::string& container_prefix,
     const char* rut_path,
-    ExactLoopbackReturn302Observation (&observations)[4],
+    ExactLoopbackFixedRedirectObservation (&observations)[4],
     std::string (&generated_sources)[2],
-    std::string& error) {
+    std::string& error,
+    u16 redirect_status = 302u) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#350 converter differential requires an executable absolute RUT path";
         return false;
@@ -33640,8 +33931,10 @@ static bool run_converter_exact_loopback_return302_differential(
             }
         }
     }
-    ExactLoopbackReturn302Observation oracle[2];
-    if (!run_pinned_exact_loopback_return302_oracle(container_prefix, oracle, error)) return false;
+    ExactLoopbackFixedRedirectObservation oracle[2];
+    if (!run_pinned_exact_loopback_fixed_redirect_oracle(
+            container_prefix, oracle, error, redirect_status))
+        return false;
     observations[0] = oracle[0];
     observations[1] = oracle[1];
     TempDir temps[2];
@@ -33656,18 +33949,19 @@ static bool run_converter_exact_loopback_return302_differential(
         const size_t port = side * 2u;
         const std::string identity = std::string(rut_path) + " " + temps[side].source +
                                      " listen:" + std::to_string(generated_ports[port]);
-        if (!capture_generated_exact_loopback_return302_side(generated_ports[port],
-                                                             generated_ports[port + 1u],
-                                                             temps[side],
-                                                             identity,
-                                                             side == 0u,
-                                                             rut_path,
-                                                             observations[side + 2u],
-                                                             generated_sources[side],
-                                                             error,
-                                                             &reservations.fds[base],
-                                                             &reservations.fds[base + 1u],
-                                                             &reservations.fds[base + 2u]))
+        if (!capture_generated_exact_loopback_fixed_redirect_side(generated_ports[port],
+                                                                  generated_ports[port + 1u],
+                                                                  temps[side],
+                                                                  identity,
+                                                                  side == 0u,
+                                                                  rut_path,
+                                                                  observations[side + 2u],
+                                                                  generated_sources[side],
+                                                                  error,
+                                                                  &reservations.fds[base],
+                                                                  &reservations.fds[base + 1u],
+                                                                  &reservations.fds[base + 2u],
+                                                                  redirect_status))
             return false;
     }
     if (reservations.fds[0] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
@@ -33677,7 +33971,7 @@ static bool run_converter_exact_loopback_return302_differential(
         if (error.empty()) error = "#350 generated captures did not retain both .2 guards";
         return false;
     }
-    return validate_exact_loopback_return302_four_way(observations, generated_sources, error);
+    return validate_exact_loopback_fixed_redirect_four_way(observations, generated_sources, error);
 }
 
 struct ExactLoopbackPrefixRootObservation {
@@ -41210,6 +41504,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-bodyful-return-oracle") == 0;
     const bool exact_loopback_return302_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return302-oracle") == 0;
+    const bool exact_loopback_return301_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return301-oracle") == 0;
     const bool exact_loopback_prefix_root_replacement_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-exact-loopback-prefix-root-replacement-oracle") == 0;
@@ -41230,6 +41526,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-exact-loopback-bodyful-return-differential") == 0;
     const bool converter_exact_loopback_return302_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-loopback-return302-differential") == 0;
+    const bool converter_exact_loopback_return301_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-loopback-return301-differential") == 0;
     const bool converter_exact_loopback_prefix_root_replacement_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-prefix-root-replacement-differential") == 0;
@@ -41342,7 +41640,8 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
-         !exact_loopback_return302_oracle && !exact_loopback_prefix_root_replacement_oracle &&
+         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
+         !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -41350,6 +41649,7 @@ int main(int argc, char** argv) {
          !converter_exact_loopback_return204_differential &&
          !converter_exact_loopback_bodyful_return_differential &&
          !converter_exact_loopback_return302_differential &&
+         !converter_exact_loopback_return301_differential &&
          !converter_exact_loopback_prefix_root_replacement_differential &&
          !converter_exact_loopback_api_v1_replacement_differential &&
          !converter_exact_loopback_api_no_uri_differential &&
@@ -41400,6 +41700,7 @@ int main(int argc, char** argv) {
         (converter_exact_loopback_return204_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_bodyful_return_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_return302_differential && argv[2][0] != '/') ||
+        (converter_exact_loopback_return301_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_prefix_root_replacement_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_api_v1_replacement_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_api_no_uri_differential && argv[2][0] != '/') ||
@@ -41461,6 +41762,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-return302-oracle\n"
                      "   or: test_nginx_differential "
+                     "--pinned-nginx-exact-loopback-return301-oracle\n"
+                     "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-prefix-root-replacement-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-api-v1-replacement-oracle\n"
@@ -41482,6 +41785,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-return302-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-loopback-return301-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-prefix-root-replacement-differential "
@@ -41818,14 +42124,27 @@ int main(int argc, char** argv) {
     }
     if (exact_loopback_return302_oracle || converter_exact_loopback_return302_differential) {
         std::string self_check_error;
-        if (!run_exact_loopback_return302_oracle_self_checks(self_check_error)) {
+        if (!run_exact_loopback_fixed_redirect_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#350 exact-loopback fixed-302 oracle self-check]: "
                       << self_check_error << "\n";
             return 1;
         }
         if (converter_exact_loopback_return302_differential &&
-            !run_exact_loopback_return302_four_way_self_checks(self_check_error)) {
+            !run_exact_loopback_fixed_redirect_four_way_self_checks(self_check_error)) {
             std::cerr << "FAIL [#350 generated/four-side self-check]: " << self_check_error << "\n";
+            return 1;
+        }
+    }
+    if (exact_loopback_return301_oracle || converter_exact_loopback_return301_differential) {
+        std::string self_check_error;
+        if (!run_exact_loopback_fixed_redirect_oracle_self_checks(self_check_error, 301u)) {
+            std::cerr << "FAIL [#351 exact-loopback fixed-301 oracle self-check]: "
+                      << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_exact_loopback_return301_differential &&
+            !run_exact_loopback_fixed_redirect_four_way_self_checks(self_check_error, 301u)) {
+            std::cerr << "FAIL [#351 generated/four-side self-check]: " << self_check_error << "\n";
             return 1;
         }
     }
@@ -41921,6 +42240,7 @@ int main(int argc, char** argv) {
         converter_exact_loopback_return204_differential ||
         converter_exact_loopback_bodyful_return_differential ||
         converter_exact_loopback_return302_differential ||
+        converter_exact_loopback_return301_differential ||
         converter_exact_loopback_prefix_root_replacement_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
@@ -42339,14 +42659,14 @@ int main(int argc, char** argv) {
         source_suffix = source_suffix ? source_suffix + 1 : temp.path;
         const std::string container_prefix = "rut-nginx-350-exact-loopback-return302-" +
                                              std::to_string(getpid()) + "-" + source_suffix;
-        ExactLoopbackReturn302Observation observations[2];
+        ExactLoopbackFixedRedirectObservation observations[2];
         std::string oracle_error;
-        if (!run_pinned_exact_loopback_return302_oracle(
+        if (!run_pinned_exact_loopback_fixed_redirect_oracle(
                 container_prefix, observations, oracle_error)) {
             std::cerr << "FAIL [#350 pinned nginx-only exact-loopback return302 oracle]: "
                       << oracle_error << "\n";
-            dump_exact_loopback_return302_observation(observations[0]);
-            dump_exact_loopback_return302_observation(observations[1]);
+            dump_exact_loopback_fixed_redirect_observation(observations[0]);
+            dump_exact_loopback_fixed_redirect_observation(observations[1]);
             return 1;
         }
         std::cerr
@@ -42364,10 +42684,47 @@ int main(int argc, char** argv) {
                "request, one response, no third/retry, and the exact Date-normalized 118-byte "
                "200/CL2/ok/close/EOF wire. Each side produced exactly five ordered strict real "
                "access records and no warn-or-higher log (#350 Stage 1 nginx-only; no parser, "
-               "converter, generated-RUT or behavior-equivalence claim; status 301 remains "
-               "blocked by #351; excludes relative/variable redirects, other targets/statuses/"
+               "converter, generated-RUT or behavior-equivalence claim; excludes relative/"
+               "variable redirects, other targets/statuses/"
                "addresses/options/listeners/servers, methods/bodies/framing/query shapes, reuse/"
                "pipeline/failures, H1.0, H2 and TLS; #279/#347 are not implemented)\n";
+        return 0;
+    }
+
+    if (exact_loopback_return301_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-351-exact-loopback-return301-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackFixedRedirectObservation observations[2];
+        std::string oracle_error;
+        if (!run_pinned_exact_loopback_fixed_redirect_oracle(
+                container_prefix, observations, oracle_error, 301u)) {
+            std::cerr << "FAIL [#351 pinned nginx-only exact-loopback return301 oracle]: "
+                      << oracle_error << "\n";
+            dump_exact_loopback_fixed_redirect_observation(observations[0]);
+            dump_exact_loopback_fixed_redirect_observation(observations[1]);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #351 pinned nginx 1.29.7 nginx-only oracle proves exact listen "
+               "127.0.0.1:<port>, exact /old fixed absolute return 301 and the minimal root "
+               "proxy in exactly listen/exact/root and listen/root/exact orders. Six initially "
+               "held CLOEXEC non-listening sockets supplied four unique ports; each .1 handoff "
+               "retained a same-port .2 guard that causally rejected wildcard bind with "
+               "EADDRINUSE and refused bounded probes before/after all requests without changing "
+               "access/upstream inventories. Fresh GET /old with canonical and alternate Host, "
+               "plus GET /old?x=1, emitted the same exact Date-normalized 366-byte 301 Moved "
+               "Permanently/CL169/fixed-Location/close/EOF wire, discarded the query, ignored "
+               "Host for Location and kept the live upstream at zero. GET /old/ and GET / each "
+               "produced one byte-exact Host-rebuilt, Connection-omitted upstream request, one "
+               "response, no third/retry, and the exact Date-normalized 118-byte "
+               "200/CL2/ok/close/EOF wire. Each side produced exactly five ordered strict real "
+               "access records and no warn-or-higher log (#351 nginx-only oracle; no parser, "
+               "converter, generated-RUT or behavior-equivalence claim; excludes relative/"
+               "variable redirects, other targets/statuses/addresses/options/listeners/servers, "
+               "methods/bodies/framing/query shapes, reuse/pipeline/failures, H1.0, H2 and TLS; "
+               "#279/#347 are not implemented)\n";
         return 0;
     }
 
@@ -42820,15 +43177,15 @@ int main(int argc, char** argv) {
         source_suffix = source_suffix ? source_suffix + 1 : temp.path;
         const std::string container_prefix = "rut-nginx-converter-350-exact-loopback-return302-" +
                                              std::to_string(getpid()) + "-" + source_suffix;
-        ExactLoopbackReturn302Observation observations[4];
+        ExactLoopbackFixedRedirectObservation observations[4];
         std::string generated_sources[2];
         std::string differential_error;
-        if (!run_converter_exact_loopback_return302_differential(
+        if (!run_converter_exact_loopback_fixed_redirect_differential(
                 container_prefix, argv[2], observations, generated_sources, differential_error)) {
             std::cerr << "FAIL [#350 converter exact-loopback fixed-302 differential]: "
                       << differential_error << "\n";
             for (const auto& observation : observations)
-                dump_exact_loopback_return302_observation(observation);
+                dump_exact_loopback_fixed_redirect_observation(observation);
             return 1;
         }
         std::cerr
@@ -42849,9 +43206,52 @@ int main(int argc, char** argv) {
                "forwarded access field 5 is rewritten upstream wire size and is not compared "
                "with nginx $request_length, tracked by #347; current RUT access text omits "
                "Host/upstream address/upstream status, which are proven independently by "
-               "request/history, owned endpoint and downstream outcome evidence; status 301 "
-               "remains blocked by #351; excludes other redirects/listeners/addresses/paths/"
+               "request/history, owned endpoint and downstream outcome evidence; excludes other "
+               "redirects/listeners/addresses/paths/"
                "methods/queries/bodies/framing/reuse/retries/failures/H1.0/H2/TLS)\n";
+        return 0;
+    }
+
+    if (converter_exact_loopback_return301_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-351-exact-loopback-return301-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackFixedRedirectObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_exact_loopback_fixed_redirect_differential(container_prefix,
+                                                                      argv[2],
+                                                                      observations,
+                                                                      generated_sources,
+                                                                      differential_error,
+                                                                      301u)) {
+            std::cerr << "FAIL [#351 converter exact-loopback fixed-301 differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_exact_loopback_fixed_redirect_observation(observation);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #351 exact listen 127.0.0.1:<port>, exact /old fixed absolute return "
+               "301 and minimal root proxy in exactly listen/exact/root and listen/root/exact "
+               "orders traversed the genuine borrowed nginx parser/provenance model and "
+               "converter into canonical 5937-byte ordinary RUT. Two isolated pinned-nginx "
+               "1.29.7 sides and two independently generated public-CLI/JIT/io_uring RUT sides "
+               "retained causal same-port non-listening .2 guards and quiet refusal probes. All "
+               "four sides matched three exact Date-normalized 366-byte fixed-Location 301/"
+               "CL169/close/EOF responses with live and settled zero upstream, followed by two "
+               "exact Date-normalized 118-byte 200/CL2/ok/close/EOF responses backed by two "
+               "ordered byte-exact Host-rebuilt, Connection-omitted upstream requests and no "
+               "retry. Each side had exactly five strict ordered side-specific access records "
+               "and a clean lifecycle; generated owned listener/redirect/root state survived "
+               "borrowed-source destruction and post-readiness source overwrite (nginx.conf was "
+               "translated to ordinary RUT, never loaded directly; generated forwarded access "
+               "field 5 is rewritten upstream wire size and is not compared with nginx "
+               "$request_length, tracked by #347; current RUT access text omits Host/upstream "
+               "address/upstream status, proven independently by request/history, owned endpoint "
+               "and downstream outcome evidence; excludes other redirects/listeners/addresses/"
+               "paths/methods/queries/bodies/framing/reuse/retries/failures/H1.0/H2/TLS)\n";
         return 0;
     }
 

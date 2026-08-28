@@ -619,6 +619,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue351_exact_loopback_return301_oracle
+        COMMAND test_nginx_differential --pinned-nginx-exact-loopback-return301-oracle
+    )
+    set_tests_properties(test_nginx_issue351_exact_loopback_return301_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue353_exact_loopback_prefix_root_replacement_oracle
         COMMAND test_nginx_differential
                 --pinned-nginx-exact-loopback-prefix-root-replacement-oracle
@@ -739,6 +751,21 @@ if(RUT_ENABLE_JIT)
     )
     set_tests_properties(
         test_nginx_issue350_converter_exact_loopback_return302_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
+        NAME test_nginx_issue351_converter_exact_loopback_return301_differential
+        COMMAND test_nginx_differential
+                --converter-exact-loopback-return301-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue351_converter_exact_loopback_return301_differential PROPERTIES
         LABELS "integration;nginx;docker;io_uring;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
