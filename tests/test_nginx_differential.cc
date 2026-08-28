@@ -16463,9 +16463,48 @@ static std::vector<std::string> max_proxy_prefix_targets() {
     return {prefix, prefix + "x", prefix + "x?y=1", route, route + "?x=1"};
 }
 
-static std::string make_max_proxy_prefix_fragment(u16 frontend_port,
-                                                  const char* address,
-                                                  u16 backend_port) {
+enum class MaxProxyForwardTargets : rut::u8 { RootReplacement, Original };
+
+struct MaxProxyPrefixProfile {
+    const char* issue;
+    const char* name;
+    const char* proxy_uri;
+    bool uses_target_transform;
+    MaxProxyForwardTargets forward_targets;
+    size_t canonical_8080_9000_size;
+    size_t maximum_exact_size;
+};
+
+static constexpr MaxProxyPrefixProfile kMaxProxyPrefixRootProfile = {
+    "#353",
+    "exact-p63-root-replacement",
+    "/",
+    true,
+    MaxProxyForwardTargets::RootReplacement,
+    3574u,
+    3582u};
+static constexpr MaxProxyPrefixProfile kMaxProxyPrefixNoUriProfile = {
+    "#356", "exact-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3418u, 3426u};
+
+static std::string max_proxy_forward_target(size_t index, const MaxProxyPrefixProfile& profile) {
+    static constexpr const char* kRootTargets[] = {"/", "/x", "/x?y=1"};
+    const auto targets = max_proxy_prefix_targets();
+    return profile.forward_targets == MaxProxyForwardTargets::Original ? targets[index]
+                                                                       : kRootTargets[index];
+}
+
+static size_t max_proxy_expected_source_size(u16 frontend_port,
+                                             u16 backend_port,
+                                             const MaxProxyPrefixProfile& profile) {
+    return profile.canonical_8080_9000_size - 8u + std::to_string(frontend_port).size() +
+           std::to_string(backend_port).size();
+}
+
+static std::string make_max_proxy_prefix_fragment(
+    u16 frontend_port,
+    const char* address,
+    u16 backend_port,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     return "server {\n"
            "  listen " +
            std::to_string(frontend_port) +
@@ -16474,16 +16513,19 @@ static std::string make_max_proxy_prefix_fragment(u16 frontend_port,
            max_proxy_prefix() +
            " {\n"
            "    proxy_pass http://" +
-           address + ":" + std::to_string(backend_port) +
-           "/;\n"
+           address + ":" + std::to_string(backend_port) + profile.proxy_uri +
+           ";\n"
            "  }\n"
            "}\n";
 }
 
-static std::string make_exact_max_proxy_prefix_fragment(u16 frontend_port,
-                                                        const char* address,
-                                                        u16 backend_port) {
-    std::string fragment = make_max_proxy_prefix_fragment(frontend_port, address, backend_port);
+static std::string make_exact_max_proxy_prefix_fragment(
+    u16 frontend_port,
+    const char* address,
+    u16 backend_port,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
+    std::string fragment =
+        make_max_proxy_prefix_fragment(frontend_port, address, backend_port, profile);
     const std::string wildcard = "  listen " + std::to_string(frontend_port) + ";\n";
     const std::string exact = "  listen 127.0.0.1:" + std::to_string(frontend_port) + ";\n";
     const size_t offset = fragment.find(wildcard);
@@ -16539,12 +16581,14 @@ struct MaxProxyPrefixObservation {
     bool eof_proven[5]{};
 };
 
-static bool validate_max_proxy_prefix_generated_source(const std::string& source,
-                                                       u16 frontend_port,
-                                                       const char* address,
-                                                       u16 backend_port,
-                                                       std::string& error,
-                                                       bool exact_listener = false) {
+static bool validate_max_proxy_prefix_generated_source(
+    const std::string& source,
+    u16 frontend_port,
+    const char* address,
+    u16 backend_port,
+    std::string& error,
+    bool exact_listener = false,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     const std::string& prefix = max_proxy_prefix();
     const std::string route = max_proxy_route_key();
     const std::string listener = std::string(exact_listener ? "listen 127.0.0.1:" : "listen :") +
@@ -16558,6 +16602,15 @@ static bool validate_max_proxy_prefix_generated_source(const std::string& source
     const std::string transform = "            strip_prefix: \"" + prefix +
                                   "\",\n"
                                   "            replace_prefix: \"/\"";
+    const bool transform_is_exact =
+        profile.uses_target_transform
+            ? count_text(source, transform) == 1u && count_text(source, "strip_prefix:") == 1u &&
+                  count_text(source, "replace_prefix:") == 1u &&
+                  count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u
+            : count_text(source, transform) == 0u && count_text(source, "strip_prefix:") == 0u &&
+                  count_text(source, "replace_prefix:") == 0u &&
+                  count_text(source, "target_transform") == 0u &&
+                  count_text(source, "return forward(nginx_upstream, request_policy: {") == 1u;
     if (count_text(source, listener) != 1u ||
         (exact_listener &&
          (source.rfind(listener, 0u) != 0u || source.find("listen :") != std::string::npos ||
@@ -16565,31 +16618,36 @@ static bool validate_max_proxy_prefix_generated_source(const std::string& source
           source.find("127.0.0.2") != std::string::npos)) ||
         count_text(source, backend) != 1u || count_text(source, route_binding) != 1u ||
         count_text(source, "route \"") != 1u || count_text(source, redirect_condition) != 1u ||
-        count_text(source, redirect_target) != 1u || count_text(source, transform) != 1u ||
-        count_text(source, "strip_prefix:") != 1u || count_text(source, "replace_prefix:") != 1u ||
-        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
+        count_text(source, redirect_target) != 1u || !transform_is_exact ||
         count_text(source, "query: \"preserve_raw\"") != 1u ||
         source.find("proxy_pass") != std::string::npos ||
         source.find("nginx.conf") != std::string::npos ||
         source.find("nginx_compat") != std::string::npos ||
         source.find("workaround") != std::string::npos) {
         error =
-            "#335 generated source was not exactly one maximum-prefix route, redirect, and "
-            "strip-to-root transform";
+            std::string(profile.issue) +
+            " generated source was not exactly one maximum-prefix route, redirect, and " +
+            (profile.uses_target_transform ? "strip-to-root transform" : "no-transform forward");
         return false;
     }
     return true;
 }
 
-static bool parse_max_proxy_prefix_nginx_access(const std::string& contents,
-                                                const std::string& scope,
-                                                const MaxProxyPrefixObservation& observation,
-                                                u16 backend_port,
-                                                std::string& error) {
+static bool parse_max_proxy_prefix_nginx_access(
+    const std::string& contents,
+    const std::string& scope,
+    const MaxProxyPrefixObservation& observation,
+    u16 backend_port,
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     std::vector<std::string> records;
     if (observation.targets != max_proxy_prefix_targets() ||
         observation.request_sizes.size() != 5u || observation.wires.size() != 5u ||
-        !split_exact_complete_log(contents, 5u, "#335 pinned nginx access log", records, error))
+        !split_exact_complete_log(contents,
+                                  5u,
+                                  (std::string(profile.issue) + " pinned nginx access log").c_str(),
+                                  records,
+                                  error))
         return false;
     for (size_t i = 0u; i < 5u; i++) {
         const bool forward = i < 3u;
@@ -16609,7 +16667,7 @@ static bool parse_max_proxy_prefix_nginx_access(const std::string& contents,
             "\" upstream_status=" + (forward ? "200" : "-");
         if (!take(expected) || cursor != records[i].size()) {
             error =
-                "#335 pinned access record " + std::to_string(i + 1u) +
+                std::string(profile.issue) + " pinned access record " + std::to_string(i + 1u) +
                 " lost raw target/order/status/request/response/upstream evidence: " + records[i];
             return false;
         }
@@ -16617,14 +16675,20 @@ static bool parse_max_proxy_prefix_nginx_access(const std::string& contents,
     return true;
 }
 
-static bool parse_max_proxy_prefix_rut_access(const std::string& contents,
-                                              const MaxProxyPrefixObservation& observation,
-                                              std::string& error) {
+static bool parse_max_proxy_prefix_rut_access(
+    const std::string& contents,
+    const MaxProxyPrefixObservation& observation,
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     std::vector<std::string> records;
     if (observation.targets != max_proxy_prefix_targets() ||
         observation.request_sizes.size() != 5u || observation.wires.size() != 5u ||
         !split_exact_complete_log(
-            contents, 5u, "#335 converter-generated RUT access log", records, error))
+            contents,
+            5u,
+            (std::string(profile.issue) + " converter-generated RUT access log").c_str(),
+            records,
+            error))
         return false;
     for (size_t i = 0u; i < 5u; i++) {
         const bool forward = i < 3u;
@@ -16641,7 +16705,8 @@ static bool parse_max_proxy_prefix_rut_access(const std::string& contents,
             !decimal_field_equals(fields[6], observation.wires[i].size()) ||
             fields[7] != "127.0.0.1" || (forward && fields[8] != "nginx_upstream") ||
             (forward && !exact_log_duration(fields[9])) || fields[forward ? 10u : 8u] != "s=0") {
-            error = "#335 generated access record " + std::to_string(i + 1u) +
+            error = std::string(profile.issue) + " generated access record " +
+                    std::to_string(i + 1u) +
                     " lost Complete target/order/status/size/upstream evidence: " + records[i];
             return false;
         }
@@ -16649,10 +16714,12 @@ static bool parse_max_proxy_prefix_rut_access(const std::string& contents,
     return true;
 }
 
-static bool validate_max_proxy_prefix_observation(const MaxProxyPrefixObservation& observation,
-                                                  u16 frontend_port,
-                                                  u16 backend_port,
-                                                  std::string& error) {
+static bool validate_max_proxy_prefix_observation(
+    const MaxProxyPrefixObservation& observation,
+    u16 frontend_port,
+    u16 backend_port,
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     const auto expected_targets = max_proxy_prefix_targets();
     if (max_proxy_prefix().size() != 63u || max_proxy_route_key().size() != 62u ||
         expected_targets[0].size() != 63u || expected_targets[1].size() != 64u ||
@@ -16686,14 +16753,16 @@ static bool validate_max_proxy_prefix_observation(const MaxProxyPrefixObservatio
         }
     }
     std::vector<std::vector<char>> expected_history;
-    for (const char* target : {"/", "/x", "/x?y=1"}) {
+    for (size_t i = 0u; i < 3u; i++) {
+        const std::string target = max_proxy_forward_target(i, profile);
         const std::string request = std::string("GET ") + target +
                                     " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
                                     "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
         expected_history.emplace_back(request.begin(), request.end());
     }
     if (observation.forward_history != expected_history) {
-        error = "#335 transform history contained a route miss, off-by-one, retry, or reorder";
+        error = std::string(profile.issue) +
+                " forward history contained a route miss, target rewrite, retry, or reorder";
         return false;
     }
     return true;
@@ -16704,41 +16773,46 @@ static bool validate_exact_max_proxy_prefix_observation(
     u16 frontend_port,
     u16 backend_port,
     bool generated,
-    std::string& error) {
-    if (!validate_max_proxy_prefix_observation(observation, frontend_port, backend_port, error))
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
+    if (!validate_max_proxy_prefix_observation(
+            observation, frontend_port, backend_port, error, profile))
         return false;
     if (!observation.exact_address_profile || !observation.negative_guard_blocked_wildcard_bind ||
         !observation.negative_probe_before_failed || !observation.negative_probe_before_quiet ||
         !observation.negative_probe_after_failed || !observation.negative_probe_after_quiet ||
         !observation.source_ownership_proven || !observation.clean_lifecycle ||
         observation.public_load_proven != generated) {
-        error =
-            "#353 P63 observation lost exact-listener causality, quiet probes, ownership, or "
-            "lifecycle evidence";
+        error = std::string(profile.issue) +
+                " P63 observation lost exact-listener causality, quiet probes, ownership, or "
+                "lifecycle evidence";
         return false;
     }
     for (const bool eof : observation.eof_proven) {
         if (!eof) {
-            error = "#353 P63 one boundary vector lacked an exact zero-tail EOF";
+            error = std::string(profile.issue) +
+                    " P63 one boundary vector lacked an exact zero-tail EOF";
             return false;
         }
     }
     return true;
 }
 
-static bool capture_max_proxy_prefix_side(u16 frontend_port,
-                                          u16 backend_port,
-                                          TempDir& temp,
-                                          const std::string& process_identity,
-                                          const char* rut_path,
-                                          bool pinned_nginx,
-                                          MaxProxyPrefixObservation& observation,
-                                          std::string& generated_source,
-                                          std::string& error,
-                                          int* frontend_reservation,
-                                          int* backend_reservation,
-                                          bool exact_address_profile = false,
-                                          int* negative_reservation = nullptr) {
+static bool capture_max_proxy_prefix_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& process_identity,
+    const char* rut_path,
+    bool pinned_nginx,
+    MaxProxyPrefixObservation& observation,
+    std::string& generated_source,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation,
+    bool exact_address_profile = false,
+    int* negative_reservation = nullptr,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     if (frontend_reservation == nullptr || backend_reservation == nullptr ||
         *frontend_reservation < 0 || *backend_reservation < 0 ||
         (!pinned_nginx &&
@@ -16748,7 +16822,7 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
     }
     if (exact_address_profile && (negative_reservation == nullptr || *negative_reservation < 0 ||
                                   !validate_exact_loopback_guard_fd(
-                                      *negative_reservation, frontend_port, error, "#353 P63")))
+                                      *negative_reservation, frontend_port, error, profile.issue)))
         return false;
     observation = MaxProxyPrefixObservation{};
     observation.side = pinned_nginx ? "pinned-nginx" : "converter-generated-rut";
@@ -16780,12 +16854,13 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         }
     }
 
-    const std::string access_scope =
-        "rut-nginx-335-max-prefix-" + observation.side + "-" + std::to_string(getpid());
+    const std::string access_scope = "rut-nginx-" + std::string(profile.name) + "-" +
+                                     observation.side + "-" + std::to_string(getpid());
     std::string borrowed_fragment =
         exact_address_profile
-            ? make_exact_max_proxy_prefix_fragment(frontend_port, "127.0.0.1", backend_port)
-            : make_max_proxy_prefix_fragment(frontend_port, "127.0.0.1", backend_port);
+            ? make_exact_max_proxy_prefix_fragment(
+                  frontend_port, "127.0.0.1", backend_port, profile)
+            : make_max_proxy_prefix_fragment(frontend_port, "127.0.0.1", backend_port, profile);
     if (borrowed_fragment.empty()) {
         error = "#353 P63 could not construct the exact-listener nginx fragment";
         return false;
@@ -16819,7 +16894,10 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         const size_t listener_value_offset = borrowed_fragment.find("127.0.0.1:");
         const size_t path_offset = borrowed_fragment.find(max_proxy_prefix(), location_offset);
         const size_t proxy_offset = borrowed_fragment.find("proxy_pass", path_offset);
-        const size_t uri_offset = borrowed_fragment.find("/;", proxy_offset + strlen("proxy_pass"));
+        const size_t uri_offset =
+            profile.proxy_uri[0] == '\0'
+                ? std::string::npos
+                : borrowed_fragment.find("/;", proxy_offset + strlen("proxy_pass"));
         const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
         const auto same_source = [&](rut::Str value, rut::Span span) {
             return value.ptr != nullptr && span.end >= span.start &&
@@ -16827,7 +16905,8 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
                    reinterpret_cast<uintptr_t>(value.ptr) - span.start == source_base;
         };
         if (location_offset == std::string::npos || path_offset == std::string::npos ||
-            proxy_offset == std::string::npos || uri_offset == std::string::npos ||
+            proxy_offset == std::string::npos ||
+            (profile.uses_target_transform && uri_offset == std::string::npos) ||
             server.listen.port != frontend_port ||
             (exact_address_profile &&
              (listener_value_offset == std::string::npos ||
@@ -16841,13 +16920,21 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
              server.listen.address != rut::ListenerAddress::IPv4Wildcard) ||
             location.path.len != 63u || !location.path.eq({max_proxy_prefix().data(), 63u}) ||
             location.path.ptr != borrowed_fragment.data() + path_offset ||
-            !same_source(location.path, location.path_span) || !proxy.has_uri ||
-            !proxy.uri.eq(rut::lit_str("/")) || !same_source(proxy.uri, proxy.uri_span) ||
-            proxy.uri.ptr != borrowed_fragment.data() + uri_offset || proxy.address[0] != 127u ||
-            proxy.address[1] != 0u || proxy.address[2] != 0u || proxy.address[3] != 1u ||
-            proxy.port != backend_port || server.exact_local_return.present ||
-            server.exact_no_content_return.present || server.exact_absolute_redirect.present) {
-            error = "#335 fragment lost its borrowed 63-byte prefix/root replacement provenance";
+            !same_source(location.path, location.path_span) ||
+            (profile.uses_target_transform &&
+             (!proxy.has_uri || !proxy.uri.eq(rut::lit_str("/")) ||
+              !same_source(proxy.uri, proxy.uri_span) ||
+              proxy.uri.ptr != borrowed_fragment.data() + uri_offset)) ||
+            (!profile.uses_target_transform &&
+             (proxy.has_uri || proxy.uri.ptr != nullptr || proxy.uri.len != 0u ||
+              proxy.uri_span.start != 0u || proxy.uri_span.end != 0u || proxy.uri_span.line != 1u ||
+              proxy.uri_span.col != 1u)) ||
+            proxy.address[0] != 127u || proxy.address[1] != 0u || proxy.address[2] != 0u ||
+            proxy.address[3] != 1u || proxy.port != backend_port ||
+            server.exact_local_return.present || server.exact_no_content_return.present ||
+            server.exact_absolute_redirect.present) {
+            error = std::string(profile.issue) +
+                    " fragment lost its borrowed 63-byte prefix/proxy-URI provenance";
             return false;
         }
         const auto lowered = rut::nginx::lower_to_rut(server);
@@ -16858,13 +16945,15 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         const rut::Str output = lowered.value().view();
         generated_source.assign(output.ptr, output.len);
         if ((exact_address_profile &&
-             generated_source.size() != kExactLoopbackMaxProxyPrefixSourceSize) ||
+             generated_source.size() !=
+                 max_proxy_expected_source_size(frontend_port, backend_port, profile)) ||
             !validate_max_proxy_prefix_generated_source(generated_source,
                                                         frontend_port,
                                                         "127.0.0.1",
                                                         backend_port,
                                                         error,
-                                                        exact_address_profile) ||
+                                                        exact_address_profile,
+                                                        profile) ||
             !write_file(temp.source, output.ptr, output.len))
             return false;
         if (exact_address_profile) {
@@ -16874,21 +16963,43 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
                 ~ProgramGuard() { program->destroy(); }
             } loaded_guard{&loaded};
             rut::LoadError load_error{};
+            u32 rir_target_transforms = 0u;
             if (!rut::load_rut_program(
                     temp.source.c_str(), loaded, load_error, rut::jit::OptLevel::O0) ||
                 !loaded.has_listener || !loaded.listener.valid() ||
                 loaded.listener.address != rut::ListenerAddress::IPv4Exact ||
                 loaded.listener.ipv4_host != 0x7f000001u || loaded.listener.port != frontend_port ||
-                loaded.config.route_count != 1u || loaded.config.target_transform_count != 1u ||
-                !loaded.config.target_transforms[0].strip_prefix.eq(
-                    {max_proxy_prefix().data(), static_cast<u32>(max_proxy_prefix().size())}) ||
-                !loaded.config.target_transforms[0].replace_prefix.eq(rut::lit_str("/")) ||
+                loaded.config.route_count != 1u ||
+                loaded.config.target_transform_count != (profile.uses_target_transform ? 1u : 0u) ||
+                (profile.uses_target_transform &&
+                 (!loaded.config.target_transforms[0].strip_prefix.eq(
+                      {max_proxy_prefix().data(), static_cast<u32>(max_proxy_prefix().size())}) ||
+                  !loaded.config.target_transforms[0].replace_prefix.eq(rut::lit_str("/")))) ||
                 loaded.config.redirect_policy_count != 1u ||
                 !loaded.config.redirect_policies[0].target_path.eq(
                     {max_proxy_prefix().data(), static_cast<u32>(max_proxy_prefix().size())})) {
-                error =
-                    "#353 P63 generated source lost exact listener/transform/redirect public "
-                    "ownership";
+                error = std::string(profile.issue) +
+                        " P63 generated source lost exact listener/transform/redirect public "
+                        "ownership";
+                return false;
+            }
+            for (u32 function = 0u; function < loaded.rir.module.func_count; function++)
+                for (u32 block = 0u; block < loaded.rir.module.functions[function].block_count;
+                     block++)
+                    for (u32 instruction = 0u;
+                         instruction <
+                         loaded.rir.module.functions[function].blocks[block].inst_count;
+                         instruction++)
+                        if (loaded.rir.module.functions[function]
+                                .blocks[block]
+                                .insts[instruction]
+                                .op == rut::rir::Opcode::ReqSetTargetTransform)
+                            rir_target_transforms++;
+            if (loaded.rir.module.target_transform_count !=
+                    (profile.uses_target_transform ? 1u : 0u) ||
+                rir_target_transforms != (profile.uses_target_transform ? 1u : 0u)) {
+                error = std::string(profile.issue) +
+                        " P63 public RIR invented or lost ReqSetTargetTransform";
                 return false;
             }
             observation.public_load_proven = true;
@@ -16929,11 +17040,11 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
     *frontend_reservation = -1;
     if (exact_address_profile) {
         if (!validate_exact_loopback_guard_fd(
-                *negative_reservation, frontend_port, error, "#353 P63") ||
+                *negative_reservation, frontend_port, error, profile.issue) ||
             !exact_loopback_guard_blocks_wildcard_bind(
-                *negative_reservation, frontend_port, error, "#353 P63") ||
+                *negative_reservation, frontend_port, error, profile.issue) ||
             !validate_exact_loopback_guard_fd(
-                *negative_reservation, frontend_port, error, "#353 P63"))
+                *negative_reservation, frontend_port, error, profile.issue))
             return false;
         observation.negative_guard_blocked_wildcard_bind = true;
     }
@@ -17014,13 +17125,13 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         error = "#335 failed to overwrite the loaded frontend source";
         return false;
     }
-    if (exact_address_profile) observation.source_ownership_proven = true;
     std::string readback;
     if (!read_exact_return204_log(destroyed_path, "#335 destroyed source", readback, error) ||
         readback != destroyed) {
         error = "#335 source overwrite/readback was not exact";
         return false;
     }
+    if (exact_address_profile) observation.source_ownership_proven = true;
 
     const auto observe_count =
         [&](u32 expected, const char* phase, std::chrono::milliseconds duration) {
@@ -17063,13 +17174,14 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         return false;
     if (exact_address_profile) {
         if (!validate_exact_loopback_guard_fd(
-                *negative_reservation, frontend_port, error, "#353 P63") ||
-            !exact_loopback_negative_connect_fails(frontend_port, error, "#353 P63"))
+                *negative_reservation, frontend_port, error, profile.issue) ||
+            !exact_loopback_negative_connect_fails(frontend_port, error, profile.issue))
             return false;
         observation.negative_probe_before_failed = true;
         if (!observe_count(0u, "quiet pre-request .2 probe", std::chrono::milliseconds(150)) ||
             !access_count_is(0u)) {
-            error = "#353 P63 pre-request .2 probe changed access/upstream inventory";
+            error = std::string(profile.issue) +
+                    " P63 pre-request .2 probe changed access/upstream inventory";
             return false;
         }
         observation.negative_probe_before_quiet = true;
@@ -17104,9 +17216,11 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         if (i < 3u) {
             if (!wait_count(static_cast<u32>(i + 1u)) ||
                 !observe_count(static_cast<u32>(i + 1u),
-                               "ordered transform episode",
+                               profile.uses_target_transform ? "ordered transform episode"
+                                                             : "ordered unchanged-target episode",
                                std::chrono::milliseconds(100))) {
-                error = "#335 transform episode did not settle without retry";
+                error =
+                    std::string(profile.issue) + " forward episode did not settle without retry";
                 return false;
             }
         } else if (!observe_count(3u,
@@ -17122,15 +17236,16 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
     }
     if (exact_address_profile) {
         if (!access_count_is(5u) ||
-            !exact_loopback_negative_connect_fails(frontend_port, error, "#353 P63"))
+            !exact_loopback_negative_connect_fails(frontend_port, error, profile.issue))
             return false;
         observation.negative_probe_after_failed = true;
         if (!observe_count(3u, "quiet post-request .2 probe", std::chrono::milliseconds(300)) ||
             !access_count_is(5u) ||
             !validate_exact_loopback_guard_fd(
-                *negative_reservation, frontend_port, error, "#353 P63")) {
+                *negative_reservation, frontend_port, error, profile.issue)) {
             if (error.empty())
-                error = "#353 P63 post-request .2 probe changed access/upstream inventory";
+                error = std::string(profile.issue) +
+                        " P63 post-request .2 probe changed access/upstream inventory";
             return false;
         }
         observation.negative_probe_after_quiet = true;
@@ -17163,7 +17278,8 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
             observation.request_sizes[i] = observation.forward_history[i].size();
     }
     if (exact_address_profile) observation.clean_lifecycle = true;
-    if (!validate_max_proxy_prefix_observation(observation, frontend_port, backend_port, error))
+    if (!validate_max_proxy_prefix_observation(
+            observation, frontend_port, backend_port, error, profile))
         return false;
     std::string access_contents;
     std::string runtime_contents;
@@ -17172,7 +17288,7 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
         return false;
     if (pinned_nginx) {
         if (!parse_max_proxy_prefix_nginx_access(
-                access_contents, access_scope, observation, backend_port, error) ||
+                access_contents, access_scope, observation, backend_port, error, profile) ||
             !read_exact_return204_log(
                 temp.nginx_log, "#335 nginx error log", runtime_contents, error))
             return false;
@@ -17182,7 +17298,7 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
                 return false;
             }
         }
-    } else if (!parse_max_proxy_prefix_rut_access(access_contents, observation, error) ||
+    } else if (!parse_max_proxy_prefix_rut_access(access_contents, observation, error, profile) ||
                !read_exact_return204_log(
                    temp.rut_log, "#335 RUT runtime log", runtime_contents, error) ||
                !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error)) {
@@ -17191,11 +17307,13 @@ static bool capture_max_proxy_prefix_side(u16 frontend_port,
     return true;
 }
 
-static bool validate_max_proxy_prefix_pair(const MaxProxyPrefixObservation observations[2],
-                                           const std::string& generated_source,
-                                           const u16 ports[4],
-                                           std::string& error,
-                                           bool exact_address_profile = false) {
+static bool validate_max_proxy_prefix_pair(
+    const MaxProxyPrefixObservation observations[2],
+    const std::string& generated_source,
+    const u16 ports[4],
+    std::string& error,
+    bool exact_address_profile = false,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     for (size_t i = 0u; i < 4u; i++) {
         if (ports[i] == 0u) {
             error = "#335 pair validator received a zero port";
@@ -17209,19 +17327,25 @@ static bool validate_max_proxy_prefix_pair(const MaxProxyPrefixObservation obser
         }
     }
     const bool observations_valid =
-        exact_address_profile
-            ? validate_exact_max_proxy_prefix_observation(
-                  observations[0], ports[0], ports[1], false, error) &&
-                  validate_exact_max_proxy_prefix_observation(
-                      observations[1], ports[2], ports[3], true, error)
-            : validate_max_proxy_prefix_observation(observations[0], ports[0], ports[1], error) &&
-                  validate_max_proxy_prefix_observation(observations[1], ports[2], ports[3], error);
+        exact_address_profile ? validate_exact_max_proxy_prefix_observation(
+                                    observations[0], ports[0], ports[1], false, error, profile) &&
+                                    validate_exact_max_proxy_prefix_observation(
+                                        observations[1], ports[2], ports[3], true, error, profile)
+                              : validate_max_proxy_prefix_observation(
+                                    observations[0], ports[0], ports[1], error, profile) &&
+                                    validate_max_proxy_prefix_observation(
+                                        observations[1], ports[2], ports[3], error, profile);
     if (observations[0].side != "pinned-nginx" ||
         observations[1].side != "converter-generated-rut" || !observations_valid ||
         (exact_address_profile &&
-         generated_source.size() != kExactLoopbackMaxProxyPrefixSourceSize) ||
-        !validate_max_proxy_prefix_generated_source(
-            generated_source, ports[2], "127.0.0.1", ports[3], error, exact_address_profile))
+         generated_source.size() != max_proxy_expected_source_size(ports[2], ports[3], profile)) ||
+        !validate_max_proxy_prefix_generated_source(generated_source,
+                                                    ports[2],
+                                                    "127.0.0.1",
+                                                    ports[3],
+                                                    error,
+                                                    exact_address_profile,
+                                                    profile))
         return false;
     const std::string* resources[] = {&observations[0].temp_path,
                                       &observations[0].config_path,
@@ -17294,17 +17418,20 @@ static bool validate_max_proxy_prefix_pair(const MaxProxyPrefixObservation obser
     return true;
 }
 
-static MaxProxyPrefixObservation make_max_proxy_prefix_self_check(u16 frontend_port,
-                                                                  u16 backend_port,
-                                                                  bool generated) {
+static MaxProxyPrefixObservation make_max_proxy_prefix_self_check(
+    u16 frontend_port,
+    u16 backend_port,
+    bool generated,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
     MaxProxyPrefixObservation value;
     value.side = generated ? "converter-generated-rut" : "pinned-nginx";
-    value.temp_path = std::string("/tmp/335-") + (generated ? "rut" : "nginx");
+    value.temp_path = std::string("/tmp/") + profile.name + (generated ? "-rut" : "-nginx");
     value.config_path = value.temp_path + (generated ? "/generated.rut" : "/nginx.conf");
     value.log_path = value.temp_path + "/runtime.log";
     value.access_path = value.temp_path + "/access.log";
-    value.process_identity = std::string("process-335-") + (generated ? "rut" : "nginx");
+    value.process_identity =
+        std::string("process-") + profile.name + (generated ? "-rut" : "-nginx");
     value.targets = max_proxy_prefix_targets();
     value.forward_accepts = value.forward_requests = value.forward_sends = 3u;
     for (size_t i = 0u; i < 5u; i++) {
@@ -17320,7 +17447,8 @@ static MaxProxyPrefixObservation make_max_proxy_prefix_self_check(u16 frontend_p
         if (date != wire.end()) std::copy_n(kDate, 29u, date);
         value.wires.push_back(std::move(wire));
     }
-    for (const char* target : {"/", "/x", "/x?y=1"}) {
+    for (size_t i = 0u; i < 3u; i++) {
+        const std::string target = max_proxy_forward_target(i, profile);
         const std::string request = std::string("GET ") + target +
                                     " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
                                     "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
@@ -37752,30 +37880,42 @@ static bool run_converter_exact_loopback_prefix_root_differential(
         observations, generated_sources, error, profile);
 }
 
-static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
+static bool run_exact_max_proxy_prefix_self_checks(
+    std::string& error, const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     static constexpr u16 kPorts[4] = {56360u, 56361u, 56362u, 56363u};
-    std::string fragment = make_exact_max_proxy_prefix_fragment(kPorts[2], "127.0.0.1", kPorts[3]);
+    std::string fragment =
+        make_exact_max_proxy_prefix_fragment(kPorts[2], "127.0.0.1", kPorts[3], profile);
     const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
     if (!parsed || parsed.value().listen.address != rut::ListenerAddress::IPv4Exact ||
         parsed.value().listen.ipv4_host != 0x7f000001u || parsed.value().location.path.len != 63u ||
-        !parsed.value().location.proxy_pass.uri.eq(rut::lit_str("/"))) {
-        error = "#353 P63 self-check exact fragment did not retain the bounded semantic model";
+        parsed.value().location.proxy_pass.has_uri != profile.uses_target_transform ||
+        (profile.uses_target_transform &&
+         !parsed.value().location.proxy_pass.uri.eq(rut::lit_str("/"))) ||
+        (!profile.uses_target_transform && (parsed.value().location.proxy_pass.uri.ptr != nullptr ||
+                                            parsed.value().location.proxy_pass.uri.len != 0u))) {
+        error = std::string(profile.issue) +
+                " P63 self-check exact fragment did not retain the bounded semantic model";
         return false;
     }
     const auto lowered = rut::nginx::lower_to_rut(parsed.value());
-    if (!lowered || lowered.value().len != kExactLoopbackMaxProxyPrefixSourceSize) {
-        error = "#353 P63 self-check did not lower to the canonical 3576-byte loopback RUT";
+    const size_t expected_source_size =
+        max_proxy_expected_source_size(kPorts[2], kPorts[3], profile);
+    if (!lowered || lowered.value().len != expected_source_size ||
+        (!profile.uses_target_transform && expected_source_size != 3420u)) {
+        error = std::string(profile.issue) +
+                " P63 self-check did not lower to the canonical loopback RUT size";
         return false;
     }
     const std::string source(lowered.value().data, lowered.value().len);
     const auto source_is_valid = [&](const std::string& candidate) {
         std::string detail;
-        return candidate.size() == kExactLoopbackMaxProxyPrefixSourceSize &&
+        return candidate.size() == expected_source_size &&
                validate_max_proxy_prefix_generated_source(
-                   candidate, kPorts[2], "127.0.0.1", kPorts[3], detail, true);
+                   candidate, kPorts[2], "127.0.0.1", kPorts[3], detail, true, profile);
     };
     if (!source_is_valid(source)) {
-        error = "#353 P63 canonical source failed its exact structural/length validator";
+        error = std::string(profile.issue) +
+                " P63 canonical source failed its exact structural/length validator";
         return false;
     }
     const auto replace_unique = [&](std::string value,
@@ -37785,7 +37925,7 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
         const size_t offset = before.empty() ? std::string::npos : value.find(before);
         if (before.empty() || before == after || offset == std::string::npos ||
             value.find(before, offset + before.size()) != std::string::npos) {
-            error = std::string("#353 P63 mutation was not unique/non-no-op: ") + label;
+            error = std::string(profile.issue) + " P63 mutation was not unique/non-no-op: " + label;
             return std::string{};
         }
         value.replace(offset, before.size(), after);
@@ -37793,23 +37933,30 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
     };
 
     std::string maximum_loopback_fragment =
-        make_exact_max_proxy_prefix_fragment(65535u, "127.0.0.1", 65535u);
+        make_exact_max_proxy_prefix_fragment(65535u, "127.0.0.1", 65535u, profile);
     std::string maximum_ipv4_fragment =
-        make_exact_max_proxy_prefix_fragment(65535u, "255.255.255.255", 65535u);
+        make_exact_max_proxy_prefix_fragment(65535u, "255.255.255.255", 65535u, profile);
     const auto maximum_loopback_parsed = rut::nginx::parse(
         {maximum_loopback_fragment.data(), static_cast<u32>(maximum_loopback_fragment.size())});
     const auto maximum_ipv4_parsed = rut::nginx::parse(
         {maximum_ipv4_fragment.data(), static_cast<u32>(maximum_ipv4_fragment.size())});
     if (!maximum_loopback_parsed || !maximum_ipv4_parsed) {
-        error = "#353 P63 maximum loopback/IPv4 fragments did not genuinely parse";
+        error = std::string(profile.issue) +
+                " P63 maximum loopback/IPv4 fragments did not genuinely parse";
         return false;
     }
     const auto maximum_loopback_lowered = rut::nginx::lower_to_rut(maximum_loopback_parsed.value());
     const auto maximum_ipv4_lowered = rut::nginx::lower_to_rut(maximum_ipv4_parsed.value());
     if (!maximum_loopback_lowered || !maximum_ipv4_lowered ||
-        maximum_loopback_lowered.value().len != kExactLoopbackMaxProxyPrefixSourceSize ||
-        maximum_ipv4_lowered.value().len != kMaximumExactMaxProxyPrefixSourceSize) {
-        error = "#353 P63 genuine maximum lowering lost the canonical 3576/3582 size boundary";
+        maximum_loopback_lowered.value().len !=
+            max_proxy_expected_source_size(65535u, 65535u, profile) ||
+        maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
+        profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
+        rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
+            (profile.uses_target_transform ? 2364u : 2520u) ||
+        maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
+        error = std::string(profile.issue) +
+                " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
         return false;
     }
     const std::string maximum_loopback_source(maximum_loopback_lowered.value().data,
@@ -37818,10 +37965,11 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
                                           maximum_ipv4_lowered.value().len);
     std::string detail;
     if (!validate_max_proxy_prefix_generated_source(
-            maximum_loopback_source, 65535u, "127.0.0.1", 65535u, detail, true) ||
+            maximum_loopback_source, 65535u, "127.0.0.1", 65535u, detail, true, profile) ||
         !validate_max_proxy_prefix_generated_source(
-            maximum_ipv4_source, 65535u, "255.255.255.255", 65535u, detail, true)) {
-        error = "#353 P63 genuine maximum sources failed exact structural validation: " + detail;
+            maximum_ipv4_source, 65535u, "255.255.255.255", 65535u, detail, true, profile)) {
+        error = std::string(profile.issue) +
+                " P63 genuine maximum sources failed exact structural validation: " + detail;
         return false;
     }
     const std::string expanded_maximum_source =
@@ -37830,15 +37978,16 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
                        "upstream nginx_upstream at \"255.255.255.255:65535\"",
                        "maximum IPv4 spelling expansion");
     if (expanded_maximum_source.empty() ||
-        expanded_maximum_source.size() != kMaximumExactMaxProxyPrefixSourceSize ||
+        expanded_maximum_source.size() != profile.maximum_exact_size ||
         expanded_maximum_source != maximum_ipv4_source) {
-        error = "#353 P63 six-byte maximum IPv4 spelling expansion was not canonical";
+        error = std::string(profile.issue) +
+                " P63 six-byte maximum IPv4 spelling expansion was not canonical";
         return false;
     }
 
     MaxProxyPrefixObservation values[2] = {
-        make_max_proxy_prefix_self_check(kPorts[0], kPorts[1], false),
-        make_max_proxy_prefix_self_check(kPorts[2], kPorts[3], true)};
+        make_max_proxy_prefix_self_check(kPorts[0], kPorts[1], false, profile),
+        make_max_proxy_prefix_self_check(kPorts[2], kPorts[3], true, profile)};
     const auto mark_exact = [](MaxProxyPrefixObservation& value, bool generated) {
         value.exact_address_profile = true;
         value.negative_guard_blocked_wildcard_bind = true;
@@ -37853,57 +38002,100 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
     };
     mark_exact(values[0], false);
     mark_exact(values[1], true);
-    if (!validate_max_proxy_prefix_pair(values, source, kPorts, error, true)) return false;
+    if (!validate_max_proxy_prefix_pair(values, source, kPorts, error, true, profile)) return false;
 
     const std::string route = max_proxy_route_key();
     const std::string changed_route = route.substr(0u, route.size() - 1u) + "S";
     const std::string prefix = max_proxy_prefix();
     const std::string changed_prefix = prefix.substr(0u, prefix.size() - 2u) + "S/";
-    const std::pair<const char*, std::string> source_mutations[] = {
+    std::vector<std::pair<const char*, std::string>> source_mutations = {
         {"listener-identity",
          replace_unique(source, "127.0.0.1:56362", "127.0.0.2:56362", "wrong-address")},
         {"route-key",
          replace_unique(
              source, "route \"" + route + "\"", "route \"" + changed_route + "\"", "route-key")},
-        {"strip-prefix",
-         replace_unique(source,
-                        "strip_prefix: \"" + prefix + "\"",
-                        "strip_prefix: \"" + changed_prefix + "\"",
-                        "strip-prefix")},
-        {"replace-prefix",
-         replace_unique(source,
-                        "            replace_prefix: \"/\"",
-                        "         replace_prefix: \"/v1/\"",
-                        "replace")},
         {"redirect-query",
          replace_unique(source,
                         "            path: \"static\", query: \"preserve_raw\"",
                         "           path: \"static\", query:  \"preserve_raw\"",
                         "query")}};
+    if (profile.uses_target_transform) {
+        source_mutations.push_back({"strip-prefix",
+                                    replace_unique(source,
+                                                   "strip_prefix: \"" + prefix + "\"",
+                                                   "strip_prefix: \"" + changed_prefix + "\"",
+                                                   "strip-prefix")});
+        source_mutations.push_back({"replace-prefix",
+                                    replace_unique(source,
+                                                   "            replace_prefix: \"/\"",
+                                                   "         replace_prefix: \"/v1/\"",
+                                                   "replace")});
+    } else {
+        const std::string forward = "return forward(nginx_upstream, request_policy: {";
+        const std::string injected =
+            "return forward(nginx_upstream, target_transform: {\n"
+            "            strip_prefix: \"" +
+            prefix +
+            "\",\n"
+            "            replace_prefix: \"/\"\n"
+            "        }, request_policy: {";
+        source_mutations.push_back(
+            {"unexpected-transform",
+             replace_unique(source, forward, injected, "unexpected-transform")});
+    }
     for (const auto& mutation : source_mutations) {
-        if (mutation.second.empty() || mutation.second.size() != source.size() ||
-            mutation.second == source) {
-            error = std::string("#353 P63 structural mutation lost same-length evidence: ") +
+        if (mutation.second.empty() || mutation.second == source) {
+            error = std::string(profile.issue) +
+                    " P63 structural mutation was empty/no-op: " + mutation.first;
+            return false;
+        }
+        const bool expected_same_size = strcmp(mutation.first, "unexpected-transform") != 0;
+        if ((mutation.second.size() == source.size()) != expected_same_size) {
+            error = std::string(profile.issue) +
+                    " P63 structural mutation lost its explicit profile-specific size contract: " +
                     mutation.first;
             return false;
         }
         const auto lexed =
             rut::lex({mutation.second.data(), static_cast<u32>(mutation.second.size())});
         if (!lexed) {
-            error = std::string("#353 P63 structural mutation failed ordinary-RUT lexing: ") +
-                    mutation.first;
+            error = std::string(profile.issue) +
+                    " P63 structural mutation failed ordinary-RUT lexing: " + mutation.first;
             return false;
         }
         const auto parsed_mutation = rut::parse_file(lexed.value());
         if (!parsed_mutation) {
-            error = std::string("#353 P63 structural mutation failed ordinary-RUT parsing: ") +
-                    mutation.first;
+            error = std::string(profile.issue) +
+                    " P63 structural mutation failed ordinary-RUT parsing: " + mutation.first;
             return false;
         }
         std::unique_ptr<rut::AstFile> parsed_mutation_ast(parsed_mutation.value());
+        detail.clear();
+        if (validate_max_proxy_prefix_generated_source(
+                mutation.second, kPorts[2], "127.0.0.1", kPorts[3], detail, true, profile)) {
+            error = std::string(profile.issue) +
+                    " P63 structural validator directly accepted mutation: " + mutation.first;
+            return false;
+        }
+        if (!expected_same_size) {
+            detail.clear();
+            if (!validate_max_proxy_prefix_generated_source(mutation.second,
+                                                            kPorts[2],
+                                                            "127.0.0.1",
+                                                            kPorts[3],
+                                                            detail,
+                                                            true,
+                                                            kMaxProxyPrefixRootProfile)) {
+                error =
+                    "#356 injected-transform mutation was not an isolated parse-valid "
+                    "opposite-profile source: " +
+                    detail;
+                return false;
+            }
+        }
         if (source_is_valid(mutation.second)) {
-            error =
-                std::string("#353 P63 exact source validator accepted mutation: ") + mutation.first;
+            error = std::string(profile.issue) +
+                    " P63 exact source validator accepted mutation: " + mutation.first;
             return false;
         }
     }
@@ -37911,20 +38103,23 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
     const auto harmless_lexed = rut::lex({harmless.data(), static_cast<u32>(harmless.size())});
     if (harmless.empty() || harmless == source || harmless.size() == source.size() ||
         !harmless_lexed) {
-        error = "#353 P63 harmless length witness failed ordinary-RUT lexing";
+        error =
+            std::string(profile.issue) + " P63 harmless length witness failed ordinary-RUT lexing";
         return false;
     }
     const auto harmless_parsed = rut::parse_file(harmless_lexed.value());
     if (!harmless_parsed) {
-        error = "#353 P63 harmless length witness failed ordinary-RUT parsing";
+        error =
+            std::string(profile.issue) + " P63 harmless length witness failed ordinary-RUT parsing";
         return false;
     }
     std::unique_ptr<rut::AstFile> harmless_ast(harmless_parsed.value());
     detail.clear();
     if (!validate_max_proxy_prefix_generated_source(
-            harmless, kPorts[2], "127.0.0.1", kPorts[3], detail, true) ||
+            harmless, kPorts[2], "127.0.0.1", kPorts[3], detail, true, profile) ||
         source_is_valid(harmless)) {
-        error = "#353 P63 harmless comment did not isolate the source-length gate";
+        error = std::string(profile.issue) +
+                " P63 harmless comment did not isolate the source-length gate";
         return false;
     }
 
@@ -37935,9 +38130,10 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
                                                              generated ? kPorts[2] : kPorts[0],
                                                              generated ? kPorts[3] : kPorts[1],
                                                              generated,
-                                                             detail))
+                                                             detail,
+                                                             profile))
                 return true;
-            error = std::string("#353 P63 observation accepted mutation: ") + label;
+            error = std::string(profile.issue) + " P63 observation accepted mutation: " + label;
             return false;
         };
     const std::pair<const char*, bool MaxProxyPrefixObservation::*> flags[] = {
@@ -37965,28 +38161,63 @@ static bool run_exact_max_proxy_prefix_self_checks(std::string& error) {
     changed = values[1];
     changed.forward_sends = 2u;
     if (!observation_rejects("episode-inventory", changed, true)) return false;
+    if (!profile.uses_target_transform) {
+        changed = values[1];
+        const std::string rewritten =
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPorts[3]) +
+            "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        if (changed.forward_history[0] == std::vector<char>(rewritten.begin(), rewritten.end())) {
+            error = "#356 unchanged-target mutation was a no-op";
+            return false;
+        }
+        changed.forward_history[0].assign(rewritten.begin(), rewritten.end());
+        changed.request_sizes[0] = changed.forward_history[0].size();
+        if (!observation_rejects("unexpected-root-rewrite", changed, true)) return false;
+    }
 
     MaxProxyPrefixObservation pair_changed[2] = {values[0], values[1]};
     pair_changed[1].temp_path = pair_changed[0].temp_path;
     detail.clear();
-    if (validate_max_proxy_prefix_pair(pair_changed, source, kPorts, detail, true)) {
-        error = "#353 P63 pair accepted a shared resource identity";
+    if (validate_max_proxy_prefix_pair(pair_changed, source, kPorts, detail, true, profile)) {
+        error = std::string(profile.issue) + " P63 pair accepted a shared resource identity";
         return false;
     }
     u16 shared_ports[4] = {kPorts[0], kPorts[1], kPorts[2], kPorts[1]};
     pair_changed[0] = values[0];
-    pair_changed[1] = make_max_proxy_prefix_self_check(kPorts[2], kPorts[1], true);
+    pair_changed[1] = make_max_proxy_prefix_self_check(kPorts[2], kPorts[1], true, profile);
     mark_exact(pair_changed[1], true);
     const std::string shared_source =
         replace_unique(source, "127.0.0.1:56363", "127.0.0.1:56361", "shared-backend-port");
     if (shared_source.empty() ||
         !validate_exact_max_proxy_prefix_observation(
-            pair_changed[1], shared_ports[2], shared_ports[3], true, detail) ||
+            pair_changed[1], shared_ports[2], shared_ports[3], true, detail, profile) ||
         !validate_max_proxy_prefix_generated_source(
-            shared_source, shared_ports[2], "127.0.0.1", shared_ports[3], detail, true) ||
-        validate_max_proxy_prefix_pair(pair_changed, shared_source, shared_ports, detail, true)) {
-        error = "#353 P63 shared-port mutation did not isolate endpoint uniqueness";
+            shared_source, shared_ports[2], "127.0.0.1", shared_ports[3], detail, true, profile) ||
+        validate_max_proxy_prefix_pair(
+            pair_changed, shared_source, shared_ports, detail, true, profile)) {
+        error = std::string(profile.issue) +
+                " P63 shared-port mutation did not isolate endpoint uniqueness";
         return false;
+    }
+    if (!profile.uses_target_transform) {
+        const std::string p64 =
+            max_proxy_prefix().substr(0u, max_proxy_prefix().size() - 1u) + "x/";
+        std::string p64_fragment =
+            make_exact_max_proxy_prefix_fragment(kPorts[2], "127.0.0.1", kPorts[3], profile);
+        const size_t path = p64_fragment.find(max_proxy_prefix());
+        if (p64.size() != 64u || path == std::string::npos ||
+            p64_fragment.find(max_proxy_prefix(), path + max_proxy_prefix().size()) !=
+                std::string::npos) {
+            error = "#356 P64 mutation was not uniquely constructible";
+            return false;
+        }
+        p64_fragment.replace(path, max_proxy_prefix().size(), p64);
+        const auto p64_parsed =
+            rut::nginx::parse({p64_fragment.data(), static_cast<u32>(p64_fragment.size())});
+        if (p64_parsed) {
+            error = "#356 parser accepted the one-byte-over P64 no-URI boundary";
+            return false;
+        }
     }
     return true;
 }
@@ -37996,22 +38227,26 @@ static bool run_converter_exact_max_proxy_prefix_differential(
     const char* rut_path,
     MaxProxyPrefixObservation (&observations)[2],
     std::string& generated_source,
-    std::string& error) {
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
-        error = "#353 P63 differential requires an executable absolute public RUT path";
+        error = std::string(profile.issue) +
+                " P63 differential requires an executable absolute public RUT path";
         return false;
     }
     ExactLoopbackReservations reservations;
     u16 ports[4]{};
     if (!reservations.reserve_side(0u, ports[0], ports[1]) ||
         !reservations.reserve_side(3u, ports[2], ports[3])) {
-        error = "#353 P63 could not hold two .1/.2 frontend pairs and two .1 backends";
+        error = std::string(profile.issue) +
+                " P63 could not hold two .1/.2 frontend pairs and two .1 backends";
         return false;
     }
     for (size_t i = 0u; i < std::size(ports); i++) {
         for (size_t j = i + 1u; j < std::size(ports); j++) {
             if (ports[i] == ports[j]) {
-                error = "#353 P63 reservations did not yield four unique port numbers";
+                error = std::string(profile.issue) +
+                        " P63 reservations did not yield four unique port numbers";
                 return false;
             }
         }
@@ -38020,7 +38255,8 @@ static bool run_converter_exact_max_proxy_prefix_differential(
     if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
         temps[0].nginx_config == temps[1].source || temps[0].nginx_log == temps[1].rut_log ||
         temps[0].nginx_access_log == temps[1].rut_access_log) {
-        error = "#353 P63 could not create isolated pinned/generated resources";
+        error = std::string(profile.issue) +
+                " P63 could not create isolated pinned/generated resources";
         return false;
     }
     const std::string nginx_identity = container_prefix + "-nginx";
@@ -38038,7 +38274,8 @@ static bool run_converter_exact_max_proxy_prefix_differential(
                                        &reservations.fds[0],
                                        &reservations.fds[2],
                                        true,
-                                       &reservations.fds[1]) ||
+                                       &reservations.fds[1],
+                                       profile) ||
         !capture_max_proxy_prefix_side(ports[2],
                                        ports[3],
                                        temps[1],
@@ -38051,16 +38288,19 @@ static bool run_converter_exact_max_proxy_prefix_differential(
                                        &reservations.fds[3],
                                        &reservations.fds[5],
                                        true,
-                                       &reservations.fds[4]))
+                                       &reservations.fds[4],
+                                       profile))
         return false;
     if (reservations.fds[0] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
         reservations.fds[5] >= 0 || reservations.fds[1] < 0 || reservations.fds[4] < 0 ||
-        !validate_exact_loopback_guard_fd(reservations.fds[1], ports[0], error, "#353 P63") ||
-        !validate_exact_loopback_guard_fd(reservations.fds[4], ports[2], error, "#353 P63")) {
-        if (error.empty()) error = "#353 P63 captures did not retain both .2 guards";
+        !validate_exact_loopback_guard_fd(reservations.fds[1], ports[0], error, profile.issue) ||
+        !validate_exact_loopback_guard_fd(reservations.fds[4], ports[2], error, profile.issue)) {
+        if (error.empty())
+            error = std::string(profile.issue) + " P63 captures did not retain both .2 guards";
         return false;
     }
-    return validate_max_proxy_prefix_pair(observations, generated_source, ports, error, true);
+    return validate_max_proxy_prefix_pair(
+        observations, generated_source, ports, error, true, profile);
 }
 
 static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword) {
@@ -41805,6 +42045,9 @@ int main(int argc, char** argv) {
     const bool converter_exact_loopback_max_proxy_prefix_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-max-proxy-prefix-differential") == 0;
+    const bool converter_exact_loopback_max_no_uri_prefix_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-exact-loopback-max-no-uri-prefix-differential") == 0;
     const bool bounded_exact_local_path_oracle =
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool bounded_no_content_path_oracle =
@@ -41921,6 +42164,7 @@ int main(int argc, char** argv) {
          !converter_exact_loopback_api_no_uri_differential &&
          !converter_exact_loopback_service_no_uri_differential &&
          !converter_exact_loopback_max_proxy_prefix_differential &&
+         !converter_exact_loopback_max_no_uri_prefix_differential &&
          !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
          !max_boundary_no_content_oracle && !bodyful_normalized_exact_oracle &&
@@ -41973,6 +42217,7 @@ int main(int argc, char** argv) {
         (converter_exact_loopback_api_no_uri_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_service_no_uri_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_max_proxy_prefix_differential && argv[2][0] != '/') ||
+        (converter_exact_loopback_max_no_uri_prefix_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
@@ -42073,6 +42318,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-max-proxy-prefix-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-loopback-max-no-uri-prefix-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
@@ -42271,7 +42519,8 @@ int main(int argc, char** argv) {
         }
     }
     if (converter_max_proxy_prefix_differential ||
-        converter_exact_loopback_max_proxy_prefix_differential) {
+        converter_exact_loopback_max_proxy_prefix_differential ||
+        converter_exact_loopback_max_no_uri_prefix_differential) {
         std::string parser_error;
         if (!run_max_proxy_prefix_self_checks(parser_error)) {
             std::cerr << "FAIL [#335 source/access/observation/pair self-check]: " << parser_error
@@ -42282,6 +42531,12 @@ int main(int argc, char** argv) {
             !run_exact_max_proxy_prefix_self_checks(parser_error)) {
             std::cerr << "FAIL [#353 exact-listener P63 boundary self-check]: " << parser_error
                       << "\n";
+            return 1;
+        }
+        if (converter_exact_loopback_max_no_uri_prefix_differential &&
+            !run_exact_max_proxy_prefix_self_checks(parser_error, kMaxProxyPrefixNoUriProfile)) {
+            std::cerr << "FAIL [#356 exact-listener P63 no-URI boundary self-check]: "
+                      << parser_error << "\n";
             return 1;
         }
     }
@@ -42520,6 +42775,7 @@ int main(int argc, char** argv) {
         converter_bodyful_normalized_exact_differential ||
         converter_max_proxy_prefix_differential ||
         converter_exact_loopback_max_proxy_prefix_differential ||
+        converter_exact_loopback_max_no_uri_prefix_differential ||
         converter_max_proxy_replacement_differential ||
         converter_static_query_proxy_uri_differential ||
         converter_zero_suffix_static_query_proxy_uri_differential ||
@@ -43353,6 +43609,46 @@ int main(int argc, char** argv) {
                "2/3 (boundary-only; no #354 non-/ replacement, #355 true no-URI, configured "
                "query, #347/#352 access-format equivalence, broader listeners/methods/bodies/"
                "framing/reuse/failures/H1.0/H2/TLS claim)\n";
+        return 0;
+    }
+
+    if (converter_exact_loopback_max_no_uri_prefix_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-356-exact-p63-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        MaxProxyPrefixObservation observations[2];
+        std::string generated_source;
+        std::string differential_error;
+        if (!run_converter_exact_max_proxy_prefix_differential(container_prefix,
+                                                               argv[2],
+                                                               observations,
+                                                               generated_source,
+                                                               differential_error,
+                                                               kMaxProxyPrefixNoUriProfile)) {
+            std::cerr << "FAIL [#356 exact-listener P63 no-URI behavior boundary]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #356 exact-address P63 no-URI boundary composes the accepted 63-byte "
+               "clean trailing-slash prefix and URI-absent proxy_pass with exact listen "
+               "127.0.0.1:<port>. One isolated pinned nginx 1.29.7 side and one independently "
+               "parsed/provenance-validated/lowered ordinary-RUT public CLI/JIT/io_uring side "
+               "used four unique frontend/backend ports and six held sockets, including "
+               "same-port .2 guards that causally rejected wildcard binds and refused quiet "
+               "probes before/after traffic. Both sides matched five exact Date-normalized "
+               "wires/EOF: three unchanged P, P+x and P+x?y=1 Host-rebuilt/Connection-omitted "
+               "upstream episodes without retry, then two query-preserving automatic 301s "
+               "with zero extra upstream. Generated source ownership, zero target transforms "
+               "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
+               "source size was derived from actual port widths; genuine maximum ports/IP is "
+               "3426 bytes with NUL reserve and 2520 bytes capacity headroom (#356 boundary "
+               "only; representative both-order behavior is separately proven; wildcard "
+               "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
+               "#347/#352 access equivalence, broader methods/bodies/framing/reuse/retries/"
+               "failures/H1.0/H2/TLS excluded; nginx.conf was translated, never loaded "
+               "directly)\n";
         return 0;
     }
 
