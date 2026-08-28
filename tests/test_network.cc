@@ -17103,6 +17103,147 @@ TEST(access_request_size,
     loop.config_ptr = nullptr;
 }
 
+static u32 access_request_size_connect_failure_handler_calls = 0;
+static u64 access_request_size_connect_failure_handler(
+    void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++access_request_size_connect_failure_handler_calls;
+    return jit::HandlerResult::make_forward_with_policies(
+               0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 0)
+        .pack();
+}
+
+TEST(access_request_size,
+     first_connect_completion_failure_keeps_downstream_wire_distinct_and_reuse_isolated) {
+    static constexpr char kClientRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kUpstreamRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: 127.0.0.1:9000\r\n"
+        "X-Test: keep\r\n\r\n";
+    static constexpr char kLegacy502[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Content-Length: 11\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Bad Gateway";
+    constexpr u32 kClientRequestLen = sizeof(kClientRequest) - 1u;
+    constexpr u32 kUpstreamRequestLen = sizeof(kUpstreamRequest) - 1u;
+    constexpr u32 kLegacy502Len = sizeof(kLegacy502) - 1u;
+    static_assert(kClientRequestLen == 105u);
+    static_assert(kUpstreamRequestLen == 66u);
+    static_assert(kLegacy502Len == 78u);
+    static_assert(kClientRequestLen != kUpstreamRequestLen);
+
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler(
+        "/ledger", kRouteMethodGet, &access_request_size_connect_failure_handler, false));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClientRequest), kClientRequestLen),
+               kClientRequestLen);
+    access_request_size_connect_failure_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, kClientRequestLen));
+
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    REQUIRE_EQ(conn->recv_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_FALSE(conn->upstream_reused);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    const i32 failed_upstream_fd = conn->upstream_fd;
+    CHECK_EQ(conn->on_recv, nullptr);
+    CHECK_EQ(conn->on_send, nullptr);
+    CHECK_EQ(conn->on_upstream_recv, nullptr);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<SmallLoop>);
+    AccessLogEntry absent{};
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_FALSE(conn->upstream_reused);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->resp_status, kStatusBadGateway);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->on_recv, nullptr);
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(conn->on_upstream_recv, nullptr);
+    CHECK_EQ(conn->on_upstream_send, nullptr);
+    // The policy-free legacy path clears callback ownership immediately and keeps the failed fd
+    // only until the downstream 502 send retires; on_response_sent then detaches it.
+    CHECK_EQ(conn->upstream_fd, failed_upstream_fd);
+    REQUIRE_EQ(conn->send_buf.len(), kLegacy502Len);
+    CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kLegacy502, kLegacy502Len), 0);
+    const MockOp* failure_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(failure_send != nullptr);
+    CHECK_EQ(failure_send->fd, 42);
+    CHECK_NE(failure_send->fd, failed_upstream_fd);
+    CHECK_EQ(failure_send->send_len, kLegacy502Len);
+    CHECK_EQ(__builtin_memcmp(failure_send->send_buf, kLegacy502, kLegacy502Len), 0);
+    CHECK_FALSE(ring.pop(absent));
+
+    const u32 completed_id = conn->id;
+    loop.inject_and_dispatch(
+        make_ev(completed_id, IoEventType::Send, static_cast<i32>(kLegacy502Len)));
+
+    AccessLogEntry access{};
+    REQUIRE(ring.pop(access));
+    CHECK_EQ(access.req_size, kClientRequestLen);
+    CHECK_NE(access.req_size, kUpstreamRequestLen);
+    CHECK_EQ(access.resp_size, kLegacy502Len);
+    CHECK_EQ(access.status, kStatusBadGateway);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(std::string(access.path, access.target_length), "/ledger?q=raw");
+    CHECK_EQ(std::string(access.upstream), "backend");
+    CHECK_FALSE(ring.pop(absent));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.conns[completed_id].fd, -1);
+    CHECK_EQ(loop.conns[completed_id].upstream_fd, -1);
+    CHECK_EQ(loop.conns[completed_id].on_recv, nullptr);
+    CHECK_EQ(loop.conns[completed_id].on_send, nullptr);
+    CHECK_EQ(loop.conns[completed_id].on_upstream_recv, nullptr);
+    CHECK_EQ(loop.conns[completed_id].on_upstream_send, nullptr);
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, completed_id);
+    CHECK_EQ(reused->downstream_req_size, 0u);
+    CHECK_EQ(reused->req_size, 0u);
+    loop.close_conn(*reused);
+    loop.config_ptr = nullptr;
+}
+
 TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_isolated) {
     SmallLoop loop;
     loop.setup();
