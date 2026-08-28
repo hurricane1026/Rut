@@ -1962,24 +1962,23 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.http1_pipeline_request_generation = 0;
     bool complete_pipeline_request = false;
 
-    // Check if the buffer contains a complete request before proceeding.
-    // For pipelined re-entries, an incomplete request should wait for more
-    // data instead of getting a spurious default response.
-    if (conn.pipeline_depth > 0) {
-        HttpParser pre_parser;
-        ParsedRequest pre_req;
-        pre_parser.reset();
-        const ParseStatus pipeline_status =
-            pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req);
-        if (pipeline_status == ParseStatus::Incomplete) {
-            // Keep pipeline_depth > 0 so subsequent recvs also check for
-            // Incomplete (multi-packet reassembly of the pipelined request).
-            conn.transition_to_reading_header(&on_header_received<Loop>);
-            if (!loop->submit_recv(conn)) loop->close_conn(conn);
-            return;
-        }
-        complete_pipeline_request = pipeline_status == ParseStatus::Complete;
+    // Admission is shared by initial and pipelined HTTP/1 requests. No request
+    // metadata, accounting, generation, route, policy or handler effect may
+    // occur until the accumulated receive buffer contains a complete header.
+    HttpParser pre_parser;
+    ParsedRequest pre_req;
+    pre_parser.reset();
+    const ParseStatus pre_status =
+        pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req);
+    if (pre_status == ParseStatus::Incomplete) {
+        // Keep pipeline_depth unchanged so fragmented successors retain their
+        // generation boundary. Initial requests likewise retain every byte.
+        // A full incomplete buffer cannot make progress and must not spin.
+        conn.transition_to_reading_header(&on_header_received<Loop>);
+        if (conn.recv_buf.write_avail() == 0 || !loop->submit_recv(conn)) loop->close_conn(conn);
+        return;
     }
+    complete_pipeline_request = conn.pipeline_depth > 0 && pre_status == ParseStatus::Complete;
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);

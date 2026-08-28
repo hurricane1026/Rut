@@ -949,8 +949,11 @@ TEST(callback_log, emits_entry_on_response) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    write_request(*c, kRequest);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1u));
     u32 send_len = c->send_buf.len();
+    REQUIRE_GT(send_len, 0u);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
 
     CHECK_EQ(ring.available(), 1u);
@@ -1003,10 +1006,15 @@ TEST(callback_log, no_log_when_ring_null) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    write_request(*c, kRequest);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1u));
     u32 send_len = c->send_buf.len();
+    REQUIRE_GT(send_len, 0u);
+    CHECK_EQ(c->resp_status, 200u);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
-    CHECK(true);
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->fd, 42);
 }
 
 // === Flusher: start() failure paths ===

@@ -3990,6 +3990,15 @@ TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {
 
 // === Recv ===
 
+static bool dispatch_complete_http1_test_request(SmallLoop& loop, Connection& conn) {
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    if (conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u) !=
+        sizeof(kRequest) - 1u)
+        return false;
+    loop.dispatch(make_ev(conn.id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1u)));
+    return true;
+}
+
 TEST(recv, then_send) {
     SmallLoop loop;
     loop.setup();
@@ -4062,7 +4071,7 @@ TEST(send, error_epipe) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
@@ -4387,8 +4396,8 @@ TEST(concurrent, multiple_connections) {
     auto* c1 = loop.find_fd(11);
     auto* c2 = loop.find_fd(12);
     REQUIRE(c0 && c1 && c2);
-    loop.inject_and_dispatch(make_ev(c0->id, IoEventType::Recv, 50));
-    loop.inject_and_dispatch(make_ev(c2->id, IoEventType::Recv, 80));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c0));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c2));
     CHECK_EQ(c0->state, ConnState::Sending);
     CHECK_EQ(c1->state, ConnState::ReadingHeader);
     CHECK_EQ(c2->state, ConnState::Sending);
@@ -4416,7 +4425,7 @@ TEST(concurrent, all_conns_recv_simultaneously) {
     for (int i = 0; i < 10; i++) loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 100 + i));
     for (u32 i = 0; i < SmallLoop::kMaxConns; i++)
         if (loop.conns[i].fd >= 100 && loop.conns[i].fd < 110)
-            loop.inject_and_dispatch(make_ev(i, IoEventType::Recv, 50));
+            REQUIRE(dispatch_complete_http1_test_request(loop, loop.conns[i]));
     int sending = 0;
     for (u32 i = 0; i < SmallLoop::kMaxConns; i++)
         if (loop.conns[i].state == ConnState::Sending) sending++;
@@ -5862,9 +5871,9 @@ TEST(recv_buf, error_closes_cleanly) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
 
-    // First recv → callback consumes + resets
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
-    CHECK_EQ(c->recv_buf.len(), 50u);  // preserved
+    // First complete recv → callback builds a response and preserves the request.
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
+    CHECK_EQ(c->recv_buf.len(), sizeof("GET / HTTP/1.1\r\nHost: x\r\n\r\n") - 1u);  // preserved
 
     // Send response → on_response_sent resets recv_buf
     loop.inject_and_dispatch(
@@ -5888,18 +5897,25 @@ TEST(recv_semantic, multi_packet_accumulation) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
 
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr u32 kFirstPacketLen = 10u;
+    static_assert(kFirstPacketLen < sizeof(kRequest) - 1u);
+
     // Manually simulate two recv packets WITHOUT going through dispatch.
     // This mimics what a real backend does when two packets arrive before
     // the event loop dispatches the first.
-    c->recv_buf.commit(100);            // first packet
-    c->recv_buf.commit(50);             // second packet appended
-    CHECK_EQ(c->recv_buf.len(), 150u);  // accumulated
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), kFirstPacketLen),
+               kFirstPacketLen);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest) + kFirstPacketLen,
+                                 sizeof(kRequest) - 1u - kFirstPacketLen),
+               sizeof(kRequest) - 1u - kFirstPacketLen);
+    CHECK_EQ(c->recv_buf.len(), sizeof(kRequest) - 1u);  // accumulated
 
     // Now dispatch a recv event — callback sees total accumulated data
-    IoEvent ev = make_ev(c->id, IoEventType::Recv, 150);
+    IoEvent ev = make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1u);
     loop.dispatch(ev);
     CHECK_EQ(c->state, ConnState::Sending);
-    CHECK_EQ(c->recv_buf.len(), 150u);  // preserved until on_response_sent
+    CHECK_EQ(c->recv_buf.len(), sizeof(kRequest) - 1u);  // preserved until on_response_sent
 }
 
 // recv when recv_buf is full: backend should not crash or corrupt
@@ -6050,7 +6066,7 @@ TEST(type_guard, response_sent_rejects_recv) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // Dispatch a Recv event while expecting Send → ignored (pipelined data).
     loop.dispatch(make_ev(cid, IoEventType::Recv, 50));
@@ -6203,7 +6219,7 @@ TEST(send_buf, write_and_data) {
     REQUIRE(c != nullptr);
 
     // After recv, callback writes HTTP response to send_buf via Buffer::write()
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_GT(c->send_buf.len(), 0u);
     CHECK(c->send_buf.valid());
 
@@ -6252,7 +6268,7 @@ TEST(send_buf, survives_reuse) {
     REQUIRE(c != nullptr);
     u32 cid = c->id;
 
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_GT(c->send_buf.len(), 0u);
 
     // Close connection
@@ -6301,7 +6317,7 @@ TEST(partial_send, backend_gets_correct_buffer) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.backend.clear_ops();
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
 
     auto* op = loop.backend.last_op(MockOp::Send);
     REQUIRE(op != nullptr);
@@ -6434,7 +6450,7 @@ TEST(copilot5, add_send_immediate_success) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *conn));
     // After recv, callback sets on_send=on_response_sent and calls submit_send.
     // MockBackend should have a Send op.
     auto* op = loop.backend.last_op(MockOp::Send);
@@ -8908,7 +8924,7 @@ TEST(close_cancel, cancels_client_fd) {
     u32 cid = c->id;
 
     // Drive to Sending state (recv → response built → waiting for send completion).
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_EQ(c->state, ConnState::Sending);
 
     loop.backend.clear_ops();
@@ -14942,6 +14958,248 @@ TEST(pipeline, no_pipeline_resets_depth) {
     CHECK_GE(loop.backend.count_ops(MockOp::Recv), 1u);
 }
 
+static u32 http1_header_admission_handler_calls = 0;
+static u64 http1_header_admission_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++http1_header_admission_handler_calls;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+TEST(http1_header_admission, initial_incomplete_45_then_57_is_neutral_and_dispatches_exactly_once) {
+    static constexpr char kPrefix[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.exam";
+    static constexpr char kSuffix[] =
+        "ple.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test: keep\r\n"
+        "\r\n";
+    static constexpr char kRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test: keep\r\n"
+        "\r\n";
+    static_assert(sizeof(kPrefix) - 1u == 45u);
+    static_assert(sizeof(kSuffix) - 1u == 57u);
+    static_assert(sizeof(kRequest) - 1u == 102u);
+
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    ShardEpoch epoch{};
+    AccessLogRing access{};
+    access.init();
+    loop.metrics = &metrics;
+    loop.epoch = &epoch;
+    loop.access_log = &access;
+    RouteConfig config{};
+    REQUIRE(
+        config.add_jit_handler("/ledger", kRouteMethodGet, &http1_header_admission_handler, false));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1u),
+               sizeof(kPrefix) - 1u);
+    http1_header_admission_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+
+    REQUIRE_EQ(conn->fd, 42);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
+    REQUIRE_EQ(conn->recv_buf.len(), sizeof(kPrefix) - 1u);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kPrefix, sizeof(kPrefix) - 1u), 0);
+    CHECK_EQ(conn->req_header_end, 0u);
+    CHECK_EQ(conn->req_initial_send_len, 0u);
+    CHECK_EQ(conn->downstream_req_size, 0u);
+    CHECK_EQ(conn->req_size, 0u);
+    CHECK_EQ(conn->req_start_us, 0u);
+    CHECK_EQ(conn->req_metadata_episode, 0u);
+    CHECK_EQ(conn->handler_gen, 0u);
+    CHECK_EQ(http1_header_admission_handler_calls, 0u);
+    CHECK_EQ(conn->request_config, nullptr);
+    CHECK_EQ(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(conn->resp_status, 0u);
+    CHECK_EQ(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(access.available(), 0u);
+
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kSuffix), sizeof(kSuffix) - 1u),
+               sizeof(kSuffix) - 1u);
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kSuffix) - 1u)));
+
+    REQUIRE_EQ(conn->recv_buf.len(), sizeof(kRequest) - 1u);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kRequest, sizeof(kRequest) - 1u), 0);
+    CHECK_EQ(conn->req_header_end, sizeof(kRequest) - 1u);
+    CHECK_EQ(conn->req_initial_send_len, sizeof(kRequest) - 1u);
+    CHECK_EQ(conn->downstream_req_size, sizeof(kRequest) - 1u);
+    CHECK_EQ(conn->req_size, sizeof(kRequest) - 1u);
+    CHECK_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(http1_header_admission_handler_calls, 1u);
+    CHECK_EQ(conn->request_config, &config);
+    CHECK_NE(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(conn->resp_status, 204u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+
+    const u32 response_len = conn->send_buf.len();
+    REQUIRE_GT(response_len, 0u);
+    const u32 id = conn->id;
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(response_len)));
+    CHECK_EQ(http1_header_admission_handler_calls, 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    AccessLogEntry entry{};
+    REQUIRE(access.pop(entry));
+    CHECK_EQ(entry.req_size, sizeof(kRequest) - 1u);
+    CHECK_EQ(entry.status, 204u);
+    CHECK_EQ(entry.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(std::string(entry.path, entry.target_length), "/ledger?q=raw");
+    CHECK_FALSE(access.pop(entry));
+}
+
+TEST(http1_header_admission, initial_suffix_fragments_remain_neutral_until_complete) {
+    static constexpr char kPrefix[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.exam";
+    static constexpr char kSuffix[] =
+        "ple.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test: keep\r\n"
+        "\r\n";
+    static constexpr u32 kSuffixPart = 19u;
+
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(
+        config.add_jit_handler("/ledger", kRouteMethodGet, &http1_header_admission_handler, false));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 43;
+    http1_header_admission_handler_calls = 0;
+
+    const auto admit_fragment = [&](const char* bytes, u32 len) {
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(bytes), len), len);
+        loop.backend.clear_ops();
+        on_header_received<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(len)));
+    };
+    admit_fragment(kPrefix, sizeof(kPrefix) - 1u);
+    REQUIRE_EQ(conn->fd, 43);
+    CHECK_EQ(http1_header_admission_handler_calls, 0u);
+    CHECK_EQ(conn->handler_gen, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+
+    admit_fragment(kSuffix, kSuffixPart);
+    REQUIRE_EQ(conn->fd, 43);
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kPrefix) - 1u + kSuffixPart);
+    CHECK_EQ(http1_header_admission_handler_calls, 0u);
+    CHECK_EQ(conn->handler_gen, 0u);
+    CHECK_EQ(conn->req_header_end, 0u);
+    CHECK_EQ(conn->downstream_req_size, 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+
+    admit_fragment(kSuffix + kSuffixPart, sizeof(kSuffix) - 1u - kSuffixPart);
+    CHECK_EQ(http1_header_admission_handler_calls, 1u);
+    CHECK_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(conn->recv_buf.len(), 102u);
+    CHECK_EQ(conn->downstream_req_size, 102u);
+    CHECK_EQ(conn->req_initial_send_len, 102u);
+    CHECK_EQ(conn->resp_status, 204u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+}
+
+TEST(http1_header_admission, full_submit_failure_eof_and_negative_fail_closed) {
+    static constexpr char kPrefix[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.exam";
+    static_assert(sizeof(kPrefix) - 1u == 45u);
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        u8 exact_storage[sizeof(kPrefix) - 1u]{};
+        conn->bind_request_receive_buffer(exact_storage, sizeof(exact_storage));
+        conn->fd = 44;
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1u),
+                   sizeof(kPrefix) - 1u);
+        loop.backend.clear_ops();
+        on_header_received<SmallLoop>(
+            &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+
+    {
+        FailRecvAsyncSmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        conn->fd = 45;
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1u),
+                   sizeof(kPrefix) - 1u);
+        on_header_received<FailRecvAsyncSmallLoop>(
+            &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.free_top, FailRecvAsyncSmallLoop::kMaxConns);
+    }
+
+    for (const i32 terminal : {0, -ECONNRESET}) {
+        SmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        conn->fd = 46;
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1u),
+                   sizeof(kPrefix) - 1u);
+        loop.backend.clear_ops();
+        on_header_received<SmallLoop>(&loop, *conn, make_ev(id, IoEventType::Recv, terminal));
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+}
+
 TEST(pipeline, request_generation_token_publishes_only_for_complete_depth_one) {
     SmallLoop loop;
     loop.setup();
@@ -15248,7 +15506,7 @@ TEST(buffer_isolation, lazy_alloc_no_proxy) {
     REQUIRE(conn != nullptr);
 
     // Process a direct (non-proxy) request.
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *conn));
     CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
 
     // No upstream slice should have been allocated for a direct response.
@@ -15469,7 +15727,7 @@ TEST(drain, on_header_received_sends_close) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     CHECK_EQ(c->keep_alive, false);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     // Should have "Connection: close" in send buffer
     const u8* sb = c->send_buf.data();
     bool has_close = false;
@@ -15756,7 +16014,7 @@ TEST(streaming, request_body_recvd_wrong_type_closes) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_recv = &on_request_body_recvd<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
@@ -16572,7 +16830,7 @@ TEST(streaming, response_body_recvd_wrong_type_closes) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 100));
@@ -22292,7 +22550,7 @@ TEST(access_log, request_complete_writes_entry) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     // Complete the response send
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
@@ -23154,7 +23412,7 @@ TEST(early_response, response_sent_tolerates_client_eof) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // Client half-close (EOF) during response send → tolerated
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
@@ -23168,7 +23426,7 @@ TEST(early_response, response_sent_closes_on_enobufs) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
@@ -23277,7 +23535,7 @@ TEST(early_response, proxy_response_sent_tolerates_eof) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_send = &on_proxy_response_sent<SmallLoop>;
     loop.dispatch(make_ev(c->id, IoEventType::Recv, 0));
     CHECK(c->fd >= 0);
@@ -24337,7 +24595,7 @@ TEST(slot_hygiene, on_send_cleared_after_response_sent) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK(c->on_send != nullptr);
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
@@ -24417,7 +24675,7 @@ TEST(dispatch, null_recv_data_no_keepalive_drains_buf) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     // Process request so on_send is set (dispatch guard needs at least one slot)
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_recv = nullptr;
     c->keep_alive = false;
     // Write data then dispatch directly → handle_unhandled_recv → reset.
@@ -24449,7 +24707,7 @@ TEST(dispatch, null_recv_enobufs_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     // Process request so slots are active
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_recv = nullptr;
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
@@ -24476,7 +24734,7 @@ TEST(dispatch, null_upstream_recv_enobufs_closes) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     // Process request so on_send is set (dispatch guard active)
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     c->on_upstream_recv = nullptr;
     u32 cid = c->id;
     // -ENOBUFS on null upstream_recv → close (prevent hot-loop)
@@ -46112,7 +46370,7 @@ TEST(state_transition, header_received_to_sending_response) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    REQUIRE(dispatch_complete_http1_test_request(loop, *c));
     CHECK_SLOTS(c, nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
 }
 

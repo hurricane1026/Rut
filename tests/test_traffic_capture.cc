@@ -569,10 +569,16 @@ TEST(capture_integration, no_capture_when_disabled) {
     REQUIRE(conn != nullptr);
     CHECK(conn->capture_buf == nullptr);
 
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 50));
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
-    // No crash, no capture — just verify it doesn't blow up
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kRequest) - 1u));
+    const u32 send_len = conn->send_buf.len();
+    REQUIRE_GT(send_len, 0u);
+    CHECK_EQ(conn->resp_status, 200u);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->fd, 42);
 }
 
 TEST(capture_integration, keepalive_captures_both) {
