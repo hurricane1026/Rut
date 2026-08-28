@@ -323,6 +323,15 @@ target_include_directories(test_access_log PRIVATE
 add_test(NAME test_access_log COMMAND test_access_log)
 set_tests_properties(test_access_log PROPERTIES LABELS "unit")
 
+add_executable(test_access_log_live test_access_log_live.cc)
+target_link_libraries(test_access_log_live rut_runtime)
+target_include_directories(test_access_log_live PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_access_log_live COMMAND test_access_log_live)
+set_tests_properties(test_access_log_live PROPERTIES LABELS "unit;runtime" TIMEOUT 30)
+
 add_executable(test_access_log_startup test_access_log_startup.cc)
 target_link_libraries(test_access_log_startup rut_runtime)
 target_include_directories(test_access_log_startup PRIVATE
