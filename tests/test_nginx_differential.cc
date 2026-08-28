@@ -4885,8 +4885,18 @@ static bool capture_api_redirect_case(u16 frontend_port,
 }
 
 struct ApiNonRootProxyUriOracleObservation {
+    std::string order;
+    std::string temp_path;
+    std::string config_path;
+    std::string log_path;
+    std::string process_identity;
+    std::string access_scope;
+    std::string config;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> forward_history;
+    std::vector<std::string> access_order;
     u32 access_records[5]{};
     u32 redirect_accepts = 0;
     u32 redirect_requests = 0;
@@ -4894,6 +4904,8 @@ struct ApiNonRootProxyUriOracleObservation {
     u32 forward_accepts = 0;
     u32 forward_requests = 0;
     u32 forward_sends = 0;
+    bool eof_proven[5]{};
+    bool clean_lifecycle = false;
 };
 
 struct CleanProxyUriOracleProfile {
@@ -4949,6 +4961,43 @@ static constexpr CleanProxyUriOracleProfile kExactServiceNoUriProxyOracleProfile
     {"/service/", "/service/x", "/service/x?y=1", "/service", "/service?x=1"},
     {"/service/", "/service/x", "/service/x?y=1"},
 };
+
+static constexpr CleanProxyUriOracleProfile kWildcardServiceNoUriProxyOracleProfile = {
+    "#357",
+    "357-wildcard-service-no-uri",
+    "/service/",
+    "",
+    {"/service/", "/service/x", "/service/x?y=1", "/service", "/service?x=1"},
+    {"/service/", "/service/x", "/service/x?y=1"},
+};
+
+static std::string make_pinned_clean_proxy_uri_config(u16 frontend_port,
+                                                      u16 backend_port,
+                                                      const std::string& access_prefix,
+                                                      const CleanProxyUriOracleProfile& profile,
+                                                      bool listen_first) {
+    const std::string listener = "  listen " + std::to_string(frontend_port) + ";\n";
+    const std::string location =
+        "  location " + std::string(profile.location) +
+        " {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + profile.proxy_uri +
+        ";\n  }\n";
+    const std::string fragment =
+        "server {\n" + (listen_first ? listener + location : location + listener) + "}\n";
+    return "error_log stderr notice;\n"
+           "events {}\n"
+           "http {\n"
+           "  log_format clean_proxy_uri_oracle '" +
+           access_prefix +
+           " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
+           "host=\"$host\"';\n"
+           "  access_log /dev/stderr clean_proxy_uri_oracle;\n" +
+           fragment + "}\n";
+}
+
+static bool read_exact_return204_log(const std::string& path,
+                                     const char* label,
+                                     std::string& contents,
+                                     std::string& error);
 
 static std::string make_api_non_root_proxy_uri_fragment(u16 frontend_port, u16 backend_port) {
     return "server {\n"
@@ -5024,8 +5073,16 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
                                               const char* access_scope,
                                               const CleanProxyUriOracleProfile& profile,
                                               ApiNonRootProxyUriOracleObservation& observation,
-                                              std::string& error) {
+                                              std::string& error,
+                                              bool listen_first = true) {
     observation = ApiNonRootProxyUriOracleObservation{};
+    observation.order = listen_first ? "listen-before-location" : "location-before-listen";
+    observation.temp_path = temp.path;
+    observation.config_path = temp.nginx_config;
+    observation.log_path = temp.nginx_log;
+    observation.process_identity = container_name;
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
     observation.wires.resize(5);
     for (const char* target : profile.targets) {
         const std::string request = api_request(target);
@@ -5052,20 +5109,10 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
 
     const std::string access_prefix = "rut-nginx-" + std::string(profile.access_tag) + "-" +
                                       access_scope + "-" + std::to_string(getpid()) + "-scoped";
-    const std::string fragment =
-        "server {\n  listen " + std::to_string(frontend_port) + ";\n  location " +
-        profile.location + " {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
-        profile.proxy_uri + ";\n  }\n}\n";
-    const std::string config =
-        "error_log stderr notice;\n"
-        "events {}\n"
-        "http {\n"
-        "  log_format clean_proxy_uri_oracle '" +
-        access_prefix +
-        " $remote_addr - - [$time_local] \"$request\" $status $body_bytes_sent "
-        "host=\"$host\"';\n"
-        "  access_log /dev/stderr clean_proxy_uri_oracle;\n" +
-        fragment + "}\n";
+    observation.access_scope = access_prefix;
+    const std::string config = make_pinned_clean_proxy_uri_config(
+        frontend_port, backend_port, access_prefix, profile, listen_first);
+    observation.config = config;
     if (!write_file(temp.nginx_config, config.data(), config.size())) {
         error = std::string("failed to write ") + profile.issue +
                 " clean proxy URI pinned nginx config";
@@ -5125,6 +5172,7 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
             return false;
         }
         observation.wires[index] = std::move(wire);
+        observation.eof_proven[index] = true;
         return true;
     };
     const auto observe_exact_count = [&](Recorder& recorder,
@@ -5330,7 +5378,340 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
                 "redirects, five total records, and zero upstream failures";
         return false;
     }
+    std::string complete_log;
+    if (!read_exact_return204_log(temp.nginx_log,
+                                  (std::string(profile.issue) + " clean oracle log").c_str(),
+                                  complete_log,
+                                  error))
+        return false;
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (complete_log.find(severity) != std::string::npos) {
+            error = std::string(profile.issue) + " nginx lifecycle log contained " + severity;
+            return false;
+        }
+    }
+    static constexpr size_t kExecutionOrder[] = {3u, 4u, 0u, 1u, 2u};
+    size_t begin = 0u;
+    while (begin < complete_log.size()) {
+        const size_t end = complete_log.find('\n', begin);
+        if (end == std::string::npos) break;
+        const std::string line = complete_log.substr(begin, end - begin);
+        begin = end + 1u;
+        if (line.find(access_prefix) == std::string::npos) continue;
+        if (observation.access_order.size() >= std::size(kExecutionOrder)) {
+            error =
+                std::string(profile.issue) + " access log contained more than five scoped records";
+            return false;
+        }
+        const size_t index = kExecutionOrder[observation.access_order.size()];
+        const std::string marker = std::string("\"GET ") + profile.targets[index] + " HTTP/1.1\" " +
+                                   (index < 3u ? "200 2" : "301 169") + " host=\"client.example\"";
+        if (line.find(marker) == std::string::npos) {
+            error =
+                std::string(profile.issue) + " scoped access records were reordered or malformed";
+            return false;
+        }
+        observation.access_order.emplace_back(profile.targets[index]);
+    }
+    if (observation.access_order.size() != std::size(kExecutionOrder)) {
+        error = std::string(profile.issue) + " access log omitted one of five ordered records";
+        return false;
+    }
+    observation.clean_lifecycle = true;
     return true;
+}
+
+static bool validate_wildcard_service_no_uri_observation(
+    const ApiNonRootProxyUriOracleObservation& observation, std::string& error) {
+    const auto& profile = kWildcardServiceNoUriProxyOracleProfile;
+    if ((observation.order != "listen-before-location" &&
+         observation.order != "location-before-listen") ||
+        observation.frontend_port == 0u || observation.backend_port == 0u ||
+        observation.frontend_port == observation.backend_port || observation.temp_path.empty() ||
+        observation.config_path.empty() || observation.log_path.empty() ||
+        observation.process_identity.empty() || observation.access_scope.empty() ||
+        observation.config !=
+            make_pinned_clean_proxy_uri_config(observation.frontend_port,
+                                               observation.backend_port,
+                                               observation.access_scope,
+                                               profile,
+                                               observation.order == "listen-before-location")) {
+        error = "#357 observation lost its exact wildcard-listener/no-URI config or identity";
+        return false;
+    }
+    if (observation.wires.size() != 5u || observation.forward_history.size() != 3u ||
+        observation.access_order.size() != 5u || observation.redirect_accepts != 0u ||
+        observation.redirect_requests != 0u || observation.redirect_sends != 0u ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u || !observation.clean_lifecycle) {
+        error =
+            "#357 observation lost its five vectors, zero redirect upstream, three forwards, "
+            "or clean lifecycle";
+        return false;
+    }
+    static constexpr size_t kExecutionOrder[] = {3u, 4u, 0u, 1u, 2u};
+    for (size_t i = 0u; i < 5u; i++) {
+        if (!observation.eof_proven[i] || observation.access_records[i] != 1u ||
+            observation.access_order[i] != profile.targets[kExecutionOrder[i]]) {
+            error = "#357 observation lost exact EOF or ordered scoped access evidence";
+            return false;
+        }
+        std::vector<char> normalized = observation.wires[i];
+        const std::vector<char> expected =
+            i < 3u ? std::vector<char>(
+                         kSuccessResponseNormalized,
+                         kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                   : expected_clean_proxy_location_redirect(
+                         observation.frontend_port, profile.location, i == 3u ? "" : "?x=1");
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "#357 observation lost an exact Date-normalized wire";
+            return false;
+        }
+    }
+    std::vector<std::vector<char>> expected_history;
+    for (const char* target : profile.forward_targets) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\nHost: " +
+                                    "127.0.0.1:" + std::to_string(observation.backend_port) +
+                                    "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error =
+            "#357 observation rewrote a no-URI target/query, retained Connection, lost "
+            "duplicate headers, or retried";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_wildcard_service_no_uri_pair(
+    const ApiNonRootProxyUriOracleObservation (&observations)[2], std::string& error) {
+    if (observations[0].order != "listen-before-location" ||
+        observations[1].order != "location-before-listen") {
+        error = "#357 pair lost its two exact declaration orders";
+        return false;
+    }
+    for (const auto& observation : observations)
+        if (!validate_wildcard_service_no_uri_observation(observation, error)) return false;
+    const u16 ports[] = {observations[0].frontend_port,
+                         observations[0].backend_port,
+                         observations[1].frontend_port,
+                         observations[1].backend_port};
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        for (size_t j = i + 1u; j < std::size(ports); j++) {
+            if (ports[i] == ports[j]) {
+                error = "#357 pair shared one of four frontend/backend ports";
+                return false;
+            }
+        }
+    }
+    const std::string* resources[] = {&observations[0].temp_path,
+                                      &observations[0].config_path,
+                                      &observations[0].log_path,
+                                      &observations[0].process_identity,
+                                      &observations[0].access_scope,
+                                      &observations[1].temp_path,
+                                      &observations[1].config_path,
+                                      &observations[1].log_path,
+                                      &observations[1].process_identity,
+                                      &observations[1].access_scope};
+    for (size_t i = 0u; i < std::size(resources); i++) {
+        for (size_t j = i + 1u; j < std::size(resources); j++) {
+            if (*resources[i] == *resources[j]) {
+                error = "#357 pair shared a process/temp/config/log/access identity";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_wildcard_service_no_uri_self_checks(std::string& error) {
+    const auto& profile = kWildcardServiceNoUriProxyOracleProfile;
+    static constexpr u16 kPorts[] = {45701u, 45702u, 45703u, 45704u};
+    if (strcmp(profile.issue, "#357") != 0 || strcmp(profile.location, "/service/") != 0 ||
+        profile.proxy_uri[0] != '\0' || strcmp(profile.forward_targets[0], "/service/") != 0 ||
+        strcmp(profile.forward_targets[1], "/service/x") != 0 ||
+        strcmp(profile.forward_targets[2], "/service/x?y=1") != 0) {
+        error = "#357 immutable profile mixed explicit-URI or rewritten-target semantics";
+        return false;
+    }
+    const auto make_observation = [&](size_t side) {
+        ApiNonRootProxyUriOracleObservation observation;
+        observation.order = side == 0u ? "listen-before-location" : "location-before-listen";
+        observation.temp_path = "/tmp/rut-nginx-357-side-" + std::to_string(side);
+        observation.config_path = observation.temp_path + "/nginx.conf";
+        observation.log_path = observation.temp_path + "/nginx.log";
+        observation.process_identity = "rut-nginx-357-process-" + std::to_string(side);
+        observation.access_scope = "rut-nginx-357-access-" + std::to_string(side);
+        observation.frontend_port = kPorts[side * 2u];
+        observation.backend_port = kPorts[side * 2u + 1u];
+        observation.config = make_pinned_clean_proxy_uri_config(observation.frontend_port,
+                                                                observation.backend_port,
+                                                                observation.access_scope,
+                                                                profile,
+                                                                side == 0u);
+        for (size_t i = 0u; i < 5u; i++) {
+            std::vector<char> wire =
+                i < 3u ? std::vector<char>(
+                             kSuccessResponseNormalized,
+                             kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                       : expected_clean_proxy_location_redirect(
+                             observation.frontend_port, profile.location, i == 3u ? "" : "?x=1");
+            const std::string marker(29u, 'X');
+            const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+            static constexpr char kDate[] = "Tue, 01 Jan 2030 00:00:00 GMT";
+            if (date != wire.end()) std::copy_n(kDate, 29u, date);
+            observation.wires.push_back(std::move(wire));
+            observation.eof_proven[i] = true;
+            observation.access_records[i] = 1u;
+        }
+        for (const char* target : profile.forward_targets) {
+            const std::string request = std::string("GET ") + target + " HTTP/1.1\r\nHost: " +
+                                        "127.0.0.1:" + std::to_string(observation.backend_port) +
+                                        "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+            observation.forward_history.emplace_back(request.begin(), request.end());
+        }
+        observation.access_order = {profile.targets[3],
+                                    profile.targets[4],
+                                    profile.targets[0],
+                                    profile.targets[1],
+                                    profile.targets[2]};
+        observation.forward_accepts = observation.forward_requests = observation.forward_sends = 3u;
+        observation.clean_lifecycle = true;
+        return observation;
+    };
+    ApiNonRootProxyUriOracleObservation valid[2] = {make_observation(0u), make_observation(1u)};
+    if (!validate_wildcard_service_no_uri_pair(valid, error)) return false;
+    const auto rejects = [&](const char* label,
+                             const ApiNonRootProxyUriOracleObservation& candidate) {
+        std::string detail;
+        if (!validate_wildcard_service_no_uri_observation(candidate, detail)) return true;
+        error = std::string("#357 observation validator accepted mutation: ") + label;
+        return false;
+    };
+    const auto replace_unique =
+        [&](std::string value, const std::string& from, const std::string& to, const char* label) {
+            const size_t offset = from.empty() ? std::string::npos : value.find(from);
+            if (from.empty() || from == to || offset == std::string::npos ||
+                value.find(from, offset + from.size()) != std::string::npos) {
+                error = std::string("#357 mutation was not unique/non-no-op: ") + label;
+                return std::string{};
+            }
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    auto changed = valid[0];
+    changed.config =
+        replace_unique(changed.config, "location /service/", "location /api/", "location");
+    if (changed.config.empty() || !rejects("wrong-location", changed)) return false;
+    changed = valid[0];
+    changed.config = replace_unique(changed.config,
+                                    "proxy_pass http://127.0.0.1:45702;",
+                                    "proxy_pass http://127.0.0.1:45702/;",
+                                    "explicit-uri");
+    if (changed.config.empty() || !rejects("explicit-uri", changed)) return false;
+    changed = valid[0];
+    changed.order = "location-before-listen";
+    if (!rejects("order", changed)) return false;
+    changed = valid[0];
+    changed.forward_history[0][4] = '/';
+    changed.forward_history[0].erase(changed.forward_history[0].begin() + 5u,
+                                     changed.forward_history[0].begin() + 12u);
+    if (!rejects("rewritten-target", changed)) return false;
+    changed = valid[0];
+    changed.wires[4] =
+        expected_clean_proxy_location_redirect(changed.frontend_port, profile.location, "");
+    if (!rejects("redirect-query", changed)) return false;
+    changed = valid[0];
+    std::swap(changed.access_order[0], changed.access_order[1]);
+    if (!rejects("access-order", changed)) return false;
+    changed = valid[0];
+    changed.access_records[2] = 0u;
+    if (!rejects("access-count", changed)) return false;
+    changed = valid[0];
+    changed.eof_proven[0] = false;
+    if (!rejects("EOF", changed)) return false;
+    changed = valid[0];
+    changed.clean_lifecycle = false;
+    if (!rejects("lifecycle", changed)) return false;
+
+    ApiNonRootProxyUriOracleObservation pair[2] = {valid[0], valid[1]};
+    pair[1].order = "listen-before-location";
+    std::string detail;
+    if (validate_wildcard_service_no_uri_pair(pair, detail)) {
+        error = "#357 pair validator accepted duplicate declaration order";
+        return false;
+    }
+    pair[1] = valid[1];
+    pair[1].temp_path = pair[0].temp_path;
+    if (validate_wildcard_service_no_uri_pair(pair, detail)) {
+        error = "#357 pair validator accepted shared resource identity";
+        return false;
+    }
+    pair[1] = valid[1];
+    pair[1].backend_port = pair[0].frontend_port;
+    pair[1].config = make_pinned_clean_proxy_uri_config(
+        pair[1].frontend_port, pair[1].backend_port, pair[1].access_scope, profile, false);
+    pair[1].forward_history.clear();
+    for (const char* target : profile.forward_targets) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                    std::to_string(pair[1].backend_port) +
+                                    "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        pair[1].forward_history.emplace_back(request.begin(), request.end());
+    }
+    if (!validate_wildcard_service_no_uri_observation(pair[1], detail) ||
+        validate_wildcard_service_no_uri_pair(pair, detail)) {
+        error = "#357 shared-port mutation did not isolate pair uniqueness";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_wildcard_service_no_uri_oracle(
+    const std::string& container_prefix,
+    ApiNonRootProxyUriOracleObservation (&observations)[2],
+    std::string& error) {
+    u16 ports[4]{};
+    for (u16& port : ports) {
+        if (!allocate_port(port)) {
+            error = "#357 could not allocate four isolated frontend/backend ports";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        for (size_t j = i + 1u; j < std::size(ports); j++) {
+            if (ports[i] == ports[j]) {
+                error = "#357 port allocation produced a shared frontend/backend port";
+                return false;
+            }
+        }
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error = "#357 could not create isolated declaration-order temp trees";
+        return false;
+    }
+    if (!run_pinned_clean_proxy_uri_oracle(ports[0],
+                                           ports[1],
+                                           temps[0],
+                                           container_prefix + "-listen-first",
+                                           "listen-first",
+                                           kWildcardServiceNoUriProxyOracleProfile,
+                                           observations[0],
+                                           error,
+                                           true) ||
+        !run_pinned_clean_proxy_uri_oracle(ports[2],
+                                           ports[3],
+                                           temps[1],
+                                           container_prefix + "-location-first",
+                                           "location-first",
+                                           kWildcardServiceNoUriProxyOracleProfile,
+                                           observations[1],
+                                           error,
+                                           false))
+        return false;
+    return validate_wildcard_service_no_uri_pair(observations, error);
 }
 
 static bool run_pinned_api_non_root_proxy_uri_oracle(
@@ -41989,6 +42370,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--api-non-root-proxy-uri-oracle") == 0;
     const bool service_root_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--service-root-proxy-uri-oracle") == 0;
+    const bool wildcard_service_no_uri_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-service-no-uri-oracle") == 0;
     const bool static_query_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-static-query-proxy-uri-oracle") == 0;
     const bool zero_suffix_static_query_proxy_uri_oracle =
@@ -42145,12 +42528,12 @@ int main(int argc, char** argv) {
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !static_query_proxy_uri_oracle &&
-         !zero_suffix_static_query_proxy_uri_oracle && !wildcard_listen_oracle &&
-         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
-         !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
-         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
-         !exact_loopback_prefix_root_replacement_oracle &&
+         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
+         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
+         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
+         !exact_loopback_listen_oracle && !exact_loopback_return204_oracle &&
+         !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
+         !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !exact_loopback_service_no_uri_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -42259,6 +42642,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
                      "   or: test_nginx_differential --api-non-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-wildcard-service-no-uri-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-static-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential "
@@ -42432,6 +42817,14 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
+    if (wildcard_service_no_uri_oracle) {
+        std::string self_check_error;
+        if (!run_wildcard_service_no_uri_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#357 wildcard /service/ no-URI oracle self-check]: "
+                      << self_check_error << "\n";
+            return 1;
+        }
+    }
     if (rut_iouring_coalesced_ingress_gate || converter_coalesced_successor_differential) {
         std::string source_error;
         if (!run_converter_coalesced_source_self_checks(source_error)) {
@@ -44223,6 +44616,38 @@ int main(int argc, char** argv) {
                "equivalence claim; excludes wider prefixes, normalization-sensitive targets, "
                "other methods, framing/body, reuse/pipeline, TLS/H2, and multiple locations or "
                "servers)\n";
+        return 0;
+    }
+
+    if (wildcard_service_no_uri_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-357-wildcard-service-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ApiNonRootProxyUriOracleObservation observations[2];
+        std::string oracle_error;
+        if (!run_pinned_wildcard_service_no_uri_oracle(
+                container_prefix, observations, oracle_error)) {
+            std::cerr << "FAIL [#357 pinned wildcard /service/ no-URI oracle]: " << oracle_error
+                      << "\n";
+            dump_service_root_proxy_uri_oracle_observation(observations[0]);
+            dump_service_root_proxy_uri_oracle_observation(observations[1]);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #357 pinned nginx 1.29.7 nginx-only oracle proves wildcard "
+               "listen <port> with clean /service/ true no-URI proxy_pass in exactly "
+               "listen/location and location/listen declaration orders. Two isolated sides used "
+               "four unique frontend/backend ports and resources; each matched five exact "
+               "Date-normalized close/EOF wires, retained three unchanged /service/, /service/x "
+               "and /service/x?y=1 upstream targets with rebuilt backend Host, omitted Connection "
+               "and duplicate headers, exactly three clean ordered episodes with no retry, and "
+               "two query-preserving 301/CL169 redirects with live and settled zero upstream. "
+               "Each side produced exactly five ordered scoped access records, zero upstream "
+               "connect failures and a clean lifecycle (#357 nginx-only; no parser/converter/"
+               "generated-RUT equivalence claim; explicit 0.0.0.0 and * spellings, P63, "
+               "configured URI/query, normalization-sensitive/absolute targets, broader methods/"
+               "bodies/framing/reuse/failures/H1.0/H2/TLS and #347/#352 excluded)\n";
         return 0;
     }
 
