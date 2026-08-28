@@ -314,8 +314,15 @@ FrontendResult<bool> validate_listener(const Server& server,
                                    sizeof(kExactLoopbackPrefix) - 1u,
                                    listener.port))
         return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
-    if (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
-        (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u))
+    const ProxyPass& proxy = server.location.proxy_pass;
+    const bool exact_root_replacement =
+        proxy_profile == ProxyLocationProfile::PrefixWithUri && proxy.has_uri &&
+        proxy.uri.len == 1u && proxy.uri.ptr != nullptr && proxy.uri.ptr[0] == '/' &&
+        !server.exact_local_return.present && !server.exact_no_content_return.present &&
+        !has_exact_absolute_redirect;
+    if (!exact_root_replacement &&
+        (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
+         (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u)))
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
     return true;

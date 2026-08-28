@@ -1166,6 +1166,223 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
     std::filesystem::remove(path);
 }
 
+TEST(serve_loader,
+     nginx_exact_loopback_prefix_root_replacement_output_is_owned_and_reuses_cleanly) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_exact_prefix_root_replacement";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8086; location /service/ { proxy_pass "
+            "http://127.0.0.1:9000/; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 3358u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    const auto check_upstream = [&](u16 expected_port) {
+        REQUIRE_EQ(program.config.upstream_count, 1u);
+        const UpstreamTarget& upstream = program.config.upstreams[0];
+        CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+        REQUIRE_EQ(upstream.addr_count, 1u);
+        CHECK_EQ(upstream.addrs[0].sin_family, AF_INET);
+        CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0x7f000001u);
+        CHECK_EQ(ntohs(upstream.addrs[0].sin_port), expected_port);
+    };
+    const auto check_prefix_route = [&]() {
+        REQUIRE_EQ(program.config.route_count, 1u);
+        const RouteEntry& route = program.config.routes[0];
+        CHECK_EQ(route.method, kRouteMethodAny);
+        CHECK_EQ(route.path_len, 8u);
+        CHECK((Str{reinterpret_cast<const char*>(route.path), route.path_len}.eq(
+            lit_str("/service"))));
+        CHECK(route.action == RouteAction::JitHandler);
+        CHECK_FALSE(route.needs_req_body);
+        static constexpr u8 kService[] = {'/', 's', 'e', 'r', 'v', 'i', 'c', 'e'};
+        const RouteEntry* matched =
+            program.config.match(kService, sizeof(kService), kRouteMethodGet);
+        REQUIRE(matched != nullptr);
+        CHECK_EQ(matched, &route);
+    };
+    const auto check_transform = [&](u16 transform_id) {
+        REQUIRE(program.config.target_transform_id_is_valid(transform_id));
+        const auto& transform = program.config.target_transforms[transform_id - 1u];
+        CHECK(transform.strip_prefix.eq(lit_str("/service/")));
+        CHECK(transform.replace_prefix.eq(lit_str("/")));
+        const uintptr_t pool = reinterpret_cast<uintptr_t>(program.config.target_transform_bytes);
+        const uintptr_t pool_end = pool + program.config.target_transform_bytes_used;
+        for (Str value : {transform.strip_prefix, transform.replace_prefix}) {
+            const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+            CHECK_GE(address, pool);
+            CHECK_LE(address, pool_end);
+            CHECK_LE(value.len, pool_end - address);
+        }
+    };
+    const auto check_redirect = [&](u16 policy_id) {
+        REQUIRE(program.config.redirect_policy_id_is_valid(policy_id));
+        const auto& policy = program.config.redirect_policies[policy_id - 1u];
+        CHECK(program.config.redirect_policy_strings_are_owned(policy));
+        CHECK(policy.scheme == RedirectPolicyScheme::Http);
+        CHECK(policy.authority == RedirectPolicyAuthority::RequestHost);
+        CHECK(policy.port == RedirectPolicyPort::ActualListener);
+        CHECK(policy.path == RedirectPolicyPath::Static);
+        CHECK(policy.query == RedirectPolicyQuery::PreserveRaw);
+        CHECK(policy.date == RedirectPolicyDate::Current);
+        CHECK(policy.connection == RedirectPolicyConnection::Close);
+        CHECK(policy.header_order == RedirectPolicyHeaderOrder::LocationThenConnection);
+        CHECK_EQ(policy.status_code, 301u);
+        CHECK(policy.reason.eq(lit_str("Moved Permanently")));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.content_type.eq(lit_str("text/html")));
+        CHECK_EQ(policy.static_authority.len, 0u);
+        CHECK(policy.target_path.eq(lit_str("/service/")));
+        CHECK_EQ(policy.body.len, 169u);
+    };
+
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8086u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_upstream(9000u);
+    check_prefix_route();
+    REQUIRE_EQ(program.config.target_transform_count, 1u);
+    REQUIRE_EQ(program.config.target_transform_bytes_used, 10u);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+    u16 transform_id = 0u;
+    u16 redirect_id = 0u;
+    u32 forward_count = 0u;
+    u32 redirect_count = 0u;
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    CHECK(program.rir.module.functions[0].route_pattern.eq(lit_str("/service")));
+    for (u32 block = 0u; block < program.rir.module.functions[0].block_count; block++) {
+        const auto& rir_block = program.rir.module.functions[0].blocks[block];
+        for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+            const auto& inst = rir_block.insts[instruction];
+            if (inst.op == rir::Opcode::RetRedirect) {
+                redirect_count++;
+                REQUIRE_GT(inst.imm.i32_val, 0);
+                REQUIRE_LE(static_cast<u32>(inst.imm.i32_val),
+                           program.rir.module.redirect_policy_count);
+                redirect_id = static_cast<u16>(inst.imm.i32_val);
+            }
+            if (inst.op != rir::Opcode::RetForwardBundle) continue;
+            forward_count++;
+            REQUIRE_GT(instruction, 0u);
+            const auto& transform = rir_block.insts[instruction - 1u];
+            REQUIRE(transform.op == rir::Opcode::ReqSetTargetTransform);
+            REQUIRE_GT(transform.imm.i32_val, 0);
+            REQUIRE_LE(static_cast<u32>(transform.imm.i32_val),
+                       program.rir.module.target_transform_count);
+            transform_id = static_cast<u16>(transform.imm.i32_val);
+        }
+    }
+    REQUIRE_EQ(redirect_count, 1u);
+    REQUIRE_EQ(forward_count, 1u);
+    REQUIRE_NE(redirect_id, 0u);
+    REQUIRE_NE(transform_id, 0u);
+    check_transform(transform_id);
+    check_redirect(redirect_id);
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8086u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    check_upstream(9000u);
+    check_prefix_route();
+    check_transform(transform_id);
+    check_redirect(redirect_id);
+
+    program.destroy();
+    CHECK_FALSE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8080u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    CHECK_EQ(program.config.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_bytes_used, 0u);
+
+    {
+        char nginx_source[] =
+            "server { listen *:8087; location / { proxy_pass http://127.0.0.1:9001; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'z', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.port, 8087u);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    for (u32 i = 0u; i < program.config.route_count; i++) {
+        CHECK_EQ(program.config.routes[i].path_len, 1u);
+        CHECK_EQ(program.config.routes[i].path[0], '/');
+    }
+    check_upstream(9001u);
+    CHECK_EQ(program.rir.module.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    for (const auto& stale : program.config.target_transforms) {
+        CHECK(stale.strip_prefix.ptr == nullptr);
+        CHECK_EQ(stale.strip_prefix.len, 0u);
+        CHECK(stale.replace_prefix.ptr == nullptr);
+        CHECK_EQ(stale.replace_prefix.len, 0u);
+    }
+    CHECK_EQ(program.rir.module.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_bytes_used, 0u);
+    for (const auto& stale : program.config.redirect_policies) {
+        CHECK(stale.scheme == RedirectPolicyScheme::Invalid);
+        CHECK(stale.authority == RedirectPolicyAuthority::Invalid);
+        CHECK(stale.port == RedirectPolicyPort::Invalid);
+        CHECK(stale.path == RedirectPolicyPath::Invalid);
+        CHECK(stale.query == RedirectPolicyQuery::Invalid);
+        CHECK(stale.date == RedirectPolicyDate::Invalid);
+        CHECK(stale.connection == RedirectPolicyConnection::Invalid);
+        CHECK(stale.header_order == RedirectPolicyHeaderOrder::Invalid);
+        CHECK_EQ(stale.status_code, 0u);
+        for (Str value : {stale.reason,
+                          stale.server,
+                          stale.content_type,
+                          stale.static_authority,
+                          stale.target_path,
+                          stale.body}) {
+            CHECK(value.ptr == nullptr);
+            CHECK_EQ(value.len, 0u);
+        }
+    }
+    program.destroy();
+    std::filesystem::remove(path);
+}
+
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
     const struct {
         const char* name;
