@@ -21536,6 +21536,14 @@ static constexpr char kStaticQueryClientRequestSix[] =
     "Host: client.example\r\n"
     "Connection: close\r\n"
     "X-Test: one\r\n\r\n";
+static constexpr u32 kStaticQueryClientRequestLengths[kStaticQueryVectorCount] = {
+    sizeof(kStaticQueryClientRequestOne) - 1u,
+    sizeof(kStaticQueryClientRequestTwo) - 1u,
+    sizeof(kStaticQueryClientRequestThree) - 1u,
+    sizeof(kStaticQueryClientRequestFour) - 1u,
+    sizeof(kStaticQueryClientRequestFive) - 1u,
+    sizeof(kStaticQueryClientRequestSix) - 1u,
+};
 static constexpr char kStaticQueryExpectedResponse[] =
     "HTTP/1.1 201 Created\r\n"
     "Server: rut-static-query\r\n"
@@ -21612,7 +21620,7 @@ static bool validate_static_query_transform_evidence(const StaticQueryTransformE
             access.target_length != target_len ||
             memcmp(access.path, client_targets[i], target_len) != 0 ||
             access.method != static_cast<u8>(LogHttpMethod::Get) || access.status != 201u ||
-            access.req_size != evidence.request_lengths[i] ||
+            access.req_size != kStaticQueryClientRequestLengths[i] ||
             access.resp_size != sizeof(kStaticQueryExpectedResponse) - 1u ||
             strcmp(access.upstream, "backend") != 0)
             return false;
@@ -21667,10 +21675,12 @@ static bool static_query_transform_validator_self_checks() {
         memcpy(valid.access[i].path, client_targets[i], valid.access[i].target_length);
         valid.access[i].method = static_cast<u8>(LogHttpMethod::Get);
         valid.access[i].status = 201u;
-        valid.access[i].req_size = valid.request_lengths[i];
+        valid.access[i].req_size = kStaticQueryClientRequestLengths[i];
         valid.access[i].resp_size = sizeof(kStaticQueryExpectedResponse) - 1u;
         memcpy(valid.access[i].upstream, "backend", sizeof("backend"));
     }
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++)
+        if (valid.request_lengths[i] == kStaticQueryClientRequestLengths[i]) return false;
     if (!validate_static_query_transform_evidence(valid, kPort)) return false;
     const auto rejects = [&](const StaticQueryTransformEvidence& mutation) {
         return !validate_static_query_transform_evidence(mutation, kPort);
@@ -21688,7 +21698,7 @@ static bool static_query_transform_validator_self_checks() {
             mutation.request_lengths[index] = 0u;
         else
             mutation.request_lengths[index] = mutation.request_header_lengths[index] =
-                mutation.access[index].req_size = static_cast<u32>(len);
+                static_cast<u32>(len);
         return mutation;
     };
 
@@ -21705,6 +21715,12 @@ static bool static_query_transform_validator_self_checks() {
     const auto collapsed_delimiters = with_upstream_target(3u, "/v1/?y=1");
     const auto ampersand = with_upstream_target(2u, "/v1/?x&y=1");
     const auto fixed_query_reordered = with_upstream_target(4u, "/v1/users?x=1?fixed=1");
+    StaticQueryTransformEvidence rebuilt_upstream_access_size = valid;
+    rebuilt_upstream_access_size.access[0].req_size =
+        rebuilt_upstream_access_size.request_lengths[0];
+    StaticQueryTransformEvidence swapped_downstream_access_sizes = valid;
+    std::swap(swapped_downstream_access_sizes.access[0].req_size,
+              swapped_downstream_access_sizes.access[1].req_size);
     StaticQueryTransformEvidence missing_episode = valid;
     missing_episode.accepted_count = kStaticQueryVectorCount - 1u;
     StaticQueryTransformEvidence duplicate_send = valid;
@@ -21727,6 +21743,7 @@ static bool static_query_transform_validator_self_checks() {
     return rejects(transformed_access) && rejects(original_upstream) && rejects(terminal_deleted) &&
            rejects(missing_query) && rejects(reordered) && rejects(missing_suffix) &&
            rejects(collapsed_delimiters) && rejects(ampersand) && rejects(fixed_query_reordered) &&
+           rejects(rebuilt_upstream_access_size) && rejects(swapped_downstream_access_sizes) &&
            rejects(missing_episode) && rejects(duplicate_send) && rejects(extra_episode) &&
            rejects(nonempty_sentinel) && rejects(missing_access) && rejects(duplicate_access) &&
            rejects(extra_access) && rejects(reversed_access);
@@ -21939,12 +21956,6 @@ route GET "/fixed" {
                                            kStaticQueryClientRequestFour,
                                            kStaticQueryClientRequestFive,
                                            kStaticQueryClientRequestSix};
-    const u32 client_request_lengths[] = {sizeof(kStaticQueryClientRequestOne) - 1u,
-                                          sizeof(kStaticQueryClientRequestTwo) - 1u,
-                                          sizeof(kStaticQueryClientRequestThree) - 1u,
-                                          sizeof(kStaticQueryClientRequestFour) - 1u,
-                                          sizeof(kStaticQueryClientRequestFive) - 1u,
-                                          sizeof(kStaticQueryClientRequestSix) - 1u};
     struct ClientGuard {
         i32 fd = -1;
         ~ClientGuard() {
@@ -21955,7 +21966,7 @@ route GET "/fixed" {
         ClientGuard client{connect_to(port)};
         REQUIRE_GE(client.fd, 0);
         set_socket_timeouts(client.fd, 5);
-        REQUIRE(send_all(client.fd, client_requests[i], client_request_lengths[i]));
+        REQUIRE(send_all(client.fd, client_requests[i], kStaticQueryClientRequestLengths[i]));
         char response[sizeof(kStaticQueryExpectedResponse) + 32u]{};
         u32 response_len = 0;
         REQUIRE(read_public_close_response(
@@ -22078,8 +22089,10 @@ route GET "/fixed" {
         CHECK_EQ(capture.method, static_cast<u8>(LogHttpMethod::Get));
         CHECK_EQ(capture.req_content_length, 0u);
         CHECK_EQ(capture.resp_content_length, sizeof(kStaticQueryExpectedResponse) - 1u);
-        REQUIRE_EQ(capture.raw_header_len, client_request_lengths[i]);
-        CHECK_EQ(memcmp(capture.raw_headers, client_requests[i], client_request_lengths[i]), 0);
+        REQUIRE_EQ(capture.raw_header_len, kStaticQueryClientRequestLengths[i]);
+        CHECK_EQ(
+            memcmp(capture.raw_headers, client_requests[i], kStaticQueryClientRequestLengths[i]),
+            0);
         CHECK_EQ(strcmp(capture.upstream_name, "backend"), 0);
     }
     CaptureEntry no_capture{};
