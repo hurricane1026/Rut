@@ -17112,6 +17112,18 @@ static u64 access_request_size_connect_failure_handler(
         .pack();
 }
 
+struct AccessRequestSizeReuseLoop : SmallLoop {
+    UpstreamPool* reuse_pool = nullptr;
+
+    bool reuse_idle_upstream(Connection& conn, u16 upstream_id, u8 backend_idx) {
+        if (reuse_pool == nullptr) return false;
+        const i32 fd = reuse_pool->take_idle(upstream_id, backend_idx);
+        if (fd < 0) return false;
+        conn.upstream_fd = fd;
+        return true;
+    }
+};
+
 TEST(access_request_size,
      first_connect_completion_failure_keeps_downstream_wire_distinct_and_reuse_isolated) {
     static constexpr char kClientRequest[] =
@@ -17242,6 +17254,229 @@ TEST(access_request_size,
     CHECK_EQ(reused->req_size, 0u);
     loop.close_conn(*reused);
     loop.config_ptr = nullptr;
+}
+
+TEST(access_request_size,
+     stale_reused_upstream_retry_keeps_downstream_wire_distinct_and_reuse_isolated) {
+    static constexpr char kClientRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kUpstreamRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: 127.0.0.1:9000\r\n"
+        "X-Test: keep\r\n\r\n";
+    static constexpr char kUpstreamResponse[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "OK";
+    constexpr u32 kClientRequestLen = sizeof(kClientRequest) - 1u;
+    constexpr u32 kUpstreamRequestLen = sizeof(kUpstreamRequest) - 1u;
+    constexpr u32 kUpstreamResponseLen = sizeof(kUpstreamResponse) - 1u;
+    static_assert(kClientRequestLen == 105u);
+    static_assert(kUpstreamRequestLen == 66u);
+    static_assert(kUpstreamResponseLen == 40u);
+    static_assert(kClientRequestLen != kUpstreamRequestLen);
+
+    AccessRequestSizeReuseLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    UpstreamPool pool{};
+    pool.init();
+    loop.reuse_pool = &pool;
+
+    i32 pooled_pair[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pooled_pair), 0);
+    const i32 pooled_fd = pooled_pair[0];
+    REQUIRE(pool.put_idle(pooled_pair[0], 0, 0, monotonic_secs()));
+    pooled_pair[0] = -1;
+    REQUIRE_EQ(pool.idle_count.load(std::memory_order_acquire), 1u);
+
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(config.upstreams[0].addr_count, 1u);
+    REQUIRE(config.add_jit_handler(
+        "/ledger", kRouteMethodGet, &access_request_size_connect_failure_handler, false));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClientRequest), kClientRequestLen),
+               kClientRequestLen);
+    access_request_size_connect_failure_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<AccessRequestSizeReuseLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, kClientRequestLen));
+
+    CHECK_EQ(pool.idle_count.load(std::memory_order_acquire), 0u);
+    CHECK(conn->upstream_reused);
+    CHECK_EQ(conn->upstream_fd, pooled_fd);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_FALSE(conn->request_upload_complete);
+    CHECK_FALSE(conn->req_client_keep_alive);
+    CHECK(conn->req_client_connection_close);
+    // Ordinary proxying keeps conn.keep_alive as the live-shard baseline; pin the
+    // parsed client-close terminal shape explicitly, as the retained body witness does.
+    conn->keep_alive = false;
+    REQUIRE_EQ(conn->recv_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    const MockOp first_upstream_send = loop.backend.ops[0];
+    CHECK_EQ(first_upstream_send.type, MockOp::Send);
+    CHECK_EQ(first_upstream_send.fd, conn->upstream_fd);
+    CHECK(first_upstream_send.send_buf == conn->recv_buf.data());
+    CHECK_EQ(first_upstream_send.send_len, kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(first_upstream_send.send_buf, kUpstreamRequest, kUpstreamRequestLen),
+             0);
+    AccessLogEntry absent{};
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+
+    CHECK(conn->upstream_reused);
+    CHECK(conn->request_upload_complete);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->retry_req_send_len, kUpstreamRequestLen);
+    CHECK(conn->retry_req_snapshot_replayable);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(conn->send_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<AccessRequestSizeReuseLoop>);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    const MockOp* first_upstream_recv = loop.backend.last_op(MockOp::Recv);
+    REQUIRE(first_upstream_recv != nullptr);
+    CHECK_EQ(first_upstream_recv->fd, pooled_fd);
+    CHECK_FALSE(ring.pop(absent));
+
+    REQUIRE_EQ(close(pooled_pair[1]), 0);
+    pooled_pair[1] = -1;
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 0));
+
+    CHECK_FALSE(conn->upstream_reused);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_FALSE(conn->request_upload_complete);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->retry_req_send_len, kUpstreamRequestLen);
+    CHECK(conn->retry_req_snapshot_replayable);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(conn->send_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<AccessRequestSizeReuseLoop>);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+    const MockOp* retry_upstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(retry_upstream_send != nullptr);
+    CHECK_EQ(retry_upstream_send->fd, conn->upstream_fd);
+    CHECK(retry_upstream_send->send_buf == conn->send_buf.data());
+    CHECK(retry_upstream_send->send_buf != conn->recv_buf.data());
+    CHECK_EQ(retry_upstream_send->send_len, kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(retry_upstream_send->send_buf, kUpstreamRequest, kUpstreamRequestLen),
+             0);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->retry_req_send_len, kUpstreamRequestLen);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+    CHECK(conn->request_upload_complete);
+    CHECK_EQ(conn->retry_req_send_len, kUpstreamRequestLen);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<AccessRequestSizeReuseLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 2u);
+    const MockOp* retry_upstream_recv = loop.backend.last_op(MockOp::Recv);
+    REQUIRE(retry_upstream_recv != nullptr);
+    CHECK_EQ(retry_upstream_recv->fd, conn->upstream_fd);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_FALSE(ring.pop(absent));
+
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstreamResponse),
+                                             kUpstreamResponseLen),
+               kUpstreamResponseLen);
+    loop.backend.inject(
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(kUpstreamResponseLen)));
+    IoEvent events[1]{};
+    REQUIRE_EQ(loop.backend.wait(events, 1), 1u);
+    loop.dispatch(events[0]);
+
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 3u);
+    const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    CHECK_EQ(downstream_send->fd, 42);
+    CHECK_EQ(downstream_send->send_len, kUpstreamResponseLen);
+    CHECK_EQ(__builtin_memcmp(downstream_send->send_buf, kUpstreamResponse, kUpstreamResponseLen),
+             0);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_FALSE(ring.pop(absent));
+
+    const u32 completed_id = conn->id;
+    loop.inject_and_dispatch(
+        make_ev(completed_id, IoEventType::Send, static_cast<i32>(kUpstreamResponseLen)));
+
+    AccessLogEntry access{};
+    REQUIRE(ring.pop(access));
+    CHECK_EQ(access.req_size, kClientRequestLen);
+    CHECK_NE(access.req_size, kUpstreamRequestLen);
+    CHECK_EQ(access.resp_size, kUpstreamResponseLen);
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(std::string(access.path, access.target_length), "/ledger?q=raw");
+    CHECK_EQ(std::string(access.upstream), "backend");
+    CHECK_FALSE(ring.pop(absent));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 3u);
+    CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
+    CHECK_EQ(loop.conns[completed_id].fd, -1);
+    CHECK_EQ(loop.conns[completed_id].upstream_fd, -1);
+    CHECK_EQ(pool.idle_count.load(std::memory_order_acquire), 0u);
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, completed_id);
+    CHECK_EQ(reused->downstream_req_size, 0u);
+    CHECK_EQ(reused->req_size, 0u);
+    CHECK_EQ(reused->retry_req_send_len, 0u);
+    loop.close_conn(*reused);
+    loop.config_ptr = nullptr;
+    loop.reuse_pool = nullptr;
+    pool.shutdown();
 }
 
 TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_isolated) {
