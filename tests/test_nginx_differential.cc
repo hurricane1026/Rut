@@ -46392,6 +46392,321 @@ static bool run_converter_request_length_differential(TempDir& temp,
         temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, error);
 }
 
+static bool validate_converter_request_length_fixed_body_source(const std::string& source,
+                                                                u16 frontend_port,
+                                                                u16 backend_port,
+                                                                const std::string& access_path,
+                                                                std::string& error) {
+    const std::string declaration = "accessLog { path: \"" + access_path +
+                                    "\", format: downstreamRequestBytes, publication: live }\n";
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
+        frontend_port == backend_port || access_path.empty() ||
+        source.rfind(declaration, 0u) != 0u || count_text(source, declaration) != 1u ||
+        count_text(source, "accessLog {") != 1u || count_text(source, access_path) != 1u ||
+        count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
+        count_text(source, "\nroute ") != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
+        count_text(source, "route GET \"/\" {") != 1u ||
+        count_text(source, "\nroute \"/\" {") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "format: downstreamRequestBytes") != 1u ||
+        count_text(source, "publication: live") != 1u ||
+        source.find("route POST ") != std::string::npos ||
+        source.find("$request_length") != std::string::npos ||
+        source.find("log_format") != std::string::npos ||
+        source.find("access_log") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("--access-log") != std::string::npos) {
+        error =
+            "#367 converter-generated ordinary RUT inventory was not exact "
+            "accessLog/listen/upstream/HEAD/GET/Any";
+        return false;
+    }
+    return true;
+}
+
+static bool build_owned_converter_request_length_fixed_body_source(u16 frontend_port,
+                                                                   u16 backend_port,
+                                                                   const std::string& access_path,
+                                                                   std::string& owned,
+                                                                   std::string& error) {
+    if (!build_owned_converter_request_length_source(
+            frontend_port, backend_port, access_path, owned, error))
+        return false;
+    return validate_converter_request_length_fixed_body_source(
+        owned, frontend_port, backend_port, access_path, error);
+}
+
+static bool run_converter_request_length_fixed_body_self_checks(std::string& error) {
+    static constexpr u16 kFrontendPort = 18080u;
+    static constexpr u16 kBackendPort = 9000u;
+    static constexpr const char* kAccessPath = "/tmp/rut-nginx-367-converter/access.log";
+    std::string source;
+    if (!build_owned_converter_request_length_fixed_body_source(
+            kFrontendPort, kBackendPort, kAccessPath, source, error))
+        return false;
+    const auto replace_once = [&](const std::string& from, const std::string& to) {
+        std::string changed = source;
+        const size_t at = changed.find(from);
+        if (at == std::string::npos || changed.find(from, at + from.size()) != std::string::npos)
+            return std::string{};
+        changed.replace(at, from.size(), to);
+        return changed;
+    };
+    const std::vector<std::string> mutations = {
+        replace_once("format: downstreamRequestBytes", "format: defaultText"),
+        replace_once("publication: live", "publication: periodic"),
+        replace_once(kAccessPath, "/tmp/rut-nginx-367-converter/other.log"),
+        replace_once("listen 127.0.0.1:18080", "listen 127.0.0.1:18081"),
+        replace_once("127.0.0.1:9000", "127.0.0.1:9001"),
+        replace_once("route HEAD \"/\" {", "route POST \"/\" {"),
+        replace_once("route GET \"/\" {", "route PUT \"/\" {"),
+        replace_once("\nroute \"/\" {", "\nroute POST \"/\" {"),
+        source + source.substr(0u, source.find('\n') + 1u),
+    };
+    for (const std::string& mutation : mutations) {
+        std::string detail;
+        if (mutation.empty() || validate_converter_request_length_fixed_body_source(
+                                    mutation, kFrontendPort, kBackendPort, kAccessPath, detail)) {
+            error = "#367 generated-source self-check accepted a semantic mutation";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_converter_request_length_fixed_body_rut_side(TempDir& temp,
+                                                             const char* rut_path,
+                                                             HeldLoopbackPorts& reservations,
+                                                             u16 frontend_port,
+                                                             u16 backend_port,
+                                                             std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#367 converter differential requires an executable absolute RUT path";
+        return false;
+    }
+    if (frontend_port == backend_port ||
+        !validate_held_loopback_port(
+            reservations.fds[0], frontend_port, "#367 generated RUT frontend handoff", error) ||
+        !validate_held_loopback_port(
+            reservations.fds[1], backend_port, "#367 generated RUT backend handoff", error)) {
+        if (error.empty()) error = "#367 could not hold distinct generated-RUT ports";
+        return false;
+    }
+
+    std::string generated;
+    if (!build_owned_converter_request_length_fixed_body_source(
+            frontend_port, backend_port, temp.rut_access_log, generated, error) ||
+        !write_file(temp.source, generated.data(), generated.size())) {
+        if (error.empty()) error = "#367 could not persist converter-generated ordinary RUT";
+        return false;
+    }
+    std::fill(generated.begin(), generated.end(), 'G');
+    std::string persisted;
+    if (!read_exact_return204_log(temp.source, "#367 persisted generated RUT", persisted, error) ||
+        !validate_converter_request_length_fixed_body_source(
+            persisted, frontend_port, backend_port, temp.rut_access_log, error))
+        return false;
+    persisted.clear();
+    persisted.shrink_to_fit();
+
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.read_exact_content_length_12_body = true;
+    backend.wait_response_peer_close = true;
+    backend.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#367 generated RUT Recorder bind", error) ||
+        !backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        if (error.empty()) error = "#367 generated-RUT Recorder could not bind held backend";
+        return false;
+    }
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!backend.running.load(std::memory_order_acquire) ||
+            !backend.thread_alive.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < recorder_deadline) {
+        if (backend.listener_failed.load(std::memory_order_acquire)) break;
+        usleep(1000);
+    }
+    if (!backend.running.load(std::memory_order_acquire) ||
+        !backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire)) {
+        error = "#367 generated-RUT Recorder was not live before frontend handoff";
+        return false;
+    }
+
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#367 generated RUT public bind", error) ||
+        !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "#367 generated ordinary RUT failed before readiness";
+        return false;
+    }
+    const auto live_with_counts = [&](u32 expected) {
+        return !poll_child(runtime.child) && backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire) &&
+               backend.accepted.load(std::memory_order_acquire) == expected &&
+               backend.requests.load(std::memory_order_acquire) == expected &&
+               backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
+    };
+    const auto quiet_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < quiet_deadline) {
+        std::string access_bytes;
+        if (!live_with_counts(0u) ||
+            !read_request_length_fixed_body_access(temp.rut_access_log, access_bytes, error) ||
+            !access_bytes.empty()) {
+            if (error.empty()) error = "#367 generated-RUT pre-request state was not quiet";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    std::vector<char> response;
+    if (client.fd < 0 ||
+        !send_all(client.fd,
+                  kRequestLengthFixedBodyClientRequest,
+                  sizeof(kRequestLengthFixedBodyClientRequest) - 1u) ||
+        !read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+        !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
+        if (error.empty()) error = "#367 generated-RUT one-send request/response/EOF failed";
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+    if (!wait_for_live_complete_origin_episode(backend, runtime.child, "#367 generated RUT", error))
+        return false;
+
+    const std::string expected_header =
+        "POST /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nContent-Length: 12\r\nX-Test: keep\r\n\r\n";
+    const std::string expected_upstream = expected_header + kRequestLengthFixedBody;
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+    const std::string actual =
+        backend.history.size() == 1u
+            ? std::string(backend.history[0].begin(), backend.history[0].end())
+            : std::string{};
+    const std::vector<char> actual_bytes(actual.begin(), actual.end());
+    const size_t actual_header_end = header_end(actual_bytes);
+    if (expected_header.size() != 87u || expected_upstream.size() != 99u ||
+        sizeof(kRequestLengthFixedBodyClientRequest) - 1u == expected_upstream.size() ||
+        backend.history.size() != 1u || backend.history[0] != expected_wire ||
+        actual_header_end != 87u || actual.size() - actual_header_end != 12u ||
+        count_text(actual, "Host: 127.0.0.1:") != 1u ||
+        count_text(actual, "Content-Length: 12\r\n") != 1u ||
+        count_text(actual, "X-Test: keep\r\n") != 1u ||
+        count_text(actual, kRequestLengthFixedBody) != 1u ||
+        actual.find("client.example") != std::string::npos ||
+        actual.find("Connection:") != std::string::npos || actual.find('\t') != std::string::npos) {
+        if (!backend.history.empty())
+            dump_wire("#367 generated RUT backend wire", backend.history[0]);
+        error = "#367 generated RUT upstream was not exact 87-header/99-total fixed-body wire";
+        return false;
+    }
+    if (!backend.response_peer_closed.load(std::memory_order_acquire) ||
+        backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        backend.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        error = "#367 generated RUT origin lacked exact peer-close/no-late-byte evidence";
+        return false;
+    }
+
+    static constexpr char kExpectedAccess[] = "135\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access_bytes;
+        if (!live_with_counts(1u) ||
+            !read_request_length_fixed_body_access(temp.rut_access_log, access_bytes, error)) {
+            if (error.empty()) error = "#367 generated RUT failed while awaiting live access";
+            return false;
+        }
+        if (access_bytes.size() > sizeof(kExpectedAccess) - 1u ||
+            memcmp(kExpectedAccess, access_bytes.data(), access_bytes.size()) != 0) {
+            error = "#367 generated-RUT access escaped the exact `135\\n` prefix";
+            return false;
+        }
+        if (access_bytes.size() == sizeof(kExpectedAccess) - 1u) break;
+        if (std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#367 generated-RUT access record was not visible before shutdown";
+            return false;
+        }
+        usleep(1000);
+    }
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        std::string access_bytes;
+        if (!live_with_counts(1u) || !complete_origin_episode_is_exact(backend) ||
+            !backend.response_peer_closed.load(std::memory_order_acquire) ||
+            backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_fixed_body_access(temp.rut_access_log, access_bytes, error) ||
+            !validate_request_length_fixed_body_access(access_bytes, error)) {
+            if (error.empty()) error = "#367 generated-RUT live evidence was not stable";
+            return false;
+        }
+        usleep(5000);
+    }
+    if (!stop_child(runtime.child) || !runtime.child.status_valid ||
+        !WIFEXITED(runtime.child.status) || WEXITSTATUS(runtime.child.status) != 0) {
+        error = "#367 generated RUT did not shut down cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    std::string final_access;
+    std::string runtime_log;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u ||
+        backend.history[0] != expected_wire ||
+        !backend.response_peer_closed.load(std::memory_order_acquire) ||
+        backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !read_request_length_fixed_body_access(temp.rut_access_log, final_access, error) ||
+        !validate_request_length_fixed_body_access(final_access, error) ||
+        !read_exact_return204_log(
+            temp.rut_log, "#367 generated RUT runtime log", runtime_log, error) ||
+        !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, frontend_port, error)) {
+        if (error.empty()) error = "#367 generated-RUT final lifecycle evidence was not exact";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_request_length_fixed_body_differential(TempDir& temp,
+                                                                 const std::string& container_name,
+                                                                 const char* rut_path,
+                                                                 std::string& error) {
+    HeldLoopbackPorts rut_reservations;
+    u16 rut_frontend_port = 0u;
+    u16 rut_backend_port = 0u;
+    if (!rut_reservations.reserve(0u, rut_frontend_port) ||
+        !rut_reservations.reserve_four_digit(1u, rut_backend_port) ||
+        rut_frontend_port == rut_backend_port) {
+        error = "#367 could not pre-hold isolated generated-RUT frontend/backend ports";
+        return false;
+    }
+    if (!run_pinned_request_length_fixed_body_oracle(temp, container_name, error)) return false;
+    return run_converter_request_length_fixed_body_rut_side(
+        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, error);
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -46433,6 +46748,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-fixed-body-oracle") == 0;
     const bool converter_request_length_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-differential") == 0;
+    const bool converter_request_length_fixed_body_differential =
+        argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool exact_loopback_return204_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return204-oracle") == 0;
     const bool exact_loopback_bodyful_return_oracle =
@@ -46588,9 +46905,9 @@ int main(int argc, char** argv) {
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
          !request_length_fixed_body_oracle && !converter_request_length_differential &&
-         !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
-         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
-         !exact_loopback_prefix_root_replacement_oracle &&
+         !converter_request_length_fixed_body_differential && !exact_loopback_return204_oracle &&
+         !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
+         !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !exact_loopback_service_no_uri_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -46641,6 +46958,7 @@ int main(int argc, char** argv) {
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
+        (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
         (converter_root_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_proxy_trace_differential && argv[2][0] != '/') ||
@@ -46725,6 +47043,9 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-request-length-fixed-body-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-request-length-differential <absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-request-length-fixed-body-differential "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-return204-oracle\n"
                      "   or: test_nginx_differential "
@@ -46909,11 +47230,17 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (request_length_fixed_body_oracle) {
+    if (request_length_fixed_body_oracle || converter_request_length_fixed_body_differential) {
         std::string self_check_error;
         if (!run_request_length_fixed_body_self_checks(self_check_error)) {
             std::cerr << "FAIL [#367 fixed-body request-length self-check]: " << self_check_error
                       << "\n";
+            return 1;
+        }
+        if (converter_request_length_fixed_body_differential &&
+            !run_converter_request_length_fixed_body_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#367 converter fixed-body request-length self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
     }
@@ -47615,6 +47942,37 @@ int main(int argc, char** argv) {
                "parse_http_profile plus lower_to_rut(HttpProfile), survived input/output-owner "
                "destruction, and ran through the public executable with source accessLog live "
                "publication and no CLI logging workaround\n";
+        return 0;
+    }
+    if (converter_request_length_fixed_body_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-367-request-length-body-diff-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_request_length_fixed_body_differential(
+                temp, container_name, argv[2], differential_error)) {
+            std::cerr << "FAIL [#367 converter fixed-body request-length differential]: "
+                      << differential_error << "\n";
+            dump_log(temp.nginx_config, "#367 pinned nginx config");
+            dump_log(temp.nginx_access_log, "#367 pinned nginx access log");
+            dump_log(temp.nginx_log, "#367 pinned nginx process log");
+            dump_log(temp.source, "#367 converter-generated ordinary RUT");
+            dump_log(temp.rut_access_log, "#367 generated RUT access log");
+            dump_log(temp.rut_log, "#367 generated RUT process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #367 pinned nginx 1.29.7 and converter-generated ordinary RUT each "
+               "accept one exact fresh complete 123-byte-header plus 12-byte fixed-Content-Length "
+               "POST delivered by one application send_all, rebuild it to one exact "
+               "87-byte-header plus 12-byte-body upstream request, return the exact "
+               "Date-normalized 118-byte response/EOF, and publish exactly `135\\n` live and "
+               "after clean shutdown with one no-retry origin episode and no late origin bytes; "
+               "the RUT side came only from parse_http_profile plus "
+               "lower_to_rut(HttpProfile), survived owner destruction, and used source "
+               "accessLog without a CLI logging workaround (no TCP segmentation or recv-boundary "
+               "claim)\n";
         return 0;
     }
     u16 frontend_port = 0;
