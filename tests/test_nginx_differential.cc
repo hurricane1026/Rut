@@ -18481,6 +18481,7 @@ struct MaxProxyPrefixProfile {
     MaxProxyForwardTargets forward_targets;
     size_t canonical_8080_9000_size;
     size_t maximum_exact_size;
+    bool strict_wildcard_boundary;
 };
 
 static constexpr MaxProxyPrefixProfile kMaxProxyPrefixRootProfile = {
@@ -18490,9 +18491,12 @@ static constexpr MaxProxyPrefixProfile kMaxProxyPrefixRootProfile = {
     true,
     MaxProxyForwardTargets::RootReplacement,
     3574u,
-    3582u};
+    3582u,
+    false};
 static constexpr MaxProxyPrefixProfile kMaxProxyPrefixNoUriProfile = {
-    "#356", "exact-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3418u, 3426u};
+    "#356", "exact-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3418u, 3426u, false};
+static constexpr MaxProxyPrefixProfile kWildcardMaxProxyPrefixNoUriProfile = {
+    "#357", "wildcard-p63-no-uri", "", false, MaxProxyForwardTargets::Original, 3409u, 3417u, true};
 
 static std::string max_proxy_forward_target(size_t index, const MaxProxyPrefixProfile& profile) {
     static constexpr const char* kRootTargets[] = {"/", "/x", "/x?y=1"};
@@ -18628,10 +18632,17 @@ static bool validate_max_proxy_prefix_generated_source(
         count_text(source, "route \"") != 1u || count_text(source, redirect_condition) != 1u ||
         count_text(source, redirect_target) != 1u || !transform_is_exact ||
         count_text(source, "query: \"preserve_raw\"") != 1u ||
+        source.find("set_path") != std::string::npos ||
+        source.find("ReqSetTargetTransform") != std::string::npos ||
         source.find("proxy_pass") != std::string::npos ||
         source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
         source.find("nginx_compat") != std::string::npos ||
-        source.find("workaround") != std::string::npos) {
+        source.find("workaround") != std::string::npos ||
+        source.find("bind_address") != std::string::npos ||
+        source.find("local_address") != std::string::npos ||
+        source.find("req.listener") != std::string::npos ||
+        source.find("address_condition") != std::string::npos) {
         error =
             std::string(profile.issue) +
             " generated source was not exactly one maximum-prefix route, redirect, and " +
@@ -18806,6 +18817,258 @@ static bool validate_exact_max_proxy_prefix_observation(
     return true;
 }
 
+static bool validate_wildcard_max_proxy_prefix_observation(
+    const MaxProxyPrefixObservation& observation,
+    u16 frontend_port,
+    u16 backend_port,
+    bool generated,
+    std::string& error,
+    const MaxProxyPrefixProfile& profile) {
+    if (!validate_max_proxy_prefix_observation(
+            observation, frontend_port, backend_port, error, profile))
+        return false;
+    if (observation.exact_address_profile || !observation.source_ownership_proven ||
+        !observation.clean_lifecycle || observation.public_load_proven != generated) {
+        error = std::string(profile.issue) +
+                " P63 observation lost wildcard-listener ownership or lifecycle evidence";
+        return false;
+    }
+    for (const bool eof : observation.eof_proven) {
+        if (!eof) {
+            error = std::string(profile.issue) +
+                    " P63 wildcard boundary vector lacked an exact zero-tail EOF";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool prove_wildcard_max_no_uri_public_ownership(const std::string& source_path,
+                                                       const std::string& source,
+                                                       u16 frontend_port,
+                                                       u16 backend_port,
+                                                       std::string& error) {
+    const std::string route = max_proxy_route_key();
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#357 wildcard P63 source failed public lexing";
+        return false;
+    }
+    const auto ast_result = rut::parse_file(lexed.value());
+    if (!ast_result) {
+        error = "#357 wildcard P63 source failed public AST parsing";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(ast_result.value());
+    const rut::AstRouteDecl* ast_route = nullptr;
+    bool ast_listener = false;
+    for (u32 i = 0u; i < ast->items.len; i++) {
+        if (ast->items[i].kind == rut::AstItemKind::Listen &&
+            ast->items[i].listen.address == rut::ListenerAddress::IPv4Wildcard &&
+            ast->items[i].listen.ipv4_host == 0u && ast->items[i].listen.port == frontend_port)
+            ast_listener = true;
+        if (ast->items[i].kind == rut::AstItemKind::Route &&
+            ast->items[i].route.path.eq({route.data(), static_cast<u32>(route.size())}))
+            ast_route = &ast->items[i].route;
+    }
+    if (!ast_listener || ast_route == nullptr || ast_route->statements.len != 1u ||
+        ast_route->statements[0] == nullptr ||
+        ast_route->statements[0]->kind != rut::AstStmtKind::If ||
+        ast_route->statements[0]->else_stmt == nullptr) {
+        error = "#357 public AST lost wildcard listener/P63 route binding";
+        return false;
+    }
+    const rut::AstStatement* ast_forward = ast_route->statements[0]->else_stmt;
+    if (ast_forward->kind == rut::AstStmtKind::Block) {
+        if (ast_forward->block_stmts.len != 1u || ast_forward->block_stmts[0] == nullptr) {
+            error = "#357 public AST lost the P63 forward block";
+            return false;
+        }
+        ast_forward = ast_forward->block_stmts[0];
+    }
+    if (ast_forward->kind != rut::AstStmtKind::ForwardUpstream ||
+        ast_forward->has_forward_target_transform ||
+        ast_forward->forward_target_transform.strip_prefix.ptr != nullptr ||
+        ast_forward->forward_target_transform.replace_prefix.ptr != nullptr) {
+        error = "#357 public AST invented a P63 target transform";
+        return false;
+    }
+    const auto hir_result = rut::analyze_file(*ast);
+    if (!hir_result) {
+        error = "#357 wildcard P63 source failed public HIR analysis";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> hir(hir_result.value());
+    if (hir->routes.len != 1u || hir->routes[0].control.kind != rut::HirControlKind::If ||
+        hir->routes[0].control.else_term.kind != rut::HirTerminatorKind::ForwardUpstream ||
+        hir->routes[0].control.else_term.has_forward_target_transform) {
+        error = "#357 public HIR lost the zero-transform P63 binding";
+        return false;
+    }
+    const auto mir_result = rut::build_mir(*hir);
+    if (!mir_result) {
+        error = "#357 wildcard P63 source failed public MIR lowering";
+        return false;
+    }
+    std::unique_ptr<rut::MirModule> mir(mir_result.value());
+    u32 mir_forwards = 0u;
+    for (u32 block = 0u; block < mir->functions[0].blocks.len; block++) {
+        const auto& term = mir->functions[0].blocks[block].term;
+        if (term.kind != rut::MirTerminatorKind::ForwardUpstream) continue;
+        mir_forwards++;
+        if (term.has_forward_target_transform) {
+            error = "#357 public MIR invented a P63 target transform";
+            return false;
+        }
+    }
+    if (mir_forwards != 1u) {
+        error = "#357 public MIR lost the single P63 forward terminator";
+        return false;
+    }
+    mir.reset();
+    hir.reset();
+    ast.reset();
+
+    rut::LoadedProgram program{};
+    struct Guard {
+        rut::LoadedProgram* value;
+        ~Guard() { value->destroy(); }
+    } guard{&program};
+    rut::LoadError load_error{};
+    if (!rut::load_rut_program(source_path.c_str(), program, load_error, rut::jit::OptLevel::O0)) {
+        error = "#357 wildcard P63 source failed public load";
+        return false;
+    }
+    u16 redirect_id = 0u;
+    u16 bundle_id = 0u;
+    u16 request_policy_id = 0u;
+    u32 redirects = 0u;
+    u32 forwards = 0u;
+    u32 transforms = 0u;
+    rut::i32 upstream_id = -1;
+    if (program.rir.module.func_count != 1u) {
+        error = "#357 public RIR lost the single P63 route function";
+        return false;
+    }
+    const auto& function = program.rir.module.functions[0];
+    const auto find_const = [&](rut::rir::ValueId value, rut::i32& result) {
+        for (u32 block = 0u; block < function.block_count; block++)
+            for (u32 instruction = 0u; instruction < function.blocks[block].inst_count;
+                 instruction++) {
+                const auto& candidate = function.blocks[block].insts[instruction];
+                if (candidate.op == rut::rir::Opcode::ConstI32 && candidate.result == value) {
+                    result = candidate.imm.i32_val;
+                    return true;
+                }
+            }
+        return false;
+    };
+    for (u32 block = 0u; block < function.block_count; block++)
+        for (u32 instruction = 0u; instruction < function.blocks[block].inst_count; instruction++) {
+            const auto& inst = function.blocks[block].insts[instruction];
+            if (inst.op == rut::rir::Opcode::ReqSetTargetTransform) transforms++;
+            if (inst.op == rut::rir::Opcode::RetRedirect) {
+                redirects++;
+                if (inst.imm.i32_val > 0 && inst.imm.i32_val <= 0xffff)
+                    redirect_id = static_cast<u16>(inst.imm.i32_val);
+            }
+            if (inst.op != rut::rir::Opcode::RetForwardBundle) continue;
+            rut::i32 request = -1;
+            rut::i32 bundle = -1;
+            forwards++;
+            if (inst.operand_count != 3u || !find_const(inst.operand(0), upstream_id) ||
+                !find_const(inst.operand(1), request) || !find_const(inst.operand(2), bundle) ||
+                request <= 0 || request > 0xffff || bundle <= 0 || bundle > 0xffff) {
+                error = "#357 public RIR lost P63 upstream/request/bundle operands";
+                return false;
+            }
+            request_policy_id = static_cast<u16>(request);
+            bundle_id = static_cast<u16>(bundle);
+        }
+    const auto owned_by = [](rut::Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+        return address >= begin && address - begin <= used - value.len;
+    };
+    const auto owned_state_is_canonical = [&]() {
+        if (!program.has_listener || !program.listener.valid() ||
+            program.listener.address != rut::ListenerAddress::IPv4Wildcard ||
+            program.listener.ipv4_host != 0u || program.listener.port != frontend_port ||
+            program.listener.transport != rut::ListenerTransport::Cleartext ||
+            program.config.route_count != 1u ||
+            program.config.routes[0].method != rut::kRouteMethodAny ||
+            program.config.routes[0].path_len != route.size() ||
+            memcmp(program.config.routes[0].path, route.data(), route.size()) != 0 ||
+            program.config.routes[0].action != rut::RouteAction::JitHandler ||
+            program.config.routes[0].needs_req_body || program.config.upstream_count != 1u ||
+            program.config.upstreams[0].addr_count != 1u ||
+            ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+            ntohs(program.config.upstreams[0].addrs[0].sin_port) != backend_port ||
+            program.config.target_transform_count != 0u ||
+            program.config.target_transform_bytes_used != 0u ||
+            program.rir.module.target_transform_count != 0u || transforms != 0u ||
+            redirects != 1u || forwards != 1u || upstream_id != 0 || redirect_id == 0u ||
+            request_policy_id != static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+            !program.config.redirect_policy_id_is_valid(redirect_id) ||
+            !program.config.policy_bundle_id_is_valid(bundle_id))
+            return false;
+        const auto& redirect = program.config.redirect_policies[redirect_id - 1u];
+        if (!program.config.redirect_policy_strings_are_owned(redirect) ||
+            !redirect.target_path.eq(
+                {max_proxy_prefix().data(), static_cast<u32>(max_proxy_prefix().size())}) ||
+            !owned_by(redirect.target_path,
+                      program.config.redirect_policy_bytes,
+                      program.config.redirect_policy_bytes_used))
+            return false;
+        const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
+        if (!program.config.response_policy_id_is_valid(bundle.response_policy_id) ||
+            !program.config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            bundle.timeout_failure_policy_id != 0u || bundle.response_read_timeout_seconds != 0u ||
+            bundle.response_buffering != rut::ForwardResponseBufferingMode::None)
+            return false;
+        const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
+        const auto& failure = program.config.failure_policies[bundle.failure_policy_id - 1u];
+        return response.server.eq(rut::lit_str("nginx/1.29.7")) &&
+               owned_by(response.server,
+                        program.config.response_policy_bytes,
+                        program.config.response_policy_bytes_used) &&
+               failure.reason.eq(rut::lit_str("Bad Gateway")) &&
+               failure.server.eq(rut::lit_str("nginx/1.29.7")) &&
+               owned_by(failure.reason,
+                        program.config.failure_policy_bytes,
+                        program.config.failure_policy_bytes_used) &&
+               owned_by(failure.server,
+                        program.config.failure_policy_bytes,
+                        program.config.failure_policy_bytes_used);
+    };
+    if (!owned_state_is_canonical()) {
+        error = "#357 public RIR/config lost wildcard listener/binding/policy ownership";
+        return false;
+    }
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    if (program.src_map == nullptr || program.src_map_len == 0u ||
+        munmap(program.src_map, program.src_map_len) != 0) {
+        error = "#357 public source/intermediate teardown failed";
+        return false;
+    }
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    static constexpr char kDestroyed[] = "destroyed-after-357-p63-public-proof\n";
+    std::string destroyed_readback;
+    if (!write_file(source_path, kDestroyed, sizeof(kDestroyed) - 1u) ||
+        !read_exact_return204_log(
+            source_path, "#357 destroyed P63 loader source", destroyed_readback, error) ||
+        destroyed_readback != kDestroyed || !owned_state_is_canonical() ||
+        !write_file(source_path, source.data(), source.size())) {
+        error = "#357 owned wildcard P63 state did not survive teardown/source overwrite";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_max_proxy_prefix_side(
     u16 frontend_port,
     u16 backend_port,
@@ -18828,6 +19091,7 @@ static bool capture_max_proxy_prefix_side(
         error = "#335 capture requires held endpoint reservations and an executable public RUT";
         return false;
     }
+    const bool strict_boundary = exact_address_profile || profile.strict_wildcard_boundary;
     if (exact_address_profile && (negative_reservation == nullptr || *negative_reservation < 0 ||
                                   !validate_exact_loopback_guard_fd(
                                       *negative_reservation, frontend_port, error, profile.issue)))
@@ -18899,7 +19163,10 @@ static bool capture_max_proxy_prefix_side(
         const auto& location = server.location;
         const auto& proxy = location.proxy_pass;
         const size_t location_offset = borrowed_fragment.find("location ");
-        const size_t listener_value_offset = borrowed_fragment.find("127.0.0.1:");
+        const std::string listener_value = exact_address_profile
+                                               ? "127.0.0.1:" + std::to_string(frontend_port)
+                                               : std::to_string(frontend_port);
+        const size_t listener_value_offset = borrowed_fragment.find(listener_value);
         const size_t path_offset = borrowed_fragment.find(max_proxy_prefix(), location_offset);
         const size_t proxy_offset = borrowed_fragment.find("proxy_pass", path_offset);
         const size_t uri_offset =
@@ -18925,7 +19192,12 @@ static bool capture_max_proxy_prefix_side(
                                                         std::to_string(frontend_port).size())}) ||
               !same_source(server.listen.value, server.listen.value_span))) ||
             (!exact_address_profile &&
-             server.listen.address != rut::ListenerAddress::IPv4Wildcard) ||
+             (server.listen.address != rut::ListenerAddress::IPv4Wildcard ||
+              (profile.strict_wildcard_boundary &&
+               (listener_value_offset == std::string::npos || server.listen.ipv4_host != 0u ||
+                !server.listen.value.eq({borrowed_fragment.data() + listener_value_offset,
+                                         static_cast<u32>(listener_value.size())}) ||
+                !same_source(server.listen.value, server.listen.value_span))))) ||
             location.path.len != 63u || !location.path.eq({max_proxy_prefix().data(), 63u}) ||
             location.path.ptr != borrowed_fragment.data() + path_offset ||
             !same_source(location.path, location.path_span) ||
@@ -18952,7 +19224,7 @@ static bool capture_max_proxy_prefix_side(
         }
         const rut::Str output = lowered.value().view();
         generated_source.assign(output.ptr, output.len);
-        if ((exact_address_profile &&
+        if ((strict_boundary &&
              generated_source.size() !=
                  max_proxy_expected_source_size(frontend_port, backend_port, profile)) ||
             !validate_max_proxy_prefix_generated_source(generated_source,
@@ -18964,7 +19236,7 @@ static bool capture_max_proxy_prefix_side(
                                                         profile) ||
             !write_file(temp.source, output.ptr, output.len))
             return false;
-        if (exact_address_profile) {
+        if (strict_boundary) {
             rut::LoadedProgram loaded{};
             struct ProgramGuard {
                 rut::LoadedProgram* program;
@@ -18975,9 +19247,11 @@ static bool capture_max_proxy_prefix_side(
             if (!rut::load_rut_program(
                     temp.source.c_str(), loaded, load_error, rut::jit::OptLevel::O0) ||
                 !loaded.has_listener || !loaded.listener.valid() ||
-                loaded.listener.address != rut::ListenerAddress::IPv4Exact ||
-                loaded.listener.ipv4_host != 0x7f000001u || loaded.listener.port != frontend_port ||
-                loaded.config.route_count != 1u ||
+                loaded.listener.address != (exact_address_profile
+                                                ? rut::ListenerAddress::IPv4Exact
+                                                : rut::ListenerAddress::IPv4Wildcard) ||
+                loaded.listener.ipv4_host != (exact_address_profile ? 0x7f000001u : 0u) ||
+                loaded.listener.port != frontend_port || loaded.config.route_count != 1u ||
                 loaded.config.target_transform_count != (profile.uses_target_transform ? 1u : 0u) ||
                 (profile.uses_target_transform &&
                  (!loaded.config.target_transforms[0].strip_prefix.eq(
@@ -18987,7 +19261,7 @@ static bool capture_max_proxy_prefix_side(
                 !loaded.config.redirect_policies[0].target_path.eq(
                     {max_proxy_prefix().data(), static_cast<u32>(max_proxy_prefix().size())})) {
                 error = std::string(profile.issue) +
-                        " P63 generated source lost exact listener/transform/redirect public "
+                        " P63 generated source lost listener/transform/redirect public "
                         "ownership";
                 return false;
             }
@@ -19012,6 +19286,10 @@ static bool capture_max_proxy_prefix_side(
             }
             observation.public_load_proven = true;
         }
+        if (profile.strict_wildcard_boundary &&
+            !prove_wildcard_max_no_uri_public_ownership(
+                temp.source, generated_source, frontend_port, backend_port, error))
+            return false;
     }
     std::fill(borrowed_fragment.begin(), borrowed_fragment.end(), '\0');
     if (!std::all_of(borrowed_fragment.begin(), borrowed_fragment.end(), [](char byte) {
@@ -19139,7 +19417,7 @@ static bool capture_max_proxy_prefix_side(
         error = "#335 source overwrite/readback was not exact";
         return false;
     }
-    if (exact_address_profile) observation.source_ownership_proven = true;
+    if (strict_boundary) observation.source_ownership_proven = true;
 
     const auto observe_count =
         [&](u32 expected, const char* phase, std::chrono::milliseconds duration) {
@@ -19208,7 +19486,7 @@ static bool capture_max_proxy_prefix_side(
             error = "#335 vector " + observation.targets[i] + " response/EOF failed: " + detail;
             return false;
         }
-        if (exact_address_profile) observation.eof_proven[i] = true;
+        if (strict_boundary) observation.eof_proven[i] = true;
         std::vector<char> normalized = observation.wires[i];
         const std::vector<char> expected =
             i < 3u ? std::vector<char>(
@@ -19285,7 +19563,7 @@ static bool capture_max_proxy_prefix_side(
         for (size_t i = 0u; i < 3u; i++)
             observation.request_sizes[i] = observation.forward_history[i].size();
     }
-    if (exact_address_profile) observation.clean_lifecycle = true;
+    if (strict_boundary) observation.clean_lifecycle = true;
     if (!validate_max_proxy_prefix_observation(
             observation, frontend_port, backend_port, error, profile))
         return false;
@@ -19339,13 +19617,18 @@ static bool validate_max_proxy_prefix_pair(
                                     observations[0], ports[0], ports[1], false, error, profile) &&
                                     validate_exact_max_proxy_prefix_observation(
                                         observations[1], ports[2], ports[3], true, error, profile)
-                              : validate_max_proxy_prefix_observation(
-                                    observations[0], ports[0], ports[1], error, profile) &&
-                                    validate_max_proxy_prefix_observation(
-                                        observations[1], ports[2], ports[3], error, profile);
+        : profile.strict_wildcard_boundary
+            ? validate_wildcard_max_proxy_prefix_observation(
+                  observations[0], ports[0], ports[1], false, error, profile) &&
+                  validate_wildcard_max_proxy_prefix_observation(
+                      observations[1], ports[2], ports[3], true, error, profile)
+            : validate_max_proxy_prefix_observation(
+                  observations[0], ports[0], ports[1], error, profile) &&
+                  validate_max_proxy_prefix_observation(
+                      observations[1], ports[2], ports[3], error, profile);
     if (observations[0].side != "pinned-nginx" ||
         observations[1].side != "converter-generated-rut" || !observations_valid ||
-        (exact_address_profile &&
+        ((exact_address_profile || profile.strict_wildcard_boundary) &&
          generated_source.size() != max_proxy_expected_source_size(ports[2], ports[3], profile)) ||
         !validate_max_proxy_prefix_generated_source(generated_source,
                                                     ports[2],
@@ -19713,9 +19996,11 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     return true;
 }
 
-static bool run_converter_max_proxy_prefix_differential(const std::string& container_prefix,
-                                                        const char* rut_path,
-                                                        std::string& error) {
+static bool run_converter_max_proxy_prefix_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    std::string& error,
+    const MaxProxyPrefixProfile& profile = kMaxProxyPrefixRootProfile) {
     struct Reservations {
         int fds[4];
         Reservations() { std::fill(std::begin(fds), std::end(fds), -1); }
@@ -19745,14 +20030,15 @@ static bool run_converter_max_proxy_prefix_differential(const std::string& conta
     u16 ports[4]{};
     for (size_t i = 0u; i < 4u; i++) {
         if (!reservations.reserve(i, ports[i])) {
-            error = "#335 could not simultaneously bind-reserve four ports";
+            error =
+                std::string(profile.issue) + " could not simultaneously bind-reserve four ports";
             return false;
         }
     }
     for (size_t i = 0u; i < 4u; i++) {
         for (size_t j = i + 1u; j < 4u; j++) {
             if (ports[i] == ports[j]) {
-                error = "#335 reserved duplicate ports";
+                error = std::string(profile.issue) + " reserved duplicate ports";
                 return false;
             }
         }
@@ -19761,7 +20047,8 @@ static bool run_converter_max_proxy_prefix_differential(const std::string& conta
     if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
         temps[0].nginx_config == temps[1].source || temps[0].nginx_log == temps[1].rut_log ||
         temps[0].nginx_access_log == temps[1].rut_access_log) {
-        error = "#335 could not create isolated pinned/generated resource trees";
+        error = std::string(profile.issue) +
+                " could not create isolated pinned/generated resource trees";
         return false;
     }
     MaxProxyPrefixObservation observations[2];
@@ -19779,7 +20066,10 @@ static bool run_converter_max_proxy_prefix_differential(const std::string& conta
                                        generated_source,
                                        error,
                                        &reservations.fds[0],
-                                       &reservations.fds[1]) ||
+                                       &reservations.fds[1],
+                                       false,
+                                       nullptr,
+                                       profile) ||
         !capture_max_proxy_prefix_side(ports[2],
                                        ports[3],
                                        temps[1],
@@ -19790,9 +20080,18 @@ static bool run_converter_max_proxy_prefix_differential(const std::string& conta
                                        generated_source,
                                        error,
                                        &reservations.fds[2],
-                                       &reservations.fds[3]))
+                                       &reservations.fds[3],
+                                       false,
+                                       nullptr,
+                                       profile))
         return false;
-    return validate_max_proxy_prefix_pair(observations, generated_source, ports, error);
+    for (const int fd : reservations.fds)
+        if (fd >= 0) {
+            error = std::string(profile.issue) + " P63 captures did not consume all four handoffs";
+            return false;
+        }
+    return validate_max_proxy_prefix_pair(
+        observations, generated_source, ports, error, false, profile);
 }
 
 static const std::string& max_proxy_replacement() {
@@ -40311,6 +40610,321 @@ static bool run_converter_exact_max_proxy_prefix_differential(
         observations, generated_source, ports, error, true, profile);
 }
 
+static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {57360u, 57361u, 57362u, 57363u};
+    const auto make_fragment = [](const std::string& endpoint,
+                                  const std::string& path,
+                                  const std::string& address,
+                                  u16 backend_port,
+                                  bool listen_first) {
+        const std::string listener = "  listen " + endpoint + ";\n";
+        const std::string location = "  location " + path + " {\n    proxy_pass http://" + address +
+                                     ":" + std::to_string(backend_port) + ";\n  }\n";
+        return "server {\n" + (listen_first ? listener + location : location + listener) + "}\n";
+    };
+    const std::string& prefix = max_proxy_prefix();
+    const std::string route = max_proxy_route_key();
+    std::string canonical;
+    for (const std::string& endpoint : {std::to_string(kPorts[2]),
+                                        "0.0.0.0:" + std::to_string(kPorts[2]),
+                                        "*:" + std::to_string(kPorts[2])}) {
+        for (const bool listen_first : {true, false}) {
+            std::string fragment =
+                make_fragment(endpoint, prefix, "127.0.0.1", kPorts[3], listen_first);
+            const auto parsed =
+                rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+            if (!parsed) {
+                error = "#357 one supported wildcard spelling/order did not parse at P63";
+                return false;
+            }
+            const auto& server = parsed.value();
+            const auto& proxy = server.location.proxy_pass;
+            const size_t endpoint_offset = fragment.find(endpoint);
+            const size_t path_offset = fragment.find(prefix);
+            const size_t proxy_offset = fragment.find("proxy_pass http://127.0.0.1:");
+            const size_t server_close = fragment.rfind('}');
+            const uintptr_t base = reinterpret_cast<uintptr_t>(fragment.data());
+            const auto borrowed = [&](rut::Str value, rut::Span span) {
+                return value.ptr != nullptr && span.end >= span.start &&
+                       span.end - span.start == value.len &&
+                       reinterpret_cast<uintptr_t>(value.ptr) - span.start == base;
+            };
+            if (endpoint_offset == std::string::npos || path_offset == std::string::npos ||
+                proxy_offset == std::string::npos || server_close == std::string::npos ||
+                server.span.start != 0u || server.span.end != server_close + 1u ||
+                server.listen.address != rut::ListenerAddress::IPv4Wildcard ||
+                server.listen.ipv4_host != 0u || server.listen.port != kPorts[2] ||
+                !server.listen.value.eq({endpoint.data(), static_cast<u32>(endpoint.size())}) ||
+                !borrowed(server.listen.value, server.listen.value_span) ||
+                server.listen.value_span.start != endpoint_offset ||
+                !server.location.path.eq({prefix.data(), static_cast<u32>(prefix.size())}) ||
+                !borrowed(server.location.path, server.location.path_span) ||
+                server.location.path_span.start != path_offset ||
+                proxy.span.start != proxy_offset ||
+                proxy.span.end != fragment.find(';', proxy_offset) + 1u || proxy.has_uri ||
+                proxy.uri.ptr != nullptr || proxy.uri.len != 0u || proxy.uri_span.start != 0u ||
+                proxy.uri_span.end != 0u || proxy.uri_span.line != 1u || proxy.uri_span.col != 1u ||
+                proxy.port != kPorts[3] || proxy.address[0] != 127u || proxy.address[1] != 0u ||
+                proxy.address[2] != 0u || proxy.address[3] != 1u) {
+                error = "#357 P63 spelling/order lost complete endpoint/path/proxy provenance";
+                return false;
+            }
+            const auto lowered = rut::nginx::lower_to_rut(server);
+            if (!lowered ||
+                lowered.value().len !=
+                    max_proxy_expected_source_size(
+                        kPorts[2], kPorts[3], kWildcardMaxProxyPrefixNoUriProfile) ||
+                lowered.value().data[lowered.value().len] != '\0') {
+                error = "#357 P63 spelling/order lost the canonical wildcard output size/NUL";
+                return false;
+            }
+            const std::string generated(lowered.value().data, lowered.value().len);
+            if (!validate_max_proxy_prefix_generated_source(generated,
+                                                            kPorts[2],
+                                                            "127.0.0.1",
+                                                            kPorts[3],
+                                                            error,
+                                                            false,
+                                                            kWildcardMaxProxyPrefixNoUriProfile))
+                return false;
+            if (canonical.empty())
+                canonical = generated;
+            else if (generated != canonical) {
+                error = "#357 wildcard spelling/order changed canonical ordinary-RUT bytes";
+                return false;
+            }
+        }
+    }
+    std::string baseline_fragment = make_fragment("8080", prefix, "127.0.0.1", 9000u, true);
+    const auto baseline_parsed =
+        rut::nginx::parse({baseline_fragment.data(), static_cast<u32>(baseline_fragment.size())});
+    if (!baseline_parsed) {
+        error = "#357 genuine 8080/9000 P63 wildcard baseline did not parse";
+        return false;
+    }
+    const auto baseline_lowered = rut::nginx::lower_to_rut(baseline_parsed.value());
+    std::string canonicalized_runtime = canonical;
+    if (!baseline_lowered || baseline_lowered.value().len != 3409u || canonical.size() != 3411u ||
+        max_proxy_expected_source_size(8080u, 9000u, kWildcardMaxProxyPrefixNoUriProfile) !=
+            3409u ||
+        !canonicalize_unique_port(
+            canonicalized_runtime, "listen :" + std::to_string(kPorts[2]), "listen :8080") ||
+        !canonicalize_unique_port(
+            canonicalized_runtime, "127.0.0.1:" + std::to_string(kPorts[3]), "127.0.0.1:9000") ||
+        canonicalized_runtime !=
+            std::string(baseline_lowered.value().data, baseline_lowered.value().len)) {
+        error = "#357 P63 wildcard canonical size formula lost the 3409-byte baseline";
+        return false;
+    }
+
+    std::string maximum_fragment = make_fragment("65535", prefix, "255.255.255.255", 65535u, true);
+    const auto maximum_parsed =
+        rut::nginx::parse({maximum_fragment.data(), static_cast<u32>(maximum_fragment.size())});
+    if (!maximum_parsed) {
+        error = "#357 genuine maximum wildcard endpoint fragment did not parse";
+        return false;
+    }
+    const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
+    if (!maximum_lowered || maximum_lowered.value().len != 3417u ||
+        rut::nginx::RutSource::kCapacity != 5946u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 2529u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 2528u ||
+        maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
+        !validate_max_proxy_prefix_generated_source(
+            std::string(maximum_lowered.value().data, maximum_lowered.value().len),
+            65535u,
+            "255.255.255.255",
+            65535u,
+            error,
+            false,
+            kWildcardMaxProxyPrefixNoUriProfile)) {
+        if (error.empty())
+            error = "#357 genuine maximum wildcard endpoints lost 3417/5946/2529/2528 evidence";
+        return false;
+    }
+
+    MaxProxyPrefixObservation values[2] = {
+        make_max_proxy_prefix_self_check(
+            kPorts[0], kPorts[1], false, kWildcardMaxProxyPrefixNoUriProfile),
+        make_max_proxy_prefix_self_check(
+            kPorts[2], kPorts[3], true, kWildcardMaxProxyPrefixNoUriProfile)};
+    const auto mark_boundary = [](MaxProxyPrefixObservation& value, bool generated) {
+        value.public_load_proven = generated;
+        value.source_ownership_proven = true;
+        value.clean_lifecycle = true;
+        std::fill(std::begin(value.eof_proven), std::end(value.eof_proven), true);
+    };
+    mark_boundary(values[0], false);
+    mark_boundary(values[1], true);
+    if (!validate_max_proxy_prefix_pair(
+            values, canonical, kPorts, error, false, kWildcardMaxProxyPrefixNoUriProfile))
+        return false;
+    const auto rejects_observation = [&](const char* label,
+                                         const MaxProxyPrefixObservation& candidate) {
+        std::string detail;
+        if (!validate_wildcard_max_proxy_prefix_observation(
+                candidate, kPorts[2], kPorts[3], true, detail, kWildcardMaxProxyPrefixNoUriProfile))
+            return true;
+        error = std::string("#357 wildcard P63 observation accepted mutation: ") + label;
+        return false;
+    };
+    auto changed = values[1];
+    changed.public_load_proven = false;
+    if (!rejects_observation("public ownership", changed)) return false;
+    changed = values[1];
+    changed.source_ownership_proven = false;
+    if (!rejects_observation("source ownership", changed)) return false;
+    changed = values[1];
+    changed.clean_lifecycle = false;
+    if (!rejects_observation("lifecycle", changed)) return false;
+    changed = values[1];
+    changed.eof_proven[4] = false;
+    if (!rejects_observation("EOF", changed)) return false;
+    changed = values[1];
+    std::swap(changed.wires[2], changed.wires[3]);
+    if (!rejects_observation("ordered observation", changed)) return false;
+    MaxProxyPrefixObservation pair_changed[2] = {values[0], values[1]};
+    pair_changed[1].access_path = pair_changed[0].access_path;
+    std::string detail;
+    if (validate_max_proxy_prefix_pair(
+            pair_changed, canonical, kPorts, detail, false, kWildcardMaxProxyPrefixNoUriProfile)) {
+        error = "#357 wildcard P63 pair accepted shared access ownership";
+        return false;
+    }
+    u16 duplicate_ports[4] = {kPorts[0], kPorts[1], kPorts[2], kPorts[0]};
+    if (validate_max_proxy_prefix_pair(values,
+                                       canonical,
+                                       duplicate_ports,
+                                       detail,
+                                       false,
+                                       kWildcardMaxProxyPrefixNoUriProfile)) {
+        error = "#357 wildcard P63 pair accepted a duplicate held port";
+        return false;
+    }
+
+    std::string nginx_access;
+    std::string rut_access;
+    for (size_t i = 0u; i < 5u; i++) {
+        const bool forward = i < 3u;
+        nginx_access += "scope raw=\"GET " + values[0].targets[i] +
+                        " HTTP/1.1\" status=" + (forward ? "200" : "301") +
+                        " request_size=" + std::to_string(values[0].request_sizes[i]) +
+                        " response_size=" + std::to_string(values[0].wires[i].size()) +
+                        " host=\"client.example\" upstream_addr=\"" +
+                        (forward ? "127.0.0.1:" + std::to_string(kPorts[1]) : "-") +
+                        "\" upstream_status=" + (forward ? "200" : "-") + "\n";
+        rut_access += "2026-08-26T21:13:05.248Z GET " + values[1].targets[i] + " " +
+                      (forward ? "200" : "301") + " 361us " +
+                      std::to_string(values[1].request_sizes[i]) + " " +
+                      std::to_string(values[1].wires[i].size()) + " 127.0.0.1" +
+                      (forward ? " nginx_upstream 243us s=0\n" : " s=0\n");
+    }
+    MaxProxyPrefixObservation access_observation = values[1];
+    const size_t first_record = rut_access.find('\n');
+    const size_t second_record = rut_access.find('\n', first_record + 1u);
+    std::string reordered_access = rut_access;
+    reordered_access.replace(0u,
+                             second_record + 1u,
+                             rut_access.substr(first_record + 1u, second_record - first_record) +
+                                 rut_access.substr(0u, first_record + 1u));
+    if (!parse_max_proxy_prefix_nginx_access(nginx_access,
+                                             "scope",
+                                             values[0],
+                                             kPorts[1],
+                                             detail,
+                                             kWildcardMaxProxyPrefixNoUriProfile) ||
+        !parse_max_proxy_prefix_rut_access(
+            rut_access, access_observation, detail, kWildcardMaxProxyPrefixNoUriProfile) ||
+        parse_max_proxy_prefix_nginx_access(
+            nginx_access + nginx_access.substr(0u, nginx_access.find('\n') + 1u),
+            "scope",
+            values[0],
+            kPorts[1],
+            detail,
+            kWildcardMaxProxyPrefixNoUriProfile) ||
+        parse_max_proxy_prefix_rut_access(
+            reordered_access, access_observation, detail, kWildcardMaxProxyPrefixNoUriProfile)) {
+        error = "#357 wildcard P63 access mutation self-check failed";
+        return false;
+    }
+
+    const auto replace_unique =
+        [](std::string value, const std::string& before, const std::string& after) {
+            const size_t offset = value.find(before);
+            if (before.empty() || before == after || offset == std::string::npos ||
+                value.find(before, offset + before.size()) != std::string::npos)
+                return std::string{};
+            value.replace(offset, before.size(), after);
+            return value;
+        };
+    for (const std::string& mutation :
+         {replace_unique(canonical,
+                         "listen :" + std::to_string(kPorts[2]),
+                         "listen 127.0.0.1:" + std::to_string(kPorts[2])),
+          replace_unique(canonical,
+                         "route \"" + route + "\" {",
+                         "route \"" + route.substr(0u, route.size() - 1u) + "S\" {"),
+          replace_unique(
+              canonical, "target_path: \"" + prefix + "\"", "target_path: \"" + route + "\""),
+          replace_unique(canonical,
+                         "return forward(nginx_upstream, request_policy: {",
+                         "return forward(nginx_upstream, target_transform: { strip_prefix: \"" +
+                             prefix + "\", replace_prefix: \"/\" }, request_policy: {"),
+          canonical + "// nginx_compat workaround marker\n"}) {
+        std::string detail;
+        if (mutation.empty() || mutation == canonical ||
+            validate_max_proxy_prefix_generated_source(mutation,
+                                                       kPorts[2],
+                                                       "127.0.0.1",
+                                                       kPorts[3],
+                                                       detail,
+                                                       false,
+                                                       kWildcardMaxProxyPrefixNoUriProfile)) {
+            error = "#357 wildcard P63 source validator accepted a direct mutation";
+            return false;
+        }
+    }
+    for (const char* marker : {"nginx.conf",
+                               "nginx::",
+                               "set_path",
+                               "ReqSetTargetTransform",
+                               "bind_address",
+                               "local_address",
+                               "req.listener",
+                               "address_condition"}) {
+        const std::string mutation = canonical + "// " + marker + " marker\n";
+        std::string detail;
+        if (validate_max_proxy_prefix_generated_source(mutation,
+                                                       kPorts[2],
+                                                       "127.0.0.1",
+                                                       kPorts[3],
+                                                       detail,
+                                                       false,
+                                                       kWildcardMaxProxyPrefixNoUriProfile)) {
+            error = std::string("#357 wildcard P63 source accepted forbidden hook: ") + marker;
+            return false;
+        }
+    }
+
+    const std::string p64 = prefix.substr(0u, prefix.size() - 1u) + "x/";
+    std::string p64_fragment =
+        make_fragment(std::to_string(kPorts[2]), p64, "127.0.0.1", kPorts[3], true);
+    const size_t p64_offset = p64_fragment.find(p64);
+    const auto p64_parsed =
+        rut::nginx::parse({p64_fragment.data(), static_cast<u32>(p64_fragment.size())});
+    if (p64.size() != 64u || p64_offset == std::string::npos || p64_parsed ||
+        p64_parsed.error().code != rut::FrontendError::UnsupportedSyntax ||
+        !p64_parsed.error().detail.eq(
+            rut::lit_str("location path is outside the bounded clean proxy profile")) ||
+        p64_parsed.error().span.start != p64_offset ||
+        p64_parsed.error().span.end != p64_offset + p64.size() ||
+        p64_parsed.error().span.line != 3u || p64_parsed.error().span.col != 12u) {
+        error = "#357 converter frontend did not fail closed at P64 with the bounded-path span";
+        return false;
+    }
+    return true;
+}
+
 static u32 wildcard_listen_source_declarations(const std::string& source, const char* keyword) {
     const std::string prefix = std::string(keyword) + " ";
     return (source.rfind(prefix, 0u) == 0u ? 1u : 0u) + count_text(source, "\n" + prefix);
@@ -44060,6 +44674,8 @@ int main(int argc, char** argv) {
     const bool converter_exact_loopback_max_no_uri_prefix_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-max-no-uri-prefix-differential") == 0;
+    const bool converter_wildcard_max_no_uri_prefix_differential =
+        argc == 3 && strcmp(argv[1], "--converter-wildcard-max-no-uri-prefix-differential") == 0;
     const bool bounded_exact_local_path_oracle =
         argc == 2 && strcmp(argv[1], "--bounded-exact-local-path-oracle") == 0;
     const bool bounded_no_content_path_oracle =
@@ -44178,12 +44794,12 @@ int main(int argc, char** argv) {
          !converter_exact_loopback_service_no_uri_differential &&
          !converter_exact_loopback_max_proxy_prefix_differential &&
          !converter_exact_loopback_max_no_uri_prefix_differential &&
-         !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
-         !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
-         !max_boundary_no_content_oracle && !bodyful_normalized_exact_oracle &&
-         !exact_local_body_space_oracle && !exact_local_body_multiple_space_oracle &&
-         !exact_local_return204_oracle && !exact_local_return204_query_oracle &&
-         !converter_exact_local_body_space_differential &&
+         !converter_wildcard_max_no_uri_prefix_differential && !bounded_exact_local_path_oracle &&
+         !bounded_no_content_path_oracle && !normalized_exact_trailing_slash_oracle &&
+         !trailing_slash_no_content_oracle && !max_boundary_no_content_oracle &&
+         !bodyful_normalized_exact_oracle && !exact_local_body_space_oracle &&
+         !exact_local_body_multiple_space_oracle && !exact_local_return204_oracle &&
+         !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
          !converter_exact_local_return204_query_differential &&
@@ -44232,6 +44848,7 @@ int main(int argc, char** argv) {
         (converter_exact_loopback_service_no_uri_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_max_no_uri_prefix_differential && argv[2][0] != '/') ||
+        (converter_wildcard_max_no_uri_prefix_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_max_proxy_replacement_differential && argv[2][0] != '/') ||
@@ -44339,6 +44956,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-max-no-uri-prefix-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-wildcard-max-no-uri-prefix-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
                      "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
@@ -44551,7 +45171,8 @@ int main(int argc, char** argv) {
     }
     if (converter_max_proxy_prefix_differential ||
         converter_exact_loopback_max_proxy_prefix_differential ||
-        converter_exact_loopback_max_no_uri_prefix_differential) {
+        converter_exact_loopback_max_no_uri_prefix_differential ||
+        converter_wildcard_max_no_uri_prefix_differential) {
         std::string parser_error;
         if (!run_max_proxy_prefix_self_checks(parser_error)) {
             std::cerr << "FAIL [#335 source/access/observation/pair self-check]: " << parser_error
@@ -44568,6 +45189,12 @@ int main(int argc, char** argv) {
             !run_exact_max_proxy_prefix_self_checks(parser_error, kMaxProxyPrefixNoUriProfile)) {
             std::cerr << "FAIL [#356 exact-listener P63 no-URI boundary self-check]: "
                       << parser_error << "\n";
+            return 1;
+        }
+        if (converter_wildcard_max_no_uri_prefix_differential &&
+            !run_wildcard_max_no_uri_prefix_self_checks(parser_error)) {
+            std::cerr << "FAIL [#357 wildcard P63 no-URI boundary self-check]: " << parser_error
+                      << "\n";
             return 1;
         }
     }
@@ -44807,6 +45434,7 @@ int main(int argc, char** argv) {
         converter_max_proxy_prefix_differential ||
         converter_exact_loopback_max_proxy_prefix_differential ||
         converter_exact_loopback_max_no_uri_prefix_differential ||
+        converter_wildcard_max_no_uri_prefix_differential ||
         converter_max_proxy_replacement_differential ||
         converter_static_query_proxy_uri_differential ||
         converter_zero_suffix_static_query_proxy_uri_differential ||
@@ -45680,6 +46308,42 @@ int main(int argc, char** argv) {
                "#347/#352 access equivalence, broader methods/bodies/framing/reuse/retries/"
                "failures/H1.0/H2/TLS excluded; nginx.conf was translated, never loaded "
                "directly)\n";
+        return 0;
+    }
+
+    if (converter_wildcard_max_no_uri_prefix_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-357-wildcard-p63-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_max_proxy_prefix_differential(container_prefix,
+                                                         argv[2],
+                                                         differential_error,
+                                                         kWildcardMaxProxyPrefixNoUriProfile)) {
+            std::cerr << "FAIL [#357 wildcard-listener P63 no-URI behavior boundary]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #357 port-only wildcard P63 no-URI boundary composes the accepted "
+               "63-byte clean trailing-slash prefix and true URI absence. One isolated pinned "
+               "nginx 1.29.7 side and one independently parsed/provenance-validated/lowered "
+               "ordinary-RUT public CLI/O2-JIT/io_uring side used four unique simultaneously "
+               "held and causally handed-off frontend/backend ports. Both sides matched five "
+               "exact Date-normalized close/zero-tail/EOF wires: three unchanged P, P+x and "
+               "P+x?y=1 Host-rebuilt/Connection-omitted duplicate-header upstream episodes "
+               "without retry, then two query-preserving redirects with live and settled zero "
+               "upstream. Generated AST/HIR/MIR/RIR/config retained wildcard listener, route "
+               "binding, owned policies and zero transforms through source/intermediate teardown "
+               "and post-readiness source overwrite. All three wildcard nginx spellings and both "
+               "orders were preflight-proven byte-identical at P63; only port-only listen-first "
+               "behavior ran here. Maximum endpoints emit 3417 bytes with 2529 capacity delta "
+               "and 2528 payload headroom before NUL; P64 is only the declared converter "
+               "support-boundary rejection (#357 remains PARTIAL; nginx.conf was translated, "
+               "never loaded by RUT; configured URI/query, normalization-sensitive/absolute "
+               "targets, broader methods/bodies/framing/reuse/failures/H1.0/H2/TLS and "
+               "#347/#352 access equivalence excluded)\n";
         return 0;
     }
 
