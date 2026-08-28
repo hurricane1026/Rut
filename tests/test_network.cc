@@ -16940,6 +16940,169 @@ TEST(access_request_size,
     CHECK_FALSE(ring.pop(extra));
 }
 
+static u32 access_request_size_fixed_body_handler_calls = 0;
+static u64 access_request_size_fixed_body_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++access_request_size_fixed_body_handler_calls;
+    return jit::HandlerResult::make_forward_with_policies(
+               0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 0)
+        .pack();
+}
+
+TEST(access_request_size,
+     fixed_content_length_later_receive_keeps_downstream_wire_distinct_and_reuse_isolated) {
+    static constexpr char kClientHeader[] =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 4\r\n"
+        "X-Trim:\t keep \t\r\n\r\n";
+    static constexpr char kFirstBodyByte[] = "A";
+    static constexpr char kTerminalBody[] = "BCD";
+    static constexpr char kClientBody[] = "ABCD";
+    static constexpr char kUpstreamRequest[] =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: 127.0.0.1:9000\r\n"
+        "Content-Length: 4\r\n"
+        "X-Trim: keep\r\n\r\n"
+        "ABCD";
+    constexpr u32 kClientHeaderLen = sizeof(kClientHeader) - 1u;
+    constexpr u32 kFirstReceiveLen = kClientHeaderLen + sizeof(kFirstBodyByte) - 1u;
+    constexpr u32 kClientRequestLen = kClientHeaderLen + sizeof(kClientBody) - 1u;
+    constexpr u32 kTerminalBodyLen = sizeof(kTerminalBody) - 1u;
+    constexpr u32 kUpstreamRequestLen = sizeof(kUpstreamRequest) - 1u;
+    constexpr u32 kUpstreamHeaderLen = kUpstreamRequestLen - (sizeof(kClientBody) - 1u);
+    static_assert(kClientHeaderLen == 102u);
+    static_assert(kFirstReceiveLen == 103u);
+    static_assert(kClientRequestLen == 106u);
+    static_assert(kTerminalBodyLen == 3u);
+    static_assert(kUpstreamRequestLen == 84u);
+    static_assert(kUpstreamHeaderLen == 80u);
+    static_assert(kClientRequestLen != kUpstreamRequestLen);
+
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler(
+        "/upload", kRouteMethodPost, &access_request_size_fixed_body_handler, false));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClientHeader), kClientHeaderLen),
+               kClientHeaderLen);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kFirstBodyByte),
+                                    sizeof(kFirstBodyByte) - 1u),
+               sizeof(kFirstBodyByte) - 1u);
+    access_request_size_fixed_body_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, kFirstReceiveLen));
+
+    REQUIRE(conn->request_policy_body_pending);
+    CHECK_EQ(conn->req_body_remaining, kTerminalBodyLen);
+    CHECK_EQ(conn->downstream_req_size, kFirstReceiveLen);
+    CHECK_EQ(conn->req_size, kFirstReceiveLen);
+    CHECK_EQ(conn->req_header_end, kClientHeaderLen);
+    CHECK_EQ(conn->req_initial_send_len, kFirstReceiveLen);
+    CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
+    CHECK_EQ(conn->request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(conn->pending_forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(conn->on_recv, &on_request_policy_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    CHECK_FALSE(conn->req_client_keep_alive);
+    CHECK(conn->req_client_connection_close);
+    conn->keep_alive = false;
+    AccessLogEntry absent{};
+    CHECK_FALSE(ring.pop(absent));
+
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kTerminalBody), kTerminalBodyLen),
+               kTerminalBodyLen);
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, kTerminalBodyLen));
+
+    CHECK_FALSE(conn->request_policy_body_pending);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_FALSE(conn->upstream_reused);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->req_header_end, kUpstreamHeaderLen);
+    CHECK_EQ(conn->req_initial_send_len, kUpstreamRequestLen);
+    REQUIRE_EQ(conn->recv_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "Host: 127.0.0.1:9000\r\n"));
+    CHECK_FALSE(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "Host: client.example\r\n"));
+    CHECK_FALSE(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "Connection:"));
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "Content-Length: 4\r\n"));
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "X-Trim: keep\r\n"));
+    CHECK_FALSE(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "X-Trim:\t keep \t\r\n"));
+    CHECK_EQ(
+        __builtin_memcmp(conn->recv_buf.data() + kUpstreamRequestLen - sizeof(kClientBody) + 1u,
+                         kClientBody,
+                         sizeof(kClientBody) - 1u),
+        0);
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    const MockOp* upstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(upstream_send != nullptr);
+    CHECK_EQ(upstream_send->fd, conn->upstream_fd);
+    CHECK_EQ(upstream_send->send_len, kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(upstream_send->send_buf, kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
+    CHECK_FALSE(ring.pop(absent));
+
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+    inject_upstream_response(loop, *conn);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    const u32 response_len = conn->send_buf.len();
+    REQUIRE_GT(response_len, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+    CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
+    const u32 completed_id = conn->id;
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, response_len));
+
+    AccessLogEntry access{};
+    REQUIRE(ring.pop(access));
+    CHECK_EQ(access.req_size, kClientRequestLen);
+    CHECK_NE(access.req_size, kUpstreamRequestLen);
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(std::string(access.path, access.target_length), "/upload");
+    CHECK_EQ(std::string(access.upstream), "backend");
+    CHECK_FALSE(ring.pop(absent));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+    CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, completed_id);
+    CHECK_EQ(reused->downstream_req_size, 0u);
+    CHECK_EQ(reused->req_size, 0u);
+    loop.close_conn(*reused);
+    loop.config_ptr = nullptr;
+}
+
 TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_isolated) {
     SmallLoop loop;
     loop.setup();
