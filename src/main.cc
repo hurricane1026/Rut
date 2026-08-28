@@ -1,4 +1,5 @@
 #include "rut/common/shard_limits.h"
+#include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/listener.h"
@@ -379,8 +380,12 @@ int main(int argc, char** argv) {
     const char* config_path = nullptr;
     ListenerSpec source_listener{};
     bool source_listener_present = false;
+    AccessLogSinkSpec source_access_log{};
     const char* access_log_path = nullptr;
+    bool cli_access_log_path_present = false;
     bool access_log_compress = false;
+    bool cli_access_log_compress_present = false;
+    bool environment_access_log_compress_present = false;
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
     // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
     bool offer_h2 = false;
@@ -388,6 +393,7 @@ int main(int argc, char** argv) {
     // listener. Opt-in (internal metrics shouldn't be public by default).
     bool serve_metrics = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
+    bool cli_access_log_level_present = false;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
@@ -446,6 +452,7 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 access_log_path = argv[i];
+                cli_access_log_path_present = true;
             } else if (str_eq(argv[i], "--tls-cert")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--tls-cert requires a path argument\n");
@@ -467,6 +474,7 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 access_log_level = 0;
+                cli_access_log_level_present = true;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
             } else if (str_eq(argv[i], "--opt")) {
@@ -485,7 +493,10 @@ int main(int argc, char** argv) {
             }
         }
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
-        if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
+        if (str_eq(argv[i], "--access-log-compress")) {
+            access_log_compress = true;
+            cli_access_log_compress_present = true;
+        }
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
@@ -509,6 +520,7 @@ int main(int argc, char** argv) {
         for (char** e = environ; *e; e++) {
             if (str_eq(*e, kEnv)) {
                 access_log_compress = true;
+                environment_access_log_compress_present = true;
                 break;
             }
         }
@@ -575,6 +587,7 @@ int main(int argc, char** argv) {
         route_config = &program.config;
         source_listener_present = program.has_listener;
         if (source_listener_present) source_listener = program.listener;
+        source_access_log = program.access_log;
         write_str("Loaded program: ");
         write_str(config_path);
         write_str(" (opt O");
@@ -593,6 +606,91 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
+
+    AccessLogStartupInputs access_log_inputs{};
+    access_log_inputs.source = source_access_log;
+    access_log_inputs.cli_path_present = cli_access_log_path_present;
+    access_log_inputs.cli_path = access_log_path;
+    access_log_inputs.cli_compression_present = cli_access_log_compress_present;
+    access_log_inputs.cli_compression = access_log_compress;
+    access_log_inputs.cli_level_present = cli_access_log_level_present;
+    access_log_inputs.cli_level = access_log_level;
+    access_log_inputs.environment_compression_present = environment_access_log_compress_present;
+    auto resolved_access_log = resolve_access_log_startup(access_log_inputs);
+    if (!resolved_access_log) {
+        switch (resolved_access_log.error()) {
+            case AccessLogStartupResolutionError::InvalidSourceSpec:
+                write_str("Invalid source accessLog metadata\n");
+                break;
+            case AccessLogStartupResolutionError::InvalidCliPath:
+                write_str("Invalid --access-log path metadata\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliPath:
+                write_str("Conflicting source accessLog and --access-log\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliCompression:
+                write_str("Conflicting source accessLog and --access-log-compress\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliLevel:
+                write_str("Conflicting source accessLog and --access-log-level\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingEnvironmentCompression:
+                write_str("Conflicting source accessLog and RUE_ACCESS_LOG_COMPRESS=1\n");
+                break;
+        }
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+
+    if (resolved_access_log->mode == AccessLogStartupMode::SourceLive) {
+        auto source_fd = open_source_access_log(resolved_access_log->source_live);
+        if (!source_fd) {
+            write_str("Failed to open source accessLog: ");
+            write_str(resolved_access_log->source_live.path);
+            switch (source_fd.error().kind) {
+                case SourceAccessLogOpenErrorKind::InvalidSpec:
+                    write_str(" (invalid metadata)");
+                    break;
+                case SourceAccessLogOpenErrorKind::OpenFailed:
+                    write_str(" (open failed, errno=");
+                    write_u32(static_cast<u32>(source_fd.error().system_error));
+                    write_str(")");
+                    break;
+                case SourceAccessLogOpenErrorKind::StatFailed:
+                    write_str(" (fstat failed, errno=");
+                    write_u32(static_cast<u32>(source_fd.error().system_error));
+                    write_str(")");
+                    break;
+                case SourceAccessLogOpenErrorKind::NotRegularFile:
+                    write_str(" (target is not a regular file)");
+                    break;
+            }
+            write_str("\n");
+#ifdef RUT_ENABLE_JIT
+            program.destroy();
+#endif
+            destroy_tls_server_context(tls_server);
+            return 1;
+        }
+        source_fd->reset();
+        write_str("source accessLog requires reliable live publication support\n");
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+
+    access_log_path = resolved_access_log->mode == AccessLogStartupMode::LegacyCli
+                          ? resolved_access_log->legacy_path
+                          : nullptr;
+    if (resolved_access_log->mode == AccessLogStartupMode::LegacyCli) {
+        access_log_compress = resolved_access_log->legacy_compression;
+        access_log_level = resolved_access_log->legacy_level;
+    }
 
     const ListenerTransport cli_transport =
         tls_server != nullptr ? ListenerTransport::Tls : ListenerTransport::Cleartext;

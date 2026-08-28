@@ -323,6 +323,25 @@ target_include_directories(test_access_log PRIVATE
 add_test(NAME test_access_log COMMAND test_access_log)
 set_tests_properties(test_access_log PROPERTIES LABELS "unit")
 
+add_executable(test_access_log_startup test_access_log_startup.cc)
+target_link_libraries(test_access_log_startup rut_runtime)
+target_include_directories(test_access_log_startup PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+target_compile_definitions(test_access_log_startup PRIVATE
+    RUT_ACCESS_LOG_STARTUP_PROCESS_TEST=1
+    RUT_SERVER_BINARY="$<TARGET_FILE:rut>"
+)
+add_dependencies(test_access_log_startup rut)
+if(RUT_ENABLE_JIT)
+    target_compile_definitions(test_access_log_startup PRIVATE
+        RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST=1
+    )
+endif()
+add_test(NAME test_access_log_startup COMMAND test_access_log_startup)
+set_tests_properties(test_access_log_startup PROPERTIES LABELS "unit;runtime" TIMEOUT 30)
+
 add_executable(test_metrics test_metrics.cc)
 target_link_libraries(test_metrics rut_runtime)
 target_include_directories(test_metrics PRIVATE
