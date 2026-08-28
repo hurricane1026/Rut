@@ -33,7 +33,9 @@ inline constexpr u32 kAccessLogCompleteTargetMax = 128;
 inline constexpr u32 kAccessLogLegacyTargetWidth = 64;
 inline constexpr u32 kAccessLogObservedStrictH1TargetMax = 16367;
 inline constexpr u32 kAccessLogTextLineCapacity = 512;
+inline constexpr u32 kAccessLogDownstreamRequestBytesLineCapacity = 11;
 static_assert(kAccessLogObservedStrictH1TargetMax <= static_cast<u32>(~u16{0}));
+static_assert(kAccessLogDownstreamRequestBytesLineCapacity == sizeof("4294967295\n") - 1u);
 
 enum class AccessLogTargetState : u8 {
     LegacyNullTerminated = 0,
@@ -161,6 +163,13 @@ static_assert(sizeof(AccessLogRing) == 98432, "AccessLogRing layout must remain 
 // shard\n". Formatting is transactional: a null or undersized output returns zero without
 // modifying caller storage. kAccessLogTextLineCapacity bounds every valid entry line.
 u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size);
+
+// Format only the downstream request byte count as unsigned decimal followed by '\n'.
+// Returns bytes written without a trailing NUL. Formatting is transactional: a null or
+// undersized output returns zero without modifying caller storage.
+u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
+                                                    char* buf,
+                                                    u32 buf_size);
 
 // Background flusher — reads from all shard rings, writes text entries to fd.
 // Optionally compresses output with zstd streaming compression.

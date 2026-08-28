@@ -250,6 +250,17 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     return w;
 }
 
+u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
+                                                    char* buf,
+                                                    u32 buf_size) {
+    char line[kAccessLogDownstreamRequestBytesLineCapacity];
+    u32 w = write_u64_dec(line, entry.req_size);
+    line[w++] = '\n';
+    if (buf == nullptr || buf_size < w) return 0;
+    for (u32 i = 0; i < w; i++) buf[i] = line[i];
+    return w;
+}
+
 // --- write_with_poll ---
 
 // Write all bytes to fd, using poll() to wait for writability.

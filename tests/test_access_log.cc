@@ -458,6 +458,78 @@ TEST(format, transactional_null_small_and_exact_size) {
         CHECK_EQ(static_cast<unsigned char>(exact[i]), 0x6Bu);
 }
 
+TEST(format_downstream_request_bytes_line, exact_boundaries_and_transactional_capacity) {
+    struct Vector {
+        u32 req_size;
+        const char* expected;
+        u32 expected_size;
+    };
+    constexpr Vector kVectors[] = {
+        {0u, "0\n", 2u},
+        {102u, "102\n", 4u},
+        {UINT32_MAX, "4294967295\n", kAccessLogDownstreamRequestBytesLineCapacity},
+    };
+
+    for (const Vector& vector : kVectors) {
+        AccessLogEntry entry{};
+        entry.req_size = vector.req_size;
+
+        char full[kAccessLogDownstreamRequestBytesLineCapacity + 3u];
+        memset(full, 0x5A, sizeof(full));
+        const u32 size = format_access_log_downstream_request_bytes_line(entry, full, sizeof(full));
+        CHECK_EQ(size, vector.expected_size);
+        CHECK(memcmp(full, vector.expected, size) == 0);
+        for (u32 i = size; i < sizeof(full); i++)
+            CHECK_EQ(static_cast<unsigned char>(full[i]), 0x5Au);
+
+        char exact[kAccessLogDownstreamRequestBytesLineCapacity];
+        memset(exact, 0x6B, sizeof(exact));
+        CHECK_EQ(format_access_log_downstream_request_bytes_line(entry, exact, size), size);
+        CHECK(memcmp(exact, vector.expected, size) == 0);
+        for (u32 i = size; i < sizeof(exact); i++)
+            CHECK_EQ(static_cast<unsigned char>(exact[i]), 0x6Bu);
+
+        char too_small[kAccessLogDownstreamRequestBytesLineCapacity];
+        memset(too_small, 0x7C, sizeof(too_small));
+        CHECK_EQ(format_access_log_downstream_request_bytes_line(entry, too_small, size - 1u), 0u);
+        for (char byte : too_small) CHECK_EQ(static_cast<unsigned char>(byte), 0x7Cu);
+
+        CHECK_EQ(format_access_log_downstream_request_bytes_line(entry, nullptr, size), 0u);
+    }
+}
+
+TEST(format_downstream_request_bytes_line, depends_only_on_downstream_request_size) {
+    AccessLogEntry base{};
+    base.req_size = 102u;
+
+    AccessLogEntry mutated = base;
+    mutated.timestamp_us = UINT64_MAX;
+    mutated.duration_us = UINT32_MAX;
+    mutated.resp_size = 66u;
+    mutated.upstream_us = UINT32_MAX - 1u;
+    mutated.addr = 0x01020304u;
+    mutated.status = 599u;
+    mutated.method = static_cast<u8>(LogHttpMethod::Trace);
+    mutated.shard_id = UINT8_MAX;
+    memset(mutated.path, 'p', sizeof(mutated.path));
+    memset(mutated.upstream, 'u', sizeof(mutated.upstream));
+    mutated.target_length = 129u;
+    mutated.target_state = AccessLogTargetState::OverLimit;
+    memset(mutated._pad, 0xA5, sizeof(mutated._pad));
+
+    char base_line[kAccessLogDownstreamRequestBytesLineCapacity];
+    char mutated_line[kAccessLogDownstreamRequestBytesLineCapacity];
+    const u32 base_size =
+        format_access_log_downstream_request_bytes_line(base, base_line, sizeof(base_line));
+    const u32 mutated_size = format_access_log_downstream_request_bytes_line(
+        mutated, mutated_line, sizeof(mutated_line));
+    CHECK_EQ(base_size, 4u);
+    CHECK_EQ(mutated_size, base_size);
+    CHECK(memcmp(base_line, "102\n", base_size) == 0);
+    CHECK(memcmp(mutated_line, base_line, base_size) == 0);
+    CHECK_NE(mutated.req_size, mutated.resp_size);
+}
+
 TEST(format, worst_case_valid_line_fits_public_flusher_capacity) {
     AccessLogEntry entry =
         make_explicit_entry(AccessLogTargetState::Complete, kAccessLogCompleteTargetMax, 't');
