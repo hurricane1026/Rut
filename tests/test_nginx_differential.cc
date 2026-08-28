@@ -9,6 +9,7 @@
 #include "rut/serve_loader.h"
 #include "rut_iouring_gate.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -341,6 +342,15 @@ static constexpr char kRequestLengthFixedBodyClientHeader[] =
     "X-Test: keep\r\n"
     "\r\n";
 static constexpr char kRequestLengthFixedBody[] = "hello-body12";
+static constexpr char kRequestLengthFixedBodyFirstSend[] =
+    "POST /ledger?q=raw HTTP/1.1\r\n"
+    "Host: client.example.with.a.long.name\r\n"
+    "Connection: close\r\n"
+    "Content-Length: 12\r\n"
+    "X-Test: keep\r\n"
+    "\r\n"
+    "hello";
+static constexpr char kRequestLengthFixedBodySecondSend[] = "-body12";
 static constexpr char kRequestLengthFixedBodyClientRequest[] =
     "POST /ledger?q=raw HTTP/1.1\r\n"
     "Host: client.example.with.a.long.name\r\n"
@@ -374,6 +384,11 @@ static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u == 102u);
 static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u != 66u);
 static_assert(sizeof(kRequestLengthFixedBodyClientHeader) - 1u == 123u);
 static_assert(sizeof(kRequestLengthFixedBody) - 1u == 12u);
+static_assert(sizeof(kRequestLengthFixedBodyFirstSend) - 1u == 128u);
+static_assert(sizeof(kRequestLengthFixedBodySecondSend) - 1u == 7u);
+static_assert(sizeof(kRequestLengthFixedBodyFirstSend) - 1u +
+                  sizeof(kRequestLengthFixedBodySecondSend) - 1u ==
+              135u);
 static_assert(sizeof(kRequestLengthFixedBodyClientRequest) - 1u == 135u);
 static_assert(sizeof(kRequestLengthFixedBodyClientRequest) - 1u != 99u);
 static_assert(sizeof(kRequestLengthFixedBodyUpstreamP4Header) - 1u == 87u);
@@ -1226,6 +1241,37 @@ static bool read_eof(int fd, std::string& error) {
         return false;
     }
     error = "EOF timeout";
+    return false;
+}
+
+static bool observe_client_open_and_quiet_nonconsuming(int fd,
+                                                       int poll_timeout_ms,
+                                                       std::string& error) {
+    pollfd p{fd, POLLIN | POLLHUP | POLLERR, 0};
+    int ready = -1;
+    do {
+        ready = poll(&p, 1, poll_timeout_ms);
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0) {
+        error = "client quiet-window poll failed";
+        return false;
+    }
+    if (ready > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        error = "client fd reached terminal/error state during quiet window";
+        return false;
+    }
+    char byte = 0;
+    ssize_t n = -1;
+    do {
+        n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+    if (n == 0)
+        error = "client observed premature EOF during quiet window";
+    else if (n > 0)
+        error = "client observed premature response bytes during quiet window";
+    else
+        error = "client non-consuming quiet-window recv failed";
     return false;
 }
 
@@ -45842,9 +45888,90 @@ static bool run_request_length_fixed_body_self_checks(std::string& error) {
     return true;
 }
 
-static bool run_pinned_request_length_fixed_body_oracle(TempDir& temp,
-                                                        const std::string& container_name,
-                                                        std::string& error) {
+static bool validate_request_length_fixed_body_split(const std::string& first,
+                                                     const std::string& second,
+                                                     std::chrono::milliseconds quiet_elapsed,
+                                                     bool backend_quiet,
+                                                     bool client_quiet,
+                                                     bool access_quiet,
+                                                     std::string& error) {
+    const std::string exact_first(kRequestLengthFixedBodyFirstSend);
+    const std::string exact_second(kRequestLengthFixedBodySecondSend);
+    const std::string combined = first + second;
+    std::string request_error;
+    if (first != exact_first || second != exact_second || first.size() != 128u ||
+        second.size() != 7u || header_end(std::vector<char>(first.begin(), first.end())) != 123u ||
+        first.compare(123u, 5u, "hello", 5u) != 0 || combined.size() != 135u ||
+        !validate_request_length_fixed_body_client(combined, request_error) ||
+        quiet_elapsed < std::chrono::milliseconds(500) || !backend_quiet || !client_quiet ||
+        !access_quiet) {
+        error = "#369 split escaped exact 128/7 bytes, 500ms quiet, or pre-suffix quiet evidence";
+        return false;
+    }
+    return true;
+}
+
+static bool run_request_length_split_fixed_body_self_checks(std::string& error) {
+    const std::string first(kRequestLengthFixedBodyFirstSend);
+    const std::string second(kRequestLengthFixedBodySecondSend);
+    if (!validate_request_length_fixed_body_split(
+            first, second, std::chrono::milliseconds(500), true, true, true, error))
+        return false;
+
+    std::vector<std::pair<std::string, std::string>> mutations;
+    const std::string combined = first + second;
+    mutations.push_back({combined.substr(0u, 127u), combined.substr(127u)});  // 4/8 body split
+    mutations.push_back({combined.substr(0u, 129u), combined.substr(129u)});  // 6/6 body split
+    mutations.push_back({second, first});
+    std::string changed = first;
+    changed.back() = 'X';
+    mutations.push_back({changed, second});
+    mutations.push_back({first + second.substr(0u, 1u), second});  // overlap
+    mutations.push_back({first, second.substr(1u)});               // omission
+    mutations.push_back({first, second + "x"});                    // extra
+    mutations.push_back({first, second + second});                 // duplicate
+    mutations.push_back({first, second + "GET /successor HTTP/1.1\r\nHost: successor\r\n\r\n"});
+    for (const auto& mutation : mutations) {
+        std::string detail;
+        if (validate_request_length_fixed_body_split(mutation.first,
+                                                     mutation.second,
+                                                     std::chrono::milliseconds(500),
+                                                     true,
+                                                     true,
+                                                     true,
+                                                     detail)) {
+            error = "#369 split self-check accepted a boundary/order/body mutation";
+            return false;
+        }
+    }
+    for (const auto evidence : {std::array<bool, 3>{false, true, true},
+                                std::array<bool, 3>{true, false, true},
+                                std::array<bool, 3>{true, true, false}}) {
+        std::string detail;
+        if (validate_request_length_fixed_body_split(first,
+                                                     second,
+                                                     std::chrono::milliseconds(500),
+                                                     evidence[0],
+                                                     evidence[1],
+                                                     evidence[2],
+                                                     detail)) {
+            error = "#369 split self-check accepted premature pre-suffix activity";
+            return false;
+        }
+    }
+    std::string detail;
+    if (validate_request_length_fixed_body_split(
+            first, second, std::chrono::milliseconds(499), true, true, true, detail)) {
+        error = "#369 split self-check accepted a shortened quiet window";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_request_length_fixed_body_oracle_impl(TempDir& temp,
+                                                             const std::string& container_name,
+                                                             bool split_delivery,
+                                                             std::string& error) {
     HeldLoopbackPorts reservations;
     u16 frontend_port = 0u;
     u16 backend_port = 0u;
@@ -45949,13 +46076,57 @@ static bool run_pinned_request_length_fixed_body_oracle(TempDir& temp,
         }
     } client{connect_once(frontend_port)};
     std::vector<char> response;
-    if (client.fd < 0 ||
-        !send_all(client.fd,
-                  kRequestLengthFixedBodyClientRequest,
-                  sizeof(kRequestLengthFixedBodyClientRequest) - 1u) ||
-        !read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+    if (client.fd < 0) {
+        error = split_delivery ? "#369 client connect failed" : "#367 client connect failed";
+        return false;
+    }
+    if (split_delivery) {
+        if (!send_all(client.fd,
+                      kRequestLengthFixedBodyFirstSend,
+                      sizeof(kRequestLengthFixedBodyFirstSend) - 1u)) {
+            error = "#369 exact 128-byte first application send failed";
+            return false;
+        }
+        const auto quiet_started = std::chrono::steady_clock::now();
+        const auto quiet_deadline = quiet_started + std::chrono::milliseconds(500);
+        for (;;) {
+            std::string access;
+            if (!live_with_counts(0u) || !backend.history.empty() || !backend.request.empty() ||
+                !read_request_length_fixed_body_access(temp.nginx_access_log, access, error) ||
+                !access.empty() ||
+                !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
+                if (error.empty())
+                    error = "#369 pre-suffix process/backend/access/client state was not quiet";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= quiet_deadline) break;
+        }
+        const auto quiet_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - quiet_started);
+        if (!validate_request_length_fixed_body_split(kRequestLengthFixedBodyFirstSend,
+                                                      kRequestLengthFixedBodySecondSend,
+                                                      quiet_elapsed,
+                                                      true,
+                                                      true,
+                                                      true,
+                                                      error) ||
+            !send_all(client.fd,
+                      kRequestLengthFixedBodySecondSend,
+                      sizeof(kRequestLengthFixedBodySecondSend) - 1u)) {
+            if (error.empty()) error = "#369 exact 7-byte second application send failed";
+            return false;
+        }
+    } else if (!send_all(client.fd,
+                         kRequestLengthFixedBodyClientRequest,
+                         sizeof(kRequestLengthFixedBodyClientRequest) - 1u)) {
+        error = "#367 one application send failed";
+        return false;
+    }
+    if (!read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
         !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
-        if (error.empty()) error = "#367 one application send/response/EOF episode failed";
+        if (error.empty())
+            error = split_delivery ? "#369 split response/EOF episode failed"
+                                   : "#367 one application send/response/EOF episode failed";
         return false;
     }
     close(client.fd);
@@ -46057,6 +46228,18 @@ static bool run_pinned_request_length_fixed_body_oracle(TempDir& temp,
         }
     }
     return true;
+}
+
+static bool run_pinned_request_length_fixed_body_oracle(TempDir& temp,
+                                                        const std::string& container_name,
+                                                        std::string& error) {
+    return run_pinned_request_length_fixed_body_oracle_impl(temp, container_name, false, error);
+}
+
+static bool run_pinned_request_length_split_fixed_body_oracle(TempDir& temp,
+                                                              const std::string& container_name,
+                                                              std::string& error) {
+    return run_pinned_request_length_fixed_body_oracle_impl(temp, container_name, true, error);
 }
 
 static std::string make_converter_request_length_profile(u16 frontend_port,
@@ -46746,6 +46929,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-oracle") == 0;
     const bool request_length_fixed_body_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-fixed-body-oracle") == 0;
+    const bool request_length_split_fixed_body_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-split-fixed-body-oracle") == 0;
     const bool converter_request_length_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
@@ -46904,7 +47089,8 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_fixed_body_oracle && !converter_request_length_differential &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_fixed_body_differential && !exact_loopback_return204_oracle &&
          !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
          !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
@@ -47041,6 +47227,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-request-length-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-request-length-fixed-body-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-request-length-split-fixed-body-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-request-length-differential <absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
@@ -47230,11 +47418,18 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (request_length_fixed_body_oracle || converter_request_length_fixed_body_differential) {
+    if (request_length_fixed_body_oracle || request_length_split_fixed_body_oracle ||
+        converter_request_length_fixed_body_differential) {
         std::string self_check_error;
         if (!run_request_length_fixed_body_self_checks(self_check_error)) {
             std::cerr << "FAIL [#367 fixed-body request-length self-check]: " << self_check_error
                       << "\n";
+            return 1;
+        }
+        if (request_length_split_fixed_body_oracle &&
+            !run_request_length_split_fixed_body_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#369 split fixed-body request-length self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
         if (converter_request_length_fixed_body_differential &&
@@ -47914,6 +48109,33 @@ int main(int argc, char** argv) {
                "Date-normalized 118-byte response/EOF, and publishes exactly `135\\n` live and "
                "after clean shutdown with one no-retry origin episode and no late origin bytes "
                "(no TCP segmentation or nginx recv-boundary claim)\n";
+        return 0;
+    }
+    if (request_length_split_fixed_body_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-369-request-length-split-body-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string oracle_error;
+        if (!run_pinned_request_length_split_fixed_body_oracle(
+                temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#369 pinned nginx split fixed-body request-length oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#369 exact nginx config");
+            dump_log(temp.nginx_access_log, "#369 nginx access log");
+            dump_log(temp.nginx_log, "#369 nginx error/process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #369 pinned nginx 1.29.7 proves the closed #367 exact 123-byte header plus "
+               "12-byte fixed-Content-Length POST, delivered by exactly two application "
+               "send_all calls of 128 bytes (header plus `hello`) and 7 bytes (`-body12`) "
+               "separated by at least 500ms of live backend/access/client quiet, is rebuilt to "
+               "one exact 87-byte header plus 12-byte body upstream request, returns the exact "
+               "Date-normalized 118-byte response/EOF, and publishes exactly `135\\n` live and "
+               "after clean shutdown with one no-retry origin episode and no late origin bytes "
+               "(#369 Stage 1 pinned-nginx-only application-send semantics; no TCP segmentation "
+               "or nginx recv-boundary, converter, generated-RUT, or capability claim)\n";
         return 0;
     }
     if (converter_request_length_differential) {
