@@ -446,7 +446,9 @@ FrontendResult<bool> validate_listener(const Server& server,
           eq(server.location.path, "/api/", sizeof("/api/") - 1u) && proxy.uri.len == 4u &&
           eq(proxy.uri, "/v1/", sizeof("/v1/") - 1u)));
     const bool exact_prefix_without_uri = proxy_profile == ProxyLocationProfile::PrefixWithoutUri &&
-                                          !proxy.has_uri && has_no_exact_action;
+                                          !proxy.has_uri && has_no_exact_action &&
+                                          server.location.path.len == sizeof("/api/") - 1u &&
+                                          eq(server.location.path, "/api/", sizeof("/api/") - 1u);
     if (!exact_prefix_replacement && !exact_prefix_without_uri &&
         (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
          (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u)))
@@ -1425,7 +1427,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
-    if (proxy_location.value() == ProxyLocationProfile::PrefixWithoutUri)
+    if (proxy_location.value() == ProxyLocationProfile::PrefixWithoutUri && !listener.value())
         return unsupported(server.location.path_span,
                            lit_str("non-root proxy_pass without URI lowering is not implemented"));
 
@@ -1512,10 +1514,12 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !writer.put(location_path) || !put("\", body: b\"") ||
         !writer.put_lit(kRedirect301Body, static_cast<u32>(__builtin_strlen(kRedirect301Body))) ||
         !put("\"})\n") || !put("    } else {\n") ||
-        !put("        return forward(nginx_upstream, target_transform: {\n") ||
-        !put("            strip_prefix: \"") || !writer.put(location_path) || !put("\",\n") ||
-        !put("            replace_prefix: \"") || !writer.put(proxy.uri) || !put("\"\n") ||
-        !put("        }, request_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
+        !put("        return forward(nginx_upstream,") ||
+        (proxy_location.value() == ProxyLocationProfile::PrefixWithUri &&
+         (!put(" target_transform: {\n") || !put("            strip_prefix: \"") ||
+          !writer.put(location_path) || !put("\",\n") || !put("            replace_prefix: \"") ||
+          !writer.put(proxy.uri) || !put("\"\n") || !put("        },"))) ||
+        !put(" request_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
         !put("            host: \"upstream\",\n") || !put("            connection: \"omit\",\n") ||
         !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
              "\"Upgrade\"]\n") ||

@@ -11349,14 +11349,11 @@ TEST(nginx_parser,
     REQUIRE_FALSE(no_uri_lowered);
     CHECK_EQ(no_uri_lowered.error().code, FrontendError::UnsupportedSyntax);
     CHECK(no_uri_lowered.error().detail.eq(
-        lit_str("non-root proxy_pass without URI lowering is not implemented")));
-    const char* no_uri_path = strstr(kTrueNoUri, "/service/");
-    REQUIRE(no_uri_path != nullptr);
-    CHECK_EQ(no_uri_lowered.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
-    CHECK_EQ(no_uri_lowered.error().span.end,
-             static_cast<u32>(no_uri_path - kTrueNoUri + strlen("/service/")));
-    CHECK_EQ(no_uri_lowered.error().span.line, 1u);
-    CHECK_EQ(no_uri_lowered.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
+        lit_str("exact listen requires the minimal root proxy profile")));
+    CHECK_EQ(no_uri_lowered.error().span.start, no_uri.value().listen.span.start);
+    CHECK_EQ(no_uri_lowered.error().span.end, no_uri.value().listen.span.end);
+    CHECK_EQ(no_uri_lowered.error().span.line, no_uri.value().listen.span.line);
+    CHECK_EQ(no_uri_lowered.error().span.col, no_uri.value().listen.span.col);
 
     static constexpr char kExtraAction[] =
         "server { listen 127.0.0.1:8080; location /service/ { proxy_pass "
@@ -11988,17 +11985,27 @@ TEST(nginx_parser,
     REQUIRE(no_uri);
     CHECK_FALSE(no_uri.value().location.proxy_pass.has_uri);
     const auto no_uri_lowered = nginx::lower_to_rut(no_uri.value());
-    REQUIRE_FALSE(no_uri_lowered);
-    CHECK_EQ(no_uri_lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(no_uri_lowered.error().detail.eq(
-        lit_str("non-root proxy_pass without URI lowering is not implemented")));
-    const char* no_uri_path = strstr(kTrueNoUri, "/api/");
-    REQUIRE(no_uri_path != nullptr);
-    CHECK_EQ(no_uri_lowered.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
-    CHECK_EQ(no_uri_lowered.error().span.end,
-             static_cast<u32>(no_uri_path - kTrueNoUri + strlen("/api/")));
-    CHECK_EQ(no_uri_lowered.error().span.line, 1u);
-    CHECK_EQ(no_uri_lowered.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
+    REQUIRE(no_uri_lowered);
+    CHECK_EQ(no_uri_lowered.value().len, 3244u);
+    CHECK_EQ(count_text(std::string(no_uri_lowered.value().data, no_uri_lowered.value().len),
+                        "target_transform:"),
+             0u);
+
+    static constexpr char kExplicitV1[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    const auto explicit_v1 = nginx::parse({kExplicitV1, sizeof(kExplicitV1) - 1u});
+    REQUIRE(explicit_v1);
+    const auto explicit_v1_lowered = nginx::lower_to_rut(explicit_v1.value());
+    REQUIRE(explicit_v1_lowered);
+    CHECK_EQ(explicit_v1_lowered.value().len, 3345u);
+    CHECK_NE(no_uri_lowered.value().len, explicit_v1_lowered.value().len);
+    CHECK_NE(std::string(no_uri_lowered.value().data, no_uri_lowered.value().len),
+             std::string(explicit_v1_lowered.value().data, explicit_v1_lowered.value().len));
+    CHECK_EQ(
+        count_text(std::string(explicit_v1_lowered.value().data, explicit_v1_lowered.value().len),
+                   "target_transform:"),
+        1u);
 
     static constexpr u32 kWildcardListenPrefixLen = sizeof("listen :") - 1u;
     static constexpr u32 kExactListenPrefixLen = sizeof("listen 127.0.0.1:") - 1u;
@@ -12236,9 +12243,14 @@ TEST(nginx_converter,
                 CHECK_EQ(lowered.error().span.line, expected_span.line);
                 CHECK_EQ(lowered.error().span.col, expected_span.col);
             };
-        expect_unsupported(server,
-                           lit_str("non-root proxy_pass without URI lowering is not implemented"),
-                           location.path_span);
+        const auto lowered = nginx::lower_to_rut(server);
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, 3244u);
+        const std::string generated(lowered.value().data, lowered.value().len);
+        CHECK_EQ(count_text(generated, "return forward(nginx_upstream, request_policy: {"), 1u);
+        CHECK_EQ(count_text(generated, "target_transform:"), 0u);
+        CHECK_EQ(count_text(generated, "strip_prefix:"), 0u);
+        CHECK_EQ(count_text(generated, "replace_prefix:"), 0u);
 
         std::vector<char> independent(source, source + source_len);
         auto forged = server;
@@ -12387,9 +12399,9 @@ TEST(nginx_converter,
         REQUIRE_FALSE(lowered);
         CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lowered.error().detail.eq(
-            lit_str("non-root proxy_pass without URI lowering is not implemented")));
-        CHECK_EQ(lowered.error().span.start, server.location.path_span.start);
-        CHECK_EQ(lowered.error().span.end, server.location.path_span.end);
+            lit_str("exact listen requires the minimal root proxy profile")));
+        CHECK_EQ(lowered.error().span.start, server.listen.span.start);
+        CHECK_EQ(lowered.error().span.end, server.listen.span.end);
     };
     static constexpr char kMinimum[] =
         "server { listen 127.0.0.1:1; location /a/ { proxy_pass "
@@ -12425,6 +12437,433 @@ TEST(nginx_converter,
     CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
     CHECK(rejected.error().detail.eq(
         lit_str("location path is outside the bounded clean proxy profile")));
+}
+
+TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transform_golden) {
+    char listen_first[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    char location_first[] =
+        "server { location /api/ { proxy_pass http://127.0.0.1:9000; } "
+        "listen 127.0.0.1:8080; }";
+    const auto lower = [](char* source, u32 len) -> FrontendResult<nginx::RutSource> {
+        const auto parsed = nginx::parse({source, len});
+        if (!parsed) return core::make_unexpected(parsed.error());
+        return nginx::lower_to_rut(parsed.value());
+    };
+    const auto first = lower(listen_first, sizeof(listen_first) - 1u);
+    const auto second = lower(location_first, sizeof(location_first) - 1u);
+    REQUIRE(first);
+    REQUIRE(second);
+    REQUIRE_EQ(first.value().len, 3244u);
+    REQUIRE_EQ(second.value().len, 3244u);
+    const std::string exact(first.value().data, first.value().len);
+    REQUIRE_EQ(exact, std::string(second.value().data, second.value().len));
+
+    // The accepted no-URI source is the fixed /api/ -> /v1/ program with exactly the complete
+    // target-transform kwarg removed. This full-byte relation pins every other emitted byte and
+    // prevents an empty replacement or a hidden path rewrite from standing in for absence.
+    char replacement_source[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    const auto replacement = lower(replacement_source, sizeof(replacement_source) - 1u);
+    REQUIRE(replacement);
+    REQUIRE_EQ(replacement.value().len, 3345u);
+    std::string expected(replacement.value().data, replacement.value().len);
+    static constexpr char kTransform[] =
+        " target_transform: {\n"
+        "            strip_prefix: \"/api/\",\n"
+        "            replace_prefix: \"/v1/\"\n"
+        "        },";
+    const size_t transform = expected.find(kTransform);
+    REQUIRE_NE(transform, std::string::npos);
+    REQUIRE_EQ(expected.find(kTransform, transform + sizeof(kTransform) - 1u), std::string::npos);
+    expected.erase(transform, sizeof(kTransform) - 1u);
+    REQUIRE_EQ(expected, exact);
+
+    memset(listen_first, 'x', sizeof(listen_first) - 1u);
+    memset(location_first, 'y', sizeof(location_first) - 1u);
+    memset(replacement_source, 'z', sizeof(replacement_source) - 1u);
+    CHECK_EQ(std::string(first.value().data, first.value().len), exact);
+    CHECK_EQ(std::string(second.value().data, second.value().len), exact);
+
+    static constexpr char kMaximum[] =
+        "server { listen 127.0.0.1:65535; location /api/ { proxy_pass "
+        "http://255.255.255.255:65535; } }";
+    const auto maximum_parsed = nginx::parse({kMaximum, sizeof(kMaximum) - 1u});
+    REQUIRE(maximum_parsed);
+    const auto maximum = nginx::lower_to_rut(maximum_parsed.value());
+    REQUIRE(maximum);
+    CHECK_EQ(maximum.value().len, 3252u);
+    CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 2685u);
+    CHECK_EQ(
+        count_text(std::string(maximum.value().data, maximum.value().len), "target_transform:"),
+        0u);
+
+    static constexpr char kWildcardNoUri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000; } }";
+    const auto wildcard_parsed = nginx::parse({kWildcardNoUri, sizeof(kWildcardNoUri) - 1u});
+    REQUIRE(wildcard_parsed);
+    const auto wildcard_lowered = nginx::lower_to_rut(wildcard_parsed.value());
+    REQUIRE_FALSE(wildcard_lowered);
+    CHECK_EQ(wildcard_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(wildcard_lowered.error().detail.eq(
+        lit_str("non-root proxy_pass without URI lowering is not implemented")));
+    CHECK_EQ(wildcard_lowered.error().span.start, wildcard_parsed.value().location.path_span.start);
+    CHECK_EQ(wildcard_lowered.error().span.end, wildcard_parsed.value().location.path_span.end);
+
+    const auto listener_is_canonical = [](const std::string& source) {
+        return source.rfind("listen 127.0.0.1:8080\n", 0u) == 0u &&
+               count_text(source, "listen 127.0.0.1:8080\n") == 1u &&
+               source.find("listen :") == std::string::npos &&
+               source.find("127.0.0.2") == std::string::npos;
+    };
+    const auto upstream_is_canonical = [](const std::string& source) {
+        return count_upstream_declarations(source) == 1u &&
+               count_text(source, "upstream nginx_upstream at \"127.0.0.1:9000\"\n") == 1u;
+    };
+    const auto pre_route_is_canonical = [](const std::string& source) {
+        return count_text(source, "pre_route TRACE { return local_response({\n") == 1u &&
+               count_text(source, "pre_route TRACE") == 1u;
+    };
+    const auto route_is_canonical = [](const std::string& source) {
+        return count_route_declarations(source) == 1u &&
+               count_text(source, "route \"/api\" {\n") == 1u &&
+               count_text(source, "if req.method == GET && req.pathOnly == \"/api\" {") == 1u &&
+               count_text(source, "return redirect({scheme: \"http\"") == 1u &&
+               count_text(source, "path: \"static\", query: \"preserve_raw\"") == 1u &&
+               count_text(source, "target_path: \"/api/\"") == 1u &&
+               count_text(source, "return forward(nginx_upstream,") == 1u;
+    };
+    const auto has_no_transform = [](const std::string& source) {
+        return source.find("target_transform") == std::string::npos &&
+               source.find("strip_prefix") == std::string::npos &&
+               source.find("replace_prefix") == std::string::npos &&
+               source.find("set_path") == std::string::npos;
+    };
+    const auto region_equals = [](const std::string& source,
+                                  const char* begin_marker,
+                                  const char* end_marker,
+                                  const char* expected_region) {
+        const size_t begin = source.find(begin_marker);
+        if (begin == std::string::npos ||
+            source.find(begin_marker, begin + strlen(begin_marker)) != std::string::npos)
+            return false;
+        const size_t end = source.find(end_marker, begin + strlen(begin_marker));
+        return end != std::string::npos && strlen(expected_region) == end - begin &&
+               source.compare(begin, end - begin, expected_region) == 0;
+    };
+    const auto request_policy_is_canonical = [&](const std::string& source) {
+        static constexpr char kExpected[] =
+            "request_policy: {\n"
+            "            version: \"HTTP/1.1\",\n"
+            "            host: \"upstream\",\n"
+            "            connection: \"omit\",\n"
+            "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+            "\"Upgrade\"]\n";
+        return count_text(source, "request_policy: {") == 1u &&
+               region_equals(source, "request_policy: {", "        }, response_policy:", kExpected);
+    };
+    const auto response_policy_is_canonical = [&](const std::string& source) {
+        static constexpr char kExpected[] =
+            "response_policy: {\n"
+            "            version: \"HTTP/1.1\",\n"
+            "            framing: \"content_length\",\n"
+            "            connection: \"request\",\n"
+            "            server: \"nginx/1.29.7\",\n"
+            "            date: \"current\",\n"
+            "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
+        return count_text(source, "response_policy: {") == 1u &&
+               region_equals(source, "response_policy: {", "        }, failure_policy:", kExpected);
+    };
+    const auto failure_policy_is_canonical = [&](const std::string& source) {
+        static constexpr char kExpected[] =
+            "failure_policy: {\n"
+            "            version: \"HTTP/1.1\",\n"
+            "            status: 502,\n"
+            "            reason: \"Bad Gateway\",\n"
+            "            content_type: \"text/html\",\n"
+            "            server: \"nginx/1.29.7\",\n"
+            "            date: \"current\",\n"
+            "            connection: \"request\",\n"
+            "            body: b\"<html>\\r\\n<head><title>502 Bad "
+            "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+            "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+            "html>\\r\\n\"\n";
+        return count_text(source, "failure_policy: {") == 1u &&
+               region_equals(source, "failure_policy: {", "        })\n", kExpected);
+    };
+    const auto unmatched_is_canonical = [](const std::string& source) {
+        return count_text(source, "\nunmatched ") == 3u &&
+               count_text(source,
+                          "unmatched OPTIONS { return local_response({\n"
+                          "  version: \"HTTP/1.1\", status: 400,") == 1u &&
+               count_text(source,
+                          "unmatched CONNECT { return local_response({\n"
+                          "  version: \"HTTP/1.1\", status: 405,") == 1u &&
+               count_text(source,
+                          "\nunmatched { return local_response({\n"
+                          "  version: \"HTTP/1.1\", status: 400,") == 1u;
+    };
+    const auto timeout_is_canonical = [](const std::string& source) {
+        return source.find("timeout_failure_policy:") == std::string::npos &&
+               source.find("response_read_timeout:") == std::string::npos &&
+               source.find("response_buffering:") == std::string::npos;
+    };
+    const auto has_no_hook = [](const std::string& source) {
+        for (const char* marker : {"nginx.conf",
+                                   "nginx::",
+                                   "nginx_compat",
+                                   "workaround",
+                                   "bind_address",
+                                   "local_address",
+                                   "req.listener",
+                                   "address_condition"})
+            if (source.find(marker) != std::string::npos) return false;
+        return true;
+    };
+    const auto source_is_canonical = [&](const std::string& source) {
+        return listener_is_canonical(source) && upstream_is_canonical(source) &&
+               pre_route_is_canonical(source) && route_is_canonical(source) &&
+               has_no_transform(source) && request_policy_is_canonical(source) &&
+               response_policy_is_canonical(source) && failure_policy_is_canonical(source) &&
+               unmatched_is_canonical(source) && timeout_is_canonical(source) &&
+               has_no_hook(source);
+    };
+    REQUIRE(source_is_canonical(exact));
+
+    const auto replace_unique = [&](std::string source, Str before, Str after) {
+        const std::string needle(before.ptr, before.len);
+        const size_t offset = source.find(needle);
+        if (needle.empty() || before.eq(after) || offset == std::string::npos ||
+            source.find(needle, offset + needle.size()) != std::string::npos) {
+            CHECK(false);
+            return std::string{};
+        }
+        source.replace(offset, needle.size(), after.ptr, after.len);
+        CHECK_FALSE(source.empty());
+        CHECK_NE(source, exact);
+        return source;
+    };
+    enum class Guard : u8 {
+        Listener,
+        Upstream,
+        PreRoute,
+        Route,
+        Transform,
+        Request,
+        Response,
+        Failure,
+        Unmatched,
+        Timeout,
+    };
+    const auto check_isolated = [&](const std::string& candidate, Guard rejected) {
+        REQUIRE_FALSE(candidate.empty());
+        const bool guards[] = {listener_is_canonical(candidate),
+                               upstream_is_canonical(candidate),
+                               pre_route_is_canonical(candidate),
+                               route_is_canonical(candidate),
+                               has_no_transform(candidate),
+                               request_policy_is_canonical(candidate),
+                               response_policy_is_canonical(candidate),
+                               failure_policy_is_canonical(candidate),
+                               unmatched_is_canonical(candidate),
+                               timeout_is_canonical(candidate)};
+        for (u32 i = 0u; i < std::size(guards); i++)
+            CHECK_EQ(guards[i], i != static_cast<u32>(rejected));
+        CHECK(has_no_hook(candidate));
+        CHECK_FALSE(source_is_canonical(candidate));
+    };
+    const struct {
+        Str before;
+        Str after;
+        Guard rejected;
+    } structure_mutations[] = {
+        {lit_str("listen 127.0.0.1:8080\n"), lit_str("listen 127.0.0.2:8080\n"), Guard::Listener},
+        {lit_str("127.0.0.1:9000"), lit_str("127.0.0.1:9001"), Guard::Upstream},
+        {lit_str("pre_route TRACE {"), lit_str("pre_route TRACX {"), Guard::PreRoute},
+        {lit_str("route \"/api\" {"), lit_str("route \"/apx\" {"), Guard::Route},
+        {lit_str("query: \"preserve_raw\""), lit_str("query: \"discard\""), Guard::Route},
+        {lit_str("target_path: \"/api/\""), lit_str("target_path: \"/apx/\""), Guard::Route},
+        {lit_str("return forward(nginx_upstream, request_policy: {"),
+         lit_str("return forwarX(nginx_upstream, request_policy: {"),
+         Guard::Route},
+        {lit_str("host: \"upstream\""), lit_str("host: \"upstreaX\""), Guard::Request},
+        {lit_str("framing: \"content_length\""),
+         lit_str("framing: \"content_lengtx\""),
+         Guard::Response},
+        {lit_str("status: 502,"), lit_str("status: 503,"), Guard::Failure},
+        {lit_str("unmatched OPTIONS { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 400,"),
+         lit_str("unmatched OPTIONS { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 401,"),
+         Guard::Unmatched},
+        {lit_str("unmatched CONNECT { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 405,"),
+         lit_str("unmatched CONNECT { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 406,"),
+         Guard::Unmatched},
+        {lit_str("\nunmatched { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 400,"),
+         lit_str("\nunmatched { return local_response({\n"
+                 "  version: \"HTTP/1.1\", status: 401,"),
+         Guard::Unmatched},
+    };
+    for (const auto& mutation : structure_mutations)
+        check_isolated(replace_unique(exact, mutation.before, mutation.after), mutation.rejected);
+    static constexpr char kInjectedTransform[] =
+        "return forward(nginx_upstream, target_transform: {\n"
+        "            strip_prefix: \"/api/\",\n"
+        "            replace_prefix: \"/\"\n"
+        "        }, request_policy: {";
+    check_isolated(replace_unique(exact,
+                                  lit_str("return forward(nginx_upstream, request_policy: {"),
+                                  {kInjectedTransform, sizeof(kInjectedTransform) - 1u}),
+                   Guard::Transform);
+    check_isolated(exact + "// response_read_timeout: forbidden\n", Guard::Timeout);
+    check_isolated(exact + "// set_path marker\n", Guard::Transform);
+    for (const char* marker : {"nginx.conf",
+                               "nginx::",
+                               "nginx_compat",
+                               "workaround",
+                               "bind_address",
+                               "local_address",
+                               "req.listener",
+                               "address_condition"}) {
+        const std::string hook = exact + "// " + marker + " marker\n";
+        REQUIRE_NE(hook, exact);
+        CHECK(listener_is_canonical(hook));
+        CHECK(upstream_is_canonical(hook));
+        CHECK(pre_route_is_canonical(hook));
+        CHECK(route_is_canonical(hook));
+        CHECK(has_no_transform(hook));
+        CHECK(request_policy_is_canonical(hook));
+        CHECK(response_policy_is_canonical(hook));
+        CHECK(failure_policy_is_canonical(hook));
+        CHECK(unmatched_is_canonical(hook));
+        CHECK_FALSE(has_no_hook(hook));
+        CHECK_FALSE(source_is_canonical(hook));
+        const auto hook_lexed = lex({hook.data(), static_cast<u32>(hook.size())});
+        REQUIRE(hook_lexed);
+        const auto hook_parsed = parse_file(hook_lexed.value());
+        REQUIRE(hook_parsed);
+        delete hook_parsed.value();
+    }
+    const std::string harmless = exact + "// canonical byte equality witness\n";
+    REQUIRE(source_is_canonical(harmless));
+    REQUIRE_NE(harmless, exact);
+
+    const auto lexed = lex({exact.data(), static_cast<u32>(exact.size())});
+    REQUIRE(lexed);
+    const auto parsed = parse_file(lexed.value());
+    REQUIRE(parsed);
+    std::unique_ptr<AstFile> ast(parsed.value());
+    REQUIRE_GT(ast->items.len, 0u);
+    REQUIRE(ast->items[0].kind == AstItemKind::Listen);
+    CHECK(ast->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(ast->items[0].listen.ipv4_host, 0x7f000001u);
+    CHECK_EQ(ast->items[0].listen.port, 8080u);
+    const AstRouteDecl* ast_route = nullptr;
+    for (u32 i = 0u; i < ast->items.len; i++)
+        if (ast->items[i].kind == AstItemKind::Route &&
+            ast->items[i].route.path.eq(lit_str("/api")))
+            ast_route = &ast->items[i].route;
+    REQUIRE(ast_route != nullptr);
+    REQUIRE_EQ(ast_route->statements.len, 1u);
+    const AstStatement& ast_if = *ast_route->statements[0];
+    REQUIRE(ast_if.kind == AstStmtKind::If);
+    REQUIRE(ast_if.then_stmt != nullptr);
+    REQUIRE(ast_if.else_stmt != nullptr);
+    REQUIRE(ast_if.then_stmt->kind == AstStmtKind::Redirect);
+    REQUIRE_NE(ast_if.then_stmt->redirect_policy_id, 0u);
+    REQUIRE_LE(ast_if.then_stmt->redirect_policy_id, ast->redirect_policies.len);
+    CHECK(ast->redirect_policies[ast_if.then_stmt->redirect_policy_id - 1u].target_path.eq(
+        lit_str("/api/")));
+    const AstStatement* ast_forward = ast_if.else_stmt;
+    if (ast_forward->kind == AstStmtKind::Block) {
+        REQUIRE_EQ(ast_forward->block_stmts.len, 1u);
+        ast_forward = ast_forward->block_stmts[0];
+    }
+    REQUIRE(ast_forward != nullptr);
+    REQUIRE(ast_forward->kind == AstStmtKind::ForwardUpstream);
+    CHECK_FALSE(ast_forward->has_forward_target_transform);
+    CHECK_EQ(ast_forward->forward_target_transform.strip_prefix.ptr, nullptr);
+    CHECK_EQ(ast_forward->forward_target_transform.replace_prefix.ptr, nullptr);
+    REQUIRE(ast_forward->has_forward_request_policy);
+    REQUIRE(ast_forward->has_forward_response_policy);
+    REQUIRE(ast_forward->has_forward_failure_policy);
+
+    const auto analyzed = analyze_file(*ast);
+    REQUIRE(analyzed);
+    std::unique_ptr<HirModule> hir(analyzed.value());
+    REQUIRE(hir->has_listener);
+    CHECK(hir->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(hir->listener.ipv4_host, 0x7f000001u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const HirRoute& hir_route = hir->routes[0];
+    CHECK(hir_route.path.eq(lit_str("/api")));
+    REQUIRE(hir_route.control.kind == HirControlKind::If);
+    REQUIRE(hir_route.control.then_term.kind == HirTerminatorKind::Redirect);
+    const HirTerminator& hir_forward = hir_route.control.else_term;
+    REQUIRE(hir_forward.kind == HirTerminatorKind::ForwardUpstream);
+    CHECK_FALSE(hir_forward.has_forward_target_transform);
+    CHECK_EQ(hir_forward.forward_target_transform.strip_prefix.ptr, nullptr);
+    CHECK_EQ(hir_forward.forward_target_transform.replace_prefix.ptr, nullptr);
+    REQUIRE_NE(hir_forward.forward_request_policy_id, 0u);
+    REQUIRE_NE(hir_forward.forward_response_policy_id, 0u);
+    REQUIRE_LE(hir_forward.forward_response_policy_id, hir->response_policies.len);
+    REQUIRE_NE(hir_forward.forward_failure_policy_id, 0u);
+    REQUIRE_LE(hir_forward.forward_failure_policy_id, hir->failure_policies.len);
+
+    const auto mir_result = build_mir(*hir);
+    REQUIRE(mir_result);
+    std::unique_ptr<MirModule> mir(mir_result.value());
+    const MirTerminator* mir_forward = nullptr;
+    for (u32 block = 0u; block < mir->functions[0].blocks.len; block++)
+        if (mir->functions[0].blocks[block].term.kind == MirTerminatorKind::ForwardUpstream)
+            mir_forward = &mir->functions[0].blocks[block].term;
+    REQUIRE(mir_forward != nullptr);
+    CHECK_FALSE(mir_forward->has_forward_target_transform);
+    REQUIRE_NE(mir_forward->forward_request_policy_id, 0u);
+    REQUIRE_NE(mir_forward->forward_response_policy_id, 0u);
+    REQUIRE_NE(mir_forward->forward_failure_policy_id, 0u);
+
+    FrontendRirModule rir{};
+    RirGuard rir_guard{rir};
+    REQUIRE(lower_to_rir(*mir, rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.target_transform_count, 0u);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK(rir.module.redirect_policies[0].target_path.eq(lit_str("/api/")));
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    bool saw_forward = false;
+    bool saw_transform = false;
+    for (u32 block = 0u; block < rir.module.functions[0].block_count; block++) {
+        const auto& rir_block = rir.module.functions[0].blocks[block];
+        for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+            const auto& inst = rir_block.insts[instruction];
+            if (inst.op == rir::Opcode::ReqSetTargetTransform) saw_transform = true;
+            if (inst.op != rir::Opcode::RetForwardBundle) continue;
+            saw_forward = true;
+            REQUIRE_EQ(inst.operand_count, 3u);
+            i32 upstream_id = -1;
+            i32 request_policy_id = -1;
+            i32 bundle_id = -1;
+            REQUIRE(find_const_i32(rir.module.functions[0], inst.operand(0), upstream_id));
+            REQUIRE(find_const_i32(rir.module.functions[0], inst.operand(1), request_policy_id));
+            REQUIRE(find_const_i32(rir.module.functions[0], inst.operand(2), bundle_id));
+            CHECK_EQ(upstream_id, 0);
+            CHECK_EQ(request_policy_id, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+            CHECK_EQ(bundle_id, 1);
+        }
+    }
+    CHECK(saw_forward);
+    CHECK_FALSE(saw_transform);
 }
 
 TEST(nginx_converter,
