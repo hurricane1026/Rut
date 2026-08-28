@@ -449,9 +449,11 @@ FrontendResult<bool> validate_listener(const Server& server,
                                           !proxy.has_uri && has_no_exact_action &&
                                           server.location.path.len == sizeof("/api/") - 1u &&
                                           eq(server.location.path, "/api/", sizeof("/api/") - 1u);
-    if (!exact_prefix_replacement && !exact_prefix_without_uri &&
-        (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
-         (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u)))
+    const bool exact_root_profile =
+        proxy_profile == ProxyLocationProfile::RootWithoutUri &&
+        (!has_exact_absolute_redirect || server.exact_absolute_redirect.response.status == 301u ||
+         server.exact_absolute_redirect.response.status == 302u);
+    if (!exact_prefix_replacement && !exact_prefix_without_uri && !exact_root_profile)
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
     return true;
