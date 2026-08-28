@@ -34,10 +34,13 @@ using rut::u16;
 using rut::u32;
 using rut::u64;
 
+#ifndef RUT_PINNED_NGINX_IMAGE
+#error "RUT_PINNED_NGINX_IMAGE must be provided by the build system"
+#endif
+
 namespace {
 
-static constexpr const char* kNginxImage =
-    "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40";
+static constexpr const char* kNginxImage = RUT_PINNED_NGINX_IMAGE;
 static constexpr char kRequest[] =
     "GET /encoded/%7Euser?tag=unreserved HTTP/1.1\r\n"
     "Host: client.example\r\n"

@@ -367,6 +367,29 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 if(RUT_ENABLE_JIT)
+    set(_RUT_PINNED_NGINX_IMAGE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/pinned-nginx-image.txt")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${_RUT_PINNED_NGINX_IMAGE_FILE}"
+    )
+    file(STRINGS "${_RUT_PINNED_NGINX_IMAGE_FILE}" _RUT_PINNED_NGINX_IMAGE_LINES
+         LIMIT_COUNT 2)
+    file(SIZE "${_RUT_PINNED_NGINX_IMAGE_FILE}" _RUT_PINNED_NGINX_IMAGE_FILE_SIZE)
+    list(LENGTH _RUT_PINNED_NGINX_IMAGE_LINES _RUT_PINNED_NGINX_IMAGE_LINE_COUNT)
+    if(NOT _RUT_PINNED_NGINX_IMAGE_LINE_COUNT EQUAL 1 OR
+       NOT _RUT_PINNED_NGINX_IMAGE_FILE_SIZE EQUAL 78)
+        message(FATAL_ERROR
+            "${_RUT_PINNED_NGINX_IMAGE_FILE} must contain exactly one newline-terminated image reference"
+        )
+    endif()
+    list(GET _RUT_PINNED_NGINX_IMAGE_LINES 0 _RUT_PINNED_NGINX_IMAGE)
+    string(LENGTH "${_RUT_PINNED_NGINX_IMAGE}" _RUT_PINNED_NGINX_IMAGE_LENGTH)
+    if(NOT _RUT_PINNED_NGINX_IMAGE_LENGTH EQUAL 77 OR
+       NOT _RUT_PINNED_NGINX_IMAGE MATCHES "^nginx@sha256:[0-9a-f]+$")
+        message(FATAL_ERROR
+            "${_RUT_PINNED_NGINX_IMAGE_FILE} must contain nginx@sha256: followed by exactly 64 lowercase hexadecimal characters"
+        )
+    endif()
+
     add_library(test_nginx_downstream_gate_preload SHARED nginx_downstream_gate_preload.c)
     target_include_directories(test_nginx_downstream_gate_preload PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -386,6 +409,9 @@ if(RUT_ENABLE_JIT)
     target_link_libraries(test_nginx_differential PRIVATE rut_nginx rut_loader Threads::Threads)
     target_include_directories(test_nginx_differential PRIVATE
         ${PROJECT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(test_nginx_differential PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
     add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
     if(TARGET test_rut_iouring_gate_preload)
