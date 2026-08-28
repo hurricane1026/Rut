@@ -211,7 +211,127 @@ bool proxy_location_path_is_clean(Str path) {
     return true;
 }
 
-enum class ProxyLocationProfile : u8 { RootWithoutUri, PrefixWithUri };
+enum class ProxyLocationProfile : u8 { RootWithoutUri, PrefixWithoutUri, PrefixWithUri };
+
+bool no_uri_proxy_endpoint_matches(uintptr_t source_base,
+                                   u32 start,
+                                   u32 end,
+                                   const ProxyPass& proxy) {
+    static constexpr char kHttpPrefix[] = "http://";
+    if (end <= start || end - start <= sizeof(kHttpPrefix) - 1u ||
+        !eq({trusted_source_at(source_base, start), sizeof(kHttpPrefix) - 1u},
+            kHttpPrefix,
+            sizeof(kHttpPrefix) - 1u))
+        return false;
+    u32 pos = start + sizeof(kHttpPrefix) - 1u;
+    for (u32 octet = 0; octet < 4u; octet++) {
+        if (pos >= end) return false;
+        u32 value = 0;
+        u32 digits = 0;
+        while (pos < end) {
+            const char byte = *trusted_source_at(source_base, pos);
+            if (byte < '0' || byte > '9') break;
+            value = value * 10u + static_cast<u32>(byte - '0');
+            pos++;
+            if (++digits > 3u || value > 255u) return false;
+        }
+        if (digits == 0u || value != proxy.address[octet]) return false;
+        if (octet != 3u) {
+            if (pos >= end || *trusted_source_at(source_base, pos) != '.') return false;
+            pos++;
+        }
+    }
+    if (pos >= end || *trusted_source_at(source_base, pos) != ':') return false;
+    pos++;
+    if (pos >= end) return false;
+    u32 parsed_port = 0;
+    for (; pos < end; pos++) {
+        const char byte = *trusted_source_at(source_base, pos);
+        if (byte < '0' || byte > '9') return false;
+        const u32 digit = static_cast<u32>(byte - '0');
+        if (parsed_port > (65535u - digit) / 10u) return false;
+        parsed_port = parsed_port * 10u + digit;
+    }
+    return parsed_port != 0u && parsed_port == proxy.port;
+}
+
+FrontendResult<ProxyLocationProfile> validate_prefix_without_uri(const Server& server) {
+    const Location& location = server.location;
+    const ProxyPass& proxy = location.proxy_pass;
+    if (proxy.has_uri || proxy.uri.ptr != nullptr || proxy.uri.len != 0u ||
+        !is_default_span(proxy.uri_span))
+        return unsupported(proxy.span, lit_str("invalid proxy_pass URI state"));
+    if (!span_position_is_coherent(server.span, location.span))
+        return unsupported(is_valid_span(location.span) ? location.span : model_span(server),
+                           lit_str("invalid proxy location spans"));
+    if (!span_position_is_coherent(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != location.path.len)
+        return unsupported(is_valid_span(location.path_span) ? location.path_span : location.span,
+                           lit_str("invalid proxy location spans"));
+    if (!span_position_is_coherent(location.span, proxy.span) ||
+        location.path_span.end >= proxy.span.start || proxy.span.end >= location.span.end)
+        return unsupported(is_valid_span(proxy.span) ? proxy.span : location.span,
+                           lit_str("invalid proxy location spans"));
+
+    const uintptr_t path_address = reinterpret_cast<uintptr_t>(location.path.ptr);
+    if (location.path.ptr == nullptr || path_address < location.path_span.start)
+        return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
+    const uintptr_t source_base = path_address - location.path_span.start;
+    if (source_base > UINTPTR_MAX - server.span.end ||
+        !source_borrow_is_coherent(location.path, location.path_span, source_base))
+        return unsupported(location.path_span, lit_str("invalid proxy_pass source provenance"));
+
+    // The containment checks above make both subtractions safe. Establish the
+    // complete keyword range before source-position validation scans or any
+    // direct trusted source read. A path offset of exactly eight would overlap
+    // the keyword rather than leave it strictly before the path token.
+    const u32 location_length = location.span.end - location.span.start;
+    const u32 path_offset = location.path_span.start - location.span.start;
+    if (location_length <= 8u || path_offset <= 8u)
+        return unsupported(location.span, lit_str("invalid proxy location spans"));
+    if (!source_position_is_coherent(source_base, server.span, location.span))
+        return unsupported(location.span, lit_str("invalid proxy location source positions"));
+    if (!source_position_is_coherent(source_base, server.span, location.path_span))
+        return unsupported(location.path_span, lit_str("invalid proxy location source positions"));
+    if (!source_position_is_coherent(source_base, server.span, proxy.span))
+        return unsupported(proxy.span, lit_str("invalid proxy location source positions"));
+
+    // All dynamic source reads below are bounded by the already-proven common
+    // source and coherent server/location/directive spans.
+    if (!eq({trusted_source_at(source_base, location.span.start), 8u}, "location", 8u) ||
+        *trusted_source_at(source_base, location.span.end - 1u) != '}' ||
+        !trusted_source_gap_is_exact(
+            source_base, location.span.start + 8u, location.path_span.start))
+        return unsupported(location.span, lit_str("invalid proxy location source syntax"));
+    u32 cursor = location.path_span.end;
+    if (!advance_trusted_source_gap(source_base, cursor, proxy.span.start) ||
+        cursor >= proxy.span.start || *trusted_source_at(source_base, cursor) != '{' ||
+        !trusted_source_gap_is_exact(source_base, cursor + 1u, proxy.span.start) ||
+        !trusted_source_gap_is_exact(source_base, proxy.span.end, location.span.end - 1u))
+        return unsupported(location.span, lit_str("invalid proxy location source syntax"));
+    if (proxy.span.end - proxy.span.start < 13u ||
+        !eq({trusted_source_at(source_base, proxy.span.start), 10u}, "proxy_pass", 10u) ||
+        *trusted_source_at(source_base, proxy.span.end - 1u) != ';')
+        return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
+    cursor = proxy.span.start + 10u;
+    if (!advance_trusted_source_gap(source_base, cursor, proxy.span.end - 1u) ||
+        cursor >= proxy.span.end - 1u)
+        return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
+    const u32 endpoint_start = cursor;
+    while (cursor < proxy.span.end - 1u &&
+           !source_byte_is_lexer_space(*trusted_source_at(source_base, cursor)) &&
+           *trusted_source_at(source_base, cursor) != '#')
+        cursor++;
+    const u32 endpoint_end = cursor;
+    if (!trusted_source_gap_is_exact(source_base, endpoint_end, proxy.span.end - 1u))
+        return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
+    if (!no_uri_proxy_endpoint_matches(source_base, endpoint_start, endpoint_end, proxy))
+        return unsupported(proxy.span, lit_str("invalid upstream endpoint model"));
+    if (!proxy_location_path_is_clean(location.path))
+        return unsupported(location.path_span,
+                           lit_str("invalid bounded proxy location path model"));
+    return ProxyLocationProfile::PrefixWithoutUri;
+}
 
 // Call only after the listener's complete source range and common-source
 // provenance have been established. Leading zeroes are intentionally accepted
@@ -325,7 +445,9 @@ FrontendResult<bool> validate_listener(const Server& server,
          (server.location.path.len == 5u &&
           eq(server.location.path, "/api/", sizeof("/api/") - 1u) && proxy.uri.len == 4u &&
           eq(proxy.uri, "/v1/", sizeof("/v1/") - 1u)));
-    if (!exact_prefix_replacement &&
+    const bool exact_prefix_without_uri = proxy_profile == ProxyLocationProfile::PrefixWithoutUri &&
+                                          !proxy.has_uri && has_no_exact_action;
+    if (!exact_prefix_replacement && !exact_prefix_without_uri &&
         (proxy_profile != ProxyLocationProfile::RootWithoutUri ||
          (has_exact_absolute_redirect && server.exact_absolute_redirect.response.status != 302u)))
         return unsupported(listener.span,
@@ -364,9 +486,7 @@ FrontendResult<ProxyLocationProfile> validate_proxy_location(const Server& serve
         return ProxyLocationProfile::RootWithoutUri;
     }
 
-    if (!proxy.has_uri)
-        return unsupported(location.path_span,
-                           lit_str("non-root location requires a proxy_pass URI"));
+    if (!proxy.has_uri) return validate_prefix_without_uri(server);
 
     // Preserve only the historical hand-built canonical `/api/ -> /` fixture. Its
     // intentionally synthetic spans predate source provenance. All parser-produced
@@ -1305,6 +1425,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
+    if (proxy_location.value() == ProxyLocationProfile::PrefixWithoutUri)
+        return unsupported(server.location.path_span,
+                           lit_str("non-root proxy_pass without URI lowering is not implemented"));
 
     RutSource output{};
     Writer writer(output);

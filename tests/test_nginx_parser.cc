@@ -2089,14 +2089,18 @@ TEST(nginx_parser, parsed_generic_proxy_location_reaches_ordinary_rut_lowering) 
     const char service_without_uri[] =
         "server { listen 8080; location /service/ { proxy_pass http://127.0.0.1:9000; } }";
     const auto missing_uri = nginx::parse({service_without_uri, sizeof(service_without_uri) - 1u});
-    REQUIRE_FALSE(missing_uri);
-    CHECK_EQ(missing_uri.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(missing_uri.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
+    REQUIRE(missing_uri);
+    CHECK_FALSE(missing_uri.value().location.proxy_pass.has_uri);
+    const auto missing_uri_lowered = nginx::lower_to_rut(missing_uri.value());
+    REQUIRE_FALSE(missing_uri_lowered);
+    CHECK_EQ(missing_uri_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(missing_uri_lowered.error().detail.eq(
+        lit_str("non-root proxy_pass without URI lowering is not implemented")));
     const char* missing_uri_path = strstr(service_without_uri, "/service/");
     REQUIRE(missing_uri_path != nullptr);
-    CHECK_EQ(missing_uri.error().span.start,
+    CHECK_EQ(missing_uri_lowered.error().span.start,
              static_cast<u32>(missing_uri_path - service_without_uri));
-    CHECK_EQ(missing_uri.error().span.end - missing_uri.error().span.start, 9u);
+    CHECK_EQ(missing_uri_lowered.error().span.end - missing_uri_lowered.error().span.start, 9u);
 
     const char api[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/; } }";
@@ -2397,11 +2401,17 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
 
     const char api_without_uri[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1; } }";
-    CHECK(is_error(nginx::parse({api_without_uri, sizeof(api_without_uri) - 1}),
-                   FrontendError::UnsupportedSyntax,
-                   1,
-                   32,
-                   lit_str("non-root location requires a proxy_pass URI")));
+    const auto parsed_api_without_uri =
+        nginx::parse({api_without_uri, sizeof(api_without_uri) - 1u});
+    REQUIRE(parsed_api_without_uri);
+    CHECK_FALSE(parsed_api_without_uri.value().location.proxy_pass.has_uri);
+    const auto lowered_api_without_uri = nginx::lower_to_rut(parsed_api_without_uri.value());
+    REQUIRE_FALSE(lowered_api_without_uri);
+    CHECK_EQ(lowered_api_without_uri.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(lowered_api_without_uri.error().span.line, 1u);
+    CHECK_EQ(lowered_api_without_uri.error().span.col, 32u);
+    CHECK(lowered_api_without_uri.error().detail.eq(
+        lit_str("non-root proxy_pass without URI lowering is not implemented")));
 
     const char api_without_trailing_slash[] =
         "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1/; } }";
@@ -8546,9 +8556,8 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     auto bad_api_present = nginx::lower_to_rut(api_present);
     REQUIRE_FALSE(bad_api_present);
     CHECK_EQ(bad_api_present.error().code, FrontendError::UnsupportedSyntax);
-    CHECK_EQ(bad_api_present.error().span.start, 22u);
-    CHECK(
-        bad_api_present.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
+    CHECK_EQ(bad_api_present.error().span.start, 26u);
+    CHECK(bad_api_present.error().detail.eq(lit_str("invalid proxy location spans")));
 
     auto other_present = valid_present;
     other_present.listen.port = 8080;
@@ -8557,9 +8566,8 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     auto bad_other_present = nginx::lower_to_rut(other_present);
     REQUIRE_FALSE(bad_other_present);
     CHECK_EQ(bad_other_present.error().code, FrontendError::UnsupportedSyntax);
-    CHECK_EQ(bad_other_present.error().span.start, 22u);
-    CHECK(bad_other_present.error().detail.eq(
-        lit_str("non-root location requires a proxy_pass URI")));
+    CHECK_EQ(bad_other_present.error().span.start, 26u);
+    CHECK(bad_other_present.error().detail.eq(lit_str("invalid proxy location spans")));
 
     auto null_present = valid_present;
     null_present.listen.port = 8080;
@@ -9144,9 +9152,8 @@ TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_
     forged.location.proxy_pass.has_uri = false;
     forged.location.proxy_pass.uri = {};
     forged.location.proxy_pass.uri_span = {};
-    expect_rejected(forged,
-                    lit_str("non-root location requires a proxy_pass URI"),
-                    accepted.location.path_span);
+    expect_rejected(
+        forged, lit_str("invalid upstream endpoint model"), accepted.location.proxy_pass.span);
 
     auto legacy_generic = api_server();
     static constexpr char kFiveByteGeneric[] = "/abc/";
@@ -11181,9 +11188,8 @@ TEST(nginx_parser,
         forged.location.proxy_pass.has_uri = false;
         forged.location.proxy_pass.uri = {};
         forged.location.proxy_pass.uri_span = {};
-        expect_unsupported(forged,
-                           lit_str("non-root location requires a proxy_pass URI"),
-                           forged.location.path_span);
+        expect_unsupported(
+            forged, lit_str("invalid upstream endpoint model"), forged.location.proxy_pass.span);
 
         forged = server;
         forged.location.proxy_read_timeout.present = true;
@@ -11337,16 +11343,20 @@ TEST(nginx_parser,
         "server { listen 127.0.0.1:8080; location /service/ { proxy_pass "
         "http://127.0.0.1:9000; } }";
     const auto no_uri = nginx::parse({kTrueNoUri, sizeof(kTrueNoUri) - 1u});
-    REQUIRE_FALSE(no_uri);
-    CHECK_EQ(no_uri.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(no_uri.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
+    REQUIRE(no_uri);
+    CHECK_FALSE(no_uri.value().location.proxy_pass.has_uri);
+    const auto no_uri_lowered = nginx::lower_to_rut(no_uri.value());
+    REQUIRE_FALSE(no_uri_lowered);
+    CHECK_EQ(no_uri_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(no_uri_lowered.error().detail.eq(
+        lit_str("non-root proxy_pass without URI lowering is not implemented")));
     const char* no_uri_path = strstr(kTrueNoUri, "/service/");
     REQUIRE(no_uri_path != nullptr);
-    CHECK_EQ(no_uri.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
-    CHECK_EQ(no_uri.error().span.end,
+    CHECK_EQ(no_uri_lowered.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
+    CHECK_EQ(no_uri_lowered.error().span.end,
              static_cast<u32>(no_uri_path - kTrueNoUri + strlen("/service/")));
-    CHECK_EQ(no_uri.error().span.line, 1u);
-    CHECK_EQ(no_uri.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
+    CHECK_EQ(no_uri_lowered.error().span.line, 1u);
+    CHECK_EQ(no_uri_lowered.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
 
     static constexpr char kExtraAction[] =
         "server { listen 127.0.0.1:8080; location /service/ { proxy_pass "
@@ -11812,9 +11822,8 @@ TEST(nginx_parser,
         forged = server;
         forged.location.proxy_pass.has_uri = false;
         CHECK_NE(forged.location.proxy_pass.has_uri, proxy.has_uri);
-        expect_unsupported(forged,
-                           lit_str("non-root location requires a proxy_pass URI"),
-                           forged.location.path_span);
+        expect_unsupported(
+            forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
         forged = server;
         forged.location.proxy_pass.uri = {};
         forged.location.proxy_pass.uri_span = {};
@@ -11976,15 +11985,20 @@ TEST(nginx_parser,
         "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
         "http://127.0.0.1:9000; } }";
     const auto no_uri = nginx::parse({kTrueNoUri, sizeof(kTrueNoUri) - 1u});
-    REQUIRE_FALSE(no_uri);
-    CHECK_EQ(no_uri.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(no_uri.error().detail.eq(lit_str("non-root location requires a proxy_pass URI")));
+    REQUIRE(no_uri);
+    CHECK_FALSE(no_uri.value().location.proxy_pass.has_uri);
+    const auto no_uri_lowered = nginx::lower_to_rut(no_uri.value());
+    REQUIRE_FALSE(no_uri_lowered);
+    CHECK_EQ(no_uri_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(no_uri_lowered.error().detail.eq(
+        lit_str("non-root proxy_pass without URI lowering is not implemented")));
     const char* no_uri_path = strstr(kTrueNoUri, "/api/");
     REQUIRE(no_uri_path != nullptr);
-    CHECK_EQ(no_uri.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
-    CHECK_EQ(no_uri.error().span.end, static_cast<u32>(no_uri_path - kTrueNoUri + strlen("/api/")));
-    CHECK_EQ(no_uri.error().span.line, 1u);
-    CHECK_EQ(no_uri.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
+    CHECK_EQ(no_uri_lowered.error().span.start, static_cast<u32>(no_uri_path - kTrueNoUri));
+    CHECK_EQ(no_uri_lowered.error().span.end,
+             static_cast<u32>(no_uri_path - kTrueNoUri + strlen("/api/")));
+    CHECK_EQ(no_uri_lowered.error().span.line, 1u);
+    CHECK_EQ(no_uri_lowered.error().span.col, static_cast<u32>(no_uri_path - kTrueNoUri + 1u));
 
     static constexpr u32 kWildcardListenPrefixLen = sizeof("listen :") - 1u;
     static constexpr u32 kExactListenPrefixLen = sizeof("listen 127.0.0.1:") - 1u;
@@ -12100,6 +12114,317 @@ TEST(nginx_parser,
     CHECK_EQ(zero_port_rejected.error().span.end, zero_port.location.proxy_pass.span.end);
     CHECK_EQ(zero_port_rejected.error().span.line, zero_port.location.proxy_pass.span.line);
     CHECK_EQ(zero_port_rejected.error().span.col, zero_port.location.proxy_pass.span.col);
+}
+
+TEST(nginx_converter,
+     issue355_models_exact_loopback_non_root_no_uri_with_provenance_and_fails_closed) {
+    char listen_first[] =
+        "server {\n"
+        "  listen 127.0.0.1:8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000;\n"
+        "  }\n"
+        "}\n";
+    char location_first[] =
+        "server {\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000;\n"
+        "  }\n"
+        "  listen 127.0.0.1:8080;\n"
+        "}\n";
+
+    const auto check = [&](char* source, u32 source_len, u32 listen_line, u32 location_line) {
+        const auto parsed = nginx::parse({source, source_len});
+        REQUIRE(parsed);
+        const nginx::Server& server = parsed.value();
+        const nginx::Listen& listener = server.listen;
+        const nginx::Location& location = server.location;
+        const nginx::ProxyPass& proxy = location.proxy_pass;
+        const char* server_start = strstr(source, "server");
+        const char* server_close = strrchr(source, '}');
+        const char* listen_start = strstr(source, "listen");
+        const char* listen_value = strstr(listen_start, "127.0.0.1:8080");
+        const char* listen_semicolon = strchr(listen_value, ';');
+        const char* location_start = strstr(source, "location");
+        const char* location_path = strstr(location_start, "/api/");
+        const char* proxy_start = strstr(location_start, "proxy_pass");
+        const char* endpoint = strstr(proxy_start, "http://127.0.0.1:9000");
+        const char* proxy_semicolon = strchr(endpoint, ';');
+        const char* location_close = strchr(proxy_semicolon, '}');
+        REQUIRE(server_start != nullptr);
+        REQUIRE(server_close != nullptr);
+        REQUIRE(listen_start != nullptr);
+        REQUIRE(listen_value != nullptr);
+        REQUIRE(listen_semicolon != nullptr);
+        REQUIRE(location_start != nullptr);
+        REQUIRE(location_path != nullptr);
+        REQUIRE(proxy_start != nullptr);
+        REQUIRE(endpoint != nullptr);
+        REQUIRE(proxy_semicolon != nullptr);
+        REQUIRE(location_close != nullptr);
+
+        const auto line = [&](const char* pointer) {
+            u32 result = 1u;
+            for (const char* cursor = source; cursor < pointer; cursor++)
+                if (*cursor == '\n') result++;
+            return result;
+        };
+        const auto col = [&](const char* pointer) {
+            const char* cursor = pointer;
+            while (cursor != source && cursor[-1] != '\n') cursor--;
+            return static_cast<u32>(pointer - cursor + 1u);
+        };
+        const auto check_span = [&](Span span, const char* start, const char* end) {
+            REQUIRE_EQ(span.start, static_cast<u32>(start - source));
+            REQUIRE_EQ(span.end, static_cast<u32>(end - source));
+            REQUIRE_EQ(span.line, line(start));
+            REQUIRE_EQ(span.col, col(start));
+        };
+        check_span(server.span, server_start, server_close + 1u);
+        check_span(listener.span, listen_start, listen_semicolon + 1u);
+        check_span(listener.value_span, listen_value, listen_semicolon);
+        check_span(location.span, location_start, location_close + 1u);
+        check_span(location.path_span, location_path, location_path + 5u);
+        check_span(proxy.span, proxy_start, proxy_semicolon + 1u);
+        CHECK_EQ(listener.span.line, listen_line);
+        CHECK_EQ(location.span.line, location_line);
+        CHECK_EQ(proxy.span.line, location_line + 1u);
+
+        REQUIRE(listener.address == ListenerAddress::IPv4Exact);
+        REQUIRE_EQ(listener.ipv4_host, 0x7f000001u);
+        REQUIRE_EQ(listener.port, 8080u);
+        REQUIRE(listener.value.eq(lit_str("127.0.0.1:8080")));
+        REQUIRE(location.path.eq(lit_str("/api/")));
+        REQUIRE_EQ(proxy.address[0], 127u);
+        REQUIRE_EQ(proxy.address[1], 0u);
+        REQUIRE_EQ(proxy.address[2], 0u);
+        REQUIRE_EQ(proxy.address[3], 1u);
+        REQUIRE_EQ(proxy.port, 9000u);
+        REQUIRE_FALSE(proxy.has_uri);
+        REQUIRE_EQ(proxy.uri.ptr, nullptr);
+        REQUIRE_EQ(proxy.uri.len, 0u);
+        REQUIRE_EQ(proxy.uri_span.start, 0u);
+        REQUIRE_EQ(proxy.uri_span.end, 0u);
+        REQUIRE_EQ(proxy.uri_span.line, 1u);
+        REQUIRE_EQ(proxy.uri_span.col, 1u);
+        REQUIRE_FALSE(location.proxy_read_timeout.present);
+        REQUIRE_FALSE(server.exact_local_return.present);
+        REQUIRE_FALSE(server.exact_no_content_return.present);
+        REQUIRE_FALSE(server.exact_absolute_redirect.present);
+        REQUIRE(server.pre_route_trace.profile ==
+                nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+        REQUIRE_EQ(server.pre_route_trace.span.start, server.span.start);
+        REQUIRE_EQ(server.pre_route_trace.span.end, server.span.end);
+
+        const uintptr_t source_base = reinterpret_cast<uintptr_t>(source);
+        REQUIRE_EQ(reinterpret_cast<uintptr_t>(listener.value.ptr) - listener.value_span.start,
+                   source_base);
+        REQUIRE_EQ(reinterpret_cast<uintptr_t>(location.path.ptr) - location.path_span.start,
+                   source_base);
+        REQUIRE_GE(location.path_span.start, location.span.start);
+        REQUIRE_LT(location.path_span.end, proxy.span.start);
+        REQUIRE_LT(proxy.span.end, location.span.end);
+
+        const auto expect_unsupported =
+            [&](const nginx::Server& candidate, Str detail, Span expected_span) {
+                const auto lowered = nginx::lower_to_rut(candidate);
+                REQUIRE_FALSE(lowered);
+                CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+                CHECK(lowered.error().detail.eq(detail));
+                CHECK_EQ(lowered.error().span.start, expected_span.start);
+                CHECK_EQ(lowered.error().span.end, expected_span.end);
+                CHECK_EQ(lowered.error().span.line, expected_span.line);
+                CHECK_EQ(lowered.error().span.col, expected_span.col);
+            };
+        expect_unsupported(server,
+                           lit_str("non-root proxy_pass without URI lowering is not implemented"),
+                           location.path_span);
+
+        std::vector<char> independent(source, source + source_len);
+        auto forged = server;
+        forged.listen.value.ptr = independent.data() + listener.value_span.start;
+        expect_unsupported(
+            forged, lit_str("invalid listen source provenance"), listener.value_span);
+        forged = server;
+        forged.location.path.ptr = independent.data() + location.path_span.start;
+        expect_unsupported(
+            forged, lit_str("invalid listen source provenance"), listener.value_span);
+
+        forged = server;
+        forged.location.path_span.end--;
+        expect_unsupported(
+            forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+        forged = server;
+        forged.location.span.start++;
+        forged.location.span.col++;
+        CHECK_EQ(forged.location.path_span.start - forged.location.span.start, 8u);
+        expect_unsupported(forged, lit_str("invalid proxy location spans"), forged.location.span);
+        forged = server;
+        forged.location.span.line++;
+        expect_unsupported(
+            forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+        forged = server;
+        forged.location.proxy_pass.span.end--;
+        expect_unsupported(
+            forged, lit_str("invalid proxy location source syntax"), forged.location.span);
+
+        forged = server;
+        forged.location.proxy_pass.has_uri = true;
+        expect_unsupported(forged,
+                           lit_str("invalid bounded proxy_pass URI model"),
+                           forged.location.proxy_pass.uri_span);
+        forged = server;
+        forged.location.proxy_pass.uri.ptr = source + proxy.span.start;
+        expect_unsupported(
+            forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
+        forged = server;
+        forged.location.proxy_pass.uri.len = 1u;
+        expect_unsupported(
+            forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
+        forged = server;
+        forged.location.proxy_pass.uri_span = proxy.span;
+        expect_unsupported(
+            forged, lit_str("invalid proxy_pass URI state"), forged.location.proxy_pass.span);
+
+        forged = server;
+        forged.location.proxy_pass.address[3] = 2u;
+        expect_unsupported(
+            forged, lit_str("invalid upstream endpoint model"), forged.location.proxy_pass.span);
+        forged = server;
+        forged.location.proxy_pass.port = 9001u;
+        expect_unsupported(
+            forged, lit_str("invalid upstream endpoint model"), forged.location.proxy_pass.span);
+        forged = server;
+        forged.listen.port = 8081u;
+        expect_unsupported(
+            forged, lit_str("invalid exact listen endpoint model"), forged.listen.value_span);
+
+        forged = server;
+        forged.location.proxy_read_timeout.milliseconds = 1000u;
+        expect_unsupported(
+            forged, lit_str("invalid absent proxy_read_timeout model"), forged.location.span);
+        forged = server;
+        forged.exact_no_content_return.response.status = 204u;
+        expect_unsupported(
+            forged, lit_str("invalid absent exact no-content return model"), forged.span);
+        forged = server;
+        forged.exact_local_return.response.status = 200u;
+        expect_unsupported(forged, lit_str("invalid absent exact local return model"), forged.span);
+        forged = server;
+        forged.exact_absolute_redirect.response.status = 302u;
+        expect_unsupported(
+            forged, lit_str("invalid absent exact absolute redirect model"), forged.span);
+
+        const char saved_proxy_keyword = *proxy_start;
+        *const_cast<char*>(proxy_start) = 'P';
+        expect_unsupported(server, lit_str("invalid proxy_pass source syntax"), proxy.span);
+        *const_cast<char*>(proxy_start) = saved_proxy_keyword;
+        const char saved_location_keyword = *location_start;
+        *const_cast<char*>(location_start) = 'L';
+        expect_unsupported(server, lit_str("invalid proxy location source syntax"), location.span);
+        *const_cast<char*>(location_start) = saved_location_keyword;
+        const char saved_proxy_semicolon = *proxy_semicolon;
+        *const_cast<char*>(proxy_semicolon) = ':';
+        expect_unsupported(server, lit_str("invalid proxy_pass source syntax"), proxy.span);
+        *const_cast<char*>(proxy_semicolon) = saved_proxy_semicolon;
+        const char saved_location_close = *location_close;
+        *const_cast<char*>(location_close) = ';';
+        expect_unsupported(server, lit_str("invalid proxy location source syntax"), location.span);
+        *const_cast<char*>(location_close) = saved_location_close;
+        const char saved_endpoint = endpoint[sizeof("http://127.0.0.1:") - 1u];
+        *const_cast<char*>(endpoint + sizeof("http://127.0.0.1:") - 1u) = '8';
+        expect_unsupported(server, lit_str("invalid upstream endpoint model"), proxy.span);
+        *const_cast<char*>(endpoint + sizeof("http://127.0.0.1:") - 1u) = saved_endpoint;
+        const char saved_path = location_path[1];
+        *const_cast<char*>(location_path + 1u) = '%';
+        expect_unsupported(
+            server, lit_str("invalid bounded proxy location path model"), location.path_span);
+        *const_cast<char*>(location_path + 1u) = saved_path;
+
+        const nginx::Server retained = server;
+        const Span retained_server_span = server.span;
+        const Span retained_listener_span = listener.span;
+        const Span retained_path_span = location.path_span;
+        const Span retained_proxy_span = proxy.span;
+        memset(source, 'x', source_len);
+        CHECK(retained.listen.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(retained.listen.ipv4_host, 0x7f000001u);
+        CHECK_EQ(retained.listen.port, 8080u);
+        CHECK_EQ(retained.location.path.len, 5u);
+        CHECK_EQ(retained.location.proxy_pass.address[0], 127u);
+        CHECK_EQ(retained.location.proxy_pass.address[3], 1u);
+        CHECK_EQ(retained.location.proxy_pass.port, 9000u);
+        CHECK_FALSE(retained.location.proxy_pass.has_uri);
+        CHECK_EQ(retained.location.proxy_pass.uri.ptr, nullptr);
+        CHECK_EQ(retained.location.proxy_pass.uri.len, 0u);
+        CHECK_EQ(retained.location.proxy_pass.uri_span.start, 0u);
+        CHECK_EQ(retained.location.proxy_pass.uri_span.end, 0u);
+        CHECK_EQ(retained.span.start, retained_server_span.start);
+        CHECK_EQ(retained.span.end, retained_server_span.end);
+        CHECK_EQ(retained.listen.span.start, retained_listener_span.start);
+        CHECK_EQ(retained.listen.span.end, retained_listener_span.end);
+        CHECK_EQ(retained.location.path_span.start, retained_path_span.start);
+        CHECK_EQ(retained.location.path_span.end, retained_path_span.end);
+        CHECK_EQ(retained.location.proxy_pass.span.start, retained_proxy_span.start);
+        CHECK_EQ(retained.location.proxy_pass.span.end, retained_proxy_span.end);
+        // Borrowed listener/path bytes are invalid after overwrite and are not read.
+    };
+
+    check(listen_first, sizeof(listen_first) - 1u, 2u, 3u);
+    check(location_first, sizeof(location_first) - 1u, 5u, 2u);
+
+    const auto check_boundary = [&](Str source, u32 expected_path_len) {
+        const auto parsed = nginx::parse(source);
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        CHECK_EQ(server.location.path.len, expected_path_len);
+        CHECK_FALSE(server.location.proxy_pass.has_uri);
+        CHECK_EQ(server.location.proxy_pass.uri.ptr, nullptr);
+        CHECK_EQ(server.location.proxy_pass.uri.len, 0u);
+        CHECK_EQ(server.location.proxy_pass.uri_span.start, 0u);
+        CHECK_EQ(server.location.proxy_pass.uri_span.end, 0u);
+        const auto lowered = nginx::lower_to_rut(server);
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lowered.error().detail.eq(
+            lit_str("non-root proxy_pass without URI lowering is not implemented")));
+        CHECK_EQ(lowered.error().span.start, server.location.path_span.start);
+        CHECK_EQ(lowered.error().span.end, server.location.path_span.end);
+    };
+    static constexpr char kMinimum[] =
+        "server { listen 127.0.0.1:1; location /a/ { proxy_pass "
+        "http://0.0.0.0:1; } }";
+    check_boundary({kMinimum, sizeof(kMinimum) - 1u}, 3u);
+    char max_path[nginx::kMaxProxyLocationPathLen + 1u]{};
+    max_path[0] = '/';
+    memset(max_path + 1u, 'a', nginx::kMaxProxyLocationPathLen - 2u);
+    max_path[nginx::kMaxProxyLocationPathLen - 1u] = '/';
+    char maximum[512]{};
+    const int maximum_len = snprintf(maximum,
+                                     sizeof(maximum),
+                                     "server { listen 127.0.0.1:65535; location %s { proxy_pass "
+                                     "http://255.255.255.255:65535; } }",
+                                     max_path);
+    REQUIRE_GT(maximum_len, 0);
+    REQUIRE_LT(static_cast<u32>(maximum_len), static_cast<u32>(sizeof(maximum)));
+    check_boundary({maximum, static_cast<u32>(maximum_len)}, nginx::kMaxProxyLocationPathLen);
+
+    char over_path[nginx::kMaxProxyLocationPathLen + 2u]{};
+    over_path[0] = '/';
+    memset(over_path + 1u, 'a', nginx::kMaxProxyLocationPathLen - 1u);
+    over_path[nginx::kMaxProxyLocationPathLen] = '/';
+    char over_limit[512]{};
+    const int over_limit_len = snprintf(over_limit,
+                                        sizeof(over_limit),
+                                        "server { listen 8080; location %s { proxy_pass "
+                                        "http://127.0.0.1:9000; } }",
+                                        over_path);
+    REQUIRE_GT(over_limit_len, 0);
+    const auto rejected = nginx::parse({over_limit, static_cast<u32>(over_limit_len)});
+    REQUIRE_FALSE(rejected);
+    CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(rejected.error().detail.eq(
+        lit_str("location path is outside the bounded clean proxy profile")));
 }
 
 TEST(nginx_converter,

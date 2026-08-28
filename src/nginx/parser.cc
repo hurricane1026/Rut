@@ -458,9 +458,6 @@ private:
         if (is_root && result.proxy_pass.has_uri)
             return unsupported(result.proxy_pass.uri_span,
                                lit_str("location / cannot use a proxy_pass URI"));
-        if (!is_root && !result.proxy_pass.has_uri)
-            return unsupported(result.path_span,
-                               lit_str("non-root location requires a proxy_pass URI"));
         result.span = Span{start.start, end.end, start.line, start.col};
         return parsed;
     }
