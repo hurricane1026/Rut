@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -505,6 +506,11 @@ struct SourceLiveProxyResult {
     bool sink_observed_live = false;
 };
 
+enum class SourceLiveProxyMode : u8 {
+    Success,
+    FileSizeWriteFatal,
+};
+
 u16 listening_port(const std::string& output) {
     static constexpr char kMarker[] = "Listening on port ";
     const size_t marker = output.find(kMarker);
@@ -526,11 +532,13 @@ bool is_prefix_of(const std::string& value, const char* expected) {
            std::memcmp(value.data(), expected, value.size()) == 0;
 }
 
-SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args,
-                                            const std::string& sink,
-                                            i32 backend_listener,
-                                            const char* request,
-                                            size_t request_length) {
+SourceLiveProxyResult run_source_live_proxy(
+    const std::vector<std::string>& args,
+    const std::string& sink,
+    i32 backend_listener,
+    const char* request,
+    size_t request_length,
+    SourceLiveProxyMode mode = SourceLiveProxyMode::Success) {
     SourceLiveProxyResult result{};
     i32 output_pipe[2];
     if (pipe(output_pipe) != 0) {
@@ -544,6 +552,11 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
             _exit(126);
         close(output_pipe[1]);
         unsetenv("RUE_ACCESS_LOG_COMPRESS");
+        if (mode == SourceLiveProxyMode::FileSizeWriteFatal) {
+            if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(124);
+            const struct rlimit file_size_limit{3u, 3u};
+            if (setrlimit(RLIMIT_FSIZE, &file_size_limit) != 0) _exit(125);
+        }
         std::vector<char*> argv;
         argv.reserve(args.size() + 1u);
         for (const std::string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
@@ -568,6 +581,7 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
     bool backend_joined = false;
     bool termination_sent = false;
     for (u32 attempt = 0; attempt < 80u && !reaped; attempt++) {
+        bool backend_joined_this_iteration = false;
         struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
         (void)poll(&ready, 1, 100);
         for (;;) {
@@ -588,14 +602,22 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
         if (transaction_attempted && !backend_joined) {
             backend.join();
             backend_joined = true;
-            result.backend_joined_live = waitpid(child, &result.process.status, WNOHANG) == 0;
+            backend_joined_this_iteration = true;
         }
+        pid_t waited;
+        do {
+            waited = waitpid(child, &result.process.status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        const bool child_observed_live = waited == 0;
+        reaped = waited == child;
+        if (reaped) result.process.status_valid = true;
+        if (backend_joined_this_iteration) result.backend_joined_live = child_observed_live;
         if (transaction_attempted) {
             const std::string current = read_file(sink);
             if (!is_prefix_of(current, "102\n")) result.sink_prefixes_valid = false;
-            if (!termination_sent && current == "102\n" && backend_joined &&
-                result.backend.accepts == 1u && result.backend.sends == 1u &&
-                waitpid(child, &result.process.status, WNOHANG) == 0) {
+            if (mode == SourceLiveProxyMode::Success && !termination_sent && current == "102\n" &&
+                backend_joined && result.backend.accepts == 1u && result.backend.sends == 1u &&
+                child_observed_live) {
                 result.sink_observed_live = true;
                 if (kill(child, SIGTERM) == 0) {
                     result.process.shutdown_signal_sent = true;
@@ -603,10 +625,7 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
                 }
             }
         }
-        const pid_t waited = waitpid(child, &result.process.status, WNOHANG);
-        reaped = waited == child;
-        if (reaped) result.process.status_valid = true;
-        if (waited < 0 && errno != EINTR && errno != ECHILD) break;
+        if (waited < 0 && errno != ECHILD) break;
     }
     if (!backend_joined) backend.join();
     if (!reaped) {
@@ -626,6 +645,17 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
     }
     close(output_pipe[0]);
     return result;
+}
+
+u32 count_occurrences(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return 0u;
+    u32 count = 0u;
+    for (size_t offset = 0u;;) {
+        offset = text.find(needle, offset);
+        if (offset == std::string::npos) return count;
+        count++;
+        offset += needle.size();
+    }
 }
 
 bool exited_one(const ProcessResult& result) {
@@ -712,6 +742,74 @@ TEST(access_log_startup, public_main_source_live_publishes_downstream_size_befor
     REQUIRE_EQ(stat(sink.c_str(), &status), 0);
     CHECK(S_ISREG(status.st_mode));
     CHECK_EQ(status.st_size, 4);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(access_log_startup, public_main_source_live_write_fatal_exits_without_retry_or_shutdown) {
+    const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-write-fatal-XXXXXX");
+    REQUIRE_FALSE(dir.empty());
+    const std::string program = dir + "/app.rut";
+    const std::string sink = dir + "/source.log";
+    u16 backend_port = 0u;
+    const i32 backend_listener = bind_loopback_listener(1024u, 9999u, backend_port);
+    REQUIRE(backend_listener >= 0);
+    REQUIRE_GE(backend_port, 1024u);
+    REQUIRE_LE(backend_port, 9999u);
+    REQUIRE(write_file(program, source_live_proxy(sink, backend_port)));
+
+    static constexpr char kClientRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test: keep\r\n"
+        "\r\n";
+    static constexpr char kBackendResponse[] =
+        "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    static_assert(sizeof(kClientRequest) - 1u == 102u);
+    const std::string expected_backend =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Test: keep\r\n\r\n";
+    REQUIRE_EQ(expected_backend.size(), 66u);
+    REQUIRE_NE(sizeof(kClientRequest) - 1u, expected_backend.size());
+
+    SourceLiveProxyResult fatal = run_source_live_proxy(
+        {RUT_SERVER_BINARY, program, "--shards", "1", "--no-pin", "--drain", "0"},
+        sink,
+        backend_listener,
+        kClientRequest,
+        sizeof(kClientRequest) - 1u,
+        SourceLiveProxyMode::FileSizeWriteFatal);
+    CHECK(fatal.request_completed);
+    CHECK(fatal.sink_prefixes_valid);
+    CHECK_FALSE(fatal.backend.timed_out);
+    CHECK_EQ(fatal.backend.accepts, 1u);
+    CHECK_EQ(fatal.backend.sends, 1u);
+    CHECK_EQ(fatal.backend.request, expected_backend);
+    CHECK_EQ(fatal.response, kBackendResponse);
+    CHECK_EQ(read_file(sink), "102");
+    struct stat status{};
+    REQUIRE_EQ(stat(sink.c_str(), &status), 0);
+    CHECK(S_ISREG(status.st_mode));
+    CHECK_EQ(status.st_size, 3);
+
+    const std::string diagnostic =
+        "Fatal SourceLive access log failure (kind=Write, ring=0, errno=" + std::to_string(EFBIG) +
+        ")";
+    CHECK_EQ(count_occurrences(fatal.process.output, diagnostic), 1u);
+    CHECK_EQ(count_occurrences(fatal.process.output, "Fatal SourceLive access log failure"), 1u);
+    CHECK(fatal.process.output.find("Fatal I/O backend failure") == std::string::npos);
+    CHECK_EQ(count_occurrences(fatal.process.output, "Backend:"), 1u);
+    CHECK(fatal.process.output.find("Listening on") != std::string::npos);
+    CHECK(fatal.process.output.find("falling back") == std::string::npos);
+    CHECK(fatal.process.output.find("Shutdown complete.") == std::string::npos);
+    CHECK_FALSE(fatal.process.shutdown_signal_sent);
+    CHECK_FALSE(fatal.process.forced_kill);
+    REQUIRE(fatal.process.status_valid);
+    REQUIRE(WIFEXITED(fatal.process.status));
+    CHECK_NE(WEXITSTATUS(fatal.process.status), 124);
+    CHECK_NE(WEXITSTATUS(fatal.process.status), 125);
+    CHECK_EQ(WEXITSTATUS(fatal.process.status), 1);
 
     std::filesystem::remove_all(dir);
 }
