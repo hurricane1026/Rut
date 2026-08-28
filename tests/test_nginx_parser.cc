@@ -105,24 +105,27 @@ static u32 count_upstream_declarations(const std::string& source) {
     return (source.rfind("upstream ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nupstream ");
 }
 
-static bool validate_static_query_proxy_generated_source_fields(const std::string& source,
-                                                                u16 listen_port,
-                                                                u16 upstream_port) {
+static bool validate_query_proxy_generated_source_fields(const std::string& source,
+                                                         u16 listen_port,
+                                                         u16 upstream_port,
+                                                         const std::string& replacement) {
     const std::string listener = "listen :" + std::to_string(listen_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
-    static constexpr char kTransform[] =
+    const std::string transform =
         "            strip_prefix: \"/api/\",\n"
-        "            replace_prefix: \"/v1/?fixed=1\"\n";
+        "            replace_prefix: \"" +
+        replacement + "\"\n";
     return count_text(source, listener) == 1u && count_text(source, upstream) == 1u &&
            count_text(source, "route \"/api\" {\n") == 1u &&
            count_text(source, "    if req.method == GET && req.pathOnly == \"/api\" {\n") == 1u &&
            count_text(source, "target_path: \"/api/\"") == 1u &&
-           count_text(source, kTransform) == 1u && count_text(source, "strip_prefix:") == 1u &&
-           count_text(source, "replace_prefix:") == 1u &&
-           count_text(source, "/v1/?fixed=1") == 1u &&
+           count_text(source, transform) == 1u && count_text(source, "strip_prefix:") == 1u &&
+           count_text(source, "replace_prefix:") == 1u && count_text(source, replacement) == 1u &&
            count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
            count_text(source, "query: \"preserve_raw\"") == 1u &&
+           source.find("query: \"drop\"") == std::string::npos &&
+           source.find("normalize") == std::string::npos &&
            count_text(source, "host: \"upstream\"") == 1u && count_text(source, "route \"") == 1u &&
            source.find("route \"/api?") == std::string::npos &&
            source.find("route \"/api/") == std::string::npos &&
@@ -139,12 +142,31 @@ static bool validate_static_query_proxy_generated_source_fields(const std::strin
            source.find("workaround") == std::string::npos;
 }
 
+static bool validate_static_query_proxy_generated_source_fields(const std::string& source,
+                                                                u16 listen_port,
+                                                                u16 upstream_port) {
+    return validate_query_proxy_generated_source_fields(
+        source, listen_port, upstream_port, "/v1/?fixed=1");
+}
+
 static bool validate_static_query_proxy_generated_source(const std::string& source,
                                                          u16 listen_port,
                                                          u16 upstream_port) {
     return validate_static_query_proxy_generated_source_fields(
                source, listen_port, upstream_port) &&
            count_route_declarations(source) == 1u &&
+           source.find("\nroute exact ") == std::string::npos &&
+           source.rfind("route exact ", 0u) != 0u;
+}
+
+static bool validate_empty_query_proxy_generated_source(const std::string& source,
+                                                        u16 listen_port,
+                                                        u16 upstream_port) {
+    return validate_query_proxy_generated_source_fields(
+               source, listen_port, upstream_port, "/v1/?") &&
+           count_route_declarations(source) == 1u &&
+           source.find("            replace_prefix: \"/v1/\"\n") == std::string::npos &&
+           source.find("            replace_prefix: \"/v1/?fixed=1\"\n") == std::string::npos &&
            source.find("\nroute exact ") == std::string::npos &&
            source.rfind("route exact ", 0u) != 0u;
 }
@@ -2230,6 +2252,88 @@ TEST(nginx_parser, models_static_query_proxy_uri_in_either_server_directive_orde
     };
     check(listen_first, sizeof(listen_first) - 1u, 4u);
     check(location_first, sizeof(location_first) - 1u, 2u);
+}
+
+TEST(nginx_parser, issue360_models_terminal_empty_query_with_exact_provenance_and_distinction) {
+    const char listen_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/?;\n"
+        "  }\n"
+        "}\n";
+    const char location_first[] =
+        "server {\n"
+        "  location /api/ { proxy_pass http://127.0.0.1:19000/v1/?; }\n"
+        "  listen 18080;\n"
+        "}\n";
+
+    const auto check = [&](const char* source,
+                           u32 source_len,
+                           u16 listen_port,
+                           u16 upstream_port,
+                           u32 expected_line) {
+        const auto parsed = nginx::parse({source, source_len});
+        REQUIRE(parsed);
+        const auto& server = parsed.value();
+        const auto& location = server.location;
+        const auto& proxy = location.proxy_pass;
+        const char* replacement = strstr(source, "/v1/?");
+        REQUIRE(replacement != nullptr);
+        const u32 expected_start = static_cast<u32>(replacement - source);
+        const char* line_start = replacement;
+        while (line_start != source && line_start[-1] != '\n') --line_start;
+
+        CHECK_EQ(server.listen.address, ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(server.listen.port, listen_port);
+        CHECK_EQ(proxy.port, upstream_port);
+        REQUIRE(proxy.has_uri);
+        CHECK_EQ(proxy.uri.len, 5u);
+        CHECK(proxy.uri.eq(lit_str("/v1/?")));
+        CHECK_EQ(proxy.uri.ptr, replacement);
+        CHECK_EQ(proxy.uri.ptr, source + proxy.uri_span.start);
+        CHECK_EQ(proxy.uri_span.start, expected_start);
+        CHECK_EQ(proxy.uri_span.end, expected_start + 5u);
+        CHECK_EQ(proxy.uri_span.end - proxy.uri_span.start, 5u);
+        CHECK_EQ(proxy.uri_span.line, expected_line);
+        CHECK_EQ(proxy.uri_span.col, static_cast<u32>(replacement - line_start + 1u));
+        CHECK_LT(proxy.uri_span.end, proxy.span.end);
+        CHECK_EQ(location.path.ptr, source + location.path_span.start);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(proxy.uri.ptr) - proxy.uri_span.start,
+                 reinterpret_cast<uintptr_t>(location.path.ptr) - location.path_span.start);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(proxy.uri.ptr) - proxy.uri_span.start,
+                 reinterpret_cast<uintptr_t>(source));
+        CHECK_EQ(server.span.start, 0u);
+        CHECK_EQ(server.span.end, source_len - 1u);
+        CHECK_EQ(source[server.span.end], '\n');
+        CHECK_GE(proxy.uri.ptr, source);
+        CHECK_LE(proxy.uri.ptr + proxy.uri.len, source + source_len);
+    };
+    check(listen_first, sizeof(listen_first) - 1u, 8080u, 9000u, 4u);
+    check(location_first, sizeof(location_first) - 1u, 18080u, 19000u, 2u);
+
+    const char path_only_source[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    const auto path_only = nginx::parse({path_only_source, sizeof(path_only_source) - 1u});
+    REQUIRE(path_only);
+    REQUIRE(path_only.value().location.proxy_pass.has_uri);
+    CHECK(path_only.value().location.proxy_pass.uri.eq(lit_str("/v1/")));
+    CHECK_EQ(path_only.value().location.proxy_pass.uri.len, 4u);
+    CHECK_FALSE(path_only.value().location.proxy_pass.uri.eq(lit_str("/v1/?")));
+
+    const char absent_source[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000; } }";
+    const auto absent = nginx::parse({absent_source, sizeof(absent_source) - 1u});
+    REQUIRE(absent);
+    const auto& absent_proxy = absent.value().location.proxy_pass;
+    CHECK_FALSE(absent_proxy.has_uri);
+    CHECK_EQ(absent_proxy.uri.ptr, nullptr);
+    CHECK_EQ(absent_proxy.uri.len, 0u);
+    CHECK_EQ(absent_proxy.uri_span.start, 0u);
+    CHECK_EQ(absent_proxy.uri_span.end, 0u);
+    CHECK_EQ(absent_proxy.uri_span.line, 1u);
+    CHECK_EQ(absent_proxy.uri_span.col, 1u);
 }
 
 TEST(nginx_parser, accepts_bounded_static_query_grammar_and_root_replacement_path) {
@@ -8313,25 +8417,39 @@ TEST(nginx_converter, emitted_generic_non_root_replacement_reaches_owned_runtime
     CHECK(populated->redirect_policy_string_is_owned(populated->redirect_policies[0].target_path));
 }
 
-TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_config) {
+static void check_query_replacement_reaches_owned_runtime_config(rut::test::TestCase* _tc,
+                                                                 const char* configured_uri,
+                                                                 u32 configured_uri_len,
+                                                                 u32 expected_owned_bytes) {
+    const Str expected_replacement{configured_uri, configured_uri_len};
     auto populated = std::make_unique<RouteConfig>();
     uintptr_t nginx_begin = 0;
     uintptr_t nginx_end = 0;
     uintptr_t generated_begin = 0;
     uintptr_t generated_end = 0;
+    uintptr_t rir_strip_begin = 0;
+    uintptr_t rir_strip_end = 0;
+    uintptr_t rir_replace_begin = 0;
+    uintptr_t rir_replace_end = 0;
     {
-        char nginx_source[] =
-            "server { listen 8080; location /api/ { proxy_pass "
-            "http://127.0.0.1:9000/v1/?fixed=1; } }";
+        char nginx_source[256]{};
+        const int nginx_source_len = snprintf(nginx_source,
+                                              sizeof(nginx_source),
+                                              "server { listen 8080; location /api/ { proxy_pass "
+                                              "http://127.0.0.1:9000%.*s; } }",
+                                              static_cast<int>(configured_uri_len),
+                                              configured_uri);
+        REQUIRE_GT(nginx_source_len, 0);
+        REQUIRE_LT(static_cast<u32>(nginx_source_len), static_cast<u32>(sizeof(nginx_source)));
         nginx_begin = reinterpret_cast<uintptr_t>(nginx_source);
-        nginx_end = nginx_begin + sizeof(nginx_source);
-        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        nginx_end = nginx_begin + static_cast<u32>(nginx_source_len) + 1u;
+        auto parsed = nginx::parse({nginx_source, static_cast<u32>(nginx_source_len)});
         REQUIRE(parsed);
         auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
         generated_begin = reinterpret_cast<uintptr_t>(lowered.value().data);
         generated_end = generated_begin + lowered.value().len;
-        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+        memset(nginx_source, 'x', static_cast<u32>(nginx_source_len));
 
         auto lexed = lex(lowered.value().view());
         REQUIRE(lexed);
@@ -8355,7 +8473,7 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
         REQUIRE(ast_forward->kind == AstStmtKind::ForwardUpstream);
         REQUIRE(ast_forward->has_forward_target_transform);
         CHECK(ast_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
-        CHECK(ast_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/?fixed=1")));
+        CHECK(ast_forward->forward_target_transform.replace_prefix.eq(expected_replacement));
 
         auto hir = analyze_file(*ast_owned);
         REQUIRE(hir);
@@ -8370,7 +8488,7 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
         REQUIRE(hir_forward.kind == HirTerminatorKind::ForwardUpstream);
         REQUIRE(hir_forward.has_forward_target_transform);
         CHECK(hir_forward.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
-        CHECK(hir_forward.forward_target_transform.replace_prefix.eq(lit_str("/v1/?fixed=1")));
+        CHECK(hir_forward.forward_target_transform.replace_prefix.eq(expected_replacement));
         CHECK_EQ(hir_forward.forward_request_policy_id, 1u);
         CHECK_EQ(hir_forward.forward_response_policy_id, 1u);
         CHECK_EQ(hir_forward.forward_failure_policy_id, 1u);
@@ -8395,7 +8513,7 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
         CHECK_EQ(mir_redirect->redirect_policy_id, 1u);
         REQUIRE(mir_forward->has_forward_target_transform);
         CHECK(mir_forward->forward_target_transform.strip_prefix.eq(lit_str("/api/")));
-        CHECK(mir_forward->forward_target_transform.replace_prefix.eq(lit_str("/v1/?fixed=1")));
+        CHECK(mir_forward->forward_target_transform.replace_prefix.eq(expected_replacement));
         CHECK_EQ(mir_forward->forward_request_policy_id, 1u);
         CHECK_EQ(mir_forward->forward_response_policy_id, 1u);
         CHECK_EQ(mir_forward->forward_failure_policy_id, 1u);
@@ -8407,7 +8525,13 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
         REQUIRE(rir::verify_module(rir.module).ok);
         REQUIRE_EQ(rir.module.target_transform_count, 1u);
         CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
-        CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/v1/?fixed=1")));
+        CHECK(rir.module.target_transforms[0].replace_prefix.eq(expected_replacement));
+        rir_strip_begin =
+            reinterpret_cast<uintptr_t>(rir.module.target_transforms[0].strip_prefix.ptr);
+        rir_strip_end = rir_strip_begin + rir.module.target_transforms[0].strip_prefix.len;
+        rir_replace_begin =
+            reinterpret_cast<uintptr_t>(rir.module.target_transforms[0].replace_prefix.ptr);
+        rir_replace_end = rir_replace_begin + rir.module.target_transforms[0].replace_prefix.len;
         REQUIRE_EQ(rir.module.response_policy_count, 1u);
         REQUIRE_EQ(rir.module.failure_policy_count, 1u);
         REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
@@ -8455,10 +8579,11 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
     // gone. The retained transform must be the RouteConfig-owned copy.
     REQUIRE_EQ(populated->route_count, 0u);
     REQUIRE_EQ(populated->target_transform_count, 1u);
-    REQUIRE_EQ(populated->target_transform_bytes_used, 17u);
+    CHECK_EQ(expected_owned_bytes, 5u + configured_uri_len);
+    REQUIRE_EQ(populated->target_transform_bytes_used, expected_owned_bytes);
     const auto& transform = populated->target_transforms[0];
     CHECK(transform.strip_prefix.eq(lit_str("/api/")));
-    CHECK(transform.replace_prefix.eq(lit_str("/v1/?fixed=1")));
+    CHECK(transform.replace_prefix.eq(expected_replacement));
     CHECK(str_is_in_owned_pool(transform.strip_prefix,
                                populated->target_transform_bytes,
                                populated->target_transform_bytes_used));
@@ -8469,6 +8594,8 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
         const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
         CHECK(address < nginx_begin || address >= nginx_end);
         CHECK(address < generated_begin || address >= generated_end);
+        CHECK(address < rir_strip_begin || address >= rir_strip_end);
+        CHECK(address < rir_replace_begin || address >= rir_replace_end);
     }
     REQUIRE_EQ(populated->response_policy_count, 1u);
     REQUIRE_EQ(populated->failure_policy_count, 1u);
@@ -8481,6 +8608,14 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
     REQUIRE_EQ(populated->redirect_policy_count, 1u);
     CHECK(populated->redirect_policies[0].target_path.eq(lit_str("/api/")));
     CHECK(populated->redirect_policy_strings_are_owned(populated->redirect_policies[0]));
+}
+
+TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_config) {
+    check_query_replacement_reaches_owned_runtime_config(_tc, "/v1/?fixed=1", 12u, 17u);
+}
+
+TEST(nginx_converter, issue360_empty_query_replacement_reaches_owned_runtime_config) {
+    check_query_replacement_reaches_owned_runtime_config(_tc, "/v1/?", 5u, 10u);
 }
 
 TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
@@ -9020,6 +9155,148 @@ TEST(nginx_converter, lowers_static_query_proxy_uri_to_exact_guarded_ordinary_ru
     replacement[4] = '/';
     expect_rejected(model, lit_str("invalid bounded proxy_pass URI model"), uri_span);
     replacement[4] = '?';
+}
+
+TEST(nginx_converter, issue360_lowers_terminal_empty_query_to_exact_ordinary_rut_source) {
+    char canonical_source[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/v1/?;\n"
+        "  }\n"
+        "}\n";
+    char location_first_source[] =
+        "server {\n"
+        "  location /api/ { proxy_pass http://127.0.0.1:19000/v1/?; }\n"
+        "  listen 18080;\n"
+        "}\n";
+    const auto parsed = nginx::parse({canonical_source, sizeof(canonical_source) - 1u});
+    const auto location_first =
+        nginx::parse({location_first_source, sizeof(location_first_source) - 1u});
+    REQUIRE(parsed);
+    REQUIRE(location_first);
+    const nginx::Server model = parsed.value();
+    const Span uri_span = model.location.proxy_pass.uri_span;
+    REQUIRE(model.location.proxy_pass.has_uri);
+    REQUIRE(model.location.proxy_pass.uri.eq(lit_str("/v1/?")));
+
+    const auto canonical_lowered = nginx::lower_to_rut(model);
+    const auto location_first_lowered = nginx::lower_to_rut(location_first.value());
+    REQUIRE(canonical_lowered);
+    REQUIRE(location_first_lowered);
+    const std::string canonical(canonical_lowered.value().data, canonical_lowered.value().len);
+    const std::string alternate(location_first_lowered.value().data,
+                                location_first_lowered.value().len);
+    REQUIRE(validate_empty_query_proxy_generated_source(canonical, 8080u, 9000u));
+    REQUIRE(validate_empty_query_proxy_generated_source(alternate, 18080u, 19000u));
+
+    char path_only_source[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    const auto path_only_model = nginx::parse({path_only_source, sizeof(path_only_source) - 1u});
+    REQUIRE(path_only_model);
+    const auto path_only_lowered = nginx::lower_to_rut(path_only_model.value());
+    REQUIRE(path_only_lowered);
+
+    // Derive the complete golden from the independently parsed `/v1/` sibling by
+    // changing exactly its one replacement line. The explicit length and
+    // headroom values below are therefore mechanically tied to retained profiles.
+    std::string expected(path_only_lowered.value().data, path_only_lowered.value().len);
+    static constexpr char kPathOnlyReplacement[] = "            replace_prefix: \"/v1/\"\n";
+    static constexpr char kEmptyQueryReplacement[] = "            replace_prefix: \"/v1/?\"\n";
+    const size_t replacement_offset = expected.find(kPathOnlyReplacement);
+    REQUIRE_NE(replacement_offset, std::string::npos);
+    CHECK_EQ(expected.find(kPathOnlyReplacement, replacement_offset + 1u), std::string::npos);
+    expected.replace(replacement_offset, sizeof(kPathOnlyReplacement) - 1u, kEmptyQueryReplacement);
+    CHECK_EQ(expected, canonical);
+    CHECK_EQ(canonical_lowered.value().len, path_only_lowered.value().len + 1u);
+    CHECK_EQ(canonical_lowered.value().len, 3337u);
+    CHECK_EQ(nginx::RutSource::kCapacity - canonical_lowered.value().len - 1u, 2608u);
+    CHECK_EQ(canonical_lowered.value().data[canonical_lowered.value().len], '\0');
+
+    // Declaration order changes neither model meaning nor any generated byte.
+    // Normalize only the two deliberately distinct ports before full equality.
+    std::string normalized = alternate;
+    const auto replace_once = [&](const std::string& from, const std::string& to) {
+        const size_t offset = normalized.find(from);
+        REQUIRE_NE(offset, std::string::npos);
+        CHECK_EQ(normalized.find(from, offset + from.size()), std::string::npos);
+        normalized.replace(offset, from.size(), to);
+    };
+    replace_once("listen :18080\n", "listen :8080\n");
+    replace_once("127.0.0.1:19000\"\n", "127.0.0.1:9000\"\n");
+    CHECK_EQ(normalized, canonical);
+
+    const auto expect_rejected = [&](const nginx::Server& candidate) {
+        const auto lowered = nginx::lower_to_rut(candidate);
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    };
+
+    static constexpr char kExternalIdentical[] = "/v1/?";
+    auto forged = model;
+    forged.location.proxy_pass.uri = {kExternalIdentical, sizeof(kExternalIdentical) - 1u};
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri = location_first.value().location.proxy_pass.uri;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri.ptr++;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri.len--;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri_span.start++;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri_span.end--;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri_span.line++;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.uri_span.col++;
+    expect_rejected(forged);
+    forged = model;
+    forged.location.proxy_pass.has_uri = false;
+    expect_rejected(forged);
+
+    char* replacement = canonical_source + uri_span.start;
+    replacement[4] = '/';  // missing terminal `?` leaves a dirty doubled slash.
+    expect_rejected(model);
+    replacement[4] = '?';
+    replacement[3] = '?';  // moved terminal delimiter.
+    replacement[4] = '/';
+    expect_rejected(model);
+    replacement[3] = '/';
+    replacement[4] = '?';
+    replacement[3] = '?';  // doubled delimiters.
+    expect_rejected(model);
+    replacement[3] = '/';
+    forged = model;
+    replacement[5] = '?';  // appended delimiter replaces `;` and widens the forged view.
+    forged.location.proxy_pass.uri.len++;
+    forged.location.proxy_pass.uri_span.end++;
+    expect_rejected(forged);
+    replacement[5] = ';';
+
+    forged = model;
+    forged.location.proxy_read_timeout.milliseconds = 1000u;
+    expect_rejected(forged);
+    forged = model;
+    forged.exact_no_content_return.response.status = 204u;
+    expect_rejected(forged);
+    forged = model;
+    forged.exact_local_return.response.status = 200u;
+    expect_rejected(forged);
+    forged = model;
+    forged.exact_absolute_redirect.response.status = 301u;
+    expect_rejected(forged);
+    forged = model;
+    forged.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
+    forged.pre_route_trace.span = {};
+    expect_rejected(forged);
 }
 
 TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_timeout) {
