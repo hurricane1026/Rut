@@ -13,8 +13,11 @@
 #include "rut/runtime/listener.h"
 #include "test.h"
 #include <cstddef>
+#include <iostream>
 #include <memory>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace rut;
@@ -63,6 +66,45 @@ static bool is_error(const FrontendResult<nginx::Server>& result,
     if (diagnostic.code != code || diagnostic.span.line != line || diagnostic.span.col != col)
         return false;
     return detail.empty() || diagnostic.detail.eq(detail);
+}
+
+static bool is_http_profile_error(const FrontendResult<nginx::HttpProfile>& result,
+                                  FrontendError code,
+                                  const std::string& source,
+                                  const std::string& token,
+                                  u32 occurrence = 0u) {
+    if (result) return false;
+    const Diagnostic& diagnostic = result.error();
+    size_t offset = token.empty() ? source.size() : 0u;
+    if (!token.empty()) {
+        for (u32 i = 0u; i <= occurrence; i++) {
+            offset = source.find(token, i == 0u ? 0u : offset + token.size());
+            if (offset == std::string::npos) return false;
+        }
+    }
+    if (offset == std::string::npos || diagnostic.code != code ||
+        diagnostic.span.start != static_cast<u32>(offset) ||
+        diagnostic.span.end != static_cast<u32>(offset + token.size()))
+        return false;
+    u32 line = 1u;
+    u32 col = 1u;
+    for (size_t i = 0; i < offset; i++) {
+        if (source[i] == '\n') {
+            line++;
+            col = 1u;
+        } else {
+            col++;
+        }
+    }
+    return diagnostic.span.line == line && diagnostic.span.col == col;
+}
+
+static std::string make_request_length_http_profile(const std::string& path,
+                                                    const std::string& server_content) {
+    return "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           path + " compat;\n  server {\n" + server_content + "  }\n}\n";
 }
 
 static bool find_const_i32(const rir::Function& function, rir::ValueId value, i32& out) {
@@ -246,6 +288,384 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().pre_route_trace.span.end, result.value().span.end);
     CHECK_EQ(result.value().pre_route_trace.span.line, result.value().span.line);
     CHECK_EQ(result.value().pre_route_trace.span.col, result.value().span.col);
+}
+
+TEST(nginx_http_profile_parser, models_exact_request_length_inventory_and_absolute_provenance) {
+    const char source[] =
+        "http {\n"
+        "  log_format compat \"$request_length\";\n"
+        "  access_log /var/log/rut/access.log compat;\n"
+        "  server {\n"
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  }\n"
+        "}\n";
+    const auto parsed = nginx::parse_http_profile({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto& profile = parsed.value();
+    const auto& format = profile.log_format;
+    const auto& access = profile.access_log;
+    const char* http = strstr(source, "http {");
+    const char* http_end = strrchr(source, '}');
+    const char* format_start = strstr(source, "log_format");
+    const char* format_end = strchr(format_start, ';');
+    const char* format_name = strstr(format_start, "compat");
+    const char* format_token = strstr(format_start, "\"$request_length\"");
+    const char* format_value = format_token + 1;
+    const char* access_start = strstr(source, "access_log");
+    const char* access_end = strchr(access_start, ';');
+    const char* path = strstr(access_start, "/var/log/rut/access.log");
+    const char* reference = strstr(path, "compat");
+    const char* server = strstr(source, "server {");
+    const char* server_end = strchr(strchr(server, '}') + 1, '}');
+    REQUIRE(http != nullptr);
+    REQUIRE(http_end != nullptr);
+    REQUIRE(format_start != nullptr);
+    REQUIRE(format_end != nullptr);
+    REQUIRE(format_name != nullptr);
+    REQUIRE(format_token != nullptr);
+    REQUIRE(access_start != nullptr);
+    REQUIRE(access_end != nullptr);
+    REQUIRE(path != nullptr);
+    REQUIRE(reference != nullptr);
+    REQUIRE(server != nullptr);
+    REQUIRE(server_end != nullptr);
+    const auto offset = [&](const char* ptr) { return static_cast<u32>(ptr - source); };
+    const auto line_col = [&](const char* ptr) {
+        u32 line = 1u;
+        u32 col = 1u;
+        for (const char* it = source; it != ptr; ++it) {
+            if (*it == '\n') {
+                line++;
+                col = 1u;
+            } else {
+                col++;
+            }
+        }
+        return std::pair<u32, u32>{line, col};
+    };
+    const auto check_span = [&](Span span, const char* begin, const char* end) {
+        const auto [line, col] = line_col(begin);
+        CHECK_EQ(span.start, offset(begin));
+        CHECK_EQ(span.end, offset(end));
+        CHECK_EQ(span.line, line);
+        CHECK_EQ(span.col, col);
+    };
+
+    CHECK_EQ(profile.source.ptr, source);
+    CHECK_EQ(profile.source.len, sizeof(source) - 1u);
+    check_span(profile.span, http, http_end + 1);
+    REQUIRE(format.profile == nginx::LogFormatProfile::RequestLengthOnly);
+    CHECK(format.name.eq(lit_str("compat")));
+    CHECK_EQ(format.name.ptr, format_name);
+    check_span(format.name_span, format_name, format_name + 6);
+    CHECK(format.value.eq(lit_str("$request_length")));
+    CHECK_EQ(format.value.ptr, format_value);
+    check_span(format.value_span, format_value, format_value + 15);
+    check_span(format.token_span, format_token, format_token + 17);
+    check_span(format.span, format_start, format_end + 1);
+    REQUIRE(access.destination_profile == nginx::AccessLogDestinationProfile::FilePath);
+    CHECK(access.path.eq(lit_str("/var/log/rut/access.log")));
+    CHECK_EQ(access.path.ptr, path);
+    check_span(access.path_span, path, path + strlen("/var/log/rut/access.log"));
+    CHECK(access.format_name.eq(lit_str("compat")));
+    CHECK_EQ(access.format_name.ptr, reference);
+    CHECK_NE(access.format_name.ptr, format.name.ptr);
+    check_span(access.format_name_span, reference, reference + 6);
+    check_span(access.span, access_start, access_end + 1);
+    check_span(profile.server.span, server, server_end + 1);
+    CHECK_EQ(profile.server.listen.port, 8080u);
+    CHECK_EQ(profile.server.location.proxy_pass.port, 9000u);
+    CHECK_LE(profile.span.start, format.span.start);
+    CHECK_LE(format.span.end, access.span.start);
+    CHECK_LE(access.span.end, profile.server.span.start);
+    CHECK_LE(profile.server.span.end, profile.span.end);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(source);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(format.name.ptr) - format.name_span.start, base);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(format.value.ptr) - format.value_span.start, base);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(access.path.ptr) - access.path_span.start, base);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(access.format_name.ptr) - access.format_name_span.start,
+             base);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(profile.server.location.path.ptr) -
+                 profile.server.location.path_span.start,
+             base);
+}
+
+TEST(nginx_http_profile_parser,
+     accepts_allowed_gaps_server_orders_and_retains_only_borrowed_lifetime_metadata) {
+    const std::string listen_first =
+        "    listen 8080;\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n";
+    const std::string location_first =
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "    listen 8080;\n";
+    for (const auto& server_content : {listen_first, location_first}) {
+        const std::string source =
+            make_request_length_http_profile("/logs/access.log", server_content);
+        const auto parsed =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        CHECK_EQ(parsed.value().server.listen.port, 8080u);
+        CHECK(parsed.value().server.location.path.eq(lit_str("/")));
+        CHECK_EQ(parsed.value().server.location.proxy_pass.port, 9000u);
+        CHECK_EQ(parsed.value().server.span.start, static_cast<u32>(source.find("server {")));
+    }
+
+    const std::string commented =
+        "# leading\n"
+        "http # wrapper\n"
+        "{\n"
+        "  log_format # name gap\n"
+        "    compat # format gap\n"
+        "    \"$request_length\" # terminator gap\n"
+        "    ;\n"
+        "  access_log # path gap\n"
+        "    /logs/access.log # reference gap\n"
+        "    compat # terminator gap\n"
+        "    ;\n"
+        "  server {\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "    listen 8080;\n"
+        "  }\n"
+        "}\n"
+        "# trailing only\n";
+    auto storage = std::make_unique<char[]>(commented.size());
+    memcpy(storage.get(), commented.data(), commented.size());
+    auto parsed = nginx::parse_http_profile({storage.get(), static_cast<u32>(commented.size())});
+    REQUIRE(parsed);
+    CHECK_EQ(parsed.value().source.ptr, storage.get());
+    CHECK(parsed.value().log_format.name.eq(lit_str("compat")));
+    CHECK(parsed.value().log_format.value.eq(lit_str("$request_length")));
+    CHECK(parsed.value().access_log.path.eq(lit_str("/logs/access.log")));
+    const Span http_span = parsed.value().span;
+    const Span format_span = parsed.value().log_format.span;
+    const Span access_span = parsed.value().access_log.span;
+    const Span server_span = parsed.value().server.span;
+    const auto format_profile = parsed.value().log_format.profile;
+    const auto destination_profile = parsed.value().access_log.destination_profile;
+    const u16 listen_port = parsed.value().server.listen.port;
+    const u16 upstream_port = parsed.value().server.location.proxy_pass.port;
+    memset(storage.get(), 'x', commented.size());
+    storage.reset();
+    CHECK_EQ(http_span.start, static_cast<u32>(commented.find("http")));
+    CHECK_LT(http_span.start, format_span.start);
+    CHECK_LT(format_span.end, access_span.start);
+    CHECK_LT(access_span.end, server_span.start);
+    CHECK_LE(server_span.end, http_span.end);
+    CHECK(format_profile == nginx::LogFormatProfile::RequestLengthOnly);
+    CHECK(destination_profile == nginx::AccessLogDestinationProfile::FilePath);
+    CHECK_EQ(listen_port, 8080u);
+    CHECK_EQ(upstream_port, 9000u);
+
+    const char bare[] = "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    REQUIRE(nginx::parse({bare, sizeof(bare) - 1u}));
+    const auto rejected_bare = nginx::parse_http_profile({bare, sizeof(bare) - 1u});
+    REQUIRE_FALSE(rejected_bare);
+    CHECK_EQ(rejected_bare.error().code, FrontendError::UnsupportedSyntax);
+    const std::string wrapped = make_request_length_http_profile("/logs/access.log", listen_first);
+    const auto rejected_wrapped = nginx::parse({wrapped.data(), static_cast<u32>(wrapped.size())});
+    REQUIRE_FALSE(rejected_wrapped);
+    CHECK_EQ(rejected_wrapped.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(rejected_wrapped.error().span.start, 0u);
+}
+
+TEST(nginx_http_profile_parser, enforces_bounded_clean_absolute_access_path_profile) {
+    const std::string server_content =
+        "    listen 8080;\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n";
+    for (const std::string& path : {"/a", "/var/log/rut.access_1-log", "/A0/.hidden/file"}) {
+        const std::string source = make_request_length_http_profile(path, server_content);
+        const auto parsed =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        CHECK_EQ(parsed.value().access_log.path.len, path.size());
+        CHECK_EQ(parsed.value().access_log.path.ptr,
+                 source.data() + parsed.value().access_log.path_span.start);
+    }
+
+    const std::string maximum = "/" + std::string(nginx::kMaxAccessLogPathLen - 1u, 'a');
+    REQUIRE_EQ(maximum.size(), nginx::kMaxAccessLogPathLen);
+    std::string source = make_request_length_http_profile(maximum, server_content);
+    auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    CHECK_EQ(parsed.value().access_log.path.len, nginx::kMaxAccessLogPathLen);
+
+    const std::string oversized = "/" + std::string(nginx::kMaxAccessLogPathLen, 'a');
+    source = make_request_length_http_profile(oversized, server_content);
+    parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE_FALSE(parsed);
+    CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(parsed.error().span.start, static_cast<u32>(source.find(oversized)));
+    CHECK_EQ(parsed.error().span.end - parsed.error().span.start, nginx::kMaxAccessLogPathLen + 1u);
+
+    const std::vector<std::string> rejected_paths = {
+        "relative.log",
+        "stderr",
+        "off",
+        "syslog:server=127.0.0.1",
+        "/dev/stderr",
+        "/",
+        "//log",
+        "/a//log",
+        "/a/",
+        "/./log",
+        "/../log",
+        "/a/./log",
+        "/a/../log",
+        "/a/$request_length",
+        "/a/log\\name",
+        "\"/a/log\"",
+        "/a/log:name",
+        std::string("/a/log") + static_cast<char>(1) + "x",
+    };
+    for (const auto& path : rejected_paths) {
+        source = make_request_length_http_profile(path, server_content);
+        const auto rejected =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE_FALSE(rejected);
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rejected.error().span.start, static_cast<u32>(source.find(path)));
+        CHECK_EQ(rejected.error().span.line, 3u);
+        CHECK_EQ(rejected.error().span.col, 14u);
+    }
+}
+
+TEST(nginx_http_profile_parser, rejects_broader_root_logging_and_shell_inventory_at_mutations) {
+    const std::string server =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    const std::string base =
+        "http { log_format compat \"$request_length\"; access_log "
+        "/logs/access.log compat; " +
+        server + " }";
+    const auto reject = [&](const std::string& source,
+                            FrontendError code,
+                            const std::string& token,
+                            u32 occurrence = 0u) {
+        const auto parsed =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        const bool matched = is_http_profile_error(parsed, code, source, token, occurrence);
+        if (!matched) {
+            std::cerr << "http-profile mutation diagnostic mismatch: token='" << token
+                      << "' occurrence=" << occurrence << " source='" << source << "'\n";
+            if (parsed)
+                std::cerr << "mutation was unexpectedly accepted\n";
+            else
+                std::cerr << "actual code=" << static_cast<u32>(parsed.error().code)
+                          << " span=" << parsed.error().span.start << ".."
+                          << parsed.error().span.end << " line=" << parsed.error().span.line
+                          << " col=" << parsed.error().span.col << "\n";
+        }
+        CHECK(matched);
+    };
+    const auto replace_once = [&](const std::string& from, const std::string& to) {
+        std::string changed = base;
+        const size_t offset = changed.find(from);
+        if (offset == std::string::npos) return std::string{};
+        changed.replace(offset, from.size(), to);
+        return changed;
+    };
+
+    reject(replace_once("\"$request_length\"", "\"$bytes_sent\""),
+           FrontendError::UnsupportedSyntax,
+           "\"$bytes_sent\"");
+    reject(replace_once("\"$request_length\"", "\"x$request_length\""),
+           FrontendError::UnsupportedSyntax,
+           "\"x$request_length\"");
+    reject(replace_once("log_format compat", "log_format other"),
+           FrontendError::UnsupportedSyntax,
+           "other");
+    reject(replace_once("log_format compat", "log_format \"compat\""),
+           FrontendError::UnsupportedSyntax,
+           "\"compat\"");
+    reject(replace_once("compat \"$request_length\"", "compat escape=json \"$request_length\""),
+           FrontendError::UnsupportedSyntax,
+           "escape=json");
+    reject(replace_once("\"$request_length\"", "'$request_length'"),
+           FrontendError::UnsupportedSyntax,
+           "'$request_length'");
+    reject(replace_once("\"$request_length\"", "$request_length"),
+           FrontendError::UnsupportedSyntax,
+           "$request_length");
+    reject(replace_once("\"$request_length\"", "\"\\$request_length\""),
+           FrontendError::UnsupportedSyntax,
+           "\"\\$request_length\"");
+    reject(replace_once("\"$request_length\"", "\" $request_length\""),
+           FrontendError::UnsupportedSyntax,
+           "\"");
+    reject(replace_once("\"$request_length\";", "\"$request_length\" escape=json;"),
+           FrontendError::UnsupportedSyntax,
+           "escape=json");
+    reject(replace_once("log_format compat \"$request_length\"; ", ""),
+           FrontendError::UnsupportedSyntax,
+           "access_log");
+    reject(replace_once("access_log /logs/access.log compat; ", ""),
+           FrontendError::UnsupportedSyntax,
+           "server");
+    reject(replace_once("log_format compat \"$request_length\"; access_log",
+                        "access_log /logs/access.log compat; log_format compat "
+                        "\"$request_length\"; access_log"),
+           FrontendError::UnsupportedSyntax,
+           "access_log");
+    reject(replace_once("access_log /logs/access.log compat;",
+                        "log_format compat \"$request_length\"; access_log "
+                        "/logs/access.log compat;"),
+           FrontendError::UnsupportedSyntax,
+           "log_format",
+           1u);
+    reject(replace_once("access_log /logs/access.log compat;",
+                        "access_log /logs/access.log compat; access_log /logs/other.log compat;"),
+           FrontendError::UnsupportedSyntax,
+           "access_log",
+           1u);
+    reject(replace_once("access.log compat", "access.log other"),
+           FrontendError::UnsupportedSyntax,
+           "other");
+    reject(replace_once("access.log compat;", "access.log compat buffer=32k;"),
+           FrontendError::UnsupportedSyntax,
+           "buffer=32k");
+    reject(replace_once("access.log compat;", "access.log compat flush=1s;"),
+           FrontendError::UnsupportedSyntax,
+           "flush=1s");
+    reject(replace_once("access.log compat;", "access.log compat extra;"),
+           FrontendError::UnsupportedSyntax,
+           "extra");
+    reject(replace_once("access.log compat; ", "access.log compat; gzip on; "),
+           FrontendError::UnsupportedSyntax,
+           "gzip");
+    reject(replace_once("access.log compat; ", "access.log compat; if ($x) {} "),
+           FrontendError::UnsupportedSyntax,
+           "if");
+    reject(replace_once(server, server + " " + server),
+           FrontendError::UnsupportedSyntax,
+           "server",
+           1u);
+    reject(replace_once("listen 8080;", "listen 8080; access_log /logs/inner.log compat;"),
+           FrontendError::UnsupportedSyntax,
+           "access_log",
+           1u);
+    reject(replace_once("location / {", "location / { access_log /logs/inner.log compat;"),
+           FrontendError::UnsupportedSyntax,
+           "access_log",
+           1u);
+    reject(replace_once("access.log compat; ", "access.log compat; unknown value; "),
+           FrontendError::UnsupportedSyntax,
+           "unknown");
+    reject(replace_once("access.log compat; ", "access.log compat; http {} "),
+           FrontendError::UnsupportedSyntax,
+           "http",
+           1u);
+    reject("events {} " + base, FrontendError::UnsupportedSyntax, "events");
+    reject("error_log stderr notice; " + base, FrontendError::UnsupportedSyntax, "error_log");
+    reject("include nginx.conf; " + base, FrontendError::UnsupportedSyntax, "include");
+    reject("daemon off; " + base, FrontendError::UnsupportedSyntax, "daemon");
+    reject(base + " trailing", FrontendError::UnexpectedToken, "trailing");
+    reject(replace_once("\"$request_length\";", "\"$request_length\""),
+           FrontendError::UnsupportedSyntax,
+           "access_log");
+    reject(replace_once("access.log compat;", "access.log compat"),
+           FrontendError::UnsupportedSyntax,
+           "server");
+    reject(base.substr(0u, base.size() - 1u), FrontendError::UnexpectedEof, "", 0u);
 }
 
 TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {

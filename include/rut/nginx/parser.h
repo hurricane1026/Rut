@@ -169,8 +169,59 @@ struct Server {
     ImplicitPreRouteTrace pre_route_trace{};
 };
 
+// The first bounded access-log compatibility slice accepts one clean absolute
+// path token. This is a syntax/semantic destination classification only: the
+// parser does not inspect or claim the type of the eventual filesystem node.
+static constexpr u32 kMaxAccessLogPathLen = 255;
+
+enum class LogFormatProfile : u8 {
+    None,
+    RequestLengthOnly,
+};
+
+struct LogFormat {
+    LogFormatProfile profile = LogFormatProfile::None;
+    Str name{};
+    Span name_span{};
+    // `value` is the exact inner value while `token_span` includes quotes.
+    Str value{};
+    Span value_span{};
+    Span token_span{};
+    Span span{};
+};
+
+enum class AccessLogDestinationProfile : u8 {
+    None,
+    FilePath,
+};
+
+struct AccessLog {
+    AccessLogDestinationProfile destination_profile = AccessLogDestinationProfile::None;
+    Str path{};
+    Span path_span{};
+    Str format_name{};
+    Span format_name_span{};
+    Span span{};
+};
+
+// One deliberately bounded `http` profile. All Str fields, including `source`,
+// borrow the caller-owned input. Child spans are absolute within that complete
+// source; later lowering must independently revalidate any externally forged
+// model before reading those borrows.
+struct HttpProfile {
+    Str source{};
+    Span span{};
+    LogFormat log_format{};
+    AccessLog access_log{};
+    Server server{};
+};
+
 // Parse exactly one minimal nginx server fragment. The returned model borrows
 // strings from source; the caller owns the source storage for its lifetime.
 FrontendResult<Server> parse(Str source);
+
+// Parse only the explicitly bounded request-length http profile documented by
+// HttpProfile. This is not a general nginx.conf grammar.
+FrontendResult<HttpProfile> parse_http_profile(Str source);
 
 }  // namespace rut::nginx

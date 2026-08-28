@@ -199,6 +199,30 @@ bool exact_local_return_path_is_clean(Str path) {
         (segment_len == 2 && path.ptr[segment_start] == '.' && path.ptr[segment_start + 1] == '.'));
 }
 
+bool access_log_path_is_clean(Str path) {
+    if (path.ptr == nullptr || path.len < 2u || path.len > kMaxAccessLogPathLen ||
+        path.ptr[0] != '/' || path.ptr[path.len - 1u] == '/' || eq(path, "/dev/stderr", 11))
+        return false;
+
+    u32 segment_start = 1u;
+    for (u32 i = 1u; i <= path.len; i++) {
+        if (i != path.len && path.ptr[i] != '/') {
+            const u8 byte = static_cast<u8>(path.ptr[i]);
+            if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                  (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-'))
+                return false;
+            continue;
+        }
+        const u32 segment_len = i - segment_start;
+        if (segment_len == 0u || (segment_len == 1u && path.ptr[segment_start] == '.') ||
+            (segment_len == 2u && path.ptr[segment_start] == '.' &&
+             path.ptr[segment_start + 1u] == '.'))
+            return false;
+        segment_start = i + 1u;
+    }
+    return true;
+}
+
 auto invalid(Span span, Str detail) {
     return frontend_error(FrontendError::UnexpectedToken, span, detail);
 }
@@ -241,6 +265,82 @@ public:
             return unsupported(cur_.span, lit_str("http/events wrappers are unsupported"));
         if (!eq(cur_.text, "server", 6)) return invalid(cur_.span, lit_str("expected server"));
 
+        auto parsed = parse_server();
+        if (!parsed) return core::make_unexpected(parsed.error());
+        if (cur_.kind != TokenKind::End) {
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
+                return unsupported(cur_.span, lit_str("multiple servers are unsupported"));
+            return invalid(cur_.span, lit_str("trailing unexpected tokens"));
+        }
+        return parsed.value();
+    }
+
+    FrontendResult<HttpProfile> run_http_profile() {
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("http profile is empty"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "http", 4))
+            return unsupported(cur_.span, lit_str("expected bounded http profile"));
+        const Span start = cur_.span;
+        advance();
+        if (!expect(TokenKind::LBrace, lit_str("expected '{' after http")))
+            return core::make_unexpected(error_);
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing log_format in http profile"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "log_format", 10))
+            return unsupported(cur_.span, lit_str("expected one log_format before access_log"));
+        auto format = parse_log_format();
+        if (!format) return core::make_unexpected(format.error());
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing access_log in http profile"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "access_log", 10)) {
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
+                return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
+            return unsupported(cur_.span, lit_str("expected one access_log after log_format"));
+        }
+        auto access = parse_access_log();
+        if (!access) return core::make_unexpected(access.error());
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing server in http profile"));
+        if (cur_.kind != TokenKind::Word || !eq(cur_.text, "server", 6)) {
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "access_log", 10))
+                return unsupported(cur_.span, lit_str("duplicate access_log is unsupported"));
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
+                return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
+            return unsupported(cur_.span, lit_str("expected one server after access_log"));
+        }
+        auto server = parse_server();
+        if (!server) return core::make_unexpected(server.error());
+
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for http profile"));
+        if (cur_.kind != TokenKind::RBrace) {
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
+                return unsupported(cur_.span, lit_str("multiple servers are unsupported"));
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "access_log", 10))
+                return unsupported(cur_.span, lit_str("duplicate access_log is unsupported"));
+            if (cur_.kind == TokenKind::Word && eq(cur_.text, "log_format", 10))
+                return unsupported(cur_.span, lit_str("duplicate log_format is unsupported"));
+            return unsupported(cur_.span, lit_str("unknown http directive"));
+        }
+        const Span end = cur_.span;
+        advance();
+        if (cur_.kind != TokenKind::End)
+            return invalid(cur_.span, lit_str("trailing unexpected tokens after http profile"));
+
+        HttpProfile result{};
+        result.source = source_;
+        result.span = Span{start.start, end.end, start.line, start.col};
+        result.log_format = format.value();
+        result.access_log = access.value();
+        result.server = server.value();
+        return result;
+    }
+
+private:
+    FrontendResult<Server> parse_server() {
         const Span start = cur_.span;
         advance();
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after server")))
@@ -318,15 +418,8 @@ public:
         // fallback, optional exact location, and declaration order.
         result.pre_route_trace.profile = ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
         result.pre_route_trace.span = result.span;
-        if (cur_.kind != TokenKind::End) {
-            if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
-                return unsupported(cur_.span, lit_str("multiple servers are unsupported"));
-            return invalid(cur_.span, lit_str("trailing unexpected tokens"));
-        }
         return result;
     }
-
-private:
     bool expect(TokenKind kind, Str detail) {
         if (cur_.kind == kind) {
             advance();
@@ -339,6 +432,87 @@ private:
     }
 
     void advance() { cur_ = lexer_.next(); }
+
+    FrontendResult<LogFormat> parse_log_format() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("log_format requires a name and format"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("log_format requires a name"));
+        const Token name = cur_;
+        if (!eq(name.text, "compat", 6))
+            return unsupported(name.span, lit_str("only log_format name compat is supported"));
+
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("log_format requires an exact format"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("log_format requires an exact format"));
+        const Token value = cur_;
+        if (!eq(value.text, "\"$request_length\"", 17))
+            return unsupported(value.span,
+                               lit_str("only exact quoted $request_length format is supported"));
+
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after log_format"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("log_format options are unsupported"));
+            return invalid(cur_.span, lit_str("expected ';' after log_format"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return LogFormat{
+            LogFormatProfile::RequestLengthOnly,
+            name.text,
+            name.span,
+            value.text.slice(1u, value.text.len - 1u),
+            Span{value.span.start + 1u, value.span.end - 1u, value.span.line, value.span.col + 1u},
+            value.span,
+            Span{start.start, end.end, start.line, start.col}};
+    }
+
+    FrontendResult<AccessLog> parse_access_log() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("access_log requires a destination and format"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("access_log requires a destination"));
+        const Token path = cur_;
+        if (!access_log_path_is_clean(path.text))
+            return unsupported(path.span,
+                               lit_str("access_log destination is outside the bounded file-path "
+                                       "profile"));
+
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("access_log requires format reference compat"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("access_log requires format reference compat"));
+        const Token reference = cur_;
+        if (!eq(reference.text, "compat", 6))
+            return unsupported(reference.span, lit_str("access_log must reference format compat"));
+
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after access_log"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return unsupported(cur_.span, lit_str("access_log options are unsupported"));
+            return invalid(cur_.span, lit_str("expected ';' after access_log"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return AccessLog{AccessLogDestinationProfile::FilePath,
+                         path.text,
+                         path.span,
+                         reference.text,
+                         reference.span,
+                         Span{start.start, end.end, start.line, start.col}};
+    }
 
     FrontendResult<Listen> parse_listen() {
         const Span start = cur_.span;
@@ -865,6 +1039,10 @@ bool proxy_pass_replacement_uri_is_clean(Str uri) {
 
 FrontendResult<Server> parse(Str source) {
     return Parser(source).run();
+}
+
+FrontendResult<HttpProfile> parse_http_profile(Str source) {
+    return Parser(source).run_http_profile();
 }
 
 }  // namespace rut::nginx
