@@ -5,6 +5,12 @@
 #include <string>
 #include <vector>
 
+#ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+#include <cstring>
+#include <functional>
+#include <thread>
+#endif
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -288,22 +294,128 @@ struct ProcessResult {
     bool shutdown_signal_sent = false;
 };
 
-bool child_blocks_signal(pid_t child, i32 signal_number) {
-    std::ifstream status("/proc/" + std::to_string(child) + "/status");
-    std::string key;
-    while (status >> key) {
-        if (key != "SigBlk:") {
-            std::string ignored;
-            std::getline(status, ignored);
+#ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+struct ProxyBackendResult {
+    std::string request;
+    u32 accepts = 0u;
+    u32 sends = 0u;
+    bool timed_out = false;
+};
+
+bool write_all(i32 fd, const char* bytes, size_t length) {
+    size_t written = 0u;
+    while (written < length) {
+        const ssize_t n = write(fd, bytes + written, length - written);
+        if (n > 0) {
+            written += static_cast<size_t>(n);
             continue;
         }
-        unsigned long long mask = 0;
-        status >> std::hex >> mask;
-        const unsigned shift = static_cast<unsigned>(signal_number - 1);
-        return shift < 64u && (mask & (1ull << shift)) != 0u;
+        if (n < 0 && errno == EINTR) continue;
+        return false;
     }
+    return true;
+}
+
+i32 bind_loopback_listener(u16 first_port, u16 last_port, u16& port) {
+    for (u32 candidate = first_port; candidate <= last_port; candidate++) {
+        const i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return -1;
+        struct sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(static_cast<u16>(candidate));
+        if (bind(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) == 0 &&
+            listen(fd, 4) == 0) {
+            port = static_cast<u16>(candidate);
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
+    static constexpr char kResponse[] =
+        "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    struct pollfd ready{listener, POLLIN, 0};
+    if (poll(&ready, 1, 5000) <= 0) {
+        result.timed_out = true;
+        close(listener);
+        return;
+    }
+    const i32 client = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    if (client < 0) {
+        result.timed_out = true;
+        close(listener);
+        return;
+    }
+    result.accepts++;
+    char bytes[512];
+    for (u32 attempt = 0; attempt < 50u; attempt++) {
+        struct pollfd input{client, POLLIN, 0};
+        const i32 polled = poll(&input, 1, 100);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0) continue;
+        const ssize_t n = read(client, bytes, sizeof(bytes));
+        if (n > 0) {
+            result.request.append(bytes, static_cast<size_t>(n));
+            if (result.request.find("\r\n\r\n") != std::string::npos) break;
+            continue;
+        }
+        break;
+    }
+    if (result.request.find("\r\n\r\n") == std::string::npos) result.timed_out = true;
+    if (write_all(client, kResponse, sizeof(kResponse) - 1u)) result.sends++;
+    close(client);
+    struct pollfd retry{listener, POLLIN, 0};
+    if (poll(&retry, 1, 300) > 0) {
+        const i32 extra = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+        if (extra >= 0) {
+            result.accepts++;
+            close(extra);
+        }
+    }
+    close(listener);
+}
+
+bool transact_loopback(u16 port,
+                       const char* request,
+                       size_t request_length,
+                       std::string& response) {
+    const i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    struct sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    if (connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) != 0 ||
+        !write_all(fd, request, request_length)) {
+        close(fd);
+        return false;
+    }
+    (void)shutdown(fd, SHUT_WR);
+    char bytes[512];
+    for (u32 attempt = 0; attempt < 50u; attempt++) {
+        struct pollfd ready{fd, POLLIN | POLLHUP, 0};
+        const i32 polled = poll(&ready, 1, 100);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0) continue;
+        const ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n > 0) {
+            response.append(bytes, static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0) {
+            close(fd);
+            return true;
+        }
+        if (errno == EINTR) continue;
+        break;
+    }
+    close(fd);
     return false;
 }
+#endif
 
 ProcessResult run_rut(const std::vector<std::string>& args,
                       bool enable_env_compression = false,
@@ -352,8 +464,7 @@ ProcessResult run_rut(const std::vector<std::string>& args,
             break;
         }
         if (terminate_after_listening && !termination_sent &&
-            result.output.find("Listening on") != std::string::npos &&
-            child_blocks_signal(child, SIGTERM)) {
+            result.output.find("Listening on") != std::string::npos) {
             if (kill(child, SIGTERM) == 0) {
                 result.shutdown_signal_sent = true;
                 termination_sent = true;
@@ -384,6 +495,139 @@ ProcessResult run_rut(const std::vector<std::string>& args,
 }
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
+struct SourceLiveProxyResult {
+    ProcessResult process;
+    ProxyBackendResult backend;
+    std::string response;
+    bool request_completed = false;
+    bool backend_joined_live = false;
+    bool sink_prefixes_valid = true;
+    bool sink_observed_live = false;
+};
+
+u16 listening_port(const std::string& output) {
+    static constexpr char kMarker[] = "Listening on port ";
+    const size_t marker = output.find(kMarker);
+    if (marker == std::string::npos) return 0u;
+    size_t cursor = marker + sizeof(kMarker) - 1u;
+    u32 value = 0u;
+    bool any = false;
+    while (cursor < output.size() && output[cursor] >= '0' && output[cursor] <= '9') {
+        any = true;
+        value = value * 10u + static_cast<u32>(output[cursor] - '0');
+        cursor++;
+    }
+    return any && value <= 65535u ? static_cast<u16>(value) : 0u;
+}
+
+bool is_prefix_of(const std::string& value, const char* expected) {
+    const size_t expected_length = std::strlen(expected);
+    return value.size() <= expected_length &&
+           std::memcmp(value.data(), expected, value.size()) == 0;
+}
+
+SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args,
+                                            const std::string& sink,
+                                            i32 backend_listener,
+                                            const char* request,
+                                            size_t request_length) {
+    SourceLiveProxyResult result{};
+    i32 output_pipe[2];
+    if (pipe(output_pipe) != 0) {
+        close(backend_listener);
+        return result;
+    }
+    const pid_t child = fork();
+    if (child == 0) {
+        close(output_pipe[0]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(output_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
+        close(output_pipe[1]);
+        unsetenv("RUE_ACCESS_LOG_COMPRESS");
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1u);
+        for (const std::string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        execv(argv[0], argv.data());
+        _exit(127);
+    }
+    if (child < 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        close(backend_listener);
+        return result;
+    }
+    close(output_pipe[1]);
+    std::thread backend(record_one_proxy_request, backend_listener, std::ref(result.backend));
+    const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
+    if (old_flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK);
+
+    char bytes[1024];
+    bool reaped = false;
+    bool transaction_attempted = false;
+    bool backend_joined = false;
+    bool termination_sent = false;
+    for (u32 attempt = 0; attempt < 80u && !reaped; attempt++) {
+        struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
+        (void)poll(&ready, 1, 100);
+        for (;;) {
+            const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
+            if (n > 0) {
+                result.process.output.append(bytes, static_cast<size_t>(n));
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        const u16 port = listening_port(result.process.output);
+        if (!transaction_attempted && port != 0u) {
+            transaction_attempted = true;
+            result.request_completed =
+                transact_loopback(port, request, request_length, result.response);
+        }
+        if (transaction_attempted && !backend_joined) {
+            backend.join();
+            backend_joined = true;
+            result.backend_joined_live = waitpid(child, &result.process.status, WNOHANG) == 0;
+        }
+        if (transaction_attempted) {
+            const std::string current = read_file(sink);
+            if (!is_prefix_of(current, "102\n")) result.sink_prefixes_valid = false;
+            if (!termination_sent && current == "102\n" && backend_joined &&
+                result.backend.accepts == 1u && result.backend.sends == 1u &&
+                waitpid(child, &result.process.status, WNOHANG) == 0) {
+                result.sink_observed_live = true;
+                if (kill(child, SIGTERM) == 0) {
+                    result.process.shutdown_signal_sent = true;
+                    termination_sent = true;
+                }
+            }
+        }
+        const pid_t waited = waitpid(child, &result.process.status, WNOHANG);
+        reaped = waited == child;
+        if (reaped) result.process.status_valid = true;
+        if (waited < 0 && errno != EINTR && errno != ECHILD) break;
+    }
+    if (!backend_joined) backend.join();
+    if (!reaped) {
+        result.process.forced_kill = true;
+        (void)kill(child, SIGKILL);
+        reaped = waitpid(child, &result.process.status, 0) == child;
+        if (reaped) result.process.status_valid = true;
+    }
+    for (;;) {
+        const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
+        if (n > 0) {
+            result.process.output.append(bytes, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(output_pipe[0]);
+    return result;
+}
+
 bool exited_one(const ProcessResult& result) {
     return result.status_valid && !result.forced_kill && WIFEXITED(result.status) &&
            WEXITSTATUS(result.status) == 1;
@@ -394,37 +638,96 @@ std::string source_with_sink(const std::string& sink) {
            "\", format: downstreamRequestBytes, publication: live }\n"
            "route GET \"/\" { return 204 }\n";
 }
+
+std::string source_live_proxy(const std::string& sink, u16 backend_port) {
+    return "accessLog { path: \"" + sink +
+           "\", format: downstreamRequestBytes, publication: live }\n"
+           "listen :0\n"
+           "upstream backend at \"127.0.0.1:" +
+           std::to_string(backend_port) +
+           "\"\n"
+           "route \"/\" {\n"
+           "  return forward(backend, request_policy: { version: \"HTTP/1.1\", "
+           "host: \"upstream\", connection: \"omit\", strip_headers: "
+           "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] })\n"
+           "}\n";
+}
 #endif
 
 }  // namespace
 
 #ifdef RUT_ACCESS_LOG_STARTUP_SOURCE_PROCESS_TEST
-TEST(access_log_startup, public_main_validates_source_sink_then_gates_before_listening) {
+TEST(access_log_startup, public_main_source_live_publishes_downstream_size_before_shutdown) {
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-main-XXXXXX");
     REQUIRE_FALSE(dir.empty());
     const std::string program = dir + "/app.rut";
     const std::string sink = dir + "/source.log";
-    REQUIRE(write_file(program, source_with_sink(sink)));
+    u16 backend_port = 0u;
+    const i32 backend_listener = bind_loopback_listener(1024u, 9999u, backend_port);
+    REQUIRE(backend_listener >= 0);
+    REQUIRE_GE(backend_port, 1024u);
+    REQUIRE_LE(backend_port, 9999u);
+    REQUIRE(write_file(program, source_live_proxy(sink, backend_port)));
 
-    ProcessResult result =
-        run_rut({RUT_SERVER_BINARY, program, "--shards", "1", "--no-pin", "--drain", "0"});
-    REQUIRE(exited_one(result));
-    CHECK(result.output.find("source accessLog requires reliable live publication support") !=
-          std::string::npos);
-    CHECK(result.output.find("Listening on") == std::string::npos);
-    CHECK(result.output.find("Backend:") == std::string::npos);
+    static constexpr char kClientRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test: keep\r\n"
+        "\r\n";
+    static constexpr char kBackendResponse[] =
+        "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    static_assert(sizeof(kClientRequest) - 1u == 102u);
+    const std::string expected_backend =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Test: keep\r\n\r\n";
+    REQUIRE_EQ(expected_backend.size(), 66u);
+    REQUIRE_NE(sizeof(kClientRequest) - 1u, expected_backend.size());
+
+    SourceLiveProxyResult live = run_source_live_proxy(
+        {RUT_SERVER_BINARY, program, "--shards", "1", "--no-pin", "--drain", "0"},
+        sink,
+        backend_listener,
+        kClientRequest,
+        sizeof(kClientRequest) - 1u);
+    CHECK(live.request_completed);
+    CHECK(live.backend_joined_live);
+    CHECK(live.sink_prefixes_valid);
+    CHECK(live.sink_observed_live);
+    CHECK_FALSE(live.backend.timed_out);
+    CHECK_EQ(live.backend.accepts, 1u);
+    CHECK_EQ(live.backend.sends, 1u);
+    CHECK_EQ(live.backend.request, expected_backend);
+    CHECK_EQ(live.response, kBackendResponse);
+    CHECK(live.process.output.find("Listening on") != std::string::npos);
+    CHECK(live.process.output.find("Fatal SourceLive") == std::string::npos);
+    CHECK(live.process.output.find("falling back") == std::string::npos);
+    CHECK(live.process.shutdown_signal_sent);
+    CHECK_FALSE(live.process.forced_kill);
+    REQUIRE(live.process.status_valid);
+    REQUIRE(WIFEXITED(live.process.status));
+    CHECK_EQ(WEXITSTATUS(live.process.status), 0);
+    CHECK_EQ(read_file(sink), "102\n");
     struct stat status{};
     REQUIRE_EQ(stat(sink.c_str(), &status), 0);
     CHECK(S_ISREG(status.st_mode));
-    CHECK_EQ(status.st_size, 0);
+    CHECK_EQ(status.st_size, 4);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(access_log_startup, public_main_source_live_open_failure_stays_before_listening) {
+    const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-open-fail-XXXXXX");
+    REQUIRE_FALSE(dir.empty());
+    const std::string program = dir + "/app.rut";
 
     const std::string missing_sink = dir + "/missing/source.log";
     REQUIRE(write_file(program, source_with_sink(missing_sink)));
-    result = run_rut({RUT_SERVER_BINARY, program, "--shards", "1", "--no-pin", "--drain", "0"});
+    ProcessResult result =
+        run_rut({RUT_SERVER_BINARY, program, "--shards", "1", "--no-pin", "--drain", "0"});
     REQUIRE(exited_one(result));
     CHECK(result.output.find("Failed to open source accessLog:") != std::string::npos);
     CHECK(result.output.find("open failed") != std::string::npos);
-    CHECK(result.output.find("reliable live publication") == std::string::npos);
     CHECK(result.output.find("Listening on") == std::string::npos);
     std::filesystem::remove_all(dir);
 }
