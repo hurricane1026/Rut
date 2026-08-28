@@ -1427,10 +1427,6 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (exact_no_content_return.value() && !is_root)
         return unsupported(server.exact_no_content_return.span,
                            lit_str("exact no-content return requires location / fallback"));
-    if (proxy_location.value() == ProxyLocationProfile::PrefixWithoutUri && !listener.value())
-        return unsupported(server.location.path_span,
-                           lit_str("non-root proxy_pass without URI lowering is not implemented"));
-
     RutSource output{};
     Writer writer(output);
     auto put = [&](const char* text) {

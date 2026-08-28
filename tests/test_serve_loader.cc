@@ -2966,6 +2966,545 @@ TEST(serve_loader, nginx_issue356_p63_no_uri_output_is_owned_and_reuses_cleanly)
     REQUIRE(std::filesystem::remove(dir));
 }
 
+TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses_cleanly) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_issue357_wildcard_p63_no_uri";
+    const std::string path = dir + "/app.rut";
+    const std::string prefix = "/" + std::string(61u, 'p') + "/";
+    const std::string route = prefix.substr(0u, prefix.size() - 1u);
+    REQUIRE_EQ(prefix.size(), 63u);
+    REQUIRE_EQ(route.size(), 62u);
+    std::string generated;
+    {
+        std::string nginx_source = "server { listen 0.0.0.0:65535; location " + prefix +
+                                   " { proxy_pass http://255.255.255.255:65535; } }";
+        const auto parsed =
+            nginx::parse({nginx_source.data(), static_cast<u32>(nginx_source.size())});
+        REQUIRE(parsed);
+        REQUIRE(parsed.value().listen.address == ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(parsed.value().listen.ipv4_host, 0u);
+        CHECK_EQ(parsed.value().listen.port, 65535u);
+        CHECK_FALSE(parsed.value().location.proxy_pass.has_uri);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 3417u);
+        CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 2529u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        REQUIRE_EQ(generated.rfind("listen :65535\n", 0u), 0u);
+        CHECK(generated.find("target_transform") == std::string::npos);
+        CHECK(generated.find("strip_prefix") == std::string::npos);
+        CHECK(generated.find("replace_prefix") == std::string::npos);
+        CHECK(generated.find("nginx_compat") == std::string::npos);
+        std::fill(nginx_source.begin(), nginx_source.end(), 'x');
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    CHECK_EQ(program.listener.ipv4_host, 0u);
+    CHECK_EQ(program.listener.port, 65535u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0xffffffffu);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 65535u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK_EQ(program.config.routes[0].method, kRouteMethodAny);
+    CHECK_EQ(program.config.routes[0].path_len, route.size());
+    CHECK((Str{program.config.routes[0].path, program.config.routes[0].path_len}.eq(
+        {route.data(), static_cast<u32>(route.size())})));
+    CHECK(program.config.routes[0].action == RouteAction::JitHandler);
+    CHECK_FALSE(program.config.routes[0].needs_req_body);
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    REQUIRE_EQ(program.rir.module.target_transform_count, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    CHECK(program.rir.module.functions[0].route_pattern.eq(
+        {route.data(), static_cast<u32>(route.size())}));
+    REQUIRE_EQ(program.rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.policy_bundle_count, 1u);
+
+    const auto find_const = [&](rir::ValueId value, i32& result) {
+        const auto& function = program.rir.module.functions[0];
+        for (u32 block = 0u; block < function.block_count; block++) {
+            const auto& candidate_block = function.blocks[block];
+            for (u32 instruction = 0u; instruction < candidate_block.inst_count; instruction++) {
+                const auto& candidate = candidate_block.insts[instruction];
+                if (candidate.op == rir::Opcode::ConstI32 && candidate.result == value) {
+                    result = candidate.imm.i32_val;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    u16 redirect_id = 0u;
+    u16 request_policy_id = 0u;
+    u16 bundle_id = 0u;
+    u32 redirect_count = 0u;
+    u32 forward_count = 0u;
+    for (u32 block = 0u; block < program.rir.module.functions[0].block_count; block++) {
+        const auto& rir_block = program.rir.module.functions[0].blocks[block];
+        for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+            const auto& inst = rir_block.insts[instruction];
+            CHECK(inst.op != rir::Opcode::ReqSetTargetTransform);
+            if (inst.op == rir::Opcode::RetRedirect) {
+                redirect_count++;
+                REQUIRE_GT(inst.imm.i32_val, 0);
+                redirect_id = static_cast<u16>(inst.imm.i32_val);
+            }
+            if (inst.op != rir::Opcode::RetForwardBundle) continue;
+            forward_count++;
+            REQUIRE_EQ(inst.operand_count, 3u);
+            i32 upstream = -1;
+            i32 request = -1;
+            i32 bundle = -1;
+            REQUIRE(find_const(inst.operand(0), upstream));
+            REQUIRE(find_const(inst.operand(1), request));
+            REQUIRE(find_const(inst.operand(2), bundle));
+            CHECK_EQ(upstream, 0);
+            CHECK_EQ(request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+            REQUIRE_GT(bundle, 0);
+            request_policy_id = static_cast<u16>(request);
+            bundle_id = static_cast<u16>(bundle);
+        }
+    }
+    REQUIRE_EQ(redirect_count, 1u);
+    REQUIRE_EQ(forward_count, 1u);
+    REQUIRE_NE(redirect_id, 0u);
+    REQUIRE_NE(request_policy_id, 0u);
+    REQUIRE_NE(bundle_id, 0u);
+
+    const auto owned_by = [](Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+        return address >= begin && address - begin <= used - value.len;
+    };
+    const auto check_owned = [&]() {
+        REQUIRE(program.has_listener);
+        CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+        CHECK(program.listener.transport == ListenerTransport::Cleartext);
+        CHECK_EQ(program.listener.ipv4_host, 0u);
+        CHECK_EQ(program.listener.port, 65535u);
+        REQUIRE_EQ(program.config.upstream_count, 1u);
+        const UpstreamTarget& upstream = program.config.upstreams[0];
+        CHECK((Str{upstream.name, upstream.name_len}.eq(lit_str("nginx_upstream"))));
+        REQUIRE_EQ(upstream.addr_count, 1u);
+        CHECK_EQ(upstream.addrs[0].sin_family, AF_INET);
+        CHECK_EQ(ntohl(upstream.addrs[0].sin_addr.s_addr), 0xffffffffu);
+        CHECK_EQ(ntohs(upstream.addrs[0].sin_port), 65535u);
+        REQUIRE_EQ(program.config.route_count, 1u);
+        const RouteEntry& loaded_route = program.config.routes[0];
+        CHECK_EQ(loaded_route.method, kRouteMethodAny);
+        CHECK_EQ(loaded_route.path_len, route.size());
+        CHECK((Str{loaded_route.path, loaded_route.path_len}.eq(
+            {route.data(), static_cast<u32>(route.size())})));
+        CHECK(loaded_route.action == RouteAction::JitHandler);
+        CHECK_FALSE(loaded_route.needs_req_body);
+        REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+        REQUIRE_EQ(program.config.response_policy_count, 1u);
+        REQUIRE_EQ(program.config.failure_policy_count, 1u);
+        REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+        REQUIRE(program.config.redirect_policy_id_is_valid(redirect_id));
+        const auto& redirect = program.config.redirect_policies[redirect_id - 1u];
+        CHECK(program.config.redirect_policy_strings_are_owned(redirect));
+        CHECK(redirect.scheme == RedirectPolicyScheme::Http);
+        CHECK(redirect.authority == RedirectPolicyAuthority::RequestHost);
+        CHECK(redirect.port == RedirectPolicyPort::ActualListener);
+        CHECK(redirect.path == RedirectPolicyPath::Static);
+        CHECK(redirect.query == RedirectPolicyQuery::PreserveRaw);
+        CHECK(redirect.date == RedirectPolicyDate::Current);
+        CHECK(redirect.connection == RedirectPolicyConnection::Close);
+        CHECK(redirect.header_order == RedirectPolicyHeaderOrder::LocationThenConnection);
+        CHECK_EQ(redirect.status_code, 301u);
+        CHECK(redirect.reason.eq(lit_str("Moved Permanently")));
+        CHECK(redirect.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(redirect.content_type.eq(lit_str("text/html")));
+        CHECK_EQ(redirect.static_authority.len, 0u);
+        CHECK(redirect.target_path.eq({prefix.data(), static_cast<u32>(prefix.size())}));
+        CHECK_EQ(redirect.body.len, 169u);
+        for (Str value : {redirect.reason,
+                          redirect.server,
+                          redirect.content_type,
+                          redirect.target_path,
+                          redirect.body})
+            CHECK(owned_by(value,
+                           program.config.redirect_policy_bytes,
+                           program.config.redirect_policy_bytes_used));
+        CHECK_EQ(request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK(request_policy_is_supported(request_policy_id));
+        REQUIRE(program.config.policy_bundle_id_is_valid(bundle_id));
+        const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
+        REQUIRE(program.config.response_policy_id_is_valid(bundle.response_policy_id));
+        REQUIRE(program.config.failure_policy_id_is_valid(bundle.failure_policy_id));
+        CHECK_EQ(bundle.timeout_failure_policy_id, 0u);
+        CHECK_EQ(bundle.response_read_timeout_seconds, 0u);
+        CHECK(bundle.response_buffering == ForwardResponseBufferingMode::None);
+        const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
+        CHECK(response.version == ResponsePolicyVersion::Http11);
+        CHECK(response.framing == ResponsePolicyFraming::ContentLength);
+        CHECK(response.connection == ResponsePolicyConnection::Request);
+        CHECK(response.date == ResponsePolicyDate::Current);
+        CHECK(response.head_mode == ResponsePolicyHeadMode::Reject);
+        CHECK(response.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(owned_by(response.server,
+                       program.config.response_policy_bytes,
+                       program.config.response_policy_bytes_used));
+        REQUIRE_EQ(response.hide_header_count, 3u);
+        static constexpr Str kHidden[] = {lit_str("Date"), lit_str("Server"), lit_str("X-Pad")};
+        for (u32 i = 0u; i < response.hide_header_count; i++) {
+            CHECK(response.hide_headers[i].eq(kHidden[i]));
+            CHECK(owned_by(response.hide_headers[i],
+                           program.config.response_policy_bytes,
+                           program.config.response_policy_bytes_used));
+        }
+        const auto& failure = program.config.failure_policies[bundle.failure_policy_id - 1u];
+        CHECK(failure.version == ForwardFailurePolicyVersion::Http11);
+        CHECK_EQ(failure.status_code, 502u);
+        CHECK(failure.date == ForwardFailurePolicyDate::Current);
+        CHECK(failure.connection == ForwardFailurePolicyConnection::Request);
+        CHECK(failure.head_mode == FailurePolicyHeadMode::Reject);
+        CHECK(failure.reason.eq(lit_str("Bad Gateway")));
+        CHECK(failure.content_type.eq(lit_str("text/html")));
+        CHECK(failure.server.eq(lit_str("nginx/1.29.7")));
+        for (Str value : {failure.reason, failure.content_type, failure.server, failure.body})
+            CHECK(owned_by(value,
+                           program.config.failure_policy_bytes,
+                           program.config.failure_policy_bytes_used));
+        CHECK_EQ(program.config.target_transform_count, 0u);
+        CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    };
+    check_owned();
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    check_owned();
+
+    program.destroy();
+    {
+        char nginx_source[] =
+            "server { listen 127.0.0.1:8094; location / { proxy_pass http://127.0.0.1:9008; } }";
+        const auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(nginx_source, 'z', sizeof(nginx_source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(program.listener.port, 8094u);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    u32 root_head_routes = 0u;
+    u32 root_get_routes = 0u;
+    u32 root_any_routes = 0u;
+    for (u32 i = 0u; i < program.config.route_count; i++) {
+        const RouteEntry& root_route = program.config.routes[i];
+        CHECK_EQ(root_route.path_len, 1u);
+        CHECK_EQ(root_route.path[0], '/');
+        for (u32 byte = 1u; byte < RouteEntry::kMaxPathLen; byte++)
+            CHECK_EQ(root_route.path[byte], '\0');
+        CHECK(root_route.action == RouteAction::JitHandler);
+        CHECK_FALSE(root_route.needs_req_body);
+        if (root_route.method == kRouteMethodHead) root_head_routes++;
+        if (root_route.method == kRouteMethodGet) root_get_routes++;
+        if (root_route.method == kRouteMethodAny) root_any_routes++;
+    }
+    CHECK_EQ(root_head_routes, 1u);
+    CHECK_EQ(root_get_routes, 1u);
+    CHECK_EQ(root_any_routes, 1u);
+    for (u32 i = program.config.route_count; i < RouteConfig::kMaxRoutes; i++) {
+        CHECK_EQ(program.config.routes[i].method, 0u);
+        CHECK(program.config.routes[i].action == RouteAction::Static);
+        CHECK_FALSE(program.config.routes[i].needs_req_body);
+        CHECK_EQ(program.config.routes[i].path_len, 0u);
+        for (char byte : program.config.routes[i].path) CHECK_EQ(byte, '\0');
+    }
+    CHECK_EQ(program.config.redirect_policy_count, 0u);
+    CHECK_EQ(program.config.redirect_policy_bytes_used, 0u);
+    for (const auto& stale : program.config.redirect_policies) {
+        CHECK(stale.scheme == RedirectPolicyScheme::Invalid);
+        CHECK(stale.authority == RedirectPolicyAuthority::Invalid);
+        CHECK(stale.port == RedirectPolicyPort::Invalid);
+        CHECK(stale.path == RedirectPolicyPath::Invalid);
+        CHECK(stale.query == RedirectPolicyQuery::Invalid);
+        CHECK(stale.date == RedirectPolicyDate::Invalid);
+        CHECK(stale.connection == RedirectPolicyConnection::Invalid);
+        CHECK(stale.header_order == RedirectPolicyHeaderOrder::Invalid);
+        CHECK_EQ(stale.status_code, 0u);
+        for (Str value : {stale.reason,
+                          stale.server,
+                          stale.content_type,
+                          stale.static_authority,
+                          stale.target_path,
+                          stale.body}) {
+            CHECK_EQ(value.ptr, nullptr);
+            CHECK_EQ(value.len, 0u);
+        }
+    }
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    for (const auto& stale : program.config.target_transforms) {
+        CHECK_EQ(stale.strip_prefix.ptr, nullptr);
+        CHECK_EQ(stale.strip_prefix.len, 0u);
+        CHECK_EQ(stale.replace_prefix.ptr, nullptr);
+        CHECK_EQ(stale.replace_prefix.len, 0u);
+    }
+    REQUIRE_EQ(program.rir.module.func_count, 3u);
+    REQUIRE_EQ(program.rir.module.target_transform_count, 0u);
+    REQUIRE_EQ(program.rir.module.redirect_policy_count, 0u);
+    u32 root_redirect_count = 0u;
+    u32 root_forward_count = 0u;
+    u32 root_head_functions = 0u;
+    u32 root_get_functions = 0u;
+    u32 root_any_functions = 0u;
+    u16 root_head_bundle = 0u;
+    u16 root_get_bundle = 0u;
+    u16 root_any_bundle = 0u;
+    u16 root_request_policy = 0u;
+    for (u32 function_index = 0u; function_index < program.rir.module.func_count;
+         function_index++) {
+        const auto& function = program.rir.module.functions[function_index];
+        CHECK(function.route_pattern.eq(lit_str("/")));
+        if (function.http_method == kRouteMethodHead) root_head_functions++;
+        if (function.http_method == kRouteMethodGet) root_get_functions++;
+        if (function.http_method == kRouteMethodAny) root_any_functions++;
+        const auto find_root_const = [&](rir::ValueId value, i32& result) {
+            for (u32 block = 0u; block < function.block_count; block++) {
+                const auto& candidate_block = function.blocks[block];
+                for (u32 instruction = 0u; instruction < candidate_block.inst_count;
+                     instruction++) {
+                    const auto& candidate = candidate_block.insts[instruction];
+                    if (candidate.op == rir::Opcode::ConstI32 && candidate.result == value) {
+                        result = candidate.imm.i32_val;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        for (u32 block = 0u; block < function.block_count; block++) {
+            const auto& rir_block = function.blocks[block];
+            for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+                const auto& inst = rir_block.insts[instruction];
+                CHECK(inst.op != rir::Opcode::ReqSetTargetTransform);
+                if (inst.op == rir::Opcode::RetRedirect) root_redirect_count++;
+                if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                root_forward_count++;
+                REQUIRE_EQ(inst.operand_count, 3u);
+                i32 upstream = -1;
+                i32 request = -1;
+                i32 root_bundle = -1;
+                REQUIRE(find_root_const(inst.operand(0), upstream));
+                REQUIRE(find_root_const(inst.operand(1), request));
+                REQUIRE(find_root_const(inst.operand(2), root_bundle));
+                CHECK_EQ(upstream, 0);
+                CHECK_EQ(request, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+                REQUIRE_GT(root_bundle, 0);
+                CHECK(program.config.policy_bundle_id_is_valid(static_cast<u16>(root_bundle)));
+                if (root_request_policy == 0u)
+                    root_request_policy = static_cast<u16>(request);
+                else
+                    CHECK_EQ(request, root_request_policy);
+                u16* selected_bundle = nullptr;
+                if (function.http_method == kRouteMethodHead) selected_bundle = &root_head_bundle;
+                if (function.http_method == kRouteMethodGet) selected_bundle = &root_get_bundle;
+                if (function.http_method == kRouteMethodAny) selected_bundle = &root_any_bundle;
+                REQUIRE(selected_bundle != nullptr);
+                REQUIRE_EQ(*selected_bundle, 0u);
+                *selected_bundle = static_cast<u16>(root_bundle);
+            }
+        }
+    }
+    CHECK_EQ(root_redirect_count, 0u);
+    CHECK_EQ(root_forward_count, 3u);
+    CHECK_EQ(root_head_functions, 1u);
+    CHECK_EQ(root_get_functions, 1u);
+    CHECK_EQ(root_any_functions, 1u);
+    REQUIRE_NE(root_request_policy, 0u);
+    REQUIRE_NE(root_head_bundle, 0u);
+    REQUIRE_NE(root_get_bundle, 0u);
+    REQUIRE_NE(root_any_bundle, 0u);
+    CHECK_NE(root_head_bundle, root_get_bundle);
+    CHECK_NE(root_head_bundle, root_any_bundle);
+    CHECK_NE(root_get_bundle, root_any_bundle);
+    REQUIRE_EQ(program.config.response_policy_count, 2u);
+    REQUIRE_EQ(program.config.failure_policy_count, 3u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 3u);
+
+    const auto check_root_bundle = [&](u16 root_bundle_id, bool suppress_body, bool buffered) {
+        CHECK_EQ(root_request_policy, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK(request_policy_is_supported(root_request_policy));
+        REQUIRE(program.config.policy_bundle_id_is_valid(root_bundle_id));
+        const auto& root_bundle = program.config.policy_bundles[root_bundle_id - 1u];
+        REQUIRE(program.config.response_policy_id_is_valid(root_bundle.response_policy_id));
+        REQUIRE(program.config.failure_policy_id_is_valid(root_bundle.failure_policy_id));
+        CHECK_EQ(root_bundle.response_read_timeout_seconds, buffered ? 60u : 0u);
+        CHECK(root_bundle.response_buffering ==
+              (buffered ? ForwardResponseBufferingMode::CompleteContentLength
+                        : ForwardResponseBufferingMode::None));
+        const auto& root_response =
+            program.config.response_policies[root_bundle.response_policy_id - 1u];
+        CHECK(root_response.version == ResponsePolicyVersion::Http11);
+        CHECK(root_response.framing == ResponsePolicyFraming::ContentLength);
+        CHECK(root_response.connection == ResponsePolicyConnection::Request);
+        CHECK(root_response.date == ResponsePolicyDate::Current);
+        CHECK(root_response.head_mode == (suppress_body ? ResponsePolicyHeadMode::SuppressBody
+                                                        : ResponsePolicyHeadMode::Reject));
+        CHECK(root_response.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(owned_by(root_response.server,
+                       program.config.response_policy_bytes,
+                       program.config.response_policy_bytes_used));
+        REQUIRE_EQ(root_response.hide_header_count, 3u);
+        static constexpr Str kHidden[] = {lit_str("Date"), lit_str("Server"), lit_str("X-Pad")};
+        for (u32 i = 0u; i < root_response.hide_header_count; i++) {
+            CHECK(root_response.hide_headers[i].eq(kHidden[i]));
+            CHECK(owned_by(root_response.hide_headers[i],
+                           program.config.response_policy_bytes,
+                           program.config.response_policy_bytes_used));
+        }
+        const auto& root_failure =
+            program.config.failure_policies[root_bundle.failure_policy_id - 1u];
+        CHECK(root_failure.version == ForwardFailurePolicyVersion::Http11);
+        CHECK_EQ(root_failure.status_code, 502u);
+        CHECK(root_failure.date == ForwardFailurePolicyDate::Current);
+        CHECK(root_failure.connection == ForwardFailurePolicyConnection::Request);
+        CHECK(root_failure.head_mode == (suppress_body ? FailurePolicyHeadMode::SuppressBody
+                                                       : FailurePolicyHeadMode::Reject));
+        CHECK(root_failure.reason.eq(lit_str("Bad Gateway")));
+        CHECK(root_failure.content_type.eq(lit_str("text/html")));
+        CHECK(root_failure.server.eq(lit_str("nginx/1.29.7")));
+        for (Str value : {root_failure.reason,
+                          root_failure.content_type,
+                          root_failure.server,
+                          root_failure.body})
+            CHECK(owned_by(value,
+                           program.config.failure_policy_bytes,
+                           program.config.failure_policy_bytes_used));
+        if (!buffered) {
+            CHECK_EQ(root_bundle.timeout_failure_policy_id, 0u);
+            return;
+        }
+        REQUIRE(program.config.timeout_failure_policy_id_is_valid(
+            root_bundle.timeout_failure_policy_id));
+        const auto& timeout =
+            program.config.failure_policies[root_bundle.timeout_failure_policy_id - 1u];
+        CHECK(timeout.version == ForwardFailurePolicyVersion::Http11);
+        CHECK_EQ(timeout.status_code, 504u);
+        CHECK(timeout.date == ForwardFailurePolicyDate::Current);
+        CHECK(timeout.connection == ForwardFailurePolicyConnection::Request);
+        CHECK(timeout.head_mode == FailurePolicyHeadMode::Reject);
+        CHECK(timeout.reason.eq(lit_str("Gateway Time-out")));
+        CHECK(timeout.content_type.eq(lit_str("text/html")));
+        CHECK(timeout.server.eq(lit_str("nginx/1.29.7")));
+        for (Str value : {timeout.reason, timeout.content_type, timeout.server, timeout.body})
+            CHECK(owned_by(value,
+                           program.config.failure_policy_bytes,
+                           program.config.failure_policy_bytes_used));
+    };
+    check_root_bundle(root_head_bundle, true, false);
+    check_root_bundle(root_get_bundle, false, true);
+    check_root_bundle(root_any_bundle, false, false);
+
+    u32 expected_response_bytes = 0u;
+    for (u32 policy = 0u; policy < program.config.response_policy_count; policy++) {
+        const auto& active = program.config.response_policies[policy];
+        expected_response_bytes += active.server.len;
+        for (u32 i = 0u; i < active.hide_header_count; i++)
+            expected_response_bytes += active.hide_headers[i].len;
+    }
+    CHECK_EQ(program.config.response_policy_bytes_used, expected_response_bytes);
+    u32 expected_failure_bytes = 0u;
+    for (u32 policy = 0u; policy < program.config.failure_policy_count; policy++) {
+        const auto& active = program.config.failure_policies[policy];
+        expected_failure_bytes +=
+            active.reason.len + active.content_type.len + active.server.len + active.body.len;
+    }
+    CHECK_EQ(program.config.failure_policy_bytes_used, expected_failure_bytes);
+    for (u32 i = program.config.response_policy_count; i < kMaxResponsePolicies; i++) {
+        const auto& stale = program.config.response_policies[i];
+        CHECK(stale.version == ResponsePolicyVersion::Invalid);
+        CHECK(stale.framing == ResponsePolicyFraming::Invalid);
+        CHECK(stale.connection == ResponsePolicyConnection::Invalid);
+        CHECK(stale.date == ResponsePolicyDate::Invalid);
+        CHECK(stale.head_mode == ResponsePolicyHeadMode::Reject);
+        CHECK_EQ(stale.server.ptr, nullptr);
+        CHECK_EQ(stale.server.len, 0u);
+        CHECK_EQ(stale.hide_header_count, 0u);
+        for (Str value : stale.hide_headers) {
+            CHECK_EQ(value.ptr, nullptr);
+            CHECK_EQ(value.len, 0u);
+        }
+    }
+    for (u32 i = program.config.failure_policy_count; i < kMaxForwardFailurePolicies; i++) {
+        const auto& stale = program.config.failure_policies[i];
+        CHECK(stale.version == ForwardFailurePolicyVersion::Invalid);
+        CHECK_EQ(stale.status_code, 0u);
+        CHECK(stale.date == ForwardFailurePolicyDate::Invalid);
+        CHECK(stale.connection == ForwardFailurePolicyConnection::Invalid);
+        CHECK(stale.head_mode == FailurePolicyHeadMode::Reject);
+        for (Str value : {stale.reason, stale.content_type, stale.server, stale.body}) {
+            CHECK_EQ(value.ptr, nullptr);
+            CHECK_EQ(value.len, 0u);
+        }
+    }
+    for (u32 i = program.config.policy_bundle_count; i < RouteConfig::kMaxForwardPolicyBundles;
+         i++) {
+        const auto& stale = program.config.policy_bundles[i];
+        CHECK_EQ(stale.response_policy_id, 0u);
+        CHECK_EQ(stale.failure_policy_id, 0u);
+        CHECK_EQ(stale.timeout_failure_policy_id, 0u);
+        CHECK_EQ(stale.response_read_timeout_seconds, 0u);
+        CHECK(stale.response_buffering == ForwardResponseBufferingMode::None);
+    }
+    CHECK(
+        std::string(program.config.redirect_policy_bytes, program.config.redirect_policy_bytes_used)
+            .find(prefix) == std::string::npos);
+    CHECK(
+        std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
+            .find(prefix) == std::string::npos);
+    CHECK(std::string(program.config.failure_policy_bytes, program.config.failure_policy_bytes_used)
+              .find(prefix) == std::string::npos);
+    for (const auto& root_route : program.config.routes)
+        CHECK(
+            std::string(root_route.path, root_route.path + RouteEntry::kMaxPathLen).find(prefix) ==
+            std::string::npos);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    CHECK(program.config.upstreams[0].name_len != 0u);
+    CHECK((Str{program.config.upstreams[0].name, program.config.upstreams[0].name_len}.eq(
+        lit_str("nginx_upstream"))));
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(program.config.upstreams[0].addrs[0].sin_family, AF_INET);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0x7f000001u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 9008u);
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    program.destroy();
+    REQUIRE(std::filesystem::remove(dir));
+}
+
 TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
     const struct {
         const char* name;
