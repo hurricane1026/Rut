@@ -23,6 +23,22 @@ The fragment form is the initial converter input. A differential test may wrap
 it in the required `events {}` and `http {}` contexts before giving it to a real
 nginx process. Support for arbitrary full nginx files is not implied.
 
+A later, separate bounded parser entry accepts one explicit `http` profile only
+for access-log compatibility work:
+
+```nginx
+http {
+    log_format compat "$request_length";
+    access_log /clean/absolute/path compat;
+    server { /* one server from the existing bounded grammar */ }
+}
+```
+
+This does not replace or broaden the bare-server entry and is not a general
+nginx.conf parser. It exists so http-context logging declarations and their
+server can share one source/provenance root. Parsing this profile does not imply
+lowering support: ordinary RUT access sink/format publication remains #363.
+
 ## Proposed pipeline
 
 ```text
