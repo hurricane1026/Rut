@@ -4327,6 +4327,8 @@ TEST(pool, reset_clears_fields) {
     const u8 data[] = "hello";
     c->recv_buf.write(data, 5);
     c->keep_alive = true;
+    c->downstream_req_size = 123;
+    c->req_size = 456;
     u32 cid = c->id;
     loop.free_conn(*c);
     // After free, connection is fully reset (sync backend frees immediately).
@@ -4334,6 +4336,8 @@ TEST(pool, reset_clears_fields) {
     CHECK(loop.conns[cid].on_recv == nullptr && loop.conns[cid].on_send == nullptr);
     CHECK_EQ(loop.conns[cid].state, ConnState::Idle);
     CHECK_EQ(loop.conns[cid].keep_alive, false);
+    CHECK_EQ(loop.conns[cid].downstream_req_size, 0u);
+    CHECK_EQ(loop.conns[cid].req_size, 0u);
     CHECK_EQ(loop.conns[cid].recv_slice, nullptr);
     CHECK_EQ(loop.conns[cid].send_slice, nullptr);
     CHECK_EQ(loop.conns[cid].recv_buf.write_avail(), 0u);
@@ -16829,6 +16833,113 @@ TEST(access_log_snapshot, completion_publication_is_explicit_episode_owned_and_o
     CHECK_FALSE(ring.pop(discarded));
 }
 
+TEST(access_request_size,
+     bodyless_request_policy_keeps_downstream_wire_distinct_and_reuse_isolated) {
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing ring{};
+    ring.init();
+    loop.access_log = &ring;
+
+    RouteConfig proxy_config{};
+    REQUIRE(proxy_config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    static constexpr char kClientRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kUpstreamRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: 127.0.0.1:9000\r\n"
+        "X-Test: keep\r\n\r\n";
+    constexpr u32 kClientRequestLen = sizeof(kClientRequest) - 1u;
+    constexpr u32 kUpstreamRequestLen = sizeof(kUpstreamRequest) - 1u;
+    static_assert(kClientRequestLen != kUpstreamRequestLen);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClientRequest), kClientRequestLen),
+               kClientRequestLen);
+    capture_request_metadata(*conn);
+    conn->capture_access_log_target_snapshot();
+    conn->req_start_us = monotonic_us();
+    conn->request_config = &proxy_config;
+    conn->keep_alive = false;
+    REQUIRE_EQ(conn->downstream_req_size, kClientRequestLen);
+    REQUIRE_EQ(conn->req_size, kClientRequestLen);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, false);
+
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    REQUIRE_EQ(conn->recv_buf.len(), kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
+    CHECK_EQ(conn->req_size, kUpstreamRequestLen);
+    CHECK_EQ(conn->downstream_req_size, kClientRequestLen);
+
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    const MockOp* upstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(upstream_send != nullptr);
+    CHECK_EQ(upstream_send->fd, conn->upstream_fd);
+    CHECK_EQ(upstream_send->send_len, kUpstreamRequestLen);
+    CHECK_EQ(__builtin_memcmp(upstream_send->send_buf, kUpstreamRequest, kUpstreamRequestLen), 0);
+
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+    inject_upstream_response(loop, *conn);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    const u32 response_len = conn->send_buf.len();
+    REQUIRE_GT(response_len, 0u);
+    const u32 completed_id = conn->id;
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, response_len));
+
+    AccessLogEntry proxy_access{};
+    REQUIRE(ring.pop(proxy_access));
+    CHECK_EQ(proxy_access.req_size, kClientRequestLen);
+    CHECK_NE(proxy_access.req_size, kUpstreamRequestLen);
+    AccessLogEntry extra{};
+    CHECK_FALSE(ring.pop(extra));
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, completed_id);
+    CHECK_EQ(reused->downstream_req_size, 0u);
+    CHECK_EQ(reused->req_size, 0u);
+    reused->fd = 43;
+    static constexpr char kLocalRequest[] =
+        "GET /local HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n";
+    constexpr u32 kLocalRequestLen = sizeof(kLocalRequest) - 1u;
+    REQUIRE_EQ(reused->recv_buf.write(reinterpret_cast<const u8*>(kLocalRequest), kLocalRequestLen),
+               kLocalRequestLen);
+    RouteConfig local_config{};
+    REQUIRE(local_config.add_static("/local", kRouteMethodGet, 204));
+    const RouteConfig* active = &local_config;
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop, *reused, make_ev(reused->id, IoEventType::Recv, static_cast<i32>(kLocalRequestLen)));
+    loop.config_ptr = nullptr;
+    REQUIRE_EQ(reused->state, ConnState::Sending);
+    CHECK_EQ(reused->resp_status, 204u);
+    static constexpr char kLocalResponse[] =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const u32 local_response_len = reused->send_buf.len();
+    REQUIRE_EQ(local_response_len, sizeof(kLocalResponse) - 1u);
+    CHECK_EQ(__builtin_memcmp(reused->send_buf.data(), kLocalResponse, sizeof(kLocalResponse) - 1u),
+             0);
+    loop.inject_and_dispatch(
+        make_ev(reused->id, IoEventType::Send, static_cast<i32>(local_response_len)));
+    AccessLogEntry local_access{};
+    REQUIRE(ring.pop(local_access));
+    CHECK_EQ(local_access.req_size, kLocalRequestLen);
+    CHECK_FALSE(ring.pop(extra));
+}
+
 TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_isolated) {
     SmallLoop loop;
     loop.setup();
@@ -16910,6 +17021,8 @@ TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_iso
     AccessLogEntry pipeline_first{};
     REQUIRE(ring.pop(pipeline_first));
     CHECK_EQ(std::string(pipeline_first.path, pipeline_first.target_length), "/pipe-one//?a=1");
+    CHECK_EQ(pipeline_first.req_size,
+             sizeof("GET /pipe-one//?a=1 HTTP/1.1\r\nHost: x\r\n\r\n") - 1u);
     REQUIRE_EQ(pipelined->pipeline_depth, 1u);
     REQUIRE_NE(pipelined->access_log_target_snapshot.episode, pipeline_first_episode);
     loop.inject_and_dispatch(
@@ -16918,6 +17031,8 @@ TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_iso
     AccessLogEntry pipeline_second{};
     REQUIRE(ring.pop(pipeline_second));
     CHECK_EQ(std::string(pipeline_second.path, pipeline_second.target_length), "/pipe-two//?b=2");
+    CHECK_EQ(pipeline_second.req_size,
+             sizeof("GET /pipe-two//?b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") - 1u);
     AccessLogEntry extra{};
     CHECK_FALSE(ring.pop(extra));
 }

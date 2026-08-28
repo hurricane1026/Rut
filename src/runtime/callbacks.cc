@@ -96,7 +96,8 @@ void capture_request_metadata(Connection& conn) {
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
-    conn.req_size = conn.recv_buf.len();
+    conn.downstream_req_size = conn.recv_buf.len();
+    conn.req_size = conn.downstream_req_size;
     conn.req_path[0] = '/';
     conn.req_path[1] = '\0';
     // Default canonical view = "" pointing into req_path[] (the canon of
@@ -284,7 +285,10 @@ void capture_request_metadata(Connection& conn) {
             const u32 kBodyInInitial = conn.req_content_length - conn.req_body_remaining;
             conn.req_initial_send_len = parser.header_end + kBodyInInitial;
         }
-        if (conn.req_initial_send_len > 0) conn.req_size = conn.req_initial_send_len;
+        if (conn.req_initial_send_len > 0) {
+            conn.downstream_req_size = conn.req_initial_send_len;
+            conn.req_size = conn.req_initial_send_len;
+        }
         conn.req_strict_h1_complete =
             (req.version == HttpVersion::Http10 || req.version == HttpVersion::Http11) &&
             conn.req_header_end != 0;

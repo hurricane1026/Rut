@@ -1801,7 +1801,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size;
-        entry.req_size = conn.req_size;
+        entry.req_size = conn.downstream_req_size;
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -2416,6 +2416,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     u32 consume = static_cast<u32>(ev.result);
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining -= consume;
+    conn.downstream_req_size += consume;
     conn.req_size += consume;
     conn.req_initial_send_len =
         conn.req_header_end + (conn.req_content_length - conn.req_body_remaining);
@@ -2498,6 +2499,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         consume = conn.req_body_remaining;
     }
     conn.req_body_remaining -= consume;
+    conn.downstream_req_size += consume;
     conn.req_size += consume;
     conn.req_initial_send_len =
         conn.req_header_end + (conn.req_content_length - conn.req_body_remaining);
@@ -6813,6 +6815,7 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
+    conn.downstream_req_size += send_len;
     conn.req_size += send_len;
     conn.req_initial_send_len = send_len;
     conn.set_slots(nullptr,
@@ -7465,7 +7468,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // WebSocket bytes with the request, req_size captured the whole recv_buf, so
     // the access-log request size would depend on packet framing. Trim to the
     // parsed header length (an upgrade request has no body).
-    if (conn.req_header_end > 0) conn.req_size = conn.req_header_end;
+    if (conn.req_header_end > 0) {
+        conn.downstream_req_size = conn.req_header_end;
+        conn.req_size = conn.req_header_end;
+    }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_sent_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
     // slot now so a long-lived tunnel doesn't hold an in-flight request slot for

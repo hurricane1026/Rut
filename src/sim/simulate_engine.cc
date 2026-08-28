@@ -741,6 +741,7 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.yield_timeout_armed = src.yield_timeout_armed;
     dst.resp_status = src.resp_status;
     dst.req_method = src.req_method;
+    dst.downstream_req_size = src.downstream_req_size;
     dst.req_size = src.req_size;
     dst.peer_addr = src.peer_addr;
     dst.peer_port = src.peer_port;

@@ -8258,13 +8258,29 @@ static bool capture_generated_exact_local_return204_order(
             temp.rut_access_log, "converter-generated #324 access log", access_contents, error) ||
         !parse_exact_return204_access_log(access_contents,
                                           strlen(local_request),
-                                          expected_backend.size(),
+                                          strlen(fallback_request),
                                           sizeof(kSuccessResponseNormalized) - 1u,
                                           error,
                                           query_target) ||
         !read_exact_return204_log(
             temp.rut_log, "converter-generated #324 runtime log", runtime_contents, error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener_record, error)) {
+        return false;
+    }
+    if (strlen(fallback_request) == expected_backend.size()) {
+        error =
+            "converter-generated #324 fixture no longer distinguishes downstream and rebuilt "
+            "request sizes";
+        return false;
+    }
+    std::string swapped_size_error;
+    if (parse_exact_return204_access_log(access_contents,
+                                         strlen(local_request),
+                                         expected_backend.size(),
+                                         sizeof(kSuccessResponseNormalized) - 1u,
+                                         swapped_size_error,
+                                         query_target)) {
+        error = "converter-generated #324 access parser accepted rebuilt upstream field 5";
         return false;
     }
     observation.local_access = 1;
@@ -9009,7 +9025,6 @@ static bool capture_generated_bounded_no_content_path_order(
         error = "#328 generated fallback recorder lifecycle/count was incomplete";
         return false;
     }
-    for (size_t i = 2u; i < 5u; i++) request_sizes[i] = observation.forward_history[i - 2u].size();
     for (size_t i = 0u; i < 5u; i++) observation.access_records[i] = 1u;
     if (!validate_bounded_no_content_path_observation(observation, backend_port, error))
         return false;
@@ -9023,6 +9038,19 @@ static bool capture_generated_bounded_no_content_path_order(
             temp.rut_log, "converter-generated #328 runtime log", runtime_contents, error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
         return false;
+    if (request_sizes[2] == observation.forward_history[0].size()) {
+        error = "#328 fixture no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    size_t swapped_sizes[5];
+    std::copy(std::begin(request_sizes), std::end(request_sizes), std::begin(swapped_sizes));
+    swapped_sizes[2] = observation.forward_history[0].size();
+    std::string swapped_size_error;
+    if (parse_bounded_no_content_rut_access_log(
+            access_contents, swapped_sizes, swapped_size_error)) {
+        error = "#328 access parser accepted rebuilt upstream field 5";
+        return false;
+    }
     return true;
 }
 
@@ -12335,7 +12363,6 @@ static bool capture_generated_trailing_slash_no_content_order(
         error = "#329 Stage 2 generated fallback recorder lifecycle/count was incomplete";
         return false;
     }
-    for (size_t i = 3u; i < 5u; i++) request_sizes[i] = observation.forward_history[i - 3u].size();
     for (size_t i = 0u; i < 5u; i++) observation.access_records[i] = 1u;
     if (!validate_trailing_no_content_observation(observation, backend_port, error)) return false;
 
@@ -12352,6 +12379,19 @@ static bool capture_generated_trailing_slash_no_content_order(
                                   error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
         return false;
+    if (request_sizes[3] == observation.forward_history[0].size()) {
+        error = "#329 fixture no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    size_t swapped_sizes[5];
+    std::copy(std::begin(request_sizes), std::end(request_sizes), std::begin(swapped_sizes));
+    swapped_sizes[3] = observation.forward_history[0].size();
+    std::string swapped_size_error;
+    if (parse_trailing_slash_no_content_rut_access_log(
+            access_contents, swapped_sizes, swapped_size_error)) {
+        error = "#329 access parser accepted rebuilt upstream field 5";
+        return false;
+    }
     return true;
 }
 
@@ -13267,8 +13307,6 @@ static bool capture_generated_max_boundary_side(u16 frontend_port,
         error = "#330 Stage 4 fallback recorder lifecycle/count was incomplete";
         return false;
     }
-    for (size_t i = 3u; i < vector_count; i++)
-        request_sizes[i] = observation.forward_history[i - 3u].size();
     for (size_t i = 0u; i < vector_count; i++) observation.access_records[i] = 1u;
     if (!validate_max_boundary_observation(observation, backend_port, error)) return false;
 
@@ -13285,6 +13323,18 @@ static bool capture_generated_max_boundary_side(u16 frontend_port,
                                   error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
         return false;
+    if (request_sizes[3] == observation.forward_history[0].size()) {
+        error = "#330 fixture no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    auto swapped_sizes = request_sizes;
+    swapped_sizes[3] = observation.forward_history[0].size();
+    std::string swapped_size_error;
+    if (parse_max_boundary_rut_access_log(
+            access_contents, observation, swapped_sizes, swapped_size_error)) {
+        error = "#330 access parser accepted rebuilt upstream field 5";
+        return false;
+    }
     return true;
 }
 
@@ -14966,8 +15016,6 @@ static bool capture_generated_bodyful_normalized_exact_side(
         error = "#331 Stage 3 fallback recorder lifecycle/count was incomplete";
         return false;
     }
-    for (size_t i = 4u; i < targets.size(); i++)
-        request_sizes[i] = observation.forward_history[i - 4u].size();
     for (u32& count : observation.access_records) count = 1u;
     if (!validate_bodyful_normalized_exact_observation(observation, backend_port, error))
         return false;
@@ -14986,6 +15034,18 @@ static bool capture_generated_bodyful_normalized_exact_side(
                                   error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
         return false;
+    if (request_sizes[4] == observation.forward_history[0].size()) {
+        error = "#331 fixture no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    auto swapped_sizes = request_sizes;
+    swapped_sizes[4] = observation.forward_history[0].size();
+    std::string swapped_size_error;
+    if (parse_bodyful_normalized_rut_access_log(
+            access_contents, observation, swapped_sizes, swapped_size_error)) {
+        error = "#331 access parser accepted rebuilt upstream field 5";
+        return false;
+    }
     return true;
 }
 
@@ -16546,8 +16606,7 @@ static bool parse_wildcard_service_no_uri_rut_access(
         const size_t vector = kOrder[record];
         const bool forwarded = vector < 3u;
         std::vector<std::string> fields;
-        const size_t request_size = forwarded ? observation.forward_history[vector].size()
-                                              : api_request(profile.targets[vector]).size();
+        const size_t request_size = api_request(profile.targets[vector]).size();
         if (!split_space_fields(records[record], fields) ||
             fields.size() != (forwarded ? 11u : 9u)) {
             error = std::string("#357 generated access ") + (forwarded ? "forwarded" : "local") +
@@ -17960,9 +18019,7 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
             const size_t vector = kAccessOrder[record];
             const bool forwarded = vector < 3u;
             const size_t request_size =
-                forwarded
-                    ? valid[2].forward_history[vector].size()
-                    : api_request(kWildcardServiceNoUriProxyOracleProfile.targets[vector]).size();
+                api_request(kWildcardServiceNoUriProxyOracleProfile.targets[vector]).size();
             records[record] =
                 "2030-01-01T00:00:00.000Z GET " +
                 std::string(kWildcardServiceNoUriProxyOracleProfile.targets[vector]) + " " +
@@ -18021,6 +18078,12 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
             return !changed[record].empty() &&
                    rejects_access(join_records(changed), label, intended_reason);
         };
+        const size_t forwarded_downstream_size =
+            api_request(kWildcardServiceNoUriProxyOracleProfile.targets[0]).size();
+        if (forwarded_downstream_size == valid[2].forward_history[0].size()) {
+            error = "#357 self-check no longer distinguishes downstream and rebuilt request sizes";
+            return false;
+        }
         if (!rejects_record_mutation(
                 0u, " s=0", " s=0 extra", "local-field-count", "local field count") ||
             !rejects_record_mutation(
@@ -18047,8 +18110,8 @@ static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error)
             !rejects_record_mutation(0u, " 101us 90 ", " 101us 89 ", "local-field5", "field-5") ||
             !rejects_record_mutation(
                 2u,
+                " 103us " + std::to_string(forwarded_downstream_size) + " ",
                 " 103us " + std::to_string(valid[2].forward_history[0].size()) + " ",
-                " 103us 1 ",
                 "forwarded-field5",
                 "field-5") ||
             !rejects_record_mutation(
@@ -18755,9 +18818,7 @@ static bool validate_max_proxy_prefix_observation(
     }
     for (size_t i = 0u; i < 5u; i++) {
         const size_t expected_access_request_size =
-            observation.side == "converter-generated-rut" && i < 3u
-                ? observation.forward_history[i].size()
-                : api_request(observation.targets[i].c_str()).size();
+            api_request(observation.targets[i].c_str()).size();
         if (observation.request_sizes[i] != expected_access_request_size) {
             error = "#335 observation request-size inventory was inconsistent";
             return false;
@@ -19562,10 +19623,6 @@ static bool capture_max_proxy_prefix_side(
         error = "#335 recorder lifecycle/count/history was not exactly three clean episodes";
         return false;
     }
-    if (!pinned_nginx) {
-        for (size_t i = 0u; i < 3u; i++)
-            observation.request_sizes[i] = observation.forward_history[i].size();
-    }
     if (strict_boundary) observation.clean_lifecycle = true;
     if (!validate_max_proxy_prefix_observation(
             observation, frontend_port, backend_port, error, profile))
@@ -19748,9 +19805,6 @@ static MaxProxyPrefixObservation make_max_proxy_prefix_self_check(
                                     "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
         value.forward_history.emplace_back(request.begin(), request.end());
     }
-    if (generated) {
-        for (size_t i = 0u; i < 3u; i++) value.request_sizes[i] = value.forward_history[i].size();
-    }
     return value;
 }
 
@@ -19794,6 +19848,14 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[1] = mutated[1].forward_history[0];
     if (!rejects_pair(mutated, source, kPorts, "transform-to-root")) return false;
+    if (values[1].request_sizes[0] == values[1].forward_history[0].size()) {
+        error = "#335 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].request_sizes[0] = mutated[1].forward_history[0].size();
+    if (!rejects_pair(mutated, source, kPorts, "downstream-size-replaced-by-upstream-size"))
+        return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[2] = mutated[1].forward_history[1];
     if (!rejects_pair(mutated, source, kPorts, "removed-forward-query")) return false;
@@ -20269,9 +20331,7 @@ static bool validate_max_proxy_replacement_observation(
     }
     for (size_t i = 0u; i < 5u; i++) {
         const size_t expected_access_request_size =
-            observation.side == "converter-generated-rut" && i < 3u
-                ? observation.forward_history[i].size()
-                : api_request(observation.targets[i].c_str()).size();
+            api_request(observation.targets[i].c_str()).size();
         if (observation.request_sizes[i] != expected_access_request_size) {
             error = "#336 observation request-size inventory was inconsistent";
             return false;
@@ -20638,10 +20698,6 @@ static bool capture_max_proxy_replacement_side(u16 frontend_port,
         error = "#336 recorder lifecycle/count/history was not exactly three clean episodes";
         return false;
     }
-    if (!pinned_nginx) {
-        for (size_t i = 0u; i < 3u; i++)
-            observation.request_sizes[i] = observation.forward_history[i].size();
-    }
     if (!validate_max_proxy_replacement_observation(
             observation, frontend_port, backend_port, error))
         return false;
@@ -20800,9 +20856,6 @@ static MaxProxyReplacementObservation make_max_proxy_replacement_self_check(u16 
                                     "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
         value.forward_history.emplace_back(request.begin(), request.end());
     }
-    if (generated) {
-        for (size_t i = 0u; i < 3u; i++) value.request_sizes[i] = value.forward_history[i].size();
-    }
     return value;
 }
 
@@ -20837,11 +20890,6 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     };
     MaxProxyReplacementObservation mutated[2];
     u16 changed_ports[4];
-    const auto sync_generated_request_sizes = [](MaxProxyReplacementObservation& value) {
-        if (value.forward_history.size() < 3u || value.request_sizes.size() < 3u) return false;
-        for (size_t i = 0u; i < 3u; i++) value.request_sizes[i] = value.forward_history[i].size();
-        return true;
-    };
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].wires[1] = mutated[1].wires[3];
     if (!rejects_pair(mutated, source, kPorts, "mirror-clamp-route-miss")) return false;
@@ -20856,39 +20904,39 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     mutated[1].targets[1] = max_proxy_replacement() + "x";
     if (!rejects_pair(mutated, source, kPorts, "raw-access-replaced-by-upstream-target"))
         return false;
+    if (values[1].request_sizes[0] == values[1].forward_history[0].size()) {
+        error = "#336 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    std::copy(std::begin(values), std::end(values), std::begin(mutated));
+    mutated[1].request_sizes[0] = mutated[1].forward_history[0].size();
+    if (!rejects_pair(mutated, source, kPorts, "downstream-size-replaced-by-upstream-size"))
+        return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[1].erase(mutated[1].forward_history[1].begin() + 4u + 128u);
-    if (!sync_generated_request_sizes(mutated[1])) return false;
     if (!rejects_pair(mutated, source, kPorts, "129-byte-transform-truncated-to-128")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[2].erase(mutated[1].forward_history[2].begin() + 4u + 129u,
                                         mutated[1].forward_history[2].begin() + 4u + 133u);
-    if (!sync_generated_request_sizes(mutated[1])) return false;
     if (!rejects_pair(mutated, source, kPorts, "removed-forward-query")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[2].erase(mutated[1].forward_history[2].begin() + 4u + 128u,
                                         mutated[1].forward_history[2].begin() + 4u + 133u);
-    if (!sync_generated_request_sizes(mutated[1])) return false;
     if (!rejects_pair(mutated, source, kPorts, "133-byte-transform-truncated-to-128")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[1].insert(mutated[1].forward_history[1].begin() + 4u + 128u, '/');
-    if (!sync_generated_request_sizes(mutated[1])) return false;
     if (!rejects_pair(mutated, source, kPorts, "transform-extra-separator")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     std::swap(mutated[1].forward_history[2][4u + 64u], mutated[1].forward_history[2][4u + 129u]);
-    if (!sync_generated_request_sizes(mutated[1]) ||
-        !rejects_pair(mutated, source, kPorts, "query-delimiter-moved-inside-replacement"))
+    if (!rejects_pair(mutated, source, kPorts, "query-delimiter-moved-inside-replacement"))
         return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history[2][4u + 131u] = '%';
     mutated[1].forward_history[2].insert(mutated[1].forward_history[2].begin() + 4u + 132u,
                                          {'3', 'D'});
-    if (!sync_generated_request_sizes(mutated[1]) ||
-        !rejects_pair(mutated, source, kPorts, "query-bytes-percent-encoded"))
-        return false;
+    if (!rejects_pair(mutated, source, kPorts, "query-bytes-percent-encoded")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     std::swap(mutated[1].forward_history[0], mutated[1].forward_history[1]);
-    if (!sync_generated_request_sizes(mutated[1])) return false;
     if (!rejects_pair(mutated, source, kPorts, "backend-order")) return false;
     std::copy(std::begin(values), std::end(values), std::begin(mutated));
     mutated[1].forward_history.push_back(mutated[1].forward_history[0]);
@@ -29941,9 +29989,7 @@ static bool parse_static_query_proxy_rut_access(
     for (size_t i = 0u; i < profile.vector_count; i++) {
         const bool forwarded = i < profile.forward_count;
         std::vector<std::string> fields;
-        const size_t field5 =
-            forwarded ? observation.forward_history[i].size()
-                      : static_query_proxy_request(profile.client_targets[i], profile).size();
+        const size_t field5 = static_query_proxy_request(profile.client_targets[i], profile).size();
         if (!split_space_fields(records[i], fields) || fields.size() != (forwarded ? 11u : 9u) ||
             !exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
             fields[2] != profile.client_targets[i] || fields[3] != (forwarded ? "200" : "301") ||
@@ -30711,8 +30757,11 @@ static bool run_static_query_proxy_differential_self_checks(std::string& error) 
     std::string access;
     for (size_t i = 0u; i < 2u; i++) {
         access += "2026-08-26T21:13:05.248Z GET " + std::string(kStaticQueryClientTargets[i]) +
-                  " 200 361us " + std::to_string(values[2].forward_history[i].size()) + " " +
-                  std::to_string(values[2].wires[i].size()) +
+                  " 200 361us " +
+                  std::to_string(static_query_proxy_request(kStaticQueryClientTargets[i],
+                                                            kStaticQueryProxyOracleProfile)
+                                     .size()) +
+                  " " + std::to_string(values[2].wires[i].size()) +
                   " 127.0.0.1 nginx_upstream 243us s=0\n";
     }
     if (!parse_static_query_proxy_rut_access(access, values[2], error)) return false;
@@ -30739,12 +30788,18 @@ static bool run_static_query_proxy_differential_self_checks(std::string& error) 
             if (!unique_replace(first, from, to, changed_first, name)) return false;
             return rejects_access(changed_first + second, name);
         };
-    const std::string first_sizes = " 361us " +
-                                    std::to_string(values[2].forward_history[0].size()) + " " +
+    const size_t first_downstream_size =
+        static_query_proxy_request(kStaticQueryClientTargets[0], kStaticQueryProxyOracleProfile)
+            .size();
+    const std::string first_sizes = " 361us " + std::to_string(first_downstream_size) + " " +
                                     std::to_string(values[2].wires[0].size()) + " 127.0.0.1";
-    const std::string wrong_response_sizes =
-        " 361us " + std::to_string(values[2].forward_history[0].size()) + " " +
-        std::to_string(values[2].wires[0].size() + 1u) + " 127.0.0.1";
+    const std::string wrong_response_sizes = " 361us " + std::to_string(first_downstream_size) +
+                                             " " + std::to_string(values[2].wires[0].size() + 1u) +
+                                             " 127.0.0.1";
+    if (first_downstream_size == values[2].forward_history[0].size()) {
+        error = "#339 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
     if (!rejects_access(second, "missing-access") ||
         !rejects_access(first + first, "duplicate-access") ||
         !rejects_access(access + first, "extra-access") ||
@@ -30753,6 +30808,10 @@ static bool run_static_query_proxy_differential_self_checks(std::string& error) 
             "GET /api/users?x=1 200", "GET /api/users 200", "raw-query-loss") ||
         !rejects_first_record_mutation(
             "/api/users?x=1 200 ", "/api/users?x=1 502 ", "wrong-http-status") ||
+        !rejects_first_record_mutation(
+            " 361us " + std::to_string(first_downstream_size) + " ",
+            " 361us " + std::to_string(values[2].forward_history[0].size()) + " ",
+            "downstream-size-replaced-by-upstream-size") ||
         !rejects_first_record_mutation(first_sizes, wrong_response_sizes, "wrong-response-size") ||
         !rejects_first_record_mutation(" nginx_upstream ", " other_upstream ", "wrong-upstream") ||
         !rejects_first_record_mutation(" s=0\n", " s=1\n", "failed-stream"))
@@ -30862,10 +30921,12 @@ static bool run_zero_suffix_static_query_proxy_differential_self_checks(std::str
 
     std::string access;
     for (size_t i = 0u; i < 2u; i++) {
-        access += "2026-08-26T21:13:05.248Z GET " + std::string(profile.client_targets[i]) +
-                  " 200 361us " + std::to_string(values[2].forward_history[i].size()) + " " +
-                  std::to_string(values[2].wires[i].size()) +
-                  " 127.0.0.1 nginx_upstream 243us s=0\n";
+        access +=
+            "2026-08-26T21:13:05.248Z GET " + std::string(profile.client_targets[i]) +
+            " 200 361us " +
+            std::to_string(static_query_proxy_request(profile.client_targets[i], profile).size()) +
+            " " + std::to_string(values[2].wires[i].size()) +
+            " 127.0.0.1 nginx_upstream 243us s=0\n";
     }
     if (!parse_static_query_proxy_rut_access(access, values[2], error, profile)) return false;
     const size_t first_end = access.find('\n');
@@ -30892,14 +30953,22 @@ static bool run_zero_suffix_static_query_proxy_differential_self_checks(std::str
             if (!replace_unique(records[0], from, to, changed, name)) return false;
             return rejects_access(changed + records[1], name);
         };
-    const std::string first_sizes = " 361us " +
-                                    std::to_string(values[2].forward_history[0].size()) + " " +
+    const size_t first_downstream_size =
+        static_query_proxy_request(profile.client_targets[0], profile).size();
+    const std::string first_sizes = " 361us " + std::to_string(first_downstream_size) + " " +
                                     std::to_string(values[2].wires[0].size()) + " 127.0.0.1";
-    const std::string wrong_response_sizes =
-        " 361us " + std::to_string(values[2].forward_history[0].size()) + " " +
-        std::to_string(values[2].wires[0].size() + 1u) + " 127.0.0.1";
+    const std::string wrong_response_sizes = " 361us " + std::to_string(first_downstream_size) +
+                                             " " + std::to_string(values[2].wires[0].size() + 1u) +
+                                             " 127.0.0.1";
+    if (first_downstream_size == values[2].forward_history[0].size()) {
+        error = "#341 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
     if (!rejects_first_record("GET /api/?x=1 200", "GET /api/ 200", "raw-query-loss") ||
         !rejects_first_record("/api/?x=1 200 ", "/api/?x=1 502 ", "wrong-http-status") ||
+        !rejects_first_record(" 361us " + std::to_string(first_downstream_size) + " ",
+                              " 361us " + std::to_string(values[2].forward_history[0].size()) + " ",
+                              "downstream-size-replaced-by-upstream-size") ||
         !rejects_first_record(first_sizes, wrong_response_sizes, "wrong-response-size") ||
         !rejects_first_record(" nginx_upstream ", " other_upstream ", "wrong-upstream") ||
         !rejects_first_record(" s=0\n", " s=1\n", "failed-stream"))
@@ -31040,9 +31109,7 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
     std::string access;
     for (size_t i = 0u; i < profile.vector_count; i++) {
         const bool forwarded = i < profile.forward_count;
-        const size_t field5 =
-            forwarded ? values[2].forward_history[i].size()
-                      : static_query_proxy_request(profile.client_targets[i], profile).size();
+        const size_t field5 = static_query_proxy_request(profile.client_targets[i], profile).size();
         access += "2026-08-26T21:13:05.248Z GET " + std::string(profile.client_targets[i]) +
                   (forwarded ? " 200 361us " : " 301 361us ") + std::to_string(field5) + " " +
                   std::to_string(values[2].wires[i].size()) + " 127.0.0.1" +
@@ -31072,7 +31139,13 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
             candidate += "\n" + access.substr(records[0].size() + 1u);
             return rejects_access(candidate, name);
         };
-    const std::string first_request_size = std::to_string(values[2].forward_history[0].size());
+    const size_t first_downstream_size =
+        static_query_proxy_request(profile.client_targets[0], profile).size();
+    const std::string first_request_size = std::to_string(first_downstream_size);
+    if (first_downstream_size == values[2].forward_history[0].size()) {
+        error = "#360 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
     if (!rejects_access(access.substr(records[0].size() + 1u), "missing-record") ||
         !rejects_access(access + records[0] + "\n", "extra-record") ||
         !rejects_access(records[1] + "\n" + records[0] + "\n" +
@@ -31080,6 +31153,10 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
                         "reordered-records") ||
         !rejects_first_record_mutation(
             "GET /api/ 200 ", "GET /api/ 0200 ", "noncanonical-status-spelling") ||
+        !rejects_first_record_mutation(
+            " 361us " + first_request_size + " ",
+            " 361us " + std::to_string(values[2].forward_history[0].size()) + " ",
+            "downstream-size-replaced-by-upstream-size") ||
         !rejects_first_record_mutation(" 361us " + first_request_size + " ",
                                        " 361us 0" + first_request_size + " ",
                                        "noncanonical-request-size-spelling"))
@@ -35754,13 +35831,13 @@ static bool parse_exact_loopback_fixed_redirect_rut_access(
     static constexpr u32 kRequestSizes[] = {
         sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
         sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
-        sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u};
+        sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+        sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+        sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u};
     for (size_t i = 0u; i < records.size(); i++) {
         std::vector<std::string> fields;
         const bool forwarded = i >= 3u;
-        const u32 request_size = forwarded
-                                     ? static_cast<u32>(observation.forward_history[i - 3u].size())
-                                     : kRequestSizes[i];
+        const u32 request_size = kRequestSizes[i];
         const u32 response_size = static_cast<u32>(observation.wires[i].size());
         if (!split_space_fields(records[i], fields) || fields.size() != (forwarded ? 11u : 9u) ||
             !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != kTargets[i] ||
@@ -35771,9 +35848,8 @@ static bool parse_exact_loopback_fixed_redirect_rut_access(
                            fields[10] != "s=0")) ||
             (!forwarded && fields[8] != "s=0")) {
             error = "#350 generated access record " + std::to_string(i + 1u) +
-                    " lost its exact current-RUT target/status/field5/response/client/upstream/"
-                    "outcome inventory; forwarded field5 is rewritten upstream wire size under "
-                    "#347, not nginx $request_length";
+                    " lost its exact target/status/downstream-field5/response/client/upstream/"
+                    "outcome inventory";
             return false;
         }
     }
@@ -36617,12 +36693,12 @@ static bool run_exact_loopback_fixed_redirect_four_way_self_checks(std::string& 
             static constexpr u32 kRequestSizes[] = {
                 sizeof(kExactAbsoluteRedirectCloseRequest) - 1u,
                 sizeof(kExactAbsoluteRedirectAlternateHostCloseRequest) - 1u,
-                sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u};
+                sizeof(kExactAbsoluteRedirectQueryCloseRequest) - 1u,
+                sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u,
+                sizeof(kExactAbsoluteRedirectRootNeighborCloseRequest) - 1u};
             for (size_t i = 0u; i < 5u; i++) {
                 const bool forwarded = i >= 3u;
-                const u32 field5 =
-                    forwarded ? static_cast<u32>(observation.forward_history[i - 3u].size())
-                              : kRequestSizes[i];
+                const u32 field5 = kRequestSizes[i];
                 observation.access_records.push_back(
                     "2030-01-01T00:00:00.000Z GET " + std::string(kTargets[i]) + " " +
                     (forwarded ? "200" : std::to_string(redirect_status)) + " 1us " +
@@ -36728,6 +36804,12 @@ static bool run_exact_loopback_fixed_redirect_four_way_self_checks(std::string& 
     const std::string status = std::to_string(redirect_status);
     const std::string alternate_status = redirect_status == 301u ? "302" : "301";
     const std::string response_size = std::to_string(profile->response_size);
+    constexpr size_t kForwardDownstreamSize =
+        sizeof(kExactAbsoluteRedirectSlashNeighborCloseRequest) - 1u;
+    if (kForwardDownstreamSize == valid[2].forward_history[0].size()) {
+        error = "#350 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
     if (!access_rejects(
             "redirect-target", 0u, " GET /old " + status + " ", " GET /new " + status + " ") ||
         !access_rejects(
@@ -36746,8 +36828,8 @@ static bool run_exact_loopback_fixed_redirect_four_way_self_checks(std::string& 
         !access_rejects("forward-status", 3u, " /old/ 200 ", " /old/ 201 ") ||
         !access_rejects("forward-field5",
                         3u,
-                        " 1us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ",
-                        " 1us 1 118 ") ||
+                        " 1us " + std::to_string(kForwardDownstreamSize) + " 118 ",
+                        " 1us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ") ||
         !access_rejects("forward-response", 3u, " 118 127.0.0.1 ", " 117 127.0.0.1 ") ||
         !access_rejects(
             "forward-client", 3u, " 127.0.0.1 nginx_upstream ", " 127.0.0.2 nginx_upstream ") ||
@@ -39263,7 +39345,7 @@ static bool parse_exact_loopback_prefix_root_rut_access(
     const ExactLoopbackPrefixOracleProfile& profile = kExactLoopbackPrefixRootProfile) {
     // The current ordinary-RUT access schema omits Host/upstream endpoint/status (#352).
     // Those facts are proven by the original request, owned source model, recorder history and
-    // downstream outcome. Forwarded field 5 is the rewritten upstream wire size (#347).
+    // downstream outcome; field 5 is the exact original downstream client request size.
     std::vector<std::string> records;
     if (observation.side != "converter-generated-rut" || observation.wires.size() != 5u ||
         observation.forward_history.size() != 3u ||
@@ -39277,9 +39359,7 @@ static bool parse_exact_loopback_prefix_root_rut_access(
     for (size_t i = 0u; i < records.size(); i++) {
         std::vector<std::string> fields;
         const bool forwarded = i < 3u;
-        const u32 field5 =
-            forwarded ? static_cast<u32>(observation.forward_history[i].size())
-                      : static_cast<u32>(api_request(profile.semantics->targets[i]).size());
+        const u32 field5 = static_cast<u32>(api_request(profile.semantics->targets[i]).size());
         const u32 response_size = static_cast<u32>(observation.wires[i].size());
         if (!split_space_fields(records[i], fields) || fields.size() != (forwarded ? 11u : 9u) ||
             !exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
@@ -39292,9 +39372,8 @@ static bool parse_exact_loopback_prefix_root_rut_access(
             (!forwarded && fields[8] != "s=0")) {
             error = std::string(profile.issue) + " generated access record " +
                     std::to_string(i + 1u) +
-                    " lost its exact current-RUT target/status/field5/response/client/upstream/"
-                    "outcome inventory; forwarded field5 is rewritten upstream wire size under "
-                    "#347, not nginx $request_length";
+                    " lost its exact target/status/downstream-field5/response/client/upstream/"
+                    "outcome inventory";
             return false;
         }
     }
@@ -40266,8 +40345,7 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
             for (size_t i = 0u; i < 5u; i++) {
                 const bool forwarded = i < 3u;
                 const u32 field5 =
-                    forwarded ? static_cast<u32>(value.forward_history[i].size())
-                              : static_cast<u32>(api_request(profile.semantics->targets[i]).size());
+                    static_cast<u32>(api_request(profile.semantics->targets[i]).size());
                 value.access_records.push_back(
                     "2030-01-01T00:00:00.000Z GET " + std::string(profile.semantics->targets[i]) +
                     " " + (forwarded ? "200" : "301") + " 1us " + std::to_string(field5) + " " +
@@ -40504,8 +40582,13 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
             error = std::string(profile.issue) + " generated access accepted mutation: " + label;
             return false;
         };
-    const std::string forward_field5 =
-        " 1us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ";
+    const size_t first_downstream_size = api_request(profile.semantics->targets[0]).size();
+    if (first_downstream_size == valid[2].forward_history[0].size()) {
+        error = std::string(profile.issue) +
+                " self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    const std::string forward_field5 = " 1us " + std::to_string(first_downstream_size) + " 118 ";
     if (!access_rejects("target",
                         0u,
                         " GET " + std::string(profile.semantics->targets[0]) + " 200 ",
@@ -40514,7 +40597,10 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
                         0u,
                         " " + std::string(profile.semantics->targets[0]) + " 200 ",
                         " " + std::string(profile.semantics->targets[0]) + " 201 ") ||
-        !access_rejects("field5", 0u, forward_field5, " 1us 1 118 ") ||
+        !access_rejects("field5",
+                        0u,
+                        forward_field5,
+                        " 1us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ") ||
         !access_rejects("response", 0u, " 118 127.0.0.1 ", " 117 127.0.0.1 ") ||
         !access_rejects("client", 0u, " 127.0.0.1 nginx_upstream ", " 127.0.0.2 nginx_upstream ") ||
         !access_rejects("upstream", 0u, " nginx_upstream 2us ", " other_upstream 2us ") ||
@@ -41041,7 +41127,6 @@ static bool run_exact_max_proxy_prefix_self_checks(
             return false;
         }
         changed.forward_history[0].assign(rewritten.begin(), rewritten.end());
-        changed.request_sizes[0] = changed.forward_history[0].size();
         if (!observation_rejects("unexpected-root-rewrite", changed, true)) return false;
     }
 
@@ -41605,19 +41690,16 @@ static bool parse_exact_loopback_action_rut_access(const std::string& contents,
                 " generated local access record lost its exact current-RUT inventory";
         return false;
     }
-    // #347 records the known semantic boundary: on a forwarded request RUT's
-    // field 5 is the rewritten upstream wire size, not nginx $request_length.
     if (!split_space_fields(records[1], fallback) || fallback.size() != 11u ||
         !exact_log_timestamp(fallback[0]) || fallback[1] != "GET" || fallback[2] != "/" ||
         !decimal_field_equals(fallback[3], 200u) || !exact_log_duration(fallback[4]) ||
-        !decimal_field_equals(fallback[5], observation.forward_history[0].size()) ||
+        !decimal_field_equals(fallback[5], strlen(profile.fallback_request)) ||
         !decimal_field_equals(fallback[6], observation.fallback_wire.size()) ||
         fallback[7] != "127.0.0.1" || fallback[8] != "nginx_upstream" ||
         !exact_log_duration(fallback[9]) || fallback[10] != "s=0") {
         error = std::string(profile.issue) +
-                " generated fallback access record lost its exact current-RUT inventory; "
-                "forwarded field 5 is rewritten upstream wire size under #347, not nginx "
-                "$request_length";
+                " generated fallback access record lost its exact downstream request-size "
+                "inventory";
         return false;
     }
     observation.local_access_record = records[0];
@@ -42387,13 +42469,13 @@ static bool parse_wildcard_listen_rut_access(
     if (observation.side != "converter-generated-rut" || observation.forward_history.size() != 1u ||
         !split_exact_complete_log(contents, 1u, label.c_str(), records, error))
         return false;
+    const size_t downstream_request_size = make_minimal_listen_request(profile.client_host).size();
     std::vector<std::string> fields;
     if (!split_space_fields(records[0], fields) || fields.size() != 11u ||
         !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != "/" ||
         fields[3] != "200" || !decimal_field_equals(fields[3], 200u) ||
-        !exact_log_duration(fields[4]) ||
-        fields[5] != std::to_string(observation.forward_history[0].size()) ||
-        !decimal_field_equals(fields[5], observation.forward_history[0].size()) ||
+        !exact_log_duration(fields[4]) || fields[5] != std::to_string(downstream_request_size) ||
+        !decimal_field_equals(fields[5], downstream_request_size) ||
         fields[6] != std::to_string(observation.wire.size()) ||
         !decimal_field_equals(fields[6], observation.wire.size()) || fields[7] != "127.0.0.1" ||
         fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]) || fields[10] != "s=0") {
@@ -43037,10 +43119,10 @@ static bool run_wildcard_listen_differential_self_checks(
                     : wildcard_listen_expected_access(
                           value.access_scope, value.backend_port, value.wire.size());
         } else {
-            value.access_record = "2026-08-26T21:13:05.248Z GET / 200 361us " +
-                                  std::to_string(value.forward_history[0].size()) + " " +
-                                  std::to_string(value.wire.size()) +
-                                  " 127.0.0.1 nginx_upstream 243us s=0";
+            value.access_record =
+                "2026-08-26T21:13:05.248Z GET / 200 361us " +
+                std::to_string(make_minimal_listen_request(profile.client_host).size()) + " " +
+                std::to_string(value.wire.size()) + " 127.0.0.1 nginx_upstream 243us s=0";
         }
     }
 
@@ -43425,8 +43507,14 @@ static bool run_wildcard_listen_differential_self_checks(
             return unique_replace(valid_access, from, to, candidate, label) &&
                    rejects_access(candidate, label);
         };
-    const std::string sizes = " 361us " + std::to_string(values[2].forward_history[0].size()) +
-                              " " + std::to_string(values[2].wire.size()) + " 127.0.0.1";
+    const size_t downstream_request_size = make_minimal_listen_request(profile.client_host).size();
+    if (downstream_request_size == values[2].forward_history[0].size()) {
+        error = std::string(profile.issue) +
+                " self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    const std::string sizes = " 361us " + std::to_string(downstream_request_size) + " " +
+                              std::to_string(values[2].wire.size()) + " 127.0.0.1";
     if (!rejects_access("", "zero-record") ||
         !rejects_access(valid_access + valid_access, "duplicate-record") ||
         !rejects_access(valid_access + "extra\n", "extra-record") ||
@@ -43434,12 +43522,12 @@ static bool run_wildcard_listen_differential_self_checks(
         !rejects_unique_access(" GET / 200 ", " POST / 200 ", "method") ||
         !rejects_unique_access(" GET / 200 ", " GET / 502 ", "status") ||
         !rejects_unique_access(sizes,
-                               " 361us 1 " + std::to_string(values[2].wire.size()) + " 127.0.0.1",
+                               " 361us " + std::to_string(values[2].forward_history[0].size()) +
+                                   " " + std::to_string(values[2].wire.size()) + " 127.0.0.1",
                                "request-size") ||
-        !rejects_unique_access(
-            sizes,
-            " 361us " + std::to_string(values[2].forward_history[0].size()) + " 1 127.0.0.1",
-            "response-size") ||
+        !rejects_unique_access(sizes,
+                               " 361us " + std::to_string(downstream_request_size) + " 1 127.0.0.1",
+                               "response-size") ||
         !rejects_unique_access(" nginx_upstream ", " other_upstream ", "upstream") ||
         !rejects_unique_access(" s=0\n", " s=1\n", "outcome"))
         return false;
@@ -43881,9 +43969,10 @@ static bool run_exact_loopback_return204_four_way_self_checks(std::string& error
                 "2026-08-27T01:02:03.004Z GET /static 204 1us " +
                 std::to_string(sizeof(kExactLoopbackReturn204LocalRequest) - 1u) +
                 " 105 127.0.0.1 s=0";
-            value.fallback_access_record = "2026-08-27T01:02:03.005Z GET / 200 2us " +
-                                           std::to_string(value.forward_history[0].size()) +
-                                           " 118 127.0.0.1 nginx_upstream 1us s=0";
+            value.fallback_access_record =
+                "2026-08-27T01:02:03.005Z GET / 200 2us " +
+                std::to_string(strlen(kReturn204PinnedActionProfile.fallback_request)) +
+                " 118 127.0.0.1 nginx_upstream 1us s=0";
         } else {
             value.local_access_record = exact_loopback_return204_local_access(value.access_scope);
             value.fallback_access_record =
@@ -43960,8 +44049,12 @@ static bool run_exact_loopback_return204_four_way_self_checks(std::string& error
         };
     const std::string local_sizes =
         " 1us " + std::to_string(sizeof(kExactLoopbackReturn204LocalRequest) - 1u) + " 105 ";
-    const std::string fallback_sizes =
-        " 2us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ";
+    const size_t fallback_downstream_size = strlen(kReturn204PinnedActionProfile.fallback_request);
+    if (fallback_downstream_size == valid[2].forward_history[0].size()) {
+        error = "#348 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    const std::string fallback_sizes = " 2us " + std::to_string(fallback_downstream_size) + " 118 ";
     if (!rejects_access_mutation("local-access-status", true, " 204 ", " 200 ") ||
         !rejects_access_mutation("local-access-request-size", true, local_sizes, " 1us 1 105 ") ||
         !rejects_access_mutation("local-access-response-size", true, " 105 ", " 104 ") ||
@@ -43969,12 +44062,14 @@ static bool run_exact_loopback_return204_four_way_self_checks(std::string& error
         !rejects_access_mutation("local-access-outcome", true, " s=0", " s=1") ||
         !rejects_access_mutation("fallback-access-target", false, " GET / 200 ", " GET /x 200 ") ||
         !rejects_access_mutation(
-            "fallback-access-request-size", false, fallback_sizes, " 2us 1 118 ") ||
-        !rejects_access_mutation(
-            "fallback-access-response-size",
+            "fallback-access-request-size",
             false,
             fallback_sizes,
-            " 2us " + std::to_string(valid[2].forward_history[0].size()) + " 117 ") ||
+            " 2us " + std::to_string(valid[2].forward_history[0].size()) + " 118 ") ||
+        !rejects_access_mutation("fallback-access-response-size",
+                                 false,
+                                 fallback_sizes,
+                                 " 2us " + std::to_string(fallback_downstream_size) + " 117 ") ||
         !rejects_access_mutation(
             "fallback-access-upstream", false, " nginx_upstream ", " other_upstream ") ||
         !rejects_access_mutation("fallback-access-client",
@@ -44138,10 +44233,10 @@ static bool run_exact_loopback_bodyful_four_way_self_checks(std::string& error) 
                 "2026-08-27T01:02:03.004Z GET /static 200 1us " +
                 std::to_string(strlen(kBodyfulReturnPinnedActionProfile.local_request)) + " " +
                 std::to_string(value.local_wire.size()) + " 127.0.0.1 s=0";
-            value.fallback_access_record = "2026-08-27T01:02:03.005Z GET / 200 2us " +
-                                           std::to_string(value.forward_history[0].size()) + " " +
-                                           std::to_string(value.fallback_wire.size()) +
-                                           " 127.0.0.1 nginx_upstream 1us s=0";
+            value.fallback_access_record =
+                "2026-08-27T01:02:03.005Z GET / 200 2us " +
+                std::to_string(strlen(kBodyfulReturnPinnedActionProfile.fallback_request)) + " " +
+                std::to_string(value.fallback_wire.size()) + " 127.0.0.1 nginx_upstream 1us s=0";
             value.source_lifetime_proven = true;
         } else {
             value.local_access_record = exact_loopback_pinned_local_access(
@@ -44239,8 +44334,13 @@ static bool run_exact_loopback_bodyful_four_way_self_checks(std::string& error) 
     const std::string local_sizes =
         " 1us " + std::to_string(strlen(kBodyfulReturnPinnedActionProfile.local_request)) + " " +
         std::to_string(valid[2].local_wire.size()) + " ";
-    const std::string fallback_sizes = " 2us " +
-                                       std::to_string(valid[2].forward_history[0].size()) + " " +
+    const size_t fallback_downstream_size =
+        strlen(kBodyfulReturnPinnedActionProfile.fallback_request);
+    if (fallback_downstream_size == valid[2].forward_history[0].size()) {
+        error = "#349 self-check no longer distinguishes downstream and rebuilt request sizes";
+        return false;
+    }
+    const std::string fallback_sizes = " 2us " + std::to_string(fallback_downstream_size) + " " +
                                        std::to_string(valid[2].fallback_wire.size()) + " ";
     if (!access_rejects("local-target", true, " GET /static 200 ", " GET /statix 200 ") ||
         !access_rejects("local-status", true, " /static 200 ", " /static 201 ") ||
@@ -44259,7 +44359,8 @@ static bool run_exact_loopback_bodyful_four_way_self_checks(std::string& error) 
         !access_rejects("fallback-field5",
                         false,
                         fallback_sizes,
-                        " 2us 1 " + std::to_string(valid[2].fallback_wire.size()) + " ") ||
+                        " 2us " + std::to_string(valid[2].forward_history[0].size()) + " " +
+                            std::to_string(valid[2].fallback_wire.size()) + " ") ||
         !access_rejects("fallback-response-size",
                         false,
                         " " + std::to_string(valid[2].fallback_wire.size()) + " 127.0.0.1 ",
@@ -44705,7 +44806,7 @@ static bool validate_rut_exact_ipv4_runtime_log(const std::string& contents,
 }
 
 static bool validate_rut_exact_ipv4_access(const std::string& contents,
-                                           size_t rewritten_upstream_request_size,
+                                           size_t downstream_request_size,
                                            size_t downstream_response_wire_size,
                                            std::string& error) {
     std::vector<std::string> records;
@@ -44716,14 +44817,13 @@ static bool validate_rut_exact_ipv4_access(const std::string& contents,
         !exact_log_timestamp(fields[0]) || fields[1] != "GET" || fields[2] != "/scope?q=1" ||
         fields[3] != "200" || !decimal_field_equals(fields[3], 200u) ||
         !exact_log_duration(fields[4]) ||
-        !decimal_field_equals(fields[5], rewritten_upstream_request_size) ||
+        !decimal_field_equals(fields[5], downstream_request_size) ||
         !decimal_field_equals(fields[6], downstream_response_wire_size) ||
         fields[7] != "127.0.0.1" || fields[8] != "exact_backend" ||
         !exact_log_duration(fields[9]) || fields[10] != "s=0") {
         error =
-            "#345 access record lost raw target/status/current-RUT rewritten-upstream "
-            "request size/downstream response size/upstream/outcome evidence (#347 tracks "
-            "original downstream request-length semantics)";
+            "#345 access record lost raw target/status/original downstream request size/"
+            "downstream response size/upstream/outcome evidence";
         return false;
     }
     return true;
@@ -45129,13 +45229,10 @@ static bool run_rut_exact_ipv4_listener_production(TempDir& temp,
     const std::string rewritten_upstream_wire =
         "GET /scope?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
         "\r\nX-Stage4: owned\r\n\r\n";
-    // Current generic RUT proxy access req_size is the rewritten upstream wire size. It is
-    // intentionally not nginx $request_length/original downstream request size; #347 tracks that
-    // separate access-log semantic capability.
     if (request_text.size() == rewritten_upstream_wire.size()) {
         error =
-            "#345 fixture no longer distinguishes current rewritten-upstream req_size from "
-            "the original downstream request length tracked by #347";
+            "#345 fixture no longer distinguishes downstream access size from rebuilt upstream "
+            "wire size";
         return false;
     }
     if (backend.history[0] !=
@@ -45150,8 +45247,7 @@ static bool run_rut_exact_ipv4_listener_production(TempDir& temp,
         !validate_rut_exact_ipv4_runtime_log(runtime_contents, temp.source, frontend_port, error) ||
         !read_exact_return204_log(
             temp.rut_access_log, "#345 exact RUT access log", access_contents, error) ||
-        !validate_rut_exact_ipv4_access(
-            access_contents, rewritten_upstream_wire.size(), wire.size(), error))
+        !validate_rut_exact_ipv4_access(access_contents, request_text.size(), wire.size(), error))
         return false;
     return validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error);
 }
@@ -46479,7 +46575,8 @@ int main(int argc, char** argv) {
                "converter, generated-RUT or behavior-equivalence claim; excludes relative/"
                "variable redirects, other targets/statuses/"
                "addresses/options/listeners/servers, methods/bodies/framing/query shapes, reuse/"
-               "pipeline/failures, H1.0, H2 and TLS; #279/#347 are not implemented)\n";
+               "pipeline/failures, H1.0, H2 and TLS; this nginx-only gate makes no #279 or "
+               "generated-RUT request-size claim)\n";
         return 0;
     }
 
@@ -46516,7 +46613,7 @@ int main(int argc, char** argv) {
                "converter, generated-RUT or behavior-equivalence claim; excludes relative/"
                "variable redirects, other targets/statuses/addresses/options/listeners/servers, "
                "methods/bodies/framing/query shapes, reuse/pipeline/failures, H1.0, H2 and TLS; "
-               "#279/#347 are not implemented)\n";
+               "this nginx-only gate makes no #279 or generated-RUT request-size claim)\n";
         return 0;
     }
 
@@ -46704,8 +46801,8 @@ int main(int argc, char** argv) {
                "automatic 301 redirects with no extra upstream. Side-scoped access/lifecycle, "
                "eight unique ports, resources, source ownership and canonical generated bytes "
                "were proven (nginx.conf was translated, never loaded directly; representative "
-               "Stage 4A only; P63, #354 non-/ replacement, #355 true no-URI, #347/#352 access "
-               "format equivalence, other listeners/prefixes/methods/bodies/framing/reuse/"
+               "Stage 4A only; P63, #354 non-/ replacement, #355 true no-URI and #352 remaining "
+               "access fields, other listeners/prefixes/methods/bodies/framing/reuse/"
                "failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
@@ -46743,7 +46840,7 @@ int main(int argc, char** argv) {
                "schemas, lifecycle, eight unique ports/resources, source ownership, canonical "
                "3345-byte representative output and order equality were proven (nginx.conf was "
                "translated, never loaded directly; fixed representative Stage 4 only; broader "
-               "P/U, configured query, P63/U128, #355 true no-URI, #347/#352 access equivalence, "
+               "P/U, configured query, P63/U128, #355 true no-URI, #352 remaining access fields, "
                "other listeners/methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
@@ -46782,7 +46879,7 @@ int main(int argc, char** argv) {
                "unique ports/resources, source lifetime and canonical order equality were proven "
                "(nginx.conf was translated, never loaded directly; fixed /api/ clean-target "
                "profile only; wildcard/other prefixes, P63, configured query, normalization-"
-               "sensitive targets, #347/#352 access equivalence, other methods/bodies/framing/"
+               "sensitive targets, #352 remaining access fields, other methods/bodies/framing/"
                "reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
@@ -46822,8 +46919,8 @@ int main(int argc, char** argv) {
                "binding-linked policy ownership, clean lifecycle, eight unique ports/resources, "
                "source lifetime and canonical order equality were proven (nginx.conf was "
                "translated, never loaded directly; representative Stage 4A only; P63, wildcard "
-               "no-URI, configured URI/query, normalization-sensitive targets, #347/#352 access "
-               "equivalence, other methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
+               "no-URI, configured URI/query, normalization-sensitive targets, #352 remaining "
+               "access fields, other methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
 
@@ -46855,7 +46952,7 @@ int main(int argc, char** argv) {
                "access, owned source and clean lifecycle. Representative both-order behavior is "
                "separately proven by #353 Stage 4A and exact P63 both-order structure by Stages "
                "2/3 (boundary-only; no #354 non-/ replacement, #355 true no-URI, configured "
-               "query, #347/#352 access-format equivalence, broader listeners/methods/bodies/"
+               "query, #352 remaining access fields, broader listeners/methods/bodies/"
                "framing/reuse/failures/H1.0/H2/TLS claim)\n";
         return 0;
     }
@@ -46894,7 +46991,7 @@ int main(int argc, char** argv) {
                "3426 bytes with NUL reserve and 2520 bytes capacity headroom (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
-               "#347/#352 access equivalence, broader methods/bodies/framing/reuse/retries/"
+               "#352 remaining access fields, broader methods/bodies/framing/reuse/retries/"
                "failures/H1.0/H2/TLS excluded; nginx.conf was translated, never loaded "
                "directly)\n";
         return 0;
@@ -46932,7 +47029,7 @@ int main(int argc, char** argv) {
                "support-boundary rejection (#357 remains PARTIAL; nginx.conf was translated, "
                "never loaded by RUT; configured URI/query, normalization-sensitive/absolute "
                "targets, broader methods/bodies/framing/reuse/failures/H1.0/H2/TLS and "
-               "#347/#352 access equivalence excluded)\n";
+               "#352 remaining access fields excluded)\n";
         return 0;
     }
 
@@ -47040,9 +47137,9 @@ int main(int argc, char** argv) {
                "Connection-omitted upstream history plus Date-normalized 118-byte "
                "200/CL2/ok/close/zero-tail/EOF downstream wire with one no-retry episode per side. "
                "Generated sources survived post-readiness overwrite and lifecycles/access "
-               "inventories were exact (nginx.conf was translated to ordinary RUT, never loaded "
-               "directly; current RUT rewritten-upstream access size is not claimed equivalent to "
-               "nginx $request_length and remains tracked by #347; excludes other addresses, "
+               "inventories were exact, including original downstream request size distinct from "
+               "the rebuilt upstream wire (nginx.conf was translated to ordinary RUT, never loaded "
+               "directly; excludes other addresses, "
                "options, listeners/servers, methods, bodies/framing, reuse/pipeline, failures, "
                "H1.0, H2, and TLS)\n";
         return 0;
@@ -47075,9 +47172,10 @@ int main(int argc, char** argv) {
                "200/CL2/ok/EOF wires, and emitted one byte-exact Host-rebuilt, "
                "Connection-omitted upstream episode with no retry. Each side had exactly two "
                "ordered access records and a clean lifecycle; generated owned listener/action/"
-               "root state survived source overwrite (nginx.conf was translated to ordinary "
-               "RUT, never loaded directly; nginx $request_length equivalence is excluded by "
-               "#347; bounded #348 composition only; excludes other listeners/addresses/paths/"
+               "root state survived source overwrite, and generated field 5 matched the exact "
+               "original downstream request size (nginx.conf was translated to ordinary RUT, "
+               "never loaded directly; bounded #348 composition only; excludes other "
+               "listeners/addresses/paths/"
                "methods/bodies/keep-alive/retries/failures/H1.0/H2/TLS)\n";
         return 0;
     }
@@ -47113,8 +47211,8 @@ int main(int argc, char** argv) {
                "records and a clean lifecycle; generated owned listener/Representation200/body/"
                "root state survived source destruction and post-readiness overwrite (nginx.conf "
                "was translated to ordinary RUT, never loaded directly; generated forwarded "
-               "field 5 is rewritten upstream wire size and is not compared with nginx "
-               "$request_length, tracked by #347; #279 escaped bodies excluded; bounded #349 "
+               "field 5 matched the exact original downstream request size while upstream wire "
+               "bytes remained independently asserted; #279 escaped bodies excluded; bounded #349 "
                "composition only; excludes redirects, other listeners/addresses/paths/methods/"
                "queries/bodies/framing/reuse/retries/failures/H1.0/H2/TLS)\n";
         return 0;
@@ -47151,8 +47249,8 @@ int main(int argc, char** argv) {
                "records and a clean lifecycle; generated owned listener/redirect/root state "
                "survived borrowed-source destruction and post-readiness source overwrite "
                "(nginx.conf was translated to ordinary RUT, never loaded directly; generated "
-               "forwarded access field 5 is rewritten upstream wire size and is not compared "
-               "with nginx $request_length, tracked by #347; current RUT access text omits "
+               "forwarded access field 5 matched the exact original downstream request size; "
+               "current RUT access text omits "
                "Host/upstream address/upstream status, which are proven independently by "
                "request/history, owned endpoint and downstream outcome evidence; excludes other "
                "redirects/listeners/addresses/paths/"
@@ -47195,8 +47293,8 @@ int main(int argc, char** argv) {
                "and a clean lifecycle; generated owned listener/redirect/root state survived "
                "borrowed-source destruction and post-readiness source overwrite (nginx.conf was "
                "translated to ordinary RUT, never loaded directly; generated forwarded access "
-               "field 5 is rewritten upstream wire size and is not compared with nginx "
-               "$request_length, tracked by #347; current RUT access text omits Host/upstream "
+               "field 5 matched the exact original downstream request size; current RUT access "
+               "text omits Host/upstream "
                "address/upstream status, proven independently by request/history, owned endpoint "
                "and downstream outcome evidence; excludes other redirects/listeners/addresses/"
                "paths/methods/queries/bodies/framing/reuse/retries/failures/H1.0/H2/TLS)\n";
@@ -47538,7 +47636,8 @@ int main(int argc, char** argv) {
                "connect failures and a clean lifecycle (#357 nginx-only; no parser/converter/"
                "generated-RUT equivalence claim; explicit 0.0.0.0 and * spellings, P63, "
                "configured URI/query, normalization-sensitive/absolute targets, broader methods/"
-               "bodies/framing/reuse/failures/H1.0/H2/TLS and #347/#352 excluded)\n";
+               "bodies/framing/reuse/failures/H1.0/H2/TLS and #352 remaining access fields "
+               "excluded)\n";
         return 0;
     }
 
@@ -47572,7 +47671,7 @@ int main(int argc, char** argv) {
                "source overwrite, clean lifecycle and canonical order equality were proven "
                "(nginx.conf was translated, never loaded by RUT; representative Stage 4A "
                "only; P63, explicit 0.0.0.0/* spellings behavior, configured URI/query, "
-               "normalization-sensitive targets, #347/#352 access equivalence, broader "
+               "normalization-sensitive targets, #352 remaining access fields, broader "
                "methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
@@ -47682,7 +47781,7 @@ int main(int argc, char** argv) {
                "generated-RUT or behavior-equivalence claim; #359 is handled separately; "
                "variables, quoted/escaped/repeated-question/fragment/normalization "
                "forms, other methods, bodies/framing, reuse/retry/failure, H1.0/H2/TLS and "
-               "#347/#352 access equivalence excluded)\n";
+               "#352 remaining access fields excluded)\n";
         return 0;
     }
 
@@ -47806,7 +47905,7 @@ int main(int argc, char** argv) {
                "and clean lifecycle (#360 bounded converter equivalence only; excludes /? "
                "profile, exact-listener allowlists, variables, quoted/escaped/repeated-query, "
                "percent/normalization-sensitive targets, other methods/bodies/framing/reuse/"
-               "retry/failure, H1.0/H2/TLS and #347/#352 cross-runtime access fields)\n";
+               "retry/failure, H1.0/H2/TLS and #352 remaining cross-runtime access fields)\n";
         return 0;
     }
 
