@@ -559,6 +559,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue360_empty_configured_query_oracle
+        COMMAND test_nginx_differential --pinned-nginx-empty-query-proxy-uri-oracle
+    )
+    set_tests_properties(test_nginx_issue360_empty_configured_query_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue342_wildcard_listen_oracle
         COMMAND test_nginx_differential --pinned-nginx-wildcard-listen-oracle
     )
