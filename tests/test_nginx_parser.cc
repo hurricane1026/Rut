@@ -12,12 +12,44 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
+#include <cstddef>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 using namespace rut;
 
 static_assert(nginx::kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
+static_assert(sizeof(void*) == 8u, "Rut's supported loader/compiler data model is 64-bit");
+static_assert(sizeof(u32) == 4u && alignof(u32) == 4u,
+              "RutSource layout evidence requires the supported 32-bit u32 model");
+static_assert(std::is_standard_layout_v<nginx::RutSource>);
+static_assert(std::is_trivially_copyable_v<nginx::RutSource>);
+static_assert(alignof(nginx::RutSource) == alignof(u32));
+static_assert(offsetof(nginx::RutSource, len) == 5948u);
+static_assert(sizeof(nginx::RutSource) == 5952u);
+
+TEST(nginx_converter, rut_source_capacity_layout_zero_reserve_and_copy_ownership) {
+    static_assert(nginx::RutSource::kCapacity == 5946u);
+    nginx::RutSource original{};
+    original.len = nginx::RutSource::kCapacity - 1u;
+    memset(original.data, 'x', original.len);
+    REQUIRE_EQ(original.data[original.len], '\0');
+    CHECK_EQ(original.view().len, 5945u);
+    CHECK_EQ(original.view().ptr, original.data);
+    CHECK_LT(original.len, nginx::RutSource::kCapacity);
+    static constexpr u32 kInvalidPayloadLength = 5946u;
+    CHECK_FALSE(kInvalidPayloadLength < nginx::RutSource::kCapacity);
+
+    nginx::RutSource copied = original;
+    memset(original.data, 'y', original.len);
+    original.len = 0u;
+    CHECK_EQ(copied.len, 5945u);
+    CHECK_EQ(copied.view().ptr, copied.data);
+    CHECK_EQ(copied.data[0], 'x');
+    CHECK_EQ(copied.data[copied.len - 1u], 'x');
+    CHECK_EQ(copied.data[copied.len], '\0');
+}
 
 namespace {
 
@@ -4000,7 +4032,7 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5626u);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -4028,7 +4060,7 @@ TEST(nginx_converter, exact_local_return_maximum_path_and_body_fit_bounded_sourc
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5681u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 256u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 265u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -4061,7 +4093,7 @@ TEST(nginx_converter, normalized_exact_local_return_maximum_path_and_body_fit_bo
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5681u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 256u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 265u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     CHECK(strstr(lowered.value().data, "route exact slash_normalized \"") != nullptr);
     const auto lexed = lex(lowered.value().view());
@@ -4110,7 +4142,7 @@ TEST(nginx_converter, multiple_space_maximum_path_and_body_keep_exact_source_cap
         REQUIRE(lowered);
         CHECK_EQ(lowered.value().len, vector.expected_len);
         CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-        CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+        CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
         const char* emitted_body = strstr(lowered.value().data, body);
         REQUIRE(emitted_body != nullptr);
         CHECK((Str{emitted_body, nginx::kMaxLocalReturnBodyLen}.eq(
@@ -5919,8 +5951,8 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5564u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
-    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 373u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 382u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -5930,7 +5962,7 @@ TEST(nginx_converter, exact_no_content_maximum_ports_fit_existing_source_capacit
 
 TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source_capacity) {
     static_assert(nginx::kMaxExactLocalReturnPathLen == 62u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
     char paths[2][nginx::kMaxExactLocalReturnPathLen + 1u]{};
     paths[0][0] = '/';
     paths[1][0] = '/';
@@ -5939,7 +5971,7 @@ TEST(nginx_converter, bounded_exact_no_content_maximum_paths_fit_existing_source
         paths[1][i] = i + 1u == nginx::kMaxExactLocalReturnPathLen ? '/' : 'b';
     }
     const u32 expected_lengths[] = {5619u, 5619u};
-    const u32 expected_headroom[] = {318u, 318u};
+    const u32 expected_headroom[] = {327u, 327u};
     const char* expected_selectors[] = {"route exact slash_normalized GET \"/aaaa",
                                         "route exact slash_normalized GET \"/bbbb"};
     for (u32 vector = 0; vector < 2u; vector++) {
@@ -5984,7 +6016,8 @@ TEST(nginx_converter, exact_redirect_maximum_ports_fit_bounded_source_capacity) 
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 5936u);
-    CHECK_EQ(lowered.value().len + 1u, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 10u);
+    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -6001,7 +6034,7 @@ TEST(nginx_converter, exact_302_redirect_maximum_ports_fit_bounded_source_capaci
     CHECK_EQ(lowered.value().len, 5912u);
     CHECK_EQ(lowered.value().len + 1u, 5913u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -6027,7 +6060,7 @@ TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
 
 TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
     char uri[nginx::kMaxProxyPassUriLen + 1u]{};
     uri[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyPassUriLen; i++) uri[i] = 'a';
@@ -6049,7 +6082,7 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 3468u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -6060,7 +6093,7 @@ TEST(nginx_converter, clean_proxy_uri_maximum_fits_strict_existing_source_capaci
 TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyLocationPathLen == 63u);
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
     char path[nginx::kMaxProxyLocationPathLen + 1u]{};
     path[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) path[i] = 'a';
@@ -6085,7 +6118,7 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
     REQUIRE(lowered);
     CHECK_EQ(lowered.value().len, 3700u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity, 5937u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     const auto ast = parse_file(lexed.value());
@@ -6096,7 +6129,7 @@ TEST(nginx_converter, maximum_clean_location_and_uri_fit_strict_existing_source_
 TEST(nginx_converter, maximum_static_query_uri_fits_strict_existing_source_capacity) {
     static_assert(nginx::kMaxProxyLocationPathLen == 63u);
     static_assert(nginx::kMaxProxyPassUriLen == 128u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
     char path[nginx::kMaxProxyLocationPathLen + 1u]{};
     path[0] = '/';
     for (u32 i = 1; i + 1u < nginx::kMaxProxyLocationPathLen; i++) path[i] = 'p';
@@ -10793,7 +10826,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
 
     const auto check_wildcard_at_length = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -10859,7 +10892,7 @@ TEST(nginx_parser,
     const u32 representative_exact_302 = representative_wildcard_302 + kExactListenerDelta;
     CHECK_EQ(representative_exact_302, 5913u);
     CHECK_LT(representative_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 24u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_302, 33u);
     check_exact_redirect({kRepresentativeExact302, sizeof(kRepresentativeExact302) - 1u},
                          302u,
                          8080u,
@@ -10880,7 +10913,7 @@ TEST(nginx_parser,
     const u32 maximum_exact_302 = maximum_wildcard_302 + kExactListenerDelta;
     CHECK_EQ(maximum_exact_302, 5921u);
     CHECK_LT(maximum_exact_302, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 16u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_302, 25u);
     check_exact_redirect({kMaximumExact302, sizeof(kMaximumExact302) - 1u},
                          302u,
                          65535u,
@@ -10899,8 +10932,9 @@ TEST(nginx_parser,
                              5928u,
                              representative_wildcard_301);
     const u32 representative_exact_301 = representative_wildcard_301 + kExactListenerDelta;
-    CHECK_EQ(representative_exact_301, nginx::RutSource::kCapacity);
-    CHECK_FALSE(representative_exact_301 < nginx::RutSource::kCapacity);
+    CHECK_EQ(representative_exact_301, 5937u);
+    CHECK_LT(representative_exact_301, nginx::RutSource::kCapacity);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_301, 9u);
     check_exact_redirect({kRepresentativeExact301, sizeof(kRepresentativeExact301) - 1u},
                          301u,
                          8080u,
@@ -10921,9 +10955,56 @@ TEST(nginx_parser,
     const u32 maximum_exact_301 = maximum_wildcard_301 + kExactListenerDelta;
     CHECK_EQ(maximum_exact_301, 5945u);
     CHECK_EQ(maximum_exact_301 + 1u, 5946u);
-    CHECK_GT(maximum_exact_301, nginx::RutSource::kCapacity);
+    CHECK_EQ(maximum_exact_301 + 1u, nginx::RutSource::kCapacity);
+    CHECK_LT(maximum_exact_301, nginx::RutSource::kCapacity);
     check_exact_redirect(
         {kMaximumExact301, sizeof(kMaximumExact301) - 1u}, 301u, 65535u, 0xffffffffu, 65535u, 0u);
+
+    const auto maximum_wildcard_301_model =
+        nginx::parse({kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u});
+    REQUIRE(maximum_wildcard_301_model);
+    const auto maximum_wildcard_301_source =
+        nginx::lower_to_rut(maximum_wildcard_301_model.value());
+    REQUIRE(maximum_wildcard_301_source);
+    REQUIRE_EQ(maximum_wildcard_301_source.value().len, 5936u);
+    std::string projected(maximum_wildcard_301_source.value().data,
+                          maximum_wildcard_301_source.value().len);
+    static constexpr char kWildcardListener[] = "listen :65535";
+    static constexpr char kExactListener[] = "listen 127.0.0.1:65535";
+    REQUIRE_EQ(projected.rfind(kWildcardListener, 0u), 0u);
+    REQUIRE_EQ(count_text(projected, kWildcardListener), 1u);
+    REQUIRE_EQ(count_text(projected, kExactListener), 0u);
+    projected.replace(0u, sizeof(kWildcardListener) - 1u, kExactListener);
+    REQUIRE_EQ(projected.size(), 5945u);
+    CHECK_EQ(projected.back(), '\n');
+    CHECK_EQ(count_text(projected, kWildcardListener), 0u);
+    CHECK_EQ(count_text(projected, kExactListener), 1u);
+
+    const auto projected_lexed = lex({projected.data(), static_cast<u32>(projected.size())});
+    REQUIRE(projected_lexed);
+    const auto projected_parsed = parse_file(projected_lexed.value());
+    REQUIRE(projected_parsed);
+    std::unique_ptr<AstFile> projected_ast(projected_parsed.value());
+    REQUIRE_GT(projected_ast->items.len, 0u);
+    REQUIRE(projected_ast->items[0].kind == AstItemKind::Listen);
+    CHECK(projected_ast->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(projected_ast->items[0].listen.ipv4_host, 0x7f000001u);
+    CHECK_EQ(projected_ast->items[0].listen.port, 65535u);
+    const auto projected_analyzed = analyze_file(*projected_ast);
+    REQUIRE(projected_analyzed);
+    std::unique_ptr<HirModule> projected_hir(projected_analyzed.value());
+    REQUIRE(projected_hir->has_listener);
+    CHECK(projected_hir->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(projected_hir->listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(projected_hir->listener.port, 65535u);
+    const auto projected_mir_result = build_mir(*projected_hir);
+    REQUIRE(projected_mir_result);
+    std::unique_ptr<MirModule> projected_mir(projected_mir_result.value());
+    FrontendRirModule projected_rir{};
+    RirGuard projected_rir_guard{projected_rir};
+    REQUIRE(lower_to_rir(*projected_mir, projected_rir));
+    CHECK(rir::verify_module(projected_rir.module).ok);
+    CHECK_EQ(projected_rir.module.redirect_policy_count, 1u);
 
     // Isolate the existing invalid-upstream-port diagnostic with a coherent
     // wildcard source; the exact composition guard intentionally precedes it.
@@ -11375,7 +11456,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
 
     const auto check_wildcard = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -11479,7 +11560,7 @@ TEST(nginx_parser,
     const u32 maximum_exact = maximum_wildcard + kExactListenerDelta;
     CHECK_EQ(maximum_exact, 3582u);
     CHECK_LT(maximum_exact, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 2355u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact, 2364u);
     check_exact({maximum_exact_source, static_cast<u32>(maximum_exact_source_len)},
                 65535u,
                 nginx::kMaxProxyLocationPathLen,
@@ -12013,7 +12094,7 @@ TEST(nginx_parser,
     static_assert(kWildcardListenPrefixLen == 8u);
     static_assert(kExactListenPrefixLen == 17u);
     static_assert(kExactListenerDelta == 9u);
-    static_assert(nginx::RutSource::kCapacity == 5937u);
+    static_assert(nginx::RutSource::kCapacity == 5946u);
 
     const auto check_wildcard = [&](Str source, u32 expected_length, u32& actual_length) {
         const auto parsed = nginx::parse(source);
@@ -12079,7 +12160,7 @@ TEST(nginx_parser,
     const u32 representative_exact_projection = representative_wildcard + kExactListenerDelta;
     CHECK_EQ(representative_exact_projection, 3345u);
     CHECK_LT(representative_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 2592u);
+    CHECK_EQ(nginx::RutSource::kCapacity - representative_exact_projection, 2601u);
     check_exact({kRepresentativeExact, sizeof(kRepresentativeExact) - 1u},
                 8080u,
                 0x7f000001u,
@@ -12097,7 +12178,7 @@ TEST(nginx_parser,
     const u32 maximum_exact_projection = maximum_wildcard + kExactListenerDelta;
     CHECK_EQ(maximum_exact_projection, 3353u);
     CHECK_LT(maximum_exact_projection, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 2584u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact_projection, 2593u);
     check_exact({kMaximumExact, sizeof(kMaximumExact) - 1u}, 65535u, 0xffffffffu, 65535u, 3353u);
 
     // A coherent wildcard counterpart isolates the scalar port-zero contract; the exact listener
@@ -12496,7 +12577,7 @@ TEST(nginx_converter, issue355_exact_loopback_api_no_uri_has_canonical_no_transf
     REQUIRE(maximum);
     CHECK_EQ(maximum.value().len, 3252u);
     CHECK_LT(maximum.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 2685u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 2694u);
     CHECK_EQ(
         count_text(std::string(maximum.value().data, maximum.value().len), "target_transform:"),
         0u);
@@ -12946,7 +13027,7 @@ TEST(nginx_converter,
     CHECK_EQ(maximum_exact.value().len, 3582u);
     CHECK_EQ(maximum_wildcard.value().len, 3573u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 2355u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 2364u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -13228,7 +13309,7 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     CHECK_EQ(maximum_exact.value().len, 3353u);
     CHECK_EQ(maximum_wildcard.value().len, 3344u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 2584u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 2593u);
     std::string maximum_expected(maximum_wildcard.value().data, maximum_wildcard.value().len);
     REQUIRE_EQ(maximum_expected.rfind("listen :65535\n", 0u), 0u);
     maximum_expected.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");
@@ -15270,7 +15351,7 @@ TEST(nginx_converter, issue350_exact_loopback_302_has_canonical_ordinary_rut_gol
     CHECK_EQ(maximum_exact.value().len, 5921u);
     CHECK_EQ(maximum_wildcard.value().len, 5912u);
     CHECK_LT(maximum_exact.value().len, nginx::RutSource::kCapacity);
-    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 16u);
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum_exact.value().len, 25u);
     std::string maximum_wildcard_as_exact(maximum_wildcard.value().data,
                                           maximum_wildcard.value().len);
     maximum_wildcard_as_exact.replace(0u, strlen("listen :65535"), "listen 127.0.0.1:65535");

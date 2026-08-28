@@ -1166,6 +1166,102 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
     std::filesystem::remove(path);
 }
 
+TEST(serve_loader, issue351_exact_5945_byte_redirect_projection_is_owned_after_teardown) {
+    static constexpr char kMaximumWildcard301[] =
+        "server { listen 65535; location / { proxy_pass http://255.255.255.255:65535; } "
+        "location = /old { return 301 http://redirect.example/new; } }";
+    const auto parsed = nginx::parse({kMaximumWildcard301, sizeof(kMaximumWildcard301) - 1u});
+    REQUIRE(parsed);
+    auto wildcard = nginx::lower_to_rut(parsed.value());
+    REQUIRE(wildcard);
+    REQUIRE_EQ(wildcard.value().len, 5936u);
+    REQUIRE_EQ(wildcard.value().data[wildcard.value().len], '\0');
+
+    static constexpr char kWildcardListener[] = "listen :65535";
+    static constexpr char kExactListener[] = "listen 127.0.0.1:65535";
+    std::string projected(wildcard.value().data, wildcard.value().len);
+    REQUIRE_EQ(projected.rfind(kWildcardListener, 0u), 0u);
+    REQUIRE_EQ(projected.find(kWildcardListener, sizeof(kWildcardListener) - 1u),
+               std::string::npos);
+    REQUIRE_EQ(projected.find(kExactListener), std::string::npos);
+    projected.replace(0u, sizeof(kWildcardListener) - 1u, kExactListener);
+    REQUIRE_EQ(projected.size(), 5945u);
+    REQUIRE_LT(projected.size(), nginx::RutSource::kCapacity);
+    REQUIRE_EQ(projected.rfind(kExactListener, 0u), 0u);
+    REQUIRE_EQ(projected.find(kExactListener, sizeof(kExactListener) - 1u), std::string::npos);
+
+    const std::string dir = "/tmp/rut_serve_loader_issue351_exact_301_projection";
+    const std::string path = write_file(dir, "app.rut", projected.c_str());
+    REQUIRE_EQ(std::filesystem::file_size(path), 5945u);
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE(program.has_listener);
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(program.listener.port, 65535u);
+    CHECK(rir::verify_module(program.rir.module).ok);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0xffffffffu);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 65535u);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+
+    u16 redirect_id = 0u;
+    u32 redirect_returns = 0u;
+    for (u32 function = 0u; function < program.rir.module.func_count; function++) {
+        const auto& rir_function = program.rir.module.functions[function];
+        for (u32 block = 0u; block < rir_function.block_count; block++) {
+            for (u32 instruction = 0u; instruction < rir_function.blocks[block].inst_count;
+                 instruction++) {
+                const auto& inst = rir_function.blocks[block].insts[instruction];
+                if (inst.op != rir::Opcode::RetRedirect) continue;
+                REQUIRE_GT(inst.imm.i32_val, 0);
+                redirect_returns++;
+                redirect_id = static_cast<u16>(inst.imm.i32_val);
+            }
+        }
+    }
+    REQUIRE_EQ(redirect_returns, 1u);
+    REQUIRE(program.config.redirect_policy_id_is_valid(redirect_id));
+    const auto redirect_is_owned_and_canonical = [&]() {
+        if (!program.config.redirect_policy_id_is_valid(redirect_id)) return false;
+        const auto& policy = program.config.redirect_policies[redirect_id - 1u];
+        return program.config.redirect_policy_strings_are_owned(policy) &&
+               policy.scheme == RedirectPolicyScheme::Http &&
+               policy.authority == RedirectPolicyAuthority::Static &&
+               policy.port == RedirectPolicyPort::Omit &&
+               policy.path == RedirectPolicyPath::Static &&
+               policy.query == RedirectPolicyQuery::Discard && policy.status_code == 301u &&
+               policy.reason.eq(lit_str("Moved Permanently")) &&
+               policy.static_authority.eq(lit_str("redirect.example")) &&
+               policy.target_path.eq(lit_str("/new"));
+    };
+    REQUIRE(redirect_is_owned_and_canonical());
+
+    std::fill(projected.begin(), projected.end(), 'x');
+    memset(wildcard.value().data, 'y', wildcard.value().len);
+    wildcard.value().len = 0u;
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK(program.listener.valid());
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    CHECK_EQ(program.listener.port, 65535u);
+    CHECK(redirect_is_owned_and_canonical());
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0xffffffffu);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 65535u);
+    program.destroy();
+    std::filesystem::remove(dir);
+}
+
 TEST(serve_loader,
      nginx_exact_loopback_prefix_root_replacement_output_is_owned_and_reuses_cleanly) {
     const std::string dir = "/tmp/rut_serve_loader_nginx_exact_prefix_root_replacement";

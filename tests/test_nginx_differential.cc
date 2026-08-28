@@ -17532,8 +17532,8 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3573u ||
-        rut::nginx::RutSource::kCapacity != 5937u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/5937 bytes";
+        rut::nginx::RutSource::kCapacity != 5946u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/5946 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -18605,8 +18605,8 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
-        rut::nginx::RutSource::kCapacity != 5937u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/5937 bytes";
+        rut::nginx::RutSource::kCapacity != 5946u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/5946 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
