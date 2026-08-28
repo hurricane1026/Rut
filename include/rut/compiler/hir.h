@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/access_log_sink.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
@@ -60,6 +61,20 @@ struct HirListener {
     ListenerAddress address = ListenerAddress::IPv4Wildcard;
     u16 port = 0;
     u32 ipv4_host = 0;
+};
+
+struct HirAccessLogDecl {
+    Span span{};
+    Span path_field_span{};
+    Span path_token_span{};
+    Span path_span{};
+    Str path{};
+    Span format_field_span{};
+    Span format_value_span{};
+    AccessLogFormatProfile format = AccessLogFormatProfile::None;
+    Span publication_field_span{};
+    Span publication_value_span{};
+    AccessLogPublicationProfile publication = AccessLogPublicationProfile::None;
 };
 struct HirImport {
     Span span{};
@@ -1414,6 +1429,8 @@ struct HirModule {
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     bool has_listener = false;
     HirListener listener{};
+    bool has_access_log = false;
+    HirAccessLogDecl access_log{};
     FixedVec<HirCacheDecl, kMaxCaches> caches;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
@@ -1444,6 +1461,8 @@ struct HirModule {
           redirect_policies(other.redirect_policies),
           has_listener(other.has_listener),
           listener(other.listener),
+          has_access_log(other.has_access_log),
+          access_log(other.access_log),
           caches(other.caches),
           imports(other.imports),
           aliases(other.aliases),
@@ -1482,6 +1501,8 @@ struct HirModule {
         redirect_policies = other.redirect_policies;
         has_listener = other.has_listener;
         listener = other.listener;
+        has_access_log = other.has_access_log;
+        access_log = other.access_log;
         caches = other.caches;
         imports = other.imports;
         aliases = other.aliases;

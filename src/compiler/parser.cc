@@ -3418,6 +3418,93 @@ struct Parser {
         return item;
     }
 
+    FrontendResult<AstItem> parse_access_log() {
+        auto kw = expect(TokenType::Ident);
+        if (!kw) return core::make_unexpected(kw.error());
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+
+        auto path_field = expect(TokenType::Ident);
+        if (!path_field) return core::make_unexpected(path_field.error());
+        if (!path_field.value()->text.eq({"path", 4}))
+            return frontend_error(FrontendError::UnexpectedToken,
+                                  span_from(*path_field.value()),
+                                  path_field.value()->text);
+        auto path_colon = expect(TokenType::Colon);
+        if (!path_colon) return core::make_unexpected(path_colon.error());
+        auto path = expect(TokenType::StringLit);
+        if (!path) return core::make_unexpected(path.error());
+        for (u32 i = 0; i < path.value()->text.len; i++) {
+            if (path.value()->text.ptr[i] == '\\')
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
+        }
+        auto path_comma = expect(TokenType::Comma);
+        if (!path_comma) return core::make_unexpected(path_comma.error());
+
+        auto format_field = expect(TokenType::Ident);
+        if (!format_field) return core::make_unexpected(format_field.error());
+        if (!format_field.value()->text.eq({"format", 6}))
+            return frontend_error(FrontendError::UnexpectedToken,
+                                  span_from(*format_field.value()),
+                                  format_field.value()->text);
+        auto format_colon = expect(TokenType::Colon);
+        if (!format_colon) return core::make_unexpected(format_colon.error());
+        auto format = expect(TokenType::Ident);
+        if (!format) return core::make_unexpected(format.error());
+        if (!format.value()->text.eq({"downstreamRequestBytes", 22}))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*format.value()), format.value()->text);
+        auto format_comma = expect(TokenType::Comma);
+        if (!format_comma) return core::make_unexpected(format_comma.error());
+
+        auto publication_field = expect(TokenType::Ident);
+        if (!publication_field) return core::make_unexpected(publication_field.error());
+        if (!publication_field.value()->text.eq({"publication", 11}))
+            return frontend_error(FrontendError::UnexpectedToken,
+                                  span_from(*publication_field.value()),
+                                  publication_field.value()->text);
+        auto publication_colon = expect(TokenType::Colon);
+        if (!publication_colon) return core::make_unexpected(publication_colon.error());
+        auto publication = expect(TokenType::Ident);
+        if (!publication) return core::make_unexpected(publication.error());
+        if (!publication.value()->text.eq({"live", 4}))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(*publication.value()),
+                                  publication.value()->text);
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+
+        AstItem item{};
+        item.kind = AstItemKind::AccessLog;
+        item.access_log.span =
+            Span{kw.value()->start, rbrace.value()->end, kw.value()->line, kw.value()->col};
+        item.access_log.path_field_span = Span{path_field.value()->start,
+                                               path.value()->end + 1u,
+                                               path_field.value()->line,
+                                               path_field.value()->col};
+        item.access_log.path_token_span = Span{path.value()->start - 1u,
+                                               path.value()->end + 1u,
+                                               path.value()->line,
+                                               path.value()->col - 1u};
+        item.access_log.path_span = span_from(*path.value());
+        item.access_log.path = path.value()->text;
+        item.access_log.format_field_span = Span{format_field.value()->start,
+                                                 format.value()->end,
+                                                 format_field.value()->line,
+                                                 format_field.value()->col};
+        item.access_log.format_value_span = span_from(*format.value());
+        item.access_log.format = AccessLogFormatProfile::DownstreamRequestBytesLine;
+        item.access_log.publication_field_span = Span{publication_field.value()->start,
+                                                      publication.value()->end,
+                                                      publication_field.value()->line,
+                                                      publication_field.value()->col};
+        item.access_log.publication_value_span = span_from(*publication.value());
+        item.access_log.publication = AccessLogPublicationProfile::LiveEachRecord;
+        item.span = item.access_log.span;
+        return item;
+    }
+
     FrontendResult<AstStatement> parse_func_body_stmt() {
         if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -5388,6 +5475,10 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 break;
             }
             default:
+                if (p.cur().type == TokenType::Ident && p.cur().text.eq({"accessLog", 9})) {
+                    item = p.parse_access_log();
+                    break;
+                }
                 if (p.cur().type == TokenType::Ident && p.cur().text.eq({"pre_route", 9})) {
                     item = p.parse_pre_route();
                     break;

@@ -477,6 +477,118 @@ TEST(serve_loader, source_listener_metadata_is_owned_by_loaded_program) {
     CHECK_EQ(program.listener.ipv4_host, 0u);
 }
 
+TEST(serve_loader, source_access_log_metadata_is_owned_and_reuses_without_stale_bytes) {
+    const std::string dir = "/tmp/rut_serve_loader_access_log_owned";
+    std::filesystem::remove_all(dir);
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "accessLog { path: \"/var/log/rut/request-length.log\", format: "
+                   "downstreamRequestBytes, publication: live }\n"
+                   "route GET \"/\" { return 200 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(program.access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+    CHECK_EQ(program.access_log.path_len, 31u);
+    CHECK_EQ(std::string(program.access_log.path, program.access_log.path_len),
+             "/var/log/rut/request-length.log");
+    CHECK_EQ(program.access_log.path[program.access_log.path_len], '\0');
+    CHECK(access_log_sink_spec_valid(program.access_log));
+
+    // AST/HIR/MIR have already been destroyed by load_rut_program. Remove the remaining source
+    // and compiler owners and prove this process-start declaration is inline owned metadata.
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK_EQ(std::string(program.access_log.path, program.access_log.path_len),
+             "/var/log/rut/request-length.log");
+    CHECK(access_log_sink_spec_valid(program.access_log));
+
+    program.destroy();
+    CHECK_FALSE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::None);
+    CHECK(program.access_log.publication == AccessLogPublicationProfile::None);
+    CHECK_EQ(program.access_log.path_len, 0u);
+    for (char byte : program.access_log.path) CHECK_EQ(byte, '\0');
+
+    const std::string boundary_path = "/" + std::string(kAccessLogSinkPathMax - 1u, 'p');
+    const std::string boundary_source = "accessLog { path: \"" + boundary_path +
+                                        "\", format: downstreamRequestBytes, publication: live }\n";
+    write_file(dir, "app.rut", boundary_source.c_str());
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(program.access_log.present);
+    CHECK_EQ(program.access_log.path_len, kAccessLogSinkPathMax);
+    CHECK_EQ(std::string(program.access_log.path, program.access_log.path_len), boundary_path);
+    CHECK_EQ(program.access_log.path[kAccessLogSinkPathMax], '\0');
+    CHECK(access_log_sink_spec_valid(program.access_log));
+    program.destroy();
+
+    // Absence on the same owner must replace, not retain, either prior declaration.
+    write_file(dir, "app.rut", "route GET \"/\" { return 204 }\n");
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK_FALSE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::None);
+    CHECK(program.access_log.publication == AccessLogPublicationProfile::None);
+    CHECK_EQ(program.access_log.path_len, 0u);
+    for (char byte : program.access_log.path) CHECK_EQ(byte, '\0');
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, failed_access_log_frontend_clears_poisoned_owned_metadata) {
+    const std::string dir = "/tmp/rut_serve_loader_access_log_failed";
+    std::filesystem::remove_all(dir);
+    const auto poison = [](LoadedProgram& program) {
+        program.access_log.present = true;
+        program.access_log.format = AccessLogFormatProfile::DownstreamRequestBytesLine;
+        program.access_log.publication = AccessLogPublicationProfile::LiveEachRecord;
+        program.access_log.path_len = 255u;
+        for (char& byte : program.access_log.path) byte = 'X';
+    };
+    const auto check_clear = [&](const LoadedProgram& program) {
+        CHECK_FALSE(program.access_log.present);
+        CHECK(program.access_log.format == AccessLogFormatProfile::None);
+        CHECK(program.access_log.publication == AccessLogPublicationProfile::None);
+        CHECK_EQ(program.access_log.path_len, 0u);
+        for (char byte : program.access_log.path) CHECK_EQ(byte, '\0');
+    };
+
+    LoadedProgram program;
+    LoadError err;
+    poison(program);
+    std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "accessLog { path: \"/var/log/rut/a.log\", format: downstreamRequestBytes, "
+                   "publication: live, }\n");
+    REQUIRE_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK(err.stage == LoadStage::Parse);
+    check_clear(program);
+    program.destroy();
+
+    poison(program);
+    write_file(dir,
+               "app.rut",
+               "accessLog { path: \"/var/log/rut/a.log\", format: downstreamRequestBytes, "
+               "publication: live }\n"
+               "accessLog { path: \"/var/log/rut/b.log\", format: downstreamRequestBytes, "
+               "publication: live }\n");
+    REQUIRE_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK(err.stage == LoadStage::Analyze);
+    check_clear(program);
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, failed_listener_parse_resets_poisoned_endpoint_and_owner_is_reusable) {
     const std::string dir = "/tmp/rut_serve_loader_failed_listener_reset";
     const std::string path =

@@ -22,6 +22,7 @@
 // hot path, so unlike the runtime it is free to use the compiler's
 // heap-allocating frontend APIs.
 
+#include "rut/common/access_log_sink.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/jit/jit_engine.h"
@@ -73,6 +74,8 @@ struct LoadedProgram {
     // from RouteConfig, which participates in route hot reload.
     bool has_listener = false;
     ListenerSpec listener{};
+    // Owned but intentionally inert until the startup sink and reliable publisher increments.
+    AccessLogSinkSpec access_log{};
     RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();

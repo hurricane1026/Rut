@@ -39,6 +39,7 @@ void LoadedProgram::destroy() {
     new (&config) RouteConfig();
     has_listener = false;
     listener = ListenerSpec{};
+    access_log = AccessLogSinkSpec{};
 }
 
 namespace {
@@ -113,6 +114,48 @@ void set_load_diag(LoadError& err, const Diagnostic& diag) {
     err.diag.detail = Str{err.detail_buf, n};
 }
 
+bool copy_access_log_sink(const HirModule& hir, Str source, AccessLogSinkSpec& out) {
+    out = AccessLogSinkSpec{};
+    if (!hir.has_access_log) return true;
+
+    const HirAccessLogDecl& decl = hir.access_log;
+    const auto contains = [](Span outer, Span inner) {
+        return outer.start <= inner.start && inner.start <= inner.end && inner.end <= outer.end;
+    };
+    if (source.ptr == nullptr || decl.path.ptr == nullptr || decl.span.end > source.len ||
+        decl.path_span.start > decl.path_span.end || decl.path_span.end > source.len ||
+        decl.path_token_span.start > decl.path_token_span.end ||
+        decl.path_token_span.end - decl.path_token_span.start < 2u ||
+        decl.path_token_span.end > source.len ||
+        decl.path_span.end - decl.path_span.start != decl.path.len ||
+        decl.path_token_span.start + 1u != decl.path_span.start ||
+        decl.path_span.end + 1u != decl.path_token_span.end ||
+        !contains(decl.span, decl.path_field_span) ||
+        !contains(decl.path_field_span, decl.path_token_span) ||
+        !contains(decl.span, decl.format_field_span) ||
+        !contains(decl.format_field_span, decl.format_value_span) ||
+        !contains(decl.span, decl.publication_field_span) ||
+        !contains(decl.publication_field_span, decl.publication_value_span) ||
+        decl.path.ptr != source.ptr + decl.path_span.start ||
+        source.ptr[decl.path_token_span.start] != '"' ||
+        source.ptr[decl.path_token_span.end - 1u] != '"' ||
+        decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine ||
+        decl.publication != AccessLogPublicationProfile::LiveEachRecord ||
+        !access_log_sink_path_valid(decl.path))
+        return false;
+
+    AccessLogSinkSpec candidate{};
+    candidate.present = true;
+    candidate.format = decl.format;
+    candidate.publication = decl.publication;
+    candidate.path_len = static_cast<u16>(decl.path.len);
+    for (u32 i = 0; i < decl.path.len; i++) candidate.path[i] = decl.path.ptr[i];
+    candidate.path[decl.path.len] = '\0';
+    if (!access_log_sink_spec_valid(candidate)) return false;
+    out = candidate;
+    return true;
+}
+
 }  // namespace
 
 bool load_rut_program(
@@ -120,6 +163,7 @@ bool load_rut_program(
     err = LoadError{};
     out.has_listener = false;
     out.listener = ListenerSpec{};
+    out.access_log = AccessLogSinkSpec{};
 
     err.stage = LoadStage::Read;
     if (!map_source(path, out)) return false;
@@ -171,6 +215,8 @@ bool load_rut_program(
         return false;
     }
     ir.hir = hir.value();
+    AccessLogSinkSpec loaded_access_log{};
+    if (!copy_access_log_sink(*ir.hir, kSource, loaded_access_log)) return false;
     if (ir.hir->has_listener) {
         out.has_listener = true;
         out.listener.address = ir.hir->listener.address;
@@ -285,6 +331,7 @@ bool load_rut_program(
     }
 #endif
 
+    out.access_log = loaded_access_log;
     return true;
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/access_log_sink.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/listener_address.h"
@@ -33,6 +34,7 @@ enum class AstItemKind : u8 {
     // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
     State,
     PreRoute,
+    AccessLog,
 };
 
 struct AstListenDecl {
@@ -40,6 +42,20 @@ struct AstListenDecl {
     ListenerAddress address = ListenerAddress::IPv4Wildcard;
     u32 port = 0;
     u32 ipv4_host = 0;
+};
+
+struct AstAccessLogDecl {
+    Span span{};
+    Span path_field_span{};
+    Span path_token_span{};
+    Span path_span{};
+    Str path{};
+    Span format_field_span{};
+    Span format_value_span{};
+    AccessLogFormatProfile format = AccessLogFormatProfile::None;
+    Span publication_field_span{};
+    Span publication_value_span{};
+    AccessLogPublicationProfile publication = AccessLogPublicationProfile::None;
 };
 
 enum class AstStmtKind : u8 {
@@ -625,6 +641,7 @@ struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
     AstListenDecl listen{};
+    AstAccessLogDecl access_log{};
     AstStateDecl state{};
     AstUpstreamDecl upstream{};
     AstImportDecl import_decl{};
@@ -1049,6 +1066,7 @@ private:
         for (u32 i = 0; i < items.len; i++) {
             switch (items[i].kind) {
                 case AstItemKind::Listen:
+                case AstItemKind::AccessLog:
                     break;
                 case AstItemKind::Func:
                     rebase_func(other, items[i].func);

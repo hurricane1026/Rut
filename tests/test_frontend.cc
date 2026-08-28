@@ -402,6 +402,264 @@ TEST(frontend, listener_analyzer_revalidates_forged_ast_metadata_before_narrowin
     }
 }
 
+TEST(frontend, access_log_declaration_preserves_exact_ast_and_hir_provenance) {
+    std::string source =
+        "accessLog {\n"
+        "    path: \"/var/log/rut/request-length.log\",\n"
+        "    format: downstreamRequestBytes,\n"
+        "    publication: live\n"
+        "}\n"
+        "route GET \"/\" { return 200 }\n";
+    const u32 path_start = static_cast<u32>(source.find("/var/log/rut/request-length.log"));
+    const u32 path_len = 31u;
+    const u32 path_field_start = static_cast<u32>(source.find("path:"));
+    const u32 format_field_start = static_cast<u32>(source.find("format:"));
+    const u32 format_value_start = static_cast<u32>(source.find("downstreamRequestBytes"));
+    const u32 publication_field_start = static_cast<u32>(source.find("publication:"));
+    const u32 publication_value_start =
+        static_cast<u32>(source.find("live", publication_field_start));
+    const u32 declaration_end = static_cast<u32>(source.find("}\n")) + 1u;
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE(ast->items[0].kind == AstItemKind::AccessLog);
+    const AstAccessLogDecl& decl = ast->items[0].access_log;
+    CHECK_EQ(decl.span.start, 0u);
+    CHECK_EQ(decl.span.end, declaration_end);
+    CHECK_EQ(decl.span.line, 1u);
+    CHECK_EQ(decl.span.col, 1u);
+    CHECK_EQ(decl.path.ptr, source.data() + path_start);
+    CHECK_EQ(decl.path.len, path_len);
+    CHECK_EQ(std::string(decl.path.ptr, decl.path.len), "/var/log/rut/request-length.log");
+    CHECK_EQ(decl.path_span.start, path_start);
+    CHECK_EQ(decl.path_span.end, path_start + path_len);
+    CHECK_EQ(decl.path_span.line, 2u);
+    CHECK_EQ(decl.path_span.col, 12u);
+    CHECK_EQ(decl.path_token_span.start, path_start - 1u);
+    CHECK_EQ(decl.path_token_span.end, path_start + path_len + 1u);
+    CHECK_EQ(decl.path_token_span.line, 2u);
+    CHECK_EQ(decl.path_token_span.col, 11u);
+    CHECK_EQ(decl.path_field_span.start, path_field_start);
+    CHECK_EQ(decl.path_field_span.end, decl.path_token_span.end);
+    CHECK_EQ(decl.format_field_span.start, format_field_start);
+    CHECK_EQ(decl.format_value_span.start, format_value_start);
+    CHECK_EQ(decl.format_value_span.end, format_value_start + 22u);
+    CHECK_EQ(decl.publication_field_span.start, publication_field_start);
+    CHECK_EQ(decl.publication_value_span.start, publication_value_start);
+    CHECK_EQ(decl.publication_value_span.end, publication_value_start + 4u);
+    CHECK(decl.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(decl.publication == AccessLogPublicationProfile::LiveEachRecord);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->has_access_log);
+    CHECK_EQ(hir->access_log.path.ptr, decl.path.ptr);
+    CHECK_EQ(hir->access_log.path.len, decl.path.len);
+    CHECK_EQ(hir->access_log.path_span.start, decl.path_span.start);
+    CHECK_EQ(hir->access_log.path_token_span.start, decl.path_token_span.start);
+    CHECK_EQ(hir->access_log.format_value_span.start, decl.format_value_span.start);
+    CHECK_EQ(hir->access_log.publication_value_span.start, decl.publication_value_span.start);
+    CHECK(hir->access_log.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(hir->access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+}
+
+TEST(frontend, copied_access_log_scalars_and_spans_do_not_depend_on_borrowed_source) {
+    Span saved_path_span{};
+    Span saved_directive_span{};
+    AccessLogFormatProfile saved_format = AccessLogFormatProfile::None;
+    AccessLogPublicationProfile saved_publication = AccessLogPublicationProfile::None;
+    {
+        std::string source =
+            "accessLog { path: \"/a.log\", format: downstreamRequestBytes, publication: live }";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        saved_path_span = hir->access_log.path_span;
+        saved_directive_span = hir->access_log.span;
+        saved_format = hir->access_log.format;
+        saved_publication = hir->access_log.publication;
+        // HirAccessLogDecl::path is a source borrow and is intentionally not read after this scope.
+    }
+    CHECK_EQ(saved_path_span.start, 19u);
+    CHECK_EQ(saved_path_span.end, 25u);
+    CHECK_EQ(saved_directive_span.start, 0u);
+    CHECK_EQ(saved_directive_span.end, 79u);
+    CHECK(saved_format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(saved_publication == AccessLogPublicationProfile::LiveEachRecord);
+}
+
+TEST(frontend, access_log_path_boundaries_and_invalid_inventory_fail_closed) {
+    const auto make_source = [](const std::string& path) {
+        return "accessLog { path: \"" + path +
+               "\", format: downstreamRequestBytes, publication: live }\n";
+    };
+
+    const std::string length255 = "/" + std::string(254u, 'a');
+    std::string source255 = make_source(length255);
+    auto tokens255 = lex({source255.data(), static_cast<u32>(source255.size())});
+    REQUIRE(tokens255);
+    auto ast255 = parse_file_heap(tokens255.value());
+    REQUIRE(ast255);
+    auto hir255 = analyze_file_heap(ast255.value());
+    REQUIRE(hir255);
+    REQUIRE(hir255->has_access_log);
+    CHECK_EQ(hir255->access_log.path.len, kAccessLogSinkPathMax);
+
+    const char with_comments[] =
+        "accessLog // process metadata\n"
+        "{ path // owned later\n"
+        ": \"/a.log\", format: downstreamRequestBytes, "
+        "publication: live }\n";
+    auto comment_tokens = lex(lit(with_comments));
+    REQUIRE(comment_tokens);
+    auto comment_ast = parse_file_heap(comment_tokens.value());
+    REQUIRE(comment_ast);
+    auto comment_hir = analyze_file_heap(comment_ast.value());
+    REQUIRE(comment_hir);
+    CHECK(comment_hir->has_access_log);
+
+    const std::string length256 = "/" + std::string(255u, 'b');
+    std::string source256 = make_source(length256);
+    auto tokens256 = lex({source256.data(), static_cast<u32>(source256.size())});
+    REQUIRE(tokens256);
+    auto ast256 = parse_file_heap(tokens256.value());
+    REQUIRE(ast256);
+    auto hir256 = analyze_file_heap(ast256.value());
+    REQUIRE_FALSE(hir256);
+    CHECK_EQ(hir256.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(hir256.error().span.start, 19u);
+    CHECK_EQ(hir256.error().span.end, 19u + 256u);
+
+    const std::vector<std::string> invalid = {
+        "/",
+        "/dev/stderr",
+        "/a//b",
+        "/a/./b",
+        "/a/../b",
+        "/a/",
+        "/a$b",
+        "/a:b",
+        "relative",
+        "stderr",
+        "off",
+        "syslog:",
+        "/a\tb",
+    };
+    for (const std::string& path : invalid) {
+        std::string source = make_source(path);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.start, 19u);
+        CHECK_EQ(hir.error().span.end, 19u + static_cast<u32>(path.size()));
+    }
+
+    const char embedded_nul[] = {'/', 'a', '\0', 'b'};
+    CHECK_FALSE(access_log_sink_path_valid({embedded_nul, sizeof(embedded_nul)}));
+}
+
+TEST(frontend, access_log_exact_field_inventory_and_profiles_reject_mutations) {
+    const struct {
+        const char* source;
+        const char* marker;
+    } invalid[] = {
+        {"accessLog { format: downstreamRequestBytes, path: \"/a\", publication: live }", "format"},
+        {"accessLog { path: \"/a\", path: \"/b\", publication: live }", "path: \"/b\""},
+        {"accessLog { path: \"/a\", publication: live }", "publication"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes }", "}"},
+        {"accessLog { destination: \"/a\", format: downstreamRequestBytes, publication: live }",
+         "destination"},
+        {"accessLog { path: \"/a\", format: defaultText, publication: live }", "defaultText"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: periodic }",
+         "periodic"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live, }", "live,"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live, extra: x }",
+         "live,"},
+        {"accessLog { path: \"/a\" format: downstreamRequestBytes, publication: live }", "format"},
+        {"accessLog { path \"/a\", format: downstreamRequestBytes, publication: live }", "\"/a\""},
+        {"accessLog { path: \"/a\\b\", format: downstreamRequestBytes, publication: live }",
+         "/a\\b"},
+        {"accessLog path: \"/a\", format: downstreamRequestBytes, publication: live }", "path"},
+    };
+    for (const auto& tc : invalid) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        const u32 marker = static_cast<u32>(std::string(tc.source).find(tc.marker));
+        CHECK(ast.error().span.start >= marker);
+        CHECK(ast.error().span.start <= marker + static_cast<u32>(strlen(tc.marker)));
+    }
+
+    const char duplicate[] =
+        "accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live }\n"
+        "accessLog { path: \"/b\", format: downstreamRequestBytes, publication: live }\n";
+    auto duplicate_tokens = lex(lit(duplicate));
+    REQUIRE(duplicate_tokens);
+    auto duplicate_ast = parse_file_heap(duplicate_tokens.value());
+    REQUIRE(duplicate_ast);
+    auto duplicate_hir = analyze_file_heap(duplicate_ast.value());
+    REQUIRE_FALSE(duplicate_hir);
+    CHECK_EQ(duplicate_hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(duplicate_hir.error().span.line, 2u);
+    CHECK_EQ(duplicate_hir.error().span.col, 1u);
+
+    auto forged = std::make_unique<AstFile>();
+    AstItem item{};
+    item.kind = AstItemKind::AccessLog;
+    item.span = {0u, 80u, 1u, 1u};
+    item.access_log.span = item.span;
+    item.access_log.path = {"/a", 2u};
+    item.access_log.path_span = {19u, 21u, 1u, 20u};
+    item.access_log.path_token_span = {18u, 22u, 1u, 19u};
+    item.access_log.path_field_span = {12u, 22u, 1u, 13u};
+    item.access_log.format_field_span = {24u, 54u, 1u, 25u};
+    item.access_log.format_value_span = {32u, 54u, 1u, 33u};
+    item.access_log.format = static_cast<AccessLogFormatProfile>(255u);
+    item.access_log.publication_field_span = {56u, 73u, 1u, 57u};
+    item.access_log.publication_value_span = {69u, 73u, 1u, 70u};
+    item.access_log.publication = AccessLogPublicationProfile::LiveEachRecord;
+    REQUIRE(forged->items.push(item));
+    auto forged_hir = analyze_file_heap(*forged);
+    REQUIRE_FALSE(forged_hir);
+    CHECK_EQ(forged_hir.error().span.start, item.access_log.format_value_span.start);
+    CHECK_EQ(forged_hir.error().span.end, item.access_log.format_value_span.end);
+}
+
+TEST(frontend, imported_access_log_declaration_is_rejected_at_main_import) {
+    const std::string dir = "/tmp/rut_frontend_access_log_import";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/dep.rut", std::ios::binary);
+        out << "accessLog { path: \"/var/log/import.log\", format: downstreamRequestBytes, "
+               "publication: live }\n";
+    }
+    const std::string main_source = "import \"dep.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex({main_source.data(), static_cast<u32>(main_source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(hir.error().span.line, 1u);
+    CHECK_EQ(hir.error().span.col, 1u);
+    CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+             "accessLog declarations must be in the main source");
+    std::filesystem::remove_all(dir);
+}
+
 static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {
     auto lexed = lex(lit(src));
     if (!lexed) return false;

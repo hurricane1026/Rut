@@ -12882,6 +12882,10 @@ static FrontendResult<void> load_imported_modules(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.import_decl.span,
                                   lit_str("listen declarations must be in the main source"));
+        if (imported_module->has_access_log)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("accessLog declarations must be in the main source"));
         if (imported_module->strict_local_response_policies.len != 0)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
@@ -14831,6 +14835,53 @@ static FrontendResult<HirModule*> analyze_file_internal(
         mod.listener.address = item.listen.address;
         mod.listener.port = static_cast<u16>(item.listen.port);
         mod.listener.ipv4_host = item.listen.ipv4_host;
+    }
+
+    // Like the listener, the access sink is immutable process-start metadata. It remains
+    // borrowed through HIR and is copied into LoadedProgram only after the complete load succeeds.
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::AccessLog) continue;
+        const AstAccessLogDecl& decl = item.access_log;
+        if (mod.has_access_log)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  decl.span,
+                                  lit_str("only one accessLog declaration is supported"));
+        if (decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine)
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.format_value_span);
+        if (decl.publication != AccessLogPublicationProfile::LiveEachRecord)
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.publication_value_span);
+        if (!access_log_sink_path_valid(decl.path))
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.path_span, decl.path);
+
+        const auto contains = [](Span outer, Span inner) {
+            return outer.start <= inner.start && inner.start <= inner.end && inner.end <= outer.end;
+        };
+        const bool spans_valid = decl.path.ptr != nullptr &&
+                                 decl.path_span.start <= decl.path_span.end &&
+                                 decl.path_span.end - decl.path_span.start == decl.path.len &&
+                                 decl.path_token_span.start + 1u == decl.path_span.start &&
+                                 decl.path_span.end + 1u == decl.path_token_span.end &&
+                                 contains(decl.span, decl.path_field_span) &&
+                                 contains(decl.path_field_span, decl.path_token_span) &&
+                                 contains(decl.span, decl.format_field_span) &&
+                                 contains(decl.format_field_span, decl.format_value_span) &&
+                                 contains(decl.span, decl.publication_field_span) &&
+                                 contains(decl.publication_field_span, decl.publication_value_span);
+        if (!spans_valid) return frontend_error(FrontendError::UnsupportedSyntax, decl.span);
+
+        mod.has_access_log = true;
+        mod.access_log.span = decl.span;
+        mod.access_log.path_field_span = decl.path_field_span;
+        mod.access_log.path_token_span = decl.path_token_span;
+        mod.access_log.path_span = decl.path_span;
+        mod.access_log.path = decl.path;
+        mod.access_log.format_field_span = decl.format_field_span;
+        mod.access_log.format_value_span = decl.format_value_span;
+        mod.access_log.format = decl.format;
+        mod.access_log.publication_field_span = decl.publication_field_span;
+        mod.access_log.publication_value_span = decl.publication_value_span;
+        mod.access_log.publication = decl.publication;
     }
     std::string normalized_source;
     if (source_path.len != 0) {
