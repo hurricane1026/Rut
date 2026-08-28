@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
@@ -22,6 +23,16 @@ namespace rut {
 
 // Forward declaration (defined below Shard).
 inline u32 detect_cpu_count();
+
+enum class ShardLiveAccessLogError : u8 {
+    InvalidLifecycle,
+    DualMode,
+    AlreadyAllocated,
+    NotAllocated,
+    SessionBinding,
+    LeaseHeld,
+    Mmap,
+};
 
 // Shard — per-core share-nothing runtime unit.
 //
@@ -58,6 +69,9 @@ struct Shard {
 
     // Per-shard access log ring (mmap'd, read by background flusher thread).
     AccessLogRing* log_ring = nullptr;
+    LiveAccessLogRing* live_log_ring = nullptr;
+    SourceLiveAccessLogLeaseSlot live_log_lease{nullptr};
+    SourceLiveAccessLogProducer live_log_producer{};
     CaptureRing* capture_ring = nullptr;
 
     // Per-shard metrics (stack-allocated, ~200 bytes).
@@ -162,6 +176,10 @@ struct Shard {
     // Allocate and wire the per-shard access log ring.
     // Call before spawn(), only when access logging is enabled.
     core::Expected<void, Error> init_access_log() {
+        if (!loop || thread_spawned)
+            return core::make_unexpected(Error::make(EBUSY, Error::Source::Thread));
+        if (live_log_ring) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        if (log_ring) return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
         void* ring_mem = mmap(nullptr,
                               sizeof(AccessLogRing),
                               PROT_READ | PROT_WRITE,
@@ -173,6 +191,66 @@ struct Shard {
         log_ring = new (ring_mem) AccessLogRing();
         log_ring->init();
         if (loop) loop->access_log = log_ring;
+        return {};
+    }
+
+    // Stage one of SourceLive shard setup. The process owner collects these
+    // ring pointers and starts exactly one SourceLiveAccessLogSession before
+    // attaching producers. This does not enable callbacks by itself.
+    core::Expected<LiveAccessLogRing*, ShardLiveAccessLogError> init_live_access_log_ring() {
+        if (!loop || thread_spawned)
+            return core::make_unexpected(ShardLiveAccessLogError::InvalidLifecycle);
+        if (log_ring) return core::make_unexpected(ShardLiveAccessLogError::DualMode);
+        if (live_log_ring) return core::make_unexpected(ShardLiveAccessLogError::AlreadyAllocated);
+        if (live_log_lease.load(std::memory_order_acquire) != nullptr)
+            return core::make_unexpected(ShardLiveAccessLogError::LeaseHeld);
+        void* ring_mem = mmap(nullptr,
+                              sizeof(LiveAccessLogRing),
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS,
+                              -1,
+                              0);
+        if (ring_mem == MAP_FAILED) return core::make_unexpected(ShardLiveAccessLogError::Mmap);
+        live_log_ring = new (ring_mem) LiveAccessLogRing();
+        live_log_ring->init();
+        loop->live_access_log = nullptr;
+        return live_log_ring;
+    }
+
+    SourceLiveAccessLogRingBinding live_access_log_binding() {
+        return {live_log_ring, &live_log_lease};
+    }
+
+    // Stage two. The caller owns and has already started session with this
+    // exact ring at ring_index. Duplicate, late, or cross-session attachment
+    // fails closed and never wires callbacks.
+    core::Expected<void, ShardLiveAccessLogError> attach_live_access_log(
+        SourceLiveAccessLogSession* session, u32 ring_index) {
+        if (!loop || thread_spawned)
+            return core::make_unexpected(ShardLiveAccessLogError::InvalidLifecycle);
+        if (log_ring) return core::make_unexpected(ShardLiveAccessLogError::DualMode);
+        if (!live_log_ring) return core::make_unexpected(ShardLiveAccessLogError::NotAllocated);
+        if (live_log_producer.initialized())
+            return core::make_unexpected(ShardLiveAccessLogError::AlreadyAllocated);
+        if (!live_log_producer.init(live_log_ring, session, ring_index, &live_log_lease))
+            return core::make_unexpected(ShardLiveAccessLogError::SessionBinding);
+        loop->live_access_log = &live_log_producer;
+        return {};
+    }
+
+    // Producers and shard thread must be quiescent. If attached, the process
+    // owner must finish/join the writer first; this check prevents unmapping a
+    // ring still borrowed by the writer.
+    core::Expected<void, ShardLiveAccessLogError> release_live_access_log() {
+        if (thread_spawned) return core::make_unexpected(ShardLiveAccessLogError::InvalidLifecycle);
+        if (!live_log_ring) return core::make_unexpected(ShardLiveAccessLogError::NotAllocated);
+        if (live_log_lease.load(std::memory_order_acquire) != nullptr)
+            return core::make_unexpected(ShardLiveAccessLogError::LeaseHeld);
+        if (loop) loop->live_access_log = nullptr;
+        live_log_producer.reset();
+        live_log_ring->~LiveAccessLogRing();
+        munmap(live_log_ring, sizeof(LiveAccessLogRing));
+        live_log_ring = nullptr;
         return {};
     }
 
@@ -228,6 +306,8 @@ struct Shard {
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
     core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
         if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
+        if (live_log_ring && !live_log_producer.initialized())
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
         // Seed from route_config only if active_config wasn't already set
         // by a reload_config() call before spawn.
         if (!active_config) active_config = route_config;
@@ -354,6 +434,13 @@ struct Shard {
     void shutdown() {
         stop();
         join();
+        if (loop) loop->live_access_log = nullptr;
+        if (live_log_ring && live_log_lease.load(std::memory_order_acquire) == nullptr) {
+            live_log_producer.reset();
+            live_log_ring->~LiveAccessLogRing();
+            munmap(live_log_ring, sizeof(LiveAccessLogRing));
+            live_log_ring = nullptr;
+        }
         if (log_ring) {
             log_ring->~AccessLogRing();
             munmap(log_ring, sizeof(AccessLogRing));
@@ -370,6 +457,7 @@ struct Shard {
             // Sync listen_fd: EventLoop may have closed it during drain.
             if (loop->listen_fd < 0) listen_fd = -1;
             loop->access_log = nullptr;
+            loop->live_access_log = nullptr;
             loop->capture_ring = nullptr;
             loop->shutdown();
             loop->~EventLoopType();

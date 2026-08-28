@@ -7921,6 +7921,93 @@ TEST(shard, access_log_init) {
     close(lfd);
 }
 
+TEST(shard, source_live_access_log_two_phase_lifecycle_is_separate_and_reusable) {
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    Shard<EpollEventLoop> shard;
+    REQUIRE(shard.init(0, lfd).has_value());
+    CHECK(shard.loop->access_log == nullptr);
+    CHECK(shard.loop->live_access_log == nullptr);
+
+    auto allocated = shard.init_live_access_log_ring();
+    REQUIRE(allocated.has_value());
+    LiveAccessLogRing* first_ring = allocated.value();
+    REQUIRE(first_ring != nullptr);
+    CHECK_EQ(shard.live_log_ring, first_ring);
+    CHECK_EQ(first_ring->published_pos.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(first_ring->committed_pos.load(std::memory_order_relaxed), 0u);
+    CHECK(shard.loop->live_access_log == nullptr);
+    auto duplicate_allocate = shard.init_live_access_log_ring();
+    REQUIRE_FALSE(duplicate_allocate.has_value());
+    CHECK(duplicate_allocate.error() == ShardLiveAccessLogError::AlreadyAllocated);
+    auto dual_legacy = shard.init_access_log();
+    REQUIRE_FALSE(dual_legacy.has_value());
+    CHECK_EQ(dual_legacy.error().code, EINVAL);
+
+    i32 output_fds[2];
+    REQUIRE(pipe2(output_fds, O_NONBLOCK | O_CLOEXEC) == 0);
+    SourceAccessLogFd output(output_fds[1]);
+    const SourceLiveAccessLogRingBinding binding = shard.live_access_log_binding();
+    CHECK_EQ(binding.ring, first_ring);
+    CHECK_EQ(binding.lease, &shard.live_log_lease);
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(static_cast<SourceAccessLogFd&&>(output), &binding, 1u));
+    CHECK_EQ(shard.live_log_lease.load(std::memory_order_acquire), &session);
+    REQUIRE(shard.attach_live_access_log(&session, 0u).has_value());
+    CHECK_EQ(shard.loop->live_access_log, &shard.live_log_producer);
+    CHECK_EQ(shard.live_log_producer.ring(), first_ring);
+    CHECK_EQ(shard.live_log_producer.session(), &session);
+    CHECK_EQ(shard.live_log_producer.ring_index(), 0u);
+    auto duplicate_attach = shard.attach_live_access_log(&session, 0u);
+    REQUIRE_FALSE(duplicate_attach.has_value());
+    CHECK(duplicate_attach.error() == ShardLiveAccessLogError::AlreadyAllocated);
+    auto premature_release = shard.release_live_access_log();
+    REQUIRE_FALSE(premature_release.has_value());
+    CHECK(premature_release.error() == ShardLiveAccessLogError::LeaseHeld);
+    CHECK_EQ(shard.live_log_ring, first_ring);
+    CHECK_EQ(shard.loop->live_access_log, &shard.live_log_producer);
+
+    REQUIRE(shard.spawn().has_value());
+    auto late_allocate_after_spawn = shard.init_live_access_log_ring();
+    REQUIRE_FALSE(late_allocate_after_spawn.has_value());
+    CHECK(late_allocate_after_spawn.error() == ShardLiveAccessLogError::InvalidLifecycle);
+    auto late_attach_after_spawn = shard.attach_live_access_log(&session, 0u);
+    REQUIRE_FALSE(late_attach_after_spawn.has_value());
+    CHECK(late_attach_after_spawn.error() == ShardLiveAccessLogError::InvalidLifecycle);
+    CHECK_EQ(shard.loop->live_access_log, &shard.live_log_producer);
+    shard.stop();
+    shard.join();
+    CHECK_FALSE(shard.thread_spawned);
+
+    const auto finished = session.finish();
+    REQUIRE(finished.status == SourceLiveAccessLogFinishStatus::Success);
+    CHECK(shard.live_log_lease.load(std::memory_order_acquire) == nullptr);
+    REQUIRE(shard.release_live_access_log().has_value());
+    CHECK(shard.live_log_ring == nullptr);
+    CHECK_FALSE(shard.live_log_producer.initialized());
+    CHECK(shard.loop->live_access_log == nullptr);
+    close(output_fds[0]);
+
+    auto reused = shard.init_live_access_log_ring();
+    REQUIRE(reused.has_value());
+    REQUIRE(reused.value() != nullptr);
+    CHECK_EQ(reused.value()->published_pos.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(reused.value()->committed_pos.load(std::memory_order_relaxed), 0u);
+    auto late_attach = shard.attach_live_access_log(&session, 0u);
+    REQUIRE_FALSE(late_attach.has_value());
+    CHECK(late_attach.error() == ShardLiveAccessLogError::SessionBinding);
+    CHECK(shard.loop->live_access_log == nullptr);
+    REQUIRE(shard.release_live_access_log().has_value());
+
+    REQUIRE(shard.init_access_log().has_value());
+    CHECK_EQ(shard.loop->access_log, shard.log_ring);
+    auto dual_live = shard.init_live_access_log_ring();
+    REQUIRE_FALSE(dual_live.has_value());
+    CHECK(dual_live.error() == ShardLiveAccessLogError::DualMode);
+    shard.shutdown();
+    close(lfd);
+}
+
 // === Route matching via real sockets (covers EpollEventLoop instantiation) ===
 
 TEST(route, static_200_real_socket) {

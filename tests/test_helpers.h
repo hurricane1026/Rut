@@ -42,6 +42,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
     ShardMetrics* const* all_shard_metrics = nullptr;
@@ -102,6 +103,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         metrics = nullptr;
         all_shard_metrics = nullptr;
@@ -477,6 +479,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
@@ -527,6 +530,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
@@ -834,6 +838,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u32 keepalive_timeout = 60;
     bool draining = false;
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
 
@@ -882,6 +887,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         running = true;
         draining = false;
         access_log = nullptr;
+        live_access_log = nullptr;
         metrics = nullptr;
         config_ptr = nullptr;
         epoch = nullptr;

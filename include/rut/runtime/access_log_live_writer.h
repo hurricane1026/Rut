@@ -10,12 +10,21 @@
 
 namespace rut {
 
+class SourceLiveAccessLogSession;
+using SourceLiveAccessLogLeaseSlot = std::atomic<SourceLiveAccessLogSession*>;
+
+struct SourceLiveAccessLogRingBinding {
+    LiveAccessLogRing* ring = nullptr;
+    SourceLiveAccessLogLeaseSlot* lease = nullptr;
+};
+
 enum class SourceLiveAccessLogFatalKind : u8 {
     None = 0,
     Notify = 1,
     Poll = 2,
     Write = 3,
     Protocol = 4,
+    RingFull = 5,
 };
 
 inline constexpr u8 kSourceLiveAccessLogNoRing = 0xffu;
@@ -33,6 +42,9 @@ enum class SourceLiveAccessLogStartErrorKind : u8 {
     NullRing,
     DuplicateRing,
     InvalidRingState,
+    NullLease,
+    DuplicateLease,
+    LeaseConflict,
     DataEventCreate,
     StopEventCreate,
     ThreadCreate,
@@ -66,7 +78,10 @@ struct SourceLiveAccessLogFinishResult {
 // One generic reliable live access-log session. On successful start(), the
 // session solely owns the moved output descriptor, its two eventfds, and its
 // writer thread. Rings remain caller-owned and must stay alive until finish()
-// returns; they must be quiescent during start validation. Producers may
+// returns; they must be quiescent during start validation. A leased binding
+// additionally CAS-claims its caller-owned lease slot until the writer has
+// joined and can no longer access that ring. Both the ring and lease slot must
+// therefore outlive finish(). Producers may
 // publish and notify only while the session is running, and must be quiescent
 // before finish(). The writer never retains a peeked entry pointer after
 // committing its position. Each ring remains FIFO; ordering between rings is
@@ -89,6 +104,11 @@ public:
     core::Expected<void, SourceLiveAccessLogStartError> start(SourceAccessLogFd&& output,
                                                               LiveAccessLogRing* const* rings,
                                                               u32 ring_count);
+    // Leased form used when ring lifetime is independently managed (for
+    // example by Shard). The raw overload above is retained for standalone
+    // caller-owned sessions and cannot be attached to a leased Shard ring.
+    core::Expected<void, SourceLiveAccessLogStartError> start(
+        SourceAccessLogFd&& output, const SourceLiveAccessLogRingBinding* bindings, u32 ring_count);
 
     // Called only after a successful try_publish() on ring_index. EINTR is
     // retried; eventfd saturation is a coalesced success. Other errors publish
@@ -105,6 +125,16 @@ public:
     SourceLiveAccessLogFinishResult finish();
 
     SourceLiveAccessLogFatal fatal() const;
+
+    // Producer-side validation/reporting boundary. These calls do not own or
+    // publish records. The binding check is valid only while producers are
+    // permitted to run; report_producer_fatal preserves the session-wide
+    // first-fatal value.
+    bool producer_binding_valid(const LiveAccessLogRing* ring,
+                                u32 ring_index,
+                                const SourceLiveAccessLogLeaseSlot* lease) const;
+    bool running() const;
+    void report_producer_fatal(SourceLiveAccessLogFatalKind kind, u32 ring_index, i32 system_error);
 
 private:
     enum class State : u8 {
@@ -123,6 +153,12 @@ private:
     void publish_fatal(SourceLiveAccessLogFatalKind kind, u8 ring_index, i32 system_error);
     void publish_writer_fatal(SourceLiveAccessLogFatalKind kind, u8 ring_index, i32 system_error);
     bool signal_event(i32 fd, u8 ring_index, bool producer_notification);
+    core::Expected<void, SourceLiveAccessLogStartError> start_impl(
+        SourceAccessLogFd&& output,
+        const SourceLiveAccessLogRingBinding* bindings,
+        u32 ring_count,
+        bool allow_unleased);
+    void release_ring_borrows();
     void close_owned();
 
     std::atomic<State> state_{State::New};
@@ -135,10 +171,12 @@ private:
     pthread_t writer_{};
     bool writer_started_ = false;
     LiveAccessLogRing* rings_[kMaxRings]{};
+    SourceLiveAccessLogLeaseSlot* leases_[kMaxRings]{};
     u32 ring_count_ = 0u;
     u32 next_ring_ = 0u;
 };
 
 static_assert(std::atomic<u64>::is_always_lock_free);
+static_assert(SourceLiveAccessLogLeaseSlot::is_always_lock_free);
 
 }  // namespace rut

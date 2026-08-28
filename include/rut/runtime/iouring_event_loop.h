@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/drain.h"
@@ -219,6 +220,7 @@ public:
     i32 listen_fd = -1;
 
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
 
     struct CaptureRing* capture_ring = nullptr;
     static constexpr u32 kCaptureSliceSize = 8192;
@@ -271,6 +273,7 @@ public:
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
         upstream_timeout = kDefaultUpstreamTimeout;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;

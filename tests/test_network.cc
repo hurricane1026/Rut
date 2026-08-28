@@ -27,6 +27,7 @@
 #include <netinet/tcp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -16613,6 +16614,45 @@ static bool load_access_log_snapshot_request(Connection& conn,
     return conn.checked_raw_request_target().state == RawRequestTargetWitnessState::Valid;
 }
 
+struct SourceLiveNetworkPipe {
+    i32 read_fd = -1;
+    i32 write_fd = -1;
+
+    ~SourceLiveNetworkPipe() {
+        if (read_fd >= 0) close(read_fd);
+        if (write_fd >= 0) close(write_fd);
+    }
+
+    bool open_nonblocking() {
+        i32 fds[2];
+        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+        read_fd = fds[0];
+        write_fd = fds[1];
+        return true;
+    }
+
+    SourceAccessLogFd take_writer() {
+        const i32 fd = write_fd;
+        write_fd = -1;
+        return SourceAccessLogFd(fd);
+    }
+};
+
+static std::string read_source_live_network_output(i32 fd) {
+    std::string result;
+    char bytes[4096];
+    for (;;) {
+        const ssize_t count = read(fd, bytes, sizeof(bytes));
+        if (count > 0) {
+            result.append(bytes, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+    return result;
+}
+
 TEST(access_log_snapshot, bounded_capture_is_owned_and_access_disabled_does_not_capture) {
     Connection conn{};
     u8 storage[SlicePool::kSliceSize]{};
@@ -17574,6 +17614,184 @@ TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_iso
              sizeof("GET /pipe-two//?b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") - 1u);
     AccessLogEntry extra{};
     CHECK_FALSE(ring.pop(extra));
+}
+
+TEST(access_log_live_callback,
+     production_start_completion_writer_and_slot_reuse_preserve_downstream_size) {
+    static constexpr char kRequest[] =
+        "GET /ledger?q=raw HTTP/1.1\r\n"
+        "Host: client.example.with.a.long.name\r\n"
+        "Connection: close\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr u32 kRequestLen = sizeof(kRequest) - 1u;
+    static_assert(kRequestLen == 105u);
+
+    SmallLoop loop;
+    loop.setup();
+    LiveAccessLogRing ring;
+    ring.init();
+    SourceLiveNetworkPipe output;
+    REQUIRE(output.open_nonblocking());
+    LiveAccessLogRing* rings[] = {&ring};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(output.take_writer(), rings, 1u));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init(&ring, &session, 0u));
+    loop.live_access_log = &producer;
+
+    RouteConfig config{};
+    REQUIRE(config.add_static("/ledger", 0, 204));
+    Connection* conn = dispatch_unmatched_request(loop, config, kRequest);
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    REQUIRE_EQ(conn->downstream_req_size, kRequestLen);
+    REQUIRE_NE(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(std::string(conn->access_log_target_snapshot.path,
+                         conn->access_log_target_snapshot.target_length),
+             "/ledger?q=raw");
+    const u32 response_wire_length = conn->send_buf.len();
+    REQUIRE_NE(response_wire_length, kRequestLen);
+
+    loop.inject_and_dispatch(
+        make_ev(id, IoEventType::Send, static_cast<i32>(response_wire_length)));
+    CHECK_EQ(loop.conns[id].access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(loop.conns[id].access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+
+    for (u32 attempt = 0u;
+         attempt < 100000u && ring.committed_pos.load(std::memory_order_acquire) != 1u;
+         attempt++)
+        sched_yield();
+    REQUIRE_EQ(ring.published_pos.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(ring.committed_pos.load(std::memory_order_acquire), 1u);
+    CHECK(session.running());
+    CHECK_EQ(read_source_live_network_output(output.read_fd), "105\n");
+
+    const auto finished = session.finish();
+    REQUIRE(finished.status == SourceLiveAccessLogFinishStatus::Success);
+    CHECK_EQ(ring.published_pos.load(std::memory_order_relaxed), 1u);
+    CHECK_EQ(ring.committed_pos.load(std::memory_order_relaxed), 1u);
+    CHECK(read_source_live_network_output(output.read_fd).empty());
+
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, id);
+    CHECK_EQ(reused->downstream_req_size, 0u);
+    CHECK_EQ(reused->req_size, 0u);
+    CHECK_EQ(reused->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(reused->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    loop.close_conn(*reused);
+    loop.live_access_log = nullptr;
+    producer.reset();
+}
+
+TEST(access_log_live_callback, dual_mode_fails_protocol_without_capture_or_publication) {
+    SmallLoop loop;
+    loop.setup();
+    AccessLogRing legacy;
+    legacy.init();
+    LiveAccessLogRing live;
+    live.init();
+    SourceLiveNetworkPipe output;
+    REQUIRE(output.open_nonblocking());
+    LiveAccessLogRing* rings[] = {&live};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(output.take_writer(), rings, 1u));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init(&live, &session, 0u));
+    loop.access_log = &legacy;
+    loop.live_access_log = &producer;
+
+    RouteConfig config{};
+    REQUIRE(config.add_static("/dual", 0, 204));
+    Connection* conn = dispatch_unmatched_request(
+        loop, config, "GET /dual HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    CHECK_EQ(conn->access_log_target_snapshot.episode, 0u);
+    CHECK_EQ(conn->access_log_target_snapshot.target_state,
+             AccessLogTargetState::LegacyNullTerminated);
+    const u32 response_wire_length = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(id, IoEventType::Send, static_cast<i32>(response_wire_length)));
+
+    AccessLogEntry legacy_entry{};
+    CHECK_FALSE(legacy.pop(legacy_entry));
+    CHECK_EQ(live.published_pos.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(live.committed_pos.load(std::memory_order_relaxed), 0u);
+    const auto fatal = session.fatal();
+    CHECK(fatal.kind == SourceLiveAccessLogFatalKind::Protocol);
+    CHECK_EQ(fatal.ring_index, 0u);
+    CHECK_EQ(fatal.system_error, EINVAL);
+    CHECK_EQ(loop.conns[id].access_log_target_snapshot.episode, 0u);
+
+    const auto finished = session.finish();
+    REQUIRE(finished.status == SourceLiveAccessLogFinishStatus::Fatal);
+    CHECK(read_source_live_network_output(output.read_fd).empty());
+    loop.access_log = nullptr;
+    loop.live_access_log = nullptr;
+    producer.reset();
+}
+
+TEST(access_log_live_callback, ring_full_is_first_fatal_and_completion_never_overwrites) {
+    SmallLoop loop;
+    loop.setup();
+    LiveAccessLogRing ring;
+    ring.init();
+    AccessLogEntry filler{};
+    filler.req_size = 7u;
+    filler.status = 418u;
+    for (u32 i = 0; i < LiveAccessLogRing::kCapacity; i++) {
+        filler.duration_us = i;
+        REQUIRE(ring.try_publish(filler).status == LiveAccessLogPublishStatus::Published);
+    }
+    const AccessLogEntry first_before = ring.entries[0];
+    REQUIRE_EQ(ring.published_pos.load(std::memory_order_relaxed), 512u);
+    REQUIRE_EQ(ring.committed_pos.load(std::memory_order_relaxed), 0u);
+
+    SourceLiveNetworkPipe output;
+    REQUIRE(output.open_nonblocking());
+    LiveAccessLogRing* rings[] = {&ring};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(output.take_writer(), rings, 1u));
+    SourceLiveAccessLogProducer producer;
+    REQUIRE(producer.init(&ring, &session, 0u));
+    loop.live_access_log = &producer;
+
+    RouteConfig config{};
+    REQUIRE(config.add_static("/full", 0, 204));
+    Connection* conn = dispatch_unmatched_request(
+        loop, config, "GET /full HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    const u32 response_wire_length = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(id, IoEventType::Send, static_cast<i32>(response_wire_length)));
+
+    CHECK_EQ(ring.published_pos.load(std::memory_order_relaxed), 512u);
+    CHECK_EQ(ring.committed_pos.load(std::memory_order_relaxed), 0u);
+    CHECK_EQ(__builtin_memcmp(&ring.entries[0], &first_before, sizeof(first_before)), 0);
+    const auto first_fatal = session.fatal();
+    CHECK(first_fatal.kind == SourceLiveAccessLogFatalKind::RingFull);
+    CHECK_EQ(first_fatal.ring_index, 0u);
+    CHECK_EQ(first_fatal.system_error, ENOBUFS);
+    session.report_producer_fatal(SourceLiveAccessLogFatalKind::Protocol, 0u, EPROTO);
+    const auto stable_fatal = session.fatal();
+    CHECK(stable_fatal.kind == SourceLiveAccessLogFatalKind::RingFull);
+    CHECK_EQ(stable_fatal.system_error, ENOBUFS);
+
+    const auto finished = session.finish();
+    REQUIRE(finished.status == SourceLiveAccessLogFinishStatus::Fatal);
+    CHECK_EQ(ring.published_pos.load(std::memory_order_relaxed), 512u);
+    CHECK_EQ(ring.committed_pos.load(std::memory_order_relaxed), 512u);
+    const std::string written = read_source_live_network_output(output.read_fd);
+    REQUIRE_EQ(written.size(), LiveAccessLogRing::kCapacity * 2u);
+    for (u32 i = 0; i < LiveAccessLogRing::kCapacity; i++)
+        CHECK_EQ(written.substr(i * 2u, 2u), "7\n");
+    loop.live_access_log = nullptr;
+    producer.reset();
 }
 
 TEST(access_log_snapshot, transport_rejects_16368_target_without_fabricated_entry) {

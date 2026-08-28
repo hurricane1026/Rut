@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/drain.h"
@@ -432,6 +433,7 @@ public:
 
     // Per-shard access log ring. Set by Shard before run(). Null = no logging.
     AccessLogRing* access_log = nullptr;
+    SourceLiveAccessLogProducer* live_access_log = nullptr;
 
     // Per-shard traffic capture ring. Use set_capture() to change.
     struct CaptureRing* capture_ring = nullptr;
@@ -482,6 +484,7 @@ public:
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
         upstream_timeout = kDefaultUpstreamTimeout;
+        live_access_log = nullptr;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;

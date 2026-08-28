@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/chunked_parser.h"
@@ -1793,7 +1794,11 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         loop->metrics->on_request_complete(kDurationUs);
     }
 
-    if (loop->access_log) {
+    const bool legacy_access_log_enabled = loop->access_log != nullptr;
+    const bool live_access_log_enabled = loop->live_access_log != nullptr;
+    if (legacy_access_log_enabled && live_access_log_enabled) {
+        loop->live_access_log->fail_protocol(EINVAL);
+    } else if (legacy_access_log_enabled || live_access_log_enabled) {
         AccessLogEntry entry{};
         entry.timestamp_us = realtime_us();
         entry.duration_us = kDurationUs;
@@ -1842,7 +1847,10 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
             entry.upstream[i] = conn.upstream_name[i];
             if (conn.upstream_name[i] == '\0') break;
         }
-        loop->access_log->push(entry);
+        if (live_access_log_enabled)
+            (void)loop->live_access_log->publish(entry);
+        else
+            loop->access_log->push(entry);
     }
     // Every completion consumes the episode-owned snapshot, including when logging was disabled
     // after request-start capture or the ring is full. A later duplicate completion can therefore
@@ -1972,7 +1980,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);
-    if (loop->access_log) conn.capture_access_log_target_snapshot();
+    if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
+        conn.capture_access_log_target_snapshot();
 
     // Tag the request with a fresh generation so the yield-heap stale
     // filter can reliably reject entries left by a close+reuse even if
