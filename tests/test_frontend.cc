@@ -34582,59 +34582,72 @@ route GET "/api" {
     rir.destroy();
 }
 
-TEST(frontend, query_bearing_target_transform_reaches_owned_config_after_source_destruction) {
-    auto config = std::make_unique<RouteConfig>();
-    {
-        std::string source =
-            "upstream backend at \"127.0.0.1:9000\"\n"
-            "route GET \"/api\" { return forward(backend, target_transform: { strip_prefix: "
-            "\"/api/\", replace_prefix: \"/v1/?fixed=1\" }) }\n";
-        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
-        REQUIRE(lexed);
-        auto ast = parse_file_heap(lexed.value());
-        REQUIRE(ast);
-        auto* statement = ast->items[1].route.statements[0];
-        REQUIRE(statement != nullptr);
-        REQUIRE(statement->has_forward_target_transform);
-        CHECK(statement->forward_target_transform.strip_prefix.eq(lit("/api/")));
-        CHECK(statement->forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+TEST(frontend, query_prefix_variants_reach_owned_config_after_source_destruction) {
+    struct Variant {
+        const char* replace_prefix;
+        u32 replace_prefix_len;
+    } variants[] = {{"/v1/?fixed=1", 12}, {"/v1/?", 5}};
 
-        auto hir = analyze_file_heap(ast.value());
-        REQUIRE(hir);
-        const auto& hir_term = hir->routes[0].control.direct_term;
-        REQUIRE(hir_term.has_forward_target_transform);
-        CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
-        CHECK(hir_term.forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+    for (const auto& variant : variants) {
+        auto config = std::make_unique<RouteConfig>();
+        {
+            std::string source =
+                "upstream backend at \"127.0.0.1:9000\"\n"
+                "route GET \"/api\" { return forward(backend, target_transform: { strip_prefix: "
+                "\"/api/\", replace_prefix: \"" +
+                std::string(variant.replace_prefix, variant.replace_prefix_len) + "\" }) }\n";
+            auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(lexed);
+            auto ast = parse_file_heap(lexed.value());
+            REQUIRE(ast);
+            auto* statement = ast->items[1].route.statements[0];
+            REQUIRE(statement != nullptr);
+            REQUIRE(statement->has_forward_target_transform);
+            CHECK(statement->forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(statement->forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
 
-        auto mir = build_mir_heap(hir.value());
-        REQUIRE(mir);
-        const auto& mir_term = mir->functions[0].blocks[0].term;
-        REQUIRE(mir_term.has_forward_target_transform);
-        CHECK(mir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
-        CHECK(mir_term.forward_target_transform.replace_prefix.eq(lit("/v1/?fixed=1")));
+            auto hir = analyze_file_heap(ast.value());
+            REQUIRE(hir);
+            const auto& hir_term = hir->routes[0].control.direct_term;
+            REQUIRE(hir_term.has_forward_target_transform);
+            CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(hir_term.forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
 
-        FrontendRirModule rir{};
-        REQUIRE(lower_to_rir(mir.value(), rir));
-        REQUIRE(rir::verify_module(rir.module).ok);
-        REQUIRE_EQ(rir.module.target_transform_count, 1u);
-        CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
-        CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit("/v1/?fixed=1")));
-        REQUIRE(populate_route_config(*config, rir.module));
-        memset(source.data(), 'x', source.size());
-        rir.destroy();
-    }
+            auto mir = build_mir_heap(hir.value());
+            REQUIRE(mir);
+            const auto& mir_term = mir->functions[0].blocks[0].term;
+            REQUIRE(mir_term.has_forward_target_transform);
+            CHECK(mir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(mir_term.forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
 
-    REQUIRE_EQ(config->target_transform_count, 1u);
-    REQUIRE_EQ(config->target_transform_bytes_used, 17u);
-    CHECK(config->target_transforms[0].strip_prefix.eq(lit("/api/")));
-    CHECK(config->target_transforms[0].replace_prefix.eq(lit("/v1/?fixed=1")));
-    const uintptr_t pool_begin = reinterpret_cast<uintptr_t>(config->target_transform_bytes);
-    const uintptr_t pool_end = pool_begin + config->target_transform_bytes_used;
-    for (Str value :
-         {config->target_transforms[0].strip_prefix, config->target_transforms[0].replace_prefix}) {
-        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        CHECK(ptr >= pool_begin);
-        CHECK(ptr + value.len <= pool_end);
+            FrontendRirModule rir{};
+            REQUIRE(lower_to_rir(mir.value(), rir));
+            REQUIRE(rir::verify_module(rir.module).ok);
+            REQUIRE_EQ(rir.module.target_transform_count, 1u);
+            CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+            CHECK(rir.module.target_transforms[0].replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
+            REQUIRE(populate_route_config(*config, rir.module));
+            memset(source.data(), 'x', source.size());
+            rir.destroy();
+        }
+
+        REQUIRE_EQ(config->target_transform_count, 1u);
+        REQUIRE_EQ(config->target_transform_bytes_used, 5u + variant.replace_prefix_len);
+        CHECK(config->target_transforms[0].strip_prefix.eq(lit("/api/")));
+        CHECK(config->target_transforms[0].replace_prefix.eq(
+            {variant.replace_prefix, variant.replace_prefix_len}));
+        const uintptr_t pool_begin = reinterpret_cast<uintptr_t>(config->target_transform_bytes);
+        const uintptr_t pool_end = pool_begin + config->target_transform_bytes_used;
+        for (Str value : {config->target_transforms[0].strip_prefix,
+                          config->target_transforms[0].replace_prefix}) {
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+            CHECK(ptr >= pool_begin);
+            CHECK(ptr + value.len <= pool_end);
+        }
     }
 }
 

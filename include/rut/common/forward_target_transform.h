@@ -42,7 +42,7 @@ inline bool forward_target_transform_clean_prefix(Str value) {
 
 inline bool forward_target_transform_replacement_prefix(Str value) {
     if (forward_target_transform_clean_prefix(value)) return true;
-    if (value.ptr == nullptr || value.len < 3 || value.len > kMaxForwardTargetTransformPrefixLen)
+    if (value.ptr == nullptr || value.len < 2 || value.len > kMaxForwardTargetTransformPrefixLen)
         return false;
 
     u32 query_delimiter = value.len;
@@ -51,7 +51,7 @@ inline bool forward_target_transform_replacement_prefix(Str value) {
         if (query_delimiter != value.len) return false;
         query_delimiter = i;
     }
-    if (query_delimiter == value.len || query_delimiter + 1 == value.len ||
+    if (query_delimiter == value.len ||
         !forward_target_transform_clean_prefix({value.ptr, query_delimiter}))
         return false;
 

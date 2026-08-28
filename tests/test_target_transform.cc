@@ -117,6 +117,16 @@ TEST(target_transform, query_bearing_populate_owns_and_duplicate_add_reuses_stor
                1u);
     CHECK_EQ(deduplicated.target_transform_count, 1u);
     CHECK_EQ(deduplicated.target_transform_bytes_used, bytes);
+
+    char empty_query_replace[] = "/v1/?";
+    RouteConfig empty_query{};
+    REQUIRE_EQ(empty_query.add_target_transform(transform({"/api/", 5}, {empty_query_replace, 5})),
+               1u);
+    empty_query_replace[4] = 'x';
+    REQUIRE_EQ(empty_query.add_target_transform(transform({"/api/", 5}, {"/v1/?", 5})), 1u);
+    CHECK_EQ(empty_query.target_transform_count, 1u);
+    CHECK_EQ(empty_query.target_transform_bytes_used, 10u);
+    CHECK(empty_query.target_transforms[0].replace_prefix.eq({"/v1/?", 5}));
 }
 
 TEST(target_transform, replacement_prefix_static_query_grammar_is_bounded_and_fail_closed) {
@@ -130,7 +140,19 @@ TEST(target_transform, replacement_prefix_static_query_grammar_is_bounded_and_fa
     overlong[0] = '/';
     overlong[1] = '?';
     for (u32 i = 2; i < sizeof(overlong); i++) overlong[i] = 'a';
+    char terminal_maximum[128];
+    terminal_maximum[0] = '/';
+    for (u32 i = 1; i < sizeof(terminal_maximum) - 2; i++) terminal_maximum[i] = 'a';
+    terminal_maximum[126] = '/';
+    terminal_maximum[127] = '?';
+    char terminal_overlong[129];
+    terminal_overlong[0] = '/';
+    for (u32 i = 1; i < sizeof(terminal_overlong) - 2; i++) terminal_overlong[i] = 'a';
+    terminal_overlong[127] = '/';
+    terminal_overlong[128] = '?';
 
+    CHECK(forward_target_transform_replacement_prefix({"/?", 2}));
+    CHECK(forward_target_transform_replacement_prefix({"/v1/?", 5}));
     CHECK(forward_target_transform_replacement_prefix({minimum, sizeof(minimum) - 1}));
     CHECK(forward_target_transform_replacement_prefix({"/?=", 3}));
     CHECK(forward_target_transform_replacement_prefix({"/?&", 3}));
@@ -141,8 +163,15 @@ TEST(target_transform, replacement_prefix_static_query_grammar_is_bounded_and_fa
     CHECK(forward_target_transform_replacement_prefix({allowlist, sizeof(allowlist) - 1}));
     CHECK(forward_target_transform_replacement_prefix({maximum, sizeof(maximum)}));
     CHECK_FALSE(forward_target_transform_replacement_prefix({overlong, sizeof(overlong)}));
-    CHECK_FALSE(forward_target_transform_replacement_prefix({"/?", 2}));
+    CHECK(
+        forward_target_transform_replacement_prefix({terminal_maximum, sizeof(terminal_maximum)}));
+    CHECK_FALSE(forward_target_transform_replacement_prefix(
+        {terminal_overlong, sizeof(terminal_overlong)}));
+    CHECK_FALSE(forward_target_transform_clean_prefix({"/?", 2}));
+    CHECK_FALSE(forward_target_transform_spec_valid(transform({"/?", 2}, {"/", 1})));
     CHECK_FALSE(forward_target_transform_replacement_prefix({"/?a?b", 5}));
+    CHECK_FALSE(forward_target_transform_replacement_prefix({nullptr, 0}));
+    CHECK_FALSE(forward_target_transform_replacement_prefix({"", 0}));
 
     // Each case mutates only the one-byte accepted static query in `/?a`, making every
     // forbidden category independently necessary to the allowlist check.

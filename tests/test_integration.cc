@@ -21493,17 +21493,46 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
 
 namespace {
 
-static constexpr char kStaticQueryClientTargetOne[] = "/api/users?x=1";
-static constexpr char kStaticQueryClientTargetTwo[] = "/api/users";
-static constexpr char kStaticQueryUpstreamTargetOne[] = "/v1/?fixed=1users?x=1";
-static constexpr char kStaticQueryUpstreamTargetTwo[] = "/v1/?fixed=1users";
+static constexpr u32 kStaticQueryVectorCount = 6u;
+static constexpr char kStaticQueryClientTargetOne[] = "/api/";
+static constexpr char kStaticQueryClientTargetTwo[] = "/api/x";
+static constexpr char kStaticQueryClientTargetThree[] = "/api/x?y=1";
+static constexpr char kStaticQueryClientTargetFour[] = "/api/?y=1";
+static constexpr char kStaticQueryClientTargetFive[] = "/fixed/users?x=1";
+static constexpr char kStaticQueryClientTargetSix[] = "/fixed/users";
+static constexpr char kStaticQueryUpstreamTargetOne[] = "/v1/?";
+static constexpr char kStaticQueryUpstreamTargetTwo[] = "/v1/?x";
+static constexpr char kStaticQueryUpstreamTargetThree[] = "/v1/?x?y=1";
+static constexpr char kStaticQueryUpstreamTargetFour[] = "/v1/??y=1";
+static constexpr char kStaticQueryUpstreamTargetFive[] = "/v1/?fixed=1users?x=1";
+static constexpr char kStaticQueryUpstreamTargetSix[] = "/v1/?fixed=1users";
 static constexpr char kStaticQueryClientRequestOne[] =
-    "GET /api/users?x=1 HTTP/1.1\r\n"
+    "GET /api/ HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n"
     "X-Test: one\r\n\r\n";
 static constexpr char kStaticQueryClientRequestTwo[] =
-    "GET /api/users HTTP/1.1\r\n"
+    "GET /api/x HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryClientRequestThree[] =
+    "GET /api/x?y=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryClientRequestFour[] =
+    "GET /api/?y=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryClientRequestFive[] =
+    "GET /fixed/users?x=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n"
+    "X-Test: one\r\n\r\n";
+static constexpr char kStaticQueryClientRequestSix[] =
+    "GET /fixed/users HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n"
     "X-Test: one\r\n\r\n";
@@ -21521,14 +21550,14 @@ struct StaticQueryTransformEvidence {
     u32 accepted_count = 0;
     u32 request_count = 0;
     u32 access_count = 0;
-    char requests[3][256]{};
-    u32 request_lengths[3]{};
-    u32 request_header_lengths[3]{};
-    u32 response_write_counts[3]{};
-    u64 request_recorded_ns[3]{};
-    u64 response_write_ns[3]{};
-    u64 response_close_ns[3]{};
-    AccessLogEntry access[3]{};
+    char requests[kStaticQueryVectorCount + 1u][256]{};
+    u32 request_lengths[kStaticQueryVectorCount + 1u]{};
+    u32 request_header_lengths[kStaticQueryVectorCount + 1u]{};
+    u32 response_write_counts[kStaticQueryVectorCount + 1u]{};
+    u64 request_recorded_ns[kStaticQueryVectorCount + 1u]{};
+    u64 response_write_ns[kStaticQueryVectorCount + 1u]{};
+    u64 response_close_ns[kStaticQueryVectorCount + 1u]{};
+    AccessLogEntry access[kStaticQueryVectorCount + 1u]{};
 };
 
 static bool static_query_transform_request_is_exact(const char* actual,
@@ -21550,13 +21579,23 @@ static bool static_query_transform_request_is_exact(const char* actual,
 
 static bool validate_static_query_transform_evidence(const StaticQueryTransformEvidence& evidence,
                                                      u16 backend_port) {
-    if (evidence.accepted_count != 2u || evidence.request_count != 2u ||
-        evidence.access_count != 2u)
+    if (evidence.accepted_count != kStaticQueryVectorCount ||
+        evidence.request_count != kStaticQueryVectorCount ||
+        evidence.access_count != kStaticQueryVectorCount)
         return false;
     const char* const upstream_targets[] = {kStaticQueryUpstreamTargetOne,
-                                            kStaticQueryUpstreamTargetTwo};
-    const char* const client_targets[] = {kStaticQueryClientTargetOne, kStaticQueryClientTargetTwo};
-    for (u32 i = 0; i < 2; i++) {
+                                            kStaticQueryUpstreamTargetTwo,
+                                            kStaticQueryUpstreamTargetThree,
+                                            kStaticQueryUpstreamTargetFour,
+                                            kStaticQueryUpstreamTargetFive,
+                                            kStaticQueryUpstreamTargetSix};
+    const char* const client_targets[] = {kStaticQueryClientTargetOne,
+                                          kStaticQueryClientTargetTwo,
+                                          kStaticQueryClientTargetThree,
+                                          kStaticQueryClientTargetFour,
+                                          kStaticQueryClientTargetFive,
+                                          kStaticQueryClientTargetSix};
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++) {
         if (!static_query_transform_request_is_exact(evidence.requests[i],
                                                      evidence.request_lengths[i],
                                                      backend_port,
@@ -21578,25 +21617,37 @@ static bool validate_static_query_transform_evidence(const StaticQueryTransformE
             strcmp(access.upstream, "backend") != 0)
             return false;
     }
-    if (evidence.request_lengths[2] != 0u || evidence.request_header_lengths[2] != 0u ||
-        evidence.response_write_counts[2] != 0u || evidence.request_recorded_ns[2] != 0u ||
-        evidence.response_write_ns[2] != 0u || evidence.response_close_ns[2] != 0u)
+    const u32 sentinel = kStaticQueryVectorCount;
+    if (evidence.request_lengths[sentinel] != 0u ||
+        evidence.request_header_lengths[sentinel] != 0u ||
+        evidence.response_write_counts[sentinel] != 0u ||
+        evidence.request_recorded_ns[sentinel] != 0u ||
+        evidence.response_write_ns[sentinel] != 0u || evidence.response_close_ns[sentinel] != 0u)
         return false;
-    for (u32 i = 0; i < sizeof(evidence.requests[2]); i++)
-        if (evidence.requests[2][i] != '\0') return false;
+    for (u32 i = 0; i < sizeof(evidence.requests[sentinel]); i++)
+        if (evidence.requests[sentinel][i] != '\0') return false;
     return true;
 }
 
 static bool static_query_transform_validator_self_checks() {
     constexpr u16 kPort = 18080;
     StaticQueryTransformEvidence valid{};
-    valid.accepted_count = 2u;
-    valid.request_count = 2u;
-    valid.access_count = 2u;
+    valid.accepted_count = kStaticQueryVectorCount;
+    valid.request_count = kStaticQueryVectorCount;
+    valid.access_count = kStaticQueryVectorCount;
     const char* const upstream_targets[] = {kStaticQueryUpstreamTargetOne,
-                                            kStaticQueryUpstreamTargetTwo};
-    const char* const client_targets[] = {kStaticQueryClientTargetOne, kStaticQueryClientTargetTwo};
-    for (u32 i = 0; i < 2; i++) {
+                                            kStaticQueryUpstreamTargetTwo,
+                                            kStaticQueryUpstreamTargetThree,
+                                            kStaticQueryUpstreamTargetFour,
+                                            kStaticQueryUpstreamTargetFive,
+                                            kStaticQueryUpstreamTargetSix};
+    const char* const client_targets[] = {kStaticQueryClientTargetOne,
+                                          kStaticQueryClientTargetTwo,
+                                          kStaticQueryClientTargetThree,
+                                          kStaticQueryClientTargetFour,
+                                          kStaticQueryClientTargetFive,
+                                          kStaticQueryClientTargetSix};
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++) {
         const int len = snprintf(valid.requests[i],
                                  sizeof(valid.requests[i]),
                                  "GET %s HTTP/1.1\r\n"
@@ -21624,73 +21675,66 @@ static bool static_query_transform_validator_self_checks() {
     const auto rejects = [&](const StaticQueryTransformEvidence& mutation) {
         return !validate_static_query_transform_evidence(mutation, kPort);
     };
+    const auto with_upstream_target = [&](u32 index, const char* target) {
+        StaticQueryTransformEvidence mutation = valid;
+        const int len = snprintf(mutation.requests[index],
+                                 sizeof(mutation.requests[index]),
+                                 "GET %s HTTP/1.1\r\n"
+                                 "Host: 127.0.0.1:%u\r\n"
+                                 "X-Test: one\r\n\r\n",
+                                 target,
+                                 kPort);
+        if (len <= 0 || len >= static_cast<int>(sizeof(mutation.requests[index])))
+            mutation.request_lengths[index] = 0u;
+        else
+            mutation.request_lengths[index] = mutation.request_header_lengths[index] =
+                mutation.access[index].req_size = static_cast<u32>(len);
+        return mutation;
+    };
 
     StaticQueryTransformEvidence transformed_access = valid;
     transformed_access.access[0].target_length = sizeof(kStaticQueryUpstreamTargetOne) - 1u;
     memcpy(transformed_access.access[0].path,
            kStaticQueryUpstreamTargetOne,
            sizeof(kStaticQueryUpstreamTargetOne) - 1u);
-    StaticQueryTransformEvidence original_upstream = valid;
-    const char* original_target =
-        strstr(original_upstream.requests[0], kStaticQueryUpstreamTargetOne);
-    if (original_target == nullptr) return false;
-    const u32 original_offset =
-        static_cast<u32>(original_target - static_cast<const char*>(original_upstream.requests[0]));
-    memcpy(original_upstream.requests[0] + original_offset,
-           kStaticQueryClientTargetOne,
-           sizeof(kStaticQueryClientTargetOne) - 1u);
-    original_upstream.request_lengths[0] -=
-        sizeof(kStaticQueryUpstreamTargetOne) - sizeof(kStaticQueryClientTargetOne);
-    original_upstream.request_header_lengths[0] = original_upstream.request_lengths[0];
-    memmove(
-        original_upstream.requests[0] + original_offset + sizeof(kStaticQueryClientTargetOne) - 1u,
-        original_target + sizeof(kStaticQueryUpstreamTargetOne) - 1u,
-        valid.request_lengths[0] - original_offset - sizeof(kStaticQueryUpstreamTargetOne) + 1u);
-    StaticQueryTransformEvidence missing_query = valid;
-    memcpy(strstr(missing_query.requests[0], kStaticQueryUpstreamTargetOne),
-           "/v1/?fixed=1users    ",
-           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
-    StaticQueryTransformEvidence reordered = valid;
-    memcpy(strstr(reordered.requests[0], kStaticQueryUpstreamTargetOne),
-           "/v1/?fixed=1?x=1users",
-           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
-    StaticQueryTransformEvidence missing_suffix = valid;
-    memcpy(strstr(missing_suffix.requests[0], kStaticQueryUpstreamTargetOne),
-           "/v1/?fixed=1         ",
-           sizeof(kStaticQueryUpstreamTargetOne) - 1u);
-    StaticQueryTransformEvidence ampersand = valid;
-    char* client_query = strstr(ampersand.requests[0], "users?x=1");
-    if (client_query == nullptr) return false;
-    client_query[5] = '&';
+    const auto original_upstream = with_upstream_target(0u, kStaticQueryClientTargetOne);
+    const auto terminal_deleted = with_upstream_target(2u, "/v1/x?y=1");
+    const auto missing_suffix = with_upstream_target(2u, "/v1/??y=1");
+    const auto missing_query = with_upstream_target(2u, "/v1/?x");
+    const auto reordered = with_upstream_target(2u, "/v1/?y=1?x");
+    const auto collapsed_delimiters = with_upstream_target(3u, "/v1/?y=1");
+    const auto ampersand = with_upstream_target(2u, "/v1/?x&y=1");
+    const auto fixed_query_reordered = with_upstream_target(4u, "/v1/users?x=1?fixed=1");
     StaticQueryTransformEvidence missing_episode = valid;
-    missing_episode.accepted_count = 1u;
+    missing_episode.accepted_count = kStaticQueryVectorCount - 1u;
     StaticQueryTransformEvidence duplicate_send = valid;
     duplicate_send.response_write_counts[0] = 2u;
     StaticQueryTransformEvidence extra_episode = valid;
-    extra_episode.request_count = 3u;
-    StaticQueryTransformEvidence nonempty_third = valid;
-    nonempty_third.requests[2][0] = 'G';
+    extra_episode.request_count = kStaticQueryVectorCount + 1u;
+    StaticQueryTransformEvidence nonempty_sentinel = valid;
+    nonempty_sentinel.requests[kStaticQueryVectorCount][0] = 'G';
     StaticQueryTransformEvidence missing_access = valid;
-    missing_access.access_count = 1u;
+    missing_access.access_count = kStaticQueryVectorCount - 1u;
     StaticQueryTransformEvidence duplicate_access = valid;
     duplicate_access.access[1] = duplicate_access.access[0];
     StaticQueryTransformEvidence extra_access = valid;
-    extra_access.access_count = 3u;
+    extra_access.access_count = kStaticQueryVectorCount + 1u;
     StaticQueryTransformEvidence reversed_access = valid;
     const AccessLogEntry saved = reversed_access.access[0];
     reversed_access.access[0] = reversed_access.access[1];
     reversed_access.access[1] = saved;
 
-    return rejects(transformed_access) && rejects(original_upstream) && rejects(missing_query) &&
-           rejects(reordered) && rejects(missing_suffix) && rejects(ampersand) &&
+    return rejects(transformed_access) && rejects(original_upstream) && rejects(terminal_deleted) &&
+           rejects(missing_query) && rejects(reordered) && rejects(missing_suffix) &&
+           rejects(collapsed_delimiters) && rejects(ampersand) && rejects(fixed_query_reordered) &&
            rejects(missing_episode) && rejects(duplicate_send) && rejects(extra_episode) &&
-           rejects(nonempty_third) && rejects(missing_access) && rejects(duplicate_access) &&
+           rejects(nonempty_sentinel) && rejects(missing_access) && rejects(duplicate_access) &&
            rejects(extra_access) && rejects(reversed_access);
 }
 
 }  // namespace
 
-TEST(route, static_query_target_transform_public_source_reaches_iouring_backend_and_access) {
+TEST(route, empty_query_target_transform_public_source_reaches_iouring_backend_and_access) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     REQUIRE(static_query_transform_validator_self_checks());
@@ -21714,7 +21758,16 @@ TEST(route, static_query_target_transform_public_source_reaches_iouring_backend_
     source_text += R"rut(
 route GET "/api" {
   return forward(backend,
-    target_transform: { strip_prefix: "/api/", replace_prefix: "/v1/?fixed=1" },
+    target_transform: { strip_prefix: "/api/", replace_prefix: "/v1/?" },
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "rut-static-query", date: "current",
+      hide_headers: ["Date", "Server"] })
+}
+route GET "/fixed" {
+  return forward(backend,
+    target_transform: { strip_prefix: "/fixed/", replace_prefix: "/v1/?fixed=1" },
     request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
       strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
     response_policy: { version: "HTTP/1.1", framing: "content_length",
@@ -21726,7 +21779,9 @@ route GET "/api" {
     CHECK_EQ(source_text.find("workaround"), std::string::npos);
     const size_t first_route = source_text.find("route GET");
     REQUIRE_NE(first_route, std::string::npos);
-    CHECK_EQ(source_text.find("route GET", first_route + 1u), std::string::npos);
+    const size_t second_route = source_text.find("route GET", first_route + 1u);
+    REQUIRE_NE(second_route, std::string::npos);
+    CHECK_EQ(source_text.find("route GET", second_route + 1u), std::string::npos);
 
     struct TempSource {
         char path[64] = "/tmp/rut_static_query_target_XXXXXX";
@@ -21764,44 +21819,60 @@ route GET "/api" {
     REQUIRE(program.jit_inited);
     REQUIRE(program.has_listener);
     CHECK_EQ(program.listener.port, 0u);
-    REQUIRE_EQ(program.rir.module.func_count, 1u);
-    REQUIRE_EQ(program.rir.module.target_transform_count, 1u);
-    REQUIRE_EQ(program.config.route_count, 1u);
-    REQUIRE_EQ(program.config.target_transform_count, 1u);
-    REQUIRE_EQ(program.config.target_transform_bytes_used, 17u);
+    REQUIRE_EQ(program.rir.module.func_count, 2u);
+    REQUIRE_EQ(program.rir.module.target_transform_count, 2u);
+    REQUIRE_EQ(program.config.route_count, 2u);
+    REQUIRE_EQ(program.config.target_transform_count, 2u);
+    REQUIRE_EQ(program.config.target_transform_bytes_used, 29u);
     REQUIRE_EQ(program.config.upstream_count, 1u);
     REQUIRE_EQ(program.config.response_policy_count, 1u);
     const auto& rir_transform = program.rir.module.target_transforms[0];
     const auto& owned_transform = program.config.target_transforms[0];
+    const auto& fixed_rir_transform = program.rir.module.target_transforms[1];
+    const auto& fixed_owned_transform = program.config.target_transforms[1];
     REQUIRE(rir_transform.strip_prefix.eq({"/api/", 5}));
-    REQUIRE(rir_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
+    REQUIRE(rir_transform.replace_prefix.eq({"/v1/?", 5}));
     REQUIRE(owned_transform.strip_prefix.eq({"/api/", 5}));
-    REQUIRE(owned_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
+    REQUIRE(owned_transform.replace_prefix.eq({"/v1/?", 5}));
+    REQUIRE(fixed_rir_transform.strip_prefix.eq({"/fixed/", 7}));
+    REQUIRE(fixed_rir_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
+    REQUIRE(fixed_owned_transform.strip_prefix.eq({"/fixed/", 7}));
+    REQUIRE(fixed_owned_transform.replace_prefix.eq({"/v1/?fixed=1", 12}));
     CHECK_NE(owned_transform.strip_prefix.ptr, rir_transform.strip_prefix.ptr);
     CHECK_NE(owned_transform.replace_prefix.ptr, rir_transform.replace_prefix.ptr);
+    CHECK_NE(fixed_owned_transform.strip_prefix.ptr, fixed_rir_transform.strip_prefix.ptr);
+    CHECK_NE(fixed_owned_transform.replace_prefix.ptr, fixed_rir_transform.replace_prefix.ptr);
     CHECK(program.config.response_policies[0].server.eq({"rut-static-query", 16}));
-    bool saw_transform_opcode = false;
-    bool saw_forward_opcode = false;
-    for (u32 bi = 0; bi < program.rir.module.functions[0].block_count; bi++) {
-        const auto& block = program.rir.module.functions[0].blocks[bi];
-        for (u32 ii = 0; ii < block.inst_count; ii++) {
-            if (block.insts[ii].op == rir::Opcode::ReqSetTargetTransform) {
-                saw_transform_opcode = true;
-                CHECK_EQ(block.insts[ii].imm.i32_val, 1);
+    bool saw_transform_opcode[2]{};
+    bool saw_forward_opcode[2]{};
+    for (u32 fi = 0; fi < program.rir.module.func_count; fi++) {
+        for (u32 bi = 0; bi < program.rir.module.functions[fi].block_count; bi++) {
+            const auto& block = program.rir.module.functions[fi].blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op == rir::Opcode::ReqSetTargetTransform) {
+                    saw_transform_opcode[fi] = true;
+                    CHECK_EQ(block.insts[ii].imm.i32_val, static_cast<i32>(fi + 1u));
+                }
+                if (block.insts[ii].op == rir::Opcode::RetForward ||
+                    block.insts[ii].op == rir::Opcode::RetForwardBundle)
+                    saw_forward_opcode[fi] = true;
             }
-            if (block.insts[ii].op == rir::Opcode::RetForward ||
-                block.insts[ii].op == rir::Opcode::RetForwardBundle)
-                saw_forward_opcode = true;
         }
     }
-    REQUIRE(saw_transform_opcode);
-    REQUIRE(saw_forward_opcode);
+    for (u32 fi = 0; fi < 2u; fi++) {
+        REQUIRE(saw_transform_opcode[fi]);
+        REQUIRE(saw_forward_opcode[fi]);
+    }
     const uintptr_t owned_begin =
         reinterpret_cast<uintptr_t>(program.config.target_transform_bytes);
     const uintptr_t owned_end = owned_begin + program.config.target_transform_bytes_used;
     const uintptr_t replace_begin = reinterpret_cast<uintptr_t>(owned_transform.replace_prefix.ptr);
     CHECK_GE(replace_begin, owned_begin);
     CHECK_LE(replace_begin + owned_transform.replace_prefix.len, owned_end);
+    const uintptr_t fixed_replace_begin =
+        reinterpret_cast<uintptr_t>(fixed_owned_transform.replace_prefix.ptr);
+    CHECK_GE(fixed_replace_begin, owned_begin);
+    CHECK_LE(fixed_replace_begin + fixed_owned_transform.replace_prefix.len, owned_end);
 
     // load_rut_program's AST/HIR/MIR owners have already gone out of scope.
     // Remove every remaining source/compiler byte before the first connection;
@@ -21819,7 +21890,9 @@ route GET "/api" {
     program.src_map_len = 0;
     CHECK_EQ(program.rir.module.func_count, 0u);
     REQUIRE(program.config.target_transforms[0].strip_prefix.eq({"/api/", 5}));
-    REQUIRE(program.config.target_transforms[0].replace_prefix.eq({"/v1/?fixed=1", 12}));
+    REQUIRE(program.config.target_transforms[0].replace_prefix.eq({"/v1/?", 5}));
+    REQUIRE(program.config.target_transforms[1].strip_prefix.eq({"/fixed/", 7}));
+    REQUIRE(program.config.target_transforms[1].replace_prefix.eq({"/v1/?fixed=1", 12}));
 
     Shard<IoUringEventLoop> shard;
     ListenerContext listener_context{};
@@ -21861,16 +21934,24 @@ route GET "/api" {
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
     const char* const client_requests[] = {kStaticQueryClientRequestOne,
-                                           kStaticQueryClientRequestTwo};
+                                           kStaticQueryClientRequestTwo,
+                                           kStaticQueryClientRequestThree,
+                                           kStaticQueryClientRequestFour,
+                                           kStaticQueryClientRequestFive,
+                                           kStaticQueryClientRequestSix};
     const u32 client_request_lengths[] = {sizeof(kStaticQueryClientRequestOne) - 1u,
-                                          sizeof(kStaticQueryClientRequestTwo) - 1u};
+                                          sizeof(kStaticQueryClientRequestTwo) - 1u,
+                                          sizeof(kStaticQueryClientRequestThree) - 1u,
+                                          sizeof(kStaticQueryClientRequestFour) - 1u,
+                                          sizeof(kStaticQueryClientRequestFive) - 1u,
+                                          sizeof(kStaticQueryClientRequestSix) - 1u};
     struct ClientGuard {
         i32 fd = -1;
         ~ClientGuard() {
             if (fd >= 0) close(fd);
         }
     };
-    for (u32 i = 0; i < 2; i++) {
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++) {
         ClientGuard client{connect_to(port)};
         REQUIRE_GE(client.fd, 0);
         set_socket_timeouts(client.fd, 5);
@@ -21902,8 +21983,10 @@ route GET "/api" {
 
     bool live_quiet = true;
     for (u32 sample = 0; sample < 100; sample++) {
-        live_quiet &= backend.accepted_count.load(std::memory_order_acquire) == 2u;
-        live_quiet &= backend.request_count.load(std::memory_order_acquire) == 2u;
+        live_quiet &=
+            backend.accepted_count.load(std::memory_order_acquire) == kStaticQueryVectorCount;
+        live_quiet &=
+            backend.request_count.load(std::memory_order_acquire) == kStaticQueryVectorCount;
         live_quiet &= backend.running.load(std::memory_order_acquire);
         live_quiet &= backend.thread_alive.load(std::memory_order_acquire);
         live_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
@@ -21927,13 +22010,13 @@ route GET "/api" {
     CHECK_EQ(shard.loop->pool.in_use(), 0u);
     CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
-    CHECK_EQ(shard.shard_metrics.connections_total, 2u);
+    CHECK_EQ(shard.shard_metrics.connections_total, kStaticQueryVectorCount);
     CHECK_EQ(shard.shard_metrics.connections_active, 0u);
-    CHECK_EQ(shard.shard_metrics.connections_closed, 2u);
-    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, kStaticQueryVectorCount);
+    CHECK_EQ(shard.shard_metrics.requests_total, kStaticQueryVectorCount);
     CHECK_EQ(shard.shard_metrics.requests_active, 0u);
-    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
-    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 4u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, kStaticQueryVectorCount);
+    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), kStaticQueryVectorCount * 2u);
 
     bool all_connections_settled = true;
     for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
@@ -21951,8 +22034,8 @@ route GET "/api" {
     StaticQueryTransformEvidence evidence{};
     evidence.accepted_count = backend.accepted_count.load(std::memory_order_acquire);
     evidence.request_count = backend.request_count.load(std::memory_order_acquire);
-    REQUIRE_EQ(shard.log_ring->available(), 2u);
-    for (u32 i = 0; i < 2; i++) {
+    REQUIRE_EQ(shard.log_ring->available(), kStaticQueryVectorCount);
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++) {
         REQUIRE(shard.log_ring->pop(evidence.access[i]));
         evidence.access_count++;
         REQUIRE_LE(backend.request_history_len[i], sizeof(evidence.requests[i]));
@@ -21968,23 +22051,27 @@ route GET "/api" {
         evidence.response_close_ns[i] =
             backend.response_connection_closed_ns[i].load(std::memory_order_acquire);
     }
-    evidence.request_lengths[2] = backend.request_history_len[2];
-    evidence.request_header_lengths[2] = backend.request_history_header_len[2];
-    evidence.response_write_counts[2] =
-        backend.response_application_write_count[2].load(std::memory_order_acquire);
-    evidence.request_recorded_ns[2] =
-        backend.request_recorded_ns[2].load(std::memory_order_acquire);
-    evidence.response_write_ns[2] =
-        backend.response_last_application_write_completed_ns[2].load(std::memory_order_acquire);
-    evidence.response_close_ns[2] =
-        backend.response_connection_closed_ns[2].load(std::memory_order_acquire);
-    memcpy(evidence.requests[2], backend.request_history[2], sizeof(evidence.requests[2]));
+    const u32 sentinel = kStaticQueryVectorCount;
+    evidence.request_lengths[sentinel] = backend.request_history_len[sentinel];
+    evidence.request_header_lengths[sentinel] = backend.request_history_header_len[sentinel];
+    evidence.response_write_counts[sentinel] =
+        backend.response_application_write_count[sentinel].load(std::memory_order_acquire);
+    evidence.request_recorded_ns[sentinel] =
+        backend.request_recorded_ns[sentinel].load(std::memory_order_acquire);
+    evidence.response_write_ns[sentinel] =
+        backend.response_last_application_write_completed_ns[sentinel].load(
+            std::memory_order_acquire);
+    evidence.response_close_ns[sentinel] =
+        backend.response_connection_closed_ns[sentinel].load(std::memory_order_acquire);
+    memcpy(evidence.requests[sentinel],
+           backend.request_history[sentinel],
+           sizeof(evidence.requests[sentinel]));
     AccessLogEntry no_access{};
     CHECK_FALSE(shard.log_ring->pop(no_access));
     REQUIRE(validate_static_query_transform_evidence(evidence, backend.port));
 
-    REQUIRE_EQ(capture_ring->available(), 2u);
-    for (u32 i = 0; i < 2; i++) {
+    REQUIRE_EQ(capture_ring->available(), kStaticQueryVectorCount);
+    for (u32 i = 0; i < kStaticQueryVectorCount; i++) {
         CaptureEntry capture{};
         REQUIRE(capture_ring->pop(capture));
         CHECK_EQ(capture.resp_status, 201u);
@@ -21999,7 +22086,8 @@ route GET "/api" {
     CHECK_FALSE(capture_ring->pop(no_capture));
     CHECK_EQ(shard.route_config, &program.config);
     CHECK_EQ(shard.active_config, &program.config);
-    CHECK(program.config.target_transforms[0].replace_prefix.eq({"/v1/?fixed=1", 12}));
+    CHECK(program.config.target_transforms[0].replace_prefix.eq({"/v1/?", 5}));
+    CHECK(program.config.target_transforms[1].replace_prefix.eq({"/v1/?fixed=1", 12}));
 }
 
 static constexpr char kPublicAccessTargetKey62[] =
