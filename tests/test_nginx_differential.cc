@@ -334,6 +334,14 @@ static constexpr char kRequestLengthOracleClientRequest[] =
     "Connection: close\r\n"
     "X-Test: keep\r\n"
     "\r\n";
+static constexpr char kRequestLengthSplitHeaderFirstSend[] =
+    "GET /ledger?q=raw HTTP/1.1\r\n"
+    "Host: client.exam";
+static constexpr char kRequestLengthSplitHeaderSecondSend[] =
+    "ple.with.a.long.name\r\n"
+    "Connection: close\r\n"
+    "X-Test: keep\r\n"
+    "\r\n";
 static constexpr char kRequestLengthFixedBodyClientHeader[] =
     "POST /ledger?q=raw HTTP/1.1\r\n"
     "Host: client.example.with.a.long.name\r\n"
@@ -382,6 +390,11 @@ static constexpr char kSuccessResponseNormalized[] =
 static_assert(sizeof(kBackendResponse) - 1u == 107u);
 static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u == 102u);
 static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u != 66u);
+static_assert(sizeof(kRequestLengthSplitHeaderFirstSend) - 1u == 45u);
+static_assert(sizeof(kRequestLengthSplitHeaderSecondSend) - 1u == 57u);
+static_assert(sizeof(kRequestLengthSplitHeaderFirstSend) - 1u +
+                  sizeof(kRequestLengthSplitHeaderSecondSend) - 1u ==
+              102u);
 static_assert(sizeof(kRequestLengthFixedBodyClientHeader) - 1u == 123u);
 static_assert(sizeof(kRequestLengthFixedBody) - 1u == 12u);
 static_assert(sizeof(kRequestLengthFixedBodyFirstSend) - 1u == 128u);
@@ -45555,6 +45568,147 @@ static bool run_request_length_oracle_self_checks(std::string& error) {
     return true;
 }
 
+static bool validate_request_length_split_header(const std::string& first,
+                                                 const std::string& second,
+                                                 std::chrono::milliseconds quiet_elapsed,
+                                                 bool nginx_live,
+                                                 bool recorder_live,
+                                                 u32 accepted,
+                                                 u32 requests,
+                                                 u32 response_sends,
+                                                 bool access_quiet,
+                                                 bool client_quiet,
+                                                 std::string& error) {
+    const std::string exact_first(kRequestLengthSplitHeaderFirstSend);
+    const std::string exact_second(kRequestLengthSplitHeaderSecondSend);
+    const std::string combined = first + second;
+    const std::vector<char> first_bytes(first.begin(), first.end());
+    const std::vector<char> combined_bytes(combined.begin(), combined.end());
+    if (first.empty() || second.empty() || first != exact_first || second != exact_second ||
+        first.size() != 45u || second.size() != 57u ||
+        first.find("\r\n\r\n") != std::string::npos || header_end(first_bytes) != 0u ||
+        first.rfind("client.exam") != first.size() - strlen("client.exam") ||
+        second.rfind("ple.with.a.long.name\r\n", 0u) != 0u ||
+        combined != kRequestLengthOracleClientRequest || combined.size() != 102u ||
+        header_end(combined_bytes) != combined.size() ||
+        quiet_elapsed < std::chrono::milliseconds(500) || !nginx_live || !recorder_live ||
+        accepted != 0u || requests != 0u || response_sends != 0u || !access_quiet ||
+        !client_quiet) {
+        error = "#370 split escaped exact 45/57 incomplete-header bytes or quiet witnesses";
+        return false;
+    }
+    return true;
+}
+
+static bool run_request_length_split_header_self_checks(std::string& error) {
+    const std::string first(kRequestLengthSplitHeaderFirstSend);
+    const std::string second(kRequestLengthSplitHeaderSecondSend);
+    const std::string combined = first + second;
+    if (!validate_request_length_split_header(first,
+                                              second,
+                                              std::chrono::milliseconds(500),
+                                              true,
+                                              true,
+                                              0u,
+                                              0u,
+                                              0u,
+                                              true,
+                                              true,
+                                              error))
+        return false;
+
+    std::vector<std::pair<std::string, std::string>> mutations = {
+        {combined.substr(0u, 44u), combined.substr(44u)},  // 44/58
+        {combined.substr(0u, 46u), combined.substr(46u)},  // 46/56
+        {combined.substr(0u, 67u), combined.substr(67u)},  // complete Host-line boundary
+        {second, first},
+        {first + second.substr(0u, 1u), second},  // overlap
+        {first, second.substr(1u)},               // omission
+        {first, second + second},                 // duplicate suffix
+        {first, second + "x"},                    // extra byte
+        {first, second + "GET /successor HTTP/1.1\r\nHost: successor\r\n\r\n"},
+        {first, ""},     // empty suffix
+        {combined, ""},  // complete prefix
+        {combined, second},
+        {first.substr(0u, 41u) + "\r\n\r\n", second},  // prefix terminator
+    };
+    std::string changed_first = first;
+    changed_first[0] = 'P';
+    mutations.push_back({changed_first, second});
+    std::string changed_second = second;
+    changed_second[0] = 'X';
+    mutations.push_back({first, changed_second});
+    for (const auto& mutation : mutations) {
+        std::string detail;
+        if (validate_request_length_split_header(mutation.first,
+                                                 mutation.second,
+                                                 std::chrono::milliseconds(500),
+                                                 true,
+                                                 true,
+                                                 0u,
+                                                 0u,
+                                                 0u,
+                                                 true,
+                                                 true,
+                                                 detail)) {
+            error = "#370 split self-check accepted a boundary/order/byte mutation";
+            return false;
+        }
+    }
+
+    struct QuietEvidence {
+        bool nginx_live;
+        bool recorder_live;
+        u32 accepted;
+        u32 requests;
+        u32 sends;
+        bool access_quiet;
+        bool client_quiet;
+    };
+    const QuietEvidence invalid_evidence[] = {
+        {false, true, 0u, 0u, 0u, true, true},
+        {true, false, 0u, 0u, 0u, true, true},
+        {true, true, 1u, 0u, 0u, true, true},
+        {true, true, 0u, 1u, 0u, true, true},
+        {true, true, 0u, 0u, 1u, true, true},
+        {true, true, 0u, 0u, 0u, false, true},
+        {true, true, 0u, 0u, 0u, true, false},
+    };
+    for (const auto& evidence : invalid_evidence) {
+        std::string detail;
+        if (validate_request_length_split_header(first,
+                                                 second,
+                                                 std::chrono::milliseconds(500),
+                                                 evidence.nginx_live,
+                                                 evidence.recorder_live,
+                                                 evidence.accepted,
+                                                 evidence.requests,
+                                                 evidence.sends,
+                                                 evidence.access_quiet,
+                                                 evidence.client_quiet,
+                                                 detail)) {
+            error = "#370 split self-check accepted a false final quiet witness";
+            return false;
+        }
+    }
+    std::string detail;
+    if (validate_request_length_split_header(first,
+                                             second,
+                                             std::chrono::milliseconds(499),
+                                             true,
+                                             true,
+                                             0u,
+                                             0u,
+                                             0u,
+                                             true,
+                                             true,
+                                             detail)) {
+        error = "#370 split self-check accepted a shortened quiet window";
+        return false;
+    }
+    return true;
+}
+
 static bool run_pinned_request_length_oracle(TempDir& temp,
                                              const std::string& container_name,
                                              std::string& error) {
@@ -45757,6 +45911,268 @@ static bool run_pinned_request_length_oracle(TempDir& temp,
     for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
         if (log_contains(temp.nginx_log, severity)) {
             error = "#362 nginx emitted warn-or-higher diagnostics";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_pinned_request_length_split_header_oracle(TempDir& temp,
+                                                          const std::string& container_name,
+                                                          std::string& error) {
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve(0u, frontend_port) ||
+        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port ||
+        !validate_held_loopback_port(
+            reservations.fds[0], frontend_port, "#370 frontend handoff", error) ||
+        !validate_held_loopback_port(
+            reservations.fds[1], backend_port, "#370 backend handoff", error)) {
+        if (error.empty()) error = "#370 could not hold distinct frontend/P4 backend ports";
+        return false;
+    }
+
+    const std::string config =
+        make_request_length_oracle_config(frontend_port, backend_port, temp.nginx_access_log);
+    if (!validate_request_length_oracle_config(
+            config, frontend_port, backend_port, temp.nginx_access_log, error) ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        if (error.empty()) error = "#370 could not persist the exact #362 nginx config";
+        return false;
+    }
+
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.wait_response_peer_close = true;
+    backend.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#370 Recorder bind", error) ||
+        !backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        if (error.empty()) error = "#370 Recorder could not bind the held P4 backend port";
+        return false;
+    }
+    const auto recorder_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!backend.running.load(std::memory_order_acquire) ||
+            !backend.thread_alive.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < recorder_ready_deadline) {
+        if (backend.listener_failed.load(std::memory_order_acquire)) break;
+        usleep(1000);
+    }
+    if (!backend.running.load(std::memory_order_acquire) ||
+        !backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire)) {
+        error = "#370 Recorder was not live before frontend handoff";
+        return false;
+    }
+
+    ChildGuard nginx;
+    DockerGuard docker(container_name);
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#370 pinned nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = "#370 pinned nginx failed before readiness";
+        return false;
+    }
+    const auto nginx_live = [&]() { return !poll_child(nginx.child); };
+    const auto recorder_live = [&]() {
+        return backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto exact_atomic_counts = [&](u32 expected) {
+        return backend.accepted.load(std::memory_order_acquire) == expected &&
+               backend.requests.load(std::memory_order_acquire) == expected &&
+               backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
+    };
+    const auto pre_request_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < pre_request_deadline) {
+        std::string access;
+        if (!nginx_live() || !recorder_live() || !exact_atomic_counts(0u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty()) {
+            if (error.empty()) error = "#370 pre-request state was not live and quiet";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kRequestLengthSplitHeaderFirstSend,
+                                   sizeof(kRequestLengthSplitHeaderFirstSend) - 1u)) {
+        error = "#370 client connect or exact 45-byte first application send failed";
+        return false;
+    }
+    const auto quiet_started = std::chrono::steady_clock::now();
+    const auto quiet_deadline = quiet_started + std::chrono::milliseconds(500);
+    for (;;) {
+        std::string access;
+        if (!nginx_live() || !recorder_live() || !exact_atomic_counts(0u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty() || !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
+            if (error.empty())
+                error = "#370 incomplete-header process/backend/access/client state was not quiet";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= quiet_deadline) break;
+    }
+
+    // The final causal snapshot is deliberately ordered access, nonblocking
+    // client peek, then process/Recorder atomics last. No Recorder containers
+    // are read until its thread is joined below.
+    std::string final_quiet_access_bytes;
+    const bool final_access_quiet =
+        read_request_length_access_file(temp.nginx_access_log, final_quiet_access_bytes, error) &&
+        final_quiet_access_bytes.empty();
+    const bool final_client_quiet = observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
+    const bool final_nginx_live = nginx_live();
+    const bool final_recorder_live = recorder_live();
+    const u32 final_accepted = backend.accepted.load(std::memory_order_acquire);
+    const u32 final_requests = backend.requests.load(std::memory_order_acquire);
+    const u32 final_response_sends =
+        backend.response_send_all_calls.load(std::memory_order_acquire);
+    const auto quiet_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - quiet_started);
+    if (!validate_request_length_split_header(kRequestLengthSplitHeaderFirstSend,
+                                              kRequestLengthSplitHeaderSecondSend,
+                                              quiet_elapsed,
+                                              final_nginx_live,
+                                              final_recorder_live,
+                                              final_accepted,
+                                              final_requests,
+                                              final_response_sends,
+                                              final_access_quiet,
+                                              final_client_quiet,
+                                              error) ||
+        !send_all(client.fd,
+                  kRequestLengthSplitHeaderSecondSend,
+                  sizeof(kRequestLengthSplitHeaderSecondSend) - 1u)) {
+        if (error.empty()) error = "#370 exact 57-byte suffix application send failed";
+        return false;
+    }
+
+    std::vector<char> response;
+    if (!read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+        !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
+        if (error.empty()) error = "#370 exact response/EOF episode failed";
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+    if (!wait_for_live_complete_origin_episode(backend, nginx.child, "#370 pinned nginx", error))
+        return false;
+    const u64 response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+    const u64 response_peer_closed_ns =
+        backend.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (!nginx_live() || !recorder_live() || !exact_atomic_counts(1u) || response_sent_ns == 0u ||
+        !backend.response_peer_closed.load(std::memory_order_acquire) ||
+        response_peer_closed_ns < response_sent_ns ||
+        response_peer_closed_ns - response_sent_ns > 2'000'000'000ull ||
+        backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        backend.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        error = "#370 origin lacked prompt post-send peer-close/no-late-byte evidence";
+        return false;
+    }
+
+    static constexpr char kExpectedAccess[] = "102\n";
+    static_assert(sizeof(kExpectedAccess) - 1u == 4u);
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access;
+        if (!nginx_live() || !recorder_live() || !exact_atomic_counts(1u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error)) {
+            if (error.empty()) error = "#370 failed while awaiting live access publication";
+            return false;
+        }
+        if (access.size() > sizeof(kExpectedAccess) - 1u ||
+            memcmp(kExpectedAccess, access.data(), access.size()) != 0) {
+            error = "#370 live access bytes were not a prefix of exact downstream value 102";
+            return false;
+        }
+        if (access.size() == sizeof(kExpectedAccess) - 1u) break;
+        if (std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#370 live access record did not become visible before shutdown";
+            return false;
+        }
+        usleep(1000);
+    }
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        std::string access;
+        const u64 stable_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+        const u64 stable_closed_ns =
+            backend.response_peer_closed_ns.load(std::memory_order_acquire);
+        if (!nginx_live() || !recorder_live() || !exact_atomic_counts(1u) ||
+            stable_sent_ns != response_sent_ns || stable_closed_ns != response_peer_closed_ns ||
+            !backend.response_peer_closed.load(std::memory_order_acquire) ||
+            backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !validate_request_length_access_bytes(access, error)) {
+            if (error.empty()) error = "#370 live completion/access evidence was not stable";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    if (!stop_child(nginx.child) || !docker.remove()) {
+        error = "#370 pinned nginx did not stop and remove cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    const std::string expected_upstream =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Test: keep\r\n\r\n";
+    const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
+    std::string final_access;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u ||
+        backend.request != expected_wire || backend.history[0] != expected_wire ||
+        expected_upstream.size() != 66u ||
+        sizeof(kRequestLengthOracleClientRequest) - 1u == expected_upstream.size() ||
+        !backend.response_peer_closed.load(std::memory_order_acquire) ||
+        backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
+        !validate_request_length_access_bytes(final_access, error)) {
+        if (error.empty()) error = "#370 final Recorder/upstream/access evidence was not exact";
+        return false;
+    }
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (log_contains(temp.nginx_log, severity)) {
+            error = "#370 nginx emitted warn-or-higher diagnostics";
             return false;
         }
     }
@@ -47014,6 +47430,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-listen-oracle") == 0;
     const bool request_length_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-oracle") == 0;
+    const bool request_length_split_header_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-split-header-oracle") == 0;
     const bool request_length_fixed_body_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-fixed-body-oracle") == 0;
     const bool request_length_split_fixed_body_oracle =
@@ -47179,8 +47597,8 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
-         !converter_request_length_differential &&
+         !request_length_split_header_oracle && !request_length_fixed_body_oracle &&
+         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -47318,6 +47736,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-exact-loopback-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-request-length-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-request-length-split-header-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-request-length-fixed-body-oracle\n"
                      "   or: test_nginx_differential "
@@ -47500,10 +47920,17 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
-    if (request_length_oracle || converter_request_length_differential) {
+    if (request_length_oracle || request_length_split_header_oracle ||
+        converter_request_length_differential) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+        if (request_length_split_header_oracle &&
+            !run_request_length_split_header_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#370 split-header request-length self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
@@ -48185,6 +48612,33 @@ int main(int argc, char** argv) {
                      "remains live; the record and one no-retry backend episode remain stable for "
                      "500ms and exact after clean shutdown (#362 Stage 1 nginx-only semantics; no "
                      "parser, converter, generated-RUT, or behavior-equivalence claim)\n";
+        return 0;
+    }
+    if (request_length_split_header_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-370-request-length-split-header-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string oracle_error;
+        if (!run_pinned_request_length_split_header_oracle(temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#370 pinned nginx split-header request-length oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#370 exact nginx config");
+            dump_log(temp.nginx_access_log, "#370 nginx access log");
+            dump_log(temp.nginx_log, "#370 nginx error/process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #370 pinned nginx 1.29.7 proves the unchanged closed #362 exact 102-byte "
+               "bodyless explicit-close H1.1 GET, delivered by two application send_all calls "
+               "of a 45-byte incomplete-header prefix ending at `client.exam` and a 57-byte "
+               "suffix beginning `ple.with.a.long.name`, remains live and backend/access/client "
+               "quiet for at least 500ms before the suffix, then rebuilds to one exact 66-byte "
+               "Host-rewritten upstream request, returns the exact Date-normalized 118-byte "
+               "response/EOF, promptly closes the origin with no late bytes, and publishes "
+               "exactly `102\\n` live and after clean shutdown (#370 Stage 1 pinned-nginx-only "
+               "application-send semantics; no TCP/read boundary, generated-RUT, arbitrary-"
+               "split, aborted-request, retry, or reuse claim)\n";
         return 0;
     }
     if (request_length_fixed_body_oracle) {
