@@ -27187,6 +27187,191 @@ void prepare_recv_only_retirement(Connection& conn, u32 episode) {
 void drain_strict_recv_retirement(IoUringEventLoop* loop,
                                   Connection& conn,
                                   u32 episode,
+                                  bool cancel_first);
+
+TEST(iouring_retirement, strict_clean_success_callbacks_retire_live_recv_before_close) {
+    for (const bool streaming : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop->alloc_upstream_buf(*conn));
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        const u32 episode = streaming ? 503u : 501u;
+        i32 downstream[2] = {-1, -1};
+        i32 upstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, upstream), 0);
+        conn->fd = downstream[0];
+        conn->upstream_fd = upstream[0];
+        conn->upstream_episode = episode;
+        conn->upstream_recv_armed = true;
+        conn->pending_ops = 1;
+        conn->response_policy_id = 1;
+        conn->upstream_keep_alive = true;  // mutation guard: strict success must not pool
+        conn->keep_alive = false;
+        conn->resp_status = 200;
+        conn->resp_body_mode = BodyMode::ContentLength;
+        conn->resp_body_remaining = 0;
+        conn->resp_body_sent = streaming ? 118u : 116u;
+        conn->state = ConnState::Sending;
+        if (streaming) {
+            static constexpr u8 kFinalBody[] = {'o', 'k'};
+            REQUIRE_EQ(conn->upstream_recv_buf.write(kFinalBody, sizeof(kFinalBody)),
+                       sizeof(kFinalBody));
+            conn->upstream_send_len = sizeof(kFinalBody);
+            conn->set_slots(nullptr,
+                            &on_response_body_sent<IoUringEventLoop>,
+                            &on_response_body_recvd<IoUringEventLoop>,
+                            nullptr);
+        } else {
+            conn->set_slots(nullptr, &on_proxy_response_sent<IoUringEventLoop>, nullptr, nullptr);
+        }
+        const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 backend_pending_before = loop->backend.pending;
+
+        if (streaming)
+            on_response_body_sent<IoUringEventLoop>(
+                loop, *conn, {id, 2, 0, 0, IoEventType::Send, 0});
+        else
+            on_proxy_response_sent<IoUringEventLoop>(
+                loop, *conn, {id, 1, 0, 0, IoEventType::Send, 0});
+
+        Connection& retired = loop->conns[id];
+        CHECK_EQ(retired.fd, -1);
+        CHECK_EQ(retired.upstream_fd, -1);
+        CHECK_EQ(retired.upstream_retiring_episode, episode);
+        CHECK(retired.upstream_retirement_active);
+        CHECK_EQ(retired.upstream_retirement_target_owned, kUpstreamOpRecv);
+        CHECK_EQ(retired.upstream_retirement_cancel_owned, kUpstreamOpRecv);
+        CHECK_EQ(retired.upstream_retirement_cancel_retry, 0u);
+        CHECK_EQ(retired.pending_ops, 2u);
+        CHECK_EQ(retired.idle_return_fd, -1);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        CHECK_EQ(loop->free_top, free_before);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before + 1u);
+        UpstreamEventToken cancel_token{};
+        REQUIRE(decode_upstream_event_token(
+            loop->backend.sq_entries[sq_tail_before & *loop->backend.sq_ring_mask].user_data,
+            &cancel_token));
+        CHECK_EQ(cancel_token.conn_id, id);
+        CHECK_EQ(cancel_token.type, IoEventType::UpstreamRecv);
+        CHECK_EQ(cancel_token.episode, episode);
+        CHECK_EQ(cancel_token.aux, kUpstreamRetirementCancelAux);
+        u8 byte = 0;
+        CHECK_EQ(recv(upstream[1], &byte, 1, MSG_DONTWAIT), 0);
+
+        __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = backend_pending_before;
+        drain_strict_recv_retirement(loop, retired, episode, streaming);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        close(downstream[1]);
+        close(upstream[1]);
+    }
+}
+
+TEST(iouring_retirement, clean_success_accepts_only_exact_active_or_terminal_retirement) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+
+    Connection* active = loop->alloc_conn();
+    REQUIRE(active != nullptr);
+    constexpr u32 kActiveEpisode = 511;
+    active->upstream_episode = kActiveEpisode;
+    active->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(active->upstream_fd, 0);
+    active->upstream_recv_armed = true;
+    active->pending_ops = 1;
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    REQUIRE(loop->begin_strict_upstream_retirement(*active));
+    close(active->upstream_fd);
+    active->upstream_fd = -1;
+    active->upstream_recv_armed = false;
+    active->upstream_abandoned = true;
+    active->clear_slots();
+    const u32 sq_tail_after_begin = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    REQUIRE(loop->prepare_clean_strict_upstream_retirement(*active));
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_after_begin);
+    CHECK_EQ(active->upstream_retiring_episode, kActiveEpisode);
+    CHECK(active->upstream_retirement_active);
+
+    // Complete-content-length response-deadline retirement can observe another
+    // F_MORE record after ownership moved to the retirement ledger. The backend
+    // marker is then armed again while the exact recv target/cancel owners remain
+    // authoritative; clean completion must accept it and the subsequent generic
+    // detach clears the marker before any downstream boundary is admitted.
+    active->upstream_recv_armed = true;
+    REQUIRE(loop->prepare_clean_strict_upstream_retirement(*active));
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_after_begin);
+    active->upstream_recv_armed = false;
+
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    drain_strict_recv_retirement(loop, *active, kActiveEpisode, false);
+    REQUIRE_FALSE(active->upstream_retirement_active);
+    REQUIRE(loop->prepare_clean_strict_upstream_retirement(*active));
+    CHECK_EQ(active->upstream_retiring_episode, kActiveEpisode);
+
+    Connection* malformed = loop->alloc_conn();
+    REQUIRE(malformed != nullptr);
+    malformed->upstream_fd = -1;
+    malformed->upstream_episode = 522;
+    malformed->upstream_retiring_episode = 521;
+    malformed->upstream_abandoned = true;
+    malformed->upstream_retirement_active = true;  // no owner: impossible active state
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    malformed->upstream_retirement_active = false;
+    malformed->upstream_retirement_target_owned = kUpstreamOpSend;  // not recv-only
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    malformed->upstream_retirement_target_owned = 0;
+
+    const auto prepare_closed_terminal = [&](u32 retiring, u32 current, bool quarantined) {
+        malformed->upstream_retiring_episode = retiring;
+        malformed->upstream_episode = current;
+        malformed->upstream_episode_quarantined = quarantined;
+        malformed->upstream_retirement_active = false;
+        malformed->upstream_retirement_target_owned = 0;
+        malformed->upstream_retirement_cancel_owned = 0;
+        malformed->upstream_retirement_cancel_retry = 0;
+        malformed->pending_ops = 0;
+    };
+    prepare_closed_terminal(521, 522, false);
+    malformed->upstream_retirement_active = true;
+    malformed->upstream_retirement_cancel_retry = kUpstreamOpRecv;
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+
+    prepare_closed_terminal(521, 520, false);  // reversed history
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    prepare_closed_terminal(521, 523, false);  // skipped successor
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    prepare_closed_terminal(521, 522, false);
+    malformed->upstream_recv_armed = true;  // no retired recv target owns this marker
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    malformed->upstream_recv_armed = false;
+    prepare_closed_terminal(kIoUserDataMaxUpstreamEpisode - 1u,
+                            kInvalidUpstreamEventEpisode,
+                            true);  // only max may quarantine
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    prepare_closed_terminal(
+        kIoUserDataMaxUpstreamEpisode, kInvalidUpstreamEventEpisode, false);  // missing quarantine
+    CHECK_FALSE(loop->prepare_clean_strict_upstream_retirement(*malformed));
+    prepare_closed_terminal(kIoUserDataMaxUpstreamEpisode,
+                            kInvalidUpstreamEventEpisode,
+                            true);  // exact exhausted successor tombstone
+    CHECK(loop->prepare_clean_strict_upstream_retirement(*malformed));
+
+    loop->free_conn(*malformed);
+    loop->free_conn(*active);
+}
+
+void drain_strict_recv_retirement(IoUringEventLoop* loop,
+                                  Connection& conn,
+                                  u32 episode,
                                   bool cancel_first) {
     const IoEvent target{conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
     const IoEvent cancel{conn.id,

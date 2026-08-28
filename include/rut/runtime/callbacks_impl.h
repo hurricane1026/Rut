@@ -1382,6 +1382,9 @@ void pipeline_dispatch(Loop* loop, Connection& conn);
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn);
 
+template <typename Loop>
+bool prepare_clean_strict_upstream_retirement(Loop* loop, Connection& conn);
+
 // Client send with @throttle token-bucket accounting. With no per-route throttle
 // (bps == 0) this is just loop->submit_send. Otherwise it advances the
 // connection's virtual-time bucket `throttle_tat_ns` by len × ns_per_byte
@@ -6383,6 +6386,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    if (!prepare_clean_strict_upstream_retirement(loop, conn)) return;
     conn.tls_proxy_stream = false;
     conn.resp_fully_buffered = false;
     conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
@@ -8998,6 +9002,24 @@ inline bool abandon_strict_upstream(Loop* loop, Connection& conn) {
     return true;
 }
 
+template <typename Loop>
+inline bool prepare_clean_strict_upstream_retirement(Loop* loop, Connection& conn) {
+    if (conn.response_policy_id == 0) return true;
+    conn.upstream_keep_alive = false;
+    if constexpr (requires { loop->prepare_clean_strict_upstream_retirement(conn); }) {
+        // Both strict-success completion callbacks have detached their old
+        // callback slots before reaching this point.  Establish exact recv
+        // retirement before release_upstream_conn closes and clears the live
+        // fd; if ownership is not provable, do not admit another downstream
+        // request boundary over ambiguous kernel work.
+        if (!loop->prepare_clean_strict_upstream_retirement(conn)) {
+            loop->close_conn(conn);
+            return false;
+        }
+    }
+    return true;
+}
+
 enum class StrictResponseRejectionCause : u8 {
     Default = 0,
     UpstreamParse,
@@ -9987,6 +10009,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    if (!prepare_clean_strict_upstream_retirement(loop, conn)) return;
 
     // One-shot proxy response complete (header-only / small Content-Length that
     // finished in the first read). Release the backend concurrency slot promptly
@@ -10002,11 +10025,6 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-
-    // Strict response-policy upstreams are intentionally never pooled.  The
-    // downstream HTTP/1.1 connection may remain keep-alive; only the backend
-    // socket is closed by release_upstream_conn below.
-    if (conn.response_policy_id != 0) conn.upstream_keep_alive = false;
 
     // Surplus upstream bytes beyond the one-shot response we sent
     // (upstream_send_len) mean a desynced stream — refuse reuse, mirroring

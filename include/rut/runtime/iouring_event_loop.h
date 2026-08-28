@@ -1275,6 +1275,49 @@ public:
         return begin_upstream_retirement_impl(c, selected, true, false);
     }
 
+    // Strict clean success uses the same exact-episode recv retirement as a
+    // strict rejection.  Most callers arrive with a live fd and establish the
+    // retirement here.  Response-deadline and strict HEAD paths can arrive
+    // after an earlier owner already closed the fd; accept only their complete,
+    // internally consistent recv-only retirement (active or drained
+    // tombstone), never an arbitrary closed upstream.
+    [[nodiscard]] bool prepare_clean_strict_upstream_retirement(Connection& c) {
+        if (c.upstream_fd >= 0) {
+            if (!begin_strict_upstream_retirement(c)) return false;
+            c.upstream_abandoned = true;
+            return true;
+        }
+
+        const u8 recv_only = kUpstreamOpRecv;
+        const u8 target = c.upstream_retirement_target_owned;
+        const u8 cancel = c.upstream_retirement_cancel_owned;
+        const u8 retry = c.upstream_retirement_cancel_retry;
+        const bool has_owner = target != 0 || cancel != 0 || retry != 0;
+        const u32 counted_owners = static_cast<u32>(target != 0) + static_cast<u32>(cancel != 0);
+        const bool exact_normal_successor =
+            !c.upstream_episode_quarantined &&
+            c.upstream_retiring_episode < kIoUserDataMaxUpstreamEpisode &&
+            c.upstream_episode == c.upstream_retiring_episode + 1u;
+        const bool exact_quarantined_successor =
+            c.upstream_episode_quarantined &&
+            c.upstream_retiring_episode == kIoUserDataMaxUpstreamEpisode &&
+            c.upstream_episode == kInvalidUpstreamEventEpisode;
+        return c.upstream_abandoned && valid_upstream_episode(c.upstream_retiring_episode) &&
+               (exact_normal_successor || exact_quarantined_successor) &&
+               c.upstream_retirement_active == has_owner &&
+               (target & static_cast<u8>(~recv_only)) == 0 &&
+               (cancel & static_cast<u8>(~recv_only)) == 0 &&
+               (retry & static_cast<u8>(~recv_only)) == 0 &&
+               (retry & static_cast<u8>(~target)) == 0 && (cancel & retry) == 0 &&
+               c.pending_ops >= counted_owners && !c.upstream_connect_armed &&
+               (!c.upstream_recv_armed || (target & recv_only) != 0) && !c.upstream_send_armed &&
+               c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
+               !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
+               !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
+               c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
+               c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned;
+    }
+
     // Safe retry point: called before backend.wait submits/blocks. A full SQ
     // necessarily has work for wait() to advance; a sticky enter failure stops
     // the shard through the existing explicit fatal path.
