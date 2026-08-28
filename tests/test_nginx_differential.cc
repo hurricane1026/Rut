@@ -806,6 +806,99 @@ static bool allocate_port(u16& port) {
     return false;
 }
 
+struct HeldLoopbackPorts {
+    int fds[8];
+
+    HeldLoopbackPorts() { std::fill(std::begin(fds), std::end(fds), -1); }
+    ~HeldLoopbackPorts() {
+        for (const int fd : fds)
+            if (fd >= 0) close(fd);
+    }
+
+    bool reserve(size_t index, u16& port) {
+        if (index >= std::size(fds) || fds[index] >= 0) return false;
+        const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return false;
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        socklen_t length = sizeof(address);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+            length != sizeof(address) || ntohl(address.sin_addr.s_addr) != 0x7f000001u ||
+            ntohs(address.sin_port) == 0u) {
+            close(fd);
+            return false;
+        }
+        fds[index] = fd;
+        port = ntohs(address.sin_port);
+        return true;
+    }
+};
+
+static bool validate_held_loopback_port(int fd, u16 port, const char* label, std::string& error) {
+    sockaddr_in address{};
+    socklen_t address_length = sizeof(address);
+    int type = 0;
+    socklen_t type_length = sizeof(type);
+    int accepting = -1;
+    socklen_t accepting_length = sizeof(accepting);
+    const int flags = fd >= 0 ? fcntl(fd, F_GETFD) : -1;
+    if (fd < 0 || port == 0u || flags < 0 || (flags & FD_CLOEXEC) == 0 ||
+        getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_length) != 0 ||
+        address_length != sizeof(address) || address.sin_family != AF_INET ||
+        ntohl(address.sin_addr.s_addr) != 0x7f000001u || ntohs(address.sin_port) != port ||
+        getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) != 0 ||
+        type_length != sizeof(type) || type != SOCK_STREAM ||
+        getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_length) != 0 ||
+        accepting_length != sizeof(accepting) || accepting != 0) {
+        error = std::string("#357 invalid live held port before ") + label;
+        return false;
+    }
+    return true;
+}
+
+static bool validate_optional_held_loopback_pair(int* frontend_reservation,
+                                                 u16 frontend_port,
+                                                 int* backend_reservation,
+                                                 u16 backend_port,
+                                                 bool required,
+                                                 const char* label,
+                                                 std::string& error) {
+    if (frontend_reservation == nullptr && backend_reservation == nullptr) {
+        if (!required) return true;
+        error = std::string("#357 missing required held reservation pair before ") + label;
+        return false;
+    }
+    if (frontend_reservation == nullptr || backend_reservation == nullptr) {
+        error = std::string("#357 incomplete held reservation pair before ") + label;
+        return false;
+    }
+    return validate_held_loopback_port(*frontend_reservation, frontend_port, label, error) &&
+           validate_held_loopback_port(*backend_reservation, backend_port, label, error);
+}
+
+static bool handoff_held_loopback_port(int* reservation,
+                                       u16 port,
+                                       const char* label,
+                                       std::string& error) {
+    if (reservation == nullptr) return true;
+    if (!validate_held_loopback_port(*reservation, port, label, error)) return false;
+    const int handed_off = *reservation;
+    if (close(handed_off) != 0) {
+        error = std::string("#357 failed held-port close before ") + label;
+        return false;
+    }
+    *reservation = -1;
+    errno = 0;
+    if (fcntl(handed_off, F_GETFD) != -1 || errno != EBADF || *reservation != -1) {
+        error = std::string("#357 held-port state survived handoff before ") + label;
+        return false;
+    }
+    return true;
+}
+
 static int connect_once(u16 port) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -4884,11 +4977,24 @@ static bool capture_api_redirect_case(u16 frontend_port,
     return true;
 }
 
+struct PublicPolicyOwnershipEvidence {
+    u16 redirect_policy_id = 0u;
+    u16 request_policy_id = 0u;
+    u16 policy_bundle_id = 0u;
+    u16 response_policy_id = 0u;
+    u16 failure_policy_id = 0u;
+    u32 redirect_bytes = 0u;
+    u32 response_bytes = 0u;
+    u32 failure_bytes = 0u;
+};
+
 struct ApiNonRootProxyUriOracleObservation {
+    std::string side;
     std::string order;
     std::string temp_path;
     std::string config_path;
     std::string log_path;
+    std::string access_path;
     std::string process_identity;
     std::string access_scope;
     std::string config;
@@ -4906,6 +5012,9 @@ struct ApiNonRootProxyUriOracleObservation {
     u32 forward_sends = 0;
     bool eof_proven[5]{};
     bool clean_lifecycle = false;
+    bool source_lifetime_proven = false;
+    bool public_policy_ownership_proven = false;
+    PublicPolicyOwnershipEvidence public_policy_ownership;
 };
 
 struct CleanProxyUriOracleProfile {
@@ -5074,12 +5183,23 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
                                               const CleanProxyUriOracleProfile& profile,
                                               ApiNonRootProxyUriOracleObservation& observation,
                                               std::string& error,
-                                              bool listen_first = true) {
+                                              bool listen_first = true,
+                                              int* frontend_reservation = nullptr,
+                                              int* backend_reservation = nullptr) {
+    if (!validate_optional_held_loopback_pair(frontend_reservation,
+                                              frontend_port,
+                                              backend_reservation,
+                                              backend_port,
+                                              false,
+                                              "pinned clean proxy side",
+                                              error))
+        return false;
     observation = ApiNonRootProxyUriOracleObservation{};
     observation.order = listen_first ? "listen-before-location" : "location-before-listen";
     observation.temp_path = temp.path;
     observation.config_path = temp.nginx_config;
     observation.log_path = temp.nginx_log;
+    observation.access_path = temp.nginx_log;
     observation.process_identity = container_name;
     observation.frontend_port = frontend_port;
     observation.backend_port = backend_port;
@@ -5225,14 +5345,19 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
 
     Recorder redirect_recorder;
     redirect_recorder.observe_extra_requests_until_stop = true;
-    if (!redirect_recorder.setup(backend_port)) {
-        error =
-            std::string("failed to start ") + profile.issue + " redirect zero-upstream recorder";
+    if (!handoff_held_loopback_port(
+            backend_reservation, backend_port, "pinned nginx backend recorder bind", error) ||
+        !redirect_recorder.setup(backend_port)) {
+        if (error.empty())
+            error = std::string("failed to start ") + profile.issue +
+                    " redirect zero-upstream recorder";
         return false;
     }
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker",
+    if (!handoff_held_loopback_port(
+            frontend_reservation, frontend_port, "pinned nginx frontend bind", error) ||
+        !spawn_child({"docker",
                       "run",
                       "--pull=never",
                       "--network",
@@ -5247,7 +5372,8 @@ static bool run_pinned_clean_proxy_uri_oracle(u16 frontend_port,
                       "daemon off;"},
                      temp.nginx_log,
                      nginx.child)) {
-        error = std::string("failed to start pinned nginx for ") + profile.issue + " oracle";
+        if (error.empty())
+            error = std::string("failed to start pinned nginx for ") + profile.issue + " oracle";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error) ||
@@ -5429,7 +5555,8 @@ static bool validate_wildcard_service_no_uri_observation(
         observation.frontend_port == 0u || observation.backend_port == 0u ||
         observation.frontend_port == observation.backend_port || observation.temp_path.empty() ||
         observation.config_path.empty() || observation.log_path.empty() ||
-        observation.process_identity.empty() || observation.access_scope.empty() ||
+        observation.access_path != observation.log_path || observation.process_identity.empty() ||
+        observation.access_scope.empty() ||
         observation.config !=
             make_pinned_clean_proxy_uri_config(observation.frontend_port,
                                                observation.backend_port,
@@ -5505,24 +5632,29 @@ static bool validate_wildcard_service_no_uri_pair(
             }
         }
     }
-    const std::string* resources[] = {&observations[0].temp_path,
-                                      &observations[0].config_path,
-                                      &observations[0].log_path,
-                                      &observations[0].process_identity,
-                                      &observations[0].access_scope,
-                                      &observations[1].temp_path,
-                                      &observations[1].config_path,
-                                      &observations[1].log_path,
-                                      &observations[1].process_identity,
-                                      &observations[1].access_scope};
-    for (size_t i = 0u; i < std::size(resources); i++) {
-        for (size_t j = i + 1u; j < std::size(resources); j++) {
-            if (*resources[i] == *resources[j]) {
+    const std::string* resources[2][6];
+    for (size_t side = 0u; side < 2u; side++) {
+        resources[side][0] = &observations[side].temp_path;
+        resources[side][1] = &observations[side].config_path;
+        resources[side][2] = &observations[side].log_path;
+        resources[side][3] = &observations[side].access_path;
+        resources[side][4] = &observations[side].process_identity;
+        resources[side][5] = &observations[side].access_scope;
+        for (size_t i = 0u; i < 6u; i++)
+            for (size_t j = i + 1u; j < 6u; j++) {
+                if (i == 2u && j == 3u) continue;
+                if (*resources[side][i] == *resources[side][j]) {
+                    error = "#357 pinned side aliased unrelated resource identities";
+                    return false;
+                }
+            }
+    }
+    for (const std::string* left : resources[0])
+        for (const std::string* right : resources[1])
+            if (*left == *right) {
                 error = "#357 pair shared a process/temp/config/log/access identity";
                 return false;
             }
-        }
-    }
     return true;
 }
 
@@ -5542,6 +5674,7 @@ static bool run_wildcard_service_no_uri_self_checks(std::string& error) {
         observation.temp_path = "/tmp/rut-nginx-357-side-" + std::to_string(side);
         observation.config_path = observation.temp_path + "/nginx.conf";
         observation.log_path = observation.temp_path + "/nginx.log";
+        observation.access_path = observation.log_path;
         observation.process_identity = "rut-nginx-357-process-" + std::to_string(side);
         observation.access_scope = "rut-nginx-357-access-" + std::to_string(side);
         observation.frontend_port = kPorts[side * 2u];
@@ -5647,6 +5780,14 @@ static bool run_wildcard_service_no_uri_self_checks(std::string& error) {
     pair[1].temp_path = pair[0].temp_path;
     if (validate_wildcard_service_no_uri_pair(pair, detail)) {
         error = "#357 pair validator accepted shared resource identity";
+        return false;
+    }
+    pair[1] = valid[1];
+    pair[1].log_path = pair[0].log_path;
+    pair[1].access_path = pair[1].log_path;
+    if (!validate_wildcard_service_no_uri_observation(pair[1], detail) ||
+        validate_wildcard_service_no_uri_pair(pair, detail)) {
+        error = "#357 pair access/log alias mutation did not isolate cross-side identity";
         return false;
     }
     pair[1] = valid[1];
@@ -16384,14 +16525,123 @@ static bool run_converter_bounded_exact_local_path_differential(
     return true;
 }
 
-static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
-                                               u16 backend_port,
-                                               TempDir& temp,
-                                               const char* rut_path,
-                                               const CleanProxyUriOracleProfile& profile,
-                                               ApiNonRootProxyUriOracleObservation& observation,
-                                               std::string& error) {
+static bool parse_wildcard_service_no_uri_rut_access(
+    const std::string& contents,
+    ApiNonRootProxyUriOracleObservation& observation,
+    std::string& error) {
+    const auto& profile = kWildcardServiceNoUriProxyOracleProfile;
+    static constexpr size_t kOrder[] = {3u, 4u, 0u, 1u, 2u};
+    std::vector<std::string> records;
+    if (!split_exact_complete_log(contents, 5u, "#357 generated RUT access log", records, error) ||
+        observation.wires.size() != 5u || observation.forward_history.size() != 3u) {
+        if (error.empty()) error = "#357 generated access lacked five-vector runtime inventory";
+        return false;
+    }
+    std::vector<std::string> access_order;
+    u32 access_records[5]{};
+    for (size_t record = 0u; record < std::size(kOrder); record++) {
+        const size_t vector = kOrder[record];
+        const bool forwarded = vector < 3u;
+        std::vector<std::string> fields;
+        const size_t request_size = forwarded ? observation.forward_history[vector].size()
+                                              : api_request(profile.targets[vector]).size();
+        if (!split_space_fields(records[record], fields) ||
+            fields.size() != (forwarded ? 11u : 9u)) {
+            error = std::string("#357 generated access ") + (forwarded ? "forwarded" : "local") +
+                    " field count changed";
+            return false;
+        }
+        if (!exact_log_timestamp(fields[0]) || fields[1] != "GET" ||
+            fields[2] != profile.targets[vector]) {
+            error = "#357 generated access record order/target/method/timestamp changed";
+            return false;
+        }
+        if (!decimal_field_equals(fields[3], forwarded ? 200u : 301u)) {
+            error = "#357 generated access status changed";
+            return false;
+        }
+        if (!exact_log_duration(fields[4])) {
+            error = "#357 generated access request duration changed";
+            return false;
+        }
+        if (!decimal_field_equals(fields[5], request_size)) {
+            error = "#357 generated access field-5 request size changed";
+            return false;
+        }
+        if (!decimal_field_equals(fields[6], observation.wires[vector].size())) {
+            error = "#357 generated access response size changed";
+            return false;
+        }
+        if (fields[7] != "127.0.0.1") {
+            error = "#357 generated access client changed";
+            return false;
+        }
+        if (forwarded && (fields[8] != "nginx_upstream" || !exact_log_duration(fields[9]))) {
+            error = "#357 generated access upstream name/duration changed";
+            return false;
+        }
+        if ((forwarded ? fields[10] : fields[8]) != "s=0") {
+            error = "#357 generated access outcome changed";
+            return false;
+        }
+        access_order.push_back(profile.targets[vector]);
+        access_records[vector]++;
+    }
+    observation.access_order = std::move(access_order);
+    std::copy(std::begin(access_records), std::end(access_records), observation.access_records);
+    return true;
+}
+
+static bool run_generated_clean_proxy_uri_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    const CleanProxyUriOracleProfile& profile,
+    ApiNonRootProxyUriOracleObservation& observation,
+    std::string& error,
+    const char* strict_order = nullptr,
+    const std::string* nginx_fragment = nullptr,
+    int* frontend_reservation = nullptr,
+    int* backend_reservation = nullptr,
+    const PublicPolicyOwnershipEvidence* ownership_evidence = nullptr) {
+    const bool strict = strict_order != nullptr;
+    if ((strict && (nginx_fragment == nullptr || ownership_evidence == nullptr)) ||
+        !validate_optional_held_loopback_pair(frontend_reservation,
+                                              frontend_port,
+                                              backend_reservation,
+                                              backend_port,
+                                              strict,
+                                              "generated clean proxy side",
+                                              error)) {
+        if (error.empty())
+            error = "#357 strict generated side omitted input or public ownership evidence";
+        return false;
+    }
     observation = ApiNonRootProxyUriOracleObservation{};
+    if (strict) {
+        observation.side = "converter-generated-rut";
+        observation.order = strict_order;
+        observation.temp_path = temp.path;
+        observation.config_path = temp.source;
+        observation.log_path = temp.rut_log;
+        observation.access_path = temp.rut_access_log;
+        observation.process_identity =
+            std::string(rut_path) + " " + temp.source + " listen:" + std::to_string(frontend_port);
+        observation.access_scope = std::string(profile.access_tag) + "-generated-" + strict_order;
+        observation.config = nginx_fragment == nullptr ? std::string{} : *nginx_fragment;
+        observation.frontend_port = frontend_port;
+        observation.backend_port = backend_port;
+        observation.public_policy_ownership = *ownership_evidence;
+        observation.public_policy_ownership_proven = ownership_evidence->redirect_policy_id != 0u &&
+                                                     ownership_evidence->request_policy_id != 0u &&
+                                                     ownership_evidence->policy_bundle_id != 0u &&
+                                                     ownership_evidence->response_policy_id != 0u &&
+                                                     ownership_evidence->failure_policy_id != 0u &&
+                                                     ownership_evidence->redirect_bytes != 0u &&
+                                                     ownership_evidence->response_bytes != 0u &&
+                                                     ownership_evidence->failure_bytes != 0u;
+    }
     observation.wires.resize(5);
     const auto recorder_live = [](const Recorder& recorder) {
         return recorder.running.load(std::memory_order_acquire) &&
@@ -16449,6 +16699,7 @@ static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
             return false;
         }
         observation.wires[index] = std::move(wire);
+        observation.eof_proven[index] = true;
         return true;
     };
     const auto observe_exact_count =
@@ -16502,22 +16753,67 @@ static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
 
     Recorder redirect_recorder;
     redirect_recorder.observe_extra_requests_until_stop = true;
-    if (!redirect_recorder.setup(backend_port)) {
-        error = std::string("failed to start generated-RUT ") + profile.issue +
-                " redirect zero-upstream recorder";
+    if (!handoff_held_loopback_port(
+            backend_reservation, backend_port, "generated RUT backend recorder bind", error) ||
+        !redirect_recorder.setup(backend_port)) {
+        if (error.empty())
+            error = std::string("failed to start generated-RUT ") + profile.issue +
+                    " redirect zero-upstream recorder";
         return false;
     }
     ChildGuard rut;
-    if (!spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
-                     temp.rut_log,
-                     rut.child)) {
-        error = std::string("failed to start converter-generated ordinary RUT for ") +
-                profile.issue + " differential";
+    const std::vector<std::string> command =
+        strict ? std::vector<std::string>{rut_path,
+                                          temp.source,
+                                          "--shards",
+                                          "1",
+                                          "--no-pin",
+                                          "--drain",
+                                          "0",
+                                          "--access-log",
+                                          temp.rut_access_log}
+               : std::vector<std::string>{
+                     rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"};
+    if (!handoff_held_loopback_port(
+            frontend_reservation, frontend_port, "generated RUT frontend bind", error) ||
+        !spawn_child(command, temp.rut_log, rut.child)) {
+        if (error.empty())
+            error = std::string("failed to start converter-generated ordinary RUT for ") +
+                    profile.issue + " differential";
         return false;
     }
     if (!wait_ready(frontend_port, rut.child, error) ||
         !wait_recorder_live(redirect_recorder, rut.child, "redirect"))
         return false;
+    if (strict) {
+        const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+        const std::string listening =
+            "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+                !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listening.c_str())) &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(rut.child)) {
+                error = "#357 generated RUT exited before public load/io_uring/listen evidence";
+                return false;
+            }
+            usleep(1000);
+        }
+        static constexpr char kDestroyed[] = "destroyed-after-357-public-load\n";
+        std::string readback;
+        if (!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listening.c_str()) ||
+            !write_file(temp.source, kDestroyed, sizeof(kDestroyed) - 1u) ||
+            !read_exact_return204_log(temp.source, "#357 destroyed source", readback, error) ||
+            readback != kDestroyed) {
+            if (error.empty())
+                error = "#357 generated RUT lacked public readiness or owned-source evidence";
+            return false;
+        }
+        observation.source_lifetime_proven = true;
+    }
 
     for (size_t i = 3; i < 5; i++) {
         const std::vector<char> expected = expected_clean_proxy_location_redirect(
@@ -16604,6 +16900,20 @@ static bool run_generated_clean_proxy_uri_side(u16 frontend_port,
         error = std::string("generated-RUT ") + profile.issue +
                 " did not preserve the exact clean proxy upstream request wires";
         return false;
+    }
+    if (strict) {
+        std::string access_contents;
+        std::string runtime_contents;
+        const std::string listener =
+            "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)";
+        if (!read_exact_return204_log(
+                temp.rut_access_log, "#357 generated access", access_contents, error) ||
+            !parse_wildcard_service_no_uri_rut_access(access_contents, observation, error) ||
+            !read_exact_return204_log(
+                temp.rut_log, "#357 generated runtime", runtime_contents, error) ||
+            !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener, error))
+            return false;
+        observation.clean_lifecycle = true;
     }
     return true;
 }
@@ -16825,6 +17135,1323 @@ static bool run_converter_service_root_proxy_uri_differential(
         }
     }
     return true;
+}
+
+static std::string make_wildcard_service_no_uri_fragment(u16 frontend_port,
+                                                         u16 backend_port,
+                                                         bool listen_first) {
+    const std::string listener = "  listen " + std::to_string(frontend_port) + ";\n";
+    const std::string location =
+        "  location /service/ {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n  }\n";
+    return "server {\n" + (listen_first ? listener + location : location + listener) + "}\n";
+}
+
+static bool validate_wildcard_service_no_uri_generated_source(const std::string& source,
+                                                              u16 frontend_port,
+                                                              u16 backend_port,
+                                                              std::string& error) {
+    const auto declarations = [&](const char* keyword) {
+        u32 count = 0u;
+        size_t begin = 0u;
+        while (begin < source.size()) {
+            const size_t end = source.find('\n', begin);
+            const size_t length = (end == std::string::npos ? source.size() : end) - begin;
+            size_t offset = 0u;
+            while (offset < length &&
+                   (source[begin + offset] == ' ' || source[begin + offset] == '\t'))
+                offset++;
+            const size_t keyword_len = strlen(keyword);
+            if (length - offset >= keyword_len &&
+                source.compare(begin + offset, keyword_len, keyword) == 0 &&
+                (length - offset == keyword_len || source[begin + offset + keyword_len] == ' ' ||
+                 source[begin + offset + keyword_len] == '\t'))
+                count++;
+            if (end == std::string::npos) break;
+            begin = end + 1u;
+        }
+        return count;
+    };
+    const std::string listener = "listen :" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kTrace[] =
+        "pre_route TRACE { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n";
+    if (source.rfind(listener, 0u) != 0u || count_text(source, listener) != 1u ||
+        declarations("listen") != 1u || count_text(source, upstream) != 1u ||
+        declarations("upstream") != 1u || declarations("pre_route") != 1u ||
+        count_text(source, "pre_route TRACE") != 1u || count_text(source, kTrace) != 1u ||
+        declarations("route") != 1u || count_text(source, "route \"/service\" {\n") != 1u ||
+        count_text(source, "req.pathOnly == \"/service\"") != 1u ||
+        count_text(source, "return redirect({scheme: \"http\"") != 1u ||
+        count_text(source, "path: \"static\", query: \"preserve_raw\"") != 1u ||
+        count_text(source, "status: 301, reason: \"Moved Permanently\"") != 1u ||
+        count_text(source, "target_path: \"/service/\"") != 1u ||
+        count_text(source, "return forward(nginx_upstream, request_policy: {") != 1u ||
+        count_text(source, "request_policy: {") != 1u ||
+        count_text(source, "host: \"upstream\"") != 1u ||
+        count_text(source, "connection: \"omit\"") != 1u ||
+        count_text(source,
+                   "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                   "\"Upgrade\"]") != 1u ||
+        count_text(source, "response_policy: {") != 1u ||
+        count_text(source, "framing: \"content_length\"") != 1u ||
+        count_text(source, "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]") != 1u ||
+        count_text(source, "failure_policy: {") != 1u || count_text(source, "status: 502,") != 1u ||
+        count_text(source, "reason: \"Bad Gateway\"") != 1u || declarations("unmatched") != 3u ||
+        count_text(source, "unmatched OPTIONS {") != 1u ||
+        count_text(source, "unmatched CONNECT {") != 1u ||
+        count_text(source, "\nunmatched {") != 1u ||
+        count_text(source,
+                   "unmatched OPTIONS { return local_response({\n"
+                   "  version: \"HTTP/1.1\", status: 400,") != 1u ||
+        count_text(source,
+                   "unmatched CONNECT { return local_response({\n"
+                   "  version: \"HTTP/1.1\", status: 405,") != 1u ||
+        count_text(source,
+                   "\nunmatched { return local_response({\n"
+                   "  version: \"HTTP/1.1\", status: 400,") != 1u ||
+        source.find("timeout_failure_policy:") != std::string::npos ||
+        source.find("response_read_timeout:") != std::string::npos ||
+        source.find("response_buffering:") != std::string::npos ||
+        source.find("target_transform") != std::string::npos ||
+        source.find("ReqSetTargetTransform") != std::string::npos ||
+        source.find("strip_prefix") != std::string::npos ||
+        source.find("replace_prefix") != std::string::npos ||
+        source.find("set_path") != std::string::npos ||
+        source.find("0.0.0.0") != std::string::npos || source.find("*:") != std::string::npos ||
+        source.find("listen 127.") != std::string::npos ||
+        source.find("proxy_pass") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("bind_address") != std::string::npos ||
+        source.find("local_address") != std::string::npos ||
+        source.find("req.listener") != std::string::npos ||
+        source.find("address_condition") != std::string::npos) {
+        error =
+            "#357 generated source escaped the canonical wildcard /service/ no-URI policy "
+            "inventory";
+        return false;
+    }
+    return true;
+}
+
+static bool prepare_wildcard_service_no_uri_generated_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    bool listen_first,
+    std::string& fragment,
+    std::string& fragment_identity,
+    std::string& generated_source,
+    PublicPolicyOwnershipEvidence& ownership_evidence,
+    std::string& error) {
+    fragment = make_wildcard_service_no_uri_fragment(frontend_port, backend_port, listen_first);
+    fragment_identity = fragment;
+    {
+        const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+        if (!parsed) {
+            error = "#357 generated side failed genuine nginx parsing";
+            return false;
+        }
+        const auto& server = parsed.value();
+        const auto& proxy = server.location.proxy_pass;
+        const std::string listen_value = std::to_string(frontend_port);
+        const std::string listen_directive = "listen " + listen_value + ";";
+        const std::string proxy_directive =
+            "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+        const size_t listen_offset = fragment.find(listen_directive);
+        const size_t listen_value_offset = fragment.find(listen_value, listen_offset);
+        const size_t location_offset = fragment.find("location /service/");
+        const size_t path_offset = fragment.find("/service/", location_offset);
+        const size_t proxy_offset = fragment.find(proxy_directive);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(fragment.data());
+        const auto borrowed = [&](rut::Str value, rut::Span span) {
+            return value.ptr != nullptr && span.end >= span.start &&
+                   span.end - span.start == value.len &&
+                   reinterpret_cast<uintptr_t>(value.ptr) - span.start == base;
+        };
+        const u32 listen_line = listen_first ? 2u : 5u;
+        const u32 location_line = listen_first ? 3u : 2u;
+        const u32 proxy_line = listen_first ? 4u : 3u;
+        if (listen_offset == std::string::npos || listen_value_offset == std::string::npos ||
+            location_offset == std::string::npos || path_offset == std::string::npos ||
+            proxy_offset == std::string::npos ||
+            server.listen.address != rut::ListenerAddress::IPv4Wildcard ||
+            server.listen.ipv4_host != 0u || server.listen.port != frontend_port ||
+            !server.listen.value.eq({listen_value.data(), static_cast<u32>(listen_value.size())}) ||
+            !borrowed(server.listen.value, server.listen.value_span) ||
+            server.listen.span.start != listen_offset ||
+            server.listen.span.end != listen_offset + listen_directive.size() ||
+            server.listen.span.line != listen_line || server.listen.span.col != 3u ||
+            server.listen.value_span.start != listen_value_offset ||
+            server.listen.value_span.line != listen_line || server.listen.value_span.col != 10u ||
+            !server.location.path.eq(rut::lit_str("/service/")) ||
+            !borrowed(server.location.path, server.location.path_span) ||
+            server.location.path_span.start != path_offset ||
+            server.location.path_span.line != location_line ||
+            server.location.path_span.col != 12u || proxy.span.start != proxy_offset ||
+            proxy.span.end != proxy_offset + proxy_directive.size() ||
+            proxy.span.line != proxy_line || proxy.span.col != 5u || proxy.has_uri ||
+            proxy.uri.ptr != nullptr || proxy.uri.len != 0u || proxy.uri_span.start != 0u ||
+            proxy.uri_span.end != 0u || proxy.port != backend_port || proxy.address[0] != 127u ||
+            proxy.address[1] != 0u || proxy.address[2] != 0u || proxy.address[3] != 1u ||
+            server.exact_local_return.present || server.exact_no_content_return.present ||
+            server.exact_absolute_redirect.present || server.location.proxy_read_timeout.present) {
+            error = "#357 generated model lost wildcard listener/path/true-no-URI provenance";
+            return false;
+        }
+        const auto lowered = rut::nginx::lower_to_rut(server);
+        if (!lowered) {
+            error = "#357 genuine wildcard /service/ no-URI model failed lowering";
+            return false;
+        }
+        generated_source.assign(lowered.value().data, lowered.value().len);
+    }
+    std::fill(fragment.begin(), fragment.end(), '\0');
+    if (!std::all_of(fragment.begin(), fragment.end(), [](char byte) { return byte == 0; })) {
+        error = "#357 failed to destroy borrowed nginx input before public load";
+        return false;
+    }
+    if (!validate_wildcard_service_no_uri_generated_source(
+            generated_source, frontend_port, backend_port, error) ||
+        !write_file(temp.source, generated_source.data(), generated_source.size()))
+        return false;
+    {
+        rut::LoadedProgram program{};
+        struct Guard {
+            rut::LoadedProgram* program;
+            ~Guard() { program->destroy(); }
+        } guard{&program};
+        rut::LoadError load_error{};
+        if (!rut::load_rut_program(
+                temp.source.c_str(), program, load_error, rut::jit::OptLevel::O0)) {
+            error = "#357 generated ordinary RUT failed public loader";
+            return false;
+        }
+        if (program.rir.module.func_count != 1u) {
+            error = "#357 public loader lost its single route function";
+            return false;
+        }
+        const auto& function = program.rir.module.functions[0];
+        const auto find_const_i32 = [&](rut::rir::ValueId value, rut::i32& result) {
+            for (u32 block = 0u; block < function.block_count; block++) {
+                const auto& candidate_block = function.blocks[block];
+                for (u32 instruction = 0u; instruction < candidate_block.inst_count;
+                     instruction++) {
+                    const auto& candidate = candidate_block.insts[instruction];
+                    if (candidate.op == rut::rir::Opcode::ConstI32 && candidate.result == value) {
+                        result = candidate.imm.i32_val;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        rut::i32 upstream_id = -1;
+        rut::i32 request_policy_id = -1;
+        rut::i32 bundle_id = -1;
+        u16 redirect_id = 0u;
+        u32 redirects = 0u;
+        u32 forwards = 0u;
+        u32 transforms = 0u;
+        for (u32 block = 0u; block < function.block_count; block++) {
+            const auto& rir_block = function.blocks[block];
+            for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+                const auto& inst = rir_block.insts[instruction];
+                if (inst.op == rut::rir::Opcode::ReqSetTargetTransform) transforms++;
+                if (inst.op == rut::rir::Opcode::RetRedirect) {
+                    redirects++;
+                    if (inst.imm.i32_val <= 0 || inst.imm.i32_val > 0xffff) {
+                        error = "#357 public RIR redirect lost its policy operand";
+                        return false;
+                    }
+                    redirect_id = static_cast<u16>(inst.imm.i32_val);
+                }
+                if (inst.op != rut::rir::Opcode::RetForwardBundle) continue;
+                forwards++;
+                if (inst.operand_count != 3u || !find_const_i32(inst.operand(0), upstream_id) ||
+                    !find_const_i32(inst.operand(1), request_policy_id) ||
+                    !find_const_i32(inst.operand(2), bundle_id)) {
+                    error = "#357 public RIR forward lost upstream/request/bundle operands";
+                    return false;
+                }
+            }
+        }
+        if (program.rir.module.upstream_count != 1u ||
+            program.rir.module.target_transform_count != 0u ||
+            program.rir.module.redirect_policy_count != 1u ||
+            program.rir.module.response_policy_count != 1u ||
+            program.rir.module.failure_policy_count != 1u ||
+            program.rir.module.policy_bundle_count != 1u) {
+            error = "#357 public RIR lost its policy inventory";
+            return false;
+        }
+        const auto owned_by = [](rut::Str value, const char* pool, u32 used) {
+            if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+            const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+            return address >= begin && address - begin <= used - value.len;
+        };
+        const auto owned_program_state_is_canonical = [&]() {
+            if (!program.has_listener || !program.listener.valid() ||
+                program.listener.address != rut::ListenerAddress::IPv4Wildcard ||
+                program.listener.ipv4_host != 0u || program.listener.port != frontend_port ||
+                program.listener.transport != rut::ListenerTransport::Cleartext ||
+                program.config.route_count != 1u ||
+                program.config.routes[0].method != rut::kRouteMethodAny ||
+                program.config.routes[0].path_len != strlen("/service") ||
+                memcmp(program.config.routes[0].path, "/service", strlen("/service")) != 0 ||
+                program.config.routes[0].action != rut::RouteAction::JitHandler ||
+                program.config.routes[0].needs_req_body || program.config.upstream_count != 1u ||
+                program.config.upstreams[0].name_len != strlen("nginx_upstream") ||
+                memcmp(program.config.upstreams[0].name,
+                       "nginx_upstream",
+                       strlen("nginx_upstream")) != 0 ||
+                program.config.upstreams[0].addr_count != 1u ||
+                ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+                ntohs(program.config.upstreams[0].addrs[0].sin_port) != backend_port ||
+                program.config.target_transform_count != 0u ||
+                program.config.target_transform_bytes_used != 0u || transforms != 0u ||
+                redirects != 1u || forwards != 1u || upstream_id != 0 ||
+                request_policy_id !=
+                    static_cast<rut::i32>(rut::RequestPolicyId::Http11FixedStrip) ||
+                !rut::request_policy_is_supported(static_cast<u16>(request_policy_id)) ||
+                strcmp(rut::request_policy_version(static_cast<u16>(request_policy_id)),
+                       "HTTP/1.1") != 0 ||
+                bundle_id <= 0 || bundle_id > 0xffff ||
+                !program.config.redirect_policy_id_is_valid(redirect_id) ||
+                !program.config.policy_bundle_id_is_valid(static_cast<u16>(bundle_id)))
+                return false;
+            const auto& redirect = program.config.redirect_policies[redirect_id - 1u];
+            if (!program.config.redirect_policy_strings_are_owned(redirect) ||
+                redirect.scheme != rut::RedirectPolicyScheme::Http ||
+                redirect.authority != rut::RedirectPolicyAuthority::RequestHost ||
+                redirect.port != rut::RedirectPolicyPort::ActualListener ||
+                redirect.path != rut::RedirectPolicyPath::Static ||
+                redirect.query != rut::RedirectPolicyQuery::PreserveRaw ||
+                redirect.date != rut::RedirectPolicyDate::Current ||
+                redirect.connection != rut::RedirectPolicyConnection::Close ||
+                redirect.header_order != rut::RedirectPolicyHeaderOrder::LocationThenConnection ||
+                redirect.status_code != 301u ||
+                !redirect.reason.eq(rut::lit_str("Moved Permanently")) ||
+                !redirect.server.eq(rut::lit_str("nginx/1.29.7")) ||
+                !redirect.content_type.eq(rut::lit_str("text/html")) ||
+                redirect.static_authority.len != 0u ||
+                !redirect.target_path.eq(rut::lit_str("/service/")) || redirect.body.len != 169u)
+                return false;
+            for (rut::Str value : {redirect.reason,
+                                   redirect.server,
+                                   redirect.content_type,
+                                   redirect.target_path,
+                                   redirect.body})
+                if (!owned_by(value,
+                              program.config.redirect_policy_bytes,
+                              program.config.redirect_policy_bytes_used))
+                    return false;
+            const auto& bundle = program.config.policy_bundles[bundle_id - 1u];
+            if (!program.config.response_policy_id_is_valid(bundle.response_policy_id) ||
+                !program.config.failure_policy_id_is_valid(bundle.failure_policy_id) ||
+                bundle.timeout_failure_policy_id != 0u ||
+                bundle.response_read_timeout_seconds != 0u ||
+                bundle.response_buffering != rut::ForwardResponseBufferingMode::None)
+                return false;
+            const auto& response = program.config.response_policies[bundle.response_policy_id - 1u];
+            if (response.version != rut::ResponsePolicyVersion::Http11 ||
+                response.framing != rut::ResponsePolicyFraming::ContentLength ||
+                response.connection != rut::ResponsePolicyConnection::Request ||
+                response.date != rut::ResponsePolicyDate::Current ||
+                response.head_mode != rut::ResponsePolicyHeadMode::Reject ||
+                !response.server.eq(rut::lit_str("nginx/1.29.7")) ||
+                !owned_by(response.server,
+                          program.config.response_policy_bytes,
+                          program.config.response_policy_bytes_used) ||
+                response.hide_header_count != 3u)
+                return false;
+            static constexpr rut::Str kHidden[] = {
+                rut::lit_str("Date"), rut::lit_str("Server"), rut::lit_str("X-Pad")};
+            for (u32 i = 0u; i < response.hide_header_count; i++)
+                if (!response.hide_headers[i].eq(kHidden[i]) ||
+                    !owned_by(response.hide_headers[i],
+                              program.config.response_policy_bytes,
+                              program.config.response_policy_bytes_used))
+                    return false;
+            const auto& failure = program.config.failure_policies[bundle.failure_policy_id - 1u];
+            static constexpr char kFailureBody[] =
+                "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n"
+                "<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n"
+                "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+            if (failure.version != rut::ForwardFailurePolicyVersion::Http11 ||
+                failure.status_code != 502u ||
+                failure.date != rut::ForwardFailurePolicyDate::Current ||
+                failure.connection != rut::ForwardFailurePolicyConnection::Request ||
+                failure.head_mode != rut::FailurePolicyHeadMode::Reject ||
+                !failure.reason.eq(rut::lit_str("Bad Gateway")) ||
+                !failure.content_type.eq(rut::lit_str("text/html")) ||
+                !failure.server.eq(rut::lit_str("nginx/1.29.7")) ||
+                !failure.body.eq({kFailureBody, sizeof(kFailureBody) - 1u}))
+                return false;
+            for (rut::Str value :
+                 {failure.reason, failure.content_type, failure.server, failure.body})
+                if (!owned_by(value,
+                              program.config.failure_policy_bytes,
+                              program.config.failure_policy_bytes_used))
+                    return false;
+            ownership_evidence.redirect_policy_id = redirect_id;
+            ownership_evidence.request_policy_id = static_cast<u16>(request_policy_id);
+            ownership_evidence.policy_bundle_id = static_cast<u16>(bundle_id);
+            ownership_evidence.response_policy_id = bundle.response_policy_id;
+            ownership_evidence.failure_policy_id = bundle.failure_policy_id;
+            ownership_evidence.redirect_bytes = program.config.redirect_policy_bytes_used;
+            ownership_evidence.response_bytes = program.config.response_policy_bytes_used;
+            ownership_evidence.failure_bytes = program.config.failure_policy_bytes_used;
+            return true;
+        };
+        if (!owned_program_state_is_canonical()) {
+            error = "#357 public load lost binding-linked owned policy state";
+            return false;
+        }
+        program.engine.shutdown();
+        program.jit_inited = false;
+        program.rir.destroy();
+        if (program.src_map == nullptr || program.src_map_len == 0u ||
+            munmap(program.src_map, program.src_map_len) != 0) {
+            error = "#357 public load could not tear down its source/intermediate state";
+            return false;
+        }
+        program.src_map = nullptr;
+        program.src_map_len = 0u;
+        ownership_evidence = PublicPolicyOwnershipEvidence{};
+        static constexpr char kDestroyedLoaderSource[] = "destroyed-after-357-loader-proof\n";
+        std::string destroyed_readback;
+        if (!write_file(temp.source, kDestroyedLoaderSource, sizeof(kDestroyedLoaderSource) - 1u) ||
+            !read_exact_return204_log(
+                temp.source, "#357 destroyed loader source", destroyed_readback, error) ||
+            destroyed_readback != kDestroyedLoaderSource || !owned_program_state_is_canonical()) {
+            if (error.empty())
+                error = "#357 owned policies did not survive source/RIR teardown and overwrite";
+            return false;
+        }
+    }
+    if (!write_file(temp.source, generated_source.data(), generated_source.size())) {
+        error = "#357 could not restore canonical runtime source after ownership proof";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_wildcard_service_no_uri_generated_observation(
+    const ApiNonRootProxyUriOracleObservation& observation, std::string& error) {
+    const auto& profile = kWildcardServiceNoUriProxyOracleProfile;
+    const auto& ownership = observation.public_policy_ownership;
+    if (observation.side != "converter-generated-rut" ||
+        (observation.order != "listen-before-location" &&
+         observation.order != "location-before-listen") ||
+        observation.config !=
+            make_wildcard_service_no_uri_fragment(observation.frontend_port,
+                                                  observation.backend_port,
+                                                  observation.order == "listen-before-location") ||
+        observation.temp_path.empty() || observation.config_path.empty() ||
+        observation.log_path.empty() || observation.access_path.empty() ||
+        observation.access_path == observation.log_path || observation.process_identity.empty() ||
+        observation.access_scope.empty() || observation.frontend_port == 0u ||
+        observation.backend_port == 0u || observation.frontend_port == observation.backend_port ||
+        !observation.source_lifetime_proven || !observation.public_policy_ownership_proven ||
+        ownership.redirect_policy_id == 0u ||
+        ownership.request_policy_id != static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
+        ownership.policy_bundle_id == 0u || ownership.response_policy_id == 0u ||
+        ownership.failure_policy_id == 0u || ownership.redirect_bytes == 0u ||
+        ownership.response_bytes == 0u || ownership.failure_bytes == 0u ||
+        !observation.clean_lifecycle) {
+        error =
+            "#357 generated observation lost side/order/input/source/public ownership or lifecycle";
+        return false;
+    }
+    if (observation.wires.size() != 5u || observation.forward_history.size() != 3u ||
+        observation.access_order.size() != 5u || observation.redirect_accepts != 0u ||
+        observation.redirect_requests != 0u || observation.redirect_sends != 0u ||
+        observation.forward_accepts != 3u || observation.forward_requests != 3u ||
+        observation.forward_sends != 3u) {
+        error =
+            "#357 generated observation lost five responses/zero redirect upstream/three forwards";
+        return false;
+    }
+    static constexpr size_t kOrder[] = {3u, 4u, 0u, 1u, 2u};
+    for (size_t i = 0u; i < 5u; i++) {
+        const std::vector<char> expected =
+            i < 3u ? std::vector<char>(
+                         kSuccessResponseNormalized,
+                         kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                   : expected_clean_proxy_location_redirect(
+                         observation.frontend_port, profile.location, i == 3u ? "" : "?x=1");
+        std::vector<char> normalized = observation.wires[i];
+        if (!observation.eof_proven[i] || observation.access_records[i] != 1u ||
+            observation.access_order[i] != profile.targets[kOrder[i]] ||
+            !normalize_date(normalized) || normalized != expected) {
+            error = "#357 generated observation lost ordered access, EOF or exact response wire";
+            return false;
+        }
+    }
+    std::vector<std::vector<char>> expected_history;
+    for (const char* target : profile.forward_targets) {
+        const std::string request = std::string("GET ") + target + " HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                    std::to_string(observation.backend_port) +
+                                    "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+        expected_history.emplace_back(request.begin(), request.end());
+    }
+    if (observation.forward_history != expected_history) {
+        error =
+            "#357 generated history rewrote a no-URI target/query, retained Connection, lost "
+            "duplicate headers or retried";
+        return false;
+    }
+    return true;
+}
+
+static std::string canonicalize_wildcard_service_no_uri_wire(
+    const ApiNonRootProxyUriOracleObservation& observation, size_t vector) {
+    if (vector >= observation.wires.size()) return {};
+    std::vector<char> normalized = observation.wires[vector];
+    if (!normalize_date(normalized)) return {};
+    std::string result(normalized.begin(), normalized.end());
+    if (vector >= 3u) {
+        const std::string dynamic = ":" + std::to_string(observation.frontend_port) + "/service/";
+        const size_t offset = result.find(dynamic);
+        if (offset == std::string::npos ||
+            result.find(dynamic, offset + dynamic.size()) != std::string::npos)
+            return {};
+        result.replace(offset, dynamic.size(), ":PORT/service/");
+    }
+    return result;
+}
+
+static std::string canonicalize_wildcard_service_no_uri_history(
+    const ApiNonRootProxyUriOracleObservation& observation) {
+    if (observation.forward_history.size() != 3u) return {};
+    std::string result;
+    const std::string dynamic = "Host: 127.0.0.1:" + std::to_string(observation.backend_port);
+    for (const auto& wire : observation.forward_history) {
+        std::string record(wire.begin(), wire.end());
+        const size_t offset = record.find(dynamic);
+        if (offset == std::string::npos ||
+            record.find(dynamic, offset + dynamic.size()) != std::string::npos)
+            return {};
+        record.replace(offset, dynamic.size(), "Host: 127.0.0.1:PORT");
+        result += record;
+    }
+    return result;
+}
+
+static bool validate_wildcard_service_no_uri_four_way(
+    const ApiNonRootProxyUriOracleObservation (&observations)[4],
+    const std::string (&generated_sources)[2],
+    const std::string& canonical_source,
+    std::string& error) {
+    static constexpr const char* kSides[] = {
+        "pinned-nginx", "pinned-nginx", "converter-generated-rut", "converter-generated-rut"};
+    static constexpr const char* kOrders[] = {"listen-before-location",
+                                              "location-before-listen",
+                                              "listen-before-location",
+                                              "location-before-listen"};
+    for (size_t side = 0u; side < 4u; side++) {
+        if (observations[side].side != kSides[side] || observations[side].order != kOrders[side] ||
+            (side < 2u ? !validate_wildcard_service_no_uri_observation(observations[side], error)
+                       : !validate_wildcard_service_no_uri_generated_observation(observations[side],
+                                                                                 error))) {
+            if (error.empty()) error = "#357 four-way side/order inventory changed";
+            return false;
+        }
+    }
+    const auto& first_ownership = observations[2].public_policy_ownership;
+    const auto& second_ownership = observations[3].public_policy_ownership;
+    if (first_ownership.redirect_policy_id != second_ownership.redirect_policy_id ||
+        first_ownership.request_policy_id != second_ownership.request_policy_id ||
+        first_ownership.policy_bundle_id != second_ownership.policy_bundle_id ||
+        first_ownership.response_policy_id != second_ownership.response_policy_id ||
+        first_ownership.failure_policy_id != second_ownership.failure_policy_id ||
+        first_ownership.redirect_bytes != second_ownership.redirect_bytes ||
+        first_ownership.response_bytes != second_ownership.response_bytes ||
+        first_ownership.failure_bytes != second_ownership.failure_bytes) {
+        error = "#357 generated sides did not retain identical concrete ownership linkage";
+        return false;
+    }
+    u16 ports[8]{};
+    const std::string* resources[4][6]{};
+    for (size_t side = 0u; side < 4u; side++) {
+        ports[side * 2u] = observations[side].frontend_port;
+        ports[side * 2u + 1u] = observations[side].backend_port;
+        resources[side][0] = &observations[side].temp_path;
+        resources[side][1] = &observations[side].config_path;
+        resources[side][2] = &observations[side].log_path;
+        resources[side][3] = &observations[side].access_path;
+        resources[side][4] = &observations[side].process_identity;
+        resources[side][5] = &observations[side].access_scope;
+    }
+    for (size_t i = 0u; i < std::size(ports); i++)
+        for (size_t j = i + 1u; j < std::size(ports); j++)
+            if (ports[i] == 0u || ports[i] == ports[j]) {
+                error = "#357 four-way observations did not retain eight unique ports";
+                return false;
+            }
+    for (size_t side = 0u; side < 4u; side++)
+        for (size_t i = 0u; i < 6u; i++) {
+            if (resources[side][i]->empty()) {
+                error = "#357 four-way observation omitted a resource identity";
+                return false;
+            }
+            for (size_t j = i + 1u; j < 6u; j++) {
+                if (side < 2u && i == 2u && j == 3u) continue;
+                if (*resources[side][i] == *resources[side][j]) {
+                    error = "#357 four-way side aliased unrelated resource identities";
+                    return false;
+                }
+            }
+        }
+    for (size_t left = 0u; left < 4u; left++)
+        for (size_t right = left + 1u; right < 4u; right++)
+            for (const std::string* left_resource : resources[left])
+                for (const std::string* right_resource : resources[right])
+                    if (*left_resource == *right_resource) {
+                        error = "#357 four-way observations shared a resource identity";
+                        return false;
+                    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& observation = observations[side + 2u];
+        std::string canonical = generated_sources[side];
+        if (!validate_wildcard_service_no_uri_generated_source(generated_sources[side],
+                                                               observation.frontend_port,
+                                                               observation.backend_port,
+                                                               error))
+            return false;
+        if (!canonicalize_unique_port(canonical,
+                                      "listen :" + std::to_string(observation.frontend_port),
+                                      "listen :8080") ||
+            !canonicalize_unique_port(canonical,
+                                      "127.0.0.1:" + std::to_string(observation.backend_port),
+                                      "127.0.0.1:9000")) {
+            error = "#357 generated source did not contain unique dynamic endpoints";
+            return false;
+        }
+        if (canonical.size() != 3247u || canonical != canonical_source) {
+            error = "#357 generated declaration orders did not canonicalize to the genuine " +
+                    std::to_string(canonical_source.size()) + "-byte source (candidate " +
+                    std::to_string(canonical.size()) + ")";
+            return false;
+        }
+    }
+    for (size_t vector = 0u; vector < 5u; vector++) {
+        const std::string reference =
+            canonicalize_wildcard_service_no_uri_wire(observations[0], vector);
+        if (reference.empty()) return false;
+        for (size_t side = 1u; side < 4u; side++)
+            if (canonicalize_wildcard_service_no_uri_wire(observations[side], vector) !=
+                reference) {
+                error = "#357 four-way downstream wire mismatch";
+                return false;
+            }
+    }
+    const std::string history = canonicalize_wildcard_service_no_uri_history(observations[0]);
+    if (history.empty()) return false;
+    for (size_t side = 1u; side < 4u; side++)
+        if (canonicalize_wildcard_service_no_uri_history(observations[side]) != history) {
+            error = "#357 four-way upstream history mismatch";
+            return false;
+        }
+    return true;
+}
+
+static bool run_wildcard_service_no_uri_four_way_self_checks(std::string& error) {
+    {
+        HeldLoopbackPorts held;
+        u16 held_ports[8]{};
+        for (size_t i = 0u; i < std::size(held_ports); i++) {
+            if (!held.reserve(i, held_ports[i]) ||
+                !validate_held_loopback_port(
+                    held.fds[i], held_ports[i], "preflight held inventory", error))
+                return false;
+            for (size_t prior = 0u; prior < i; prior++)
+                if (held_ports[i] == held_ports[prior]) {
+                    error = "#357 preflight held inventory reused a live port";
+                    return false;
+                }
+        }
+        const auto pair_rejects_without_consuming = [&](int* frontend,
+                                                        u16 frontend_port,
+                                                        int* backend,
+                                                        u16 backend_port,
+                                                        bool required,
+                                                        const char* label) {
+            std::string detail;
+            if (validate_optional_held_loopback_pair(
+                    frontend, frontend_port, backend, backend_port, required, label, detail) ||
+                detail.empty()) {
+                error = std::string("#357 reservation pair self-check accepted ") + label;
+                return false;
+            }
+            for (size_t i = 0u; i < 3u; i++)
+                if (!validate_held_loopback_port(
+                        held.fds[i], held_ports[i], "reservation rejection preservation", error))
+                    return false;
+            return true;
+        };
+        int inactive = -1;
+        std::string detail;
+        if (!validate_optional_held_loopback_pair(nullptr,
+                                                  held_ports[0],
+                                                  nullptr,
+                                                  held_ports[1],
+                                                  false,
+                                                  "legacy null pair",
+                                                  detail) ||
+            !pair_rejects_without_consuming(
+                nullptr, held_ports[0], nullptr, held_ports[1], true, "strict null pair") ||
+            !pair_rejects_without_consuming(&held.fds[0],
+                                            held_ports[0],
+                                            nullptr,
+                                            held_ports[1],
+                                            false,
+                                            "pinned one-sided pair") ||
+            !pair_rejects_without_consuming(&inactive,
+                                            held_ports[0],
+                                            &held.fds[1],
+                                            held_ports[1],
+                                            true,
+                                            "inactive strict pair") ||
+            !pair_rejects_without_consuming(&held.fds[0],
+                                            held_ports[2],
+                                            &held.fds[1],
+                                            held_ports[1],
+                                            true,
+                                            "wrong-port strict pair"))
+            return false;
+        for (size_t handoff = 0u; handoff < std::size(held_ports); handoff++) {
+            for (size_t future = handoff; future < std::size(held_ports); future++)
+                if (!validate_held_loopback_port(
+                        held.fds[future], held_ports[future], "ordered preflight handoff", error))
+                    return false;
+            if (!handoff_held_loopback_port(
+                    &held.fds[handoff], held_ports[handoff], "ordered preflight handoff", error))
+                return false;
+            for (size_t consumed = 0u; consumed <= handoff; consumed++)
+                if (held.fds[consumed] >= 0) {
+                    error = "#357 preflight handoff retained a consumed live descriptor";
+                    return false;
+                }
+        }
+    }
+    static constexpr u16 kPorts[] = {
+        45801u, 45802u, 45803u, 45804u, 45805u, 45806u, 45807u, 45808u};
+    const auto lower = [&](u16 frontend, u16 backend, bool listen_first, std::string& output) {
+        std::string input = make_wildcard_service_no_uri_fragment(frontend, backend, listen_first);
+        const auto parsed = rut::nginx::parse({input.data(), static_cast<u32>(input.size())});
+        if (!parsed) return false;
+        const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) return false;
+        output.assign(lowered.value().data, lowered.value().len);
+        return true;
+    };
+    std::string canonical;
+    std::string sources[2];
+    if (!lower(8080u, 9000u, true, canonical) || canonical.size() != 3247u ||
+        !lower(kPorts[4], kPorts[5], true, sources[0]) ||
+        !lower(kPorts[6], kPorts[7], false, sources[1])) {
+        error = "#357 self-check could not construct genuine canonical generated sources";
+        return false;
+    }
+    const auto make_observation = [&](size_t side) {
+        ApiNonRootProxyUriOracleObservation value;
+        const bool generated = side >= 2u;
+        const bool listen_first = side == 0u || side == 2u;
+        value.side = generated ? "converter-generated-rut" : "pinned-nginx";
+        value.order = listen_first ? "listen-before-location" : "location-before-listen";
+        value.temp_path = "/tmp/rut-357-four-side-" + std::to_string(side);
+        value.config_path = value.temp_path + (generated ? "/source.rut" : "/nginx.conf");
+        value.log_path = value.temp_path + (generated ? "/rut.log" : "/nginx.log");
+        value.access_path = generated ? value.temp_path + "/access.log" : value.log_path;
+        value.process_identity = "rut-357-process-" + std::to_string(side);
+        value.access_scope = "rut-357-access-" + std::to_string(side);
+        value.frontend_port = kPorts[side * 2u];
+        value.backend_port = kPorts[side * 2u + 1u];
+        value.config =
+            generated ? make_wildcard_service_no_uri_fragment(
+                            value.frontend_port, value.backend_port, listen_first)
+                      : make_pinned_clean_proxy_uri_config(value.frontend_port,
+                                                           value.backend_port,
+                                                           value.access_scope,
+                                                           kWildcardServiceNoUriProxyOracleProfile,
+                                                           listen_first);
+        for (size_t vector = 0u; vector < 5u; vector++) {
+            std::vector<char> wire =
+                vector < 3u ? std::vector<char>(kSuccessResponseNormalized,
+                                                kSuccessResponseNormalized +
+                                                    sizeof(kSuccessResponseNormalized) - 1u)
+                            : expected_clean_proxy_location_redirect(
+                                  value.frontend_port,
+                                  kWildcardServiceNoUriProxyOracleProfile.location,
+                                  vector == 3u ? "" : "?x=1");
+            const std::string marker(29u, 'X');
+            const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+            static constexpr char kDate[] = "Tue, 01 Jan 2030 00:00:00 GMT";
+            if (date != wire.end()) std::copy_n(kDate, 29u, date);
+            value.wires.push_back(std::move(wire));
+            value.eof_proven[vector] = true;
+            value.access_records[vector] = 1u;
+        }
+        for (const char* target : kWildcardServiceNoUriProxyOracleProfile.forward_targets) {
+            const std::string request =
+                std::string("GET ") + target +
+                " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(value.backend_port) +
+                "\r\nX-Dup: one\r\nX-Dup: two\r\n\r\n";
+            value.forward_history.emplace_back(request.begin(), request.end());
+        }
+        value.access_order = {kWildcardServiceNoUriProxyOracleProfile.targets[3],
+                              kWildcardServiceNoUriProxyOracleProfile.targets[4],
+                              kWildcardServiceNoUriProxyOracleProfile.targets[0],
+                              kWildcardServiceNoUriProxyOracleProfile.targets[1],
+                              kWildcardServiceNoUriProxyOracleProfile.targets[2]};
+        value.forward_accepts = value.forward_requests = value.forward_sends = 3u;
+        value.clean_lifecycle = true;
+        value.source_lifetime_proven = generated;
+        value.public_policy_ownership_proven = generated;
+        if (generated) {
+            value.public_policy_ownership.redirect_policy_id = 1u;
+            value.public_policy_ownership.request_policy_id =
+                static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip);
+            value.public_policy_ownership.policy_bundle_id = 1u;
+            value.public_policy_ownership.response_policy_id = 1u;
+            value.public_policy_ownership.failure_policy_id = 1u;
+            value.public_policy_ownership.redirect_bytes = 1u;
+            value.public_policy_ownership.response_bytes = 1u;
+            value.public_policy_ownership.failure_bytes = 1u;
+        }
+        return value;
+    };
+    ApiNonRootProxyUriOracleObservation valid[4] = {
+        make_observation(0u), make_observation(1u), make_observation(2u), make_observation(3u)};
+    if (!validate_wildcard_service_no_uri_four_way(valid, sources, canonical, error)) return false;
+
+    const auto replace_unique =
+        [&](std::string value, const std::string& from, const std::string& to, const char* label) {
+            const size_t offset = from.empty() ? std::string::npos : value.find(from);
+            if (from.empty() || from == to || offset == std::string::npos ||
+                value.find(from, offset + from.size()) != std::string::npos) {
+                error = std::string("#357 self-check mutation was not unique/non-no-op: ") + label;
+                return std::string{};
+            }
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    {
+        static constexpr size_t kAccessOrder[] = {3u, 4u, 0u, 1u, 2u};
+        std::string records[5];
+        for (size_t record = 0u; record < std::size(kAccessOrder); record++) {
+            const size_t vector = kAccessOrder[record];
+            const bool forwarded = vector < 3u;
+            const size_t request_size =
+                forwarded
+                    ? valid[2].forward_history[vector].size()
+                    : api_request(kWildcardServiceNoUriProxyOracleProfile.targets[vector]).size();
+            records[record] =
+                "2030-01-01T00:00:00.000Z GET " +
+                std::string(kWildcardServiceNoUriProxyOracleProfile.targets[vector]) + " " +
+                (forwarded ? "200" : "301") + " " + std::to_string(101u + record) + "us " +
+                std::to_string(request_size) + " " + std::to_string(valid[2].wires[vector].size()) +
+                " 127.0.0.1" +
+                (forwarded ? " nginx_upstream " + std::to_string(201u + record) + "us s=0"
+                           : " s=0");
+        }
+        const auto join_records = [](const std::string(&lines)[5], size_t count = 5u) {
+            std::string result;
+            for (size_t i = 0u; i < count; i++) result += lines[i] + "\n";
+            return result;
+        };
+        const std::string valid_access = join_records(records);
+        const auto pristine_access_observation = [&]() {
+            auto value = valid[2];
+            value.access_order.clear();
+            std::fill(std::begin(value.access_records), std::end(value.access_records), 0u);
+            return value;
+        };
+        auto parsed_access = pristine_access_observation();
+        if (!parse_wildcard_service_no_uri_rut_access(valid_access, parsed_access, error) ||
+            parsed_access.access_order != valid[2].access_order ||
+            !std::all_of(std::begin(parsed_access.access_records),
+                         std::end(parsed_access.access_records),
+                         [](u32 count) { return count == 1u; })) {
+            if (error.empty()) error = "#357 valid raw five-record access fixture did not parse";
+            return false;
+        }
+        const auto rejects_access = [&](const std::string& candidate,
+                                        const char* label,
+                                        const char* intended_reason) {
+            if (candidate.empty() || candidate == valid_access) {
+                error = std::string("#357 raw access mutation was empty/no-op: ") + label;
+                return false;
+            }
+            auto changed_access = pristine_access_observation();
+            std::string detail;
+            if (!parse_wildcard_service_no_uri_rut_access(candidate, changed_access, detail) &&
+                !detail.empty() &&
+                (intended_reason == nullptr || detail.find(intended_reason) != std::string::npos))
+                return true;
+            error = std::string("#357 raw access parser did not reject for intended reason: ") +
+                    label + " (" + detail + ")";
+            return false;
+        };
+        const auto rejects_record_mutation = [&](size_t record,
+                                                 const std::string& from,
+                                                 const std::string& to,
+                                                 const char* label,
+                                                 const char* intended_reason) {
+            std::string changed[5];
+            std::copy(std::begin(records), std::end(records), std::begin(changed));
+            changed[record] = replace_unique(changed[record], from, to, label);
+            return !changed[record].empty() &&
+                   rejects_access(join_records(changed), label, intended_reason);
+        };
+        if (!rejects_record_mutation(
+                0u, " s=0", " s=0 extra", "local-field-count", "local field count") ||
+            !rejects_record_mutation(
+                2u, " s=0", " s=0 extra", "forwarded-field-count", "forwarded field count") ||
+            !rejects_record_mutation(0u,
+                                     "2030-01-01T00:00:00.000Z",
+                                     "X030-01-01T00:00:00.000Z",
+                                     "timestamp",
+                                     "timestamp") ||
+            !rejects_record_mutation(0u, " GET /service ", " POST /service ", "method", "method") ||
+            !rejects_record_mutation(
+                0u, " GET /service 301 ", " GET /servicf 301 ", "local-target", "order/target") ||
+            !rejects_record_mutation(2u,
+                                     " GET /service/ 200 ",
+                                     " GET /servicf/ 200 ",
+                                     "forwarded-target",
+                                     "order/target") ||
+            !rejects_record_mutation(0u, " 301 ", " 302 ", "local-status", "status") ||
+            !rejects_record_mutation(2u, " 200 ", " 201 ", "forwarded-status", "status") ||
+            !rejects_record_mutation(
+                0u, " 101us ", " 101ms ", "local-request-duration", "request duration") ||
+            !rejects_record_mutation(
+                2u, " 103us ", " 103ms ", "forwarded-request-duration", "request duration") ||
+            !rejects_record_mutation(0u, " 101us 90 ", " 101us 89 ", "local-field5", "field-5") ||
+            !rejects_record_mutation(
+                2u,
+                " 103us " + std::to_string(valid[2].forward_history[0].size()) + " ",
+                " 103us 1 ",
+                "forwarded-field5",
+                "field-5") ||
+            !rejects_record_mutation(
+                0u,
+                " " + std::to_string(valid[2].wires[3].size()) + " 127.0.0.1 ",
+                " " + std::to_string(valid[2].wires[3].size() + 1u) + " 127.0.0.1 ",
+                "local-response-size",
+                "response size") ||
+            !rejects_record_mutation(
+                2u,
+                " " + std::to_string(valid[2].wires[0].size()) + " 127.0.0.1 ",
+                " " + std::to_string(valid[2].wires[0].size() + 1u) + " 127.0.0.1 ",
+                "forwarded-response-size",
+                "response size") ||
+            !rejects_record_mutation(
+                0u, " 127.0.0.1 s=0", " 127.0.0.2 s=0", "local-client", "client") ||
+            !rejects_record_mutation(2u,
+                                     " 127.0.0.1 nginx_upstream ",
+                                     " 127.0.0.2 nginx_upstream ",
+                                     "forwarded-client",
+                                     "client") ||
+            !rejects_record_mutation(2u,
+                                     " nginx_upstream 203us ",
+                                     " other_upstream 203us ",
+                                     "upstream-name",
+                                     "upstream name/duration") ||
+            !rejects_record_mutation(2u,
+                                     " nginx_upstream 203us ",
+                                     " nginx_upstream 203ms ",
+                                     "upstream-duration",
+                                     "upstream name/duration") ||
+            !rejects_record_mutation(0u, " s=0", " s=1", "local-outcome", "outcome") ||
+            !rejects_record_mutation(2u, " s=0", " s=1", "forwarded-outcome", "outcome"))
+            return false;
+        std::string missing[5];
+        std::copy(std::begin(records), std::end(records), std::begin(missing));
+        std::string duplicate[5];
+        std::copy(std::begin(records), std::end(records), std::begin(duplicate));
+        duplicate[1] = duplicate[0];
+        std::string reordered[5];
+        std::copy(std::begin(records), std::end(records), std::begin(reordered));
+        std::swap(reordered[0], reordered[1]);
+        if (!rejects_access(join_records(missing, 4u), "missing-record", nullptr) ||
+            !rejects_access(join_records(duplicate), "duplicate-record", "order/target") ||
+            !rejects_access(join_records(reordered), "reordered-records", "order/target") ||
+            !rejects_access(valid_access + records[0] + "\n", "extra-record", nullptr))
+            return false;
+        auto transactional = valid[2];
+        transactional.access_order = {"sentinel-a", "sentinel-b"};
+        const std::vector<std::string> access_order_before = transactional.access_order;
+        static constexpr u32 kSentinelCounts[] = {7u, 8u, 9u, 10u, 11u};
+        std::copy(
+            std::begin(kSentinelCounts), std::end(kSentinelCounts), transactional.access_records);
+        u32 access_records_before[5];
+        std::copy(std::begin(transactional.access_records),
+                  std::end(transactional.access_records),
+                  std::begin(access_records_before));
+        std::string late_failure[5];
+        std::copy(std::begin(records), std::end(records), std::begin(late_failure));
+        late_failure[4] = replace_unique(late_failure[4], " s=0", " s=1", "late-outcome");
+        std::string transactional_error;
+        if (late_failure[4].empty() ||
+            parse_wildcard_service_no_uri_rut_access(
+                join_records(late_failure), transactional, transactional_error) ||
+            transactional_error.find("outcome") == std::string::npos ||
+            transactional.access_order != access_order_before ||
+            !std::equal(std::begin(transactional.access_records),
+                        std::end(transactional.access_records),
+                        std::begin(access_records_before))) {
+            error = "#357 rejected raw access parse mutated seeded transactional state";
+            return false;
+        }
+    }
+    const std::pair<const char*, std::string> source_mutations[] = {
+        {"listener",
+         replace_unique(sources[0], "listen :45805", "listen 127.0.0.1:45805", "listener")},
+        {"route",
+         replace_unique(sources[0], "route \"/service\" {", "route \"/servicf\" {", "route")},
+        {"redirect",
+         replace_unique(
+             sources[0], "target_path: \"/service/\"", "target_path: \"/servicf/\"", "redirect")},
+        {"pre-route",
+         replace_unique(
+             sources[0],
+             "pre_route TRACE { return local_response({\n  version: \"HTTP/1.1\", status: 405,",
+             "pre_route TRACE { return local_response({\n  version: \"HTTP/1.1\", status: 406,",
+             "pre-route")},
+        {"redirect-policy",
+         replace_unique(sources[0],
+                        "status: 301, reason: \"Moved Permanently\"",
+                        "status: 302, reason: \"Moved Permanently\"",
+                        "redirect-policy")},
+        {"request-policy",
+         replace_unique(sources[0],
+                        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                        "\"Upgrade\"]",
+                        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+                        "\"Upgradf\"]",
+                        "request-policy")},
+        {"response-policy",
+         replace_unique(sources[0],
+                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]",
+                        "hide_headers: [\"Date\", \"Server\", \"X-Paf\"]",
+                        "response-policy")},
+        {"failure-policy",
+         replace_unique(
+             sources[0], "reason: \"Bad Gateway\"", "reason: \"Bad Gatewax\"", "failure-policy")},
+        {"unmatched-options",
+         replace_unique(sources[0],
+                        "unmatched OPTIONS { return local_response({\n  version: \"HTTP/1.1\", "
+                        "status: 400,",
+                        "unmatched OPTIONS { return local_response({\n  version: \"HTTP/1.1\", "
+                        "status: 401,",
+                        "unmatched-options")},
+        {"unmatched-connect",
+         replace_unique(sources[0],
+                        "unmatched CONNECT { return local_response({\n  version: \"HTTP/1.1\", "
+                        "status: 405,",
+                        "unmatched CONNECT { return local_response({\n  version: \"HTTP/1.1\", "
+                        "status: 406,",
+                        "unmatched-connect")},
+        {"unmatched-any",
+         replace_unique(sources[0],
+                        "\nunmatched { return local_response({\n  version: \"HTTP/1.1\", status: "
+                        "400,",
+                        "\nunmatched { return local_response({\n  version: \"HTTP/1.1\", status: "
+                        "401,",
+                        "unmatched-any")},
+        {"transform",
+         replace_unique(sources[0],
+                        "return forward(nginx_upstream, request_policy: {",
+                        "return forward(nginx_upstream, target_transform: { strip_prefix: "
+                        "\"/service/\", replace_prefix: \"/\" }, request_policy: {",
+                        "transform")}};
+    for (const auto& mutation : source_mutations) {
+        if (mutation.second.empty() || mutation.second == sources[0]) return false;
+        const auto lexed =
+            rut::lex({mutation.second.data(), static_cast<u32>(mutation.second.size())});
+        if (!lexed) {
+            error = std::string("#357 self-check source mutation was not valid ordinary RUT: ") +
+                    mutation.first;
+            return false;
+        }
+        const auto parsed = rut::parse_file(lexed.value());
+        const bool parser_level_rejection = strcmp(mutation.first, "request-policy") == 0;
+        if (!parsed && !parser_level_rejection) {
+            error = std::string("#357 self-check source mutation was not valid ordinary RUT: ") +
+                    mutation.first;
+            return false;
+        }
+        std::unique_ptr<rut::AstFile> ast(parsed ? parsed.value() : nullptr);
+        std::string detail;
+        if (validate_wildcard_service_no_uri_generated_source(
+                mutation.second, kPorts[4], kPorts[5], detail)) {
+            error =
+                std::string("#357 generated source validator accepted mutation: ") + mutation.first;
+            return false;
+        }
+    }
+    for (const char* hook : {"nginx.conf",
+                             "nginx::",
+                             "nginx_compat",
+                             "workaround",
+                             "bind_address",
+                             "local_address",
+                             "req.listener",
+                             "address_condition"}) {
+        const std::string candidate = sources[0] + "// " + hook + " marker\n";
+        if (candidate == sources[0]) return false;
+        const auto lexed = rut::lex({candidate.data(), static_cast<u32>(candidate.size())});
+        if (!lexed) {
+            error = std::string("#357 hook mutation was not valid ordinary RUT: ") + hook;
+            return false;
+        }
+        const auto parsed = rut::parse_file(lexed.value());
+        if (!parsed) {
+            error = std::string("#357 hook mutation was not valid ordinary RUT: ") + hook;
+            return false;
+        }
+        std::unique_ptr<rut::AstFile> ast(parsed.value());
+        std::string hook_error;
+        if (validate_wildcard_service_no_uri_generated_source(
+                candidate, kPorts[4], kPorts[5], hook_error)) {
+            error = std::string("#357 source validator accepted hook marker: ") + hook;
+            return false;
+        }
+    }
+    auto changed = valid[2];
+    changed.config = replace_unique(changed.config,
+                                    "proxy_pass http://127.0.0.1:45806;",
+                                    "proxy_pass http://127.0.0.1:45806/;",
+                                    "explicit-uri");
+    std::string detail;
+    if (changed.config.empty() ||
+        validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+        error = "#357 generated observation accepted explicit-URI input";
+        return false;
+    }
+    const std::pair<const char*, bool ApiNonRootProxyUriOracleObservation::*> flags[] = {
+        {"source-lifetime", &ApiNonRootProxyUriOracleObservation::source_lifetime_proven},
+        {"public-ownership", &ApiNonRootProxyUriOracleObservation::public_policy_ownership_proven},
+        {"lifecycle", &ApiNonRootProxyUriOracleObservation::clean_lifecycle}};
+    for (const auto& flag : flags) {
+        changed = valid[2];
+        changed.*(flag.second) = false;
+        if (validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+            error = std::string("#357 generated observation accepted missing ") + flag.first;
+            return false;
+        }
+    }
+    changed = valid[2];
+    changed.public_policy_ownership.policy_bundle_id = 0u;
+    if (validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+        error = "#357 generated observation accepted missing linked ownership evidence";
+        return false;
+    }
+    changed = valid[2];
+    changed.eof_proven[0] = false;
+    if (validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+        error = "#357 generated observation accepted missing EOF";
+        return false;
+    }
+    changed = valid[2];
+    std::swap(changed.access_order[0], changed.access_order[1]);
+    if (validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+        error = "#357 generated observation accepted reordered access";
+        return false;
+    }
+    ApiNonRootProxyUriOracleObservation four[4] = {valid[0], valid[1], valid[2], valid[3]};
+    four[2].frontend_port = four[3].frontend_port;
+    four[2].config =
+        make_wildcard_service_no_uri_fragment(four[2].frontend_port, four[2].backend_port, true);
+    for (size_t vector = 3u; vector < 5u; vector++) {
+        std::vector<char> wire = expected_clean_proxy_location_redirect(
+            four[2].frontend_port, "/service/", vector == 3u ? "" : "?x=1");
+        const std::string marker(29u, 'X');
+        const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
+        static constexpr char kDate[] = "Tue, 01 Jan 2030 00:00:00 GMT";
+        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        four[2].wires[vector] = std::move(wire);
+    }
+    std::string shared_sources[2] = {
+        replace_unique(sources[0], "listen :45805", "listen :45807", "shared-port"), sources[1]};
+    if (shared_sources[0].empty() ||
+        !validate_wildcard_service_no_uri_generated_observation(four[2], detail) ||
+        validate_wildcard_service_no_uri_four_way(four, shared_sources, canonical, detail)) {
+        error = "#357 shared-port mutation did not isolate eight-port uniqueness";
+        return false;
+    }
+    changed = valid[2];
+    changed.access_path = changed.log_path;
+    if (validate_wildcard_service_no_uri_generated_observation(changed, detail)) {
+        error = "#357 generated observation accepted a runtime/access log alias";
+        return false;
+    }
+    std::copy(std::begin(valid), std::end(valid), std::begin(four));
+    four[3].access_path = four[0].access_path;
+    if (!validate_wildcard_service_no_uri_generated_observation(four[3], detail) ||
+        validate_wildcard_service_no_uri_four_way(four, sources, canonical, detail)) {
+        error = "#357 coherent shared access/resource identity escaped four-way uniqueness";
+        return false;
+    }
+    const std::string harmless = sources[0] + "\n";
+    if (!validate_wildcard_service_no_uri_generated_source(
+            harmless, kPorts[4], kPorts[5], detail)) {
+        error = "#357 harmless source failed structural validator";
+        return false;
+    }
+    const auto harmless_lexed = rut::lex({harmless.data(), static_cast<u32>(harmless.size())});
+    if (!harmless_lexed) {
+        error = "#357 harmless source failed ordinary-RUT lexing";
+        return false;
+    }
+    const auto harmless_parsed = rut::parse_file(harmless_lexed.value());
+    if (!harmless_parsed) {
+        error = "#357 harmless source failed ordinary-RUT parsing";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> harmless_ast(harmless_parsed.value());
+    std::string harmless_sources[2] = {harmless, sources[1]};
+    if (validate_wildcard_service_no_uri_four_way(valid, harmless_sources, canonical, detail)) {
+        error = "#357 four-way validator accepted noncanonical generated bytes";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_wildcard_service_no_uri_differential(
+    const std::string& container_prefix,
+    const char* rut_path,
+    ApiNonRootProxyUriOracleObservation (&observations)[4],
+    std::string (&generated_sources)[2],
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#357 differential requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[8]{};
+    for (size_t i = 0u; i < std::size(ports); i++) {
+        if (!reservations.reserve(i, ports[i]) ||
+            !validate_held_loopback_port(
+                reservations.fds[i], ports[i], "eight-way live inventory", error)) {
+            if (error.empty()) error = "#357 could not simultaneously hold eight endpoints";
+            return false;
+        }
+        for (size_t prior = 0u; prior < i; prior++)
+            if (ports[i] == ports[prior]) {
+                error = "#357 eight live reservations did not retain unique nonzero ports";
+                return false;
+            }
+    }
+    TempDir temps[4];
+    for (TempDir& temp : temps)
+        if (!temp.create()) {
+            error = "#357 could not create four isolated side resources";
+            return false;
+        }
+    for (size_t i = 0u; i < std::size(temps); i++)
+        for (size_t j = i + 1u; j < std::size(temps); j++)
+            if (strcmp(temps[i].path, temps[j].path) == 0 ||
+                temps[i].nginx_config == temps[j].nginx_config ||
+                temps[i].source == temps[j].source || temps[i].nginx_log == temps[j].nginx_log ||
+                temps[i].rut_log == temps[j].rut_log ||
+                temps[i].nginx_access_log == temps[j].nginx_access_log ||
+                temps[i].rut_access_log == temps[j].rut_access_log) {
+                error = "#357 four sides shared a temp/config/log/access resource";
+                return false;
+            }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t endpoint = side * 2u;
+        for (size_t future = endpoint; future < std::size(ports); future++)
+            if (!validate_held_loopback_port(reservations.fds[future],
+                                             ports[future],
+                                             "pinned ordered handoff inventory",
+                                             error))
+                return false;
+        if (!run_pinned_clean_proxy_uri_oracle(
+                ports[endpoint],
+                ports[endpoint + 1u],
+                temps[side],
+                container_prefix + (side == 0u ? "-listen-first" : "-location-first"),
+                side == 0u ? "listen-first" : "location-first",
+                kWildcardServiceNoUriProxyOracleProfile,
+                observations[side],
+                error,
+                side == 0u,
+                &reservations.fds[endpoint],
+                &reservations.fds[endpoint + 1u]))
+            return false;
+        observations[side].side = "pinned-nginx";
+        if (reservations.fds[endpoint] >= 0 || reservations.fds[endpoint + 1u] >= 0) return false;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t endpoint = 4u + side * 2u;
+        for (size_t future = endpoint; future < std::size(ports); future++)
+            if (!validate_held_loopback_port(reservations.fds[future],
+                                             ports[future],
+                                             "generated ordered handoff inventory",
+                                             error))
+                return false;
+        std::string borrowed_fragment;
+        std::string fragment_identity;
+        PublicPolicyOwnershipEvidence ownership_evidence;
+        if (!prepare_wildcard_service_no_uri_generated_side(ports[endpoint],
+                                                            ports[endpoint + 1u],
+                                                            temps[side + 2u],
+                                                            side == 0u,
+                                                            borrowed_fragment,
+                                                            fragment_identity,
+                                                            generated_sources[side],
+                                                            ownership_evidence,
+                                                            error) ||
+            !run_generated_clean_proxy_uri_side(
+                ports[endpoint],
+                ports[endpoint + 1u],
+                temps[side + 2u],
+                rut_path,
+                kWildcardServiceNoUriProxyOracleProfile,
+                observations[side + 2u],
+                error,
+                side == 0u ? "listen-before-location" : "location-before-listen",
+                &fragment_identity,
+                &reservations.fds[endpoint],
+                &reservations.fds[endpoint + 1u],
+                &ownership_evidence))
+            return false;
+        if (reservations.fds[endpoint] >= 0 || reservations.fds[endpoint + 1u] >= 0) return false;
+    }
+    for (const int fd : reservations.fds)
+        if (fd >= 0) {
+            error = "#357 ordered captures did not consume all eight exact handoffs";
+            return false;
+        }
+    std::string canonical_fragment = make_wildcard_service_no_uri_fragment(8080u, 9000u, true);
+    const auto parsed =
+        rut::nginx::parse({canonical_fragment.data(), static_cast<u32>(canonical_fragment.size())});
+    if (!parsed) return false;
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered || lowered.value().len != 3247u) {
+        error = "#357 genuine representative source did not have canonical size 3247";
+        return false;
+    }
+    const std::string canonical_source(lowered.value().data, lowered.value().len);
+    return validate_wildcard_service_no_uri_four_way(
+        observations, generated_sources, canonical_source, error);
 }
 
 static const std::string& max_proxy_prefix() {
@@ -42372,6 +43999,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--service-root-proxy-uri-oracle") == 0;
     const bool wildcard_service_no_uri_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-service-no-uri-oracle") == 0;
+    const bool converter_wildcard_service_no_uri_differential =
+        argc == 3 && strcmp(argv[1], "--converter-wildcard-service-no-uri-differential") == 0;
     const bool static_query_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-static-query-proxy-uri-oracle") == 0;
     const bool zero_suffix_static_query_proxy_uri_oracle =
@@ -42529,11 +44158,12 @@ int main(int argc, char** argv) {
          !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
          !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
          !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
-         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
-         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
-         !exact_loopback_listen_oracle && !exact_loopback_return204_oracle &&
-         !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
-         !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
+         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
+         !zero_suffix_static_query_proxy_uri_oracle && !wildcard_listen_oracle &&
+         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
+         !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
+         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
+         !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !exact_loopback_service_no_uri_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -42588,6 +44218,7 @@ int main(int argc, char** argv) {
         (converter_api_non_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_static_query_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_zero_suffix_static_query_proxy_uri_differential && argv[2][0] != '/') ||
+        (converter_wildcard_service_no_uri_differential && argv[2][0] != '/') ||
         (converter_wildcard_listen_differential && argv[2][0] != '/') ||
         (converter_asterisk_wildcard_listen_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_listen_differential && argv[2][0] != '/') ||
@@ -42644,6 +44275,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-wildcard-service-no-uri-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--converter-wildcard-service-no-uri-differential <absolute-rut>\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-static-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential "
@@ -42817,11 +44450,16 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
-    if (wildcard_service_no_uri_oracle) {
+    if (wildcard_service_no_uri_oracle || converter_wildcard_service_no_uri_differential) {
         std::string self_check_error;
         if (!run_wildcard_service_no_uri_self_checks(self_check_error)) {
             std::cerr << "FAIL [#357 wildcard /service/ no-URI oracle self-check]: "
                       << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_wildcard_service_no_uri_differential &&
+            !run_wildcard_service_no_uri_four_way_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#357 generated/four-side self-check]: " << self_check_error << "\n";
             return 1;
         }
     }
@@ -44648,6 +46286,41 @@ int main(int argc, char** argv) {
                "generated-RUT equivalence claim; explicit 0.0.0.0 and * spellings, P63, "
                "configured URI/query, normalization-sensitive/absolute targets, broader methods/"
                "bodies/framing/reuse/failures/H1.0/H2/TLS and #347/#352 excluded)\n";
+        return 0;
+    }
+
+    if (converter_wildcard_service_no_uri_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-357-wildcard-service-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ApiNonRootProxyUriOracleObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_wildcard_service_no_uri_differential(
+                container_prefix, argv[2], observations, generated_sources, differential_error)) {
+            std::cerr << "FAIL [#357 converter wildcard /service/ no-URI differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_service_root_proxy_uri_oracle_observation(observation);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #357 representative port-only wildcard listen <port> plus clean "
+               "/service/ true no-URI proxy_pass traversed genuine nginx parsing/provenance "
+               "and independent lowering in both declaration orders to the canonical "
+               "3247-byte ordinary RUT program. Two pinned nginx 1.29.7 sides and two "
+               "public-CLI/JIT/io_uring generated-RUT sides used eight unique ports/resources "
+               "and matched five exact Date-normalized wires/EOF, three unchanged /service/, "
+               "/service/x and /service/x?y=1 upstream targets with rebuilt Host, omitted "
+               "Connection and preserved duplicate headers, exactly three episodes/no retry, "
+               "and two query-preserving 301 redirects with zero extra upstream. Side-specific "
+               "ordered access schemas, zero target transforms, owned public state, post-load "
+               "source overwrite, clean lifecycle and canonical order equality were proven "
+               "(nginx.conf was translated, never loaded by RUT; representative Stage 4A "
+               "only; P63, explicit 0.0.0.0/* spellings behavior, configured URI/query, "
+               "normalization-sensitive targets, #347/#352 access equivalence, broader "
+               "methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
 
