@@ -711,6 +711,20 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue369_converter_request_length_split_fixed_body_differential
+        COMMAND test_nginx_differential --converter-request-length-split-fixed-body-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue369_converter_request_length_split_fixed_body_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue342_wildcard_listen_oracle
         COMMAND test_nginx_differential --pinned-nginx-wildcard-listen-oracle
     )

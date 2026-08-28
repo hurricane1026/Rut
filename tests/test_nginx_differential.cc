@@ -46091,7 +46091,9 @@ static bool run_pinned_request_length_fixed_body_oracle_impl(TempDir& temp,
         const auto quiet_deadline = quiet_started + std::chrono::milliseconds(500);
         for (;;) {
             std::string access;
-            if (!live_with_counts(0u) || !backend.history.empty() || !backend.request.empty() ||
+            // Recorder publishes accepted before it can read or mutate request/history.
+            // Keeping accepted at zero therefore proves those non-atomic containers untouched.
+            if (!live_with_counts(0u) ||
                 !read_request_length_fixed_body_access(temp.nginx_access_log, access, error) ||
                 !access.empty() ||
                 !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
@@ -46101,14 +46103,24 @@ static bool run_pinned_request_length_fixed_body_oracle_impl(TempDir& temp,
             }
             if (std::chrono::steady_clock::now() >= quiet_deadline) break;
         }
+        // The last 25ms client observation can outlive the preceding backend/access
+        // snapshot. Take one mandatory, nonblocking final snapshot immediately before
+        // validating and sending the suffix.
+        const bool final_backend_quiet = live_with_counts(0u);
+        std::string final_quiet_access;
+        const bool final_access_quiet = read_request_length_fixed_body_access(
+                                            temp.nginx_access_log, final_quiet_access, error) &&
+                                        final_quiet_access.empty();
+        const bool final_client_quiet =
+            observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
         const auto quiet_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - quiet_started);
         if (!validate_request_length_fixed_body_split(kRequestLengthFixedBodyFirstSend,
                                                       kRequestLengthFixedBodySecondSend,
                                                       quiet_elapsed,
-                                                      true,
-                                                      true,
-                                                      true,
+                                                      final_backend_quiet,
+                                                      final_client_quiet,
+                                                      final_access_quiet,
                                                       error) ||
             !send_all(client.fd,
                       kRequestLengthFixedBodySecondSend,
@@ -46665,6 +46677,7 @@ static bool run_converter_request_length_fixed_body_rut_side(TempDir& temp,
                                                              HeldLoopbackPorts& reservations,
                                                              u16 frontend_port,
                                                              u16 backend_port,
+                                                             bool split_delivery,
                                                              std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#367 converter differential requires an executable absolute RUT path";
@@ -46763,13 +46776,70 @@ static bool run_converter_request_length_fixed_body_rut_side(TempDir& temp,
         }
     } client{connect_once(frontend_port)};
     std::vector<char> response;
-    if (client.fd < 0 ||
-        !send_all(client.fd,
-                  kRequestLengthFixedBodyClientRequest,
-                  sizeof(kRequestLengthFixedBodyClientRequest) - 1u) ||
-        !read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+    if (client.fd < 0) {
+        error = split_delivery ? "#369 generated-RUT client connect failed"
+                               : "#367 generated-RUT client connect failed";
+        return false;
+    }
+    if (split_delivery) {
+        if (!send_all(client.fd,
+                      kRequestLengthFixedBodyFirstSend,
+                      sizeof(kRequestLengthFixedBodyFirstSend) - 1u)) {
+            error = "#369 generated-RUT exact 128-byte first application send failed";
+            return false;
+        }
+        const auto quiet_started = std::chrono::steady_clock::now();
+        const auto split_quiet_deadline = quiet_started + std::chrono::milliseconds(500);
+        for (;;) {
+            std::string access_bytes;
+            // Recorder publishes accepted before it can read or mutate request/history.
+            // Keeping accepted at zero therefore proves those non-atomic containers untouched.
+            if (!live_with_counts(0u) ||
+                !read_request_length_fixed_body_access(temp.rut_access_log, access_bytes, error) ||
+                !access_bytes.empty() ||
+                !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
+                if (error.empty())
+                    error =
+                        "#369 generated-RUT pre-suffix backend/access/client state was not quiet";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= split_quiet_deadline) break;
+        }
+        // Close the gap after the last blocking client observation with one
+        // mandatory all-sides snapshot immediately before the suffix.
+        const bool final_backend_quiet = live_with_counts(0u);
+        std::string final_quiet_access;
+        const bool final_access_quiet =
+            read_request_length_fixed_body_access(temp.rut_access_log, final_quiet_access, error) &&
+            final_quiet_access.empty();
+        const bool final_client_quiet =
+            observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
+        const auto quiet_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - quiet_started);
+        if (!validate_request_length_fixed_body_split(kRequestLengthFixedBodyFirstSend,
+                                                      kRequestLengthFixedBodySecondSend,
+                                                      quiet_elapsed,
+                                                      final_backend_quiet,
+                                                      final_client_quiet,
+                                                      final_access_quiet,
+                                                      error) ||
+            !send_all(client.fd,
+                      kRequestLengthFixedBodySecondSend,
+                      sizeof(kRequestLengthFixedBodySecondSend) - 1u)) {
+            if (error.empty()) error = "#369 generated-RUT exact 7-byte second send failed";
+            return false;
+        }
+    } else if (!send_all(client.fd,
+                         kRequestLengthFixedBodyClientRequest,
+                         sizeof(kRequestLengthFixedBodyClientRequest) - 1u)) {
+        error = "#367 generated-RUT one application send failed";
+        return false;
+    }
+    if (!read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
         !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
-        if (error.empty()) error = "#367 generated-RUT one-send request/response/EOF failed";
+        if (error.empty())
+            error = split_delivery ? "#369 generated-RUT split request/response/EOF failed"
+                                   : "#367 generated-RUT one-send request/response/EOF failed";
         return false;
     }
     close(client.fd);
@@ -46887,7 +46957,24 @@ static bool run_converter_request_length_fixed_body_differential(TempDir& temp,
     }
     if (!run_pinned_request_length_fixed_body_oracle(temp, container_name, error)) return false;
     return run_converter_request_length_fixed_body_rut_side(
-        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, error);
+        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, false, error);
+}
+
+static bool run_converter_request_length_split_fixed_body_differential(
+    TempDir& temp, const std::string& container_name, const char* rut_path, std::string& error) {
+    HeldLoopbackPorts rut_reservations;
+    u16 rut_frontend_port = 0u;
+    u16 rut_backend_port = 0u;
+    if (!rut_reservations.reserve(0u, rut_frontend_port) ||
+        !rut_reservations.reserve_four_digit(1u, rut_backend_port) ||
+        rut_frontend_port == rut_backend_port) {
+        error = "#369 could not pre-hold isolated generated-RUT frontend/backend ports";
+        return false;
+    }
+    if (!run_pinned_request_length_split_fixed_body_oracle(temp, container_name, error))
+        return false;
+    return run_converter_request_length_fixed_body_rut_side(
+        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, true, error);
 }
 
 int main(int argc, char** argv) {
@@ -46935,6 +47022,9 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-request-length-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
+    const bool converter_request_length_split_fixed_body_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-request-length-split-fixed-body-differential") == 0;
     const bool exact_loopback_return204_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return204-oracle") == 0;
     const bool exact_loopback_bodyful_return_oracle =
@@ -47091,9 +47181,11 @@ int main(int argc, char** argv) {
          !exact_loopback_listen_oracle && !request_length_oracle &&
          !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
          !converter_request_length_differential &&
-         !converter_request_length_fixed_body_differential && !exact_loopback_return204_oracle &&
-         !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
-         !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
+         !converter_request_length_fixed_body_differential &&
+         !converter_request_length_split_fixed_body_differential &&
+         !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
+         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
+         !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !exact_loopback_service_no_uri_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -47145,6 +47237,7 @@ int main(int argc, char** argv) {
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
+        (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
         (converter_root_proxy_trace_differential && argv[2][0] != '/') ||
         (converter_api_proxy_trace_differential && argv[2][0] != '/') ||
@@ -47233,6 +47326,9 @@ int main(int argc, char** argv) {
                      "--converter-request-length-differential <absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-request-length-fixed-body-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-request-length-split-fixed-body-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-return204-oracle\n"
@@ -47419,20 +47515,23 @@ int main(int argc, char** argv) {
         }
     }
     if (request_length_fixed_body_oracle || request_length_split_fixed_body_oracle ||
-        converter_request_length_fixed_body_differential) {
+        converter_request_length_fixed_body_differential ||
+        converter_request_length_split_fixed_body_differential) {
         std::string self_check_error;
         if (!run_request_length_fixed_body_self_checks(self_check_error)) {
             std::cerr << "FAIL [#367 fixed-body request-length self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
-        if (request_length_split_fixed_body_oracle &&
+        if ((request_length_split_fixed_body_oracle ||
+             converter_request_length_split_fixed_body_differential) &&
             !run_request_length_split_fixed_body_self_checks(self_check_error)) {
             std::cerr << "FAIL [#369 split fixed-body request-length self-check]: "
                       << self_check_error << "\n";
             return 1;
         }
-        if (converter_request_length_fixed_body_differential &&
+        if ((converter_request_length_fixed_body_differential ||
+             converter_request_length_split_fixed_body_differential) &&
             !run_converter_request_length_fixed_body_self_checks(self_check_error)) {
             std::cerr << "FAIL [#367 converter fixed-body request-length self-check]: "
                       << self_check_error << "\n";
@@ -48195,6 +48294,39 @@ int main(int argc, char** argv) {
                "lower_to_rut(HttpProfile), survived owner destruction, and used source "
                "accessLog without a CLI logging workaround (no TCP segmentation or recv-boundary "
                "claim)\n";
+        return 0;
+    }
+    if (converter_request_length_split_fixed_body_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-369-request-length-split-body-diff-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_request_length_split_fixed_body_differential(
+                temp, container_name, argv[2], differential_error)) {
+            std::cerr << "FAIL [#369 converter split fixed-body request-length differential]: "
+                      << differential_error << "\n";
+            dump_log(temp.nginx_config, "#369 pinned nginx config");
+            dump_log(temp.nginx_access_log, "#369 pinned nginx access log");
+            dump_log(temp.nginx_log, "#369 pinned nginx process log");
+            dump_log(temp.source, "#369 converter-generated ordinary RUT");
+            dump_log(temp.rut_access_log, "#369 generated RUT access log");
+            dump_log(temp.rut_log, "#369 generated RUT process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #369 pinned nginx 1.29.7 and converter-generated ordinary RUT each "
+               "accept the closed #367 exact 123-byte-header plus 12-byte fixed-Content-Length "
+               "POST delivered by two application send_all calls of 128 bytes (header plus "
+               "`hello`) and 7 bytes (`-body12`) separated by at least 500ms of live backend/"
+               "access/client quiet, rebuild it to one exact 87-byte-header plus 12-byte-body "
+               "upstream request, return the exact Date-normalized 118-byte response/EOF, and "
+               "publish exactly `135\\n` live and after clean shutdown with one no-retry origin "
+               "episode and no late origin bytes; the RUT side came only from "
+               "parse_http_profile plus lower_to_rut(HttpProfile), survived owner destruction, "
+               "and used source accessLog without a CLI workaround (#369 exact 128/500ms/7 "
+               "application-send slice only; no TCP segmentation, recv-boundary, or arbitrary-"
+               "split claim)\n";
         return 0;
     }
     u16 frontend_port = 0;
