@@ -327,6 +327,12 @@ static constexpr char kBackendResponse[] =
     "Server: differential-backend\r\n"
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 2\r\n\r\nok";
+static constexpr char kRequestLengthOracleClientRequest[] =
+    "GET /ledger?q=raw HTTP/1.1\r\n"
+    "Host: client.example.with.a.long.name\r\n"
+    "Connection: close\r\n"
+    "X-Test: keep\r\n"
+    "\r\n";
 static constexpr char kSuccessResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -334,6 +340,10 @@ static constexpr char kSuccessResponseNormalized[] =
     "Content-Length: 2\r\n"
     "Connection: close\r\n"
     "\r\nok";
+static_assert(sizeof(kBackendResponse) - 1u == 107u);
+static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u == 102u);
+static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u != 66u);
+static_assert(sizeof(kSuccessResponseNormalized) - 1u == 118u);
 static constexpr char kBodyfulNormalizedExactResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -837,6 +847,34 @@ struct HeldLoopbackPorts {
         fds[index] = fd;
         port = ntohs(address.sin_port);
         return true;
+    }
+
+    bool reserve_four_digit(size_t index, u16& port) {
+        if (index >= std::size(fds) || fds[index] >= 0) return false;
+        static constexpr u16 kFirstPort = 1024u;
+        static constexpr u16 kLastPort = 9999u;
+        static constexpr u32 kPortCount = kLastPort - kFirstPort + 1u;
+        const u32 start = static_cast<u32>(getpid()) % kPortCount;
+        for (u32 attempt = 0; attempt < kPortCount; attempt++) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) continue;
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const u16 candidate = static_cast<u16>(kFirstPort + ((start + attempt) % kPortCount));
+            address.sin_port = htons(candidate);
+            socklen_t length = sizeof(address);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+                getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0 &&
+                length == sizeof(address) && ntohl(address.sin_addr.s_addr) == 0x7f000001u &&
+                ntohs(address.sin_port) == candidate) {
+                fds[index] = fd;
+                port = candidate;
+                return true;
+            }
+            close(fd);
+        }
+        return false;
     }
 };
 
@@ -45252,6 +45290,398 @@ static bool run_rut_exact_ipv4_listener_production(TempDir& temp,
     return validate_exact_loopback_guard_fd(reservations.guard, frontend_port, error);
 }
 
+static std::string make_request_length_oracle_config(u16 frontend_port,
+                                                     u16 backend_port,
+                                                     const std::string& access_path) {
+    return "error_log stderr notice;\n"
+           "events {}\n"
+           "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_request_length_oracle_config(const std::string& config,
+                                                  u16 frontend_port,
+                                                  u16 backend_port,
+                                                  const std::string& access_path,
+                                                  std::string& error) {
+    const std::string expected =
+        make_request_length_oracle_config(frontend_port, backend_port, access_path);
+    if (frontend_port == 0u || backend_port < 1024u || backend_port > 9999u ||
+        frontend_port == backend_port || access_path.empty() || config != expected ||
+        count_text(config, "error_log ") != 1u ||
+        count_text(config, "error_log stderr notice;\n") != 1u ||
+        count_text(config, "events {}") != 1u || count_text(config, "http {") != 1u ||
+        count_text(config, "log_format ") != 1u ||
+        count_text(config, "log_format compat \"$request_length\";") != 1u ||
+        count_text(config, "$request_length") != 1u || count_text(config, "$") != 1u ||
+        count_text(config, "access_log ") != 1u ||
+        count_text(config, "access_log " + access_path + " compat;") != 1u ||
+        count_text(config, access_path) != 1u || count_text(config, "server {") != 1u ||
+        count_text(config, "listen ") != 1u ||
+        count_text(config, "listen 127.0.0.1:" + std::to_string(frontend_port) + ";") != 1u ||
+        count_text(config, "location / {") != 1u || count_text(config, "location ") != 1u ||
+        count_text(config, "proxy_pass ") != 1u ||
+        count_text(config, "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";") !=
+            1u ||
+        config.find("buffer=") != std::string::npos || config.find("flush=") != std::string::npos ||
+        config.find("gzip") != std::string::npos || config.find("syslog:") != std::string::npos ||
+        config.find("open_log_file_cache") != std::string::npos ||
+        config.find("access_log off") != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        config.find("proxy_http_version") != std::string::npos ||
+        config.find("include ") != std::string::npos) {
+        error = "#362 config escaped the exact unbuffered request-length root-proxy inventory";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_request_length_access_bytes(const std::string& contents, std::string& error) {
+    if (contents != "102\n") {
+        error = "#362 access file was not exactly the downstream request length 102 plus newline";
+        return false;
+    }
+    return true;
+}
+
+static bool read_request_length_access_file(const std::string& path,
+                                            std::string& contents,
+                                            std::string& error) {
+    contents.clear();
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) return true;
+        error = "#362 could not open the access file";
+        return false;
+    }
+    char bytes[32];
+    for (;;) {
+        const ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n > 0) {
+            contents.append(bytes, static_cast<size_t>(n));
+            if (contents.size() > sizeof(bytes)) {
+                close(fd);
+                error = "#362 access file exceeded the bounded oracle size";
+                return false;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            close(fd);
+            error = "#362 access file read failed";
+            return false;
+        }
+        break;
+    }
+    if (close(fd) != 0) {
+        error = "#362 access file close failed";
+        return false;
+    }
+    return true;
+}
+
+static bool run_request_length_oracle_self_checks(std::string& error) {
+    const std::string request(kRequestLengthOracleClientRequest);
+    if (request !=
+            "GET /ledger?q=raw HTTP/1.1\r\n"
+            "Host: client.example.with.a.long.name\r\n"
+            "Connection: close\r\n"
+            "X-Test: keep\r\n"
+            "\r\n" ||
+        request.size() != 102u || count_text(request, "\r\nHost:") != 1u ||
+        count_text(request, "\r\nConnection: close\r\n") != 1u ||
+        count_text(request, "\r\nX-Test: keep\r\n") != 1u ||
+        request.find('\t') != std::string::npos ||
+        request.find("\r\nContent-Length:") != std::string::npos ||
+        request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request.find("\r\nExpect:") != std::string::npos ||
+        request.find("\r\nUpgrade:") != std::string::npos) {
+        error = "#362 request self-check escaped the exact bodyless H1.1 domain";
+        return false;
+    }
+
+    std::string detail;
+    if (!validate_request_length_access_bytes("102\n", detail)) {
+        error = "#362 exact access self-check rejected its valid record";
+        return false;
+    }
+    for (const char* mutation : {"", "102", "101\n", "66\n", "102\n102\n", "105\n"}) {
+        detail.clear();
+        if (validate_request_length_access_bytes(mutation, detail)) {
+            error = "#362 access self-check accepted a semantic mutation";
+            return false;
+        }
+    }
+
+    static constexpr u16 kFrontendPort = 18080u;
+    static constexpr u16 kBackendPort = 9000u;
+    static constexpr const char* kAccessPath = "/tmp/rut-nginx-362-self/access.log";
+    const std::string valid =
+        make_request_length_oracle_config(kFrontendPort, kBackendPort, kAccessPath);
+    detail.clear();
+    if (!validate_request_length_oracle_config(
+            valid, kFrontendPort, kBackendPort, kAccessPath, detail)) {
+        error = "#362 config self-check rejected its valid exact inventory";
+        return false;
+    }
+    const auto replace_once = [&](const char* from, const char* to) {
+        std::string changed = valid;
+        const size_t at = changed.find(from);
+        if (at == std::string::npos || changed.find(from, at + strlen(from)) != std::string::npos)
+            return std::string{};
+        changed.replace(at, strlen(from), to);
+        return changed;
+    };
+    const std::vector<std::string> mutations = {
+        replace_once("$request_length", "$bytes_sent"),
+        replace_once("\"$request_length\"", "\"$request_length $status\""),
+        replace_once(" compat;\n  server", " compat buffer=32k;\n  server"),
+        replace_once(" compat;\n  server", " compat flush=1s;\n  server"),
+        replace_once("access_log ", "access_log syslog:server=127.0.0.1 "),
+        valid + "gzip on;\n",
+        valid + "log_format adjacent \"$request_length\";\n",
+        valid + "access_log /tmp/adjacent.log compat;\n",
+        valid + "server { listen 127.0.0.1:18081; }\n",
+        valid + "location /adjacent { proxy_pass http://127.0.0.1:9000; }\n",
+    };
+    for (const auto& mutation : mutations) {
+        if (mutation.empty()) {
+            error = "#362 config self-check could not construct a mutation";
+            return false;
+        }
+        detail.clear();
+        if (validate_request_length_oracle_config(
+                mutation, kFrontendPort, kBackendPort, kAccessPath, detail)) {
+            error = "#362 config self-check accepted an adjacent directive/option mutation";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_pinned_request_length_oracle(TempDir& temp,
+                                             const std::string& container_name,
+                                             std::string& error) {
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve(0u, frontend_port) ||
+        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port ||
+        !validate_held_loopback_port(
+            reservations.fds[0], frontend_port, "#362 frontend handoff", error) ||
+        !validate_held_loopback_port(
+            reservations.fds[1], backend_port, "#362 backend handoff", error)) {
+        if (error.empty()) error = "#362 could not hold distinct frontend/P4 backend ports";
+        return false;
+    }
+
+    const std::string config =
+        make_request_length_oracle_config(frontend_port, backend_port, temp.nginx_access_log);
+    if (!validate_request_length_oracle_config(
+            config, frontend_port, backend_port, temp.nginx_access_log, error) ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        if (error.empty()) error = "#362 could not persist its exact nginx config";
+        return false;
+    }
+
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#362 Recorder bind", error) ||
+        !backend.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        if (error.empty()) error = "#362 Recorder could not bind the held P4 backend port";
+        return false;
+    }
+    const auto recorder_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!backend.running.load(std::memory_order_acquire) ||
+            !backend.thread_alive.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < recorder_ready_deadline) {
+        if (backend.listener_failed.load(std::memory_order_acquire)) break;
+        usleep(1000);
+    }
+    if (!backend.running.load(std::memory_order_acquire) ||
+        !backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire)) {
+        error = "#362 Recorder was not live before frontend handoff";
+        return false;
+    }
+
+    ChildGuard nginx;
+    DockerGuard docker(container_name);
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#362 pinned nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = "#362 pinned nginx failed before readiness";
+        return false;
+    }
+
+    const auto live_with_counts = [&](u32 expected) {
+        return !poll_child(nginx.child) && backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire) &&
+               backend.accepted.load(std::memory_order_acquire) == expected &&
+               backend.requests.load(std::memory_order_acquire) == expected &&
+               backend.response_send_all_calls.load(std::memory_order_acquire) == expected;
+    };
+    const auto quiet_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < quiet_deadline) {
+        std::string access;
+        if (!live_with_counts(0u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty()) {
+            if (error.empty())
+                error = "#362 pre-request window was not live and access/upstream quiet";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    client.fd = connect_once(frontend_port);
+    std::vector<char> response;
+    if (client.fd < 0 ||
+        !send_all(client.fd,
+                  kRequestLengthOracleClientRequest,
+                  sizeof(kRequestLengthOracleClientRequest) - 1u) ||
+        !read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+        !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
+        if (error.empty()) error = "#362 exact client request/response episode failed";
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+    if (!wait_for_live_complete_origin_episode(backend, nginx.child, "#362 pinned nginx", error))
+        return false;
+
+    const std::string expected_upstream =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Test: keep\r\n\r\n";
+    const std::vector<char> expected_upstream_wire(expected_upstream.begin(),
+                                                   expected_upstream.end());
+    const std::string actual_upstream =
+        backend.history.size() == 1u
+            ? std::string(backend.history[0].begin(), backend.history[0].end())
+            : std::string{};
+    if (backend_port < 1024u || backend_port > 9999u || expected_upstream.size() != 66u ||
+        sizeof(kRequestLengthOracleClientRequest) - 1u == expected_upstream.size() ||
+        backend.history.size() != 1u || backend.history[0] != expected_upstream_wire ||
+        count_text(actual_upstream, "Host: 127.0.0.1:") != 1u ||
+        count_text(actual_upstream, "X-Test: keep\r\n") != 1u ||
+        actual_upstream.find("client.example") != std::string::npos ||
+        actual_upstream.find("Connection:") != std::string::npos ||
+        actual_upstream.find('\t') != std::string::npos) {
+        if (!backend.history.empty()) dump_wire("#362 actual backend wire", backend.history[0]);
+        error =
+            "#362 backend wire was not exact 66-byte Host-rebuilt canonical request "
+            "(actual size " +
+            std::to_string(backend.history.empty() ? 0u : backend.history[0].size()) + ")";
+        return false;
+    }
+
+    static constexpr char kExpectedAccess[] = "102\n";
+    static_assert(sizeof(kExpectedAccess) - 1u == 4u);
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access;
+        if (!live_with_counts(1u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error)) {
+            if (error.empty()) error = "#362 process/Recorder failed while awaiting live access";
+            return false;
+        }
+        if (access.size() > sizeof(kExpectedAccess) - 1u ||
+            memcmp(kExpectedAccess, access.data(), access.size()) != 0) {
+            error = "#362 live access bytes were not a prefix of exact downstream value 102";
+            return false;
+        }
+        if (access.size() == sizeof(kExpectedAccess) - 1u) break;
+        if (std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#362 live access record did not become visible before shutdown";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        std::string access;
+        if (!live_with_counts(1u) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !validate_request_length_access_bytes(access, error)) {
+            if (error.empty()) error = "#362 live access/backend evidence was not stable";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    if (!stop_child(nginx.child) || !docker.remove()) {
+        error = "#362 pinned nginx did not stop and remove cleanly";
+        return false;
+    }
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    std::string final_access;
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u ||
+        backend.history[0] != expected_upstream_wire ||
+        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
+        !validate_request_length_access_bytes(final_access, error)) {
+        if (error.empty()) error = "#362 final recorder/access evidence was not exact";
+        return false;
+    }
+    for (const char* severity : {"[warn]", "[error]", "[crit]", "[alert]", "[emerg]"}) {
+        if (log_contains(temp.nginx_log, severity)) {
+            error = "#362 nginx emitted warn-or-higher diagnostics";
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -45287,6 +45717,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-asterisk-wildcard-listen-oracle") == 0;
     const bool exact_loopback_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-listen-oracle") == 0;
+    const bool request_length_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-oracle") == 0;
     const bool exact_loopback_return204_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-return204-oracle") == 0;
     const bool exact_loopback_bodyful_return_oracle =
@@ -45440,9 +45872,10 @@ int main(int argc, char** argv) {
          !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
-         !exact_loopback_listen_oracle && !exact_loopback_return204_oracle &&
-         !exact_loopback_bodyful_return_oracle && !exact_loopback_return302_oracle &&
-         !exact_loopback_return301_oracle && !exact_loopback_prefix_root_replacement_oracle &&
+         !exact_loopback_listen_oracle && !request_length_oracle &&
+         !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
+         !exact_loopback_return302_oracle && !exact_loopback_return301_oracle &&
+         !exact_loopback_prefix_root_replacement_oracle &&
          !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
          !exact_loopback_service_no_uri_oracle && !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
@@ -45570,6 +46003,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-listen-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-request-length-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-return204-oracle\n"
                      "   or: test_nginx_differential "
@@ -45740,6 +46175,14 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
+    if (request_length_oracle) {
+        std::string self_check_error;
+        if (!run_request_length_oracle_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
+                      << "\n";
+            return 1;
+        }
+    }
     if (wildcard_service_no_uri_oracle || converter_wildcard_service_no_uri_differential) {
         std::string self_check_error;
         if (!run_wildcard_service_no_uri_self_checks(self_check_error)) {
@@ -46363,6 +46806,31 @@ int main(int argc, char** argv) {
         if (!probe_error.empty()) std::cerr << probe_error << "\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
+    }
+    if (request_length_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-362-request-length-" + std::to_string(getpid()) + "-" + source_suffix;
+        std::string oracle_error;
+        if (!run_pinned_request_length_oracle(temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#362 pinned nginx-only request-length oracle]: " << oracle_error
+                      << "\n";
+            dump_log(temp.nginx_config, "#362 exact nginx config");
+            dump_log(temp.nginx_access_log, "#362 nginx access log");
+            dump_log(temp.nginx_log, "#362 nginx error/process log");
+            return 1;
+        }
+        std::cerr << "PASS: #362 pinned nginx 1.29.7 nginx-only oracle proves one exact 102-byte "
+                     "fresh bodyless explicit-close H1.1 GET is rebuilt to one exact 66-byte "
+                     "Host-rewritten, Connection-omitted upstream request with one canonical "
+                     "X-Test header "
+                     "on a held four-digit backend port, produces the exact Date-normalized "
+                     "118-byte response/zero-tail/EOF, and publishes exactly `102\\n` while nginx "
+                     "remains live; the record and one no-retry backend episode remain stable for "
+                     "500ms and exact after clean shutdown (#362 Stage 1 nginx-only semantics; no "
+                     "parser, converter, generated-RUT, or behavior-equivalence claim)\n";
+        return 0;
     }
     u16 frontend_port = 0;
     u16 backend_port = 0;
