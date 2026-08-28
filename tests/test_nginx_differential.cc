@@ -1,6 +1,7 @@
 #include "downstream_publication_gate.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
+#include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
@@ -33711,6 +33712,8 @@ struct ExactLoopbackPrefixRootObservation {
     bool negative_probe_after_quiet = false;
     bool clean_lifecycle = false;
     bool source_lifetime_proven = false;
+    bool public_policy_ownership_proven = false;
+    bool target_transform_inventory_proven = false;
     bool eof_proven[5]{};
 };
 
@@ -33719,14 +33722,15 @@ struct ExactLoopbackPrefixOracleProfile {
     const char* log_name;
     const CleanProxyUriOracleProfile* semantics;
     u32 canonical_8080_9000_size;
+    bool uses_target_transform;
 };
 
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackPrefixRootProfile = {
-    "#353", "exact_loopback_prefix_root", &kServiceRootProxyUriOracleProfile, 3358u};
+    "#353", "exact_loopback_prefix_root", &kServiceRootProxyUriOracleProfile, 3358u, true};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiV1Profile = {
-    "#354", "exact_loopback_api_v1", &kExactApiV1ProxyUriOracleProfile, 3345u};
+    "#354", "exact_loopback_api_v1", &kExactApiV1ProxyUriOracleProfile, 3345u, true};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiNoUriProfile = {
-    "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 0u};
+    "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 3244u, false};
 
 static std::string make_exact_loopback_prefix_root_config(
     u16 frontend_port,
@@ -35561,6 +35565,15 @@ static bool validate_exact_loopback_prefix_root_generated_source(
     const std::string strip = "strip_prefix: \"" + location + "\"";
     const std::string replace =
         "replace_prefix: \"" + std::string(profile.semantics->proxy_uri) + "\"";
+    const bool forward_shape_is_canonical =
+        profile.uses_target_transform
+            ? count_text(source, "return forward(nginx_upstream, target_transform: {") == 1u &&
+                  count_text(source, strip) == 1u && count_text(source, replace) == 1u
+            : count_text(source, "return forward(nginx_upstream, request_policy: {") == 1u &&
+                  source.find("target_transform") == std::string::npos &&
+                  source.find("strip_prefix") == std::string::npos &&
+                  source.find("replace_prefix") == std::string::npos &&
+                  source.find("set_path") == std::string::npos;
     const auto region_equals = [](const std::string& candidate,
                                   const char* begin_marker,
                                   const char* end_marker,
@@ -35665,9 +35678,7 @@ static bool validate_exact_loopback_prefix_root_generated_source(
         count_text(source, "authority: \"request_host\", port: \"actual_listener\"") != 1u ||
         count_text(source, "path: \"static\", query: \"preserve_raw\"") != 1u ||
         count_text(source, "status: 301, reason: \"Moved Permanently\"") != 1u ||
-        count_text(source, redirect_target) != 1u ||
-        count_text(source, "return forward(nginx_upstream, target_transform: {") != 1u ||
-        count_text(source, strip) != 1u || count_text(source, replace) != 1u ||
+        count_text(source, redirect_target) != 1u || !forward_shape_is_canonical ||
         !request_policy_is_canonical(source) || !response_policy_is_canonical(source) ||
         !failure_policy_is_canonical(source) || !timeout_and_buffering_are_canonical(source) ||
         !unmatched_actions_are_canonical(source) || source.find("listen :") != std::string::npos ||
@@ -35767,7 +35778,9 @@ static bool validate_exact_loopback_prefix_root_generated_observation(
         !observation.negative_probe_before_failed || !observation.negative_probe_before_quiet ||
         !observation.forward_epoch_settled || !observation.redirect_epoch_quiet ||
         !observation.negative_probe_after_failed || !observation.negative_probe_after_quiet ||
-        !observation.clean_lifecycle || !observation.source_lifetime_proven) {
+        !observation.clean_lifecycle || !observation.source_lifetime_proven ||
+        !observation.public_policy_ownership_proven ||
+        !observation.target_transform_inventory_proven) {
         error = std::string(profile.issue) +
                 " generated observation lost address causality, quietness, source ownership "
                 "or lifecycle evidence";
@@ -35997,7 +36010,10 @@ static bool capture_generated_exact_loopback_prefix_root_side(
         const size_t path_offset = borrowed_fragment.find(profile.semantics->location);
         const size_t proxy_offset = borrowed_fragment.find(proxy_directive);
         const size_t target_offset = borrowed_fragment.find("http://127.0.0.1:", proxy_offset);
-        const size_t uri_offset = borrowed_fragment.find('/', target_offset + strlen("http://"));
+        const size_t uri_offset =
+            profile.uses_target_transform
+                ? borrowed_fragment.find('/', target_offset + strlen("http://"))
+                : std::string::npos;
         const uintptr_t base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
         const auto owned_borrow = [&](rut::Str text, rut::Span span) {
             return text.ptr != nullptr && span.end >= span.start &&
@@ -36017,9 +36033,10 @@ static bool capture_generated_exact_loopback_prefix_root_side(
             listener_offset == std::string::npos || location_offset == std::string::npos ||
             location_close == std::string::npos || path_offset == std::string::npos ||
             proxy_offset == std::string::npos || target_offset == std::string::npos ||
-            uri_offset == std::string::npos || server.span.start != 0u ||
-            server.span.end != server_close + 1u || server.span.line != 1u ||
-            server.span.col != 1u || server.listen.address != rut::ListenerAddress::IPv4Exact ||
+            (profile.uses_target_transform && uri_offset == std::string::npos) ||
+            server.span.start != 0u || server.span.end != server_close + 1u ||
+            server.span.line != 1u || server.span.col != 1u ||
+            server.listen.address != rut::ListenerAddress::IPv4Exact ||
             server.listen.ipv4_host != 0x7f000001u || server.listen.port != frontend_port ||
             !owned_borrow(server.listen.value, server.listen.value_span) ||
             !server.listen.value.eq(
@@ -36032,7 +36049,7 @@ static bool capture_generated_exact_loopback_prefix_root_side(
             !owned_borrow(server.location.path, server.location.path_span) ||
             !server.location.path.eq({profile.semantics->location,
                                       static_cast<u32>(strlen(profile.semantics->location))}) ||
-            server.location.path_span.start != path_offset || !proxy.has_uri ||
+            server.location.path_span.start != path_offset ||
             server.location.path_span.line != location_line ||
             server.location.path_span.col != 12u || server.location.span.start != location_offset ||
             server.location.span.end != location_close + 1u ||
@@ -36040,11 +36057,17 @@ static bool capture_generated_exact_loopback_prefix_root_side(
             proxy.span.start != proxy_offset ||
             proxy.span.end != proxy_offset + proxy_directive.size() ||
             proxy.span.line != proxy_line || proxy.span.col != 5u ||
-            !owned_borrow(proxy.uri, proxy.uri_span) || proxy.uri_span.start != uri_offset ||
-            proxy.uri_span.end != uri_offset + strlen(profile.semantics->proxy_uri) ||
-            !proxy.uri.eq({profile.semantics->proxy_uri,
-                           static_cast<u32>(strlen(profile.semantics->proxy_uri))}) ||
-            proxy.uri_span.line != proxy_line || proxy.uri_span.col != col_of(uri_offset) ||
+            (profile.uses_target_transform &&
+             (!proxy.has_uri || !owned_borrow(proxy.uri, proxy.uri_span) ||
+              proxy.uri_span.start != uri_offset ||
+              proxy.uri_span.end != uri_offset + strlen(profile.semantics->proxy_uri) ||
+              !proxy.uri.eq({profile.semantics->proxy_uri,
+                             static_cast<u32>(strlen(profile.semantics->proxy_uri))}) ||
+              proxy.uri_span.line != proxy_line || proxy.uri_span.col != col_of(uri_offset))) ||
+            (!profile.uses_target_transform &&
+             (proxy.has_uri || proxy.uri.ptr != nullptr || proxy.uri.len != 0u ||
+              proxy.uri_span.start != 0u || proxy.uri_span.end != 0u || proxy.uri_span.line != 1u ||
+              proxy.uri_span.col != 1u)) ||
             proxy.address[0] != 127u || proxy.address[1] != 0u || proxy.address[2] != 0u ||
             proxy.address[3] != 1u || proxy.port != backend_port ||
             server.exact_local_return.present || server.exact_no_content_return.present ||
@@ -36082,6 +36105,82 @@ static bool capture_generated_exact_loopback_prefix_root_side(
         error = std::string(profile.issue) + " failed to destroy borrowed nginx source";
         return false;
     }
+    if (!profile.uses_target_transform) {
+        const auto lexed =
+            rut::lex({generated_source.data(), static_cast<u32>(generated_source.size())});
+        if (!lexed) {
+            error = std::string(profile.issue) + " zero-transform source failed public lexing";
+            return false;
+        }
+        const auto parsed = rut::parse_file(lexed.value());
+        if (!parsed) {
+            error = std::string(profile.issue) + " zero-transform source failed public parsing";
+            return false;
+        }
+        std::unique_ptr<rut::AstFile> ast(parsed.value());
+        const rut::AstRouteDecl* ast_route = nullptr;
+        for (u32 i = 0u; i < ast->items.len; i++)
+            if (ast->items[i].kind == rut::AstItemKind::Route &&
+                ast->items[i].route.path.eq({"/api", 4u}))
+                ast_route = &ast->items[i].route;
+        if (ast_route == nullptr || ast_route->statements.len != 1u ||
+            ast_route->statements[0] == nullptr ||
+            ast_route->statements[0]->kind != rut::AstStmtKind::If ||
+            ast_route->statements[0]->else_stmt == nullptr) {
+            error = std::string(profile.issue) + " public AST lost the no-URI route control";
+            return false;
+        }
+        const rut::AstStatement* ast_forward = ast_route->statements[0]->else_stmt;
+        if (ast_forward->kind == rut::AstStmtKind::Block) {
+            if (ast_forward->block_stmts.len != 1u || ast_forward->block_stmts[0] == nullptr) {
+                error = std::string(profile.issue) + " public AST lost the forward block";
+                return false;
+            }
+            ast_forward = ast_forward->block_stmts[0];
+        }
+        if (ast_forward->kind != rut::AstStmtKind::ForwardUpstream ||
+            ast_forward->has_forward_target_transform ||
+            ast_forward->forward_target_transform.strip_prefix.ptr != nullptr ||
+            ast_forward->forward_target_transform.replace_prefix.ptr != nullptr) {
+            error = std::string(profile.issue) + " public AST invented a target transform";
+            return false;
+        }
+        const auto analyzed = rut::analyze_file(*ast);
+        if (!analyzed) {
+            error = std::string(profile.issue) + " zero-transform source failed public analysis";
+            return false;
+        }
+        std::unique_ptr<rut::HirModule> hir(analyzed.value());
+        if (hir->routes.len != 1u || hir->routes[0].control.kind != rut::HirControlKind::If ||
+            hir->routes[0].control.else_term.kind != rut::HirTerminatorKind::ForwardUpstream ||
+            hir->routes[0].control.else_term.has_forward_target_transform ||
+            hir->routes[0].control.else_term.forward_target_transform.strip_prefix.ptr != nullptr ||
+            hir->routes[0].control.else_term.forward_target_transform.replace_prefix.ptr !=
+                nullptr) {
+            error = std::string(profile.issue) + " public HIR invented a target transform";
+            return false;
+        }
+        const auto mir_result = rut::build_mir(*hir);
+        if (!mir_result) {
+            error = std::string(profile.issue) + " zero-transform source failed MIR lowering";
+            return false;
+        }
+        std::unique_ptr<rut::MirModule> mir(mir_result.value());
+        u32 mir_forwards = 0u;
+        for (u32 block = 0u; block < mir->functions[0].blocks.len; block++) {
+            const auto& term = mir->functions[0].blocks[block].term;
+            if (term.kind != rut::MirTerminatorKind::ForwardUpstream) continue;
+            mir_forwards++;
+            if (term.has_forward_target_transform) {
+                error = std::string(profile.issue) + " public MIR invented a target transform";
+                return false;
+            }
+        }
+        if (mir_forwards != 1u) {
+            error = std::string(profile.issue) + " public MIR lost the single forward terminator";
+            return false;
+        }
+    }
     {
         rut::LoadedProgram program{};
         struct ProgramGuard {
@@ -36101,6 +36200,7 @@ static bool capture_generated_exact_loopback_prefix_root_side(
         rut::i32 upstream_id = -1;
         u32 redirect_returns = 0u;
         u32 forward_returns = 0u;
+        u32 transform_ops = 0u;
         if (program.rir.module.func_count == 1u) {
             const auto& function = program.rir.module.functions[0];
             const auto find_const_i32 = [&](rut::rir::ValueId value, rut::i32& result) {
@@ -36126,8 +36226,8 @@ static bool capture_generated_exact_loopback_prefix_root_side(
                         redirect_returns++;
                         redirect_id = static_cast<u16>(inst.imm.i32_val);
                     }
-                    if (inst.op != rut::rir::Opcode::RetForwardBundle || instruction == 0u)
-                        continue;
+                    if (inst.op == rut::rir::Opcode::ReqSetTargetTransform) transform_ops++;
+                    if (inst.op != rut::rir::Opcode::RetForwardBundle) continue;
                     rut::i32 request_id = -1;
                     rut::i32 actual_bundle_id = -1;
                     if (inst.operand_count != 3u || !find_const_i32(inst.operand(0), upstream_id) ||
@@ -36140,10 +36240,20 @@ static bool capture_generated_exact_loopback_prefix_root_side(
                     }
                     request_policy_id = static_cast<u16>(request_id);
                     bundle_id = static_cast<u16>(actual_bundle_id);
-                    const auto& transform = rir_block.insts[instruction - 1u];
-                    if (transform.op == rut::rir::Opcode::ReqSetTargetTransform &&
-                        transform.imm.i32_val > 0) {
-                        forward_returns++;
+                    forward_returns++;
+                    if (profile.uses_target_transform) {
+                        if (instruction == 0u) {
+                            error = std::string(profile.issue) +
+                                    " public RIR forward lost its target-transform predecessor";
+                            return false;
+                        }
+                        const auto& transform = rir_block.insts[instruction - 1u];
+                        if (transform.op != rut::rir::Opcode::ReqSetTargetTransform ||
+                            transform.imm.i32_val <= 0) {
+                            error = std::string(profile.issue) +
+                                    " public RIR forward lost its target-transform linkage";
+                            return false;
+                        }
                         transform_id = static_cast<u16>(transform.imm.i32_val);
                     }
                 }
@@ -36159,10 +36269,15 @@ static bool capture_generated_exact_loopback_prefix_root_side(
                    strlen(profile.semantics->location) - 1u) != 0 ||
             program.config.routes[0].action != rut::RouteAction::JitHandler ||
             program.config.routes[0].needs_req_body ||
-            program.config.target_transform_count != 1u ||
+            program.rir.module.target_transform_count !=
+                (profile.uses_target_transform ? 1u : 0u) ||
+            program.config.target_transform_count != (profile.uses_target_transform ? 1u : 0u) ||
             program.config.redirect_policy_count != 1u || redirect_returns != 1u ||
-            forward_returns != 1u || upstream_id != 0 || request_policy_id == 0u ||
-            bundle_id == 0u || !program.config.target_transform_id_is_valid(transform_id) ||
+            forward_returns != 1u || transform_ops != (profile.uses_target_transform ? 1u : 0u) ||
+            upstream_id != 0 || request_policy_id == 0u || bundle_id == 0u ||
+            (profile.uses_target_transform &&
+             !program.config.target_transform_id_is_valid(transform_id)) ||
+            (!profile.uses_target_transform && transform_id != 0u) ||
             !program.config.redirect_policy_id_is_valid(redirect_id) ||
             program.config.upstreams[0].addr_count != 1u ||
             ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
@@ -36237,20 +36352,28 @@ static bool capture_generated_exact_loopback_prefix_root_side(
             }
             return true;
         };
-        const auto& transform = program.config.target_transforms[transform_id - 1u];
-        const auto& redirect = program.config.redirect_policies[redirect_id - 1u];
-        if (!transform.strip_prefix.eq({profile.semantics->location,
-                                        static_cast<u32>(strlen(profile.semantics->location))}) ||
-            !transform.replace_prefix.eq(
-                {profile.semantics->proxy_uri,
-                 static_cast<u32>(strlen(profile.semantics->proxy_uri))}) ||
-            !program.config.redirect_policy_strings_are_owned(redirect) ||
-            redirect.authority != rut::RedirectPolicyAuthority::RequestHost ||
-            redirect.port != rut::RedirectPolicyPort::ActualListener ||
-            redirect.query != rut::RedirectPolicyQuery::PreserveRaw ||
-            redirect.status_code != 301u || !forward_policies_are_owned_and_canonical() ||
-            !redirect.target_path.eq({profile.semantics->location,
-                                      static_cast<u32>(strlen(profile.semantics->location))})) {
+        const auto owned_program_state_is_canonical = [&]() {
+            const auto& redirect = program.config.redirect_policies[redirect_id - 1u];
+            if (!program.config.redirect_policy_strings_are_owned(redirect) ||
+                redirect.authority != rut::RedirectPolicyAuthority::RequestHost ||
+                redirect.port != rut::RedirectPolicyPort::ActualListener ||
+                redirect.query != rut::RedirectPolicyQuery::PreserveRaw ||
+                redirect.status_code != 301u || !forward_policies_are_owned_and_canonical() ||
+                !redirect.target_path.eq({profile.semantics->location,
+                                          static_cast<u32>(strlen(profile.semantics->location))}))
+                return false;
+            if (!profile.uses_target_transform)
+                return program.config.target_transform_count == 0u &&
+                       program.config.target_transform_bytes_used == 0u;
+            const auto& transform = program.config.target_transforms[transform_id - 1u];
+            return transform.strip_prefix.eq(
+                       {profile.semantics->location,
+                        static_cast<u32>(strlen(profile.semantics->location))}) &&
+                   transform.replace_prefix.eq(
+                       {profile.semantics->proxy_uri,
+                        static_cast<u32>(strlen(profile.semantics->proxy_uri))});
+        };
+        if (!owned_program_state_is_canonical()) {
             error = std::string(profile.issue) +
                     " public load lost binding-linked transform/redirect ownership";
             return false;
@@ -36266,11 +36389,13 @@ static bool capture_generated_exact_loopback_prefix_root_side(
         }
         program.src_map = nullptr;
         program.src_map_len = 0u;
-        if (!forward_policies_are_owned_and_canonical()) {
+        if (!owned_program_state_is_canonical()) {
             error = std::string(profile.issue) +
-                    " public load policy strings did not survive source/RIR teardown";
+                    " public load policy/redirect state did not survive source/RIR teardown";
             return false;
         }
+        observation.public_policy_ownership_proven = true;
+        observation.target_transform_inventory_proven = true;
     }
 
     struct RecorderGuard {
@@ -36607,6 +36732,8 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
         value.redirect_epoch_quiet = value.negative_probe_after_failed = true;
         value.negative_probe_after_quiet = value.clean_lifecycle = true;
         value.source_lifetime_proven = generated;
+        value.public_policy_ownership_proven = generated;
+        value.target_transform_inventory_proven = generated;
         std::fill(std::begin(value.eof_proven), std::end(value.eof_proven), true);
         return value;
     };
@@ -36651,7 +36778,7 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
     const std::string alternate_location = alternate_route + "/";
     const std::string replacement(profile.semantics->proxy_uri);
     const std::string alternate_replacement = replacement == "/" ? "/v1/" : "/";
-    const std::pair<const char*, std::string> mutations[] = {
+    std::vector<std::pair<const char*, std::string>> mutations = {
         {"listener", replace_unique(sources[0], "127.0.0.1:46305", "127.0.0.2:46305", "listener")},
         {"wildcard",
          replace_unique(sources[0], "listen 127.0.0.1:46305", "listen :46305", "wildcard")},
@@ -36668,21 +36795,6 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
                         "target_path: \"" + location + "\"",
                         "target_path: \"" + alternate_location + "\"",
                         "target")},
-        {"transform-strip",
-         replace_unique(sources[0],
-                        "strip_prefix: \"" + location + "\"",
-                        "strip_prefix: \"" + alternate_location + "\"",
-                        "strip")},
-        {"transform-replace",
-         replace_unique(sources[0],
-                        "replace_prefix: \"" + replacement + "\"",
-                        "replace_prefix: \"" + alternate_replacement + "\"",
-                        "replace")},
-        {"transform-configured-query",
-         replace_unique(sources[0],
-                        "replace_prefix: \"" + replacement + "\"",
-                        "replace_prefix: \"" + replacement + "?fixed=1\"",
-                        "replace-query")},
         {"request-host-policy",
          replace_unique(sources[0],
                         "            host: \"upstream\",",
@@ -36795,6 +36907,32 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
         {"hook-request-listener", sources[0] + "// req.listener marker\n"},
         {"hook-address-condition", sources[0] + "// address_condition marker\n"},
         {"hook-bind-address", sources[0] + "// bind_address marker\n"}};
+    if (profile.uses_target_transform) {
+        mutations.push_back({"transform-strip",
+                             replace_unique(sources[0],
+                                            "strip_prefix: \"" + location + "\"",
+                                            "strip_prefix: \"" + alternate_location + "\"",
+                                            "strip")});
+        mutations.push_back({"transform-replace",
+                             replace_unique(sources[0],
+                                            "replace_prefix: \"" + replacement + "\"",
+                                            "replace_prefix: \"" + alternate_replacement + "\"",
+                                            "replace")});
+        mutations.push_back({"transform-configured-query",
+                             replace_unique(sources[0],
+                                            "replace_prefix: \"" + replacement + "\"",
+                                            "replace_prefix: \"" + replacement + "?fixed=1\"",
+                                            "replace-query")});
+    } else {
+        mutations.push_back(
+            {"forbidden-target-transform",
+             replace_unique(sources[0],
+                            "return forward(nginx_upstream, request_policy: {",
+                            "return forward(nginx_upstream, target_transform: { strip_prefix: "
+                            "\"/api/\", replace_prefix: \"/\" }, request_policy: {",
+                            "forbidden-target-transform")});
+        mutations.push_back({"forbidden-set-path", sources[0] + "// set_path no-URI workaround\n"});
+    }
     for (const auto& mutation : mutations)
         if (!source_rejects(mutation.first, mutation.second)) return false;
 
@@ -36912,7 +37050,11 @@ static bool run_exact_loopback_prefix_root_four_way_self_checks(
         {"redirect-zero", &ExactLoopbackPrefixRootObservation::redirect_epoch_quiet},
         {"post-probe", &ExactLoopbackPrefixRootObservation::negative_probe_after_failed},
         {"post-quiet", &ExactLoopbackPrefixRootObservation::negative_probe_after_quiet},
-        {"lifecycle", &ExactLoopbackPrefixRootObservation::clean_lifecycle}};
+        {"lifecycle", &ExactLoopbackPrefixRootObservation::clean_lifecycle},
+        {"public-policy-ownership",
+         &ExactLoopbackPrefixRootObservation::public_policy_ownership_proven},
+        {"target-transform-inventory",
+         &ExactLoopbackPrefixRootObservation::target_transform_inventory_proven}};
     for (const auto& mutation : generated_flags) {
         changed = valid[2];
         changed.*(mutation.second) = false;
@@ -41094,6 +41236,8 @@ int main(int argc, char** argv) {
     const bool converter_exact_loopback_api_v1_replacement_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-api-v1-replacement-differential") == 0;
+    const bool converter_exact_loopback_api_no_uri_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-loopback-api-no-uri-differential") == 0;
     const bool converter_exact_loopback_max_proxy_prefix_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-max-proxy-prefix-differential") == 0;
@@ -41208,6 +41352,7 @@ int main(int argc, char** argv) {
          !converter_exact_loopback_return302_differential &&
          !converter_exact_loopback_prefix_root_replacement_differential &&
          !converter_exact_loopback_api_v1_replacement_differential &&
+         !converter_exact_loopback_api_no_uri_differential &&
          !converter_exact_loopback_max_proxy_prefix_differential &&
          !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
@@ -41257,6 +41402,7 @@ int main(int argc, char** argv) {
         (converter_exact_loopback_return302_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_prefix_root_replacement_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_api_v1_replacement_differential && argv[2][0] != '/') ||
+        (converter_exact_loopback_api_no_uri_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
@@ -41342,6 +41488,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-api-v1-replacement-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-loopback-api-no-uri-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-max-proxy-prefix-differential "
@@ -41709,11 +41858,17 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (exact_loopback_api_no_uri_oracle) {
+    if (exact_loopback_api_no_uri_oracle || converter_exact_loopback_api_no_uri_differential) {
         std::string self_check_error;
         if (!run_exact_loopback_api_no_uri_self_checks(self_check_error)) {
             std::cerr << "FAIL [#355 exact-loopback /api/ no-URI oracle self-check]: "
                       << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_exact_loopback_api_no_uri_differential &&
+            !run_exact_loopback_prefix_root_four_way_self_checks(self_check_error,
+                                                                 kExactLoopbackApiNoUriProfile)) {
+            std::cerr << "FAIL [#355 generated/four-way self-check]: " << self_check_error << "\n";
             return 1;
         }
     }
@@ -42401,6 +42556,45 @@ int main(int argc, char** argv) {
                "translated, never loaded directly; fixed representative Stage 4 only; broader "
                "P/U, configured query, P63/U128, #355 true no-URI, #347/#352 access equivalence, "
                "other listeners/methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
+        return 0;
+    }
+
+    if (converter_exact_loopback_api_no_uri_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-355-exact-api-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackPrefixRootObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_exact_loopback_prefix_root_differential(container_prefix,
+                                                                   argv[2],
+                                                                   observations,
+                                                                   generated_sources,
+                                                                   differential_error,
+                                                                   kExactLoopbackApiNoUriProfile)) {
+            std::cerr << "FAIL [#355 converter exact-loopback /api/ no-URI differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_exact_loopback_prefix_root_observation(observation,
+                                                            kExactLoopbackApiNoUriProfile);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #355 fixed exact listen 127.0.0.1:<port> plus clean /api/ prefix and "
+               "true no-URI proxy_pass in exactly listen/location and location/listen orders "
+               "traversed genuine nginx parsing/model lowering into canonical 3244-byte ordinary "
+               "RUT with zero target transforms. Two pinned-nginx 1.29.7 and two independent "
+               "public-CLI/JIT/io_uring sides retained causal same-port .2 guards and matched all "
+               "five Date-normalized downstream wires/EOF, three unchanged upstream targets "
+               "/api/, /api/x and /api/x?y=1 with rebuilt Host and omitted Connection, and "
+               "query-preserving automatic 301 redirects with no extra upstream. Side-scoped "
+               "current access schemas, binding-linked policy ownership, clean lifecycle, eight "
+               "unique ports/resources, source lifetime and canonical order equality were proven "
+               "(nginx.conf was translated, never loaded directly; fixed /api/ clean-target "
+               "profile only; wildcard/other prefixes, P63, configured query, normalization-"
+               "sensitive targets, #347/#352 access equivalence, other methods/bodies/framing/"
+               "reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
 
