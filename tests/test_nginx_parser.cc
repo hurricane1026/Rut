@@ -31,6 +31,12 @@ static_assert(std::is_trivially_copyable_v<nginx::RutSource>);
 static_assert(alignof(nginx::RutSource) == alignof(u32));
 static_assert(offsetof(nginx::RutSource, len) == 5948u);
 static_assert(sizeof(nginx::RutSource) == 5952u);
+static_assert(std::is_standard_layout_v<nginx::HttpProfileRutSource>);
+static_assert(std::is_trivially_copyable_v<nginx::HttpProfileRutSource>);
+static_assert(nginx::HttpProfileRutSource::kMaxAccessLogDeclarationLen == 329u);
+static_assert(nginx::HttpProfileRutSource::kCapacity == 6275u);
+static_assert(offsetof(nginx::HttpProfileRutSource, len) == 6276u);
+static_assert(sizeof(nginx::HttpProfileRutSource) == 6280u);
 
 TEST(nginx_converter, rut_source_capacity_layout_zero_reserve_and_copy_ownership) {
     static_assert(nginx::RutSource::kCapacity == 5946u);
@@ -666,6 +672,145 @@ TEST(nginx_http_profile_parser, rejects_broader_root_logging_and_shell_inventory
            FrontendError::UnsupportedSyntax,
            "server");
     reject(base.substr(0u, base.size() - 1u), FrontendError::UnexpectedEof, "", 0u);
+}
+
+TEST(nginx_converter,
+     http_profile_lowers_both_server_orders_to_exact_owned_access_log_then_existing_server) {
+    const std::string listen_first =
+        "    listen 8080;\n"
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n";
+    const std::string location_first =
+        "    location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "    listen 8080;\n";
+    std::string canonical;
+    for (const std::string& server_content : {listen_first, location_first}) {
+        std::string source = make_request_length_http_profile("/a", server_content);
+        const auto parsed =
+            nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        const auto server = nginx::lower_to_rut(parsed.value().server);
+        REQUIRE(server);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        static constexpr char kDeclaration[] =
+            "accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live }\n";
+        const std::string expected =
+            std::string(kDeclaration) + std::string(server.value().data, server.value().len);
+        CHECK_EQ(lowered.value().len, expected.size());
+        CHECK_EQ(std::string(lowered.value().data, lowered.value().len), expected);
+        CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+        CHECK_EQ(count_text(expected, "accessLog {"), 1u);
+        CHECK_EQ(expected.rfind(kDeclaration, 0u), 0u);
+        if (canonical.empty())
+            canonical = expected;
+        else
+            CHECK_EQ(expected, canonical);
+
+        const nginx::HttpProfileRutSource owned = lowered.value();
+        std::fill(source.begin(), source.end(), 'x');
+        CHECK_EQ(std::string(owned.data, owned.len), canonical);
+        const nginx::HttpProfileRutSource copied = owned;
+        CHECK_EQ(copied.view().ptr, copied.data);
+        CHECK_EQ(std::string(copied.data, copied.len), canonical);
+        CHECK_EQ(copied.data[copied.len], '\0');
+    }
+    CHECK_EQ(nginx::RutSource::kCapacity, 5946u);
+}
+
+TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_byte) {
+    const std::string path = "/" + std::string(nginx::kMaxAccessLogPathLen - 1u, 'p');
+    REQUIRE_EQ(path.size(), 255u);
+    const std::string server_content =
+        "    listen 127.0.0.1:65535;\n"
+        "    location / { proxy_pass http://255.255.255.255:65535; }\n"
+        "    location = /old { return 301 http://redirect.example/new; }\n";
+    std::string source = make_request_length_http_profile(path, server_content);
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto server = nginx::lower_to_rut(parsed.value().server);
+    REQUIRE(server);
+    REQUIRE_EQ(server.value().len, 5945u);
+    REQUIRE_EQ(server.value().len + 1u, nginx::RutSource::kCapacity);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len - server.value().len,
+             nginx::HttpProfileRutSource::kMaxAccessLogDeclarationLen);
+    CHECK_EQ(lowered.value().len, 6274u);
+    CHECK_EQ(lowered.value().len + 1u, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+    const std::string declaration =
+        "accessLog { path: \"" + path + "\", format: downstreamRequestBytes, publication: live }\n";
+    REQUIRE_EQ(declaration.size(), 329u);
+    CHECK_EQ(std::string(lowered.value().data, declaration.size()), declaration);
+    CHECK_EQ(std::string(lowered.value().data + declaration.size(), server.value().len),
+             std::string(server.value().data, server.value().len));
+}
+
+TEST(nginx_converter,
+     http_profile_reparse_rejects_complete_forged_inventory_without_child_dereference) {
+    std::string source =
+        make_request_length_http_profile("/logs/access.log",
+                                         "    listen 8080;\n"
+                                         "    location / { proxy_pass http://127.0.0.1:9000; }\n");
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    REQUIRE(nginx::lower_to_rut(parsed.value()));
+    const auto rejected = [&](const nginx::HttpProfile& candidate) {
+        const auto result = nginx::lower_to_rut(candidate);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    };
+
+    auto forged = parsed.value();
+    forged.log_format.profile = nginx::LogFormatProfile::None;
+    rejected(forged);
+    forged = parsed.value();
+    forged.access_log.destination_profile = nginx::AccessLogDestinationProfile::None;
+    rejected(forged);
+    forged = parsed.value();
+    forged.span.end--;
+    rejected(forged);
+    forged = parsed.value();
+    forged.log_format.name.ptr = reinterpret_cast<const char*>(1u);
+    rejected(forged);
+    forged = parsed.value();
+    forged.access_log.path.ptr = reinterpret_cast<const char*>(1u);
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.listen.port++;
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.listen.address = static_cast<ListenerAddress>(255u);
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.location.proxy_pass.address[0] = 10u;
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.location.path_span.end--;
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.exact_no_content_return.present = true;
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
+    rejected(forged);
+
+    std::string independent = source;
+    const auto other =
+        nginx::parse_http_profile({independent.data(), static_cast<u32>(independent.size())});
+    REQUIRE(other);
+    forged = parsed.value();
+    forged.access_log.path = other.value().access_log.path;
+    rejected(forged);
+    forged = parsed.value();
+    forged.server.location.path = other.value().server.location.path;
+    rejected(forged);
+
+    source[source.find("$request_length")] = 'x';
+    const auto mutated_source = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(mutated_source);
+    CHECK_EQ(mutated_source.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {

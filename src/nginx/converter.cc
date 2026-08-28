@@ -1,5 +1,6 @@
 #include "rut/nginx/converter.h"
 
+#include "rut/common/access_log_sink.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/strict_local_response.h"
 
@@ -182,6 +183,7 @@ static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactPathViewLen);
+static_assert(kMaxAccessLogPathLen == kAccessLogSinkPathMax);
 
 constexpr bool proxy_pass_uri_segment_byte_is_clean(char value) {
     const u8 byte = static_cast<u8>(value);
@@ -1395,6 +1397,200 @@ bool put_exact_no_content_return(Writer& writer, Str path) {
            writer.put_cstr("  head_mode: \"suppress_body\", body: b\"\"\n}) }\n");
 }
 
+bool spans_equal(const Span& left, const Span& right) {
+    return left.start == right.start && left.end == right.end && left.line == right.line &&
+           left.col == right.col;
+}
+
+bool borrowed_views_identical(Str left, Str right) {
+    return left.ptr == right.ptr && left.len == right.len;
+}
+
+struct HttpProfileComparison {
+    Span mismatch{};
+
+    bool reject(Span safe_span) {
+        mismatch = safe_span;
+        return false;
+    }
+};
+
+bool compare_listen(const Listen& supplied,
+                    const Listen& fresh,
+                    HttpProfileComparison& comparison,
+                    Span fallback) {
+    if (supplied.port != fresh.port || supplied.address != fresh.address ||
+        supplied.ipv4_host != fresh.ipv4_host || !spans_equal(supplied.span, fresh.span) ||
+        !borrowed_views_identical(supplied.value, fresh.value) ||
+        !spans_equal(supplied.value_span, fresh.value_span))
+        return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
+    return true;
+}
+
+bool compare_proxy_pass(const ProxyPass& supplied,
+                        const ProxyPass& fresh,
+                        HttpProfileComparison& comparison,
+                        Span fallback) {
+    for (u32 i = 0u; i < 4u; i++)
+        if (supplied.address[i] != fresh.address[i])
+            return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
+    if (supplied.port != fresh.port || supplied.has_uri != fresh.has_uri ||
+        !borrowed_views_identical(supplied.uri, fresh.uri) ||
+        !spans_equal(supplied.uri_span, fresh.uri_span) || !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
+    return true;
+}
+
+bool compare_proxy_read_timeout(const ProxyReadTimeout& supplied,
+                                const ProxyReadTimeout& fresh,
+                                HttpProfileComparison& comparison,
+                                Span fallback) {
+    if (supplied.present != fresh.present || supplied.milliseconds != fresh.milliseconds ||
+        !spans_equal(supplied.span, fresh.span) ||
+        !spans_equal(supplied.value_span, fresh.value_span))
+        return comparison.reject(is_valid_span(fresh.span) ? fresh.span : fallback);
+    return true;
+}
+
+bool compare_location(const Location& supplied,
+                      const Location& fresh,
+                      HttpProfileComparison& comparison,
+                      Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (!borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(safe);
+    return compare_proxy_pass(supplied.proxy_pass, fresh.proxy_pass, comparison, safe) &&
+           compare_proxy_read_timeout(
+               supplied.proxy_read_timeout, fresh.proxy_read_timeout, comparison, safe);
+}
+
+bool compare_exact_local_return(const ExactLocalReturnLocation& supplied,
+                                const ExactLocalReturnLocation& fresh,
+                                HttpProfileComparison& comparison,
+                                Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (supplied.present != fresh.present || !borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !spans_equal(supplied.span, fresh.span) ||
+        supplied.response.status != fresh.response.status ||
+        !borrowed_views_identical(supplied.response.body, fresh.response.body) ||
+        !spans_equal(supplied.response.body_span, fresh.response.body_span) ||
+        !spans_equal(supplied.response.span, fresh.response.span))
+        return comparison.reject(safe);
+    return true;
+}
+
+bool compare_exact_no_content_return(const ExactNoContentReturnLocation& supplied,
+                                     const ExactNoContentReturnLocation& fresh,
+                                     HttpProfileComparison& comparison,
+                                     Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (supplied.present != fresh.present || !borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !spans_equal(supplied.span, fresh.span) ||
+        supplied.response.status != fresh.response.status ||
+        !spans_equal(supplied.response.status_span, fresh.response.status_span) ||
+        !spans_equal(supplied.response.span, fresh.response.span))
+        return comparison.reject(safe);
+    return true;
+}
+
+bool compare_absolute_redirect(const AbsoluteRedirect& supplied,
+                               const AbsoluteRedirect& fresh,
+                               HttpProfileComparison& comparison,
+                               Span safe) {
+    if (supplied.status != fresh.status ||
+        !borrowed_views_identical(supplied.status_lexeme, fresh.status_lexeme) ||
+        !spans_equal(supplied.status_span, fresh.status_span) ||
+        !borrowed_views_identical(supplied.target, fresh.target) ||
+        !spans_equal(supplied.target_span, fresh.target_span) ||
+        !borrowed_views_identical(supplied.authority, fresh.authority) ||
+        !spans_equal(supplied.authority_span, fresh.authority_span) ||
+        !borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(safe);
+    return true;
+}
+
+bool compare_exact_absolute_redirect(const ExactAbsoluteRedirectLocation& supplied,
+                                     const ExactAbsoluteRedirectLocation& fresh,
+                                     HttpProfileComparison& comparison,
+                                     Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (supplied.present != fresh.present || !borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(safe);
+    return compare_absolute_redirect(supplied.response, fresh.response, comparison, safe);
+}
+
+bool compare_server(const Server& supplied,
+                    const Server& fresh,
+                    HttpProfileComparison& comparison) {
+    if (!spans_equal(supplied.span, fresh.span)) return comparison.reject(fresh.span);
+    if (!compare_listen(supplied.listen, fresh.listen, comparison, fresh.span) ||
+        !compare_location(supplied.location, fresh.location, comparison, fresh.span) ||
+        !compare_exact_local_return(
+            supplied.exact_local_return, fresh.exact_local_return, comparison, fresh.span) ||
+        !compare_exact_no_content_return(supplied.exact_no_content_return,
+                                         fresh.exact_no_content_return,
+                                         comparison,
+                                         fresh.span) ||
+        !compare_exact_absolute_redirect(supplied.exact_absolute_redirect,
+                                         fresh.exact_absolute_redirect,
+                                         comparison,
+                                         fresh.span))
+        return false;
+    if (supplied.pre_route_trace.profile != fresh.pre_route_trace.profile ||
+        !spans_equal(supplied.pre_route_trace.span, fresh.pre_route_trace.span))
+        return comparison.reject(fresh.span);
+    return true;
+}
+
+bool compare_log_format(const LogFormat& supplied,
+                        const LogFormat& fresh,
+                        HttpProfileComparison& comparison,
+                        Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (supplied.profile != fresh.profile || !borrowed_views_identical(supplied.name, fresh.name) ||
+        !spans_equal(supplied.name_span, fresh.name_span) ||
+        !borrowed_views_identical(supplied.value, fresh.value) ||
+        !spans_equal(supplied.value_span, fresh.value_span) ||
+        !spans_equal(supplied.token_span, fresh.token_span) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(safe);
+    return true;
+}
+
+bool compare_access_log(const AccessLog& supplied,
+                        const AccessLog& fresh,
+                        HttpProfileComparison& comparison,
+                        Span fallback) {
+    const Span safe = is_valid_span(fresh.span) ? fresh.span : fallback;
+    if (supplied.destination_profile != fresh.destination_profile ||
+        !borrowed_views_identical(supplied.path, fresh.path) ||
+        !spans_equal(supplied.path_span, fresh.path_span) ||
+        !borrowed_views_identical(supplied.format_name, fresh.format_name) ||
+        !spans_equal(supplied.format_name_span, fresh.format_name_span) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(safe);
+    return true;
+}
+
+bool compare_http_profile(const HttpProfile& supplied,
+                          const HttpProfile& fresh,
+                          HttpProfileComparison& comparison) {
+    if (!borrowed_views_identical(supplied.source, fresh.source) ||
+        !spans_equal(supplied.span, fresh.span))
+        return comparison.reject(fresh.span);
+    return compare_log_format(supplied.log_format, fresh.log_format, comparison, fresh.span) &&
+           compare_access_log(supplied.access_log, fresh.access_log, comparison, fresh.span) &&
+           compare_server(supplied.server, fresh.server, comparison);
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
@@ -1537,6 +1733,55 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
              "html>\\r\\n\"\n") ||
         !put("        })\n") || !put("    }\n") || !put("}\n"))
         return fail_overflow();
+    return output;
+}
+
+FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile) {
+    const uintptr_t source_address = reinterpret_cast<uintptr_t>(profile.source.ptr);
+    if (profile.source.ptr == nullptr || profile.source.len == 0u ||
+        source_address > UINTPTR_MAX - profile.source.len)
+        return unsupported(profile.span, lit_str("invalid readable http profile source"));
+
+    // The documented readable/stable root view is the only supplied borrow we
+    // inspect. Reparse it, compare metadata without reading any supplied child
+    // pointer, then consume only the fresh parser-owned views below.
+    auto reparsed = parse_http_profile(profile.source);
+    if (!reparsed) return core::make_unexpected(reparsed.error());
+    const HttpProfile& fresh = reparsed.value();
+    HttpProfileComparison comparison{};
+    if (!compare_http_profile(profile, fresh, comparison))
+        return unsupported(comparison.mismatch,
+                           lit_str("http profile metadata does not match its source"));
+
+    if (!access_log_sink_path_valid(fresh.access_log.path))
+        return unsupported(fresh.access_log.path_span,
+                           lit_str("invalid access log sink path model"));
+
+    auto server_source = lower_to_rut(fresh.server);
+    if (!server_source) return core::make_unexpected(server_source.error());
+
+    static constexpr char kAccessLogPrefix[] = "accessLog { path: \"";
+    static constexpr char kAccessLogSuffix[] =
+        "\", format: downstreamRequestBytes, publication: live }\n";
+    static_assert(sizeof(kAccessLogPrefix) - 1u == 19u);
+    static_assert(sizeof(kAccessLogSuffix) - 1u == 55u);
+    static_assert(sizeof(kAccessLogPrefix) - 1u + kAccessLogSinkPathMax + sizeof(kAccessLogSuffix) -
+                      1u ==
+                  HttpProfileRutSource::kMaxAccessLogDeclarationLen);
+
+    HttpProfileRutSource output{};
+    const auto put = [&](Str text) {
+        if (text.ptr == nullptr || text.len >= HttpProfileRutSource::kCapacity - output.len)
+            return false;
+        for (u32 i = 0u; i < text.len; i++) output.data[output.len + i] = text.ptr[i];
+        output.len += text.len;
+        return true;
+    };
+    if (!put({kAccessLogPrefix, sizeof(kAccessLogPrefix) - 1u}) || !put(fresh.access_log.path) ||
+        !put({kAccessLogSuffix, sizeof(kAccessLogSuffix) - 1u}) ||
+        !put(server_source.value().view()))
+        return out_of_memory(fresh.span, lit_str("generated RUT http profile source is too large"));
+    output.data[output.len] = '\0';
     return output;
 }
 

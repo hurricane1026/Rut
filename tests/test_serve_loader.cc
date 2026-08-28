@@ -544,6 +544,71 @@ TEST(serve_loader, source_access_log_metadata_is_owned_and_reuses_without_stale_
     std::filesystem::remove_all(dir);
 }
 
+TEST(serve_loader, nginx_http_profile_lowering_loads_owned_access_log_and_proxy_inventory) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_http_profile_access_log";
+    std::filesystem::remove_all(dir);
+    const std::string path = dir + "/app.rut";
+    static constexpr char kAccessPath[] = "/var/log/rut/generated-request-length.log";
+    std::string generated;
+    {
+        std::string nginx_source =
+            "http { log_format compat \"$request_length\"; access_log " + std::string(kAccessPath) +
+            " compat; server { listen 127.0.0.1:8088; location / { proxy_pass "
+            "http://127.0.0.1:9002; } } }";
+        const auto parsed =
+            nginx::parse_http_profile({nginx_source.data(), static_cast<u32>(nginx_source.size())});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        std::fill(nginx_source.begin(), nginx_source.end(), 'x');
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    REQUIRE(program.has_listener);
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8088u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), 9002u);
+    REQUIRE_EQ(program.config.route_count, 3u);
+    for (u32 i = 0u; i < program.config.route_count; i++) {
+        CHECK_EQ(program.config.routes[i].path_len, 1u);
+        CHECK_EQ(program.config.routes[i].path[0], '/');
+    }
+    REQUIRE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(program.access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+    CHECK_EQ(std::string(program.access_log.path, program.access_log.path_len), kAccessPath);
+    CHECK_EQ(program.access_log.path[program.access_log.path_len], '\0');
+    CHECK(access_log_sink_spec_valid(program.access_log));
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    CHECK_EQ(std::string(program.access_log.path, program.access_log.path_len), kAccessPath);
+    CHECK(access_log_sink_spec_valid(program.access_log));
+
+    program.destroy();
+    write_file(dir, "app.rut", "route GET \"/\" { return 204 }\n");
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK_FALSE(program.access_log.present);
+    CHECK_EQ(program.access_log.path_len, 0u);
+    for (char byte : program.access_log.path) CHECK_EQ(byte, '\0');
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(serve_loader, failed_access_log_frontend_clears_poisoned_owned_metadata) {
     const std::string dir = "/tmp/rut_serve_loader_access_log_failed";
     std::filesystem::remove_all(dir);

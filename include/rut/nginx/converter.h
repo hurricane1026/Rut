@@ -35,9 +35,32 @@ struct RutSource {
     [[nodiscard]] Str view() const { return {data, len}; }
 };
 
+// Owned output for the bounded request-length http profile. The accessLog
+// declaration contributes at most 329 bytes (19-byte prefix, 255-byte path,
+// 55-byte suffix); the existing Server lowering contributes at most 5945
+// payload bytes. One final byte remains zero for termination.
+struct HttpProfileRutSource {
+    static constexpr u32 kMaxAccessLogDeclarationLen = 329u;
+    static constexpr u32 kCapacity = 6275u;
+    char data[kCapacity]{};
+    u32 len = 0;
+
+    [[nodiscard]] Str view() const { return {data, len}; }
+};
+
+static_assert(HttpProfileRutSource::kMaxAccessLogDeclarationLen == 19u + 255u + 55u);
+static_assert(HttpProfileRutSource::kCapacity ==
+              RutSource::kCapacity + HttpProfileRutSource::kMaxAccessLogDeclarationLen);
+
 // Lower only the parser's exact minimal semantic model to deterministic RUT
 // source. The output is intentionally nginx-independent RUT policy syntax;
 // unsupported/forged model values fail closed with the model's source span.
 FrontendResult<RutSource> lower_to_rut(const Server& server);
+
+// Lower the exact bounded http profile to an ordinary RUT accessLog declaration
+// followed by the unchanged Server lowering. `profile.source` must remain
+// readable and byte-stable until this call returns. The returned source owns
+// every emitted byte and is independent of the nginx input afterward.
+FrontendResult<HttpProfileRutSource> lower_to_rut(const HttpProfile& profile);
 
 }  // namespace rut::nginx
