@@ -748,6 +748,21 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue354_converter_exact_loopback_api_v1_replacement_differential
+        COMMAND test_nginx_differential
+                --converter-exact-loopback-api-v1-replacement-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue354_converter_exact_loopback_api_v1_replacement_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue353_converter_exact_loopback_max_proxy_prefix_differential
         COMMAND test_nginx_differential
                 --converter-exact-loopback-max-proxy-prefix-differential
