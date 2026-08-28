@@ -34035,7 +34035,7 @@ static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiV1Profile = {
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiNoUriProfile = {
     "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 3244u, false};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackServiceNoUriOracleProfile = {
-    "#356", "exact_loopback_service_no_uri", &kExactServiceNoUriProxyOracleProfile, 0u, false};
+    "#356", "exact_loopback_service_no_uri", &kExactServiceNoUriProxyOracleProfile, 3256u, false};
 
 static std::string make_exact_loopback_prefix_root_config(
     u16 frontend_port,
@@ -36675,7 +36675,9 @@ static bool capture_generated_exact_loopback_prefix_root_side(
         const rut::AstRouteDecl* ast_route = nullptr;
         for (u32 i = 0u; i < ast->items.len; i++)
             if (ast->items[i].kind == rut::AstItemKind::Route &&
-                ast->items[i].route.path.eq({"/api", 4u}))
+                ast->items[i].route.path.eq(
+                    {profile.semantics->location,
+                     static_cast<u32>(strlen(profile.semantics->location) - 1u)}))
                 ast_route = &ast->items[i].route;
         if (ast_route == nullptr || ast_route->statements.len != 1u ||
             ast_route->statements[0] == nullptr ||
@@ -41798,6 +41800,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--converter-exact-loopback-api-v1-replacement-differential") == 0;
     const bool converter_exact_loopback_api_no_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-loopback-api-no-uri-differential") == 0;
+    const bool converter_exact_loopback_service_no_uri_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-loopback-service-no-uri-differential") == 0;
     const bool converter_exact_loopback_max_proxy_prefix_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-exact-loopback-max-proxy-prefix-differential") == 0;
@@ -41915,6 +41919,7 @@ int main(int argc, char** argv) {
          !converter_exact_loopback_prefix_root_replacement_differential &&
          !converter_exact_loopback_api_v1_replacement_differential &&
          !converter_exact_loopback_api_no_uri_differential &&
+         !converter_exact_loopback_service_no_uri_differential &&
          !converter_exact_loopback_max_proxy_prefix_differential &&
          !bounded_exact_local_path_oracle && !bounded_no_content_path_oracle &&
          !normalized_exact_trailing_slash_oracle && !trailing_slash_no_content_oracle &&
@@ -41966,6 +41971,7 @@ int main(int argc, char** argv) {
         (converter_exact_loopback_prefix_root_replacement_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_api_v1_replacement_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_api_no_uri_differential && argv[2][0] != '/') ||
+        (converter_exact_loopback_service_no_uri_differential && argv[2][0] != '/') ||
         (converter_exact_loopback_max_proxy_prefix_differential && argv[2][0] != '/') ||
         (converter_service_root_proxy_uri_differential && argv[2][0] != '/') ||
         (converter_max_proxy_prefix_differential && argv[2][0] != '/') ||
@@ -42061,6 +42067,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-api-no-uri-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-loopback-service-no-uri-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-loopback-max-proxy-prefix-differential "
@@ -42455,11 +42464,18 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (exact_loopback_service_no_uri_oracle) {
+    if (exact_loopback_service_no_uri_oracle ||
+        converter_exact_loopback_service_no_uri_differential) {
         std::string self_check_error;
         if (!run_exact_loopback_service_no_uri_self_checks(self_check_error)) {
             std::cerr << "FAIL [#356 exact-loopback /service/ no-URI oracle self-check]: "
                       << self_check_error << "\n";
+            return 1;
+        }
+        if (converter_exact_loopback_service_no_uri_differential &&
+            !run_exact_loopback_prefix_root_four_way_self_checks(
+                self_check_error, kExactLoopbackServiceNoUriOracleProfile)) {
+            std::cerr << "FAIL [#356 generated/four-way self-check]: " << self_check_error << "\n";
             return 1;
         }
     }
@@ -43264,6 +43280,46 @@ int main(int argc, char** argv) {
                "profile only; wildcard/other prefixes, P63, configured query, normalization-"
                "sensitive targets, #347/#352 access equivalence, other methods/bodies/framing/"
                "reuse/failures/H1.0/H2/TLS excluded)\n";
+        return 0;
+    }
+
+    if (converter_exact_loopback_service_no_uri_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-converter-356-exact-service-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackPrefixRootObservation observations[4];
+        std::string generated_sources[2];
+        std::string differential_error;
+        if (!run_converter_exact_loopback_prefix_root_differential(
+                container_prefix,
+                argv[2],
+                observations,
+                generated_sources,
+                differential_error,
+                kExactLoopbackServiceNoUriOracleProfile)) {
+            std::cerr << "FAIL [#356 converter exact-loopback /service/ no-URI differential]: "
+                      << differential_error << "\n";
+            for (const auto& observation : observations)
+                dump_exact_loopback_prefix_root_observation(
+                    observation, kExactLoopbackServiceNoUriOracleProfile);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #356 representative exact listen 127.0.0.1:<port> plus clean /service/ "
+               "prefix and true no-URI proxy_pass in exactly listen/location and "
+               "location/listen orders traversed genuine nginx parsing/model lowering into "
+               "canonical 3256-byte ordinary RUT with zero target transforms. Two pinned-nginx "
+               "1.29.7 and two independent public-CLI/JIT/io_uring sides retained causal "
+               "same-port .2 guards and matched all five Date-normalized downstream wires/EOF, "
+               "three unchanged upstream targets /service/, /service/x and /service/x?y=1 with "
+               "rebuilt Host and omitted Connection, and query-preserving automatic 301 "
+               "redirects with no extra upstream. Side-scoped current access schemas, "
+               "binding-linked policy ownership, clean lifecycle, eight unique ports/resources, "
+               "source lifetime and canonical order equality were proven (nginx.conf was "
+               "translated, never loaded directly; representative Stage 4A only; P63, wildcard "
+               "no-URI, configured URI/query, normalization-sensitive targets, #347/#352 access "
+               "equivalence, other methods/bodies/framing/reuse/failures/H1.0/H2/TLS excluded)\n";
         return 0;
     }
 
