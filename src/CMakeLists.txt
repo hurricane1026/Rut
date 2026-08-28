@@ -148,6 +148,7 @@ add_library(rut_runtime STATIC
     runtime/ws_terminate.cc
     runtime/access_log.cc
     runtime/access_log_live.cc
+    runtime/access_log_live_writer.cc
     runtime/access_log_startup.cc
     runtime/traffic_capture.cc
     runtime/route_art.cc

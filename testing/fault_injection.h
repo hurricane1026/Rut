@@ -169,12 +169,52 @@ public:
     ~ScopedIoFault();
 
     int remaining_read_eintrs() const;
+    int remaining_write_eagains() const;
     int remaining_write_eintrs() const;
+    int remaining_write_fatals() const;
     int remaining_send_eagains() const;
     int remaining_connect_failures() const;
 
 private:
     IoFaultConfig previous_;
+};
+
+enum class HeldPositiveWriteError : uint8_t {
+    None,
+    InvalidTargetFd,
+    InvalidPrefixLength,
+    AlreadyOwned,
+    InvalidWriteLength,
+    PrefixWriteFailed,
+    DuplicateRelease,
+};
+
+// Process-wide, fd-specific test seam for a real positive short write followed
+// by one held matching write. The first target write reaches the kernel with
+// strict_prefix bytes. The second target write stops before the kernel until
+// release() is called. One owner is allowed; destruction releases and waits for
+// an in-flight hold so no global state or blocked thread survives the scope.
+class ScopedHeldPositiveWrite {
+public:
+    ScopedHeldPositiveWrite(int target_fd, size_t strict_prefix);
+    ScopedHeldPositiveWrite(const ScopedHeldPositiveWrite&) = delete;
+    ScopedHeldPositiveWrite& operator=(const ScopedHeldPositiveWrite&) = delete;
+    ~ScopedHeldPositiveWrite();
+
+    bool wait_until_held();
+    bool release();
+    bool wait_until_consumed();
+
+    bool owns_state() const;
+    bool prefix_consumed() const;
+    bool held() const;
+    bool released() const;
+    bool consumed() const;
+    bool failed_closed() const;
+    HeldPositiveWriteError error() const;
+
+private:
+    HeldPositiveWriteError local_error_ = HeldPositiveWriteError::None;
 };
 
 class ScopedSyscallFault {

@@ -42,6 +42,27 @@ void poison_held_epoll_event(HeldEpollEventState& state, HeldEpollEventError err
     state.error = error;
 }
 
+struct HeldPositiveWriteState {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    ScopedHeldPositiveWrite* owner = nullptr;
+    int target_fd = -1;
+    size_t strict_prefix = 0u;
+    bool prefix_consumed = false;
+    bool held = false;
+    bool released = false;
+    bool consumed = false;
+    HeldPositiveWriteError error = HeldPositiveWriteError::None;
+};
+
+HeldPositiveWriteState g_held_positive_write{};
+
+void poison_held_positive_write(HeldPositiveWriteState& state, HeldPositiveWriteError error) {
+    state.error = error;
+    state.released = true;
+    pthread_cond_broadcast(&state.condition);
+}
+
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
 using SocketFn = int (*)(int, int, int);
@@ -433,8 +454,16 @@ int ScopedIoFault::remaining_read_eintrs() const {
     return g_read_eintr_count.load(std::memory_order_relaxed);
 }
 
+int ScopedIoFault::remaining_write_eagains() const {
+    return g_write_eagain_count.load(std::memory_order_relaxed);
+}
+
 int ScopedIoFault::remaining_write_eintrs() const {
     return g_write_eintr_count.load(std::memory_order_relaxed);
+}
+
+int ScopedIoFault::remaining_write_fatals() const {
+    return g_write_fatal_count.load(std::memory_order_relaxed);
 }
 
 int ScopedIoFault::remaining_send_eagains() const {
@@ -443,6 +472,139 @@ int ScopedIoFault::remaining_send_eagains() const {
 
 int ScopedIoFault::remaining_connect_failures() const {
     return g_connect_fail_count.load(std::memory_order_relaxed);
+}
+
+ScopedHeldPositiveWrite::ScopedHeldPositiveWrite(int target_fd, size_t strict_prefix) {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (target_fd < 0) {
+        local_error_ = HeldPositiveWriteError::InvalidTargetFd;
+    } else if (strict_prefix == 0u) {
+        local_error_ = HeldPositiveWriteError::InvalidPrefixLength;
+    } else if (state.owner != nullptr) {
+        local_error_ = HeldPositiveWriteError::AlreadyOwned;
+    } else {
+        state.owner = this;
+        state.target_fd = target_fd;
+        state.strict_prefix = strict_prefix;
+        state.prefix_consumed = false;
+        state.held = false;
+        state.released = false;
+        state.consumed = false;
+        state.error = HeldPositiveWriteError::None;
+    }
+    pthread_mutex_unlock(&state.mutex);
+}
+
+ScopedHeldPositiveWrite::~ScopedHeldPositiveWrite() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (state.owner == this) {
+        state.released = true;
+        pthread_cond_broadcast(&state.condition);
+        while (state.held && !state.consumed) pthread_cond_wait(&state.condition, &state.mutex);
+        state.owner = nullptr;
+        state.target_fd = -1;
+        state.strict_prefix = 0u;
+        state.prefix_consumed = false;
+        state.held = false;
+        state.released = false;
+        state.consumed = false;
+        state.error = HeldPositiveWriteError::None;
+    }
+    pthread_mutex_unlock(&state.mutex);
+}
+
+bool ScopedHeldPositiveWrite::wait_until_held() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    while (state.owner == this && !state.held && state.error == HeldPositiveWriteError::None)
+        pthread_cond_wait(&state.condition, &state.mutex);
+    const bool result =
+        state.owner == this && state.held && state.error == HeldPositiveWriteError::None;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::release() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    if (state.owner != this || state.error != HeldPositiveWriteError::None || !state.held) {
+        pthread_mutex_unlock(&state.mutex);
+        return false;
+    }
+    if (state.released) {
+        poison_held_positive_write(state, HeldPositiveWriteError::DuplicateRelease);
+        pthread_mutex_unlock(&state.mutex);
+        return false;
+    }
+    state.released = true;
+    pthread_cond_broadcast(&state.condition);
+    pthread_mutex_unlock(&state.mutex);
+    return true;
+}
+
+bool ScopedHeldPositiveWrite::wait_until_consumed() {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    while (state.owner == this && !state.consumed && state.error == HeldPositiveWriteError::None)
+        pthread_cond_wait(&state.condition, &state.mutex);
+    const bool result =
+        state.owner == this && state.consumed && state.error == HeldPositiveWriteError::None;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::owns_state() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::prefix_consumed() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.prefix_consumed;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::held() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.held;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::released() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.released;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::consumed() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const bool result = state.owner == this && state.consumed;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
+}
+
+bool ScopedHeldPositiveWrite::failed_closed() const {
+    return error() != HeldPositiveWriteError::None;
+}
+
+HeldPositiveWriteError ScopedHeldPositiveWrite::error() const {
+    auto& state = g_held_positive_write;
+    pthread_mutex_lock(&state.mutex);
+    const HeldPositiveWriteError result = state.owner == this ? state.error : local_error_;
+    pthread_mutex_unlock(&state.mutex);
+    return result;
 }
 
 ScopedSyscallFault::ScopedSyscallFault(const SyscallFaultConfig& config)
@@ -671,6 +833,61 @@ extern "C" ssize_t read(int fd, void* buf, size_t count) {
 
 extern "C" ssize_t write(int fd, const void* buf, size_t count) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    auto& held = rut::test_fault::g_held_positive_write;
+    pthread_mutex_lock(&held.mutex);
+    const bool matches_held_write = held.owner != nullptr && fd == held.target_fd &&
+                                    held.error == rut::test_fault::HeldPositiveWriteError::None;
+    if (matches_held_write && !held.prefix_consumed) {
+        if (count <= held.strict_prefix) {
+            rut::test_fault::poison_held_positive_write(
+                held, rut::test_fault::HeldPositiveWriteError::InvalidWriteLength);
+            pthread_mutex_unlock(&held.mutex);
+            errno = EINVAL;
+            return -1;
+        }
+        const size_t prefix = held.strict_prefix;
+        pthread_mutex_unlock(&held.mutex);
+        const ssize_t result = rut::test_fault::g_real_write(fd, buf, prefix);
+        pthread_mutex_lock(&held.mutex);
+        if (held.owner != nullptr && fd == held.target_fd) {
+            if (result == static_cast<ssize_t>(prefix)) {
+                held.prefix_consumed = true;
+                pthread_cond_broadcast(&held.condition);
+            } else {
+                rut::test_fault::poison_held_positive_write(
+                    held, rut::test_fault::HeldPositiveWriteError::PrefixWriteFailed);
+            }
+        }
+        pthread_mutex_unlock(&held.mutex);
+        return result;
+    }
+    if (matches_held_write && held.prefix_consumed && !held.consumed) {
+        held.held = true;
+        pthread_cond_broadcast(&held.condition);
+        while (!held.released && held.error == rut::test_fault::HeldPositiveWriteError::None)
+            pthread_cond_wait(&held.condition, &held.mutex);
+        const bool proceed = held.error == rut::test_fault::HeldPositiveWriteError::None;
+        if (!proceed) {
+            held.held = false;
+            held.consumed = true;
+            pthread_cond_broadcast(&held.condition);
+        }
+        pthread_mutex_unlock(&held.mutex);
+        if (!proceed) {
+            errno = EIO;
+            return -1;
+        }
+        const ssize_t result = rut::test_fault::g_real_write(fd, buf, count);
+        pthread_mutex_lock(&held.mutex);
+        if (held.owner != nullptr && fd == held.target_fd) {
+            held.held = false;
+            held.consumed = true;
+            pthread_cond_broadcast(&held.condition);
+        }
+        pthread_mutex_unlock(&held.mutex);
+        return result;
+    }
+    pthread_mutex_unlock(&held.mutex);
     if (rut::test_fault::io_fd_matches(fd)) {
         if (rut::test_fault::consume_fault(rut::test_fault::g_write_eagain_count)) {
             errno = EAGAIN;

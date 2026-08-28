@@ -332,6 +332,18 @@ target_include_directories(test_access_log_live PRIVATE
 add_test(NAME test_access_log_live COMMAND test_access_log_live)
 set_tests_properties(test_access_log_live PROPERTIES LABELS "unit;runtime" TIMEOUT 30)
 
+add_executable(test_access_log_live_writer
+    test_access_log_live_writer.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
+target_link_libraries(test_access_log_live_writer rut_runtime)
+target_include_directories(test_access_log_live_writer PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_access_log_live_writer COMMAND test_access_log_live_writer)
+set_tests_properties(test_access_log_live_writer PROPERTIES LABELS "unit;runtime" TIMEOUT 30)
+
 add_executable(test_access_log_startup test_access_log_startup.cc)
 target_link_libraries(test_access_log_startup rut_runtime)
 target_include_directories(test_access_log_startup PRIVATE
