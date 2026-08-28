@@ -4931,6 +4931,15 @@ static constexpr CleanProxyUriOracleProfile kExactApiV1ProxyUriOracleProfile = {
     {"/v1/", "/v1/x", "/v1/x?y=1"},
 };
 
+static constexpr CleanProxyUriOracleProfile kExactApiNoUriProxyOracleProfile = {
+    "#355",
+    "355-exact-api-no-uri",
+    "/api/",
+    "",
+    {"/api/", "/api/x", "/api/x?y=1", "/api", "/api?x=1"},
+    {"/api/", "/api/x", "/api/x?y=1"},
+};
+
 static std::string make_api_non_root_proxy_uri_fragment(u16 frontend_port, u16 backend_port) {
     return "server {\n"
            "  listen " +
@@ -33716,6 +33725,8 @@ static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackPrefixRootProfil
     "#353", "exact_loopback_prefix_root", &kServiceRootProxyUriOracleProfile, 3358u};
 static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiV1Profile = {
     "#354", "exact_loopback_api_v1", &kExactApiV1ProxyUriOracleProfile, 3345u};
+static constexpr ExactLoopbackPrefixOracleProfile kExactLoopbackApiNoUriProfile = {
+    "#355", "exact_loopback_api_no_uri", &kExactApiNoUriProxyOracleProfile, 0u};
 
 static std::string make_exact_loopback_prefix_root_config(
     u16 frontend_port,
@@ -34783,6 +34794,309 @@ static bool run_exact_loopback_api_v1_self_checks(std::string& error) {
     return true;
 }
 
+static bool run_exact_loopback_api_no_uri_self_checks(std::string& error) {
+    static constexpr u16 kPorts[] = {45501u, 45502u, 45503u, 45504u, 45505u};
+    const std::string scope = "rut-nginx-355-selfcheck-scope";
+    const std::string access_path = "/tmp/rut-nginx-355-selfcheck-access";
+    const auto replace_unique =
+        [&](std::string value, const std::string& from, const std::string& to, const char* label) {
+            const size_t offset = from.empty() ? std::string::npos : value.find(from);
+            if (from.empty() || from == to || offset == std::string::npos ||
+                value.find(from, offset + from.size()) != std::string::npos) {
+                error = std::string("#355 mutation was not unique/non-no-op: ") + label;
+                return std::string{};
+            }
+            value.replace(offset, from.size(), to);
+            return value;
+        };
+    if (kExactLoopbackApiNoUriProfile.semantics != &kExactApiNoUriProxyOracleProfile ||
+        kExactApiNoUriProxyOracleProfile.proxy_uri[0] != '\0' ||
+        strcmp(kExactApiNoUriProxyOracleProfile.forward_targets[0], "/api/") != 0 ||
+        strcmp(kExactApiNoUriProxyOracleProfile.forward_targets[1], "/api/x") != 0 ||
+        strcmp(kExactApiNoUriProxyOracleProfile.forward_targets[2], "/api/x?y=1") != 0) {
+        error = "#355 immutable profile did not distinguish absent URI from replacement semantics";
+        return false;
+    }
+    const std::string valid_config = make_exact_loopback_prefix_root_config(
+        kPorts[0], kPorts[1], true, scope, access_path, kExactLoopbackApiNoUriProfile);
+    if (!validate_exact_loopback_prefix_root_config(valid_config,
+                                                    kPorts[0],
+                                                    kPorts[1],
+                                                    true,
+                                                    scope,
+                                                    access_path,
+                                                    error,
+                                                    kExactLoopbackApiNoUriProfile) ||
+        !validate_exact_loopback_prefix_root_config(
+            make_exact_loopback_prefix_root_config(kPorts[2],
+                                                   kPorts[3],
+                                                   false,
+                                                   scope + "-other",
+                                                   access_path + "-other",
+                                                   kExactLoopbackApiNoUriProfile),
+            kPorts[2],
+            kPorts[3],
+            false,
+            scope + "-other",
+            access_path + "-other",
+            error,
+            kExactLoopbackApiNoUriProfile))
+        return false;
+    const std::string proxy = "proxy_pass http://127.0.0.1:45502;";
+    if (count_text(valid_config, proxy) != 1u ||
+        valid_config.find("proxy_pass http://127.0.0.1:45502/;") != std::string::npos) {
+        error = "#355 canonical config did not contain exactly the URI-absent proxy_pass spelling";
+        return false;
+    }
+    const auto structure_rejects = [&](const char* label, const std::string& candidate) {
+        std::string detail;
+        if (!candidate.empty() && candidate != valid_config &&
+            !validate_exact_loopback_prefix_root_structure(candidate,
+                                                           kPorts[0],
+                                                           kPorts[1],
+                                                           true,
+                                                           scope,
+                                                           access_path,
+                                                           detail,
+                                                           kExactLoopbackApiNoUriProfile))
+            return true;
+        error = std::string("#355 structure/profile validator accepted mutation: ") + label;
+        return false;
+    };
+    const std::pair<const char*, std::string> config_mutations[] = {
+        {"wildcard-listener",
+         replace_unique(valid_config,
+                        "listen 127.0.0.1:45501;",
+                        "listen 0.0.0.0:45501;",
+                        "wildcard-listener")},
+        {"wrong-address",
+         replace_unique(
+             valid_config, "listen 127.0.0.1:45501;", "listen 127.0.0.2:45501;", "wrong-address")},
+        {"prefix", replace_unique(valid_config, "location /api/", "location /app/", "prefix")},
+        {"explicit-root",
+         replace_unique(
+             valid_config, proxy, "proxy_pass http://127.0.0.1:45502/;", "explicit-root")},
+        {"replacement-uri",
+         replace_unique(
+             valid_config, proxy, "proxy_pass http://127.0.0.1:45502/v1/;", "replacement-uri")},
+        {"order",
+         make_exact_loopback_prefix_root_config(
+             kPorts[0], kPorts[1], false, scope, access_path, kExactLoopbackApiNoUriProfile)},
+        {"extra-directive",
+         replace_unique(valid_config,
+                        "  server {\n",
+                        "  server {\n    server_tokens off;\n",
+                        "extra-directive")},
+    };
+    for (const auto& mutation : config_mutations)
+        if (!structure_rejects(mutation.first, mutation.second)) return false;
+    const std::string harmless_comment = replace_unique(valid_config,
+                                                        "  server {\n",
+                                                        "  server {\n"
+                                                        "    # harmless format witness\n",
+                                                        "harmless-comment");
+    std::string witness_detail;
+    if (harmless_comment.empty() || harmless_comment == valid_config ||
+        !validate_exact_loopback_prefix_root_structure(harmless_comment,
+                                                       kPorts[0],
+                                                       kPorts[1],
+                                                       true,
+                                                       scope,
+                                                       access_path,
+                                                       witness_detail,
+                                                       kExactLoopbackApiNoUriProfile) ||
+        validate_exact_loopback_prefix_root_config(harmless_comment,
+                                                   kPorts[0],
+                                                   kPorts[1],
+                                                   true,
+                                                   scope,
+                                                   access_path,
+                                                   witness_detail,
+                                                   kExactLoopbackApiNoUriProfile)) {
+        error = "#355 legal comment did not isolate structure from canonical byte equality";
+        return false;
+    }
+
+    const auto make_observation = [&](size_t side, u16 frontend, u16 backend) {
+        ExactLoopbackPrefixRootObservation observation;
+        observation.side = "pinned-nginx";
+        observation.order = side == 0u ? "listen-before-location" : "location-before-listen";
+        observation.temp_path =
+            "/tmp/rut-nginx-355-side-" + std::to_string(side) + "-" + std::to_string(frontend);
+        observation.config_path = observation.temp_path + "/nginx.conf";
+        observation.log_path = observation.temp_path + "/error.log";
+        observation.access_path = observation.temp_path + "/access.log";
+        observation.process_identity =
+            "rut-nginx-355-process-" + std::to_string(side) + "-" + std::to_string(frontend);
+        observation.access_scope =
+            "rut-nginx-355-scope-" + std::to_string(side) + "-" + std::to_string(frontend);
+        observation.frontend_port = frontend;
+        observation.backend_port = backend;
+        observation.negative_port = frontend;
+        observation.config = make_exact_loopback_prefix_root_config(frontend,
+                                                                    backend,
+                                                                    side == 0u,
+                                                                    observation.access_scope,
+                                                                    observation.access_path,
+                                                                    kExactLoopbackApiNoUriProfile);
+        for (size_t i = 0u; i < 5u; i++) {
+            std::vector<char> wire =
+                i < 3u ? std::vector<char>(
+                             kSuccessResponseNormalized,
+                             kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                       : expected_clean_proxy_location_redirect(
+                             frontend, "/api/", i == 3u ? "" : "?x=1");
+            std::string text(wire.begin(), wire.end());
+            const size_t date = text.find("XXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+            if (date != std::string::npos) text.replace(date, 29u, "Tue, 01 Jan 2030 00:00:00 GMT");
+            observation.wires.emplace_back(text.begin(), text.end());
+        }
+        observation.forward_history =
+            exact_loopback_prefix_root_expected_history(backend, kExactLoopbackApiNoUriProfile);
+        observation.access_records = exact_loopback_prefix_root_expected_access(
+            observation.access_scope, backend, kExactLoopbackApiNoUriProfile);
+        observation.forward_accepts = observation.forward_requests = observation.forward_sends = 3u;
+        observation.negative_guard_stream = observation.negative_guard_cloexec = true;
+        observation.negative_guard_non_listening = true;
+        observation.negative_guard_blocked_wildcard_bind = observation.readiness_quiet = true;
+        observation.negative_probe_before_failed = observation.negative_probe_before_quiet = true;
+        observation.forward_epoch_settled = observation.redirect_epoch_quiet = true;
+        observation.negative_probe_after_failed = observation.negative_probe_after_quiet = true;
+        observation.clean_lifecycle = true;
+        std::fill(std::begin(observation.eof_proven), std::end(observation.eof_proven), true);
+        return observation;
+    };
+    ExactLoopbackPrefixRootObservation valid[2] = {
+        make_observation(0u, kPorts[0], kPorts[1]),
+        make_observation(1u, kPorts[2], kPorts[3]),
+    };
+    if (!validate_exact_loopback_prefix_root_pair(valid, error, kExactLoopbackApiNoUriProfile))
+        return false;
+    {
+        auto access = valid[0].access_records;
+        access[0] =
+            replace_unique(access[0], "GET /api/ HTTP/1.1", "GET /v1/ HTTP/1.1", "access-target");
+        if (access[0].empty()) return false;
+        std::string contents;
+        for (const auto& record : access) contents += record + "\n";
+        std::vector<std::string> parsed;
+        std::string detail;
+        if (parse_exact_loopback_prefix_root_access(contents,
+                                                    valid[0].access_scope,
+                                                    valid[0].backend_port,
+                                                    parsed,
+                                                    detail,
+                                                    kExactLoopbackApiNoUriProfile)) {
+            error = "#355 access parser accepted a replaced no-URI target";
+            return false;
+        }
+        access = valid[0].access_records;
+        std::swap(access[0], access[1]);
+        contents.clear();
+        for (const auto& record : access) contents += record + "\n";
+        if (parse_exact_loopback_prefix_root_access(contents,
+                                                    valid[0].access_scope,
+                                                    valid[0].backend_port,
+                                                    parsed,
+                                                    detail,
+                                                    kExactLoopbackApiNoUriProfile)) {
+            error = "#355 access parser accepted reordered inventory";
+            return false;
+        }
+    }
+    const auto observation_rejects = [&](const char* label,
+                                         const ExactLoopbackPrefixRootObservation& candidate) {
+        std::string detail;
+        if (!validate_exact_loopback_prefix_root_observation(
+                candidate, detail, kExactLoopbackApiNoUriProfile))
+            return true;
+        error = std::string("#355 observation validator accepted mutation: ") + label;
+        return false;
+    };
+    const auto mutate_wire = [&](const std::vector<char>& wire,
+                                 const std::string& from,
+                                 const std::string& to,
+                                 const char* label) {
+        const std::string text(wire.begin(), wire.end());
+        const std::string changed = replace_unique(text, from, to, label);
+        return std::vector<char>(changed.begin(), changed.end());
+    };
+    ExactLoopbackPrefixRootObservation candidate = valid[0];
+    candidate.forward_history[0] = mutate_wire(candidate.forward_history[0],
+                                               "GET /api/ HTTP/1.1",
+                                               "GET /v1/ HTTP/1.1",
+                                               "unchanged-target");
+    if (candidate.forward_history[0].empty() || !observation_rejects("unchanged-target", candidate))
+        return false;
+    candidate = valid[0];
+    candidate.forward_history[2] =
+        mutate_wire(candidate.forward_history[2], "?y=1", "?y=2", "forward-query");
+    if (candidate.forward_history[2].empty() || !observation_rejects("forward-query", candidate))
+        return false;
+    candidate = valid[0];
+    candidate.forward_history[0] = mutate_wire(candidate.forward_history[0],
+                                               "\r\n\r\n",
+                                               "\r\nConnection: close\r\n\r\n",
+                                               "forward-connection");
+    if (candidate.forward_history[0].empty() ||
+        !observation_rejects("forward-connection", candidate))
+        return false;
+    candidate = valid[0];
+    candidate.forward_history.pop_back();
+    candidate.forward_accepts = candidate.forward_requests = candidate.forward_sends = 2u;
+    if (!observation_rejects("missing-forward", candidate)) return false;
+    candidate = valid[0];
+    candidate.wires[4] = mutate_wire(candidate.wires[4], "?x=1", "?x=2", "redirect-query");
+    if (candidate.wires[4].empty() || !observation_rejects("redirect-query", candidate))
+        return false;
+    candidate = valid[0];
+    candidate.eof_proven[0] = false;
+    if (!observation_rejects("forward-eof", candidate)) return false;
+    const std::pair<const char*, bool ExactLoopbackPrefixRootObservation::*> flags[] = {
+        {"guard-stream", &ExactLoopbackPrefixRootObservation::negative_guard_stream},
+        {"guard-cloexec", &ExactLoopbackPrefixRootObservation::negative_guard_cloexec},
+        {"guard-non-listening", &ExactLoopbackPrefixRootObservation::negative_guard_non_listening},
+        {"wildcard", &ExactLoopbackPrefixRootObservation::negative_guard_blocked_wildcard_bind},
+        {"readiness", &ExactLoopbackPrefixRootObservation::readiness_quiet},
+        {"pre-probe", &ExactLoopbackPrefixRootObservation::negative_probe_before_failed},
+        {"pre-quiet", &ExactLoopbackPrefixRootObservation::negative_probe_before_quiet},
+        {"forward-settle", &ExactLoopbackPrefixRootObservation::forward_epoch_settled},
+        {"redirect-zero", &ExactLoopbackPrefixRootObservation::redirect_epoch_quiet},
+        {"post-probe", &ExactLoopbackPrefixRootObservation::negative_probe_after_failed},
+        {"post-quiet", &ExactLoopbackPrefixRootObservation::negative_probe_after_quiet},
+        {"lifecycle", &ExactLoopbackPrefixRootObservation::clean_lifecycle},
+    };
+    for (const auto& mutation : flags) {
+        candidate = valid[0];
+        candidate.*(mutation.second) = false;
+        if (!observation_rejects(mutation.first, candidate)) return false;
+    }
+    ExactLoopbackPrefixRootObservation pair_mutation[2] = {valid[0], valid[1]};
+    pair_mutation[0].order = "location-before-listen";
+    std::string detail;
+    if (validate_exact_loopback_prefix_root_pair(
+            pair_mutation, detail, kExactLoopbackApiNoUriProfile)) {
+        error = "#355 pair validator accepted duplicate declaration-order identity";
+        return false;
+    }
+    pair_mutation[0] = valid[0];
+    pair_mutation[0].temp_path = pair_mutation[1].temp_path;
+    if (validate_exact_loopback_prefix_root_pair(
+            pair_mutation, detail, kExactLoopbackApiNoUriProfile)) {
+        error = "#355 pair validator accepted shared resources";
+        return false;
+    }
+    pair_mutation[0] = make_observation(0u, valid[1].frontend_port, kPorts[4]);
+    if (!validate_exact_loopback_prefix_root_observation(
+            pair_mutation[0], detail, kExactLoopbackApiNoUriProfile) ||
+        validate_exact_loopback_prefix_root_pair(
+            pair_mutation, detail, kExactLoopbackApiNoUriProfile)) {
+        error = "#355 pair validator did not isolate shared endpoint identity";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_pinned_exact_loopback_prefix_root_side(
     u16 frontend_port,
     u16 backend_port,
@@ -35214,6 +35528,7 @@ static std::string make_exact_loopback_prefix_root_fragment(
 
 static u32 exact_loopback_prefix_expected_source_size(
     u16 frontend_port, u16 backend_port, const ExactLoopbackPrefixOracleProfile& profile) {
+    if (profile.canonical_8080_9000_size == 0u) return 0u;
     const auto digits = [](u16 value) {
         u32 result = 1u;
         while (value >= 10u) {
@@ -40759,6 +41074,8 @@ int main(int argc, char** argv) {
     const bool exact_loopback_api_v1_replacement_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-exact-loopback-api-v1-replacement-oracle") == 0;
+    const bool exact_loopback_api_no_uri_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-api-no-uri-oracle") == 0;
     const bool converter_wildcard_listen_differential =
         argc == 3 && strcmp(argv[1], "--converter-wildcard-listen-differential") == 0;
     const bool converter_asterisk_wildcard_listen_differential =
@@ -40882,7 +41199,8 @@ int main(int argc, char** argv) {
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
          !exact_loopback_return302_oracle && !exact_loopback_prefix_root_replacement_oracle &&
-         !exact_loopback_api_v1_replacement_oracle && !converter_wildcard_listen_differential &&
+         !exact_loopback_api_v1_replacement_oracle && !exact_loopback_api_no_uri_oracle &&
+         !converter_wildcard_listen_differential &&
          !converter_asterisk_wildcard_listen_differential &&
          !converter_exact_loopback_listen_differential &&
          !converter_exact_loopback_return204_differential &&
@@ -41000,6 +41318,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-exact-loopback-prefix-root-replacement-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-exact-loopback-api-v1-replacement-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-exact-loopback-api-no-uri-oracle\n"
                      "   or: test_nginx_differential --converter-wildcard-listen-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
@@ -41386,6 +41706,14 @@ int main(int argc, char** argv) {
             !run_exact_loopback_prefix_root_four_way_self_checks(self_check_error,
                                                                  kExactLoopbackApiV1Profile)) {
             std::cerr << "FAIL [#354 generated/four-way self-check]: " << self_check_error << "\n";
+            return 1;
+        }
+    }
+    if (exact_loopback_api_no_uri_oracle) {
+        std::string self_check_error;
+        if (!run_exact_loopback_api_no_uri_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#355 exact-loopback /api/ no-URI oracle self-check]: "
+                      << self_check_error << "\n";
             return 1;
         }
     }
@@ -41963,6 +42291,45 @@ int main(int argc, char** argv) {
                "#347/#352 excluded; excludes other prefixes/replacements/addresses/options/"
                "listeners/servers, methods/bodies/framing/reuse/pipeline/failures, H1.0, H2 "
                "and TLS)\n";
+        return 0;
+    }
+
+    if (exact_loopback_api_no_uri_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix = "rut-nginx-355-exact-loopback-api-no-uri-" +
+                                             std::to_string(getpid()) + "-" + source_suffix;
+        ExactLoopbackPrefixRootObservation observations[2];
+        std::string oracle_error;
+        if (!run_pinned_exact_loopback_prefix_root_oracle(
+                container_prefix, observations, oracle_error, kExactLoopbackApiNoUriProfile)) {
+            std::cerr << "FAIL [#355 pinned nginx-only exact-loopback /api/ no-URI oracle]: "
+                      << oracle_error << "\n";
+            dump_exact_loopback_prefix_root_observation(observations[0],
+                                                        kExactLoopbackApiNoUriProfile);
+            dump_exact_loopback_prefix_root_observation(observations[1],
+                                                        kExactLoopbackApiNoUriProfile);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #355 pinned nginx 1.29.7 nginx-only oracle proves exact listen "
+               "127.0.0.1:<port>, clean prefix location /api/ and proxy_pass with no URI in "
+               "exactly listen/location and location/listen declaration orders. Six initially "
+               "held CLOEXEC non-listening sockets supplied four unique ports; each .1 handoff "
+               "retained a same-port .2 guard that causally rejected wildcard bind with "
+               "EADDRINUSE and refused bounded probes before/after all requests without changing "
+               "access/upstream inventories. Fresh GET /api/, /api/x and /api/x?y=1 produced "
+               "exactly three ordered byte-exact unchanged upstream targets /api/, /api/x and "
+               "/api/x?y=1 with rebuilt Host, omitted Connection, no fourth/retry and exact "
+               "Date-normalized 118-byte 200/CL2/ok/close/EOF responses. GET /api and "
+               "/api?x=1 produced authoritative automatic 301 wires with Location /api/ and "
+               "/api/?x=1, close/EOF and no additional upstream episode. Each side produced "
+               "exactly five ordered strict real nginx access records and no warn-or-higher log "
+               "(#355 Stage 1 nginx-only; no parser, model, converter, generated-RUT or behavior-"
+               "equivalence claim; normalized/rewrite-sensitive targets, broad no-URI forms, "
+               "configured query, P63/U128 and #347/#352 access-format equivalence are excluded; "
+               "also excludes other prefixes/addresses/options/listeners/servers, methods/bodies/"
+               "framing/reuse/pipeline/failures, H1.0, H2 and TLS)\n";
         return 0;
     }
 
