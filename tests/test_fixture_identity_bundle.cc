@@ -454,27 +454,40 @@ int main() {
         "NoNewPrivs:\t1\n"
         "CapInh:\t0000000000000000\n"
         "CapPrm:\t0000000000000001\n"
-        "CapEff:\tABCDEF0123456789\n";
+        "CapEff:\tABCDEF0123456789\n"
+        "CapBnd:\t000001ffffffffff\n"
+        "CapAmb:\t0000000000000002\n";
     DroppedStatusEvidence strict_evidence;
     std::string strict_error;
-    bool ok = check(parse_dropped_status_evidence(strict_status, strict_evidence, strict_error) &&
-                        strict_evidence.uid_values == std::array<uid_t, 4>{11, 12, 13, 14} &&
-                        strict_evidence.gid_values == std::array<gid_t, 4>{21, 22, 23, 24} &&
-                        strict_evidence.supplementary_groups == std::vector<gid_t>{31, 32, 31} &&
-                        strict_evidence.no_new_privs && strict_evidence.cap_inh_clear &&
-                        !strict_evidence.cap_prm_clear && !strict_evidence.cap_eff_clear,
-                    "strict dropped status evidence retains every field");
+    bool ok =
+        check(parse_dropped_status_evidence(strict_status, strict_evidence, strict_error) &&
+                  strict_evidence.uid_values == std::array<uid_t, 4>{11, 12, 13, 14} &&
+                  strict_evidence.gid_values == std::array<gid_t, 4>{21, 22, 23, 24} &&
+                  strict_evidence.supplementary_groups == std::vector<gid_t>{31, 32, 31} &&
+                  strict_evidence.no_new_privs && strict_evidence.cap_inh_clear &&
+                  !strict_evidence.cap_prm_clear && !strict_evidence.cap_eff_clear &&
+                  strict_evidence.cap_inh == 0 && strict_evidence.cap_prm == 1 &&
+                  strict_evidence.cap_eff == 0xabcdef0123456789ULL &&
+                  strict_evidence.cap_bnd == 0x000001ffffffffffULL && strict_evidence.cap_amb == 2,
+              "strict dropped status evidence retains every field");
     const std::string empty_groups_status =
         replace_once(strict_status, "Groups:\t31 32 31", "Groups:\t");
     const std::string nnp_zero_status =
         replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\t0");
     DroppedStatusEvidence empty_groups_evidence;
     DroppedStatusEvidence nnp_zero_evidence;
+    DroppedStatusEvidence changed_nonzero_cap_evidence;
+    const std::string changed_nonzero_cap_status =
+        replace_once(strict_status, "CapPrm:\t0000000000000001", "CapPrm:\t0000000000000002");
     ok &= check(
         parse_dropped_status_evidence(empty_groups_status, empty_groups_evidence, strict_error) &&
             empty_groups_evidence.supplementary_groups.empty() &&
             parse_dropped_status_evidence(nnp_zero_status, nnp_zero_evidence, strict_error) &&
-            !nnp_zero_evidence.no_new_privs,
+            !nnp_zero_evidence.no_new_privs &&
+            parse_dropped_status_evidence(
+                changed_nonzero_cap_status, changed_nonzero_cap_evidence, strict_error) &&
+            !strict_evidence.cap_prm_clear && !changed_nonzero_cap_evidence.cap_prm_clear &&
+            strict_evidence.cap_prm != changed_nonzero_cap_evidence.cap_prm,
         "strict status extraction does not impose later group/NNP expectations");
     const auto status_rejected = [&](const std::string& status) {
         DroppedStatusEvidence ignored;
@@ -516,7 +529,7 @@ int main() {
             status_rejected(replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\tbad")) &&
             status_rejected(replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\t2")),
         "strict NoNewPrivs missing/duplicate/extra/malformed/range mutations rejected");
-    for (const char* capability : {"CapInh", "CapPrm", "CapEff"}) {
+    for (const char* capability : {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"}) {
         const std::string prefix = std::string(capability) + ":";
         const size_t start = strict_status.find(prefix);
         const size_t end = strict_status.find('\n', start);
@@ -818,6 +831,12 @@ int main() {
                                     CmsgShape::Exact,
                                     dropped_wire.size()),
               "dropped wrong role rejected");
+    ok &=
+        check(receive_dropped_fails(dropped_header_mutation(6, static_cast<u16>(Role::Ancestry), 2),
+                                    dropped_fds,
+                                    CmsgShape::Exact,
+                                    dropped_wire.size()),
+              "dropped wire rejects Ancestry role numeric");
     ok &= check(receive_dropped_fails(dropped_header_mutation(8, kDroppedFdCount - 1, 2),
                                       dropped_fds,
                                       CmsgShape::Exact,
@@ -933,6 +952,16 @@ int main() {
     old_root_dropped[kHeaderBytes + kRoleManifestBytes] = static_cast<unsigned char>(Role::Dropped);
     ok &= check(receive_fails(old_root_dropped, fds, CmsgShape::Exact, old_root_dropped.size()),
                 "old bundle Dropped Root slot rejected");
+    std::vector<unsigned char> old_launcher_ancestry = wire;
+    old_launcher_ancestry[kHeaderBytes + 0] = static_cast<unsigned char>(Role::Ancestry);
+    ok &= check(
+        receive_fails(old_launcher_ancestry, fds, CmsgShape::Exact, old_launcher_ancestry.size()),
+        "old bundle Ancestry Launcher slot rejected");
+    std::vector<unsigned char> old_root_ancestry = wire;
+    old_root_ancestry[kHeaderBytes + kRoleManifestBytes] =
+        static_cast<unsigned char>(Role::Ancestry);
+    ok &= check(receive_fails(old_root_ancestry, fds, CmsgShape::Exact, old_root_ancestry.size()),
+                "old bundle Ancestry Root slot rejected");
 
     RoleBundle dead_dropped;
     ok &= check(open_role(child, Role::Dropped, dead_dropped, error),

@@ -190,13 +190,23 @@ static bool exact_tokens(const std::string& text, std::vector<std::string>& toke
     return input.eof();
 }
 
-static bool parse_capability(const std::vector<std::string>& tokens, bool& clear) {
+static bool parse_capability(const std::vector<std::string>& tokens, u64& value, bool& clear) {
     if (tokens.size() != 1 || tokens[0].size() != 16) return false;
-    clear = true;
+    u64 parsed = 0;
     for (const unsigned char byte : tokens[0]) {
-        if (!std::isxdigit(byte)) return false;
-        if (byte != '0') clear = false;
+        unsigned digit = 0;
+        if (byte >= '0' && byte <= '9')
+            digit = static_cast<unsigned>(byte - '0');
+        else if (byte >= 'a' && byte <= 'f')
+            digit = static_cast<unsigned>(byte - 'a') + 10;
+        else if (byte >= 'A' && byte <= 'F')
+            digit = static_cast<unsigned>(byte - 'A') + 10;
+        else
+            return false;
+        parsed = (parsed << 4) | digit;
     }
+    value = parsed;
+    clear = parsed == 0;
     return true;
 }
 
@@ -211,6 +221,8 @@ static bool parse_dropped_status(const std::string& text,
     bool have_inh = false;
     bool have_prm = false;
     bool have_eff = false;
+    bool have_bnd = false;
+    bool have_amb = false;
     std::istringstream lines(text);
     std::string line;
     while (std::getline(lines, line)) {
@@ -218,7 +230,8 @@ static bool parse_dropped_status(const std::string& text,
         if (colon == std::string::npos) continue;
         const std::string key = line.substr(0, colon);
         if (key != "Uid" && key != "Gid" && key != "Groups" && key != "NoNewPrivs" &&
-            key != "CapInh" && key != "CapPrm" && key != "CapEff")
+            key != "CapInh" && key != "CapPrm" && key != "CapEff" && key != "CapBnd" &&
+            key != "CapAmb")
             continue;
         std::vector<std::string> tokens;
         if (!exact_tokens(line.substr(colon + 1), tokens)) {
@@ -274,25 +287,39 @@ static bool parse_dropped_status(const std::string& text,
             continue;
         }
         bool* clear = nullptr;
+        u64* raw = nullptr;
         bool* present = nullptr;
         if (key == "CapInh") {
             clear = &parsed.cap_inh_clear;
+            raw = &parsed.cap_inh;
             present = &have_inh;
         } else if (key == "CapPrm") {
             clear = &parsed.cap_prm_clear;
+            raw = &parsed.cap_prm;
             present = &have_prm;
-        } else {
+        } else if (key == "CapEff") {
             clear = &parsed.cap_eff_clear;
+            raw = &parsed.cap_eff;
             present = &have_eff;
+        } else if (key == "CapBnd") {
+            clear = &parsed.cap_inh_clear;
+            raw = &parsed.cap_bnd;
+            present = &have_bnd;
+        } else {
+            clear = &parsed.cap_inh_clear;
+            raw = &parsed.cap_amb;
+            present = &have_amb;
         }
-        if (*present || !parse_capability(tokens, *clear)) {
+        bool ignored_clear = false;
+        bool& parsed_clear = (key == "CapBnd" || key == "CapAmb") ? ignored_clear : *clear;
+        if (*present || !parse_capability(tokens, *raw, parsed_clear)) {
             error = "dropped status capability field was not exact hexadecimal evidence";
             return false;
         }
         *present = true;
     }
     if (!have_uid || !have_gid || !have_groups || !have_nnp || !have_inh || !have_prm ||
-        !have_eff) {
+        !have_eff || !have_bnd || !have_amb) {
         error = "dropped status required security field was missing";
         return false;
     }
@@ -789,13 +816,28 @@ bool extract_dropped_identity_evidence(const RoleBundle& role,
                                        DroppedIdentityEvidence& evidence,
                                        std::string& error) {
     evidence = DroppedIdentityEvidence{};
+    ProcessIdentityEvidence process;
+    if (!extract_process_identity_evidence(role, Role::Dropped, process, error)) return false;
+    evidence.identity = process.identity;
+    evidence.state = process.state;
+    evidence.status = std::move(process.status);
+    evidence.cmdline = std::move(process.cmdline);
+    evidence.pidfd_live = process.pidfd_live;
+    return true;
+}
+
+bool extract_process_identity_evidence(const RoleBundle& role,
+                                       Role expected_role,
+                                       ProcessIdentityEvidence& evidence,
+                                       std::string& error) {
+    evidence = ProcessIdentityEvidence{};
     error.clear();
-    if (role.manifest.role != Role::Dropped) {
-        error = "dropped evidence role was not exact";
+    if (role.manifest.role != expected_role) {
+        error = "process evidence role was not exact";
         return false;
     }
     if (!validate_role(role, error)) {
-        error = "dropped evidence role FD validation failed: " + error;
+        error = "process evidence role FD validation failed: " + error;
         return false;
     }
 
@@ -819,29 +861,48 @@ bool extract_dropped_identity_evidence(const RoleBundle& role,
         !read_fd(role.fds[static_cast<size_t>(FdSlot::Stat)], stat_text, 8192) ||
         !parse_proc_stat(stat_text, second, &second_state) || !live_process_state(second_state) ||
         !identity_matches_manifest(second) || !same_stat_identity(first, second)) {
-        error = "dropped evidence stat identity/state was invalid, dead, or unstable";
+        error = "process evidence stat identity/state was invalid, dead, or unstable";
         return false;
     }
 
-    DroppedStatusEvidence status;
-    std::string status_text;
-    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Status)], status_text, 16384) ||
-        !parse_dropped_status(status_text, status, error) ||
-        status.uid_values[0] != role.manifest.uid || status.gid_values[0] != role.manifest.gid) {
-        if (error.empty()) error = "dropped evidence status/manifest IDs did not match";
+    DroppedStatusEvidence first_status;
+    DroppedStatusEvidence second_status;
+    std::string first_status_text;
+    std::string second_status_text;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Status)], first_status_text, 16384) ||
+        !parse_dropped_status(first_status_text, first_status, error) ||
+        !read_fd(role.fds[static_cast<size_t>(FdSlot::Status)], second_status_text, 16384) ||
+        !parse_dropped_status(second_status_text, second_status, error) ||
+        first_status.uid_values != second_status.uid_values ||
+        first_status.gid_values != second_status.gid_values ||
+        first_status.supplementary_groups != second_status.supplementary_groups ||
+        first_status.no_new_privs != second_status.no_new_privs ||
+        first_status.cap_inh != second_status.cap_inh ||
+        first_status.cap_prm != second_status.cap_prm ||
+        first_status.cap_eff != second_status.cap_eff ||
+        first_status.cap_bnd != second_status.cap_bnd ||
+        first_status.cap_amb != second_status.cap_amb ||
+        first_status.cap_inh_clear != second_status.cap_inh_clear ||
+        first_status.cap_prm_clear != second_status.cap_prm_clear ||
+        first_status.cap_eff_clear != second_status.cap_eff_clear ||
+        second_status.uid_values[0] != role.manifest.uid ||
+        second_status.gid_values[0] != role.manifest.gid) {
+        if (error.empty()) error = "process evidence status was unstable or mismatched";
         return false;
     }
 
-    std::string cmdline;
-    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Cmdline)], cmdline, 8192) ||
-        cmdline.size() != role.manifest.argv_length ||
-        hash_bytes(cmdline) != role.manifest.argv_hash) {
-        error = "dropped evidence cmdline did not match its receiver-derived manifest";
+    std::string first_cmdline;
+    std::string second_cmdline;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Cmdline)], first_cmdline, 8192) ||
+        !read_fd(role.fds[static_cast<size_t>(FdSlot::Cmdline)], second_cmdline, 8192) ||
+        first_cmdline != second_cmdline || second_cmdline.size() != role.manifest.argv_length ||
+        hash_bytes(second_cmdline) != role.manifest.argv_hash) {
+        error = "process evidence cmdline was unstable or mismatched";
         return false;
     }
     const int pidfd = role.fds[static_cast<size_t>(FdSlot::Pidfd)];
     if (!read_pidfd_binding(pidfd, role.manifest.pid) || !pidfd_is_live(pidfd)) {
-        error = "dropped evidence pidfd was not bound and live";
+        error = "process evidence pidfd was not bound and live";
         return false;
     }
 
@@ -854,8 +915,8 @@ bool extract_dropped_identity_evidence(const RoleBundle& role,
     second.argv_hash = role.manifest.argv_hash;
     evidence.identity = second;
     evidence.state = second_state;
-    evidence.status = std::move(status);
-    evidence.cmdline = std::move(cmdline);
+    evidence.status = std::move(second_status);
+    evidence.cmdline = std::move(second_cmdline);
     evidence.pidfd_live = true;
     error.clear();
     return true;

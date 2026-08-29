@@ -34,7 +34,9 @@ static_assert(kDroppedFdCount == 6 && kDroppedHeaderBytes == kHeaderBytes);
 static_assert(kRoleCount == 2 && kFdsPerRole == 6 && kBundleFdCount == 12);
 static_assert(kRoleManifestBytes == 112 && kWireBytes == 240);
 
-enum class Role : u16 { Launcher = 1, Root = 2, Dropped = 3 };
+enum class Role : u16 { Launcher = 1, Root = 2, Dropped = 3, Ancestry = 4 };
+static_assert(static_cast<u16>(Role::Launcher) == 1 && static_cast<u16>(Role::Root) == 2 &&
+              static_cast<u16>(Role::Dropped) == 3 && static_cast<u16>(Role::Ancestry) == 4);
 
 enum class FdSlot : size_t {
     Stat = 0,
@@ -66,12 +68,27 @@ struct DroppedStatusEvidence {
     std::array<gid_t, 4> gid_values{};
     std::vector<gid_t> supplementary_groups;
     bool no_new_privs = false;
+    u64 cap_inh = 0;
+    u64 cap_prm = 0;
+    u64 cap_eff = 0;
+    u64 cap_bnd = 0;
+    u64 cap_amb = 0;
     bool cap_inh_clear = false;
     bool cap_prm_clear = false;
     bool cap_eff_clear = false;
 };
 
 struct DroppedIdentityEvidence {
+    RoleManifest identity;
+    char state = '\0';
+    DroppedStatusEvidence status;
+    std::string cmdline;
+    bool pidfd_live = false;
+};
+
+// Strict kernel-derived evidence shared by manifest-free tests-only transports.
+// It imposes no caller, root, stage, or ancestry policy.
+struct ProcessIdentityEvidence {
     RoleManifest identity;
     char state = '\0';
     DroppedStatusEvidence status;
@@ -146,6 +163,10 @@ bool parse_dropped_status_evidence(const std::string& status,
                                    std::string& error);
 bool extract_dropped_identity_evidence(const RoleBundle& role,
                                        DroppedIdentityEvidence& evidence,
+                                       std::string& error);
+bool extract_process_identity_evidence(const RoleBundle& role,
+                                       Role expected_role,
+                                       ProcessIdentityEvidence& evidence,
                                        std::string& error);
 
 }  // namespace rut::test::fixture_identity_bundle

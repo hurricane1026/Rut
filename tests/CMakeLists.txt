@@ -34,6 +34,17 @@ set_tests_properties(test_fixture_identity_bundle PROPERTIES
     TIMEOUT 30
 )
 
+# Manifest-free bounded ancestry FD transport.  This remains a pure
+# socketpair/procfs self-check and is not connected to the privileged broker.
+add_library(fixture_ancestry_bundle STATIC fixture_ancestry_bundle.cc)
+target_include_directories(fixture_ancestry_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_ancestry_bundle PUBLIC fixture_identity_bundle)
+
+add_executable(test_fixture_ancestry_bundle test_fixture_ancestry_bundle.cc)
+target_link_libraries(test_fixture_ancestry_bundle PRIVATE fixture_ancestry_bundle)
+add_test(NAME test_fixture_ancestry_bundle COMMAND test_fixture_ancestry_bundle)
+set_tests_properties(test_fixture_ancestry_bundle PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
 # Pure #358 Stage 2a3b sudo/nsenter/launcher causal state model.  This test
 # uses synthetic process identities and never invokes sudo or fakes a positive
 # privileged semantic run.
