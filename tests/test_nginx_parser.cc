@@ -1,3 +1,4 @@
+#include "fixtures/nginx373_nohide.inc"
 #include "rut/common/strict_local_response.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -744,6 +745,45 @@ TEST(nginx_converter, http_profile_exact_maximum_payload_owns_terminal_capacity_
     CHECK_EQ(std::string(lowered.value().data, declaration.size()), declaration);
     CHECK_EQ(std::string(lowered.value().data + declaration.size(), server.value().len),
              std::string(server.value().data, server.value().len));
+}
+
+TEST(nginx_converter, issue373_http_profile_hide_exact_maximum_fits_and_is_owned) {
+    const std::string path = "/" + std::string(nginx::kMaxAccessLogPathLen - 1u, 'p');
+    REQUIRE_EQ(path.size(), 255u);
+    const std::string server_content =
+        "    listen 127.0.0.1:65535;\n"
+        "    location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://255.255.255.255:65535; }\n";
+    std::string source = make_request_length_http_profile(path, server_content);
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    const auto server = nginx::lower_to_rut(parsed.value().server);
+    REQUIRE(server);
+    REQUIRE_EQ(server.value().len, 5374u);
+    CHECK_EQ(server.value().len + 572u, nginx::RutSource::kCapacity);
+    CHECK_EQ(server.value().data[server.value().len], '\0');
+    CHECK_LT(server.value().len, nginx::RutSource::kCapacity);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    REQUIRE_EQ(lowered.value().len, 5703u);
+    CHECK_EQ(lowered.value().len + 572u, nginx::HttpProfileRutSource::kCapacity);
+    CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len), "X-Compat-Hidden"),
+             3u);
+    const std::string declaration =
+        "accessLog { path: \"" + path + "\", format: downstreamRequestBytes, publication: live }\n";
+    REQUIRE_EQ(declaration.size(), 329u);
+    CHECK_EQ(std::string(lowered.value().data, declaration.size()), declaration);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    const auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    delete ast.value();
+    std::string owned(lowered.value().data, lowered.value().len);
+    std::fill(source.begin(), source.end(), 'x');
+    CHECK_EQ(std::string(lowered.value().data, lowered.value().len), owned);
+    CHECK_NE(owned.find("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]"),
+             std::string::npos);
 }
 
 TEST(nginx_converter,
@@ -18325,9 +18365,251 @@ TEST(nginx_parser_issue373, parses_literal_proxy_hide_header_in_four_orders_with
         CHECK_EQ(header.span.col, static_cast<u32>(keyword - source + 1u));
         CHECK_FALSE(parsed.value().location.proxy_read_timeout.present);
         const auto lowered = nginx::lower_to_rut(parsed.value());
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
-        CHECK_EQ(lowered.error().span.start, header.span.start);
+        REQUIRE(lowered);
+        const std::string generated(lowered.value().data, lowered.value().len);
+        CHECK_EQ(
+            count_text(generated,
+                       "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
+            3u);
+        CHECK_EQ(count_text(generated, "proxy_hide_header"), 0u);
+    }
+}
+
+TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
+    static constexpr char kHideBeforeProxy[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    static constexpr char kProxyBeforeHide[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; proxy_hide_header X-Compat-Hidden; } }";
+    static constexpr char kLocationHideBeforeProxy[] =
+        "server { location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } listen 127.0.0.1:8080; }";
+    static constexpr char kLocationProxyBeforeHide[] =
+        "server { location / { proxy_pass http://127.0.0.1:9000; proxy_hide_header "
+        "X-Compat-Hidden; } listen 127.0.0.1:8080; }";
+    const char* const sources[] = {
+        kHideBeforeProxy, kProxyBeforeHide, kLocationHideBeforeProxy, kLocationProxyBeforeHide};
+
+    static constexpr char kOldLine[] =
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
+    static constexpr char kNewLine[] =
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+        "\"X-Compat-Hidden\"]\n";
+    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
+    const std::string no_hide(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
+    REQUIRE_EQ(no_hide.size(), 5309u);
+    REQUIRE_EQ(count_text(no_hide, kOldLine), 3u);
+    REQUIRE_EQ(count_text(no_hide, "X-Compat-Hidden"), 0u);
+    std::string expected = no_hide;
+    size_t cursor = 0u;
+    for (u32 i = 0u; i < 3u; i++) {
+        const size_t line = expected.find(kOldLine, cursor);
+        REQUIRE_NE(line, std::string::npos);
+        expected.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
+        cursor = line + strlen(kOldLine) + strlen(kSuffix);
+    }
+    REQUIRE_EQ(expected.size(), 5366u);
+    REQUIRE_EQ(count_text(expected, kNewLine), 3u);
+    REQUIRE_EQ(count_text(expected, "X-Compat-Hidden"), 3u);
+    CHECK_EQ(expected.size() - no_hide.size(), 57u);
+    CHECK_EQ(expected.data()[expected.size()], '\0');
+
+    const auto canonical = [&](const std::string& candidate) {
+        return count_text(candidate, kOldLine) == 0u && count_text(candidate, kNewLine) == 3u &&
+               count_text(candidate, "X-Compat-Hidden") == 3u &&
+               count_text(candidate, "proxy_hide_header") == 0u &&
+               candidate.find("nginx.conf") == std::string::npos &&
+               candidate.find("nginx_compat") == std::string::npos &&
+               candidate.find("req.listener") == std::string::npos;
+    };
+    REQUIRE(canonical(expected));
+    for (const char* source : sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        CHECK_EQ(lowered.value().len, 5366u);
+        CHECK_EQ(std::string(lowered.value().data, lowered.value().len), expected);
+        CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
+    }
+    static constexpr char kNoHideInput[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    const auto no_hide_parsed =
+        nginx::parse({kNoHideInput, static_cast<u32>(sizeof(kNoHideInput) - 1u)});
+    REQUIRE(no_hide_parsed);
+    const auto no_hide_lowered = nginx::lower_to_rut(no_hide_parsed.value());
+    REQUIRE(no_hide_lowered);
+    REQUIRE_EQ(no_hide_lowered.value().len, 5309u);
+    CHECK_EQ(std::string(no_hide_lowered.value().data, no_hide_lowered.value().len), no_hide);
+    const auto expected_lexed = lex({expected.data(), static_cast<u32>(expected.size())});
+    REQUIRE(expected_lexed);
+    const auto expected_ast = parse_file(expected_lexed.value());
+    REQUIRE(expected_ast);
+    std::unique_ptr<AstFile> expected_ast_owned(expected_ast.value());
+    const auto expected_hir = analyze_file(*expected_ast_owned);
+    REQUIRE(expected_hir);
+
+    const auto require_rejected_mutation = [&](std::string mutation) {
+        CHECK_NE(mutation, expected);
+        CHECK_FALSE(canonical(mutation));
+    };
+    std::string missing = expected;
+    const size_t first_new = missing.find(kNewLine);
+    REQUIRE_NE(first_new, std::string::npos);
+    missing.replace(first_new, sizeof(kNewLine) - 1u, kOldLine);
+    CHECK_EQ(count_text(missing, kNewLine), 2u);
+    require_rejected_mutation(missing);
+
+    std::string duplicate = expected;
+    duplicate.replace(first_new,
+                      sizeof(kNewLine) - 1u,
+                      "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+                      "\"X-Compat-Hidden\", \"X-Compat-Hidden\"]\n");
+    CHECK_EQ(count_text(duplicate, "X-Compat-Hidden"), 4u);
+    require_rejected_mutation(duplicate);
+
+    std::string wrong_order = expected;
+    wrong_order.replace(first_new,
+                        sizeof(kNewLine) - 1u,
+                        "            hide_headers: [\"Date\", \"Server\", "
+                        "\"X-Compat-Hidden\", \"X-Pad\"]\n");
+    require_rejected_mutation(wrong_order);
+
+    std::string wrong_case = expected;
+    wrong_case.replace(first_new,
+                       sizeof(kNewLine) - 1u,
+                       "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+                       "\"x-compat-hidden\"]\n");
+    require_rejected_mutation(wrong_case);
+
+    std::string wrong_keyword = expected;
+    wrong_keyword.replace(first_new, strlen("hide_headers"), "hide_headerz");
+    require_rejected_mutation(wrong_keyword);
+
+    std::string injected_failure = expected;
+    const size_t failure = injected_failure.find("        failure_policy: {");
+    REQUIRE_NE(failure, std::string::npos);
+    injected_failure.insert(failure, kNewLine);
+    require_rejected_mutation(injected_failure);
+
+    std::string injected_local = expected;
+    const size_t local = injected_local.find("route HEAD \"/\" {");
+    REQUIRE_NE(local, std::string::npos);
+    injected_local.insert(local, kNewLine);
+    CHECK_EQ(count_text(injected_failure, "X-Compat-Hidden"), 4u);
+    CHECK_EQ(count_text(injected_local, "X-Compat-Hidden"), 4u);
+    require_rejected_mutation(injected_local);
+
+    std::string one_occurrence = expected;
+    size_t second_new = one_occurrence.find(kNewLine, first_new + sizeof(kNewLine) - 1u);
+    REQUIRE_NE(second_new, std::string::npos);
+    size_t third_new = one_occurrence.find(kNewLine, second_new + sizeof(kNewLine) - 1u);
+    REQUIRE_NE(third_new, std::string::npos);
+    one_occurrence.replace(second_new, sizeof(kNewLine) - 1u, kOldLine);
+    one_occurrence.replace(
+        third_new - (sizeof(kNewLine) - sizeof(kOldLine)), sizeof(kNewLine) - 1u, kOldLine);
+    CHECK_EQ(count_text(one_occurrence, "X-Compat-Hidden"), 1u);
+    require_rejected_mutation(one_occurrence);
+
+    std::string four_occurrences = expected;
+    four_occurrences.insert(four_occurrences.find("        failure_policy: {"), kNewLine);
+    CHECK_EQ(count_text(four_occurrences, "X-Compat-Hidden"), 4u);
+    require_rejected_mutation(four_occurrences);
+}
+
+TEST(nginx_converter_issue373, hide_header_policies_are_deduplicated_and_owned_end_to_end) {
+    static constexpr char kOldLine[] =
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n";
+    static constexpr char kSuffix[] = ", \"X-Compat-Hidden\"";
+    std::string source(kIssue373NoHideGolden, sizeof(kIssue373NoHideGolden) - 1u);
+    size_t cursor = 0u;
+    for (u32 i = 0u; i < 3u; i++) {
+        const size_t line = source.find(kOldLine, cursor);
+        REQUIRE_NE(line, std::string::npos);
+        source.replace(line + strlen(kOldLine) - 2u, 0u, kSuffix);
+        cursor = line + strlen(kOldLine) + strlen(kSuffix);
+    }
+    REQUIRE_EQ(source.size(), 5366u);
+    RouteConfig populated{};
+    {
+        const auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        const auto parsed = parse_file(lexed.value());
+        REQUIRE(parsed);
+        std::unique_ptr<AstFile> ast(parsed.value());
+        REQUIRE_EQ(ast->response_policies.len, 2u);
+        const AstRouteDecl* routes[3]{};
+        for (u32 item = 0u; item < ast->items.len; item++) {
+            if (ast->items[item].kind != AstItemKind::Route) continue;
+            const auto& route = ast->items[item].route;
+            if (route.method_is_any)
+                routes[2] = &route;
+            else if (route.method == static_cast<u8>(TokenType::KwHead))
+                routes[0] = &route;
+            else if (route.method == static_cast<u8>(TokenType::KwGet))
+                routes[1] = &route;
+        }
+        for (const AstRouteDecl* route : routes) REQUIRE(route != nullptr);
+        CHECK_NE(routes[0]->statements[0]->forward_response_policy_id,
+                 routes[1]->statements[0]->forward_response_policy_id);
+        CHECK_EQ(routes[1]->statements[0]->forward_response_policy_id,
+                 routes[2]->statements[0]->forward_response_policy_id);
+        for (u32 policy_id = 0u; policy_id < ast->response_policies.len; policy_id++) {
+            const auto& policy = ast->response_policies[policy_id];
+            REQUIRE_EQ(policy.hide_header_count, 4u);
+            static constexpr Str kHeaders[] = {
+                lit_str("Date"), lit_str("Server"), lit_str("X-Pad"), lit_str("X-Compat-Hidden")};
+            for (u32 header = 0u; header < 4u; header++)
+                CHECK(policy.hide_headers[header].eq(kHeaders[header]));
+        }
+        const auto hir = analyze_file(*ast);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->response_policies.len, 2u);
+        const auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->response_policies.len, 2u);
+        for (u32 function = 0u; function < mir_owned->functions.len; function++) {
+            const auto& term = mir_owned->functions[function].blocks[0].term;
+            REQUIRE(term.kind == MirTerminatorKind::ForwardUpstream);
+            CHECK_EQ(term.forward_response_policy_id, function == 0u ? 1u : 2u);
+        }
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE_EQ(rir.module.response_policy_count, 2u);
+        for (u32 policy_id = 0u; policy_id < rir.module.response_policy_count; policy_id++) {
+            const auto& policy = rir.module.response_policies[policy_id];
+            REQUIRE_EQ(policy.hide_header_count, 4u);
+            CHECK(response_policy_hides_header(policy, lit_str("x-compat-hidden")));
+            CHECK(response_policy_hides_header(policy, lit_str("X-COMPAT-HIDDEN")));
+            CHECK(policy.hide_headers[0].eq(lit_str("Date")));
+            CHECK(policy.hide_headers[1].eq(lit_str("Server")));
+            CHECK(policy.hide_headers[2].eq(lit_str("X-Pad")));
+            CHECK(policy.hide_headers[3].eq(lit_str("X-Compat-Hidden")));
+        }
+        REQUIRE(populate_route_config(populated, rir.module));
+        REQUIRE_EQ(populated.response_policy_count, 2u);
+        REQUIRE_EQ(populated.failure_policy_count, 3u);
+        REQUIRE_EQ(populated.strict_local_response_policy_count, 3u);
+        REQUIRE_EQ(populated.policy_bundle_count, 3u);
+        REQUIRE_EQ(populated.response_policy_bytes_used, 84u);
+        CHECK_EQ(populated.policy_bundles[0].response_policy_id, 1u);
+        CHECK_EQ(populated.policy_bundles[1].response_policy_id, 2u);
+        CHECK_EQ(populated.policy_bundles[2].response_policy_id, 2u);
+    }
+    for (u32 policy_id = 0u; policy_id < populated.response_policy_count; policy_id++) {
+        const auto& policy = populated.response_policies[policy_id];
+        REQUIRE_EQ(policy.hide_header_count, 4u);
+        CHECK(response_policy_hides_header(policy, lit_str("x-compat-hidden")));
+        CHECK(response_policy_hides_header(policy, lit_str("X-COMPAT-HIDDEN")));
+        for (u32 header = 0u; header < policy.hide_header_count; header++)
+            CHECK(str_is_in_owned_pool(policy.hide_headers[header],
+                                       populated.response_policy_bytes,
+                                       populated.response_policy_bytes_used));
     }
 }
 
@@ -18352,7 +18634,8 @@ TEST(nginx_parser_issue373, accepts_lexer_gaps_comments_and_bounded_compositions
         REQUIRE(parsed.value().location.proxy_hide_header.present);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+        CHECK(lowered.error().detail.eq(
+            lit_str("proxy_hide_header requires the minimal exact-loopback root proxy profile")));
         CHECK_EQ(lowered.error().span.start, parsed.value().location.proxy_hide_header.span.start);
     }
 
@@ -18388,9 +18671,10 @@ TEST(nginx_parser_issue373, accepts_end_exclusive_adjacent_directive_spans) {
     CHECK_EQ(first.value().location.proxy_hide_header.span.end,
              first.value().location.proxy_pass.span.start);
     auto lowered = nginx::lower_to_rut(first.value());
-    REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
-    CHECK_EQ(lowered.error().span.start, first.value().location.proxy_hide_header.span.start);
+    REQUIRE(lowered);
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len),
+                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
+             3u);
 
     const char proxy_then_hide[] =
         "server { listen 127.0.0.1:8080; location / { proxy_pass "
@@ -18402,9 +18686,10 @@ TEST(nginx_parser_issue373, accepts_end_exclusive_adjacent_directive_spans) {
     CHECK_EQ(second.value().location.proxy_pass.span.end,
              second.value().location.proxy_hide_header.span.start);
     lowered = nginx::lower_to_rut(second.value());
-    REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
-    CHECK_EQ(lowered.error().span.start, second.value().location.proxy_hide_header.span.start);
+    REQUIRE(lowered);
+    CHECK_EQ(count_text(std::string(lowered.value().data, lowered.value().len),
+                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
+             3u);
 
     const char adjacent_timeout[] =
         "server { listen 127.0.0.1:8080; location / { proxy_hide_header "
@@ -18420,7 +18705,8 @@ TEST(nginx_parser_issue373, accepts_end_exclusive_adjacent_directive_spans) {
              third.value().location.proxy_pass.span.start);
     lowered = nginx::lower_to_rut(third.value());
     REQUIRE_FALSE(lowered);
-    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+    CHECK(lowered.error().detail.eq(
+        lit_str("proxy_hide_header requires the minimal exact-loopback root proxy profile")));
     CHECK_EQ(lowered.error().span.start, third.value().location.proxy_hide_header.span.start);
 }
 
@@ -18664,8 +18950,11 @@ TEST(nginx_converter_issue373, borrowed_hide_model_requires_live_stable_source) 
         copied_proxy_port = borrowed.location.proxy_pass.port;
 
         auto lowered = nginx::lower_to_rut(borrowed);
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+        REQUIRE(lowered);
+        CHECK_EQ(
+            count_text(std::string(lowered.value().data, lowered.value().len),
+                       "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
+            3u);
 
         const u32 gap = borrowed.location.proxy_hide_header.span.end;
         REQUIRE_EQ(source[gap], ' ');
@@ -18675,8 +18964,11 @@ TEST(nginx_converter_issue373, borrowed_hide_model_requires_live_stable_source) 
         CHECK(lowered.error().detail.eq(lit_str("invalid proxy location source syntax")));
         source[gap] = ' ';
         lowered = nginx::lower_to_rut(borrowed);
-        REQUIRE_FALSE(lowered);
-        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+        REQUIRE(lowered);
+        CHECK_EQ(
+            count_text(std::string(lowered.value().data, lowered.value().len),
+                       "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
+            3u);
     }
 
     // The semantic model owns only scalar metadata and spans. Once the source is

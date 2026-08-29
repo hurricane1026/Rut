@@ -2161,6 +2161,138 @@ TEST(serve_loader, issue372_root_empty_query_transform_is_owned_and_reload_clear
     std::filesystem::remove(dir);
 }
 
+TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_name) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_issue373_hide_headers";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char source[] =
+            "server { listen 127.0.0.1:8088; location / { proxy_hide_header "
+            "X-Compat-Hidden; proxy_pass http://127.0.0.1:9002; } }";
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 5366u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(source, 'x', sizeof(source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    const auto str_is_owned_by = [](Str value, const char* pool, u32 used) {
+        if (value.ptr == nullptr || value.len == 0u || value.len > used) return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+        return address >= begin && address - begin < used && value.len <= used - (address - begin);
+    };
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    const auto check_owned_response_policies = [&](u32 expected_count, u32 expected_bytes) {
+        REQUIRE_EQ(program.config.response_policy_count, 2u);
+        REQUIRE_EQ(program.config.failure_policy_count, 3u);
+        REQUIRE_EQ(program.config.policy_bundle_count, 3u);
+        REQUIRE_EQ(program.config.response_policy_bytes_used, expected_bytes);
+        for (u32 policy_id = 0u; policy_id < 2u; policy_id++) {
+            const auto& policy = program.config.response_policies[policy_id];
+            REQUIRE_EQ(policy.hide_header_count, expected_count);
+            CHECK(str_is_owned_by(policy.server,
+                                  program.config.response_policy_bytes,
+                                  program.config.response_policy_bytes_used));
+            static constexpr Str kHeaders[] = {
+                lit_str("Date"), lit_str("Server"), lit_str("X-Pad"), lit_str("X-Compat-Hidden")};
+            for (u32 header = 0u; header < expected_count; header++) {
+                CHECK(policy.hide_headers[header].eq(kHeaders[header]));
+                CHECK(str_is_owned_by(policy.hide_headers[header],
+                                      program.config.response_policy_bytes,
+                                      program.config.response_policy_bytes_used));
+            }
+            for (u32 header = expected_count; header < kMaxResponsePolicyHideHeaders; header++) {
+                CHECK(policy.hide_headers[header].ptr == nullptr);
+                CHECK_EQ(policy.hide_headers[header].len, 0u);
+            }
+        }
+    };
+    const auto check_root_mapping = [&]() {
+        REQUIRE_EQ(program.rir.module.func_count, 3u);
+        for (u32 function = 0u; function < 3u; function++) {
+            const auto& rir_function = program.rir.module.functions[function];
+            u32 forwards = 0u;
+            i32 bundle_id = -1;
+            for (u32 block = 0u; block < rir_function.block_count; block++) {
+                const auto& rir_block = rir_function.blocks[block];
+                for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+                    const auto& inst = rir_block.insts[instruction];
+                    if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                    forwards++;
+                    REQUIRE_EQ(inst.operand_count, 3u);
+                    for (u32 scan_block = 0u; scan_block < rir_function.block_count; scan_block++) {
+                        const auto& constants = rir_function.blocks[scan_block];
+                        for (u32 scan = 0u; scan < constants.inst_count; scan++) {
+                            const auto& candidate = constants.insts[scan];
+                            if (candidate.op == rir::Opcode::ConstI32 &&
+                                candidate.result == inst.operand(2))
+                                bundle_id = candidate.imm.i32_val;
+                        }
+                    }
+                }
+            }
+            REQUIRE_EQ(forwards, 1u);
+            CHECK_EQ(bundle_id, function == 0u ? 1 : function == 1u ? 2 : 3);
+        }
+        CHECK_EQ(program.config.policy_bundles[0].response_policy_id, 1u);
+        CHECK_EQ(program.config.policy_bundles[1].response_policy_id, 2u);
+        CHECK_EQ(program.config.policy_bundles[2].response_policy_id, 2u);
+    };
+    check_owned_response_policies(4u, 84u);
+    CHECK(
+        std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
+            .find("X-Compat-Hidden") != std::string::npos);
+    check_root_mapping();
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    program.destroy();
+
+    {
+        char source[] =
+            "server { listen 127.0.0.1:8088; location / { proxy_pass "
+            "http://127.0.0.1:9002; } }";
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 5309u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(source, 'z', sizeof(source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    check_owned_response_policies(3u, 54u);
+    CHECK(
+        std::string(program.config.response_policy_bytes, program.config.response_policy_bytes_used)
+            .find("X-Compat-Hidden") == std::string::npos);
+    check_root_mapping();
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE(program.src_map != nullptr);
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    program.destroy();
+    REQUIRE(std::filesystem::remove(dir));
+}
+
 TEST(serve_loader, nginx_exact_loopback_api_no_uri_output_is_owned_and_reuses_cleanly) {
     const std::string dir = "/tmp/rut_serve_loader_nginx_exact_api_no_uri";
     const std::string path = dir + "/app.rut";

@@ -1345,8 +1345,8 @@ FrontendResult<bool> validate_proxy_hide_header(const Server& server, bool exact
         exact_listener && server.listen.address == ListenerAddress::IPv4Exact &&
         server.listen.ipv4_host == 0x7f000001u && eq(location.path, "/", 1u) && !proxy.has_uri &&
         proxy.uri.ptr == nullptr && proxy.uri.len == 0u && is_default_span(proxy.uri_span) &&
-        !server.exact_local_return.present && !server.exact_no_content_return.present &&
-        !server.exact_absolute_redirect.present;
+        !timeout.present && !server.exact_local_return.present &&
+        !server.exact_no_content_return.present && !server.exact_absolute_redirect.present;
     if (!minimal_profile)
         return unsupported(
             header.span,
@@ -1515,7 +1515,7 @@ bool put_request_policy(Writer& writer) {
            writer.put_cstr("        },\n");
 }
 
-bool put_response_policy(Writer& writer, bool suppress_body) {
+bool put_response_policy(Writer& writer, bool suppress_body, bool hide_compat_header) {
     return writer.put_cstr("        response_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            framing: \"content_length\",\n") &&
@@ -1523,7 +1523,10 @@ bool put_response_policy(Writer& writer, bool suppress_body) {
            (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
            writer.put_cstr("            date: \"current\",\n") &&
-           writer.put_cstr("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") &&
+           writer.put_cstr(hide_compat_header
+                               ? "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
+                                 "\"X-Compat-Hidden\"]\n"
+                               : "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") &&
            writer.put_cstr("        },\n");
 }
 
@@ -1556,14 +1559,18 @@ bool put_timeout_failure_policy(Writer& writer) {
            writer.put_cstr("\"\n") && writer.put_cstr("        },\n");
 }
 
-bool put_root_forward(
-    Writer& writer, const char* method, u32 method_len, bool suppress_body, bool buffered) {
+bool put_root_forward(Writer& writer,
+                      const char* method,
+                      u32 method_len,
+                      bool suppress_body,
+                      bool buffered,
+                      bool hide_compat_header) {
     return writer.put_cstr("route ") &&
            (method_len == 0
                 ? writer.put_cstr("\"/\" {\n")
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
            writer.put_cstr("    return forward(nginx_upstream, ") && put_request_policy(writer) &&
-           put_response_policy(writer, suppress_body) &&
+           put_response_policy(writer, suppress_body, hide_compat_header) &&
            put_failure_policy(writer, suppress_body, buffered) &&
            (buffered ? put_timeout_failure_policy(writer) : true) &&
            (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
@@ -1572,9 +1579,11 @@ bool put_root_forward(
            writer.put_cstr("    )\n}\n");
 }
 
-bool put_root_forward_action(Writer& writer, bool suppress_body, bool buffered, Str indent) {
+bool put_root_forward_action(
+    Writer& writer, bool suppress_body, bool buffered, bool hide_compat_header, Str indent) {
     return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
-           put_request_policy(writer) && put_response_policy(writer, suppress_body) &&
+           put_request_policy(writer) &&
+           put_response_policy(writer, suppress_body, hide_compat_header) &&
            put_failure_policy(writer, suppress_body, buffered) &&
            (buffered ? put_timeout_failure_policy(writer) : true) &&
            (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
@@ -1623,7 +1632,7 @@ bool put_exact_absolute_redirect(
            writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
            writer.put_lit(body, body_len) && writer.put_cstr("\"})\n") &&
            writer.put_cstr("    } else {\n") &&
-           put_root_forward_action(writer, false, true, lit_str("        ")) &&
+           put_root_forward_action(writer, false, true, false, lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
 
@@ -1873,20 +1882,24 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto proxy_location = validate_proxy_location(server);
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
+    bool hide_compat_header = false;
+    bool exact_listener = false;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
         auto listener =
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
         auto header = validate_proxy_hide_header(server, listener.value());
         if (!header) return core::make_unexpected(header.error());
-        return unsupported(server.location.proxy_hide_header.span,
-                           lit_str("proxy_hide_header lowering is not implemented"));
+        exact_listener = listener.value();
+        hide_compat_header = true;
+    } else {
+        auto timeout = validate_proxy_read_timeout(server);
+        if (!timeout) return core::make_unexpected(timeout.error());
+        auto listener =
+            validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
+        if (!listener) return core::make_unexpected(listener.error());
+        exact_listener = listener.value();
     }
-    auto timeout = validate_proxy_read_timeout(server);
-    if (!timeout) return core::make_unexpected(timeout.error());
-    auto listener =
-        validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
-    if (!listener) return core::make_unexpected(listener.error());
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)
         return invalid_integer(server.location.proxy_pass.span,
@@ -1912,7 +1925,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return out_of_memory(server.span, lit_str("generated RUT source is too large"));
     };
 
-    if (!(listener.value() ? put("listen 127.0.0.1:") : put("listen :")) ||
+    if (!(exact_listener ? put("listen 127.0.0.1:") : put("listen :")) ||
         !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
@@ -1952,15 +1965,15 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return fail_overflow();
 
     if (is_root) {
-        if (!put_root_forward(writer, "HEAD", 4, true, false) ||
+        if (!put_root_forward(writer, "HEAD", 4, true, false, hide_compat_header) ||
             (exact_absolute_redirect.value()
                  ? !put_exact_absolute_redirect(writer,
                                                 server.exact_absolute_redirect.path,
                                                 server.exact_absolute_redirect.response.status,
                                                 server.exact_absolute_redirect.response.authority,
                                                 server.exact_absolute_redirect.response.path)
-                 : !put_root_forward(writer, "GET", 3, false, true)) ||
-            !put_root_forward(writer, "", 0, false, false) ||
+                 : !put_root_forward(writer, "GET", 3, false, true, hide_compat_header)) ||
+            !put_root_forward(writer, "", 0, false, false, hide_compat_header) ||
             (exact_local_return.value() &&
              !put_exact_local_return(writer,
                                      server.exact_local_return.path,
