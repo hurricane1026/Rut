@@ -1,6 +1,7 @@
 // #358 Stage 2a3b: authenticated sudo/nsenter broker lifecycle only.
 // No HTTP listener, nginx process, RUT process, or AF_INET socket is created here.
 
+#include "fixture_direct_launch.h"
 #include "fixture_ipv4_topology.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,6 +39,18 @@
 namespace {
 
 using namespace rut::test::fixture_worker_protocol;
+using rut::test::fixture_direct_launch::AllowedStages;
+using rut::test::fixture_direct_launch::current_allows_group_signal;
+using rut::test::fixture_direct_launch::direct_launch_diagnostic;
+using rut::test::fixture_direct_launch::DirectLaunch;
+using rut::test::fixture_direct_launch::DirectLaunchAnchor;
+using rut::test::fixture_direct_launch::kLaunchMarker;
+using rut::test::fixture_direct_launch::kMaxLaunchAncestry;
+using rut::test::fixture_direct_launch::launch_marker_matches;
+using rut::test::fixture_direct_launch::LaunchStage;
+using rut::test::fixture_direct_launch::observe_direct;
+using rut::test::fixture_direct_launch::StageDescriptor;
+using rut::test::fixture_direct_launch::validate_launcher_ancestry;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
 
 constexpr u16 kBrokerRootHello = 20;
@@ -66,18 +80,6 @@ struct ParentEndpoint {
 
     bool cleanup(std::string& error);
     ~ParentEndpoint();
-};
-
-struct DirectChild {
-    pid_t pid = -1;
-    u64 start = 0;
-    dev_t expected_exe_dev = 0;
-    ino_t expected_exe_ino = 0;
-    std::string expected_argv;
-    ProcIdentity validated_identity;
-    bool identity_valid = false;
-    int status = 0;
-    bool reaped = false;
 };
 
 static bool endpoint_matches(const ParentEndpoint& endpoint, const EndpointIdentity& expected);
@@ -837,11 +839,11 @@ static bool no_process_with_token(const std::string& token) {
     return clean;
 }
 
-static bool wait_direct(DirectChild& child, int timeout_ms) {
+static bool wait_direct(DirectLaunch& child, int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-        const pid_t waited = waitpid(child.pid, &child.status, WNOHANG);
-        if (waited == child.pid) {
+        const pid_t waited = waitpid(child.anchor.pid, &child.status, WNOHANG);
+        if (waited == child.anchor.pid) {
             child.reaped = true;
             return true;
         }
@@ -851,29 +853,29 @@ static bool wait_direct(DirectChild& child, int timeout_ms) {
     return false;
 }
 
-static bool record_direct_child_identity(DirectChild& child) {
+static bool record_direct_launch_identity(DirectLaunch& child) {
     ProcIdentity current;
-    if (child.pid <= 1 || !read_proc(child.pid, current, false) || current.pid != child.pid ||
-        current.start != child.start || current.pgid != child.pid || current.pgid <= 1 ||
-        current.exe_dev != child.expected_exe_dev || current.exe_ino != child.expected_exe_ino ||
-        current.cmdline != child.expected_argv)
-        return false;
-    child.validated_identity = std::move(current);
-    child.identity_valid = true;
-    return true;
+    std::string reason;
+    if (child.anchor.pid > 1 && read_proc(child.anchor.pid, current, false) &&
+        observe_direct(child, current, reason))
+        return true;
+    child.reason =
+        reason.empty() ? "direct launch current /proc identity could not be read" : reason;
+    return false;
 }
 
-static bool safe_signal_direct_child(const DirectChild& child, int signal_number) {
+static bool safe_signal_direct_child(DirectLaunch& child, int signal_number) {
     ProcIdentity current;
-    return child.identity_valid && child.pid > 1 && child.validated_identity.pid == child.pid &&
-           child.validated_identity.pgid == child.pid && child.validated_identity.pgid > 1 &&
-           child.validated_identity.start == child.start &&
-           child.validated_identity.exe_dev == child.expected_exe_dev &&
-           child.validated_identity.exe_ino == child.expected_exe_ino &&
-           child.validated_identity.cmdline == child.expected_argv &&
-           read_proc(child.pid, current, false) &&
-           same_process_identity(child.validated_identity, current) &&
-           current.pgid == current.pid && kill(-current.pgid, signal_number) == 0;
+    std::string reason;
+    if (child.anchor.pid <= 1 || child.anchor.pgid <= 1 ||
+        !read_proc(child.anchor.pid, current, false) ||
+        !current_allows_group_signal(child, current, reason)) {
+        child.reason =
+            reason.empty() ? "direct launch could not be revalidated for group signal" : reason;
+        return false;
+    }
+    if (!observe_direct(child, current, reason)) return false;
+    return kill(-child.anchor.pgid, signal_number) == 0;
 }
 
 static bool bounded_wait_and_signal_self_check(std::string& error) {
@@ -913,26 +915,21 @@ static bool bounded_wait_and_signal_self_check(std::string& error) {
     const bool ready_exact = read_exact(ready[0], &marker, 1, kHandshakeMs) && marker == 0xa3;
     close(ready[0]);
     ProcIdentity observed;
-    DirectChild direct;
-    direct.pid = child;
     const bool identity_exact = ready_exact && read_proc(child, observed, false) &&
                                 observed.ppid == getpid() && observed.pgid == child &&
                                 observed.uid == parent.uid && observed.gid == parent.gid &&
                                 observed.netns == parent.netns && observed.exe == parent.exe &&
                                 observed.cmdline == parent.cmdline;
-    if (identity_exact) {
-        direct.start = observed.start;
-        direct.expected_exe_dev = observed.exe_dev;
-        direct.expected_exe_ino = observed.exe_ino;
-        direct.expected_argv = observed.cmdline;
-        direct.validated_identity = observed;
-        direct.identity_valid = true;
-    }
-    DirectChild stale = direct;
-    stale.validated_identity.start++;
-    DirectChild unsafe = direct;
-    unsafe.validated_identity.pgid = 1;
-    const bool mutations = identity_exact && safe_signal_direct_child(direct, 0) &&
+    const StageDescriptor self_stage{observed.exe_dev, observed.exe_ino, observed.cmdline};
+    DirectLaunch direct({child, observed.start, child, parent.uid, parent.gid, parent.netns},
+                        {self_stage, self_stage, self_stage, parent.netns + 1});
+    std::string launch_reason;
+    const bool observed_exact = identity_exact && observe_direct(direct, observed, launch_reason);
+    DirectLaunch stale = direct;
+    stale.current_identity.start++;
+    DirectLaunch unsafe = direct;
+    unsafe.current_identity.pgid = 1;
+    const bool mutations = observed_exact && safe_signal_direct_child(direct, 0) &&
                            !safe_signal_direct_child(stale, 0) &&
                            !safe_signal_direct_child(unsafe, 0);
     int status = 0;
@@ -954,6 +951,55 @@ static bool bounded_wait_and_signal_self_check(std::string& error) {
     return true;
 }
 
+static bool wait_marker_exec_close(int fd, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        pollfd descriptor{fd, static_cast<short>(POLLIN | POLLHUP), 0};
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
+        if (remaining <= 0) return false;
+        const int rc = poll(&descriptor, 1, static_cast<int>(remaining));
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0 || (descriptor.revents & (POLLERR | POLLNVAL)) != 0) return false;
+        unsigned char extra = 0;
+        const ssize_t count = read(fd, &extra, 1);
+        if (count == 0) return true;
+        if (count > 0) return false;
+        if (errno != EINTR && errno != EAGAIN) return false;
+    }
+}
+
+static bool stable_proc_identity(pid_t pid, ProcIdentity& identity) {
+    ProcIdentity first, second;
+    return read_proc(pid, first, false) && read_proc(pid, second, false) &&
+           same_process_identity(first, second) && (identity = std::move(second), true);
+}
+
+static void reap_failed_direct(pid_t child, std::optional<DirectLaunch>& launch) {
+    int status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child || (waited < 0 && errno != EINTR)) return;
+        (void)poll(nullptr, 0, 10);
+    }
+    if (launch && launch->current_valid && safe_signal_direct_child(*launch, SIGKILL) &&
+        wait_direct(*launch, kCleanupMs))
+        return;
+    // An unreaped directly-owned child PID cannot be reused.  When no exact
+    // allowed stage exists, kill only that PID and never its unvalidated PGID.
+    if (kill(child, SIGKILL) == 0) {
+        const auto kill_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+        while (std::chrono::steady_clock::now() < kill_deadline) {
+            const pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child || (waited < 0 && errno != EINTR)) return;
+            (void)poll(nullptr, 0, 10);
+        }
+    }
+}
+
 static bool launch_sudo(const std::string& sudo_path,
                         const std::string& nsenter_path,
                         const std::string& executable,
@@ -961,31 +1007,91 @@ static bool launch_sudo(const std::string& sudo_path,
                         const ParentEndpoint& endpoint,
                         const Token& token,
                         const char* scenario,
-                        DirectChild& child) {
+                        std::optional<DirectLaunch>& launch,
+                        std::string& error) {
     const std::string netns = "/proc/" + std::to_string(topology.holder_pid) + "/ns/net";
     const std::string netns_arg = "--net=" + netns;
     const std::string expected_netns = std::to_string(topology.holder_netns);
     const std::string token_value = token_text(token);
-    struct stat sudo_status{};
-    if (stat(sudo_path.c_str(), &sudo_status) != 0) return false;
-    child.expected_exe_dev = sudo_status.st_dev;
-    child.expected_exe_ino = sudo_status.st_ino;
-    child.expected_argv = exact_argv({sudo_path,
-                                      "-n",
-                                      "--",
-                                      nsenter_path,
-                                      netns_arg,
-                                      "--",
-                                      executable,
-                                      "--fixture-broker-launcher",
-                                      endpoint.socket,
-                                      token_value,
-                                      expected_netns,
-                                      scenario});
-    child.pid = fork();
-    if (child.pid < 0) return false;
-    if (child.pid == 0) {
-        (void)setpgid(0, 0);
+    struct stat sudo_status{}, nsenter_status{}, launcher_status{};
+    ProcIdentity parent;
+    if (stat(sudo_path.c_str(), &sudo_status) != 0 ||
+        stat(nsenter_path.c_str(), &nsenter_status) != 0 ||
+        stat(executable.c_str(), &launcher_status) != 0 || !read_proc(getpid(), parent, false) ||
+        parent.uid == 0 || parent.netns == topology.holder_netns) {
+        error = "launch descriptor or caller identity setup failed";
+        return false;
+    }
+    const std::string launcher_argv = exact_argv({executable,
+                                                  "--fixture-broker-launcher",
+                                                  endpoint.socket,
+                                                  token_value,
+                                                  expected_netns,
+                                                  scenario});
+    const std::string nsenter_argv = exact_argv({nsenter_path,
+                                                 netns_arg,
+                                                 "--",
+                                                 executable,
+                                                 "--fixture-broker-launcher",
+                                                 endpoint.socket,
+                                                 token_value,
+                                                 expected_netns,
+                                                 scenario});
+    const std::string sudo_argv = exact_argv({sudo_path,
+                                              "-n",
+                                              "--",
+                                              nsenter_path,
+                                              netns_arg,
+                                              "--",
+                                              executable,
+                                              "--fixture-broker-launcher",
+                                              endpoint.socket,
+                                              token_value,
+                                              expected_netns,
+                                              scenario});
+    const AllowedStages allowed{{sudo_status.st_dev, sudo_status.st_ino, sudo_argv},
+                                {nsenter_status.st_dev, nsenter_status.st_ino, nsenter_argv},
+                                {launcher_status.st_dev, launcher_status.st_ino, launcher_argv},
+                                topology.holder_netns};
+    int marker_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
+    if (pipe2(marker_pipe, O_CLOEXEC) != 0 || pipe2(release_pipe, O_CLOEXEC) != 0) {
+        if (marker_pipe[0] >= 0) close(marker_pipe[0]);
+        if (marker_pipe[1] >= 0) close(marker_pipe[1]);
+        error = "CLOEXEC launch marker pipe setup failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(marker_pipe[0]);
+        close(marker_pipe[1]);
+        close(release_pipe[0]);
+        close(release_pipe[1]);
+        error = "sudo launch fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(marker_pipe[0]);
+        close(release_pipe[1]);
+        size_t offset = 0;
+        if (setpgid(0, 0) != 0) _exit(125);
+        while (offset != kLaunchMarker.size()) {
+            const ssize_t count =
+                write(marker_pipe[1], kLaunchMarker.data() + offset, kLaunchMarker.size() - offset);
+            if (count > 0)
+                offset += static_cast<size_t>(count);
+            else if (count < 0 && errno == EINTR)
+                continue;
+            else
+                _exit(125);
+        }
+        unsigned char release = 0;
+        ssize_t count;
+        do {
+            count = read(release_pipe[0], &release, 1);
+        } while (count < 0 && errno == EINTR);
+        if (count != 1 || release != 0x4c) _exit(125);
+        close(release_pipe[0]);
         execl(sudo_path.c_str(),
               sudo_path.c_str(),
               "-n",
@@ -1002,26 +1108,52 @@ static bool launch_sudo(const std::string& sudo_path,
               static_cast<char*>(nullptr));
         _exit(127);
     }
-    (void)setpgid(child.pid, child.pid);
+    close(marker_pipe[1]);
+    close(release_pipe[0]);
+    std::array<unsigned char, kLaunchMarker.size()> marker{};
+    ProcIdentity anchor_identity;
+    const bool marker_exact =
+        read_exact(marker_pipe[0], marker.data(), marker.size(), kHandshakeMs) &&
+        launch_marker_matches(marker.data(), marker.size());
+    const bool anchor_exact =
+        marker_exact && stable_proc_identity(child, anchor_identity) &&
+        anchor_identity.pid == child && anchor_identity.ppid == getpid() &&
+        anchor_identity.start != 0 && anchor_identity.pgid == child &&
+        anchor_identity.uid == parent.uid && anchor_identity.gid == parent.gid &&
+        anchor_identity.netns == parent.netns && anchor_identity.exe_dev == parent.exe_dev &&
+        anchor_identity.exe_ino == parent.exe_ino && anchor_identity.cmdline == parent.cmdline;
+    if (anchor_exact)
+        launch.emplace(
+            DirectLaunchAnchor{
+                child, anchor_identity.start, child, parent.uid, parent.gid, parent.netns},
+            allowed,
+            true);
+    const unsigned char release = 0x4c;
+    const bool released = anchor_exact && write_exact(release_pipe[1], &release, 1, kHandshakeMs);
+    close(release_pipe[1]);
+    const bool exec_closed = released && wait_marker_exec_close(marker_pipe[0], kHandshakeMs);
+    close(marker_pipe[0]);
+    if (!anchor_exact || !exec_closed) {
+        error = !marker_exact   ? "missing or invalid child launch marker"
+                : !anchor_exact ? "fork/marker immutable /proc anchor was not exact"
+                                : "CLOEXEC marker did not close on exact sudo exec";
+        reap_failed_direct(child, launch);
+        return false;
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
     do {
         ProcIdentity identity;
-        if (read_proc(child.pid, identity, false)) {
-            if (child.start == 0) child.start = identity.start;
-            if (identity.start == child.start && identity.pgid == child.pid &&
-                identity.exe_dev == child.expected_exe_dev &&
-                identity.exe_ino == child.expected_exe_ino &&
-                identity.cmdline == child.expected_argv) {
-                child.validated_identity = std::move(identity);
-                child.identity_valid = true;
-                return true;
-            }
+        if (stable_proc_identity(child, identity)) {
+            std::string reason;
+            if (observe_direct(*launch, identity, reason)) return true;
+            error = reason;
+            reap_failed_direct(child, launch);
+            return false;
         }
         (void)poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
-    if (!wait_direct(child, kCleanupMs) && record_direct_child_identity(child) &&
-        safe_signal_direct_child(child, SIGKILL))
-        (void)wait_direct(child, kCleanupMs);
+    error = "no stable exact sudo/nsenter/launcher stage observed within 250ms";
+    reap_failed_direct(child, launch);
     return false;
 }
 
@@ -1033,15 +1165,23 @@ static bool decode_ready(
            decode_report(frame.payload, report);
 }
 
-static bool ancestor_contains(pid_t start, pid_t expected, size_t limit) {
-    pid_t current = start;
-    for (size_t depth = 0; depth != limit && current > 1; ++depth) {
-        if (current == expected) return true;
+static bool read_launcher_ancestry(const ProcIdentity& launcher,
+                                   const DirectLaunch& launch,
+                                   std::vector<ProcIdentity>& ancestry,
+                                   std::string& reason) {
+    pid_t current = launcher.ppid;
+    for (size_t depth = 0; depth != kMaxLaunchAncestry && current > 1; ++depth) {
         ProcIdentity identity;
-        if (!read_proc(current, identity, false) || identity.ppid == current) return false;
+        if (!stable_proc_identity(current, identity) || identity.ppid == identity.pid) {
+            reason = "launcher ancestry could not be read as a stable /proc chain";
+            return false;
+        }
+        ancestry.push_back(identity);
+        if (identity.pid == launch.anchor.pid) return true;
         current = identity.ppid;
     }
-    return current == expected;
+    reason = "launcher ancestry did not reach immutable direct PID within bound";
+    return false;
 }
 
 static bool validate_root_broker(const Report& report,
@@ -1051,29 +1191,54 @@ static bool validate_root_broker(const Report& report,
                                  const std::string& executable,
                                  const std::string& expected_argv,
                                  const std::string& expected_launcher_argv,
-                                 const DirectChild& sudo_child) {
+                                 DirectLaunch& sudo_launch) {
     if (peer.pid <= 1 || peer.uid != 0 || peer.gid != 0 ||
         report.target_pid != static_cast<u64>(peer.pid) ||
         report.target_pid != static_cast<u64>(proc.pid) || report.wrapper_pid <= 1 ||
         report.target_pid == report.wrapper_pid || report.start != proc.start ||
+        report.pgid != static_cast<u64>(proc.pgid) || proc.pgid != sudo_launch.anchor.pgid ||
         report.netns != topology.holder_netns || proc.netns != topology.holder_netns ||
-        report.uid != 0 || report.gid != 0 || report.exe != executable || proc.exe != executable ||
-        report.exe_dev != proc.exe_dev || report.exe_ino != proc.exe_ino ||
+        report.uid != 0 || report.gid != 0 || proc.uid != 0 || proc.gid != 0 ||
+        report.exe != executable || proc.exe != executable || report.exe_dev != proc.exe_dev ||
+        report.exe_ino != proc.exe_ino ||
+        proc.exe_dev != sudo_launch.allowed.launcher_stage.exe_dev ||
+        proc.exe_ino != sudo_launch.allowed.launcher_stage.exe_ino ||
         report.argv != expected_argv || proc.cmdline != expected_argv ||
         report.mode != "broker-root" || proc.ppid != static_cast<pid_t>(report.wrapper_pid) ||
-        peer.pid == sudo_child.pid)
+        report.no_new_privs != static_cast<u64>(proc.no_new_privs) ||
+        report.capabilities_clear != static_cast<u64>(proc.capabilities_clear) ||
+        report.groups_clear != 0 || report.groups_unchanged != 1) {
+        sudo_launch.reason = "root broker report/peer/current /proc fields were not exact";
         return false;
+    }
     ProcIdentity launcher;
-    ProcIdentity sudo_identity;
-    return proc.ppid != sudo_child.pid && read_proc(proc.ppid, launcher, false) &&
-           launcher.netns == topology.holder_netns && launcher.exe == executable &&
-           launcher.cmdline == expected_launcher_argv &&
-           read_proc(sudo_child.pid, sudo_identity, false) &&
-           sudo_identity.start == sudo_child.start &&
-           sudo_identity.exe_dev == sudo_child.expected_exe_dev &&
-           sudo_identity.exe_ino == sudo_child.expected_exe_ino &&
-           sudo_identity.cmdline == sudo_child.expected_argv &&
-           ancestor_contains(proc.ppid, sudo_child.pid, 8);
+    std::vector<ProcIdentity> ancestry;
+    std::string reason;
+    if (!stable_proc_identity(proc.ppid, launcher) || launcher.pid != proc.ppid ||
+        launcher.cmdline != expected_launcher_argv ||
+        (launcher.pid != sudo_launch.anchor.pid &&
+         !read_launcher_ancestry(launcher, sudo_launch, ancestry, reason)) ||
+        !validate_launcher_ancestry(sudo_launch, launcher, ancestry, reason)) {
+        sudo_launch.reason =
+            reason.empty() ? "root broker launcher provenance was not exact" : reason;
+        return false;
+    }
+    return true;
+}
+
+static DirectLaunch copy_launch_with_anchor(const DirectLaunch& source, DirectLaunchAnchor anchor) {
+    DirectLaunch result(std::move(anchor), source.allowed, source.marker_valid);
+    result.observed_stages = source.observed_stages;
+    result.mode = source.mode;
+    result.current_identity = source.current_identity;
+    result.current_stage = source.current_stage;
+    result.current_valid = source.current_valid;
+    result.launcher_identity = source.launcher_identity;
+    result.launcher_valid = source.launcher_valid;
+    result.reason = source.reason;
+    result.status = source.status;
+    result.reaped = source.reaped;
+    return result;
 }
 
 static bool causal_mutation_self_checks(const Report& root_report,
@@ -1092,8 +1257,9 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                         const std::string& dropped_argv,
                                         const std::string& target_argv,
                                         const Token& token,
-                                        const DirectChild& sudo_child,
+                                        DirectLaunch& sudo_child,
                                         const ParentEndpoint& endpoint) {
+    DirectLaunch baseline_launch = sudo_child;
     const bool root_baseline = validate_root_broker(root_report,
                                                     root_peer,
                                                     root_proc,
@@ -1101,15 +1267,19 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                     executable,
                                                     root_argv,
                                                     launcher_argv,
-                                                    sudo_child);
+                                                    baseline_launch);
     Report changed_root = root_report;
     changed_root.netns++;
     Peer changed_root_peer = root_peer;
     changed_root_peer.pid++;
     ProcIdentity changed_root_proc = root_proc;
     changed_root_proc.start++;
-    DirectChild changed_sudo = sudo_child;
-    changed_sudo.start++;
+    DirectLaunchAnchor stale_anchor = sudo_child.anchor;
+    stale_anchor.start++;
+    DirectLaunch changed_sudo = copy_launch_with_anchor(sudo_child, stale_anchor);
+    DirectLaunch changed_report_launch = sudo_child;
+    DirectLaunch changed_peer_launch = sudo_child;
+    DirectLaunch changed_proc_launch = sudo_child;
     const bool root_mutations = !validate_root_broker(changed_root,
                                                       root_peer,
                                                       root_proc,
@@ -1117,7 +1287,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
-                                                      sudo_child) &&
+                                                      changed_report_launch) &&
                                 !validate_root_broker(root_report,
                                                       changed_root_peer,
                                                       root_proc,
@@ -1125,7 +1295,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
-                                                      sudo_child) &&
+                                                      changed_peer_launch) &&
                                 !validate_root_broker(root_report,
                                                       root_peer,
                                                       changed_root_proc,
@@ -1133,7 +1303,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
-                                                      sudo_child) &&
+                                                      changed_proc_launch) &&
                                 !validate_root_broker(root_report,
                                                       root_peer,
                                                       root_proc,
@@ -1257,16 +1427,16 @@ static bool causal_mutation_self_checks(const Report& root_report,
         !safe_signal_target(target_report, target_peer, changed_target_proc, 0) &&
         !safe_signal_target(unsafe_signal_report, target_peer, target_proc, 0) &&
         process_alive(target_peer.pid);
-    DirectChild stale_sudo = sudo_child;
-    stale_sudo.validated_identity.start++;
-    DirectChild unsafe_sudo = sudo_child;
-    unsafe_sudo.validated_identity.pgid = 1;
+    DirectLaunch stale_sudo = sudo_child;
+    stale_sudo.current_identity.start++;
+    DirectLaunch unsafe_sudo = sudo_child;
+    unsafe_sudo.current_identity.pgid = 1;
     const bool sudo_signal_mutations =
-        sudo_child.identity_valid &&
-        stale_sudo.validated_identity.start != sudo_child.validated_identity.start &&
-        unsafe_sudo.validated_identity.pgid != sudo_child.validated_identity.pgid &&
+        sudo_child.current_valid &&
+        stale_sudo.current_identity.start != sudo_child.current_identity.start &&
+        unsafe_sudo.current_identity.pgid != sudo_child.current_identity.pgid &&
         safe_signal_direct_child(sudo_child, 0) && !safe_signal_direct_child(stale_sudo, 0) &&
-        !safe_signal_direct_child(unsafe_sudo, 0) && process_alive(sudo_child.pid);
+        !safe_signal_direct_child(unsafe_sudo, 0) && process_alive(sudo_child.anchor.pid);
     EndpointIdentity changed_endpoint = endpoint.identity;
     changed_endpoint.socket_ino++;
     const std::vector<unsigned char> trace{'G', 'D', 'U', 'N', 'C', 'P', 'X'};
@@ -1322,12 +1492,22 @@ static bool run_session(const std::string& sudo_path,
     ParentEndpoint endpoint;
     Token token;
     if (!new_token(token) || !create_parent_endpoint(endpoint, error)) return false;
-    DirectChild sudo_child;
-    if (!launch_sudo(
-            sudo_path, nsenter_path, executable, topology, endpoint, token, scenario, sudo_child)) {
-        error = "sudo/nsenter launch failed";
+    std::optional<DirectLaunch> direct_launch;
+    std::string launch_error;
+    if (!launch_sudo(sudo_path,
+                     nsenter_path,
+                     executable,
+                     topology,
+                     endpoint,
+                     token,
+                     scenario,
+                     direct_launch,
+                     launch_error)) {
+        error = "sudo/nsenter launch failed: " + launch_error;
+        if (direct_launch) error += "; " + direct_launch_diagnostic(*direct_launch);
         return false;
     }
+    DirectLaunch& sudo_child = *direct_launch;
     int root_fd = -1, broker_fd = -1, target_fd = -1;
     Report root_report, broker_report, target_report;
     Peer root_peer, broker_peer, target_peer;
@@ -1367,8 +1547,9 @@ static bool run_session(const std::string& sudo_path,
                                   root_argv,
                                   launcher_argv,
                                   sudo_child) ||
-            !record_direct_child_identity(sudo_child) || !endpoint_unchanged(endpoint)) {
-            error = "root broker provenance/endpoint validation failed";
+            !record_direct_launch_identity(sudo_child) || !endpoint_unchanged(endpoint)) {
+            error = "root broker provenance/endpoint validation failed: " +
+                    direct_launch_diagnostic(sudo_child);
             break;
         }
         if (!send_frame(root_fd,
@@ -1442,7 +1623,7 @@ static bool run_session(const std::string& sudo_path,
                                          false,
                                          true) ||
                 target_proc.ppid != broker_peer.pid || target_peer.pid == root_peer.pid ||
-                target_peer.pid == broker_peer.pid || target_peer.pid == sudo_child.pid ||
+                target_peer.pid == broker_peer.pid || target_peer.pid == sudo_child.anchor.pid ||
                 target_peer.pid == static_cast<pid_t>(root_report.wrapper_pid) ||
                 target_proc.netns != topology.holder_netns) {
                 error = "target exact secured identity failed";
@@ -1566,11 +1747,12 @@ static bool run_session(const std::string& sudo_path,
     if (!success && broker_peer.pid > 1 && broker_proc.pid == broker_peer.pid &&
         process_alive(broker_peer.pid))
         (void)terminate_verified(broker_report, broker_peer, broker_proc);
-    if (!sudo_child.reaped && sudo_child.pid > 1) {
+    if (!sudo_child.reaped && sudo_child.anchor.pid > 1) {
         if (!wait_direct(sudo_child, kCleanupMs)) {
             if (!safe_signal_direct_child(sudo_child, SIGTERM)) {
                 if (!error.empty()) error += "; ";
-                error += "refused unsafe sudo-child cleanup signal";
+                error += "refused unsafe direct-launch cleanup signal: " +
+                         direct_launch_diagnostic(sudo_child);
             } else if (!wait_direct(sudo_child, kCleanupMs) &&
                        (!safe_signal_direct_child(sudo_child, SIGKILL) ||
                         !wait_direct(sudo_child, kCleanupMs))) {

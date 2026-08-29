@@ -20,6 +20,17 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Pure #358 Stage 2a3b sudo/nsenter/launcher causal state model.  This test
+# uses synthetic process identities and never invokes sudo or fakes a positive
+# privileged semantic run.
+add_library(fixture_direct_launch STATIC fixture_direct_launch.cc)
+target_include_directories(fixture_direct_launch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_direct_launch test_fixture_direct_launch.cc)
+target_link_libraries(test_fixture_direct_launch PRIVATE fixture_direct_launch)
+add_test(NAME test_fixture_direct_launch COMMAND test_fixture_direct_launch)
+set_tests_properties(test_fixture_direct_launch PROPERTIES LABELS "unit" TIMEOUT 30)
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -502,7 +513,10 @@ if(RUT_ENABLE_JIT)
         test_fixture_privileged_broker.cc
         fixture_ipv4_topology.cc
     )
-    target_link_libraries(test_fixture_privileged_broker PRIVATE fixture_worker_protocol)
+    target_link_libraries(test_fixture_privileged_broker PRIVATE
+        fixture_direct_launch
+        fixture_worker_protocol
+    )
     target_include_directories(test_fixture_privileged_broker PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
