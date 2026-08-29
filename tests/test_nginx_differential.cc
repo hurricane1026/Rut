@@ -50580,6 +50580,429 @@ static bool capture_proxy_hide_header_generated_pair(const char* rut_path,
     return true;
 }
 
+// Final Stage 4b2b composition.  The four captures deliberately share one
+// reservation set, but consume only their own handoff pair.  Consequently all
+// eight endpoints are held before N1 is started while each side remains an
+// independent resource/process identity.
+struct ProxyHideHeaderFinalDifferential {
+    StaticQueryProxyOracleObservation pinned[2];
+    ProxyHideHeaderGeneratedObservation generated[2];
+    u16 ports[8]{};
+};
+
+static bool validate_proxy_hide_header_final(const ProxyHideHeaderFinalDifferential& value,
+                                             std::string& error) {
+    const u16 pinned_ports[4] = {value.ports[0], value.ports[1], value.ports[2], value.ports[3]};
+    if (!validate_static_query_proxy_pair(
+            value.pinned, pinned_ports, error, kProxyHideHeaderOracleProfile) ||
+        !validate_proxy_hide_header_generated_pair({value.generated[0], value.generated[1]}, error))
+        return false;
+    if (value.generated[0].frontend_port != value.ports[4] ||
+        value.generated[0].backend_port != value.ports[5] ||
+        value.generated[1].frontend_port != value.ports[6] ||
+        value.generated[1].backend_port != value.ports[7]) {
+        error = "#373 final differential generated endpoint-array binding failed";
+        return false;
+    }
+    for (size_t i = 0u; i < 8u; i++) {
+        if (value.ports[i] < 1024u || value.ports[i] > 9999u) {
+            error = "#373 final differential endpoint was not a four-digit port";
+            return false;
+        }
+        for (size_t j = i + 1u; j < 8u; j++) {
+            if (value.ports[i] == value.ports[j]) {
+                error = "#373 final differential reused one of eight held endpoints";
+                return false;
+            }
+        }
+    }
+    const std::string* identities[] = {&value.pinned[0].temp_path,
+                                       &value.pinned[1].temp_path,
+                                       &value.generated[0].temp_path,
+                                       &value.generated[1].temp_path,
+                                       &value.pinned[0].config_path,
+                                       &value.pinned[1].config_path,
+                                       &value.generated[0].source_path,
+                                       &value.generated[1].source_path,
+                                       &value.pinned[0].log_path,
+                                       &value.pinned[1].log_path,
+                                       &value.generated[0].runtime_log_path,
+                                       &value.generated[1].runtime_log_path,
+                                       &value.pinned[0].access_path,
+                                       &value.pinned[1].access_path,
+                                       &value.generated[0].access_probe_path,
+                                       &value.generated[1].access_probe_path,
+                                       &value.pinned[0].process_identity,
+                                       &value.pinned[1].process_identity,
+                                       &value.generated[0].process_identity,
+                                       &value.generated[1].process_identity};
+    for (const std::string* identity : identities) {
+        if (identity->empty()) {
+            error = "#373 final differential had an empty resource/process identity";
+            return false;
+        }
+    }
+    for (size_t i = 0u; i < std::size(identities); i++)
+        for (size_t j = i + 1u; j < std::size(identities); j++)
+            if (*identities[i] == *identities[j]) {
+                error = "#373 final differential crossed a resource/process identity";
+                return false;
+            }
+
+    // Each side has already proved status/header/body/EOF semantics in its
+    // side-specific validator.  Compare all four exact Date-normalized wires.
+    std::vector<std::vector<char>> downstream;
+    downstream.reserve(4u);
+    downstream.push_back(value.pinned[0].wires[0]);
+    downstream.push_back(value.pinned[1].wires[0]);
+    downstream.push_back(value.generated[0].response);
+    downstream.push_back(value.generated[1].response);
+    for (std::vector<char>& wire : downstream) {
+        if (wire.size() != 176u || !normalize_date(wire)) {
+            error =
+                "#373 final differential downstream wire was not exact 176-byte Date-normalized";
+            return false;
+        }
+    }
+    for (size_t i = 1u; i < downstream.size(); i++)
+        if (downstream[i] != downstream[0]) {
+            error = "#373 final differential N/R downstream wires differed";
+            return false;
+        }
+
+    std::vector<std::string> upstream;
+    upstream.reserve(4u);
+    std::string canonical;
+    if (!canonicalize_generated_upstream_host(
+            value.pinned[0].forward_history[0], value.pinned[0].backend_port, canonical, error))
+        return false;
+    upstream.push_back(canonical);
+    if (!canonicalize_generated_upstream_host(
+            value.pinned[1].forward_history[0], value.pinned[1].backend_port, canonical, error))
+        return false;
+    upstream.push_back(canonical);
+    if (!canonicalize_generated_upstream_host(value.generated[0].upstream_history[0],
+                                              value.generated[0].backend_port,
+                                              canonical,
+                                              error))
+        return false;
+    upstream.push_back(canonical);
+    if (!canonicalize_generated_upstream_host(value.generated[1].upstream_history[0],
+                                              value.generated[1].backend_port,
+                                              canonical,
+                                              error))
+        return false;
+    upstream.push_back(canonical);
+    for (size_t i = 1u; i < upstream.size(); i++)
+        if (upstream[i] != upstream[0]) {
+            error = "#373 final differential N/R upstream Host/header wires differed";
+            return false;
+        }
+    return true;
+}
+
+static bool run_proxy_hide_header_final_self_checks(
+    const ProxyHideHeaderFinalDifferential& baseline, std::string& error) {
+    if (!validate_proxy_hide_header_final(baseline, error)) return false;
+    const auto rejects = [&](ProxyHideHeaderFinalDifferential candidate,
+                             const char* field,
+                             bool differs,
+                             const char* label) {
+        if (!differs) {
+            error = std::string("#373 final mutation did not change ") + field + ": " + label;
+            return false;
+        }
+        std::string detail;
+        if (validate_proxy_hide_header_final(candidate, detail)) {
+            error = std::string("#373 final mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    auto candidate = baseline;
+    std::swap(candidate.pinned[0].order, candidate.pinned[1].order);
+    if (!rejects(candidate,
+                 "order",
+                 candidate.pinned[0].order != baseline.pinned[0].order &&
+                     candidate.pinned[1].order != baseline.pinned[1].order,
+                 "wrong pinned order"))
+        return false;
+    candidate = baseline;
+    candidate.generated[0].order = "location-first";
+    if (!rejects(candidate,
+                 "order",
+                 candidate.generated[0].order != baseline.generated[0].order,
+                 "wrong generated order"))
+        return false;
+    candidate = baseline;
+    u16 unused_port = 9999u;
+    while (std::find(std::begin(baseline.ports), std::end(baseline.ports), unused_port) !=
+           std::end(baseline.ports))
+        --unused_port;
+    if (unused_port < 1024u || unused_port == baseline.ports[4]) {
+        error = "#373 final port mutation fixture lacked a unique four-digit endpoint";
+        return false;
+    }
+    candidate.ports[4] = unused_port;
+    if (!rejects(candidate,
+                 "port",
+                 candidate.ports[4] != baseline.ports[4],
+                 "generated endpoint-array binding mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].temp_path = candidate.generated[0].temp_path;
+    if (!rejects(candidate,
+                 "resource",
+                 candidate.generated[1].temp_path != baseline.generated[1].temp_path,
+                 "cross-side resource reuse"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].process_identity = candidate.generated[0].process_identity;
+    if (!rejects(candidate,
+                 "process",
+                 candidate.generated[1].process_identity != baseline.generated[1].process_identity,
+                 "cross-side process identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.pinned[1].config_path = candidate.pinned[0].config_path;
+    if (!rejects(candidate,
+                 "config",
+                 candidate.pinned[1].config_path != baseline.pinned[1].config_path,
+                 "cross-side config identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].response[100] = 'X';
+    if (!rejects(candidate,
+                 "downstream",
+                 candidate.generated[1].response != baseline.generated[1].response,
+                 "N/R downstream mismatch"))
+        return false;
+    candidate = baseline;
+    {
+        std::string wire(candidate.generated[1].upstream_history[0].begin(),
+                         candidate.generated[1].upstream_history[0].end());
+        const std::string host =
+            "Host: 127.0.0.1:" + std::to_string(candidate.generated[1].backend_port) + "\r\n";
+        const size_t at = wire.find(host);
+        if (at == std::string::npos) {
+            error = "#373 final upstream mutation fixture lacked complete Host token";
+            return false;
+        }
+        const u16 alternate_port = candidate.generated[1].backend_port == 9999u
+                                       ? 9998u
+                                       : static_cast<u16>(candidate.generated[1].backend_port + 1u);
+        const std::string alternate = "Host: 127.0.0.1:" + std::to_string(alternate_port) + "\r\n";
+        if (alternate == host || alternate_port < 1024u || alternate_port > 9999u) {
+            error = "#373 final upstream mutation fixture lacked a distinct four-digit Host";
+            return false;
+        }
+        wire.replace(at, host.size(), alternate);
+        candidate.generated[1].upstream_history[0].assign(wire.begin(), wire.end());
+    }
+    if (!rejects(candidate,
+                 "upstream",
+                 candidate.generated[1].upstream_history != baseline.generated[1].upstream_history,
+                 "N/R upstream Host mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].response.insert(
+        candidate.generated[1].response.begin(),
+        {'X', '-', 'C', 'o', 'm', 'p', 'a', 't', '-', 'H',  'i', 'd',
+         'd', 'e', 'n', ':', ' ', 'l', 'e', 'a', 'k', '\r', '\n'});
+    if (!rejects(candidate,
+                 "hidden",
+                 candidate.generated[1].response != baseline.generated[1].response,
+                 "hidden header leak"))
+        return false;
+    candidate = baseline;
+    {
+        const std::string visible = "X-Compat-Visible: keep\r\n";
+        std::string wire(candidate.generated[1].response.begin(),
+                         candidate.generated[1].response.end());
+        const size_t at = wire.find(visible);
+        if (at == std::string::npos) {
+            error = "#373 final visible-header mutation fixture was malformed";
+            return false;
+        }
+        wire.replace(at, visible.size(), "X-Compat-Visible: keep\r\nX-Compat-Visible: keep\r\n");
+        candidate.generated[1].response.assign(wire.begin(), wire.end());
+    }
+    if (!rejects(candidate,
+                 "visible",
+                 candidate.generated[1].response != baseline.generated[1].response,
+                 "visible header duplicate"))
+        return false;
+    candidate = baseline;
+    const std::string cookie_a = "Set-Cookie: a=1\r\n";
+    const std::string cookie_b = "Set-Cookie: b=2\r\n";
+    std::string response(candidate.generated[1].response.begin(),
+                         candidate.generated[1].response.end());
+    const size_t a = response.find(cookie_a), b = response.find(cookie_b);
+    if (a == std::string::npos || b == std::string::npos || a > b) {
+        error = "#373 final cookie-order mutation fixture was malformed";
+        return false;
+    }
+    response.replace(a, cookie_a.size(), cookie_b);
+    response.replace(b, cookie_b.size(), cookie_a);
+    candidate.generated[1].response.assign(response.begin(), response.end());
+    if (!rejects(candidate,
+                 "cookies",
+                 candidate.generated[1].response != baseline.generated[1].response,
+                 "visible/cookie order mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].accepted = 2u;
+    if (!rejects(candidate,
+                 "count",
+                 candidate.generated[1].accepted != baseline.generated[1].accepted,
+                 "retry/count mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].response_peer_close_count = 2u;
+    if (!rejects(candidate,
+                 "FIN",
+                 candidate.generated[1].response_peer_close_count !=
+                     baseline.generated[1].response_peer_close_count,
+                 "FIN mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].response_peer_unexpected_data = true;
+    if (!rejects(candidate,
+                 "late",
+                 candidate.generated[1].response_peer_unexpected_data !=
+                     baseline.generated[1].response_peer_unexpected_data,
+                 "late origin bytes"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].eof = false;
+    if (!rejects(candidate,
+                 "EOF",
+                 candidate.generated[1].eof != baseline.generated[1].eof,
+                 "EOF mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].stable_window = false;
+    if (!rejects(candidate,
+                 "stability",
+                 candidate.generated[1].stable_window != baseline.generated[1].stable_window,
+                 "stability mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].access_enoent_final = false;
+    if (!rejects(
+            candidate,
+            "access",
+            candidate.generated[1].access_enoent_final != baseline.generated[1].access_enoent_final,
+            "generated access appearance"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].poison += "poison";
+    if (!rejects(candidate,
+                 "poison",
+                 candidate.generated[1].poison != baseline.generated[1].poison,
+                 "generated source poison bytes"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].source_poisoned = false;
+    if (!rejects(candidate,
+                 "source_poisoned",
+                 candidate.generated[1].source_poisoned != baseline.generated[1].source_poisoned,
+                 "generated source poison ownership"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].child_live_after_poison = false;
+    if (!rejects(candidate,
+                 "liveness",
+                 candidate.generated[1].child_live_after_poison !=
+                     baseline.generated[1].child_live_after_poison,
+                 "post-poison liveness corruption"))
+        return false;
+    candidate = baseline;
+    candidate.pinned[1].source_poison += "poison";
+    if (!rejects(candidate,
+                 "source_poison",
+                 candidate.pinned[1].source_poison != baseline.pinned[1].source_poison,
+                 "pinned source poison bytes"))
+        return false;
+    candidate = baseline;
+    candidate.pinned[1].source_poisoned = false;
+    if (!rejects(candidate,
+                 "source_poisoned",
+                 candidate.pinned[1].source_poisoned != baseline.pinned[1].source_poisoned,
+                 "pinned source poison ownership"))
+        return false;
+    candidate = baseline;
+    candidate.generated[1].exited_zero = false;
+    if (!rejects(candidate,
+                 "lifecycle",
+                 candidate.generated[1].exited_zero != baseline.generated[1].exited_zero,
+                 "lifecycle corruption"))
+        return false;
+    return true;
+}
+
+static bool capture_proxy_hide_header_final(const char* rut_path,
+                                            const std::string& container_prefix,
+                                            ProxyHideHeaderFinalDifferential& value,
+                                            std::string& error) {
+    TempDir temps[4];
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!temps[i].create()) {
+            error = "#373 final differential could not create four independent TempDir trees";
+            return false;
+        }
+    }
+    HeldLoopbackPorts reservations;
+    for (size_t i = 0u; i < 8u; i++) {
+        if (!reservations.reserve_four_digit(i, value.ports[i])) {
+            error = "#373 final differential could not reserve all eight unique ports before N1";
+            return false;
+        }
+    }
+    // N1/N2 consume ports 0..3; R1/R2 consume ports 4..7.  Every other
+    // reservation remains held during the active side's backend/frontend handoff.
+    if (!capture_static_query_proxy_oracle_side(value.ports[0],
+                                                value.ports[1],
+                                                temps[0],
+                                                container_prefix + "-N1",
+                                                true,
+                                                value.pinned[0],
+                                                error,
+                                                &reservations.fds[0],
+                                                &reservations.fds[1],
+                                                kProxyHideHeaderOracleProfile) ||
+        !capture_static_query_proxy_oracle_side(value.ports[2],
+                                                value.ports[3],
+                                                temps[1],
+                                                container_prefix + "-N2",
+                                                false,
+                                                value.pinned[1],
+                                                error,
+                                                &reservations.fds[2],
+                                                &reservations.fds[3],
+                                                kProxyHideHeaderOracleProfile) ||
+        !capture_proxy_hide_header_generated_side(value.ports[4],
+                                                  value.ports[5],
+                                                  temps[2],
+                                                  rut_path,
+                                                  true,
+                                                  value.generated[0],
+                                                  error,
+                                                  &reservations.fds[4],
+                                                  &reservations.fds[5]) ||
+        !capture_proxy_hide_header_generated_side(value.ports[6],
+                                                  value.ports[7],
+                                                  temps[3],
+                                                  rut_path,
+                                                  false,
+                                                  value.generated[1],
+                                                  error,
+                                                  &reservations.fds[6],
+                                                  &reservations.fds[7]))
+        return false;
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -50621,6 +51044,8 @@ int main(int argc, char** argv) {
     const bool proxy_hide_header_generated_pair_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-pair-self-check") == 0;
+    const bool converter_proxy_hide_header_differential =
+        argc == 3 && strcmp(argv[1], "--converter-proxy-hide-header-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -50802,7 +51227,8 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !proxy_hide_header_generated_pair_self_check && !wildcard_listen_oracle &&
+         !proxy_hide_header_generated_pair_self_check &&
+         !converter_proxy_hide_header_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
          !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
@@ -50867,6 +51293,7 @@ int main(int argc, char** argv) {
         ((proxy_hide_header_generated_side_self_check ||
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
+        (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
@@ -50954,6 +51381,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-generated-pair-self-check "
                      "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-proxy-hide-header-differential <absolute-rut-executable>\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -51185,6 +51614,15 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (converter_proxy_hide_header_differential) {
+        struct stat executable_stat{};
+        if (argv[2] == nullptr || argv[2][0] != '/' || stat(argv[2], &executable_stat) != 0 ||
+            !S_ISREG(executable_stat.st_mode) || access(argv[2], X_OK) != 0) {
+            std::cerr << "FAIL [#373 final differential preflight]: RUT path must be an executable "
+                         "absolute regular file\n";
+            return 1;
+        }
+    }
 
 #ifndef __linux__
     if (rut_initial_header_split_public) {
@@ -51280,6 +51718,35 @@ int main(int argc, char** argv) {
                "Date-normalized downstream/upstream wires, endpoint/resource/PID isolation, "
                "poison liveness, FIN/EOF/stability, disabled access and clean io_uring lifecycle; "
                "generated-pair witness only (no nginx/four-way equivalence claim)\n";
+        return 0;
+    }
+    if (converter_proxy_hide_header_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-373-final-" + std::to_string(getpid()) + "-" + source_suffix;
+        ProxyHideHeaderFinalDifferential differential;
+        std::string final_error;
+        if (!capture_proxy_hide_header_final(
+                argv[2], container_prefix, differential, final_error) ||
+            !run_proxy_hide_header_final_self_checks(differential, final_error)) {
+            if (final_error.empty())
+                final_error = "#373 final differential returned false without detail";
+            std::cerr << "FAIL [#373 final four-way differential]: " << final_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #373 final four-way differential matched the exact bounded slice of one "
+               "literal proxy_hide_header X-Compat-Hidden on the exact-loopback root proxy: "
+               "two pinned nginx 1.29.7 declaration orders and two independently parsed/lowered "
+               "ordinary-RUT declaration orders each proved the fresh bodyless explicit-close "
+               "H1.1 GET, exact Date-normalized 176-byte downstream and Host-normalized 66-byte "
+               "upstream wires, hidden-field removal, visible/cookie retention/order, origin "
+               "Date/Server absence, one/no-retry origin episode, prompt FIN/EOF/stability, "
+               "side-specific access ownership, source/config poison and clean lifecycle. "
+               "Excluded: other headers/directives, inheritance, proxy_pass_header, control or "
+               "default-response behavior, methods/bodies/framing/reuse/protocol/TLS, and broad "
+               "#253 compatibility.\n";
         return 0;
     }
     if (request_length_oracle || request_length_split_header_oracle ||
