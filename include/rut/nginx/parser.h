@@ -50,6 +50,16 @@ struct ProxyReadTimeout {
     Span value_span{};
 };
 
+// One bounded response-header suppression directive. `name` borrows the exact
+// unquoted source token; spans retain the complete directive and name token.
+// Lowering support is intentionally separate from parser/model admission.
+struct ProxyHideHeader {
+    bool present = false;
+    Str name{};
+    Span name_span{};
+    Span span{};
+};
+
 // A proxy location prefix must fit completely in the runtime request-path
 // observation buffer, including its trailing slash. The runtime reserves one
 // byte for termination, so the semantic model admits at most 63 source bytes.
@@ -66,6 +76,7 @@ struct Location {
     Span span{};
     ProxyPass proxy_pass{};
     ProxyReadTimeout proxy_read_timeout{};
+    ProxyHideHeader proxy_hide_header{};
 };
 
 // This bounded local-response slice borrows one non-empty raw quoted body of at

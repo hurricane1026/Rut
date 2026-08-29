@@ -388,6 +388,9 @@ private:
             } else if (eq(cur_.text, "proxy_read_timeout", 18)) {
                 return unsupported(cur_.span,
                                    lit_str("proxy_read_timeout is unsupported at server level"));
+            } else if (eq(cur_.text, "proxy_hide_header", 17)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_hide_header is unsupported at server level"));
             } else {
                 return unsupported(cur_.span, lit_str("unknown server directive"));
             }
@@ -595,6 +598,7 @@ private:
         result.path_span = path.span;
         bool have_proxy = false;
         bool have_proxy_read_timeout = false;
+        bool have_proxy_hide_header = false;
         while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::End) {
             if (cur_.kind != TokenKind::Word)
                 return invalid(cur_.span, lit_str("expected location directive"));
@@ -615,6 +619,13 @@ private:
                 if (!timeout) return core::make_unexpected(timeout.error());
                 result.proxy_read_timeout = timeout.value();
                 have_proxy_read_timeout = true;
+            } else if (eq(cur_.text, "proxy_hide_header", 17)) {
+                if (have_proxy_hide_header)
+                    return unsupported(cur_.span, lit_str("duplicate proxy_hide_header"));
+                auto header = parse_proxy_hide_header();
+                if (!header) return core::make_unexpected(header.error());
+                result.proxy_hide_header = header.value();
+                have_proxy_hide_header = true;
             } else if (eq(cur_.text, "location", 8)) {
                 return unsupported(cur_.span, lit_str("nested locations are unsupported"));
             } else if (eq(cur_.text, "return", 6)) {
@@ -700,6 +711,9 @@ private:
             } else if (eq(cur_.text, "proxy_pass", 10)) {
                 return unsupported(cur_.span,
                                    lit_str("proxy_pass is unsupported in exact locations"));
+            } else if (eq(cur_.text, "proxy_hide_header", 17)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_hide_header is unsupported in exact locations"));
             } else if (eq(cur_.text, "location", 8)) {
                 return unsupported(cur_.span, lit_str("nested locations are unsupported"));
             } else {
@@ -867,7 +881,8 @@ private:
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("proxy_read_timeout requires a value"));
         if (eq(cur_.text, "proxy_pass", 10) || eq(cur_.text, "proxy_read_timeout", 18) ||
-            eq(cur_.text, "location", 8) || eq(cur_.text, "server", 6))
+            eq(cur_.text, "proxy_hide_header", 17) || eq(cur_.text, "location", 8) ||
+            eq(cur_.text, "server", 6))
             return invalid(cur_.span, lit_str("proxy_read_timeout requires a value"));
         const Token value = cur_;
         if (contains(value.text, '$'))
@@ -888,7 +903,8 @@ private:
             return missing(cur_.span, lit_str("expected ';' after proxy_read_timeout"));
         if (cur_.kind == TokenKind::Word &&
             (eq(cur_.text, "proxy_pass", 10) || eq(cur_.text, "proxy_read_timeout", 18) ||
-             eq(cur_.text, "location", 8) || eq(cur_.text, "server", 6)))
+             eq(cur_.text, "proxy_hide_header", 17) || eq(cur_.text, "location", 8) ||
+             eq(cur_.text, "server", 6)))
             return invalid(cur_.span, lit_str("expected ';' after proxy_read_timeout"));
         if (cur_.kind != TokenKind::Semicolon) {
             if (cur_.kind == TokenKind::Word)
@@ -899,6 +915,35 @@ private:
         advance();
         return ProxyReadTimeout{
             true, seconds * 1000u, Span{start.start, end.end, start.line, start.col}, value.span};
+    }
+
+    FrontendResult<ProxyHideHeader> parse_proxy_hide_header() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("proxy_hide_header requires a name"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("proxy_hide_header requires a name"));
+        if (eq(cur_.text, "proxy_pass", 10) || eq(cur_.text, "proxy_read_timeout", 18) ||
+            eq(cur_.text, "proxy_hide_header", 17) || eq(cur_.text, "location", 8) ||
+            eq(cur_.text, "server", 6))
+            return invalid(cur_.span, lit_str("proxy_hide_header requires a name"));
+        const Token name = cur_;
+        if (!eq(name.text, "X-Compat-Hidden", 15))
+            return unsupported(
+                name.span, lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after proxy_hide_header"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return invalid(cur_.span, lit_str("proxy_hide_header accepts exactly one name"));
+            return invalid(cur_.span, lit_str("expected ';' after proxy_hide_header"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return ProxyHideHeader{
+            true, name.text, name.span, Span{start.start, end.end, start.line, start.col}};
     }
 
     FrontendResult<ProxyPass> parse_proxy_pass() {

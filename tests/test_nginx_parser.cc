@@ -18290,6 +18290,425 @@ TEST(nginx_converter, asterisk_ipv4_wildcard_listener_survives_frontend_lifetime
     CHECK(populated->strict_local_response_table_is_valid());
 }
 
+TEST(nginx_parser_issue373, parses_literal_proxy_hide_header_in_four_orders_with_provenance) {
+    const char* sources[] = {
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; "
+        "proxy_hide_header X-Compat-Hidden; } }",
+        "server { location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } listen 127.0.0.1:8080; }",
+        "server { location / { proxy_pass http://127.0.0.1:9000; proxy_hide_header "
+        "X-Compat-Hidden; } listen 127.0.0.1:8080; }",
+    };
+    for (const char* source : sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        const auto& header = parsed.value().location.proxy_hide_header;
+        const char* keyword = strstr(source, "proxy_hide_header");
+        const char* name = strstr(keyword, "X-Compat-Hidden");
+        const char* semicolon = strchr(name, ';');
+        REQUIRE(keyword != nullptr);
+        REQUIRE(name != nullptr);
+        REQUIRE(semicolon != nullptr);
+        REQUIRE(header.present);
+        CHECK(header.name.eq(lit_str("X-Compat-Hidden")));
+        CHECK_EQ(header.name.ptr, name);
+        CHECK_EQ(header.name.len, 15u);
+        CHECK_EQ(header.name_span.start, static_cast<u32>(name - source));
+        CHECK_EQ(header.name_span.end, static_cast<u32>(name - source + 15u));
+        CHECK_EQ(header.name_span.line, 1u);
+        CHECK_EQ(header.name_span.col, static_cast<u32>(name - source + 1u));
+        CHECK_EQ(header.span.start, static_cast<u32>(keyword - source));
+        CHECK_EQ(header.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(header.span.line, 1u);
+        CHECK_EQ(header.span.col, static_cast<u32>(keyword - source + 1u));
+        CHECK_FALSE(parsed.value().location.proxy_read_timeout.present);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+        CHECK_EQ(lowered.error().span.start, header.span.start);
+    }
+}
+
+TEST(nginx_parser_issue373, accepts_lexer_gaps_comments_and_bounded_compositions) {
+    const char gaps[] =
+        "server {\n listen 127.0.0.1:8080;\n location / {\n proxy_hide_header #a\n "
+        "X-Compat-Hidden #b\n ;\n proxy_pass http://127.0.0.1:9000;\n }\n}";
+    const auto gap_parsed = nginx::parse({gaps, sizeof(gaps) - 1u});
+    REQUIRE(gap_parsed);
+    CHECK(gap_parsed.value().location.proxy_hide_header.name.eq(lit_str("X-Compat-Hidden")));
+
+    const char* timeout_sources[] = {
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_read_timeout 1s; proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:9000; proxy_hide_header X-Compat-Hidden; } }",
+    };
+    for (const char* source : timeout_sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        REQUIRE(parsed.value().location.proxy_read_timeout.present);
+        REQUIRE(parsed.value().location.proxy_hide_header.present);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+        CHECK_EQ(lowered.error().span.start, parsed.value().location.proxy_hide_header.span.start);
+    }
+
+    const char* excluded_profiles[] = {
+        "server { listen 8080; location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; proxy_hide_header X-Compat-Hidden; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } location = /healthz { return 204; } }",
+    };
+    for (const char* source : excluded_profiles) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(
+            lit_str("proxy_hide_header requires the minimal exact-loopback root proxy profile")));
+        CHECK_EQ(lowered.error().span.start, parsed.value().location.proxy_hide_header.span.start);
+    }
+}
+
+TEST(nginx_parser_issue373, accepts_end_exclusive_adjacent_directive_spans) {
+    const char hide_then_proxy[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header "
+        "X-Compat-Hidden;proxy_pass http://127.0.0.1:9000; } }";
+    const auto first = nginx::parse({hide_then_proxy, sizeof(hide_then_proxy) - 1u});
+    REQUIRE(first);
+    REQUIRE(first.value().location.proxy_hide_header.present);
+    CHECK_FALSE(first.value().location.proxy_read_timeout.present);
+    CHECK_EQ(first.value().location.proxy_hide_header.span.end,
+             first.value().location.proxy_pass.span.start);
+    auto lowered = nginx::lower_to_rut(first.value());
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+    CHECK_EQ(lowered.error().span.start, first.value().location.proxy_hide_header.span.start);
+
+    const char proxy_then_hide[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000;proxy_hide_header X-Compat-Hidden; } }";
+    const auto second = nginx::parse({proxy_then_hide, sizeof(proxy_then_hide) - 1u});
+    REQUIRE(second);
+    REQUIRE(second.value().location.proxy_hide_header.present);
+    CHECK_FALSE(second.value().location.proxy_read_timeout.present);
+    CHECK_EQ(second.value().location.proxy_pass.span.end,
+             second.value().location.proxy_hide_header.span.start);
+    lowered = nginx::lower_to_rut(second.value());
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+    CHECK_EQ(lowered.error().span.start, second.value().location.proxy_hide_header.span.start);
+
+    const char adjacent_timeout[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header "
+        "X-Compat-Hidden;proxy_read_timeout 1s;proxy_pass http://127.0.0.1:9000; } }";
+    const auto third = nginx::parse({adjacent_timeout, sizeof(adjacent_timeout) - 1u});
+    REQUIRE(third);
+    REQUIRE(third.value().location.proxy_hide_header.present);
+    REQUIRE(third.value().location.proxy_read_timeout.present);
+    CHECK_EQ(third.value().location.proxy_read_timeout.milliseconds, 1000u);
+    CHECK_EQ(third.value().location.proxy_hide_header.span.end,
+             third.value().location.proxy_read_timeout.span.start);
+    CHECK_EQ(third.value().location.proxy_read_timeout.span.end,
+             third.value().location.proxy_pass.span.start);
+    lowered = nginx::lower_to_rut(third.value());
+    REQUIRE_FALSE(lowered);
+    CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+    CHECK_EQ(lowered.error().span.start, third.value().location.proxy_hide_header.span.start);
+}
+
+TEST(nginx_parser_issue373, rejects_bad_arity_name_duplicates_and_contexts) {
+    struct Rejection {
+        const char* source;
+        FrontendError code;
+        Str detail;
+        const char* token;
+    };
+    const Rejection vectors[] = {
+        {"server { listen 8080; location / { proxy_hide_header; proxy_pass "
+         "http://127.0.0.1:9000; } }",
+         FrontendError::UnexpectedToken,
+         lit_str("proxy_hide_header requires a name"),
+         ";"},
+        {"server { listen 8080; location / { proxy_hide_header X-Compat-Hidden extra; "
+         "proxy_pass http://127.0.0.1:9000; } }",
+         FrontendError::UnexpectedToken,
+         lit_str("proxy_hide_header accepts exactly one name"),
+         "extra"},
+        {"server { listen 8080; location / { proxy_hide_header x-compat-hidden; proxy_pass "
+         "http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         "x-compat-hidden"},
+        {"server { listen 8080; location / { proxy_hide_header \"X-Compat-Hidden\"; "
+         "proxy_pass http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         "\"X-Compat-Hidden\""},
+        {"server { listen 8080; location / { proxy_hide_header $hidden; proxy_pass "
+         "http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         "$hidden"},
+        {"server { listen 8080; location / { proxy_hide_header X-Compat\\-Hidden; proxy_pass "
+         "http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only literal proxy_hide_header X-Compat-Hidden is modeled"),
+         "X-Compat\\-Hidden"},
+        {"server { listen 8080; location / { proxy_hide_header X-Compat-Hidden } }",
+         FrontendError::UnexpectedToken,
+         lit_str("expected ';' after proxy_hide_header"),
+         "}"},
+        {"server { listen 8080; proxy_hide_header X-Compat-Hidden; location / { proxy_pass "
+         "http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_hide_header is unsupported at server level"),
+         "proxy_hide_header"},
+        {"server { listen 8080; location = /healthz { proxy_hide_header X-Compat-Hidden; "
+         "return 204; } location / { proxy_pass http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_hide_header is unsupported in exact locations"),
+         "proxy_hide_header"},
+        {"server { listen 8080; location / { proxy_hide_header X-Compat-Hidden; "
+         "proxy_hide_header X-Compat-Hidden; proxy_pass http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("duplicate proxy_hide_header"),
+         "proxy_hide_header X-Compat-Hidden; proxy_pass"},
+        {"server { listen 8080; location / { location /nested { proxy_hide_header "
+         "X-Compat-Hidden; } proxy_pass http://127.0.0.1:9000; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("nested locations are unsupported"),
+         "location /nested"},
+    };
+    for (const auto& vector : vectors) {
+        const auto parsed = nginx::parse({vector.source, static_cast<u32>(strlen(vector.source))});
+        REQUIRE_FALSE(parsed);
+        CHECK_EQ(parsed.error().code, vector.code);
+        CHECK(parsed.error().detail.eq(vector.detail));
+        CHECK_NE(strstr(vector.source, vector.token), nullptr);
+    }
+}
+
+TEST(nginx_parser_issue373, retained_profiles_have_fully_default_absent_hide_inventory) {
+    const char* sources[] = {
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }",
+        "server { listen 8080; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:9000; } }",
+        "server { listen 127.0.0.1:8080; location / { proxy_pass "
+        "http://127.0.0.1:9000; } location = /healthz { return 204; } }",
+    };
+    for (const char* source : sources) {
+        const auto parsed = nginx::parse({source, static_cast<u32>(strlen(source))});
+        REQUIRE(parsed);
+        const auto& header = parsed.value().location.proxy_hide_header;
+        CHECK_FALSE(header.present);
+        CHECK_EQ(header.name.ptr, nullptr);
+        CHECK_EQ(header.name.len, 0u);
+        CHECK_EQ(header.name_span.start, 0u);
+        CHECK_EQ(header.name_span.end, 0u);
+        CHECK_EQ(header.name_span.line, 1u);
+        CHECK_EQ(header.name_span.col, 1u);
+        CHECK_EQ(header.span.start, 0u);
+        CHECK_EQ(header.span.end, 0u);
+        CHECK_EQ(header.span.line, 1u);
+        CHECK_EQ(header.span.col, 1u);
+    }
+}
+
+TEST(nginx_converter_issue373, rejects_forged_hide_inventory_without_dynamic_reads) {
+    char source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto accepted = parsed.value();
+    const auto reject = [&](const nginx::Server& model, Str detail) {
+        const auto lowered = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(detail));
+    };
+
+    auto forged = accepted;
+    forged.location.proxy_hide_header.present = false;
+    reject(forged, lit_str("invalid absent proxy_hide_header model"));
+    const char prefix_source[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_hide_header X-Compat-Hidden; "
+        "proxy_pass http://127.0.0.1:9000; } }";
+    const auto prefix_parsed = nginx::parse({prefix_source, sizeof(prefix_source) - 1u});
+    REQUIRE(prefix_parsed);
+    auto residual_prefix = prefix_parsed.value();
+    residual_prefix.location.proxy_hide_header.present = false;
+    reject(residual_prefix, lit_str("invalid absent proxy_hide_header model"));
+    for (const u32 len : {14u, 16u}) {
+        forged = accepted;
+        forged.location.proxy_hide_header.name.len = len;
+        reject(forged, lit_str("invalid proxy_hide_header name model"));
+    }
+    forged = accepted;
+    forged.location.proxy_hide_header.name.ptr = nullptr;
+    reject(forged, lit_str("invalid proxy_hide_header name model"));
+    forged = accepted;
+    forged.location.proxy_hide_header.name.ptr =
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    reject(forged, lit_str("invalid proxy_hide_header source provenance"));
+    forged = accepted;
+    forged.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(UINTPTR_MAX - 7u);
+    reject(forged, lit_str("invalid proxy_hide_header name model"));
+    forged = accepted;
+    forged.location.proxy_hide_header.name_span.start =
+        forged.location.proxy_hide_header.span.start;
+    reject(forged, lit_str("invalid proxy_hide_header spans"));
+    forged = accepted;
+    forged.location.proxy_hide_header.span = forged.location.proxy_pass.span;
+    reject(forged, lit_str("invalid proxy_hide_header spans"));
+    std::string independent(source);
+    forged = accepted;
+    forged.location.proxy_hide_header.name.ptr =
+        independent.data() + forged.location.proxy_hide_header.name_span.start;
+    reject(forged, lit_str("invalid proxy_hide_header source provenance"));
+    forged = accepted;
+    forged.location.proxy_hide_header.name_span.line++;
+    reject(forged, lit_str("invalid proxy_hide_header source positions"));
+    forged = accepted;
+    forged.location.proxy_hide_header.span.start++;
+    forged.location.proxy_hide_header.span.end++;
+    forged.location.proxy_hide_header.name_span.start++;
+    forged.location.proxy_hide_header.name_span.end++;
+    forged.location.proxy_hide_header.name.ptr++;
+    reject(forged, lit_str("invalid proxy_hide_header spans"));
+    forged = accepted;
+    forged.listen.value.ptr = reinterpret_cast<const char*>(UINTPTR_MAX - 1u);
+    reject(forged, lit_str("invalid listen source provenance"));
+
+    const u32 keyword = accepted.location.proxy_hide_header.span.start;
+    const u32 semicolon = accepted.location.proxy_hide_header.span.end - 1u;
+    const char saved_keyword = source[keyword];
+    source[keyword] = 'x';
+    reject(accepted, lit_str("invalid proxy_hide_header source syntax"));
+    source[keyword] = saved_keyword;
+    const u32 name = accepted.location.proxy_hide_header.name_span.start;
+    const char saved_name = source[name];
+    source[name] = 'x';
+    reject(accepted, lit_str("invalid proxy_hide_header source syntax"));
+    source[name] = saved_name;
+    const char saved_semicolon = source[semicolon];
+    source[semicolon] = ':';
+    reject(accepted, lit_str("invalid proxy_hide_header source syntax"));
+    source[semicolon] = saved_semicolon;
+
+    const u32 proxy_keyword = accepted.location.proxy_pass.span.start;
+    const char saved_proxy_keyword = source[proxy_keyword];
+    source[proxy_keyword] = 'x';
+    reject(accepted, lit_str("invalid proxy_pass source syntax"));
+    source[proxy_keyword] = saved_proxy_keyword;
+
+    const char* proxy_endpoint = strstr(source + proxy_keyword, "127.0.0.1:9000");
+    REQUIRE(proxy_endpoint != nullptr);
+    const u32 proxy_address = static_cast<u32>(proxy_endpoint - source);
+    const char saved_proxy_address = source[proxy_address];
+    source[proxy_address] = '2';
+    reject(accepted, lit_str("invalid proxy_pass source syntax"));
+    source[proxy_address] = saved_proxy_address;
+
+    forged = accepted;
+    forged.location.proxy_pass.port = 9001u;
+    reject(forged, lit_str("invalid proxy_pass source syntax"));
+
+    const u32 inter_directive_gap = accepted.location.proxy_hide_header.span.end;
+    REQUIRE_LT(inter_directive_gap, accepted.location.proxy_pass.span.start);
+    REQUIRE_EQ(source[inter_directive_gap], ' ');
+    source[inter_directive_gap] = 'x';
+    reject(accepted, lit_str("invalid proxy location source syntax"));
+    source[inter_directive_gap] = ' ';
+
+    const char no_hide_timeout_port0[] =
+        "server { listen 0; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    auto legacy = nginx::parse({no_hide_timeout_port0, sizeof(no_hide_timeout_port0) - 1u});
+    REQUIRE_FALSE(legacy);  // Parser retains its existing zero-listen rejection.
+
+    auto hand_built = canonical_server();
+    hand_built.location.proxy_read_timeout.present = true;
+    hand_built.location.proxy_read_timeout.milliseconds = 1000u;
+    hand_built.location.span = Span{20, 54, 1, 21};
+    hand_built.location.proxy_read_timeout.span = Span{24, 52, 1, 25};
+    hand_built.location.proxy_read_timeout.value_span = Span{43, 45, 1, 44};
+    hand_built.listen.port = 0u;
+    const auto legacy_order = nginx::lower_to_rut(hand_built);
+    REQUIRE_FALSE(legacy_order);
+    CHECK(
+        legacy_order.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
+}
+
+TEST(nginx_converter_issue373, borrowed_hide_model_requires_live_stable_source) {
+    nginx::Server borrowed{};
+    Span copied_header_span{};
+    u16 copied_proxy_port = 0u;
+    {
+        std::string source =
+            "server { listen 127.0.0.1:8080; location / { proxy_hide_header X-Compat-Hidden; "
+            "proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        borrowed = parsed.value();
+        copied_header_span = borrowed.location.proxy_hide_header.span;
+        copied_proxy_port = borrowed.location.proxy_pass.port;
+
+        auto lowered = nginx::lower_to_rut(borrowed);
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+
+        const u32 gap = borrowed.location.proxy_hide_header.span.end;
+        REQUIRE_EQ(source[gap], ' ');
+        source[gap] = 'x';
+        lowered = nginx::lower_to_rut(borrowed);
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(lit_str("invalid proxy location source syntax")));
+        source[gap] = ' ';
+        lowered = nginx::lower_to_rut(borrowed);
+        REQUIRE_FALSE(lowered);
+        CHECK(lowered.error().detail.eq(lit_str("proxy_hide_header lowering is not implemented")));
+    }
+
+    // The semantic model owns only scalar metadata and spans. Once the source is
+    // destroyed, borrowed Str values must not be read or lowered.
+    CHECK(borrowed.location.proxy_hide_header.present);
+    CHECK_EQ(borrowed.location.proxy_hide_header.name.len, 15u);
+    CHECK_EQ(borrowed.location.proxy_hide_header.span.start, copied_header_span.start);
+    CHECK_EQ(borrowed.location.proxy_hide_header.span.end, copied_header_span.end);
+    CHECK_EQ(borrowed.location.proxy_pass.port, copied_proxy_port);
+}
+
+TEST(nginx_converter_issue373, http_profile_comparison_rejects_forged_hide_child_without_read) {
+    const std::string source = make_request_length_http_profile(
+        "/tmp/rut-373-access.log",
+        "    listen 127.0.0.1:8080;\n"
+        "    location / { proxy_hide_header X-Compat-Hidden; proxy_pass "
+        "http://127.0.0.1:9000; }\n");
+    const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(parsed);
+    auto forged = parsed.value();
+    forged.server.location.proxy_hide_header.name.ptr =
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    auto rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+    forged = parsed.value();
+    forged.server.location.proxy_hide_header.name_span.start++;
+    rejected = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
