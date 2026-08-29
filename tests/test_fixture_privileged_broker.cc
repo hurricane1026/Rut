@@ -95,14 +95,14 @@ static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int
 static bool stable_proc_identity(pid_t pid, ProcIdentity& identity);
 static bool child_exited_wnowait(pid_t pid);
 static bool group_has_live_member(pid_t pgid);
-static int group_member_count(pid_t pgid);
-static bool group_has_root_member(pid_t pgid);
+enum class GroupScanResult { Exact, Unreadable };
+static GroupScanResult group_member_count(pid_t pgid, int& count);
 struct GroupLease;
 static bool cleanup_group_lease(GroupLease& lease,
                                 DirectLaunch& launch,
                                 bool authority,
                                 std::string& error);
-static bool has_group_authority(const DirectLaunch& launch);
+static bool has_group_authority(const DirectLaunch& launch, const GroupLease& lease);
 
 static bool control_lease_lost(int fd) {
     if (fd < 0) return false;
@@ -120,11 +120,18 @@ static bool control_lease_lost(int fd) {
 struct ProcFailureProbe {
     bool stat_read = false;
     bool stat_parse = false;
+    bool stat_start_stable = false;
+    std::uint64_t stat_start_before = 0;
+    std::uint64_t stat_start_after = 0;
+    pid_t stat_sid = -1;
     int stat_errno = 0;
     bool status_read = false;
+    bool status_parse = false;
     int status_errno = 0;
     bool netns_stat = false;
     int netns_errno = 0;
+    bool exe_stat = false;
+    int exe_stat_errno = 0;
     bool exe_read = false;
     int exe_errno = 0;
     bool cmdline_read = false;
@@ -140,6 +147,29 @@ static std::uint64_t probe_hash(const std::string& value) {
         hash *= 1099511628211ULL;
     }
     return hash;
+}
+
+static bool parse_probe_stat(const std::string& text, pid_t& sid, std::uint64_t& start) {
+    const size_t comm_end = text.rfind(") ");
+    if (comm_end == std::string::npos) return false;
+    std::istringstream fields(text.substr(comm_end + 2));
+    char state = 0;
+    long ppid = 0;
+    long pgid = 0;
+    long session = 0;
+    if (!(fields >> state >> ppid >> pgid >> session)) return false;
+    for (int field = 7; field <= 22; ++field) {
+        if (field == 22) {
+            unsigned long long value = 0;
+            if (!(fields >> value)) return false;
+            start = static_cast<std::uint64_t>(value);
+        } else {
+            long long value = 0;
+            if (!(fields >> value)) return false;
+        }
+    }
+    sid = static_cast<pid_t>(session);
+    return sid > 0 && start != 0;
 }
 
 static bool probe_file(const std::string& path, std::string& output, int& error_number) {
@@ -179,19 +209,50 @@ static ProcFailureProbe probe_proc(pid_t pid) {
     std::string stat_text;
     probe.stat_read = probe_file(prefix + "/stat", stat_text, probe.stat_errno);
     if (probe.stat_read) {
-        const size_t comm_end = stat_text.rfind(") ");
-        std::istringstream fields(comm_end == std::string::npos ? std::string{}
-                                                                : stat_text.substr(comm_end + 2));
-        char state = 0;
-        long ppid = 0;
-        long pgid = 0;
-        probe.stat_parse = comm_end != std::string::npos && (fields >> state >> ppid >> pgid);
+        probe.stat_parse = parse_probe_stat(stat_text, probe.stat_sid, probe.stat_start_before);
+        if (probe.stat_parse) {
+            std::string after_text;
+            int after_errno = 0;
+            pid_t after_sid = -1;
+            probe.stat_start_stable =
+                probe_file(prefix + "/stat", after_text, after_errno) &&
+                parse_probe_stat(after_text, after_sid, probe.stat_start_after) &&
+                after_sid == probe.stat_sid && probe.stat_start_after == probe.stat_start_before;
+            if (!probe.stat_start_stable && probe.stat_errno == 0) probe.stat_errno = after_errno;
+        }
     }
     std::string status;
     probe.status_read = probe_file(prefix + "/status", status, probe.status_errno);
+    if (probe.status_read) {
+        bool uid = false, gid = false, groups = false, nnp = false;
+        std::istringstream lines(status);
+        std::string line;
+        while (std::getline(lines, line)) {
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::istringstream value(line.substr(colon + 1));
+            if (line.rfind("Uid:", 0) == 0) {
+                unsigned long ignored = 0;
+                uid = static_cast<bool>(value >> ignored);
+            } else if (line.rfind("Gid:", 0) == 0) {
+                unsigned long ignored = 0;
+                gid = static_cast<bool>(value >> ignored);
+            } else if (line.rfind("Groups:", 0) == 0) {
+                std::string ignored;
+                groups = static_cast<bool>(value >> ignored) || value.eof();
+            } else if (line.rfind("NoNewPrivs:", 0) == 0) {
+                int ignored = 0;
+                nnp = static_cast<bool>(value >> ignored);
+            }
+        }
+        probe.status_parse = uid && gid && groups && nnp;
+    }
     struct stat netns{};
     probe.netns_stat = stat((prefix + "/ns/net").c_str(), &netns) == 0;
     if (!probe.netns_stat) probe.netns_errno = errno;
+    struct stat executable{};
+    probe.exe_stat = stat((prefix + "/exe").c_str(), &executable) == 0;
+    if (!probe.exe_stat) probe.exe_stat_errno = errno;
     std::array<char, PATH_MAX> exe{};
     const ssize_t exe_length = readlink((prefix + "/exe").c_str(), exe.data(), exe.size() - 1);
     probe.exe_read = exe_length >= 0;
@@ -210,9 +271,12 @@ static std::string probe_diagnostic(pid_t pid) {
     std::ostringstream out;
     out << "proc-probe pid=" << pid << " stat{read=" << probe.stat_read
         << ",parse=" << probe.stat_parse << ",errno=" << probe.stat_errno
-        << "} status{read=" << probe.status_read << ",errno=" << probe.status_errno
+        << ",start=" << probe.stat_start_before << ",after=" << probe.stat_start_after
+        << ",stable=" << probe.stat_start_stable << "} status{read=" << probe.status_read
+        << ",parse=" << probe.status_parse << ",errno=" << probe.status_errno
         << "} netns{stat=" << probe.netns_stat << ",errno=" << probe.netns_errno
-        << "} exe{read=" << probe.exe_read << ",errno=" << probe.exe_errno
+        << "} exe{stat=" << probe.exe_stat << ",stat_errno=" << probe.exe_stat_errno
+        << ",read=" << probe.exe_read << ",errno=" << probe.exe_errno
         << "} cmdline{read=" << probe.cmdline_read << ",errno=" << probe.cmdline_errno
         << ",length=" << probe.cmdline_length << ",hash=0x" << std::hex << probe.cmdline_hash
         << std::dec << "}";
@@ -243,7 +307,9 @@ struct GroupLease {
         pgid = identity.pgid;
         sid = identity.sid;
         start = identity.start;
-        if (pid <= 1 || pgid != pid || sid <= 1 || start == 0 || group_member_count(pgid) != 1)
+        int member_count = 0;
+        if (pid <= 1 || pgid != pid || sid <= 1 || start == 0 ||
+            group_member_count(pgid, member_count) != GroupScanResult::Exact || member_count != 1)
             return false;
 #ifdef SYS_pidfd_open
         pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
@@ -269,8 +335,12 @@ struct GroupLease {
         return child_exited_wnowait(pid) && !group_has_live_member(pgid);
     }
 
-    bool signal_contained(int signal_number) const {
-        return revalidate() && kill(-pgid, signal_number) == 0;
+    bool signal_single(int signal_number) const {
+        ProcIdentity current;
+        if (geteuid() == 0 || pid <= 1 || pidfd < 0 || !revalidate() ||
+            !read_proc(pid, current, false) || current.uid != getuid() || current.gid != getgid())
+            return false;
+        return kill(pid, signal_number) == 0;
     }
 };
 
@@ -450,10 +520,20 @@ static bool pure_protocol_self_checks(std::string& error) {
     const ProcFailureProbe self_probe = probe_proc(getpid());
     const std::string self_probe_text = probe_diagnostic(getpid());
     const bool probe_success_is_diagnostic_only =
-        self_probe.stat_read && self_probe.stat_parse && self_probe.status_read &&
-        self_probe.netns_stat && self_probe.exe_read && self_probe.cmdline_read &&
+        self_probe.stat_read && self_probe.stat_parse && self_probe.stat_start_stable &&
+        self_probe.status_read && self_probe.status_parse && self_probe.netns_stat &&
+        self_probe.exe_stat && self_probe.exe_read && self_probe.cmdline_read &&
         self_probe_text.find("stat{read=1,parse=1") != std::string::npos &&
+        self_probe_text.find("status{read=1,parse=1") != std::string::npos &&
+        self_probe_text.find("exe{stat=1") != std::string::npos &&
         self_probe_text.find("cmdline{read=1") != std::string::npos;
+    pid_t malformed_sid = -1;
+    std::uint64_t malformed_start = 0;
+    const bool probe_parse_mutations =
+        !parse_probe_stat("", malformed_sid, malformed_start) &&
+        !parse_probe_stat("(partial) R 1 2", malformed_sid, malformed_start) &&
+        !probe_proc(0).stat_read && !probe_proc(0).status_read &&
+        probe_diagnostic(0).find("stat{read=0,parse=0") != std::string::npos;
     if (!parse_credentials(credentials, parsed_uid, parsed_gid) || parsed_uid != uid ||
         parsed_gid != gid || !parse_credentials(changed_credentials, changed_uid, changed_gid) ||
         (changed_uid == uid && changed_gid == gid) ||
@@ -463,7 +543,7 @@ static bool pure_protocol_self_checks(std::string& error) {
         !valid_security_trace(trace) || valid_security_trace(reordered_trace) ||
         valid_security_trace(duplicate_trace) || valid_security_trace(short_trace) ||
         !socket_helper_rejected || !pipe_helper_accepted || !release_exact || !wait_decisions ||
-        !probe_success_is_diagnostic_only) {
+        !probe_success_is_diagnostic_only || !probe_parse_mutations) {
         error = "credential/security-trace mutation self-check failed";
         return false;
     }
@@ -589,8 +669,6 @@ static int dropped_broker_main(const char* executable,
         credentials.type != kCallerCredentials || !token_equal(credentials.token, token) ||
         !parse_credentials(credentials.payload, caller_uid, caller_gid) || caller_uid == 0)
         return 25;
-    close(kCredentialFd);
-
     const gid_t sentinel = caller_gid == static_cast<gid_t>(65534) ? 65533 : 65534;
     if (setgroups(1, &sentinel) != 0) return 26;
     int launch_pipe[2] = {-1, -1};
@@ -1102,7 +1180,12 @@ static bool safe_signal_direct_child(DirectLaunch& child, int signal_number) {
         return false;
     }
     if (!observe_direct(child, current, reason)) return false;
-    return kill(-child.anchor.pgid, signal_number) == 0;
+    if (geteuid() == 0) return kill(-child.anchor.pgid, signal_number) == 0;
+    if (current.uid != getuid() || current.gid != getgid()) {
+        child.reason = "ordinary parent lacked exact direct-child credentials";
+        return false;
+    }
+    return kill(current.pid, signal_number) == 0;
 }
 
 static bool bounded_wait_and_signal_self_check(std::string& error) {
@@ -1288,15 +1371,16 @@ static bool child_exited_wnowait(pid_t pid) {
            (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED);
 }
 
-static int group_member_count(pid_t pgid) {
+static GroupScanResult group_member_count(pid_t pgid, int& count) {
     const int directory = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) return -1;
+    if (directory < 0) return GroupScanResult::Unreadable;
     DIR* entries = fdopendir(directory);
     if (entries == nullptr) {
         close(directory);
-        return -1;
+        return GroupScanResult::Unreadable;
     }
-    int count = 0;
+    count = 0;
+    GroupScanResult result = GroupScanResult::Exact;
     while (dirent* entry = readdir(entries)) {
         if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
         char* end = nullptr;
@@ -1305,10 +1389,14 @@ static int group_member_count(pid_t pgid) {
         const pid_t pid = static_cast<pid_t>(parsed);
         std::string stat_text;
         const std::string path = "/proc/" + std::to_string(pid) + "/stat";
-        if (!read_file(path, stat_text, 8192)) continue;
+        if (!read_file(path, stat_text, 8192)) {
+            errno = 0;
+            if (kill(pid, 0) == 0 || errno == EPERM) result = GroupScanResult::Unreadable;
+            continue;
+        }
         const size_t comm_end = stat_text.rfind(") ");
         if (comm_end == std::string::npos) {
-            count = -1;
+            result = GroupScanResult::Unreadable;
             break;
         }
         std::istringstream fields(stat_text.substr(comm_end + 2));
@@ -1316,13 +1404,13 @@ static int group_member_count(pid_t pgid) {
         long ppid = 0;
         long process_group = 0;
         if (!(fields >> state >> ppid >> process_group)) {
-            count = -1;
+            result = GroupScanResult::Unreadable;
             break;
         }
         if (process_group == pgid) ++count;
     }
     closedir(entries);
-    return count;
+    return result;
 }
 
 static bool group_has_live_member(pid_t pgid) {
@@ -1362,37 +1450,6 @@ static bool group_has_live_member(pid_t pgid) {
     return live;
 }
 
-static bool group_has_root_member(pid_t pgid) {
-    const int directory = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) return true;
-    DIR* entries = fdopendir(directory);
-    if (entries == nullptr) {
-        close(directory);
-        return true;
-    }
-    bool root_member = false;
-    while (dirent* entry = readdir(entries)) {
-        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
-        char* end = nullptr;
-        const long parsed = strtol(entry->d_name, &end, 10);
-        if (end == entry->d_name || *end != '\0' || parsed <= 1) continue;
-        const pid_t pid = static_cast<pid_t>(parsed);
-        ProcIdentity identity;
-        if (!read_proc(pid, identity, false)) {
-            errno = 0;
-            if (kill(pid, 0) == 0 || errno == EPERM) root_member = true;
-            if (root_member) break;
-            continue;
-        }
-        if (identity.pgid == pgid && identity.uid == 0) {
-            root_member = true;
-            break;
-        }
-    }
-    closedir(entries);
-    return root_member;
-}
-
 static bool cleanup_group_lease(GroupLease& lease,
                                 DirectLaunch& launch,
                                 bool authority,
@@ -1401,16 +1458,13 @@ static bool cleanup_group_lease(GroupLease& lease,
         error = "direct launch group cleanup lacked caller authority";
         return false;
     }
-    if (geteuid() != 0 && group_has_root_member(lease.pgid)) {
-        error = "ordinary parent refused to signal a group containing a root member";
-        return false;
-    }
     if (lease.gone()) return true;
     const auto signal_group = [&](int signal_number) {
-        if (launch.current_valid) return safe_signal_direct_child(launch, signal_number);
-        // A stable PID/start/PGID/SID lease is sufficient for cleanup
-        // containment; an unknown stage is never accepted as a launch result.
-        return lease.signal_contained(signal_number);
+        // An unprivileged parent may only signal its exact direct child.  A
+        // privileged parent may signal the revalidated launch group.
+        if (geteuid() == 0 && launch.current_valid)
+            return safe_signal_direct_child(launch, signal_number);
+        return lease.signal_single(signal_number);
     };
     if (!signal_group(SIGTERM)) {
         error = "direct launch group TERM failed identity/authority revalidation";
@@ -1439,9 +1493,19 @@ static bool launcher_gone_or_wnowait(const DirectLaunch& launch) {
     return kill(launch.launcher_identity.pid, 0) < 0 && errno == ESRCH;
 }
 
-static bool has_group_authority(const DirectLaunch& launch) {
-    return geteuid() == 0 || launch.anchor.caller_uid == static_cast<uid_t>(geteuid()) ||
-           (launch.current_valid && launch.current_identity.uid == static_cast<uid_t>(geteuid()));
+static bool has_group_authority(const DirectLaunch& launch, const GroupLease& lease) {
+    if (geteuid() == 0) return true;
+    if (!launch.marker_valid || lease.pidfd < 0 || lease.pid != launch.anchor.pid ||
+        lease.start != launch.anchor.start || lease.pgid != launch.anchor.pgid ||
+        lease.sid != launch.anchor.sid)
+        return false;
+    ProcIdentity current;
+    return read_proc(lease.pid, current, false) && current.pid == launch.anchor.pid &&
+           current.start == launch.anchor.start && current.pgid == launch.anchor.pgid &&
+           current.sid == launch.anchor.sid && current.uid == getuid() && current.gid == getgid() &&
+           current.uid == launch.anchor.caller_uid && current.gid == launch.anchor.caller_gid &&
+           current.exe_dev == launch.anchor.exe_dev && current.exe_ino == launch.anchor.exe_ino &&
+           current.exe == launch.anchor.exe && current.cmdline == launch.anchor.cmdline;
 }
 
 static bool group_lease_self_check(std::string& error) {
@@ -1485,7 +1549,7 @@ static bool group_lease_self_check(std::string& error) {
         lease_exact &&
         waitid(P_PID, static_cast<id_t>(child), &live, WEXITED | WNOHANG | WNOWAIT) == 0 &&
         live.si_pid == 0;
-    const bool signaled = lease_exact && lease.signal_contained(SIGKILL);
+    const bool signaled = lease_exact && lease.signal_single(SIGKILL);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
     bool exited_wnowait = false;
     while (std::chrono::steady_clock::now() < deadline && !exited_wnowait) {
@@ -1510,7 +1574,10 @@ static bool group_lease_self_check(std::string& error) {
         !live_wnowait || !signaled || !exited_wnowait || !group_disappeared || !reaped ||
         !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
         error = "GroupLease WNOWAIT/PGID disappearance harness failed";
-        if (!reaped && lease_exact && lease.revalidate()) (void)kill(-lease.pgid, SIGKILL);
+        if (!reaped && lease_exact && lease.signal_single(SIGKILL)) {
+            // The exact-PID fallback above is the only signal available to an
+            // ordinary parent; never turn a failed self-check into a PGID kill.
+        }
         if (!reaped) {
             const auto reap_deadline =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
@@ -1684,8 +1751,8 @@ static bool begin_launch(const std::string& sudo_path,
         bool cleaned = false;
         if (launch && lease) {
             std::string lease_error;
-            cleaned =
-                cleanup_group_lease(*lease, *launch, has_group_authority(*launch), lease_error);
+            cleaned = cleanup_group_lease(
+                *lease, *launch, has_group_authority(*launch, *lease), lease_error);
             if (cleaned && !launch->reaped && lease->gone())
                 cleaned = wait_direct(*launch, kCleanupMs);
             if (!cleaned && !lease_error.empty()) error += "; " + lease_error;
@@ -1841,6 +1908,32 @@ static bool validate_root_broker(const Report& report,
         return false;
     }
     return true;
+}
+
+struct DestructiveAuth {
+    bool valid = false;
+};
+
+// This authorization is deliberately narrower than semantic success.  It is
+// only the proof needed to close the authenticated root lease after the full
+// report, peer, endpoint, and direct-launch checks have passed.
+static DestructiveAuth authorize_destructive_close(const ParentEndpoint& endpoint,
+                                                   const Report& report,
+                                                   const Peer& peer,
+                                                   const ProcIdentity& proc,
+                                                   const HeldTopologySnapshot& topology,
+                                                   const std::string& executable,
+                                                   const std::string& expected_argv,
+                                                   const std::string& expected_launcher_argv,
+                                                   DirectLaunch& launch) {
+    return {endpoint_unchanged(endpoint) && validate_root_broker(report,
+                                                                 peer,
+                                                                 proc,
+                                                                 topology,
+                                                                 executable,
+                                                                 expected_argv,
+                                                                 expected_launcher_argv,
+                                                                 launch)};
 }
 
 static DirectLaunch copy_launch_with_anchor(const DirectLaunch& source, DirectLaunchAnchor anchor) {
@@ -2078,7 +2171,25 @@ static bool safe_signal_target(const Report& report,
         !read_proc(peer.pid, current) || !same_process_identity(expected, current) ||
         current.pgid != current.pid)
         return false;
-    return kill(-current.pgid, signal_number) == 0;
+    // The ordinary test parent never signals a process group: target identity
+    // is revalidated, then only that exact PID is signaled.
+    return kill(current.pid, signal_number) == 0;
+}
+
+static bool wait_identity_gone_or_reused(const ProcIdentity& expected, int timeout_ms) {
+    if (expected.pid <= 1 || expected.start == 0) return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        ProcIdentity current;
+        if (read_proc(expected.pid, current, false)) {
+            if (current.start != expected.start) return true;
+        } else {
+            errno = 0;
+            if (kill(expected.pid, 0) < 0 && errno == ESRCH) return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        (void)poll(nullptr, 0, 10);
+    }
 }
 
 static bool terminate_verified(const Report& report,
@@ -2130,7 +2241,7 @@ static bool run_session(const std::string& sudo_path,
             std::string cleanup_error;
             if (!cleanup_group_lease(*group_lease,
                                      *direct_launch,
-                                     has_group_authority(*direct_launch),
+                                     has_group_authority(*direct_launch, *group_lease),
                                      cleanup_error) ||
                 !group_lease->gone()) {
                 if (!error.empty()) error += "; ";
@@ -2148,18 +2259,13 @@ static bool run_session(const std::string& sudo_path,
     ProcIdentity root_proc, broker_proc, target_proc;
     bool success = false;
     do {
-        if (!await_root_hello(endpoint,
-                              sudo_child,
-                              token,
-                              hello_deadline,
-                              root_fd,
-                              root_peer,
-                              root_report,
-                              error) ||
-            !read_proc(root_peer.pid, root_proc, false)) {
+        const bool root_hello_ok = await_root_hello(
+            endpoint, sudo_child, token, hello_deadline, root_fd, root_peer, root_report, error);
+        const bool root_proc_ok =
+            root_hello_ok && root_peer.pid > 1 && read_proc(root_peer.pid, root_proc, false);
+        if (!root_hello_ok || !root_proc_ok) {
             if (error.empty()) error = "root broker HELLO/peer identity failed";
-            if (root_peer.pid > 1 && root_proc.pid != root_peer.pid)
-                error += "; " + probe_diagnostic(root_peer.pid);
+            if (!root_proc_ok) error += "; " + probe_diagnostic(root_peer.pid);
             break;
         }
         const std::string root_argv = exact_argv({executable,
@@ -2181,15 +2287,16 @@ static bool run_session(const std::string& sudo_path,
                                                      std::to_string(topology.holder_netns),
                                                      scenario,
                                                      std::to_string(kCredentialFd)});
-        if (!validate_root_broker(root_report,
-                                  root_peer,
-                                  root_proc,
-                                  topology,
-                                  executable,
-                                  root_argv,
-                                  launcher_argv,
-                                  sudo_child) ||
-            !record_direct_launch_identity(sudo_child) || !endpoint_unchanged(endpoint)) {
+        const DestructiveAuth destructive_auth = authorize_destructive_close(endpoint,
+                                                                             root_report,
+                                                                             root_peer,
+                                                                             root_proc,
+                                                                             topology,
+                                                                             executable,
+                                                                             root_argv,
+                                                                             launcher_argv,
+                                                                             sudo_child);
+        if (!destructive_auth.valid || !record_direct_launch_identity(sudo_child)) {
             error = "root broker provenance/endpoint validation failed: " +
                     direct_launch_diagnostic(sudo_child);
             break;
@@ -2386,16 +2493,26 @@ static bool run_session(const std::string& sudo_path,
     if (root_fd >= 0) close(root_fd);
     if (broker_fd >= 0) close(broker_fd);
     if (target_fd >= 0) close(target_fd);
-    if (!success && target_peer.pid > 1 && target_proc.pid == target_peer.pid &&
-        process_alive(target_peer.pid))
-        (void)terminate_verified(target_report, target_peer, target_proc);
-    if (!success && broker_peer.pid > 1 && broker_proc.pid == broker_peer.pid &&
-        process_alive(broker_peer.pid))
-        (void)terminate_verified(broker_report, broker_peer, broker_proc);
+    if (!success) {
+        // Closing leases is the first failure action.  The root/dropped/target
+        // PDEATHSIG/EOF chain owns its descendants; allow that chain to settle
+        // before considering any identity-safe fallback.
+        (void)wait_identity_gone_or_reused(target_proc, kCleanupMs);
+        (void)wait_identity_gone_or_reused(broker_proc, kCleanupMs);
+        (void)wait_identity_gone_or_reused(root_proc, kCleanupMs);
+        if (target_peer.pid > 1 && target_proc.pid == target_peer.pid &&
+            process_alive(target_peer.pid))
+            (void)terminate_verified(target_report, target_peer, target_proc);
+        if (broker_peer.pid > 1 && broker_proc.pid == broker_peer.pid &&
+            process_alive(broker_peer.pid))
+            (void)terminate_verified(broker_report, broker_peer, broker_proc);
+    }
     if (!success) {
         std::string lease_error;
-        if (!cleanup_group_lease(
-                launch_lease, sudo_child, has_group_authority(sudo_child), lease_error)) {
+        if (!cleanup_group_lease(launch_lease,
+                                 sudo_child,
+                                 has_group_authority(sudo_child, launch_lease),
+                                 lease_error)) {
             if (!error.empty()) error += "; ";
             error += lease_error;
             success = false;
