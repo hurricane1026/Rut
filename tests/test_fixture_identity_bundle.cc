@@ -212,7 +212,11 @@ static bool receive_fails(const std::vector<unsigned char>& wire,
         }
         return false;
     }
-    return sent ? !accepted && no_leak : !accepted;
+    // Non-empty negative cases must first prove that the malformed record was
+    // delivered.  Otherwise a sender-side failure could masquerade as a
+    // receiver rejection (the empty call below is the intentional EOF case).
+    if (!wire.empty() && !sent) return false;
+    return !accepted && no_leak;
 }
 
 static bool compare_manifests(const IdentityBundle& expected, const IdentityBundle& actual) {
