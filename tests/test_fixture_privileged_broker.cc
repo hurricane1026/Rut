@@ -459,6 +459,8 @@ struct RetainedAnchorEvidence {
     char state = 0;
     uid_t uid = static_cast<uid_t>(-1);
     gid_t gid = static_cast<gid_t>(-1);
+    std::array<uid_t, 4> uid_values{};
+    std::array<gid_t, 4> gid_values{};
     std::string cmdline;
     bool pidfd_live = false;
 };
@@ -508,20 +510,28 @@ static bool parse_retained_anchor_status(const std::string& text,
         if (colon == std::string::npos) continue;
         std::istringstream value(line.substr(colon + 1));
         if (line.rfind("Uid:", 0) == 0 || line.rfind("Gid:", 0) == 0) {
+            const bool is_uid = line.rfind("Uid:", 0) == 0;
+            bool& present = is_uid ? have_uid : have_gid;
+            if (present) return false;
             std::array<unsigned long long, 4> ids{};
             for (auto& id : ids)
                 if (!(value >> id)) return false;
             std::string extra;
             if (value >> extra) return false;
-            if (line.rfind("Uid:", 0) == 0) {
-                if (ids[0] > std::numeric_limits<uid_t>::max()) return false;
-                evidence.uid = static_cast<uid_t>(ids[0]);
-                have_uid = true;
+            if (is_uid) {
+                for (size_t index = 0; index != ids.size(); ++index) {
+                    if (ids[index] > std::numeric_limits<uid_t>::max()) return false;
+                    evidence.uid_values[index] = static_cast<uid_t>(ids[index]);
+                }
+                evidence.uid = evidence.uid_values[0];
             } else {
-                if (ids[0] > std::numeric_limits<gid_t>::max()) return false;
-                evidence.gid = static_cast<gid_t>(ids[0]);
-                have_gid = true;
+                for (size_t index = 0; index != ids.size(); ++index) {
+                    if (ids[index] > std::numeric_limits<gid_t>::max()) return false;
+                    evidence.gid_values[index] = static_cast<gid_t>(ids[index]);
+                }
+                evidence.gid = evidence.gid_values[0];
             }
+            present = true;
         }
     }
     return have_uid && have_gid;
@@ -647,7 +657,10 @@ static std::string retained_wrapper_diagnostic(const DirectLaunch& launch,
         << ",launcher_stage=launcher,launcher_exe=" << launcher.exe_dev << ':' << launcher.exe_ino
         << ",launcher_argv_bytes=" << launcher.argv_length << ",launcher_argv_hash=0x" << std::hex
         << launcher.argv_hash << std::dec << ",sudo_exe=" << launch.allowed.sudo_stage.exe_dev
-        << ':' << launch.allowed.sudo_stage.exe_ino
+        << ':' << launch.allowed.sudo_stage.exe_ino << ",sudo_uid_tuple=" << evidence.uid_values[0]
+        << ':' << evidence.uid_values[1] << ':' << evidence.uid_values[2] << ':'
+        << evidence.uid_values[3] << ",sudo_gid_tuple=" << evidence.gid_values[0] << ':'
+        << evidence.gid_values[1] << ':' << evidence.gid_values[2] << ':' << evidence.gid_values[3]
         << ",sudo_argv_observed_bytes=" << evidence.cmdline.size() << ",sudo_argv_observed_hash=0x"
         << std::hex << probe_hash(evidence.cmdline) << std::dec
         << ",sudo_argv_expected_bytes=" << launch.allowed.sudo_stage.argv.size()
@@ -1881,6 +1894,23 @@ static bool stable_proc_identity(pid_t pid, ProcIdentity& identity) {
 }
 
 static bool retained_anchor_self_check(std::string& error) {
+    const std::string valid_status("Uid: 0 0 0 0\nGid: 0 0 0 0\n");
+    RetainedAnchorEvidence parsed_status;
+    RetainedAnchorEvidence missing_status;
+    RetainedAnchorEvidence extra_status;
+    RetainedAnchorEvidence out_of_range_status;
+    const bool status_parser_ok =
+        parse_retained_anchor_status(valid_status, parsed_status) &&
+        parsed_status.uid_values == std::array<uid_t, 4>{0, 0, 0, 0} &&
+        parsed_status.gid_values == std::array<gid_t, 4>{0, 0, 0, 0} &&
+        !parse_retained_anchor_status("Uid: 0 0 0\nGid: 0 0 0 0\n", missing_status) &&
+        !parse_retained_anchor_status("Uid: 0 0 0 0 0\nGid: 0 0 0 0\n", extra_status) &&
+        !parse_retained_anchor_status("Uid: 18446744073709551616 0 0 0\nGid: 0 0 0 0\n",
+                                      out_of_range_status);
+    if (!status_parser_ok) {
+        error = "retained sudo credential tuple parser mutation self-check failed";
+        return false;
+    }
     int ready[2] = {-1, -1};
     if (pipe2(ready, O_CLOEXEC) != 0) {
         error = "retained-anchor ready pipe failed";
