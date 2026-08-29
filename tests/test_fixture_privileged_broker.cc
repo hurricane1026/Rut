@@ -623,6 +623,39 @@ static bool prove_retained_sudo_wrapper(DirectLaunch& launch,
     return validate_launcher_ancestry(launch, launcher, {direct}, reason);
 }
 
+static std::string retained_wrapper_diagnostic(const DirectLaunch& launch,
+                                               const GroupLease& lease,
+                                               const RetainedAnchorEvidence& evidence,
+                                               const identity_bundle::RoleManifest& launcher) {
+    std::ostringstream out;
+    out << "retained-wrapper{mode="
+        << rut::test::fixture_direct_launch::launch_mode_name(launch.mode)
+        << ",current_valid=" << launch.current_valid << ",observed_stage="
+        << (launch.current_valid
+                ? rut::test::fixture_direct_launch::launch_stage_name(launch.current_stage)
+                : "none")
+        << ",expected_stage=sudo"
+        << ",anchor=" << launch.anchor.pid << ':' << launch.anchor.start << ':'
+        << launch.anchor.pgid << ':' << launch.anchor.sid << ",lease=" << lease.pid << ':'
+        << lease.start << ':' << lease.pgid << ':' << lease.sid
+        << ",lease_pidfd_live=" << retained_pidfd_live(lease.pidfd) << ",evidence=" << evidence.pid
+        << ':' << evidence.start << ':' << evidence.ppid << ':' << evidence.pgid << ':'
+        << evidence.sid << ':' << evidence.state << ':' << evidence.uid << ':' << evidence.gid
+        << ",evidence_pidfd_live=" << evidence.pidfd_live << ",launcher=" << launcher.pid << ':'
+        << launcher.start << ':' << launcher.ppid << ':' << launcher.pgid << ':' << launcher.sid
+        << ':' << launcher.uid << ':' << launcher.gid
+        << ",launcher_stage=launcher,launcher_exe=" << launcher.exe_dev << ':' << launcher.exe_ino
+        << ",launcher_argv_bytes=" << launcher.argv_length << ",launcher_argv_hash=0x" << std::hex
+        << launcher.argv_hash << std::dec << ",sudo_exe=" << launch.allowed.sudo_stage.exe_dev
+        << ':' << launch.allowed.sudo_stage.exe_ino
+        << ",sudo_argv_observed_bytes=" << evidence.cmdline.size() << ",sudo_argv_observed_hash=0x"
+        << std::hex << probe_hash(evidence.cmdline) << std::dec
+        << ",sudo_argv_expected_bytes=" << launch.allowed.sudo_stage.argv.size()
+        << ",sudo_argv_expected_hash=0x" << std::hex << probe_hash(launch.allowed.sudo_stage.argv)
+        << std::dec << '}';
+    return out.str();
+}
+
 static bool parse_u64(const char* text, u64& value) {
     if (text == nullptr || *text == '\0') return false;
     char* end = nullptr;
@@ -1867,7 +1900,7 @@ static bool retained_anchor_self_check(std::string& error) {
             setpgid(0, 0) != 0)
             _exit(125);
         const unsigned char marker = 0xa7;
-        (void)write(ready[1], &marker, 1);
+        if (!write_pipe_exact(ready[1], &marker, 1, kCleanupMs)) _exit(125);
         close(ready[1]);
         for (;;) pause();
     }
@@ -2592,7 +2625,8 @@ static bool validate_root_broker(const Report& report,
     if (launcher.pid != sudo_launch.anchor.pid) {
         if (retained_anchor == nullptr ||
             !prove_retained_sudo_wrapper(sudo_launch, launcher, *retained_anchor, reason)) {
-            sudo_launch.reason = "live sudo-wrapper direct lineage was not exact";
+            sudo_launch.reason =
+                reason.empty() ? "live sudo-wrapper direct lineage was not exact" : reason;
             return false;
         }
         return true;
@@ -2843,7 +2877,7 @@ static bool identity_bundle_integration_self_check(std::string& error) {
         close(child_ready[0]);
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(125);
         const unsigned char ready = 0x91;
-        (void)write(child_ready[1], &ready, 1);
+        if (!write_pipe_exact(child_ready[1], &ready, 1, kCleanupMs)) _exit(125);
         close(child_ready[1]);
         for (;;) pause();
     }
@@ -3477,7 +3511,12 @@ static bool run_session(const std::string& sudo_path,
             retained_anchor.emplace();
             if (!capture_retained_anchor_evidence(
                     sudo_child, launch_lease, *retained_anchor, identity_error)) {
-                error = "root broker retained sudo anchor validation failed: " + identity_error;
+                error = "root broker retained sudo anchor validation failed: " + identity_error +
+                        "; " +
+                        retained_wrapper_diagnostic(sudo_child,
+                                                    launch_lease,
+                                                    *retained_anchor,
+                                                    received_identity.bundle().roles[0].manifest);
                 received_identity.reset();
                 break;
             }
@@ -3509,6 +3548,12 @@ static bool run_session(const std::string& sudo_path,
                                                    sudo_child))) {
             error = "root broker bundle provenance validation failed: " + identity_error + "; " +
                     direct_launch_diagnostic(sudo_child);
+            if (retained_anchor)
+                error += "; " +
+                         retained_wrapper_diagnostic(sudo_child,
+                                                     launch_lease,
+                                                     *retained_anchor,
+                                                     received_identity.bundle().roles[0].manifest);
             received_identity.reset();
             break;
         }
