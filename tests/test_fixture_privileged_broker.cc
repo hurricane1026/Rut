@@ -3699,26 +3699,26 @@ static DirectLaunch copy_launch_with_anchor(const DirectLaunch& source, DirectLa
     return result;
 }
 
-static bool causal_mutation_self_checks(const Report& root_report,
-                                        const Peer& root_peer,
-                                        const ProcIdentity& root_proc,
-                                        const ProcIdentity& launcher_proc,
-                                        const Report& broker_report,
-                                        const Peer& broker_peer,
-                                        const ProcIdentity& broker_proc,
-                                        const Report& target_report,
-                                        const Peer& target_peer,
-                                        const ProcIdentity& target_proc,
-                                        const HeldTopologySnapshot& topology,
-                                        const std::string& executable,
-                                        const std::string& root_argv,
-                                        const std::string& launcher_argv,
-                                        const std::string& dropped_argv,
-                                        const std::string& target_argv,
-                                        const Token& token,
-                                        DirectLaunch& sudo_child,
-                                        const RetainedAnchorEvidence* retained_anchor,
-                                        const ParentEndpoint& endpoint) {
+static MutationDiagnostic causal_mutation_self_checks(const Report& root_report,
+                                                      const Peer& root_peer,
+                                                      const ProcIdentity& root_proc,
+                                                      const ProcIdentity& launcher_proc,
+                                                      const Report& broker_report,
+                                                      const Peer& broker_peer,
+                                                      const ProcIdentity& broker_proc,
+                                                      const Report& target_report,
+                                                      const Peer& target_peer,
+                                                      const ProcIdentity& target_proc,
+                                                      const HeldTopologySnapshot& topology,
+                                                      const std::string& executable,
+                                                      const std::string& root_argv,
+                                                      const std::string& launcher_argv,
+                                                      const std::string& dropped_argv,
+                                                      const std::string& target_argv,
+                                                      const Token& token,
+                                                      DirectLaunch& sudo_child,
+                                                      const RetainedAnchorEvidence* retained_anchor,
+                                                      const ParentEndpoint& endpoint) {
     DirectLaunch baseline_launch = sudo_child;
     const bool root_baseline = validate_root_broker(root_report,
                                                     root_peer,
@@ -3897,15 +3897,23 @@ static bool causal_mutation_self_checks(const Report& root_report,
         !safe_signal_target(target_report, target_peer, changed_target_proc, 0) &&
         !safe_signal_target(unsafe_signal_report, target_peer, target_proc, 0) &&
         process_alive(target_peer.pid);
+    DirectLaunch baseline_sudo = sudo_child;
     DirectLaunch stale_sudo = sudo_child;
     stale_sudo.current_identity.start++;
     DirectLaunch unsafe_sudo = sudo_child;
     unsafe_sudo.current_identity.pgid = 1;
+    // The retained sudo wrapper has transitioned away from the ordinary
+    // parent's exact UID/GID authority.  Its live identity must remain
+    // unsignalable here; caller-owned direct launches retain the positive
+    // single-PID signal coverage exercised by bounded_wait_and_signal_self_check().
+    const bool sudo_signal_baseline = retained_anchor != nullptr
+                                          ? !safe_signal_direct_child(baseline_sudo, 0)
+                                          : safe_signal_direct_child(baseline_sudo, 0);
     const bool sudo_signal_mutations =
         sudo_child.current_valid &&
         stale_sudo.current_identity.start != sudo_child.current_identity.start &&
         unsafe_sudo.current_identity.pgid != sudo_child.current_identity.pgid &&
-        safe_signal_direct_child(sudo_child, 0) && !safe_signal_direct_child(stale_sudo, 0) &&
+        sudo_signal_baseline && !safe_signal_direct_child(stale_sudo, 0) &&
         !safe_signal_direct_child(unsafe_sudo, 0) && process_alive(sudo_child.anchor.pid);
     EndpointIdentity changed_endpoint = endpoint.identity;
     changed_endpoint.socket_ino++;
@@ -3914,11 +3922,22 @@ static bool causal_mutation_self_checks(const Report& root_report,
     std::swap(swapped_trace[1], swapped_trace[2]);
     std::vector<unsigned char> short_trace = trace;
     short_trace.pop_back();
-    return root_baseline && root_mutations && broker_baseline && broker_mutations &&
-           target_baseline && target_mutations && signal_mutations && sudo_signal_mutations &&
-           endpoint_unchanged(endpoint) && !endpoint_matches(endpoint, changed_endpoint) &&
-           valid_security_trace(trace) && !valid_security_trace(swapped_trace) &&
-           !valid_security_trace(short_trace);
+    MutationDiagnostic diagnostic =
+        first_failed_mutation({{"root.baseline", root_baseline},
+                               {"root.mutations", root_mutations},
+                               {"broker.baseline", broker_baseline},
+                               {"broker.mutations", broker_mutations},
+                               {"target.baseline", target_baseline},
+                               {"target.mutations", target_mutations},
+                               {"target.signal", signal_mutations},
+                               {"sudo.signal", sudo_signal_mutations},
+                               {"endpoint.current", endpoint_unchanged(endpoint)},
+                               {"endpoint.mutation", !endpoint_matches(endpoint, changed_endpoint)},
+                               {"trace.exact", valid_security_trace(trace)},
+                               {"trace.swap", !valid_security_trace(swapped_trace)},
+                               {"trace.short", !valid_security_trace(short_trace)}});
+    if (!diagnostic.success) diagnostic.detail = "causal predicate failed";
+    return diagnostic;
 }
 
 static bool safe_signal_target(const Report& report,
@@ -4302,28 +4321,33 @@ static bool run_session(const std::string& sudo_path,
                 error = "target exact secured identity failed";
                 break;
             }
-            if (strcmp(scenario, "normal") == 0 && !causal_mutation_self_checks(root_report,
-                                                                                root_peer,
-                                                                                root_proc,
-                                                                                launcher_proc,
-                                                                                broker_report,
-                                                                                broker_peer,
-                                                                                broker_proc,
-                                                                                target_report,
-                                                                                target_peer,
-                                                                                target_proc,
-                                                                                topology,
-                                                                                executable,
-                                                                                root_argv,
-                                                                                launcher_argv,
-                                                                                dropped_argv,
-                                                                                target_argv,
-                                                                                token,
-                                                                                sudo_child,
-                                                                                retained_anchor_ptr,
-                                                                                endpoint)) {
-                error = "broker/target causal mutation self-check failed";
-                break;
+            if (strcmp(scenario, "normal") == 0) {
+                const MutationDiagnostic causal = causal_mutation_self_checks(root_report,
+                                                                              root_peer,
+                                                                              root_proc,
+                                                                              launcher_proc,
+                                                                              broker_report,
+                                                                              broker_peer,
+                                                                              broker_proc,
+                                                                              target_report,
+                                                                              target_peer,
+                                                                              target_proc,
+                                                                              topology,
+                                                                              executable,
+                                                                              root_argv,
+                                                                              launcher_argv,
+                                                                              dropped_argv,
+                                                                              target_argv,
+                                                                              token,
+                                                                              sudo_child,
+                                                                              retained_anchor_ptr,
+                                                                              endpoint);
+                if (!causal.success) {
+                    error =
+                        "broker/target causal mutation self-check failed: " + causal.failed_label +
+                        ": " + causal.detail;
+                    break;
+                }
             }
         }
         Frame security_trace;
