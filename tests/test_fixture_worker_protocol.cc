@@ -107,6 +107,18 @@ bool run_transport_tests(const Token& token, std::string& error) {
         error = "early EOF transport test failed";
         return false;
     }
+    int closed_peer[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, closed_peer) != 0) {
+        error = "closed-peer socketpair failed";
+        return false;
+    }
+    close(closed_peer[1]);
+    const bool closed_peer_rejected = !send_frame(closed_peer[0], ping, kHandshakeMs);
+    close(closed_peer[0]);
+    if (!closed_peer_rejected) {
+        error = "closed-peer send did not fail without terminating the process";
+        return false;
+    }
     return true;
 }
 

@@ -64,11 +64,8 @@ struct ParentEndpoint {
     int listener = -1;
     EndpointIdentity identity;
 
-    ~ParentEndpoint() {
-        if (listener >= 0) close(listener);
-        if (!socket.empty()) (void)unlink(socket.c_str());
-        if (!directory.empty()) (void)rmdir(directory.c_str());
-    }
+    bool cleanup(std::string& error);
+    ~ParentEndpoint();
 };
 
 struct DirectChild {
@@ -77,12 +74,16 @@ struct DirectChild {
     dev_t expected_exe_dev = 0;
     ino_t expected_exe_ino = 0;
     std::string expected_argv;
+    ProcIdentity validated_identity;
+    bool identity_valid = false;
     int status = 0;
     bool reaped = false;
 };
 
 static bool endpoint_matches(const ParentEndpoint& endpoint, const EndpointIdentity& expected);
 static bool endpoint_unchanged(const ParentEndpoint& endpoint);
+static bool endpoint_replacement_self_check(std::string& error);
+static bool bounded_wait_and_signal_self_check(std::string& error);
 static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
@@ -257,6 +258,44 @@ static bool pure_protocol_self_checks(std::string& error) {
     return true;
 }
 
+static bool wait_owned_child_bounded(pid_t child,
+                                     const std::string& expected_exe,
+                                     const std::string& expected_argv,
+                                     uid_t expected_uid,
+                                     gid_t expected_gid,
+                                     ino_t expected_netns,
+                                     pid_t expected_pgid,
+                                     bool require_capabilities_clear,
+                                     int timeout_ms,
+                                     int& status) {
+    const auto wait_until = [&](std::chrono::steady_clock::time_point deadline) {
+        while (std::chrono::steady_clock::now() < deadline) {
+            const pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) return true;
+            if (waited < 0 && errno != EINTR) return false;
+            (void)poll(nullptr, 0, 10);
+        }
+        return false;
+    };
+    if (wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)))
+        return true;
+    ProcIdentity before;
+    if (child <= 1 || expected_pgid <= 1 || !read_proc(child, before, require_capabilities_clear) ||
+        before.pid != child || before.ppid != getpid() || before.pgid != expected_pgid ||
+        before.uid != expected_uid || before.gid != expected_gid ||
+        before.netns != expected_netns || before.exe != expected_exe ||
+        before.cmdline != expected_argv || kill(child, SIGTERM) != 0)
+        return false;
+    if (wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs)))
+        return true;
+    ProcIdentity after_term;
+    if (!read_proc(child, after_term, require_capabilities_clear) ||
+        !same_process_identity(before, after_term) || after_term.ppid != getpid() ||
+        after_term.pgid != expected_pgid || kill(child, SIGKILL) != 0)
+        return false;
+    return wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
+}
+
 static int secured_target_main(const char* control_path,
                                const char* token_string,
                                const char* broker_text,
@@ -269,7 +308,7 @@ static int secured_target_main(const char* control_path,
     if (control < 0) return 41;
     if (strcmp(scenario, "no-ready") == 0) {
         Frame ignored;
-        (void)receive_frame(control, ignored, 60'000);
+        (void)receive_frame(control, ignored, kBrokerDeadlineMs);
         close(control);
         return 0;
     }
@@ -281,8 +320,8 @@ static int secured_target_main(const char* control_path,
     }
     for (;;) {
         Frame command;
-        if (!receive_frame(control, command, 60'000) || !token_equal(command.token, token) ||
-            !command.payload.empty()) {
+        if (!receive_frame(control, command, kBrokerDeadlineMs) ||
+            !token_equal(command.token, token) || !command.payload.empty()) {
             close(control);
             return 0;
         }
@@ -329,7 +368,6 @@ static int dropped_broker_main(const char* executable,
         !get_peer(kCredentialFd, root_peer) || root_peer.pid != root_broker || root_peer.uid != 0 ||
         root_peer.gid != 0 || getppid() != root_broker)
         return 22;
-    alarm(15);
     Frame credentials;
     uid_t caller_uid = 0;
     gid_t caller_gid = 0;
@@ -358,7 +396,8 @@ static int dropped_broker_main(const char* executable,
         } while (count < 0 && errno == EINTR);
         close(launch_pipe[0]);
         if (count != 1 || authorization != 'L') _exit(51);
-        if (strcmp(scenario, "term-ignore") == 0) {
+        if (strcmp(scenario, "term-ignore") == 0 ||
+            strcmp(scenario, "owned-wait-term-ignore") == 0) {
             struct sigaction action{};
             action.sa_handler = SIG_IGN;
             sigemptyset(&action.sa_mask);
@@ -407,20 +446,33 @@ static int dropped_broker_main(const char* executable,
             Frame{kSecurityTrace, token, std::vector<unsigned char>(trace.begin(), trace.end())},
             kHandshakeMs))
         return 36;
-    alarm(0);
     Frame command;
     if (strcmp(scenario, "broker-early") == 0) {
-        if (!receive_frame(control, command, 60'000) || command.type != kBrokerExitEarly ||
-            !token_equal(command.token, token))
+        if (!receive_frame(control, command, kBrokerDeadlineMs) ||
+            command.type != kBrokerExitEarly || !token_equal(command.token, token))
             return 33;
         _exit(86);
     }
     int target_status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(target, &target_status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited != target) return 34;
+    const std::string target_argv = exact_argv({executable,
+                                                "--fixture-privileged-target",
+                                                control_path,
+                                                token_string,
+                                                std::to_string(getpid()),
+                                                scenario});
+    const int target_wait_ms =
+        strcmp(scenario, "owned-wait-term-ignore") == 0 ? kCleanupMs : kBrokerDeadlineMs;
+    if (!wait_owned_child_bounded(target,
+                                  executable,
+                                  target_argv,
+                                  caller_uid,
+                                  caller_gid,
+                                  static_cast<ino_t>(expected_netns),
+                                  target,
+                                  true,
+                                  target_wait_ms,
+                                  target_status))
+        return 34;
     const std::vector<unsigned char> status_payload{
         static_cast<unsigned char>(target_status),
         static_cast<unsigned char>(target_status >> 8),
@@ -449,7 +501,6 @@ static int root_broker_main(const char* executable,
     if (launcher <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != launcher) return 21;
     ProcIdentity identity;
     if (!read_proc(getpid(), identity, false) || identity.netns != expected_netns) return 22;
-    alarm(15);
     const int root_control = connect_control(control_path);
     if (root_control < 0) return 23;
     Report root_report;
@@ -470,6 +521,13 @@ static int root_broker_main(const char* executable,
         return 25;
     close(root_control);
 
+    const std::string dropped_argv = exact_argv({executable,
+                                                 "--fixture-privileged-dropped-broker",
+                                                 control_path,
+                                                 token_string,
+                                                 expected_netns_text,
+                                                 scenario,
+                                                 std::to_string(kCredentialFd)});
     int credential_pair[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, credential_pair) != 0) return 26;
     const pid_t dropped = fork();
@@ -500,17 +558,32 @@ static int root_broker_main(const char* executable,
                     Frame{kCallerCredentials, token, credentials.payload},
                     kHandshakeMs)) {
         close(credential_pair[0]);
-        (void)kill(dropped, SIGKILL);
+        int abandoned_status = 0;
+        (void)wait_owned_child_bounded(dropped,
+                                       executable,
+                                       dropped_argv,
+                                       caller_uid,
+                                       caller_gid,
+                                       static_cast<ino_t>(expected_netns),
+                                       dropped,
+                                       true,
+                                       kCleanupMs,
+                                       abandoned_status);
         return 28;
     }
     close(credential_pair[0]);
-    alarm(0);
     int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(dropped, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited != dropped) return 29;
+    if (!wait_owned_child_bounded(dropped,
+                                  executable,
+                                  dropped_argv,
+                                  caller_uid,
+                                  caller_gid,
+                                  static_cast<ino_t>(expected_netns),
+                                  dropped,
+                                  true,
+                                  kBrokerDeadlineMs,
+                                  status))
+        return 29;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 30;
@@ -525,8 +598,12 @@ static int launcher_main(const char* executable,
     if (parent <= 1 || geteuid() != 0 || prctl(PR_SET_CHILD_SUBREAPER, 1) != 0 ||
         prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent)
         return 10;
+    u64 expected_netns_value = 0;
+    if (!parse_u64(expected_netns, expected_netns_value)) return 11;
+    const std::string broker_argv = exact_argv(
+        {executable, "--fixture-privileged-broker", control_path, token, expected_netns, scenario});
     const pid_t broker = fork();
-    if (broker < 0) return 11;
+    if (broker < 0) return 12;
     if (broker == 0) {
         execl(executable,
               executable,
@@ -539,15 +616,31 @@ static int launcher_main(const char* executable,
         _exit(127);
     }
     if (getppid() != parent) {
-        (void)kill(broker, SIGKILL);
-        return 12;
+        int abandoned_status = 0;
+        (void)wait_owned_child_bounded(broker,
+                                       executable,
+                                       broker_argv,
+                                       0,
+                                       0,
+                                       static_cast<ino_t>(expected_netns_value),
+                                       getpgrp(),
+                                       false,
+                                       kCleanupMs,
+                                       abandoned_status);
+        return 13;
     }
     int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(broker, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited != broker) return 13;
+    if (!wait_owned_child_bounded(broker,
+                                  executable,
+                                  broker_argv,
+                                  0,
+                                  0,
+                                  static_cast<ino_t>(expected_netns_value),
+                                  getpgrp(),
+                                  false,
+                                  kBrokerDeadlineMs,
+                                  status))
+        return 13;
     // Reap any target adopted after an intentionally early broker death.
     const bool broker_died_early = WIFEXITED(status) && WEXITSTATUS(status) == 86;
     const auto adopted_deadline =
@@ -577,28 +670,32 @@ static bool create_parent_endpoint(ParentEndpoint& endpoint, std::string& error)
         return false;
     }
     endpoint.directory = pattern.data();
-    endpoint.socket = endpoint.directory + "/control.sock";
+    struct stat directory{};
     if (chmod(endpoint.directory.c_str(), 0700) != 0 ||
-        !create_listener(endpoint.socket, endpoint.listener) ||
-        chmod(endpoint.socket.c_str(), 0600) != 0) {
+        stat(endpoint.directory.c_str(), &directory) != 0 || !S_ISDIR(directory.st_mode) ||
+        directory.st_uid != getuid() || directory.st_gid != getgid() ||
+        (directory.st_mode & 0777) != 0700) {
+        error = "parent temporary directory identity was not exact";
+        return false;
+    }
+    endpoint.identity.directory_dev = directory.st_dev;
+    endpoint.identity.directory_ino = directory.st_ino;
+    endpoint.identity.uid = directory.st_uid;
+    endpoint.identity.gid = directory.st_gid;
+    const std::string socket_path = endpoint.directory + "/control.sock";
+    if (!create_listener(socket_path, endpoint.listener)) {
         error = "parent AF_UNIX endpoint creation failed";
         return false;
     }
-    struct stat directory{}, socket{};
-    if (stat(endpoint.directory.c_str(), &directory) != 0 ||
-        lstat(endpoint.socket.c_str(), &socket) != 0 || !S_ISDIR(directory.st_mode) ||
-        !S_ISSOCK(socket.st_mode) || (directory.st_mode & 0777) != 0700 ||
-        (socket.st_mode & 0777) != 0600 || directory.st_uid != getuid() ||
-        socket.st_uid != getuid() || directory.st_gid != getgid() || socket.st_gid != getgid()) {
+    endpoint.socket = socket_path;
+    struct stat socket{};
+    if (lstat(socket_path.c_str(), &socket) != 0 || !S_ISSOCK(socket.st_mode) ||
+        (socket.st_mode & 0777) != 0600 || socket.st_uid != getuid() || socket.st_gid != getgid()) {
         error = "parent endpoint ownership/mode was not exact";
         return false;
     }
-    endpoint.identity = {directory.st_dev,
-                         directory.st_ino,
-                         socket.st_dev,
-                         socket.st_ino,
-                         directory.st_uid,
-                         directory.st_gid};
+    endpoint.identity.socket_dev = socket.st_dev;
+    endpoint.identity.socket_ino = socket.st_ino;
     return true;
 }
 
@@ -616,6 +713,103 @@ static bool endpoint_matches(const ParentEndpoint& endpoint, const EndpointIdent
 
 static bool endpoint_unchanged(const ParentEndpoint& endpoint) {
     return endpoint_matches(endpoint, endpoint.identity);
+}
+
+bool ParentEndpoint::cleanup(std::string& error) {
+    if (listener >= 0) {
+        close(listener);
+        listener = -1;
+    }
+    if (socket.empty() && directory.empty()) return true;
+    struct stat directory_status{};
+    if (directory.empty() || stat(directory.c_str(), &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode) || directory_status.st_dev != identity.directory_dev ||
+        directory_status.st_ino != identity.directory_ino ||
+        directory_status.st_uid != identity.uid || directory_status.st_gid != identity.gid ||
+        (directory_status.st_mode & 0777) != 0700) {
+        error = "refusing parent endpoint cleanup after identity/type/mode replacement";
+        return false;
+    }
+    if (!socket.empty()) {
+        struct stat socket_status{};
+        if (lstat(socket.c_str(), &socket_status) != 0 || !S_ISSOCK(socket_status.st_mode) ||
+            socket_status.st_dev != identity.socket_dev ||
+            socket_status.st_ino != identity.socket_ino || socket_status.st_uid != identity.uid ||
+            socket_status.st_gid != identity.gid || (socket_status.st_mode & 0777) != 0600) {
+            error = "refusing parent endpoint cleanup after identity/type/mode replacement";
+            return false;
+        }
+        if (unlink(socket.c_str()) != 0) {
+            error = "exact parent control socket unlink failed";
+            return false;
+        }
+        socket.clear();
+    }
+    if (rmdir(directory.c_str()) != 0) {
+        error = "exact parent temporary directory removal failed";
+        return false;
+    }
+    directory.clear();
+    return true;
+}
+
+ParentEndpoint::~ParentEndpoint() {
+    std::string error;
+    if (!cleanup(error) && !error.empty())
+        std::cerr << "FAIL [#358 Stage 2a3b endpoint destructor]: " << error << "\n";
+}
+
+static bool endpoint_replacement_self_check(std::string& error) {
+    ParentEndpoint endpoint;
+    if (!create_parent_endpoint(endpoint, error)) return false;
+    close(endpoint.listener);
+    endpoint.listener = -1;
+    if (unlink(endpoint.socket.c_str()) != 0) {
+        error = "endpoint replacement self-check could not remove its original socket";
+        return false;
+    }
+    const int replacement =
+        open(endpoint.socket.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (replacement < 0) {
+        error = "endpoint replacement self-check could not create its owned mutation";
+        return false;
+    }
+    close(replacement);
+    struct stat replaced{};
+    if (lstat(endpoint.socket.c_str(), &replaced) != 0 || !S_ISREG(replaced.st_mode) ||
+        replaced.st_uid != getuid() || replaced.st_gid != getgid() ||
+        (replaced.st_mode & 0777) != 0600) {
+        error = "endpoint replacement mutation was not exact";
+        return false;
+    }
+    std::string cleanup_error;
+    if (endpoint.cleanup(cleanup_error) || cleanup_error.empty()) {
+        error = "endpoint cleanup accepted a replaced socket";
+        return false;
+    }
+    struct stat still_replaced{};
+    if (lstat(endpoint.socket.c_str(), &still_replaced) != 0 ||
+        still_replaced.st_dev != replaced.st_dev || still_replaced.st_ino != replaced.st_ino ||
+        !S_ISREG(still_replaced.st_mode)) {
+        error = "refused endpoint cleanup deleted or changed the replacement";
+        return false;
+    }
+    if (unlink(endpoint.socket.c_str()) != 0) {
+        error = "self-check-owned replacement unlink failed";
+        return false;
+    }
+    endpoint.socket.clear();
+    struct stat directory{};
+    if (stat(endpoint.directory.c_str(), &directory) != 0 || !S_ISDIR(directory.st_mode) ||
+        directory.st_dev != endpoint.identity.directory_dev ||
+        directory.st_ino != endpoint.identity.directory_ino || directory.st_uid != getuid() ||
+        directory.st_gid != getgid() || (directory.st_mode & 0777) != 0700 ||
+        rmdir(endpoint.directory.c_str()) != 0) {
+        error = "self-check-owned directory cleanup was not identity safe";
+        return false;
+    }
+    endpoint.directory.clear();
+    return true;
 }
 
 static bool no_process_with_token(const std::string& token) {
@@ -655,6 +849,109 @@ static bool wait_direct(DirectChild& child, int timeout_ms) {
         (void)poll(nullptr, 0, 10);
     }
     return false;
+}
+
+static bool record_direct_child_identity(DirectChild& child) {
+    ProcIdentity current;
+    if (child.pid <= 1 || !read_proc(child.pid, current, false) || current.pid != child.pid ||
+        current.start != child.start || current.pgid != child.pid || current.pgid <= 1 ||
+        current.exe_dev != child.expected_exe_dev || current.exe_ino != child.expected_exe_ino ||
+        current.cmdline != child.expected_argv)
+        return false;
+    child.validated_identity = std::move(current);
+    child.identity_valid = true;
+    return true;
+}
+
+static bool safe_signal_direct_child(const DirectChild& child, int signal_number) {
+    ProcIdentity current;
+    return child.identity_valid && child.pid > 1 && child.validated_identity.pid == child.pid &&
+           child.validated_identity.pgid == child.pid && child.validated_identity.pgid > 1 &&
+           child.validated_identity.start == child.start &&
+           child.validated_identity.exe_dev == child.expected_exe_dev &&
+           child.validated_identity.exe_ino == child.expected_exe_ino &&
+           child.validated_identity.cmdline == child.expected_argv &&
+           read_proc(child.pid, current, false) &&
+           same_process_identity(child.validated_identity, current) &&
+           current.pgid == current.pid && kill(-current.pgid, signal_number) == 0;
+}
+
+static bool bounded_wait_and_signal_self_check(std::string& error) {
+    int ready[2] = {-1, -1};
+    if (pipe2(ready, O_CLOEXEC) != 0) {
+        error = "bounded-wait self-check pipe failed";
+        return false;
+    }
+    ProcIdentity parent;
+    if (!read_proc(getpid(), parent, false)) {
+        close(ready[0]);
+        close(ready[1]);
+        error = "bounded-wait self-check parent identity failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        error = "bounded-wait self-check fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(ready[0]);
+        struct sigaction action{};
+        action.sa_handler = SIG_IGN;
+        sigemptyset(&action.sa_mask);
+        const unsigned char marker = 0xa3;
+        if (setpgid(0, 0) != 0 || sigaction(SIGTERM, &action, nullptr) != 0 ||
+            write(ready[1], &marker, 1) != 1)
+            _exit(70);
+        close(ready[1]);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    unsigned char marker = 0;
+    const bool ready_exact = read_exact(ready[0], &marker, 1, kHandshakeMs) && marker == 0xa3;
+    close(ready[0]);
+    ProcIdentity observed;
+    DirectChild direct;
+    direct.pid = child;
+    const bool identity_exact = ready_exact && read_proc(child, observed, false) &&
+                                observed.ppid == getpid() && observed.pgid == child &&
+                                observed.uid == parent.uid && observed.gid == parent.gid &&
+                                observed.netns == parent.netns && observed.exe == parent.exe &&
+                                observed.cmdline == parent.cmdline;
+    if (identity_exact) {
+        direct.start = observed.start;
+        direct.expected_exe_dev = observed.exe_dev;
+        direct.expected_exe_ino = observed.exe_ino;
+        direct.expected_argv = observed.cmdline;
+        direct.validated_identity = observed;
+        direct.identity_valid = true;
+    }
+    DirectChild stale = direct;
+    stale.validated_identity.start++;
+    DirectChild unsafe = direct;
+    unsafe.validated_identity.pgid = 1;
+    const bool mutations = identity_exact && safe_signal_direct_child(direct, 0) &&
+                           !safe_signal_direct_child(stale, 0) &&
+                           !safe_signal_direct_child(unsafe, 0);
+    int status = 0;
+    const bool reaped = wait_owned_child_bounded(child,
+                                                 parent.exe,
+                                                 parent.cmdline,
+                                                 parent.uid,
+                                                 parent.gid,
+                                                 parent.netns,
+                                                 child,
+                                                 false,
+                                                 50,
+                                                 status);
+    if (!identity_exact || !mutations || !reaped || !WIFSIGNALED(status) ||
+        WTERMSIG(status) != SIGKILL) {
+        error = "bounded child wait/stale identity/TERM-ignore self-check failed";
+        return false;
+    }
+    return true;
 }
 
 static bool launch_sudo(const std::string& sudo_path,
@@ -710,15 +1007,21 @@ static bool launch_sudo(const std::string& sudo_path,
     do {
         ProcIdentity identity;
         if (read_proc(child.pid, identity, false)) {
-            child.start = identity.start;
-            return true;
+            if (child.start == 0) child.start = identity.start;
+            if (identity.start == child.start && identity.pgid == child.pid &&
+                identity.exe_dev == child.expected_exe_dev &&
+                identity.exe_ino == child.expected_exe_ino &&
+                identity.cmdline == child.expected_argv) {
+                child.validated_identity = std::move(identity);
+                child.identity_valid = true;
+                return true;
+            }
         }
         (void)poll(nullptr, 0, 5);
     } while (std::chrono::steady_clock::now() < deadline);
-    (void)kill(-child.pid, SIGKILL);
-    while (waitpid(child.pid, &child.status, 0) < 0 && errno == EINTR) {
-    }
-    child.reaped = true;
+    if (!wait_direct(child, kCleanupMs) && record_direct_child_identity(child) &&
+        safe_signal_direct_child(child, SIGKILL))
+        (void)wait_direct(child, kCleanupMs);
     return false;
 }
 
@@ -805,6 +1108,8 @@ static bool causal_mutation_self_checks(const Report& root_report,
     changed_root_peer.pid++;
     ProcIdentity changed_root_proc = root_proc;
     changed_root_proc.start++;
+    DirectChild changed_sudo = sudo_child;
+    changed_sudo.start++;
     const bool root_mutations = !validate_root_broker(changed_root,
                                                       root_peer,
                                                       root_proc,
@@ -836,13 +1141,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
-                                                      DirectChild{sudo_child.pid,
-                                                                  sudo_child.start + 1,
-                                                                  sudo_child.expected_exe_dev,
-                                                                  sudo_child.expected_exe_ino,
-                                                                  sudo_child.expected_argv,
-                                                                  0,
-                                                                  false});
+                                                      changed_sudo);
     const bool broker_baseline = identity_matches_report(broker_report,
                                                          broker_peer,
                                                          broker_proc,
@@ -958,6 +1257,16 @@ static bool causal_mutation_self_checks(const Report& root_report,
         !safe_signal_target(target_report, target_peer, changed_target_proc, 0) &&
         !safe_signal_target(unsafe_signal_report, target_peer, target_proc, 0) &&
         process_alive(target_peer.pid);
+    DirectChild stale_sudo = sudo_child;
+    stale_sudo.validated_identity.start++;
+    DirectChild unsafe_sudo = sudo_child;
+    unsafe_sudo.validated_identity.pgid = 1;
+    const bool sudo_signal_mutations =
+        sudo_child.identity_valid &&
+        stale_sudo.validated_identity.start != sudo_child.validated_identity.start &&
+        unsafe_sudo.validated_identity.pgid != sudo_child.validated_identity.pgid &&
+        safe_signal_direct_child(sudo_child, 0) && !safe_signal_direct_child(stale_sudo, 0) &&
+        !safe_signal_direct_child(unsafe_sudo, 0) && process_alive(sudo_child.pid);
     EndpointIdentity changed_endpoint = endpoint.identity;
     changed_endpoint.socket_ino++;
     const std::vector<unsigned char> trace{'G', 'D', 'U', 'N', 'C', 'P', 'X'};
@@ -966,7 +1275,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
     std::vector<unsigned char> short_trace = trace;
     short_trace.pop_back();
     return root_baseline && root_mutations && broker_baseline && broker_mutations &&
-           target_baseline && target_mutations && signal_mutations &&
+           target_baseline && target_mutations && signal_mutations && sudo_signal_mutations &&
            endpoint_unchanged(endpoint) && !endpoint_matches(endpoint, changed_endpoint) &&
            valid_security_trace(trace) && !valid_security_trace(swapped_trace) &&
            !valid_security_trace(short_trace);
@@ -1058,7 +1367,7 @@ static bool run_session(const std::string& sudo_path,
                                   root_argv,
                                   launcher_argv,
                                   sudo_child) ||
-            !endpoint_unchanged(endpoint)) {
+            !record_direct_child_identity(sudo_child) || !endpoint_unchanged(endpoint)) {
             error = "root broker provenance/endpoint validation failed";
             break;
         }
@@ -1227,7 +1536,8 @@ static bool run_session(const std::string& sudo_path,
                                       (static_cast<int>(exited.payload[2]) << 16) |
                                       (static_cast<int>(exited.payload[3]) << 24);
             const bool expected_status =
-                strcmp(scenario, "term-ignore") == 0
+                (strcmp(scenario, "term-ignore") == 0 ||
+                 strcmp(scenario, "owned-wait-term-ignore") == 0)
                     ? WIFSIGNALED(target_status) && WTERMSIG(target_status) == SIGKILL
                     : WIFEXITED(target_status) && WEXITSTATUS(target_status) == 0;
             if (!expected_status) {
@@ -1257,13 +1567,25 @@ static bool run_session(const std::string& sudo_path,
         process_alive(broker_peer.pid))
         (void)terminate_verified(broker_report, broker_peer, broker_proc);
     if (!sudo_child.reaped && sudo_child.pid > 1) {
-        (void)kill(-sudo_child.pid, SIGTERM);
         if (!wait_direct(sudo_child, kCleanupMs)) {
-            (void)kill(-sudo_child.pid, SIGKILL);
-            (void)wait_direct(sudo_child, kCleanupMs);
+            if (!safe_signal_direct_child(sudo_child, SIGTERM)) {
+                if (!error.empty()) error += "; ";
+                error += "refused unsafe sudo-child cleanup signal";
+            } else if (!wait_direct(sudo_child, kCleanupMs) &&
+                       (!safe_signal_direct_child(sudo_child, SIGKILL) ||
+                        !wait_direct(sudo_child, kCleanupMs))) {
+                if (!error.empty()) error += "; ";
+                error += "identity-safe sudo-child cleanup did not reap";
+            }
         }
     }
     if (!endpoint_unchanged(endpoint) && error.empty()) error = "endpoint changed during cleanup";
+    std::string endpoint_cleanup_error;
+    if (!endpoint.cleanup(endpoint_cleanup_error)) {
+        success = false;
+        if (!error.empty()) error += "; ";
+        error += endpoint_cleanup_error;
+    }
     return success;
 }
 
@@ -1300,8 +1622,14 @@ static bool run_preflight_command(const std::vector<std::string>& argv) {
         if (std::chrono::steady_clock::now() >= deadline) break;
         (void)poll(nullptr, 0, 10);
     }
-    (void)kill(-child, SIGKILL);
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    (void)kill(child, SIGKILL);
+    const auto kill_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < kill_deadline) {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 && errno != EINTR) break;
+        (void)poll(nullptr, 0, 10);
     }
     return false;
 }
@@ -1344,15 +1672,20 @@ static bool run_positive(const std::string& sudo_path,
                          const std::string& executable,
                          const HeldTopologySnapshot& topology,
                          std::string& error) {
-    ProcIdentity host, holder;
-    if (!read_proc(getpid(), host) || !read_proc(topology.holder_pid, holder, false) ||
-        holder.start != topology.holder_start || holder.netns != topology.holder_netns ||
+    ProcIdentity host;
+    if (!read_proc(getpid(), host) || topology.holder_pid <= 1 || topology.holder_start == 0 ||
+        topology.holder_netns == 0 || !process_alive(topology.holder_pid) ||
         host.netns == topology.holder_netns) {
         error = "held topology holder identity changed before broker launch";
         return false;
     }
-    for (const char* scenario :
-         {"normal", "ready-loss", "no-ready", "term-ignore", "broker-early", "broker-lease-loss"})
+    for (const char* scenario : {"normal",
+                                 "ready-loss",
+                                 "no-ready",
+                                 "term-ignore",
+                                 "owned-wait-term-ignore",
+                                 "broker-early",
+                                 "broker-lease-loss"})
         if (!run_session(sudo_path, nsenter_path, executable, topology, scenario, error)) {
             error = std::string(scenario) + ": " + error;
             return false;
@@ -1382,7 +1715,8 @@ int main(int argc, char** argv) {
     std::string sudo_path, nsenter_path, error;
     const bool required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED") != nullptr &&
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
-    if (!pure_protocol_self_checks(error)) {
+    if (!pure_protocol_self_checks(error) || !endpoint_replacement_self_check(error) ||
+        !bounded_wait_and_signal_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }

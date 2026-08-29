@@ -70,7 +70,7 @@ bool write_exact(int fd, const unsigned char* data, size_t size, int timeout_ms)
     size_t done = 0;
     while (done != size) {
         if (!wait_fd(fd, POLLOUT, deadline)) return false;
-        const ssize_t n = write(fd, data + done, size - done);
+        const ssize_t n = send(fd, data + done, size - done, MSG_NOSIGNAL);
         if (n > 0) {
             done += static_cast<size_t>(n);
         } else if (n < 0 && errno == EINTR) {
@@ -607,10 +607,15 @@ bool create_listener(const std::string& path, int& fd) {
         return false;
     }
     memcpy(address.sun_path, path.data(), path.size() + 1);
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        chmod(path.c_str(), 0600) != 0 || listen(fd, 1) != 0) {
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         close(fd);
         fd = -1;
+        return false;
+    }
+    if (chmod(path.c_str(), 0600) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        fd = -1;
+        (void)unlink(path.c_str());
         return false;
     }
     return true;
