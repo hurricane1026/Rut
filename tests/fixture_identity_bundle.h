@@ -96,6 +96,10 @@ private:
 };
 
 bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error);
+bool adopt_role(Role role,
+                std::array<int, kFdsPerRole>& inherited_fds,
+                RoleBundle& role_bundle,
+                std::string& error);
 bool validate_bundle(const IdentityBundle& bundle, std::string& error);
 std::vector<unsigned char> encode_bundle(const IdentityBundle& bundle);
 bool send_bundle(int fd,

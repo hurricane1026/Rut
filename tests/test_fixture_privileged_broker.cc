@@ -2,6 +2,7 @@
 // No HTTP listener, nginx process, RUT process, or AF_INET socket is created here.
 
 #include "fixture_direct_launch.h"
+#include "fixture_identity_bundle.h"
 #include "fixture_ipv4_topology.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
@@ -39,6 +40,7 @@
 namespace {
 
 using namespace rut::test::fixture_worker_protocol;
+namespace identity_bundle = rut::test::fixture_identity_bundle;
 using rut::test::fixture_direct_launch::AllowedStages;
 using rut::test::fixture_direct_launch::current_allows_group_signal;
 using rut::test::fixture_direct_launch::direct_launch_diagnostic;
@@ -60,8 +62,12 @@ constexpr u16 kLaunchTarget = 23;
 constexpr u16 kTargetExited = 24;
 constexpr u16 kBrokerExitEarly = 25;
 constexpr u16 kSecurityTrace = 26;
+constexpr u16 kIdentityBundleRequest = 27;
+constexpr u16 kIdentityBundleAck = 28;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kCredentialFd = 198;
+constexpr int kLauncherBundleFdBase = 220;
+static_assert(kLauncherBundleFdBase > kCredentialFd);
 
 struct EndpointIdentity {
     dev_t directory_dev = 0;
@@ -90,6 +96,7 @@ static bool group_lease_self_check(std::string& error);
 static bool lease_loss_owner_cascade_self_check(std::string& error);
 static bool launcher_error_order_self_check(std::string& error);
 static bool prelaunch_close_first_self_check(std::string& error);
+static bool identity_bundle_integration_self_check(std::string& error);
 static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
@@ -111,6 +118,68 @@ static bool cleanup_group_lease(GroupLease& lease,
                                 bool authority,
                                 std::string& error);
 static bool has_group_authority(const DirectLaunch& launch, const GroupLease& lease);
+
+static void close_launcher_bundle_handoff() {
+    for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i)
+        close(kLauncherBundleFdBase + static_cast<int>(i));
+}
+
+static bool install_launcher_bundle_handoff(const identity_bundle::RoleBundle& launcher_role) {
+    for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i) {
+        const int destination = kLauncherBundleFdBase + static_cast<int>(i);
+        errno = 0;
+        const int flags = fcntl(destination, F_GETFD);
+        if (flags >= 0) {
+            if (std::find(launcher_role.fds.begin(), launcher_role.fds.end(), destination) ==
+                launcher_role.fds.end())
+                return false;
+        } else if (errno != EBADF) {
+            return false;
+        }
+    }
+    std::array<int, identity_bundle::kFdsPerRole> temporary{};
+    temporary.fill(-1);
+    for (size_t i = 0; i != temporary.size(); ++i) {
+        temporary[i] =
+            fcntl(launcher_role.fds[i],
+                  F_DUPFD_CLOEXEC,
+                  kLauncherBundleFdBase + static_cast<int>(identity_bundle::kFdsPerRole));
+        if (temporary[i] < 0) {
+            for (int fd : temporary)
+                if (fd >= 0) close(fd);
+            return false;
+        }
+    }
+    bool installed = true;
+    for (size_t i = 0; i != temporary.size(); ++i) {
+        const int destination = kLauncherBundleFdBase + static_cast<int>(i);
+        if (dup3(temporary[i], destination, 0) != destination) installed = false;
+    }
+    for (int fd : temporary) close(fd);
+    if (!installed) close_launcher_bundle_handoff();
+    return installed;
+}
+
+static bool take_launcher_bundle_handoff(identity_bundle::RoleBundle& launcher_role,
+                                         std::string& error) {
+    std::array<int, identity_bundle::kFdsPerRole> inherited{};
+    inherited.fill(-1);
+    for (size_t i = 0; i != inherited.size(); ++i) {
+        const int fd = kLauncherBundleFdBase + static_cast<int>(i);
+        const int flags = fcntl(fd, F_GETFD);
+        if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            for (int owned : inherited)
+                if (owned >= 0) close(owned);
+            for (size_t rest = i; rest != inherited.size(); ++rest)
+                close(kLauncherBundleFdBase + static_cast<int>(rest));
+            error = "launcher identity handoff slot was missing or not restorable CLOEXEC";
+            return false;
+        }
+        inherited[i] = fd;
+    }
+    return identity_bundle::adopt_role(
+        identity_bundle::Role::Launcher, inherited, launcher_role, error);
+}
 
 static bool control_lease_lost(int fd) {
     if (fd < 0) return false;
@@ -1051,6 +1120,14 @@ static int root_broker_main(const char* executable,
         return 20;
     const pid_t launcher = getppid();
     if (launcher <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != launcher) return 21;
+    identity_bundle::IdentityBundle bundle;
+    std::string identity_error;
+    if (!take_launcher_bundle_handoff(bundle.roles[0], identity_error) ||
+        bundle.roles[0].manifest.pid != launcher ||
+        !identity_bundle::open_role(
+            getpid(), identity_bundle::Role::Root, bundle.roles[1], identity_error) ||
+        !identity_bundle::validate_bundle(bundle, identity_error))
+        return 22;
     ProcIdentity identity;
     if (!read_proc(getpid(), identity, false) || identity.netns != expected_netns) return 22;
     const int root_control = connect_control(control_path);
@@ -1060,6 +1137,27 @@ static int root_broker_main(const char* executable,
         !send_frame(
             root_control, Frame{kBrokerRootHello, token, encode_report(root_report)}, kHandshakeMs))
         return 24;
+    Frame bundle_request;
+    if (!receive_frame(root_control, bundle_request, kHandshakeMs) ||
+        bundle_request.type != kIdentityBundleRequest ||
+        !token_equal(bundle_request.token, token) || !bundle_request.payload.empty() ||
+        !identity_bundle::send_bundle(
+            root_control,
+            bundle,
+            std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(identity_bundle::kTransportTimeoutMs)))
+        return 24;
+    Frame bundle_ack;
+    if (!receive_frame(root_control, bundle_ack, kHandshakeMs) ||
+        bundle_ack.type != kIdentityBundleAck || !token_equal(bundle_ack.token, token) ||
+        !bundle_ack.payload.empty())
+        return 24;
+    bundle.close();
+    for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i) {
+        errno = 0;
+        if (fcntl(kLauncherBundleFdBase + static_cast<int>(i), F_GETFD) >= 0 || errno != EBADF)
+            return 24;
+    }
     Peer parent_peer;
     Frame credentials;
     uid_t caller_uid = 0;
@@ -1180,11 +1278,20 @@ static int launcher_main(const char* executable,
         return 10;
     u64 expected_netns_value = 0;
     if (!parse_u64(expected_netns, expected_netns_value)) return 11;
+    identity_bundle::RoleBundle launcher_role;
+    std::string identity_error;
+    if (!identity_bundle::open_role(
+            getpid(), identity_bundle::Role::Launcher, launcher_role, identity_error) ||
+        launcher_role.manifest.pid != getpid() || launcher_role.manifest.ppid != parent ||
+        launcher_role.manifest.pgid != getpgrp() || launcher_role.manifest.uid != 0 ||
+        launcher_role.manifest.gid != 0 || launcher_role.manifest.netns != expected_netns_value)
+        return 11;
     const std::string broker_argv = exact_argv(
         {executable, "--fixture-privileged-broker", control_path, token, expected_netns, scenario});
     const pid_t broker = fork();
     if (broker < 0) return 12;
     if (broker == 0) {
+        if (!install_launcher_bundle_handoff(launcher_role)) _exit(126);
         execl(executable,
               executable,
               "--fixture-privileged-broker",
@@ -1440,17 +1547,6 @@ static bool wait_direct(DirectLaunch& child, int timeout_ms) {
         }
         (void)poll(nullptr, 0, 10);
     }
-    return false;
-}
-
-static bool record_direct_launch_identity(DirectLaunch& child) {
-    ProcIdentity current;
-    std::string reason;
-    if (child.anchor.pid > 1 && read_proc(child.anchor.pid, current, false) &&
-        observe_direct(child, current, reason))
-        return true;
-    child.reason =
-        reason.empty() ? "direct launch current /proc identity could not be read" : reason;
     return false;
 }
 
@@ -2091,8 +2187,10 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
                              Peer& peer,
                              Report& report,
                              Token& frame_token,
+                             identity_bundle::ReceivedBundle& received_bundle,
                              std::string& error) {
     root_fd = -1;
+    received_bundle.reset();
     std::string last_observation = "no direct /proc observation";
     for (;;) {
         const int remaining = remaining_deadline_ms(deadline);
@@ -2144,6 +2242,11 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
             return false;
         }
         frame_token = frame.token;
+        if (!send_frame(root_fd, Frame{kIdentityBundleRequest, token, {}}, remaining) ||
+            !identity_bundle::receive_bundle(root_fd, received_bundle, deadline, error)) {
+            if (error.empty()) error = "root identity bundle request/receive failed";
+            return false;
+        }
         return true;
     }
     error = "root HELLO missed the absolute post-release deadline (last observation: " +
@@ -2152,28 +2255,10 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
     return false;
 }
 
-static bool read_launcher_ancestry(const ProcIdentity& launcher,
-                                   const DirectLaunch& launch,
-                                   std::vector<ProcIdentity>& ancestry,
-                                   std::string& reason) {
-    pid_t current = launcher.ppid;
-    for (size_t depth = 0; depth != kMaxLaunchAncestry && current > 1; ++depth) {
-        ProcIdentity identity;
-        if (!stable_proc_identity(current, identity) || identity.ppid == identity.pid) {
-            reason = "launcher ancestry could not be read as a stable /proc chain";
-            return false;
-        }
-        ancestry.push_back(identity);
-        if (identity.pid == launch.anchor.pid) return true;
-        current = identity.ppid;
-    }
-    reason = "launcher ancestry did not reach immutable direct PID within bound";
-    return false;
-}
-
 static bool validate_root_broker(const Report& report,
                                  const Peer& peer,
                                  const ProcIdentity& proc,
+                                 const ProcIdentity& launcher,
                                  const HeldTopologySnapshot& topology,
                                  const std::string& executable,
                                  const std::string& expected_argv,
@@ -2184,33 +2269,445 @@ static bool validate_root_broker(const Report& report,
         report.target_pid != static_cast<u64>(proc.pid) || report.wrapper_pid <= 1 ||
         report.target_pid == report.wrapper_pid || report.start != proc.start ||
         report.pgid != static_cast<u64>(proc.pgid) || proc.pgid != sudo_launch.anchor.pgid ||
-        report.netns != topology.holder_netns || proc.netns != topology.holder_netns ||
-        report.uid != 0 || report.gid != 0 || proc.uid != 0 || proc.gid != 0 ||
-        report.exe != executable || proc.exe != executable || report.exe_dev != proc.exe_dev ||
-        report.exe_ino != proc.exe_ino ||
+        proc.sid != sudo_launch.anchor.sid || report.netns != topology.holder_netns ||
+        proc.netns != topology.holder_netns || report.uid != 0 || report.gid != 0 ||
+        proc.uid != 0 || proc.gid != 0 || report.exe != executable || proc.exe != executable ||
+        report.exe_dev != proc.exe_dev || report.exe_ino != proc.exe_ino ||
         proc.exe_dev != sudo_launch.allowed.launcher_stage.exe_dev ||
         proc.exe_ino != sudo_launch.allowed.launcher_stage.exe_ino ||
         report.argv != expected_argv || proc.cmdline != expected_argv ||
         report.mode != "broker-root" || proc.ppid != static_cast<pid_t>(report.wrapper_pid) ||
+        launcher.pid != proc.ppid || launcher.start == 0 ||
+        launcher.pgid != sudo_launch.anchor.pgid || launcher.sid != sudo_launch.anchor.sid ||
+        launcher.uid != 0 || launcher.gid != 0 || launcher.netns != topology.holder_netns ||
+        launcher.exe != executable ||
+        launcher.exe_dev != sudo_launch.allowed.launcher_stage.exe_dev ||
+        launcher.exe_ino != sudo_launch.allowed.launcher_stage.exe_ino ||
+        launcher.cmdline != expected_launcher_argv ||
         report.no_new_privs != static_cast<u64>(proc.no_new_privs) ||
         report.capabilities_clear != static_cast<u64>(proc.capabilities_clear) ||
-        report.groups_clear != 0 || report.groups_unchanged != 1) {
+        report.groups_clear != 0 || report.groups_unchanged != 1 ||
+        proc.supplementary_groups == 0) {
         sudo_launch.reason = "root broker report/peer/current /proc fields were not exact";
         return false;
     }
-    ProcIdentity launcher;
     std::vector<ProcIdentity> ancestry;
     std::string reason;
-    if (!stable_proc_identity(proc.ppid, launcher) || launcher.pid != proc.ppid ||
-        launcher.cmdline != expected_launcher_argv ||
-        (launcher.pid != sudo_launch.anchor.pid &&
-         !read_launcher_ancestry(launcher, sudo_launch, ancestry, reason)) ||
+    if (launcher.pid != sudo_launch.anchor.pid) {
+        if (!sudo_launch.current_valid || launcher.ppid != sudo_launch.anchor.pid ||
+            child_exited_wnowait(sudo_launch.anchor.pid)) {
+            sudo_launch.reason = "live sudo-wrapper direct lineage was not exact";
+            return false;
+        }
+        ancestry.push_back(sudo_launch.current_identity);
+    }
+    if ((launcher.pid == sudo_launch.anchor.pid && launcher.start != sudo_launch.anchor.start) ||
         !validate_launcher_ancestry(sudo_launch, launcher, ancestry, reason)) {
         sudo_launch.reason =
             reason.empty() ? "root broker launcher provenance was not exact" : reason;
         return false;
     }
     return true;
+}
+
+static ProcIdentity proc_from_bundle_role(const identity_bundle::RoleManifest& manifest,
+                                          const std::string& executable,
+                                          const std::string& argv) {
+    ProcIdentity proc;
+    proc.pid = manifest.pid;
+    proc.ppid = manifest.ppid;
+    proc.sid = manifest.sid;
+    proc.start = manifest.start;
+    proc.pgid = manifest.pgid;
+    proc.uid = manifest.uid;
+    proc.gid = manifest.gid;
+    proc.netns = static_cast<ino_t>(manifest.netns);
+    proc.exe_dev = static_cast<dev_t>(manifest.exe_dev);
+    proc.exe_ino = static_cast<ino_t>(manifest.exe_ino);
+    proc.exe = executable;
+    proc.cmdline = argv;
+    return proc;
+}
+
+static bool read_bundle_status_evidence(const identity_bundle::RoleBundle& role,
+                                        ProcIdentity& proc) {
+    const int fd = role.fds[static_cast<size_t>(identity_bundle::FdSlot::Status)];
+    if (fd < 0 || lseek(fd, 0, SEEK_SET) < 0) return false;
+    std::string status;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        const ssize_t count = read(fd, buffer.data(), buffer.size());
+        if (count > 0) {
+            if (status.size() > 16384 - static_cast<size_t>(count)) return false;
+            status.append(buffer.data(), static_cast<size_t>(count));
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        return false;
+    }
+    bool have_nnp = false;
+    bool have_groups = false;
+    bool seen_inh = false;
+    bool seen_prm = false;
+    bool seen_eff = false;
+    bool clear_inh = false;
+    bool clear_prm = false;
+    bool clear_eff = false;
+    std::istringstream lines(status);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::istringstream value(line.substr(colon + 1));
+        if (line.rfind("NoNewPrivs:", 0) == 0) {
+            int parsed = -1;
+            if (!(value >> parsed) || (parsed != 0 && parsed != 1)) return false;
+            proc.no_new_privs = parsed == 1;
+            have_nnp = true;
+        } else if (line.rfind("Groups:", 0) == 0) {
+            std::string group;
+            proc.supplementary_groups = 0;
+            while (value >> group) ++proc.supplementary_groups;
+            have_groups = true;
+        } else if (line.rfind("CapInh:", 0) == 0 || line.rfind("CapPrm:", 0) == 0 ||
+                   line.rfind("CapEff:", 0) == 0) {
+            std::string hex;
+            if (!(value >> hex) || hex.empty()) return false;
+            const bool clear = hex.find_first_not_of('0') == std::string::npos;
+            if (line.rfind("CapInh:", 0) == 0) {
+                seen_inh = true;
+                clear_inh = clear;
+            }
+            if (line.rfind("CapPrm:", 0) == 0) {
+                seen_prm = true;
+                clear_prm = clear;
+            }
+            if (line.rfind("CapEff:", 0) == 0) {
+                seen_eff = true;
+                clear_eff = clear;
+            }
+        }
+    }
+    proc.capabilities_clear = clear_inh && clear_prm && clear_eff;
+    return have_nnp && have_groups && seen_inh && seen_prm && seen_eff;
+}
+
+static bool validate_identity_manifest_binding(
+    const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount>& manifests,
+    const Report& report,
+    const Peer& peer,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& expected_root_argv,
+    const std::string& expected_launcher_argv,
+    const ProcIdentity& root_status_evidence,
+    DirectLaunch& sudo_launch,
+    ProcIdentity& root_proc,
+    ProcIdentity& launcher_proc,
+    std::string& error) {
+    const identity_bundle::RoleManifest& launcher = manifests[0];
+    const identity_bundle::RoleManifest& root = manifests[1];
+    const auto argv_exact = [](const identity_bundle::RoleManifest& manifest,
+                               const std::string& expected) {
+        return manifest.argv_length == expected.size() &&
+               manifest.argv_hash == probe_hash(expected);
+    };
+    const dev_t expected_dev = sudo_launch.allowed.launcher_stage.exe_dev;
+    const ino_t expected_ino = sudo_launch.allowed.launcher_stage.exe_ino;
+    if (launcher.role != identity_bundle::Role::Launcher ||
+        root.role != identity_bundle::Role::Root || peer.pid <= 1 || peer.uid != 0 ||
+        peer.gid != 0 || root.pid != peer.pid ||
+        root.pid != static_cast<pid_t>(report.target_pid) || root.start != report.start ||
+        root.ppid != launcher.pid || root.ppid != static_cast<pid_t>(report.wrapper_pid) ||
+        root.pgid != sudo_launch.anchor.pgid || root.sid != sudo_launch.anchor.sid ||
+        root.uid != 0 || root.gid != 0 || root.netns != topology.holder_netns ||
+        root.exe_dev != static_cast<u64>(expected_dev) ||
+        root.exe_ino != static_cast<u64>(expected_ino) || !argv_exact(root, expected_root_argv) ||
+        launcher.pid != static_cast<pid_t>(report.wrapper_pid) || launcher.start == 0 ||
+        (launcher.pid == sudo_launch.anchor.pid ? launcher.ppid != getpid()
+                                                : launcher.ppid != sudo_launch.anchor.pid) ||
+        launcher.pgid != sudo_launch.anchor.pgid || launcher.sid != sudo_launch.anchor.sid ||
+        launcher.uid != 0 || launcher.gid != 0 || launcher.netns != topology.holder_netns ||
+        launcher.exe_dev != static_cast<u64>(expected_dev) ||
+        launcher.exe_ino != static_cast<u64>(expected_ino) ||
+        !argv_exact(launcher, expected_launcher_argv) || report.exe != executable ||
+        report.exe_dev != root.exe_dev || report.exe_ino != root.exe_ino ||
+        report.argv != expected_root_argv || report.uid != 0 || report.gid != 0 ||
+        report.netns != topology.holder_netns || report.pgid != static_cast<u64>(root.pgid) ||
+        report.mode != "broker-root") {
+        error = "identity bundle manifest/peer/report binding was not exact";
+        return false;
+    }
+    root_proc = proc_from_bundle_role(root, executable, expected_root_argv);
+    root_proc.no_new_privs = root_status_evidence.no_new_privs;
+    root_proc.capabilities_clear = root_status_evidence.capabilities_clear;
+    root_proc.supplementary_groups = root_status_evidence.supplementary_groups;
+    launcher_proc = proc_from_bundle_role(launcher, executable, expected_launcher_argv);
+    if (!validate_root_broker(report,
+                              peer,
+                              root_proc,
+                              launcher_proc,
+                              topology,
+                              executable,
+                              expected_root_argv,
+                              expected_launcher_argv,
+                              sudo_launch)) {
+        error = sudo_launch.reason;
+        return false;
+    }
+    return true;
+}
+
+static bool validate_received_identity_bundle(const identity_bundle::IdentityBundle& bundle,
+                                              const Report& report,
+                                              const Peer& peer,
+                                              const HeldTopologySnapshot& topology,
+                                              const std::string& executable,
+                                              const std::string& expected_root_argv,
+                                              const std::string& expected_launcher_argv,
+                                              DirectLaunch& sudo_launch,
+                                              ProcIdentity& root_proc,
+                                              ProcIdentity& launcher_proc,
+                                              std::string& error) {
+    std::string transport_error;
+    if (!identity_bundle::validate_bundle(bundle, transport_error)) {
+        error = "received identity bundle failed transport validation: " + transport_error;
+        return false;
+    }
+    const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount> manifests{
+        bundle.roles[0].manifest, bundle.roles[1].manifest};
+    ProcIdentity root_status_evidence;
+    if (!read_bundle_status_evidence(bundle.roles[1], root_status_evidence)) {
+        error = "received Root status FD security evidence was invalid";
+        return false;
+    }
+    return validate_identity_manifest_binding(manifests,
+                                              report,
+                                              peer,
+                                              topology,
+                                              executable,
+                                              expected_root_argv,
+                                              expected_launcher_argv,
+                                              root_status_evidence,
+                                              sudo_launch,
+                                              root_proc,
+                                              launcher_proc,
+                                              error);
+}
+
+static bool identity_bundle_integration_self_check(std::string& error) {
+    int child_ready[2] = {-1, -1};
+    if (pipe2(child_ready, O_CLOEXEC) != 0) {
+        error = "identity integration child-ready pipe failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(child_ready[0]);
+        close(child_ready[1]);
+        error = "identity integration child fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(child_ready[0]);
+        const unsigned char ready = 0x91;
+        (void)write(child_ready[1], &ready, 1);
+        close(child_ready[1]);
+        for (;;) pause();
+    }
+    close(child_ready[1]);
+    unsigned char ready = 0;
+    bool ok = read_exact(child_ready[0], &ready, 1, kCleanupMs) && ready == 0x91;
+    close(child_ready[0]);
+
+    identity_bundle::IdentityBundle source;
+    std::string bundle_error;
+    ok = ok &&
+         identity_bundle::open_role(
+             getpid(), identity_bundle::Role::Launcher, source.roles[0], bundle_error) &&
+         identity_bundle::open_role(
+             child, identity_bundle::Role::Root, source.roles[1], bundle_error) &&
+         identity_bundle::validate_bundle(source, bundle_error);
+    int sockets[2] = {-1, -1};
+    ok = ok && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0;
+    Token token;
+    ok = ok && new_token(token);
+    Frame frame;
+    if (ok) {
+        ok = send_frame(sockets[0], Frame{kBrokerRootHello, token, {}}, kHandshakeMs) &&
+             receive_frame(sockets[1], frame, kHandshakeMs) && frame.type == kBrokerRootHello &&
+             token_equal(frame.token, token) &&
+             send_frame(sockets[1], Frame{kIdentityBundleRequest, token, {}}, kHandshakeMs) &&
+             receive_frame(sockets[0], frame, kHandshakeMs) &&
+             frame.type == kIdentityBundleRequest && token_equal(frame.token, token);
+    }
+    identity_bundle::ReceivedBundle received;
+    if (ok) {
+        ok = identity_bundle::send_bundle(
+                 sockets[0],
+                 source,
+                 std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(identity_bundle::kTransportTimeoutMs)) &&
+             identity_bundle::receive_bundle(
+                 sockets[1],
+                 received,
+                 std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(identity_bundle::kTransportTimeoutMs),
+                 bundle_error) &&
+             send_frame(sockets[1], Frame{kIdentityBundleAck, token, {}}, kHandshakeMs) &&
+             receive_frame(sockets[0], frame, kHandshakeMs) && frame.type == kIdentityBundleAck &&
+             token_equal(frame.token, token);
+    }
+
+    identity_bundle::RoleBundle adopted_handoff;
+    std::string handoff_error;
+    if (ok) {
+        ok = install_launcher_bundle_handoff(source.roles[0]) &&
+             take_launcher_bundle_handoff(adopted_handoff, handoff_error) &&
+             adopted_handoff.manifest.pid == source.roles[0].manifest.pid &&
+             adopted_handoff.manifest.start == source.roles[0].manifest.start &&
+             adopted_handoff.manifest.exe_dev == source.roles[0].manifest.exe_dev &&
+             adopted_handoff.manifest.exe_ino == source.roles[0].manifest.exe_ino &&
+             adopted_handoff.manifest.argv_length == source.roles[0].manifest.argv_length &&
+             adopted_handoff.manifest.argv_hash == source.roles[0].manifest.argv_hash;
+        adopted_handoff.close();
+        for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i) {
+            errno = 0;
+            ok = ok && fcntl(kLauncherBundleFdBase + static_cast<int>(i), F_GETFD) < 0 &&
+                 errno == EBADF;
+        }
+    }
+
+    received.reset();
+    source.close();
+    if (sockets[0] >= 0) close(sockets[0]);
+    if (sockets[1] >= 0) close(sockets[1]);
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) ok = false;
+    pid_t waited;
+    do {
+        waited = waitpid(child, nullptr, 0);
+    } while (waited < 0 && errno == EINTR);
+    ok = ok && waited == child;
+    if (!ok) {
+        error = "identity bundle handshake/binding mutation self-check failed: " + bundle_error;
+        return false;
+    }
+    return true;
+}
+
+static bool live_identity_bundle_mutation_checks(const identity_bundle::IdentityBundle& bundle,
+                                                 const Report& report,
+                                                 const Peer& peer,
+                                                 const HeldTopologySnapshot& topology,
+                                                 const std::string& executable,
+                                                 const std::string& root_argv,
+                                                 const std::string& launcher_argv,
+                                                 const DirectLaunch& live_launch) {
+    ProcIdentity ignored_root;
+    ProcIdentity ignored_launcher;
+    std::string ignored_error;
+    DirectLaunch full_baseline = live_launch;
+    if (!validate_received_identity_bundle(bundle,
+                                           report,
+                                           peer,
+                                           topology,
+                                           executable,
+                                           root_argv,
+                                           launcher_argv,
+                                           full_baseline,
+                                           ignored_root,
+                                           ignored_launcher,
+                                           ignored_error))
+        return false;
+    const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount> manifests{
+        bundle.roles[0].manifest, bundle.roles[1].manifest};
+    const auto accepted_with_evidence = [&](const auto& candidate_manifests,
+                                            const Report& candidate_report,
+                                            const Peer& candidate_peer,
+                                            const ProcIdentity& candidate_evidence) {
+        DirectLaunch launch = live_launch;
+        ProcIdentity root_proc;
+        ProcIdentity launcher_proc;
+        std::string error;
+        return validate_identity_manifest_binding(candidate_manifests,
+                                                  candidate_report,
+                                                  candidate_peer,
+                                                  topology,
+                                                  executable,
+                                                  root_argv,
+                                                  launcher_argv,
+                                                  candidate_evidence,
+                                                  launch,
+                                                  root_proc,
+                                                  launcher_proc,
+                                                  error);
+    };
+    const auto accepted = [&](const auto& candidate_manifests,
+                              const Report& candidate_report,
+                              const Peer& candidate_peer) {
+        return accepted_with_evidence(
+            candidate_manifests, candidate_report, candidate_peer, ignored_root);
+    };
+    if (!accepted(manifests, report, peer)) return false;
+    const auto rejects = [&](auto mutation) {
+        auto changed = manifests;
+        mutation(changed);
+        return !accepted(changed, report, peer);
+    };
+    Peer changed_peer = peer;
+    ++changed_peer.pid;
+    Report changed_report = report;
+    ++changed_report.target_pid;
+    Report changed_nnp_report = report;
+    changed_nnp_report.no_new_privs ^= 1;
+    Report changed_caps_report = report;
+    changed_caps_report.capabilities_clear ^= 1;
+    Report changed_groups_report = report;
+    changed_groups_report.groups_clear = 1;
+    changed_groups_report.groups_unchanged = 0;
+    ProcIdentity changed_nnp_evidence = ignored_root;
+    changed_nnp_evidence.no_new_privs = !changed_nnp_evidence.no_new_privs;
+    ProcIdentity changed_caps_evidence = ignored_root;
+    changed_caps_evidence.capabilities_clear = !changed_caps_evidence.capabilities_clear;
+    ProcIdentity changed_groups_evidence = ignored_root;
+    changed_groups_evidence.supplementary_groups = 0;
+    auto detached = manifests;
+    detached[0].pid += 100000;
+    detached[0].ppid = 1;
+    detached[1].ppid = detached[0].pid;
+    Report detached_report = report;
+    detached_report.wrapper_pid = static_cast<u64>(detached[0].pid);
+    return !accepted(manifests, report, changed_peer) &&
+           !accepted(manifests, changed_report, peer) &&
+           !accepted(manifests, changed_nnp_report, peer) &&
+           !accepted(manifests, changed_caps_report, peer) &&
+           !accepted(manifests, changed_groups_report, peer) &&
+           !accepted_with_evidence(manifests, report, peer, changed_nnp_evidence) &&
+           !accepted_with_evidence(manifests, report, peer, changed_caps_evidence) &&
+           !accepted_with_evidence(manifests, report, peer, changed_groups_evidence) &&
+           rejects([](auto& value) { ++value[1].pid; }) &&
+           rejects([](auto& value) { ++value[0].pid; }) &&
+           rejects([](auto& value) { ++value[1].ppid; }) &&
+           rejects([](auto& value) { ++value[0].ppid; }) &&
+           rejects([](auto& value) { ++value[1].start; }) &&
+           rejects([](auto& value) { ++value[0].start; }) &&
+           rejects([](auto& value) { ++value[1].netns; }) &&
+           rejects([](auto& value) { ++value[0].netns; }) &&
+           rejects([](auto& value) { ++value[1].exe_dev; }) &&
+           rejects([](auto& value) { ++value[1].exe_ino; }) &&
+           rejects([](auto& value) { ++value[0].exe_dev; }) &&
+           rejects([](auto& value) { ++value[0].exe_ino; }) &&
+           rejects([](auto& value) { ++value[1].argv_length; }) &&
+           rejects([](auto& value) { ++value[1].argv_hash; }) &&
+           rejects([](auto& value) { ++value[0].argv_length; }) &&
+           rejects([](auto& value) { ++value[0].argv_hash; }) &&
+           rejects([](auto& value) { ++value[1].uid; }) &&
+           rejects([](auto& value) { ++value[1].gid; }) &&
+           rejects([](auto& value) { ++value[0].uid; }) &&
+           rejects([](auto& value) { ++value[0].gid; }) &&
+           rejects([](auto& value) { std::swap(value[0], value[1]); }) &&
+           !accepted(detached, detached_report, peer);
 }
 
 struct DestructiveAuth {
@@ -2260,6 +2757,7 @@ static DirectLaunch copy_launch_with_anchor(const DirectLaunch& source, DirectLa
 static bool causal_mutation_self_checks(const Report& root_report,
                                         const Peer& root_peer,
                                         const ProcIdentity& root_proc,
+                                        const ProcIdentity& launcher_proc,
                                         const Report& broker_report,
                                         const Peer& broker_peer,
                                         const ProcIdentity& broker_proc,
@@ -2279,6 +2777,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
     const bool root_baseline = validate_root_broker(root_report,
                                                     root_peer,
                                                     root_proc,
+                                                    launcher_proc,
                                                     topology,
                                                     executable,
                                                     root_argv,
@@ -2299,6 +2798,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
     const bool root_mutations = !validate_root_broker(changed_root,
                                                       root_peer,
                                                       root_proc,
+                                                      launcher_proc,
                                                       topology,
                                                       executable,
                                                       root_argv,
@@ -2307,6 +2807,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                 !validate_root_broker(root_report,
                                                       changed_root_peer,
                                                       root_proc,
+                                                      launcher_proc,
                                                       topology,
                                                       executable,
                                                       root_argv,
@@ -2315,6 +2816,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                 !validate_root_broker(root_report,
                                                       root_peer,
                                                       changed_root_proc,
+                                                      launcher_proc,
                                                       topology,
                                                       executable,
                                                       root_argv,
@@ -2323,6 +2825,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                 !validate_root_broker(root_report,
                                                       root_peer,
                                                       root_proc,
+                                                      launcher_proc,
                                                       topology,
                                                       executable,
                                                       root_argv,
@@ -2543,8 +3046,9 @@ static bool run_session(const std::string& sudo_path,
     int root_fd = -1, broker_fd = -1, target_fd = -1;
     Report root_report, broker_report, target_report;
     Peer root_peer, broker_peer, target_peer;
-    ProcIdentity root_proc, broker_proc, target_proc;
+    ProcIdentity root_proc, launcher_proc, broker_proc, target_proc;
     Token root_frame_token;
+    identity_bundle::ReceivedBundle received_identity;
     bool success = false;
     do {
         const bool root_hello_ok = await_root_hello(endpoint,
@@ -2555,6 +3059,7 @@ static bool run_session(const std::string& sudo_path,
                                                     root_peer,
                                                     root_report,
                                                     root_frame_token,
+                                                    received_identity,
                                                     error);
         const std::string root_argv = exact_argv({executable,
                                                   "--fixture-privileged-broker",
@@ -2578,11 +3083,9 @@ static bool run_session(const std::string& sudo_path,
                                                                              root_argv,
                                                                              launcher_argv,
                                                                              sudo_child);
-        const bool root_proc_ok =
-            root_hello_ok && root_peer.pid > 1 && read_proc(root_peer.pid, root_proc, false);
-        if (!root_hello_ok || !destructive_auth.valid || !root_proc_ok) {
+        if (!root_hello_ok || !destructive_auth.valid) {
             if (error.empty()) error = "root broker HELLO/peer identity failed";
-            if (!root_proc_ok) error += "; " + probe_diagnostic(root_peer.pid);
+            received_identity.reset();
             break;
         }
         const std::string dropped_argv = exact_argv({executable,
@@ -2592,23 +3095,39 @@ static bool run_session(const std::string& sudo_path,
                                                      std::to_string(topology.holder_netns),
                                                      scenario,
                                                      std::to_string(kCredentialFd)});
-        if (!validate_root_broker(root_report,
-                                  root_peer,
-                                  root_proc,
-                                  topology,
-                                  executable,
-                                  root_argv,
-                                  launcher_argv,
-                                  sudo_child) ||
-            !record_direct_launch_identity(sudo_child)) {
-            error = "root broker provenance/endpoint validation failed: " +
+        std::string identity_error;
+        if (!validate_received_identity_bundle(received_identity.bundle(),
+                                               root_report,
+                                               root_peer,
+                                               topology,
+                                               executable,
+                                               root_argv,
+                                               launcher_argv,
+                                               sudo_child,
+                                               root_proc,
+                                               launcher_proc,
+                                               identity_error) ||
+            !endpoint_unchanged(endpoint) ||
+            (strcmp(scenario, "normal") == 0 &&
+             !live_identity_bundle_mutation_checks(received_identity.bundle(),
+                                                   root_report,
+                                                   root_peer,
+                                                   topology,
+                                                   executable,
+                                                   root_argv,
+                                                   launcher_argv,
+                                                   sudo_child))) {
+            error = "root broker bundle provenance validation failed: " + identity_error + "; " +
                     direct_launch_diagnostic(sudo_child);
+            received_identity.reset();
             break;
         }
-        if (!send_frame(root_fd,
+        received_identity.reset();
+        if (!send_frame(root_fd, Frame{kIdentityBundleAck, token, {}}, kHandshakeMs) ||
+            !send_frame(root_fd,
                         Frame{kCallerCredentials, token, credentials_payload(getuid(), getgid())},
                         kHandshakeMs)) {
-            error = "caller credential frame failed";
+            error = "identity bundle ACK/caller credential frame failed";
             break;
         }
         if (!accept_bounded(endpoint.listener, broker_fd) ||
@@ -2683,6 +3202,7 @@ static bool run_session(const std::string& sudo_path,
             if (strcmp(scenario, "normal") == 0 && !causal_mutation_self_checks(root_report,
                                                                                 root_peer,
                                                                                 root_proc,
+                                                                                launcher_proc,
                                                                                 broker_report,
                                                                                 broker_peer,
                                                                                 broker_proc,
@@ -2984,7 +3504,8 @@ int main(int argc, char** argv) {
     if (!pure_protocol_self_checks(error) || !endpoint_replacement_self_check(error) ||
         !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
         !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
-        !prelaunch_close_first_self_check(error)) {
+        !prelaunch_close_first_self_check(error) ||
+        !identity_bundle_integration_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }

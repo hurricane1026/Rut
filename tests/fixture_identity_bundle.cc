@@ -514,6 +514,47 @@ bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error
     return true;
 }
 
+bool adopt_role(Role role,
+                std::array<int, kFdsPerRole>& inherited_fds,
+                RoleBundle& role_bundle,
+                std::string& error) {
+    role_bundle.close();
+    role_bundle.manifest = RoleManifest{};
+    role_bundle.manifest.role = role;
+    role_bundle.fds = inherited_fds;
+    inherited_fds.fill(-1);
+    std::string stat_text;
+    std::string status_text;
+    std::string cmdline;
+    if (!read_fd(role_bundle.fds[static_cast<size_t>(FdSlot::Stat)], stat_text, 8192) ||
+        !parse_proc_stat(stat_text, role_bundle.manifest) ||
+        !read_fd(role_bundle.fds[static_cast<size_t>(FdSlot::Status)], status_text, 16384) ||
+        !parse_status_ids(status_text, role_bundle.manifest.uid, role_bundle.manifest.gid) ||
+        !read_fd(role_bundle.fds[static_cast<size_t>(FdSlot::Cmdline)], cmdline, 8192)) {
+        role_bundle.close();
+        error = "inherited identity bundle proc manifest parse failed";
+        return false;
+    }
+    struct stat executable{};
+    struct stat netns{};
+    if (fstat(role_bundle.fds[static_cast<size_t>(FdSlot::Executable)], &executable) != 0 ||
+        fstat(role_bundle.fds[static_cast<size_t>(FdSlot::Netns)], &netns) != 0) {
+        role_bundle.close();
+        error = "inherited identity bundle executable/netns stat failed";
+        return false;
+    }
+    role_bundle.manifest.netns = static_cast<u64>(netns.st_ino);
+    role_bundle.manifest.exe_dev = static_cast<u64>(executable.st_dev);
+    role_bundle.manifest.exe_ino = static_cast<u64>(executable.st_ino);
+    role_bundle.manifest.argv_length = cmdline.size();
+    role_bundle.manifest.argv_hash = hash_bytes(cmdline);
+    if (!validate_role(role_bundle, error)) {
+        role_bundle.close();
+        return false;
+    }
+    return true;
+}
+
 std::vector<unsigned char> encode_bundle(const IdentityBundle& bundle) {
     std::vector<unsigned char> output;
     output.reserve(kWireBytes);

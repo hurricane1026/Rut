@@ -529,6 +529,7 @@ if(RUT_ENABLE_JIT)
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
         fixture_direct_launch
+        fixture_identity_bundle
         fixture_worker_protocol
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE
