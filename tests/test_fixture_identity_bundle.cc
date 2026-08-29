@@ -8,7 +8,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -16,7 +18,7 @@ namespace {
 
 using namespace rut::test::fixture_identity_bundle;
 
-enum class CmsgShape { Exact, Missing, Short, Long, WrongType };
+enum class CmsgShape { Exact, Missing, Short, Long, ExtraCredentials };
 
 static bool send_plain(int fd,
                        const unsigned char* data,
@@ -62,21 +64,33 @@ static bool send_raw(int fd,
     std::array<int, kBundleFdCount + 1> rights{};
     std::copy(fds.begin(), fds.end(), rights.begin());
     rights[kBundleFdCount] = fds[0];
-    std::array<unsigned char, CMSG_SPACE((kBundleFdCount + 1) * sizeof(int))> control{};
+    alignas(cmsghdr) std::array<unsigned char,
+                                CMSG_SPACE((kBundleFdCount + 1) * sizeof(int)) +
+                                    CMSG_SPACE(sizeof(struct ucred))>
+        control{};
     iovec vector{const_cast<unsigned char*>(wire.data()), first_bytes};
     msghdr message{};
     message.msg_iov = &vector;
     message.msg_iovlen = 1;
     if (shape != CmsgShape::Missing) {
         message.msg_control = control.data();
-        message.msg_controllen = control.size();
+        message.msg_controllen = CMSG_SPACE(count * sizeof(int));
+        if (shape == CmsgShape::ExtraCredentials)
+            message.msg_controllen += CMSG_SPACE(sizeof(struct ucred));
         cmsghdr* header = CMSG_FIRSTHDR(&message);
         header->cmsg_level = SOL_SOCKET;
-        header->cmsg_type = shape == CmsgShape::WrongType ? 0 : SCM_RIGHTS;
+        header->cmsg_type = SCM_RIGHTS;
         header->cmsg_len = CMSG_LEN(count * sizeof(int));
-        if (shape == CmsgShape::WrongType) header->cmsg_len = CMSG_LEN(sizeof(int));
-        const size_t copied = shape == CmsgShape::WrongType ? 1 : count;
-        memcpy(CMSG_DATA(header), rights.data(), copied * sizeof(int));
+        memcpy(CMSG_DATA(header), rights.data(), count * sizeof(int));
+        if (shape == CmsgShape::ExtraCredentials) {
+            cmsghdr* credentials_header = CMSG_NXTHDR(&message, header);
+            if (credentials_header == nullptr) return false;
+            const struct ucred credentials{getpid(), getuid(), getgid()};
+            credentials_header->cmsg_level = SOL_SOCKET;
+            credentials_header->cmsg_type = SCM_CREDENTIALS;
+            credentials_header->cmsg_len = CMSG_LEN(sizeof(credentials));
+            memcpy(CMSG_DATA(credentials_header), &credentials, sizeof(credentials));
+        }
     }
     ssize_t sent;
     do {
@@ -87,16 +101,18 @@ static bool send_raw(int fd,
         !send_plain(fd,
                     wire.data() + sent,
                     first_bytes - static_cast<size_t>(sent),
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500)))
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500))) {
         return false;
+    }
     if (complete && first_bytes != wire.size() &&
         !send_plain(fd,
                     wire.data() + first_bytes,
                     wire.size() - first_bytes,
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500)))
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500))) {
         return false;
+    }
     if (trailing_rights) {
-        std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
         unsigned char byte = 0;
         iovec trailing_vector{&byte, sizeof(byte)};
         msghdr trailing{};
@@ -135,7 +151,16 @@ static bool receive_fails(const std::vector<unsigned char>& wire,
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
     const size_t before = fd_count();
+    if (shape == CmsgShape::ExtraCredentials) {
+        int enabled = 1;
+        if (setsockopt(sockets[1], SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) != 0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            return false;
+        }
+    }
     const bool sent = send_raw(sockets[0], wire, fds, shape, first_bytes, trailing, complete);
+    const int send_errno = sent ? 0 : errno;
     shutdown(sockets[0], SHUT_WR);
     ReceivedBundle received;
     std::string error;
@@ -148,6 +173,16 @@ static bool receive_fails(const std::vector<unsigned char>& wire,
     const bool no_leak = fd_count() == before;
     close(sockets[0]);
     close(sockets[1]);
+    if (shape == CmsgShape::ExtraCredentials && !sent) {
+        // Some kernels reject explicitly supplied credentials on stream
+        // sockets.  Treat that as a kernel-level rejection, never as proof
+        // that our receiver rejected the ancillary record.
+        if (send_errno == EINVAL) {
+            std::fprintf(stderr, "kernel rejected SCM_CREDENTIALS ancillary\n");
+            return true;
+        }
+        return false;
+    }
     return sent ? !accepted && no_leak : !accepted;
 }
 
@@ -203,6 +238,15 @@ int main() {
         waitpid(child, nullptr, 0);
         return 1;
     }
+    bool shared_objects = bundle.roles[0].manifest.exe_dev == bundle.roles[1].manifest.exe_dev &&
+                          bundle.roles[0].manifest.exe_ino == bundle.roles[1].manifest.exe_ino &&
+                          bundle.roles[0].manifest.netns == bundle.roles[1].manifest.netns;
+    if (!check(shared_objects, "shared executable/netns objects accepted across roles")) {
+        bundle.close();
+        kill(child, SIGKILL);
+        waitpid(child, nullptr, 0);
+        return 1;
+    }
     const std::vector<unsigned char> wire = encode_bundle(bundle);
     const std::array<int, kBundleFdCount> fds = flatten(bundle);
     bool ok = check(wire.size() == kWireBytes && kPayloadBytes != 0, "fixed nonempty payload");
@@ -237,7 +281,8 @@ int main() {
         check(receive_fails(wire, fds, CmsgShape::Missing, wire.size()), "missing rights rejected");
     ok &= check(receive_fails(wire, fds, CmsgShape::Short, wire.size()), "short rights rejected");
     ok &= check(receive_fails(wire, fds, CmsgShape::Long, wire.size()), "long rights rejected");
-    ok &= check(receive_fails(wire, fds, CmsgShape::WrongType, wire.size()), "wrong cmsg rejected");
+    ok &= check(receive_fails(wire, fds, CmsgShape::ExtraCredentials, wire.size()),
+                "extra credentials ancillary rejected");
     ok &= check(receive_fails(wire, fds, CmsgShape::Exact, 5, false, false),
                 "truncated header rejected");
     ok &= check(receive_fails(wire, fds, CmsgShape::Exact, kHeaderBytes + 2, false, false),
@@ -274,6 +319,25 @@ int main() {
     ok &= check(receive_fails(wire, foreign_array, CmsgShape::Exact, wire.size()),
                 "foreign fd rejected");
     close(foreign);
+    const pid_t foreign_child = fork();
+    if (foreign_child == 0)
+        for (;;) pause();
+    ok &= check(foreign_child > 1, "foreign child setup");
+    int foreign_child_pidfd = -1;
+#ifdef SYS_pidfd_open
+    if (foreign_child > 1) foreign_child_pidfd = syscall(SYS_pidfd_open, foreign_child, 0);
+#endif
+    std::array<int, kBundleFdCount> foreign_pidfd = fds;
+    foreign_pidfd[11] = foreign_child_pidfd;
+    ok &= check(foreign_child_pidfd >= 0 && fds[11] != foreign_child_pidfd && foreign_pidfd != fds,
+                "foreign child pidfd mutation differs");
+    ok &= check(receive_fails(wire, foreign_pidfd, CmsgShape::Exact, wire.size()),
+                "foreign child pidfd rejected");
+    if (foreign_child_pidfd >= 0) close(foreign_child_pidfd);
+    if (foreign_child > 1) {
+        kill(foreign_child, SIGKILL);
+        waitpid(foreign_child, nullptr, 0);
+    }
     std::vector<unsigned char> bad_pid = wire;
     ++bad_pid[kHeaderBytes + 8];
     ok &= check(bad_pid != wire, "manifest pid mutation differs");

@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -28,8 +29,8 @@ static_assert(sizeof(pid_t) <= sizeof(u64));
 
 static u64 hash_bytes(const std::string& bytes) {
     u64 hash = 1469598103934665603ULL;
-    for (const unsigned char byte : bytes) {
-        hash ^= byte;
+    for (const char byte : bytes) {
+        hash ^= static_cast<u64>(static_cast<unsigned char>(byte));
         hash *= 1099511628211ULL;
     }
     return hash;
@@ -105,6 +106,16 @@ static bool read_fd(int fd, std::string& output, size_t limit) {
 }
 
 static bool parse_proc_stat(const std::string& text, RoleManifest& manifest) {
+    const size_t pid_end = text.find(' ');
+    if (pid_end == std::string::npos || pid_end == 0) return false;
+    const std::string pid_text = text.substr(0, pid_end);
+    char* pid_parse_end = nullptr;
+    errno = 0;
+    const unsigned long parsed_pid = std::strtoul(pid_text.c_str(), &pid_parse_end, 10);
+    if (errno != 0 || pid_parse_end == nullptr || *pid_parse_end != '\0' || parsed_pid <= 1 ||
+        parsed_pid > static_cast<unsigned long>(std::numeric_limits<pid_t>::max()))
+        return false;
+    manifest.pid = static_cast<pid_t>(parsed_pid);
     const size_t comm_end = text.rfind(") ");
     if (comm_end == std::string::npos) return false;
     std::istringstream fields(text.substr(comm_end + 2));
@@ -183,6 +194,31 @@ static bool fd_link(int fd, std::string& path) {
     if (length < 0) return false;
     path.assign(buffer.data(), static_cast<size_t>(length));
     return true;
+}
+
+static bool read_pidfd_binding(int fd, pid_t expected_pid) {
+    const int info =
+        open(("/proc/self/fdinfo/" + std::to_string(fd)).c_str(), O_RDONLY | O_CLOEXEC);
+    if (info < 0) return false;
+    std::string text;
+    const bool read = read_fd(info, text, 4096);
+    close(info);
+    if (!read) return false;
+    std::istringstream lines(text);
+    std::string key;
+    pid_t pid = -1;
+    bool found = false;
+    while (lines >> key) {
+        if (key == "Pid:") {
+            long parsed = 0;
+            if (found || !(lines >> parsed) || parsed <= 1 || parsed != expected_pid) return false;
+            pid = static_cast<pid_t>(parsed);
+            found = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return found && pid == expected_pid;
 }
 
 static bool decode_manifest(const unsigned char* data,
@@ -272,7 +308,8 @@ static bool validate_role(const RoleBundle& role, std::string& error) {
     }
     if (!fd_fs_readable(role.fds[static_cast<size_t>(FdSlot::Executable)]) ||
         !fd_fs_magic(role.fds[static_cast<size_t>(FdSlot::Netns)], kNsfsMagic) ||
-        !fd_fs_magic(role.fds[static_cast<size_t>(FdSlot::Pidfd)], kPidfdMagic))
+        !fd_fs_magic(role.fds[static_cast<size_t>(FdSlot::Pidfd)], kPidfdMagic) ||
+        !read_pidfd_binding(role.fds[static_cast<size_t>(FdSlot::Pidfd)], m.pid))
         return invalid("fd filesystem type invalid");
 
     struct stat executable{};
@@ -289,8 +326,8 @@ static bool validate_role(const RoleBundle& role, std::string& error) {
     if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Stat)], stat_text, 8192) ||
         !parse_proc_stat(stat_text, observed))
         return invalid("stat content invalid");
-    if (observed.start != m.start || observed.ppid != m.ppid || observed.pgid != m.pgid ||
-        observed.sid != m.sid)
+    if (observed.pid != m.pid || observed.start != m.start || observed.ppid != m.ppid ||
+        observed.pgid != m.pgid || observed.sid != m.sid)
         return invalid("stat manifest mismatch");
     std::string status_text;
     uid_t uid = 0;
@@ -302,6 +339,12 @@ static bool validate_role(const RoleBundle& role, std::string& error) {
     if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Cmdline)], cmdline, 8192) ||
         cmdline.size() != m.argv_length || hash_bytes(cmdline) != m.argv_hash)
         return invalid("cmdline content invalid");
+    RoleManifest stable = m;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Stat)], stat_text, 8192) ||
+        !parse_proc_stat(stat_text, stable) || stable.pid != observed.pid ||
+        stable.start != observed.start || stable.ppid != observed.ppid ||
+        stable.pgid != observed.pgid || stable.sid != observed.sid)
+        return invalid("stat identity was not stable");
     (void)error;
     return true;
 }
@@ -499,7 +542,7 @@ bool send_bundle(int fd,
     size_t at = 0;
     for (const RoleBundle& role : bundle.roles)
         for (int value : role.fds) fds[at++] = value;
-    std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
+    alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
     iovec vector{const_cast<unsigned char*>(wire.data()), wire.size()};
     msghdr message{};
     message.msg_iov = &vector;
@@ -531,7 +574,7 @@ bool receive_bundle(int fd,
         return false;
     }
     std::array<unsigned char, kWireBytes> wire{};
-    std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
+    alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
     iovec vector{wire.data(), wire.size()};
     msghdr message{};
     message.msg_iov = &vector;
@@ -562,7 +605,7 @@ bool receive_bundle(int fd,
             error = "identity bundle frame was truncated before payload completion";
             return false;
         }
-        std::array<unsigned char, CMSG_SPACE(sizeof(int))> extra_control{};
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> extra_control{};
         iovec rest{wire.data() + done, wire.size() - done};
         msghdr rest_message{};
         rest_message.msg_iov = &rest;
@@ -574,6 +617,7 @@ bool receive_bundle(int fd,
         } while (count < 0 && errno == EINTR);
         if (count <= 0 || (rest_message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
             CMSG_FIRSTHDR(&rest_message) != nullptr) {
+            close_rights_in_message(rest_message);
             close_fds(fds);
             error = "identity bundle payload read had EOF/truncation/ancillary data";
             return false;
@@ -584,29 +628,35 @@ bool receive_bundle(int fd,
     // record after it is never silently ignored (the caller may still use the
     // socket in the opposite direction for its ACK).
     pollfd trailing{fd, POLLIN, 0};
-    if (poll(&trailing, 1, 0) < 0 && errno != EINTR) {
+    int trailing_poll;
+    do {
+        trailing_poll = poll(&trailing, 1, 0);
+    } while (trailing_poll < 0 && errno == EINTR);
+    if (trailing_poll < 0) {
         close_fds(fds);
         error = "identity bundle trailing-data poll failed";
         return false;
     }
     if ((trailing.revents & POLLIN) != 0) {
         unsigned char byte = 0;
-        std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
         iovec trailing_vector{&byte, sizeof(byte)};
         msghdr trailing_message{};
         trailing_message.msg_iov = &trailing_vector;
         trailing_message.msg_iovlen = 1;
         trailing_message.msg_control = trailing_control.data();
         trailing_message.msg_controllen = trailing_control.size();
-        const ssize_t trailing_count =
-            recvmsg(fd, &trailing_message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        ssize_t trailing_count;
+        do {
+            trailing_count = recvmsg(fd, &trailing_message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        } while (trailing_count < 0 && errno == EINTR);
         if (trailing_count > 0 || CMSG_FIRSTHDR(&trailing_message) != nullptr) {
             close_rights_in_message(trailing_message);
             close_fds(fds);
             error = "identity bundle had trailing data or ancillary records";
             return false;
         }
-        if (trailing_count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        if (trailing_count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             close_fds(fds);
             error = "identity bundle trailing-data receive failed";
             return false;
