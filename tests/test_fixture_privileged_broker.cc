@@ -3250,7 +3250,9 @@ static MutationDiagnostic live_identity_bundle_mutation_checks(
     if (!diagnostic.success) return diagnostic;
     diagnostic = check("manifest.root.start", rejects([](auto& value) { ++value[1].start; }));
     if (!diagnostic.success) return diagnostic;
-    diagnostic = check("manifest.launcher.start", rejects([](auto& value) { ++value[0].start; }));
+    // Semantic validation has no independent Launcher start source after the
+    // bundle has been received; exercise its explicit nonzero guard here.
+    diagnostic = check("manifest.launcher.start", rejects([](auto& value) { value[0].start = 0; }));
     if (!diagnostic.success) return diagnostic;
     diagnostic = check("manifest.root.netns", rejects([](auto& value) { ++value[1].netns; }));
     if (!diagnostic.success) return diagnostic;

@@ -52,6 +52,23 @@ static std::array<int, kBundleFdCount> flatten(const IdentityBundle& bundle) {
     return result;
 }
 
+static u64 read_wire_u64(const std::vector<unsigned char>& wire, size_t offset) {
+    u64 value = 0;
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        value |= static_cast<u64>(wire[offset + shift / 8]) << shift;
+    return value;
+}
+
+static bool xor_nonzero_wire_u64(std::vector<unsigned char>& wire, size_t offset) {
+    const u64 before = read_wire_u64(wire, offset);
+    for (size_t byte = 0; byte != sizeof(u64); ++byte) {
+        wire[offset + byte] ^= 0x01;
+        if (read_wire_u64(wire, offset) != 0 && read_wire_u64(wire, offset) != before) return true;
+        wire[offset + byte] ^= 0x01;
+    }
+    return false;
+}
+
 static bool send_raw(int fd,
                      const std::vector<unsigned char>& wire,
                      const std::array<int, kBundleFdCount>& fds,
@@ -335,6 +352,29 @@ int main() {
     ok &= check(bad_manifest != wire, "manifest mutation differs");
     ok &= check(receive_fails(bad_manifest, fds, CmsgShape::Exact, bad_manifest.size()),
                 "manifest reserved mutation rejected");
+    // Semantic mutation checks separately require a nonzero start.  These
+    // transport mutations keep that invariant while changing the exact
+    // little-endian start field checked against the retained Stat FD.
+    constexpr size_t kManifestStartOffset = 2 * sizeof(u64);  // role, pid, start
+    const size_t launcher_start_offset = kHeaderBytes + kManifestStartOffset;
+    const size_t root_start_offset = kHeaderBytes + kRoleManifestBytes + kManifestStartOffset;
+    std::vector<unsigned char> bad_launcher_start = wire;
+    const u64 launcher_start = read_wire_u64(bad_launcher_start, launcher_start_offset);
+    ok &= check(xor_nonzero_wire_u64(bad_launcher_start, launcher_start_offset) &&
+                    bad_launcher_start != wire &&
+                    read_wire_u64(bad_launcher_start, launcher_start_offset) != 0 &&
+                    read_wire_u64(bad_launcher_start, launcher_start_offset) != launcher_start,
+                "launcher start wire mutation differs and remains nonzero");
+    ok &= check(receive_fails(bad_launcher_start, fds, CmsgShape::Exact, bad_launcher_start.size()),
+                "launcher start/stat FD mismatch rejected");
+    std::vector<unsigned char> bad_root_start = wire;
+    const u64 root_start = read_wire_u64(bad_root_start, root_start_offset);
+    ok &= check(xor_nonzero_wire_u64(bad_root_start, root_start_offset) && bad_root_start != wire &&
+                    read_wire_u64(bad_root_start, root_start_offset) != 0 &&
+                    read_wire_u64(bad_root_start, root_start_offset) != root_start,
+                "root start wire mutation differs and remains nonzero");
+    ok &= check(receive_fails(bad_root_start, fds, CmsgShape::Exact, bad_root_start.size()),
+                "root start/stat FD mismatch rejected");
     std::vector<int> reordered(fds.begin(), fds.end());
     std::swap(reordered[0], reordered[1]);
     std::array<int, kBundleFdCount> reordered_array{};
