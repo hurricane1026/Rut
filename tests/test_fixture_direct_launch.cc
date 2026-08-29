@@ -183,6 +183,12 @@ bool run_checks(std::string& error) {
     if (!expect(
             !observe_direct(unknown_direct, unknown_stage, reason), "unknown direct stage", error))
         return false;
+    DirectLaunch transient_unknown = make_launch();
+    if (!expect(!observe_direct(transient_unknown, unknown_stage, reason) &&
+                    observe_direct(transient_unknown, sudo, reason),
+                "transient unknown stage followed by exact stage",
+                error))
+        return false;
     DirectLaunch bad_nsenter_credentials = make_launch();
     ProcIdentity caller_nsenter = nsenter_host;
     caller_nsenter.uid = kCallerUid;

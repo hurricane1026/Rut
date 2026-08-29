@@ -90,6 +90,15 @@ static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
                                int signal_number);
+static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int timeout_ms);
+
+enum class DirectWaitDisposition { Reaped, Retry, Error };
+
+static DirectWaitDisposition classify_direct_wait(pid_t waited, pid_t expected, int wait_errno) {
+    if (waited == expected) return DirectWaitDisposition::Reaped;
+    if (waited == 0 || (waited < 0 && wait_errno == EINTR)) return DirectWaitDisposition::Retry;
+    return DirectWaitDisposition::Error;
+}
 
 static bool parse_u64(const char* text, u64& value) {
     if (text == nullptr || *text == '\0') return false;
@@ -246,6 +255,24 @@ static bool pure_protocol_self_checks(std::string& error) {
     duplicate_trace.push_back('X');
     std::vector<unsigned char> short_trace = trace;
     short_trace.pop_back();
+    int release_pipe[2] = {-1, -1};
+    if (pipe2(release_pipe, O_CLOEXEC) != 0) {
+        error = "release-pipe self-check setup failed";
+        return false;
+    }
+    const unsigned char release = 0x4c;
+    const bool socket_helper_rejected = !write_exact(release_pipe[1], &release, 1, 50);
+    const bool pipe_helper_accepted = write_pipe_exact(release_pipe[1], &release, 1, 50);
+    unsigned char received = 0;
+    const bool release_exact = read(release_pipe[0], &received, 1) == 1 && received == release;
+    close(release_pipe[0]);
+    close(release_pipe[1]);
+    const bool wait_decisions =
+        classify_direct_wait(42, 42, 0) == DirectWaitDisposition::Reaped &&
+        classify_direct_wait(0, 42, 0) == DirectWaitDisposition::Retry &&
+        classify_direct_wait(-1, 42, EINTR) == DirectWaitDisposition::Retry &&
+        classify_direct_wait(-1, 42, ECHILD) == DirectWaitDisposition::Error &&
+        classify_direct_wait(-1, 42, ESRCH) == DirectWaitDisposition::Error;
     if (!parse_credentials(credentials, parsed_uid, parsed_gid) || parsed_uid != uid ||
         parsed_gid != gid || !parse_credentials(changed_credentials, changed_uid, changed_gid) ||
         (changed_uid == uid && changed_gid == gid) ||
@@ -253,7 +280,8 @@ static bool pure_protocol_self_checks(std::string& error) {
         parse_credentials(short_credentials, changed_uid, changed_gid) ||
         parse_credentials(root_credentials, changed_uid, changed_gid) ||
         !valid_security_trace(trace) || valid_security_trace(reordered_trace) ||
-        valid_security_trace(duplicate_trace) || valid_security_trace(short_trace)) {
+        valid_security_trace(duplicate_trace) || valid_security_trace(short_trace) ||
+        !socket_helper_rejected || !pipe_helper_accepted || !release_exact || !wait_decisions) {
         error = "credential/security-trace mutation self-check failed";
         return false;
     }
@@ -843,11 +871,16 @@ static bool wait_direct(DirectLaunch& child, int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         const pid_t waited = waitpid(child.anchor.pid, &child.status, WNOHANG);
-        if (waited == child.anchor.pid) {
+        const DirectWaitDisposition disposition =
+            classify_direct_wait(waited, child.anchor.pid, waited < 0 ? errno : 0);
+        if (disposition == DirectWaitDisposition::Reaped) {
             child.reaped = true;
             return true;
         }
-        if (waited < 0 && errno != EINTR) return false;
+        if (disposition == DirectWaitDisposition::Error) {
+            child.reason = "waitpid(direct launch) failed: " + std::string(strerror(errno));
+            return false;
+        }
         (void)poll(nullptr, 0, 10);
     }
     return false;
@@ -951,53 +984,98 @@ static bool bounded_wait_and_signal_self_check(std::string& error) {
     return true;
 }
 
-static bool wait_marker_exec_close(int fd, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    for (;;) {
-        pollfd descriptor{fd, static_cast<short>(POLLIN | POLLHUP), 0};
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   deadline - std::chrono::steady_clock::now())
-                                   .count();
-        if (remaining <= 0) return false;
-        const int rc = poll(&descriptor, 1, static_cast<int>(remaining));
-        if (rc < 0 && errno == EINTR) continue;
-        if (rc <= 0 || (descriptor.revents & (POLLERR | POLLNVAL)) != 0) return false;
-        unsigned char extra = 0;
-        const ssize_t count = read(fd, &extra, 1);
-        if (count == 0) return true;
-        if (count > 0) return false;
-        if (errno != EINTR && errno != EAGAIN) return false;
-    }
-}
-
 static bool stable_proc_identity(pid_t pid, ProcIdentity& identity) {
     ProcIdentity first, second;
     return read_proc(pid, first, false) && read_proc(pid, second, false) &&
            same_process_identity(first, second) && (identity = std::move(second), true);
 }
 
-static void reap_failed_direct(pid_t child, std::optional<DirectLaunch>& launch) {
+static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int timeout_ms) {
+    struct sigaction ignore{};
+    struct sigaction old_action{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &old_action) != 0) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    size_t offset = 0;
+    bool complete = true;
+    while (offset != size) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
+        if (remaining <= 0) {
+            complete = false;
+            break;
+        }
+        pollfd descriptor{fd, POLLOUT, 0};
+        const int polled = poll(&descriptor, 1, static_cast<int>(remaining));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0 || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            complete = false;
+            break;
+        }
+        const ssize_t written = write(fd, data + offset, size - offset);
+        if (written > 0)
+            offset += static_cast<size_t>(written);
+        else if (written < 0 && errno == EINTR)
+            continue;
+        else {
+            complete = false;
+            break;
+        }
+    }
+    (void)sigaction(SIGPIPE, &old_action, nullptr);
+    return complete;
+}
+
+static bool reap_failed_direct(pid_t child, std::optional<DirectLaunch>& launch) {
     int status = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
     while (std::chrono::steady_clock::now() < deadline) {
         const pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child || (waited < 0 && errno != EINTR)) return;
+        const DirectWaitDisposition disposition =
+            classify_direct_wait(waited, child, waited < 0 ? errno : 0);
+        if (disposition == DirectWaitDisposition::Reaped) return true;
+        if (disposition == DirectWaitDisposition::Error) {
+            if (launch)
+                launch->reason =
+                    "waitpid(direct launch cleanup) failed: " + std::string(strerror(errno));
+            return false;
+        }
         (void)poll(nullptr, 0, 10);
     }
     if (launch && launch->current_valid && safe_signal_direct_child(*launch, SIGKILL) &&
         wait_direct(*launch, kCleanupMs))
-        return;
-    // An unreaped directly-owned child PID cannot be reused.  When no exact
-    // allowed stage exists, kill only that PID and never its unvalidated PGID.
-    if (kill(child, SIGKILL) == 0) {
-        const auto kill_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-        while (std::chrono::steady_clock::now() < kill_deadline) {
-            const pid_t waited = waitpid(child, &status, WNOHANG);
-            if (waited == child || (waited < 0 && errno != EINTR)) return;
-            (void)poll(nullptr, 0, 10);
-        }
+        return true;
+    if (launch) {
+        if (launch->reason.empty())
+            launch->reason = "direct launch cleanup timed out without an exact signalable stage";
     }
+    return false;
+}
+
+static bool observe_launch_until_launcher(DirectLaunch& launch,
+                                          int timeout_ms,
+                                          std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::string last_reason = "no stable /proc observation";
+    while (std::chrono::steady_clock::now() < deadline) {
+        ProcIdentity identity;
+        if (stable_proc_identity(launch.anchor.pid, identity)) {
+            std::string reason;
+            if (observe_direct(launch, identity, reason) && launch.current_valid &&
+                launch.current_stage == LaunchStage::Launcher)
+                return true;
+            if (!reason.empty()) last_reason = reason;
+        } else {
+            last_reason = "transient /proc identity was unavailable";
+        }
+        (void)poll(nullptr, 0, 5);
+    }
+    error = "no stable exact sudo/nsenter/launcher stage observed within " +
+            std::to_string(timeout_ms) + "ms (last observation: " + last_reason + ")";
+    launch.reason = error;
+    return false;
 }
 
 static bool launch_sudo(const std::string& sudo_path,
@@ -1085,13 +1163,13 @@ static bool launch_sudo(const std::string& sudo_path,
             else
                 _exit(125);
         }
+        close(marker_pipe[1]);
         unsigned char release = 0;
         ssize_t count;
         do {
             count = read(release_pipe[0], &release, 1);
         } while (count < 0 && errno == EINTR);
         if (count != 1 || release != 0x4c) _exit(125);
-        close(release_pipe[0]);
         execl(sudo_path.c_str(),
               sudo_path.c_str(),
               "-n",
@@ -1129,31 +1207,21 @@ static bool launch_sudo(const std::string& sudo_path,
             allowed,
             true);
     const unsigned char release = 0x4c;
-    const bool released = anchor_exact && write_exact(release_pipe[1], &release, 1, kHandshakeMs);
+    const bool released =
+        anchor_exact && write_pipe_exact(release_pipe[1], &release, 1, kHandshakeMs);
     close(release_pipe[1]);
-    const bool exec_closed = released && wait_marker_exec_close(marker_pipe[0], kHandshakeMs);
     close(marker_pipe[0]);
-    if (!anchor_exact || !exec_closed) {
+    if (!anchor_exact || !released) {
         error = !marker_exact   ? "missing or invalid child launch marker"
                 : !anchor_exact ? "fork/marker immutable /proc anchor was not exact"
-                                : "CLOEXEC marker did not close on exact sudo exec";
-        reap_failed_direct(child, launch);
+                                : "release pipe write failed before the exact launch gate";
+        if (!reap_failed_direct(child, launch) && launch)
+            error += "; direct launch cleanup failed: " + direct_launch_diagnostic(*launch);
         return false;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    do {
-        ProcIdentity identity;
-        if (stable_proc_identity(child, identity)) {
-            std::string reason;
-            if (observe_direct(*launch, identity, reason)) return true;
-            error = reason;
-            reap_failed_direct(child, launch);
-            return false;
-        }
-        (void)poll(nullptr, 0, 5);
-    } while (std::chrono::steady_clock::now() < deadline);
-    error = "no stable exact sudo/nsenter/launcher stage observed within 250ms";
-    reap_failed_direct(child, launch);
+    if (launch && observe_launch_until_launcher(*launch, 250, error)) return true;
+    if (launch && !reap_failed_direct(child, launch))
+        error += "; direct launch cleanup failed: " + direct_launch_diagnostic(*launch);
     return false;
 }
 
