@@ -678,33 +678,60 @@ void IdentityBundle::close() {
 }
 
 bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error) {
+    OpenRoleFailure ignored;
+    return open_role(pid, role, role_bundle, ignored, error);
+}
+
+bool open_role(
+    pid_t pid, Role role, RoleBundle& role_bundle, OpenRoleFailure& failure, std::string& error) {
     role_bundle.close();
+    failure = OpenRoleFailure{};
     role_bundle.manifest = RoleManifest{};
     role_bundle.manifest.role = role;
     role_bundle.manifest.pid = pid;
     if (pid <= 1) {
+        failure.slot = FdSlot::Unknown;
+        failure.phase = "pid_validate";
+        failure.operation = "none";
+        failure.error_number = 0;
         error = "identity bundle pid was unsafe";
         return false;
     }
     const std::string prefix = "/proc/" + std::to_string(pid);
-    if (!open_cloexec(prefix + "/stat", O_RDONLY, role_bundle.fds[0]) ||
-        !open_cloexec(prefix + "/status", O_RDONLY, role_bundle.fds[1]) ||
-        !open_cloexec(prefix + "/cmdline", O_RDONLY, role_bundle.fds[2]) ||
-        !open_cloexec(prefix + "/exe", O_PATH, role_bundle.fds[3]) ||
-        !open_cloexec(prefix + "/ns/net", O_PATH, role_bundle.fds[4])) {
+    const auto open_slot = [&](FdSlot slot, const std::string& path, int flags) {
+        const size_t index = static_cast<size_t>(slot);
+        if (open_cloexec(path, flags, role_bundle.fds[index])) return true;
+        failure.slot = slot;
+        failure.phase = "open";
+        failure.operation = "open";
+        failure.error_number = errno;
         role_bundle.close();
         error = "identity bundle proc fd open failed";
         return false;
-    }
+    };
+    if (!open_slot(FdSlot::Stat, prefix + "/stat", O_RDONLY) ||
+        !open_slot(FdSlot::Status, prefix + "/status", O_RDONLY) ||
+        !open_slot(FdSlot::Cmdline, prefix + "/cmdline", O_RDONLY) ||
+        !open_slot(FdSlot::Executable, prefix + "/exe", O_PATH) ||
+        !open_slot(FdSlot::Netns, prefix + "/ns/net", O_PATH))
+        return false;
 #ifdef SYS_pidfd_open
     const long raw_pidfd = syscall(SYS_pidfd_open, pid, 0);
     if (raw_pidfd < 0 || raw_pidfd > std::numeric_limits<int>::max()) {
+        failure.slot = FdSlot::Pidfd;
+        failure.phase = "open";
+        failure.operation = "pidfd_open";
+        failure.error_number = raw_pidfd > std::numeric_limits<int>::max() ? EOVERFLOW : errno;
         role_bundle.close();
         error = "identity bundle pidfd open failed";
         return false;
     }
     role_bundle.fds[5] = static_cast<int>(raw_pidfd);
 #else
+    failure.slot = FdSlot::Pidfd;
+    failure.phase = "open";
+    failure.operation = "pidfd_open";
+    failure.error_number = ENOSYS;
     role_bundle.close();
     error = "identity bundle pidfd is unavailable";
     return false;
@@ -712,18 +739,41 @@ bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error
     std::string stat_text;
     std::string status_text;
     std::string cmdline;
-    if (!read_fd(role_bundle.fds[0], stat_text, 8192) ||
-        !parse_proc_stat(stat_text, role_bundle.manifest) ||
-        !read_fd(role_bundle.fds[1], status_text, 16384) ||
-        !parse_status_ids(status_text, role_bundle.manifest.uid, role_bundle.manifest.gid) ||
-        !read_fd(role_bundle.fds[2], cmdline, 8192)) {
+    const auto manifest_failure = [&](FdSlot slot, const char* phase, int number) {
+        failure.slot = slot;
+        failure.phase = "manifest";
+        failure.operation = phase;
+        failure.error_number = number;
         role_bundle.close();
         error = "identity bundle proc manifest parse failed";
         return false;
-    }
+    };
+    if (!read_fd(role_bundle.fds[0], stat_text, 8192))
+        return manifest_failure(FdSlot::Stat, "read", errno);
+    if (!parse_proc_stat(stat_text, role_bundle.manifest))
+        return manifest_failure(FdSlot::Stat, "parse", 0);
+    if (!read_fd(role_bundle.fds[1], status_text, 16384))
+        return manifest_failure(FdSlot::Status, "read", errno);
+    if (!parse_status_ids(status_text, role_bundle.manifest.uid, role_bundle.manifest.gid))
+        return manifest_failure(FdSlot::Status, "parse", 0);
+    if (!read_fd(role_bundle.fds[2], cmdline, 8192))
+        return manifest_failure(FdSlot::Cmdline, "read", errno);
     struct stat executable{};
     struct stat netns{};
-    if (fstat(role_bundle.fds[3], &executable) != 0 || fstat(role_bundle.fds[4], &netns) != 0) {
+    if (fstat(role_bundle.fds[3], &executable) != 0) {
+        failure.slot = FdSlot::Executable;
+        failure.phase = "manifest";
+        failure.operation = "fstat";
+        failure.error_number = errno;
+        role_bundle.close();
+        error = "identity bundle executable/netns stat failed";
+        return false;
+    }
+    if (fstat(role_bundle.fds[4], &netns) != 0) {
+        failure.slot = FdSlot::Netns;
+        failure.phase = "manifest";
+        failure.operation = "fstat";
+        failure.error_number = errno;
         role_bundle.close();
         error = "identity bundle executable/netns stat failed";
         return false;
@@ -734,6 +784,10 @@ bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error
     role_bundle.manifest.argv_length = cmdline.size();
     role_bundle.manifest.argv_hash = hash_bytes(cmdline);
     if (!validate_role(role_bundle, error)) {
+        failure.slot = FdSlot::Unknown;
+        failure.phase = "validate";
+        failure.operation = "none";
+        failure.error_number = 0;
         role_bundle.close();
         return false;
     }

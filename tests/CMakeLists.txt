@@ -539,6 +539,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
+        fixture_ancestry_bundle
         fixture_direct_launch
         fixture_identity_bundle
         fixture_worker_protocol

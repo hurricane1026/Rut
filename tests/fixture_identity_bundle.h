@@ -45,6 +45,7 @@ enum class FdSlot : size_t {
     Executable = 3,
     Netns = 4,
     Pidfd = 5,
+    Unknown = kFdsPerRole,
 };
 
 struct RoleManifest {
@@ -96,6 +97,15 @@ struct ProcessIdentityEvidence {
     bool pidfd_live = false;
 };
 
+// Safe, bounded diagnostics for callers that must identify the first failed
+// kernel descriptor without exposing paths, argv, or other process content.
+struct OpenRoleFailure {
+    FdSlot slot = FdSlot::Unknown;
+    std::string phase;
+    std::string operation;
+    int error_number = 0;
+};
+
 struct RoleBundle {
     RoleManifest manifest;
     std::array<int, kFdsPerRole> fds{};
@@ -138,6 +148,8 @@ private:
 };
 
 bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error);
+bool open_role(
+    pid_t pid, Role role, RoleBundle& role_bundle, OpenRoleFailure& failure, std::string& error);
 bool adopt_role(Role role,
                 std::array<int, kFdsPerRole>& inherited_fds,
                 RoleBundle& role_bundle,

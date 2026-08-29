@@ -470,6 +470,34 @@ int main() {
                   strict_evidence.cap_eff == 0xabcdef0123456789ULL &&
                   strict_evidence.cap_bnd == 0x000001ffffffffffULL && strict_evidence.cap_amb == 2,
               "strict dropped status evidence retains every field");
+    const auto owns_no_fds = [](const RoleBundle& role) {
+        return std::all_of(role.fds.begin(), role.fds.end(), [](int fd) { return fd < 0; });
+    };
+    RoleBundle failed_role;
+    OpenRoleFailure open_failure;
+    std::string open_failure_error;
+    ok &= check(!open_role(1, Role::Ancestry, failed_role, open_failure, open_failure_error) &&
+                    open_failure.slot == FdSlot::Unknown && open_failure.phase == "pid_validate" &&
+                    open_failure.operation == "none" && open_failure.error_number == 0 &&
+                    owns_no_fds(failed_role),
+                "unsafe PID open diagnostic is aggregate and owns no FDs");
+    const pid_t vanished = fork();
+    if (!check(vanished >= 0, "vanished child fork")) return 1;
+    if (vanished == 0) _exit(0);
+    int vanished_status = 0;
+    pid_t vanished_waited;
+    do {
+        vanished_waited = waitpid(vanished, &vanished_status, 0);
+    } while (vanished_waited < 0 && errno == EINTR);
+    open_failure = OpenRoleFailure{};
+    open_failure_error.clear();
+    ok &= check(
+        vanished_waited == vanished &&
+            !open_role(vanished, Role::Ancestry, failed_role, open_failure, open_failure_error) &&
+            open_failure.slot == FdSlot::Stat && open_failure.phase == "open" &&
+            open_failure.operation == "open" && open_failure.error_number != 0 &&
+            owns_no_fds(failed_role),
+        "reaped PID reports first stat open failure and owns no FDs");
     const std::string empty_groups_status =
         replace_once(strict_status, "Groups:\t31 32 31", "Groups:\t");
     const std::string nnp_zero_status =
