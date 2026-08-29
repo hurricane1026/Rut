@@ -49353,6 +49353,786 @@ static bool run_proxy_hide_header_source_self_checks(std::string& error) {
     return true;
 }
 
+// #373 Stage 4b1 is intentionally a one-side witness.  Keep its observation
+// independent from the broad static-query oracle: this is the exact root
+// proxy/header slice and has no access sink or nginx runtime hook.
+struct ProxyHideHeaderGeneratedObservation {
+    std::string temp_path;
+    std::string fragment;
+    std::string source;
+    std::string source_path;
+    std::string runtime_log_path;
+    std::string access_probe_path;
+    std::string rut_executable;
+    std::string process_identity;
+    std::vector<std::string> process_argv;
+    pid_t child_pid = -1;
+    std::string order;
+    std::string poison;
+    std::string runtime_log;
+    std::vector<char> response;
+    std::vector<std::vector<char>> upstream_history;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 sends = 0u;
+    u32 response_peer_close_count = 0u;
+    u64 response_sent_ns = 0u;
+    u64 response_peer_closed_ns = 0u;
+    bool response_peer_closed = false;
+    bool response_peer_unexpected_data = false;
+    bool response_peer_observation_failed = false;
+    bool eof = false;
+    bool access_enoent_before = false;
+    bool access_enoent_after = false;
+    bool access_enoent_final = false;
+    bool child_live_after_poison = false;
+    bool stable_window = false;
+    bool source_poisoned = false;
+    bool exited_zero = false;
+};
+
+static bool proxy_hide_header_access_is_absent(const std::string& path, std::string& error) {
+    errno = 0;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        error = "#373 generated side disabled-access probe unexpectedly appeared";
+        return false;
+    }
+    if (errno != ENOENT) {
+        error = "#373 generated side disabled-access probe was not ENOENT";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_proxy_hide_header_generated_observation(
+    const ProxyHideHeaderGeneratedObservation& observation, std::string& error) {
+    const std::string expected_poison = "destroyed-after-373-" + observation.order + "-load\n";
+    const std::string expected_listener =
+        "Listening on port " + std::to_string(observation.frontend_port) + " with 1 shard(s)";
+    const bool identities_valid =
+        !observation.temp_path.empty() && !observation.source_path.empty() &&
+        !observation.runtime_log_path.empty() && !observation.access_probe_path.empty() &&
+        !observation.rut_executable.empty() && observation.rut_executable.front() == '/' &&
+        observation.child_pid > 0 &&
+        observation.process_identity ==
+            observation.temp_path + "/rut-pid-" + std::to_string(observation.child_pid) &&
+        observation.source_path == observation.temp_path + "/generated.rut" &&
+        observation.runtime_log_path == observation.temp_path + "/rut.log" &&
+        observation.access_probe_path == observation.temp_path + "/rut-access.log" &&
+        observation.process_argv.size() == 7u &&
+        observation.process_argv[0] == observation.rut_executable &&
+        observation.process_argv[1] == observation.source_path &&
+        observation.process_argv[2] == "--shards" && observation.process_argv[3] == "1" &&
+        observation.process_argv[4] == "--no-pin" && observation.process_argv[5] == "--drain" &&
+        observation.process_argv[6] == "0" &&
+        std::find(observation.process_argv.begin(),
+                  observation.process_argv.end(),
+                  "--access-log") == observation.process_argv.end();
+    if (observation.frontend_port < 1024u || observation.frontend_port > 9999u ||
+        observation.backend_port < 1024u || observation.backend_port > 9999u ||
+        observation.frontend_port == observation.backend_port ||
+        (observation.order != "listen-first" && observation.order != "location-first") ||
+        observation.fragment !=
+            make_static_query_proxy_fragment(observation.frontend_port,
+                                             observation.backend_port,
+                                             observation.order == "listen-first",
+                                             kProxyHideHeaderOracleProfile) ||
+        !identities_valid ||
+        !validate_proxy_hide_header_generated_source(
+            observation.source, observation.frontend_port, observation.backend_port, error) ||
+        observation.poison != expected_poison || !observation.source_poisoned ||
+        !observation.child_live_after_poison || !observation.access_enoent_before ||
+        !observation.access_enoent_after || !observation.access_enoent_final ||
+        observation.response.size() != 176u || !observation.eof || observation.accepted != 1u ||
+        observation.requests != 1u || observation.sends != 1u ||
+        observation.response_peer_close_count != 1u || observation.upstream_history.size() != 1u ||
+        observation.response_sent_ns == 0u ||
+        observation.response_peer_closed_ns < observation.response_sent_ns ||
+        observation.response_peer_closed_ns - observation.response_sent_ns > 2'000'000'000ull ||
+        !observation.response_peer_closed || observation.response_peer_unexpected_data ||
+        observation.response_peer_observation_failed || !observation.stable_window ||
+        !observation.exited_zero) {
+        if (error.empty()) error = "#373 generated observation failed lifecycle/inventory checks";
+        return false;
+    }
+    const std::string request = static_query_proxy_request("/", kProxyHideHeaderOracleProfile);
+    const std::vector<char> expected_upstream = static_query_expected_upstream(
+        "/", observation.backend_port, kProxyHideHeaderOracleProfile);
+    std::vector<char> normalized = observation.response;
+    const std::string raw(observation.response.begin(), observation.response.end());
+    const std::string normalized_text(kProxyHideHeaderResponseNormalized);
+    const std::string upstream(observation.upstream_history[0].begin(),
+                               observation.upstream_history[0].end());
+    if (request.size() != 85u || raw.find("X-Compat-Hidden:") != std::string::npos ||
+        raw.find("x-compat-hidden:") != std::string::npos ||
+        raw.find("Server: origin\r\n") != std::string::npos ||
+        raw.find("Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n") != std::string::npos ||
+        !normalize_date(normalized) ||
+        std::string(normalized.begin(), normalized.end()) != normalized_text ||
+        count_text(raw, "X-Compat-Visible: keep\r\n") != 1u ||
+        count_text(raw, "Set-Cookie: a=1\r\n") != 1u ||
+        count_text(raw, "Set-Cookie: b=2\r\n") != 1u ||
+        raw.find("X-Compat-Visible: keep\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n") ==
+            std::string::npos ||
+        observation.upstream_history[0] != expected_upstream || upstream.size() != 66u ||
+        count_text(upstream,
+                   "Host: 127.0.0.1:" + std::to_string(observation.backend_port) + "\r\n") != 1u ||
+        count_text(upstream, "X-Dupe: one\r\n") != 1u ||
+        count_text(upstream, "X-Dupe: two\r\n") != 1u ||
+        upstream.find("X-Dupe: one\r\nX-Dupe: two\r\n") == std::string::npos ||
+        upstream.find("hidden.example") != std::string::npos ||
+        upstream.find("Connection:") != std::string::npos ||
+        upstream.find("Content-Length:") != std::string::npos ||
+        upstream.find("Transfer-Encoding:") != std::string::npos ||
+        upstream.rfind("\r\n\r\n") != upstream.size() - 4u) {
+        error = "#373 generated observation changed exact request/response header semantics";
+        return false;
+    }
+    const std::string listener = expected_listener;
+    if (!parse_exact_return204_runtime_log(
+            observation.runtime_log, observation.source_path, listener, error)) {
+        error += " actual=" + observation.runtime_log;
+        return false;
+    }
+    return true;
+}
+
+static bool capture_proxy_hide_header_generated_side(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const char* rut_path,
+    bool listen_first,
+    ProxyHideHeaderGeneratedObservation& observation,
+    std::string& error,
+    int* frontend_reservation,
+    int* backend_reservation) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+        frontend_reservation == nullptr || backend_reservation == nullptr ||
+        !validate_held_loopback_port(
+            *frontend_reservation, frontend_port, "#373 generated frontend handoff", error) ||
+        !validate_held_loopback_port(
+            *backend_reservation, backend_port, "#373 generated backend handoff", error)) {
+        if (error.empty()) error = "#373 generated side requires executable and held P4 ports";
+        return false;
+    }
+    observation = ProxyHideHeaderGeneratedObservation{};
+    observation.temp_path = temp.path;
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+    observation.source_path = temp.source;
+    observation.runtime_log_path = temp.rut_log;
+    observation.access_probe_path = temp.rut_access_log;
+    observation.rut_executable = rut_path;
+    observation.order = listen_first ? "listen-first" : "location-first";
+    observation.fragment = make_static_query_proxy_fragment(
+        frontend_port, backend_port, listen_first, kProxyHideHeaderOracleProfile);
+
+    // Parse and lower the borrowed fragment, then destroy both borrowed input
+    // and lower-buffer ownership before persistence.  Stage 4a's exact source
+    // validator remains the authority for the 5366-byte output.
+    {
+        std::string borrowed = observation.fragment;
+        const auto parsed = rut::nginx::parse({borrowed.data(), static_cast<u32>(borrowed.size())});
+        if (!parsed) {
+            error = "#373 generated side failed genuine nginx parsing";
+            return false;
+        }
+        auto lowered = rut::nginx::lower_to_rut(parsed.value());
+        if (!lowered) {
+            error = "#373 generated side failed genuine nginx lowering";
+            return false;
+        }
+        if (lowered.value().len == 0u || lowered.value().len >= rut::nginx::RutSource::kCapacity ||
+            lowered.value().data[lowered.value().len] != '\0') {
+            error = "#373 generated side lowering lacked a bounded terminal NUL";
+            return false;
+        }
+        observation.source.assign(lowered.value().data, lowered.value().len);
+        if (!validate_proxy_hide_header_generated_source(
+                observation.source, frontend_port, backend_port, error))
+            return false;
+        std::fill(borrowed.begin(), borrowed.end(), 'F');
+        std::fill(lowered.value().data, lowered.value().data + lowered.value().len, 'L');
+        if (!std::all_of(borrowed.begin(), borrowed.end(), [](char byte) { return byte == 'F'; }) ||
+            !std::all_of(lowered.value().data,
+                         lowered.value().data + lowered.value().len,
+                         [](char byte) { return byte == 'L'; })) {
+            error = "#373 generated side ownership poison did not cover every intended byte";
+            return false;
+        }
+        if (!validate_proxy_hide_header_generated_source(
+                observation.source, frontend_port, backend_port, error))
+            return false;
+    }
+    if (!write_file(temp.source, observation.source.data(), observation.source.size())) {
+        error = "#373 generated side could not persist ordinary source";
+        return false;
+    }
+    std::string persisted;
+    if (!read_exact_return204_log(
+            temp.source, "#373 persisted generated source", persisted, error) ||
+        persisted != observation.source ||
+        !validate_proxy_hide_header_generated_source(persisted, frontend_port, backend_port, error))
+        return false;
+    if (!proxy_hide_header_access_is_absent(temp.rut_access_log, error)) return false;
+    observation.access_enoent_before = true;
+
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder backend;
+    RecorderGuard backend_guard{&backend};
+    backend.wait_response_peer_close = true;
+    backend.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            backend_reservation, backend_port, "#373 generated Recorder bind", error) ||
+        !backend.setup(backend_port,
+                       1u,
+                       kProxyHideHeaderOriginResponse,
+                       sizeof(kProxyHideHeaderOriginResponse) - 1u)) {
+        if (error.empty()) error = "#373 generated Recorder could not bind held backend";
+        return false;
+    }
+    const auto recorder_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!backend.running.load(std::memory_order_acquire) ||
+            !backend.thread_alive.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < recorder_deadline)
+        usleep(1000);
+    if (!backend.running.load(std::memory_order_acquire) ||
+        !backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire)) {
+        error = "#373 generated Recorder was not live before frontend handoff";
+        return false;
+    }
+    observation.process_argv = {rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"};
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            frontend_reservation, frontend_port, "#373 generated public bind", error) ||
+        !spawn_child(observation.process_argv, temp.rut_log, runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "#373 generated RUT failed before readiness";
+        return false;
+    }
+    observation.process_identity =
+        observation.temp_path + "/rut-pid-" + std::to_string(runtime.child.pid);
+    observation.child_pid = runtime.child.pid;
+    const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+    const std::string listener =
+        "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+            !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log, listener.c_str())) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#373 generated RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!log_contains(temp.rut_log, loaded.c_str()) ||
+        !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+        !log_contains(temp.rut_log, listener.c_str())) {
+        error = "#373 generated RUT lacked exact public io_uring readiness";
+        return false;
+    }
+    const std::string poison = "destroyed-after-373-" + observation.order + "-load\n";
+    std::string readback;
+    if (!write_file(temp.source, poison.data(), poison.size()) ||
+        !read_exact_return204_log(temp.source, "#373 poisoned generated source", readback, error) ||
+        readback != poison || poll_child(runtime.child)) {
+        error = "#373 generated source poison/readback did not preserve live child";
+        return false;
+    }
+    observation.poison = readback;
+    observation.source_poisoned = true;
+    observation.child_live_after_poison = true;
+    if (!proxy_hide_header_access_is_absent(temp.rut_access_log, error)) return false;
+    observation.access_enoent_after = true;
+    const auto live = [&]() {
+        return !poll_child(runtime.child) && backend.running.load(std::memory_order_acquire) &&
+               backend.thread_alive.load(std::memory_order_acquire) &&
+               !backend.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto quiet_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < quiet_deadline) {
+        if (!live() || backend.accepted.load(std::memory_order_acquire) != 0u ||
+            backend.requests.load(std::memory_order_acquire) != 0u ||
+            backend.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !proxy_hide_header_access_is_absent(temp.rut_access_log, error)) {
+            if (error.empty()) error = "#373 generated pre-request window was not quiet";
+            return false;
+        }
+        usleep(5000);
+    }
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    ClientGuard client{connect_once(frontend_port)};
+    if (client.fd < 0 ||
+        !send_all(
+            client.fd, kProxyHideHeaderClientRequest, sizeof(kProxyHideHeaderClientRequest) - 1u) ||
+        !read_response(client.fd, observation.response, error) || !read_eof(client.fd, error)) {
+        error = "#373 generated exact request/response/EOF failed";
+        return false;
+    }
+    observation.eof = true;
+    close(client.fd);
+    client.fd = -1;
+    if (!wait_for_live_complete_origin_episode(backend, runtime.child, "#373 generated RUT", error))
+        return false;
+    observation.response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+    observation.response_peer_closed_ns =
+        backend.response_peer_closed_ns.load(std::memory_order_acquire);
+    observation.response_peer_close_count =
+        backend.response_peer_close_count.load(std::memory_order_acquire);
+    observation.response_peer_closed = backend.response_peer_closed.load(std::memory_order_acquire);
+    observation.response_peer_unexpected_data =
+        backend.response_peer_unexpected_data.load(std::memory_order_acquire);
+    observation.response_peer_observation_failed =
+        backend.response_peer_observation_failed.load(std::memory_order_acquire);
+    if (observation.response_peer_close_count != 1u) {
+        error = "#373 generated side did not observe exactly one live origin FIN";
+        return false;
+    }
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        if (!live() || backend.accepted.load(std::memory_order_acquire) != 1u ||
+            backend.requests.load(std::memory_order_acquire) != 1u ||
+            backend.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            backend.response_sent_ns.load(std::memory_order_acquire) !=
+                observation.response_sent_ns ||
+            backend.response_peer_closed_ns.load(std::memory_order_acquire) !=
+                observation.response_peer_closed_ns ||
+            backend.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !proxy_hide_header_access_is_absent(temp.rut_access_log, error)) {
+            if (error.empty()) error = "#373 generated live evidence was not stable";
+            return false;
+        }
+        usleep(5000);
+    }
+    observation.stable_window = true;
+    if (!stop_child(runtime.child) || !runtime.child.status_valid ||
+        !WIFEXITED(runtime.child.status) || WEXITSTATUS(runtime.child.status) != 0) {
+        error = "#373 generated RUT did not exit controlled with status 0";
+        return false;
+    }
+    observation.exited_zero = true;
+    if (!proxy_hide_header_access_is_absent(temp.rut_access_log, error)) return false;
+    observation.access_enoent_final = true;
+    backend.stop();
+    backend_guard.recorder = nullptr;
+    observation.accepted = backend.accepted.load(std::memory_order_acquire);
+    observation.requests = backend.requests.load(std::memory_order_acquire);
+    observation.sends = backend.response_send_all_calls.load(std::memory_order_acquire);
+    observation.upstream_history = backend.history;
+    observation.response_peer_close_count =
+        backend.response_peer_close_count.load(std::memory_order_acquire);
+    if (backend.thread_alive.load(std::memory_order_acquire) ||
+        backend.listener_failed.load(std::memory_order_acquire) ||
+        observation.response_peer_close_count != 1u ||
+        !backend.response_send_succeeded.load(std::memory_order_acquire) ||
+        !backend.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !backend.response_connection_closed.load(std::memory_order_acquire) ||
+        !read_exact_return204_log(
+            temp.rut_log, "#373 generated runtime log", observation.runtime_log, error))
+        return false;
+    return validate_proxy_hide_header_generated_observation(observation, error);
+}
+
+static bool run_proxy_hide_header_generated_observation_self_checks(
+    const ProxyHideHeaderGeneratedObservation& baseline, std::string& error) {
+    if (!validate_proxy_hide_header_generated_observation(baseline, error)) return false;
+    const auto rejects = [&](ProxyHideHeaderGeneratedObservation candidate,
+                             const char* field,
+                             bool differs,
+                             const char* label) {
+        if (!differs) {
+            error = std::string("#373 observation mutation did not change ") + field + ": " + label;
+            return false;
+        }
+        std::string detail;
+        if (validate_proxy_hide_header_generated_observation(candidate, detail)) {
+            error = std::string("#373 observation mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    auto candidate = baseline;
+    candidate.response[100] = 'X';
+    if (!rejects(
+            candidate, "response", candidate.response != baseline.response, "wire hidden leakage"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.response.begin(), candidate.response.end());
+        const size_t at = text.find("X-Compat-Visible: keep");
+        if (at == std::string::npos) {
+            error = "#373 visible-header mutation fixture was absent";
+            return false;
+        }
+        text.replace(at, strlen("X-Compat-Visible: keep"), "X-Compat-Visible: drop");
+        candidate.response.assign(text.begin(), text.end());
+    }
+    if (!rejects(
+            candidate, "response", candidate.response != baseline.response, "visible-header value"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.response.begin(), candidate.response.end());
+        const std::string cookies = "Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n";
+        const size_t at = text.find(cookies);
+        if (at == std::string::npos) {
+            error = "#373 cookie-order mutation fixture was absent";
+            return false;
+        }
+        text.replace(at, cookies.size(), "Set-Cookie: b=2\r\nSet-Cookie: a=1\r\n");
+        candidate.response.assign(text.begin(), text.end());
+    }
+    if (!rejects(candidate, "response", candidate.response != baseline.response, "cookie order"))
+        return false;
+    candidate = baseline;
+    candidate.response.pop_back();
+    if (!rejects(candidate, "response", candidate.response != baseline.response, "wire length"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.upstream_history[0].begin(),
+                         candidate.upstream_history[0].end());
+        const std::string duplicate_order = "X-Dupe: one\r\nX-Dupe: two\r\n";
+        const size_t at = text.find(duplicate_order);
+        if (at == std::string::npos) {
+            error = "#373 upstream duplicate-order mutation fixture was absent";
+            return false;
+        }
+        text.replace(at, duplicate_order.size(), "X-Dupe: two\r\nX-Dupe: one\r\n");
+        candidate.upstream_history[0].assign(text.begin(), text.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream duplicate order"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.upstream_history[0].begin(),
+                         candidate.upstream_history[0].end());
+        const size_t at = text.find("X-Dupe: one\r\n");
+        if (at == std::string::npos) return false;
+        text.replace(at, strlen("X-Dupe: one\r\n"), "X-Dupe: xxx\r\n");
+        candidate.upstream_history[0].assign(text.begin(), text.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream X-Dupe value"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.upstream_history[0].begin(),
+                         candidate.upstream_history[0].end());
+        const std::string host =
+            "Host: 127.0.0.1:" + std::to_string(baseline.backend_port) + "\r\n";
+        const size_t at = text.find(host);
+        if (at == std::string::npos) {
+            error = "#373 upstream Host mutation fixture was absent";
+            return false;
+        }
+        const u16 alternate = baseline.backend_port == 9999u ? 9998u : baseline.backend_port + 1u;
+        text.replace(at, host.size(), "Host: 127.0.0.1:" + std::to_string(alternate) + "\r\n");
+        candidate.upstream_history[0].assign(text.begin(), text.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream Host/request"))
+        return false;
+    candidate = baseline;
+    {
+        std::string text(candidate.upstream_history[0].begin(),
+                         candidate.upstream_history[0].end());
+        const size_t at = text.find("X-Dupe: one");
+        if (at == std::string::npos) {
+            error = "#373 upstream-Connection mutation fixture was absent";
+            return false;
+        }
+        text.replace(at, strlen("X-Dupe: one"), "Connection: ");
+        candidate.upstream_history[0].assign(text.begin(), text.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream Connection"))
+        return false;
+    candidate = baseline;
+    candidate.requests = 2u;
+    if (!rejects(candidate, "requests", candidate.requests != baseline.requests, "upstream count"))
+        return false;
+    candidate = baseline;
+    candidate.response_peer_closed_ns += 2'000'000'001ull;
+    if (!rejects(candidate,
+                 "response_peer_closed_ns",
+                 candidate.response_peer_closed_ns != baseline.response_peer_closed_ns,
+                 "FIN timing"))
+        return false;
+    candidate = baseline;
+    candidate.response_peer_unexpected_data = true;
+    if (!rejects(candidate,
+                 "response_peer_unexpected_data",
+                 candidate.response_peer_unexpected_data != baseline.response_peer_unexpected_data,
+                 "late data/failure"))
+        return false;
+    candidate = baseline;
+    candidate.access_enoent_final = false;
+    if (!rejects(candidate,
+                 "access_enoent_final",
+                 candidate.access_enoent_final != baseline.access_enoent_final,
+                 "access appearance"))
+        return false;
+    candidate = baseline;
+    candidate.child_live_after_poison = false;
+    if (!rejects(candidate,
+                 "child_live_after_poison",
+                 candidate.child_live_after_poison != baseline.child_live_after_poison,
+                 "poison liveness"))
+        return false;
+    candidate = baseline;
+    candidate.runtime_log += "fatal\n";
+    if (!rejects(candidate,
+                 "runtime_log",
+                 candidate.runtime_log != baseline.runtime_log,
+                 "lifecycle corruption"))
+        return false;
+    const auto replace_response = [&](const std::string& from, const std::string& to) {
+        candidate = baseline;
+        std::string text(candidate.response.begin(), candidate.response.end());
+        const size_t at = text.find(from);
+        if (at == std::string::npos || from.size() != to.size()) return false;
+        text.replace(at, from.size(), to);
+        candidate.response.assign(text.begin(), text.end());
+        return true;
+    };
+    if (!replace_response("X-Compat-Visible: keep\r\n", "X-Compat-Hidden: keep \r\n") ||
+        !rejects(candidate,
+                 "response",
+                 candidate.response != baseline.response,
+                 "literal uppercase hidden leakage"))
+        return false;
+    if (!replace_response("X-Compat-Visible: keep\r\n", "x-compat-hidden: keep \r\n") ||
+        !rejects(candidate,
+                 "response",
+                 candidate.response != baseline.response,
+                 "literal lowercase hidden leakage"))
+        return false;
+    if (!replace_response("X-Compat-Visible: keep\r\n", "X-Removed-Head: xxxxxx\r\n") ||
+        !rejects(candidate,
+                 "response",
+                 candidate.response != baseline.response,
+                 "visible header removal"))
+        return false;
+    if (!replace_response("Set-Cookie: a=1\r\n", "X-Removed: xxxx\r\n") ||
+        !rejects(candidate, "response", candidate.response != baseline.response, "cookie removal"))
+        return false;
+    for (const char* field : {"accepted", "requests", "sends"}) {
+        for (const u32 value : {0u, 2u}) {
+            candidate = baseline;
+            if (strcmp(field, "accepted") == 0) candidate.accepted = value;
+            if (strcmp(field, "requests") == 0) candidate.requests = value;
+            if (strcmp(field, "sends") == 0) candidate.sends = value;
+            const std::string label = std::string(field) + "=" + std::to_string(value);
+            const bool differs =
+                (strcmp(field, "accepted") == 0 && candidate.accepted != baseline.accepted) ||
+                (strcmp(field, "requests") == 0 && candidate.requests != baseline.requests) ||
+                (strcmp(field, "sends") == 0 && candidate.sends != baseline.sends);
+            if (!rejects(candidate, field, differs, label.c_str())) return false;
+        }
+    }
+    candidate = baseline;
+    candidate.upstream_history.clear();
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream history empty"))
+        return false;
+    candidate = baseline;
+    candidate.upstream_history.push_back(candidate.upstream_history.front());
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.upstream_history != baseline.upstream_history,
+                 "upstream history duplicate"))
+        return false;
+    candidate = baseline;
+    candidate.response_peer_closed = false;
+    if (!rejects(candidate,
+                 "response_peer_closed",
+                 candidate.response_peer_closed != baseline.response_peer_closed,
+                 "FIN boolean false"))
+        return false;
+    for (const u32 value : {0u, 2u}) {
+        candidate = baseline;
+        candidate.response_peer_close_count = value;
+        const std::string label = "FIN count=" + std::to_string(value);
+        if (!rejects(candidate,
+                     "response_peer_close_count",
+                     candidate.response_peer_close_count != baseline.response_peer_close_count,
+                     label.c_str()))
+            return false;
+    }
+    candidate = baseline;
+    candidate.response_sent_ns = 0u;
+    if (!rejects(candidate,
+                 "response_sent_ns",
+                 candidate.response_sent_ns != baseline.response_sent_ns,
+                 "FIN before-send timestamp"))
+        return false;
+    candidate = baseline;
+    candidate.response_peer_closed_ns = candidate.response_sent_ns + 2'000'000'001ull;
+    if (!rejects(candidate,
+                 "response_peer_closed_ns",
+                 candidate.response_peer_closed_ns != baseline.response_peer_closed_ns,
+                 "FIN over-two-second timestamp"))
+        return false;
+    candidate = baseline;
+    candidate.response_peer_observation_failed = true;
+    if (!rejects(
+            candidate,
+            "response_peer_observation_failed",
+            candidate.response_peer_observation_failed != baseline.response_peer_observation_failed,
+            "FIN observation failure"))
+        return false;
+    candidate = baseline;
+    candidate.stable_window = false;
+    if (!rejects(candidate,
+                 "stable_window",
+                 candidate.stable_window != baseline.stable_window,
+                 "stable window false"))
+        return false;
+    for (const char* field :
+         {"access_enoent_before", "access_enoent_after", "access_enoent_final"}) {
+        candidate = baseline;
+        if (strcmp(field, "access_enoent_before") == 0) candidate.access_enoent_before = false;
+        if (strcmp(field, "access_enoent_after") == 0) candidate.access_enoent_after = false;
+        if (strcmp(field, "access_enoent_final") == 0) candidate.access_enoent_final = false;
+        const bool differs = (strcmp(field, "access_enoent_before") == 0 &&
+                              candidate.access_enoent_before != baseline.access_enoent_before) ||
+                             (strcmp(field, "access_enoent_after") == 0 &&
+                              candidate.access_enoent_after != baseline.access_enoent_after) ||
+                             (strcmp(field, "access_enoent_final") == 0 &&
+                              candidate.access_enoent_final != baseline.access_enoent_final);
+        if (!rejects(candidate, field, differs, "access probe appeared")) return false;
+    }
+    candidate = baseline;
+    candidate.poison = "wrong-poison\n";
+    if (!rejects(candidate, "poison", candidate.poison != baseline.poison, "poison bytes"))
+        return false;
+    candidate = baseline;
+    candidate.source_poisoned = false;
+    if (!rejects(candidate,
+                 "source_poisoned",
+                 candidate.source_poisoned != baseline.source_poisoned,
+                 "source poison marker false"))
+        return false;
+    candidate = baseline;
+    candidate.exited_zero = false;
+    if (!rejects(candidate,
+                 "exited_zero",
+                 candidate.exited_zero != baseline.exited_zero,
+                 "exit status nonzero"))
+        return false;
+    candidate = baseline;
+    const size_t lifecycle_newline = candidate.runtime_log.find("Backend: io_uring\n");
+    if (lifecycle_newline == std::string::npos) return false;
+    candidate.runtime_log.erase(lifecycle_newline, strlen("Backend: io_uring\n"));
+    if (!rejects(candidate,
+                 "runtime_log",
+                 candidate.runtime_log != baseline.runtime_log,
+                 "lifecycle missing line"))
+        return false;
+    candidate = baseline;
+    const size_t lifecycle_backend = candidate.runtime_log.find("Backend: io_uring\n");
+    const size_t lifecycle_loaded = candidate.runtime_log.find("Loaded program:");
+    if (lifecycle_backend == std::string::npos || lifecycle_loaded == std::string::npos)
+        return false;
+    candidate.runtime_log.erase(lifecycle_backend, strlen("Backend: io_uring\n"));
+    candidate.runtime_log.insert(lifecycle_loaded, "Backend: io_uring\n");
+    if (!rejects(candidate,
+                 "runtime_log",
+                 candidate.runtime_log != baseline.runtime_log,
+                 "lifecycle order"))
+        return false;
+    for (const char* extra : {"extra\n", "Fallback: epoll\n", "fatal\n"}) {
+        candidate = baseline;
+        candidate.runtime_log += extra;
+        if (!rejects(
+                candidate, "runtime_log", candidate.runtime_log != baseline.runtime_log, extra))
+            return false;
+    }
+    candidate = baseline;
+    candidate.child_pid++;
+    if (!rejects(candidate, "child_pid", candidate.child_pid != baseline.child_pid, "child PID"))
+        return false;
+    candidate = baseline;
+    candidate.process_identity += "-changed";
+    if (!rejects(candidate,
+                 "process_identity",
+                 candidate.process_identity != baseline.process_identity,
+                 "process identity"))
+        return false;
+    for (const char* field :
+         {"temp_path", "source_path", "runtime_log_path", "access_probe_path"}) {
+        candidate = baseline;
+        if (strcmp(field, "temp_path") == 0) candidate.temp_path += "-changed";
+        if (strcmp(field, "source_path") == 0) candidate.source_path += ".changed";
+        if (strcmp(field, "runtime_log_path") == 0) candidate.runtime_log_path += ".changed";
+        if (strcmp(field, "access_probe_path") == 0) candidate.access_probe_path += ".changed";
+        const bool differs =
+            (strcmp(field, "temp_path") == 0 && candidate.temp_path != baseline.temp_path) ||
+            (strcmp(field, "source_path") == 0 && candidate.source_path != baseline.source_path) ||
+            (strcmp(field, "runtime_log_path") == 0 &&
+             candidate.runtime_log_path != baseline.runtime_log_path) ||
+            (strcmp(field, "access_probe_path") == 0 &&
+             candidate.access_probe_path != baseline.access_probe_path);
+        if (!rejects(candidate, field, differs, "resource identity")) return false;
+    }
+    candidate = baseline;
+    candidate.process_argv[6] = "1";
+    if (!rejects(candidate,
+                 "process_argv",
+                 candidate.process_argv != baseline.process_argv,
+                 "argv drain value"))
+        return false;
+    candidate = baseline;
+    candidate.process_argv.push_back("--access-log");
+    if (!rejects(candidate,
+                 "process_argv",
+                 candidate.process_argv != baseline.process_argv,
+                 "argv access-log"))
+        return false;
+    candidate = baseline;
+    candidate.eof = false;
+    if (!rejects(candidate, "eof", candidate.eof != baseline.eof, "EOF evidence")) return false;
+    candidate = baseline;
+    const std::string opposite_order =
+        baseline.order == "listen-first" ? "location-first" : "listen-first";
+    candidate.poison = "destroyed-after-373-" + opposite_order + "-load\n";
+    if (!rejects(candidate, "poison", candidate.poison != baseline.poison, "opposite-order poison"))
+        return false;
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -49388,6 +50168,9 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
     const bool proxy_hide_header_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
+    const bool proxy_hide_header_generated_side_self_check =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -49568,11 +50351,12 @@ int main(int argc, char** argv) {
          !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_source_self_check && !wildcard_listen_oracle &&
-         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
-         !request_length_oracle && !request_length_split_header_oracle &&
-         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
-         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
+         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
+         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
+         !exact_loopback_listen_oracle && !request_length_oracle &&
+         !request_length_split_header_oracle && !rut_initial_header_split_public &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -49630,6 +50414,7 @@ int main(int argc, char** argv) {
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (rut_initial_header_split_public && argv[2][0] != '/') ||
+        (proxy_hide_header_generated_side_self_check && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
@@ -49711,6 +50496,9 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--converter-proxy-hide-header-generated-side-self-check "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -49924,6 +50712,16 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (proxy_hide_header_generated_side_self_check) {
+        struct stat executable_stat{};
+        if (argv[2] == nullptr || argv[2][0] != '/' || stat(argv[2], &executable_stat) != 0 ||
+            !S_ISREG(executable_stat.st_mode) || access(argv[2], X_OK) != 0) {
+            std::cerr << "FAIL [#373 generated-side preflight]: RUT path must be an executable "
+                         "absolute regular file\n";
+            return 1;
+        }
+    }
+
 #ifndef __linux__
     if (rut_initial_header_split_public) {
         std::cerr << "FAIL [#371 ordinary-RUT public witness]: Linux/io_uring is required\n";
@@ -49961,6 +50759,45 @@ int main(int argc, char** argv) {
                "response/EOF, prompt origin FIN with no late bytes, and exactly `102\\n` live "
                "and after clean shutdown (generic RUT capability only; no nginx, converter, "
                "TCP/CQE boundary, arbitrary split, TLS, retry, or reuse claim)\n";
+        return 0;
+    }
+    if (proxy_hide_header_generated_side_self_check) {
+        std::string source_error;
+        if (!run_proxy_hide_header_source_self_checks(source_error)) {
+            std::cerr << "FAIL [#373 generated-side source/model self-check]: " << source_error
+                      << "\n";
+            return 1;
+        }
+        HeldLoopbackPorts reservations;
+        u16 frontend_port = 0u;
+        u16 backend_port = 0u;
+        if (!reservations.reserve_four_digit(0u, frontend_port) ||
+            !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port) {
+            std::cerr << "FAIL [#373 generated-side]: could not hold distinct four-digit ports\n";
+            return 1;
+        }
+        ProxyHideHeaderGeneratedObservation observation;
+        std::string generated_error;
+        if (!capture_proxy_hide_header_generated_side(frontend_port,
+                                                      backend_port,
+                                                      temp,
+                                                      argv[2],
+                                                      true,
+                                                      observation,
+                                                      generated_error,
+                                                      &reservations.fds[0],
+                                                      &reservations.fds[1]) ||
+            !run_proxy_hide_header_generated_observation_self_checks(observation,
+                                                                     generated_error)) {
+            std::cerr << "FAIL [#373 generated-side live self-check]: " << generated_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5366-byte "
+                     "proxy_hide_header source and proved the generated ordinary-RUT public "
+                     "io_uring side's exact 85-byte request, 66-byte rebuilt upstream, 219-byte "
+                     "origin response, 176-byte hidden-header-filtered response/EOF, poison "
+                     "liveness, ENOENT disabled access, live FIN stability and clean lifecycle; "
+                     "generated-side witness only (no four-way equivalence claim)\n";
         return 0;
     }
     if (request_length_oracle || request_length_split_header_oracle ||
