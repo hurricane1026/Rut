@@ -65,6 +65,7 @@ constexpr u16 kBrokerExitEarly = 25;
 constexpr u16 kSecurityTrace = 26;
 constexpr u16 kIdentityBundleRequest = 27;
 constexpr u16 kIdentityBundleAck = 28;
+constexpr u16 kDroppedIdentityRequest = 29;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kCredentialFd = 198;
 constexpr int kLauncherBundleFdBase = 220;
@@ -87,6 +88,12 @@ struct ParentEndpoint {
 
     bool cleanup(std::string& error);
     ~ParentEndpoint();
+};
+
+struct MutationDiagnostic {
+    bool success = true;
+    std::string failed_label;
+    std::string detail;
 };
 
 static bool endpoint_matches(const ParentEndpoint& endpoint, const EndpointIdentity& expected);
@@ -120,6 +127,32 @@ static bool cleanup_group_lease(GroupLease& lease,
                                 bool authority,
                                 std::string& error);
 static bool has_group_authority(const DirectLaunch& launch, const GroupLease& lease);
+
+static bool validate_dropped_identity_binding(
+    const identity_bundle::DroppedIdentityEvidence& evidence,
+    const Report& report,
+    const Peer& peer,
+    const Peer& root_peer,
+    const ProcIdentity& root_proc,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& dropped_argv,
+    uid_t caller_uid,
+    gid_t caller_gid,
+    bool root_control_ok,
+    bool endpoint_ok,
+    std::string& error);
+static MutationDiagnostic dropped_identity_mutation_checks(
+    const identity_bundle::DroppedIdentityEvidence& evidence,
+    const Report& report,
+    const Peer& peer,
+    const Peer& root_peer,
+    const ProcIdentity& root_proc,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& dropped_argv,
+    uid_t caller_uid,
+    gid_t caller_gid);
 
 static void close_launcher_bundle_handoff() {
     for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i)
@@ -1280,6 +1313,23 @@ static int dropped_broker_main(const char* executable,
         !send_frame(
             control, Frame{kBrokerDropped, token, encode_report(dropped_report)}, kHandshakeMs))
         return 31;
+    Frame identity_request;
+    if (!receive_frame(control, identity_request, kHandshakeMs) ||
+        identity_request.type != kDroppedIdentityRequest ||
+        !token_equal(identity_request.token, token) || !identity_request.payload.empty())
+        return 32;
+    identity_bundle::RoleBundle dropped_role;
+    std::string dropped_identity_error;
+    if (!identity_bundle::open_role(
+            getpid(), identity_bundle::Role::Dropped, dropped_role, dropped_identity_error) ||
+        !identity_bundle::send_dropped_role(
+            control,
+            dropped_role,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeMs)))
+        return 32;
+    // The sender retains no received/source descriptors after the SCM_RIGHTS
+    // record is accepted; the parent owns the copies used for extraction.
+    dropped_role.close();
     Frame launch;
     if (!receive_frame(control, launch, kHandshakeMs) || launch.type != kLaunchTarget ||
         !token_equal(launch.token, token) || !launch.payload.empty() ||
@@ -2839,12 +2889,6 @@ static bool groups_evidence_matches(const Report& report,
     return root.supplementary_groups == launcher.supplementary_groups;
 }
 
-struct MutationDiagnostic {
-    bool success = true;
-    std::string failed_label;
-    std::string detail;
-};
-
 static MutationDiagnostic first_failed_mutation(
     const std::vector<std::pair<const char*, bool>>& checks) {
     for (const auto& check : checks)
@@ -2862,25 +2906,295 @@ static std::string group_mutation_detail(const Report& report,
     return detail.str();
 }
 
-static std::string dropped_identity_detail(const Peer& peer,
-                                           const Report& report,
-                                           const ProcIdentity& proc,
-                                           const std::string& observed_argv,
-                                           const std::string& expected_argv) {
-    std::ostringstream detail;
-    detail << "peer{pid=" << peer.pid << ",uid=" << peer.uid << ",gid=" << peer.gid
-           << "},report{target_pid=" << report.target_pid << ",wrapper_pid=" << report.wrapper_pid
-           << ",start=" << report.start << ",pgid=" << report.pgid << ",uid=" << report.uid
-           << ",gid=" << report.gid << ",netns=" << report.netns << "},proc{pid=" << proc.pid
-           << ",start=" << proc.start << ",ppid=" << proc.ppid << ",pgid=" << proc.pgid
-           << ",sid=" << proc.sid << ",uid=" << proc.uid << ",gid=" << proc.gid
-           << ",netns=" << proc.netns << ",groups=" << proc.supplementary_groups
-           << ",nnp=" << proc.no_new_privs << ",caps=" << proc.capabilities_clear
-           << ",exe_dev=" << proc.exe_dev << ",exe_ino=" << proc.exe_ino
-           << "},argv{observed_length=" << observed_argv.size() << ",observed_hash=0x" << std::hex
-           << probe_hash(observed_argv) << std::dec << ",expected_length=" << expected_argv.size()
-           << ",expected_hash=0x" << std::hex << probe_hash(expected_argv) << std::dec << '}';
-    return detail.str();
+static ProcIdentity proc_from_dropped_evidence(
+    const identity_bundle::DroppedIdentityEvidence& evidence, const std::string& executable) {
+    ProcIdentity proc;
+    const identity_bundle::RoleManifest& identity = evidence.identity;
+    proc.pid = identity.pid;
+    proc.ppid = identity.ppid;
+    proc.sid = identity.sid;
+    proc.start = identity.start;
+    proc.pgid = identity.pgid;
+    proc.uid = identity.uid;
+    proc.gid = identity.gid;
+    proc.netns = static_cast<ino_t>(identity.netns);
+    proc.exe_dev = static_cast<dev_t>(identity.exe_dev);
+    proc.exe_ino = static_cast<ino_t>(identity.exe_ino);
+    proc.exe = executable;
+    proc.cmdline = evidence.cmdline;
+    proc.no_new_privs = evidence.status.no_new_privs;
+    proc.capabilities_clear = evidence.status.cap_inh_clear && evidence.status.cap_prm_clear &&
+                              evidence.status.cap_eff_clear;
+    proc.supplementary_groups = evidence.status.supplementary_groups.size();
+    return proc;
+}
+
+static bool validate_dropped_identity_binding(
+    const identity_bundle::DroppedIdentityEvidence& evidence,
+    const Report& report,
+    const Peer& peer,
+    const Peer& root_peer,
+    const ProcIdentity& root_proc,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& dropped_argv,
+    uid_t caller_uid,
+    gid_t caller_gid,
+    bool root_control_ok,
+    bool endpoint_ok,
+    std::string& error) {
+    const identity_bundle::RoleManifest& identity = evidence.identity;
+    const bool uid_slots = std::all_of(evidence.status.uid_values.begin(),
+                                       evidence.status.uid_values.end(),
+                                       [caller_uid](uid_t value) { return value == caller_uid; });
+    const bool gid_slots = std::all_of(evidence.status.gid_values.begin(),
+                                       evidence.status.gid_values.end(),
+                                       [caller_gid](gid_t value) { return value == caller_gid; });
+    const bool caps_clear = evidence.status.cap_inh_clear && evidence.status.cap_prm_clear &&
+                            evidence.status.cap_eff_clear;
+    const bool live_state = evidence.state == 'R' || evidence.state == 'S' ||
+                            evidence.state == 'D' || evidence.state == 'T' ||
+                            evidence.state == 't' || evidence.state == 'W' ||
+                            evidence.state == 'K' || evidence.state == 'P' || evidence.state == 'I';
+    struct stat expected_executable{};
+    const bool expected_executable_ok =
+        stat(executable.c_str(), &expected_executable) == 0 && S_ISREG(expected_executable.st_mode);
+    const bool exact =
+        peer.pid > 1 && peer.pid == identity.pid &&
+        report.target_pid == static_cast<u64>(peer.pid) && peer.uid == caller_uid &&
+        peer.gid == caller_gid && root_peer.pid > 1 && root_peer.uid == 0 && root_peer.gid == 0 &&
+        identity.ppid == root_peer.pid && root_peer.pid == root_proc.pid && root_proc.start != 0 &&
+        root_proc.sid > 1 && root_proc.exe == executable && identity.pgid == identity.pid &&
+        identity.sid == root_proc.sid && identity.uid == caller_uid && identity.gid == caller_gid &&
+        identity.netns == topology.holder_netns && expected_executable_ok &&
+        root_proc.exe_dev == static_cast<dev_t>(expected_executable.st_dev) &&
+        root_proc.exe_ino == static_cast<ino_t>(expected_executable.st_ino) &&
+        identity.exe_dev == static_cast<u64>(root_proc.exe_dev) &&
+        identity.exe_ino == static_cast<u64>(root_proc.exe_ino) &&
+        identity.exe_dev == static_cast<u64>(expected_executable.st_dev) &&
+        identity.exe_ino == static_cast<u64>(expected_executable.st_ino) &&
+        identity.argv_length == dropped_argv.size() &&
+        identity.argv_hash == probe_hash(dropped_argv) && evidence.cmdline == dropped_argv &&
+        live_state && uid_slots && gid_slots && evidence.status.supplementary_groups.empty() &&
+        evidence.status.no_new_privs && caps_clear && evidence.pidfd_live &&
+        report.target_pid == static_cast<u64>(identity.pid) &&
+        report.wrapper_pid == static_cast<u64>(root_peer.pid) && report.start == identity.start &&
+        report.pgid == static_cast<u64>(identity.pgid) && report.uid == caller_uid &&
+        report.gid == caller_gid && report.netns == topology.holder_netns &&
+        report.exe_dev == identity.exe_dev && report.exe_ino == identity.exe_ino &&
+        report.exe == executable && report.argv == dropped_argv &&
+        report.mode == "broker-dropped" && report.no_new_privs == 1 &&
+        report.capabilities_clear == 1 && report.groups_clear == 1 &&
+        report.groups_unchanged == 0 && root_control_ok && endpoint_ok;
+    if (!exact) error = "dropped kernel evidence/report binding was not exact";
+    return exact;
+}
+
+static MutationDiagnostic dropped_identity_mutation_checks(
+    const identity_bundle::DroppedIdentityEvidence& evidence,
+    const Report& report,
+    const Peer& peer,
+    const Peer& root_peer,
+    const ProcIdentity& root_proc,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& dropped_argv,
+    uid_t caller_uid,
+    gid_t caller_gid) {
+    const auto accepted = [&](const identity_bundle::DroppedIdentityEvidence& candidate_evidence,
+                              const Report& candidate_report,
+                              const Peer& candidate_peer,
+                              const Peer& candidate_root_peer,
+                              bool root_control_ok = true,
+                              bool endpoint_ok = true) {
+        std::string ignored;
+        return validate_dropped_identity_binding(candidate_evidence,
+                                                 candidate_report,
+                                                 candidate_peer,
+                                                 candidate_root_peer,
+                                                 root_proc,
+                                                 topology,
+                                                 executable,
+                                                 dropped_argv,
+                                                 caller_uid,
+                                                 caller_gid,
+                                                 root_control_ok,
+                                                 endpoint_ok,
+                                                 ignored);
+    };
+    const auto check = [](const char* label, bool rejected) -> MutationDiagnostic {
+        return rejected ? MutationDiagnostic{}
+                        : MutationDiagnostic{false, label, "mutation accepted unexpectedly"};
+    };
+    const auto distinct_uid = [caller_uid]() {
+        return caller_uid == std::numeric_limits<uid_t>::max() ? static_cast<uid_t>(caller_uid - 1)
+                                                               : static_cast<uid_t>(caller_uid + 1);
+    };
+    const auto distinct_gid = [caller_gid]() {
+        return caller_gid == std::numeric_limits<gid_t>::max() ? static_cast<gid_t>(caller_gid - 1)
+                                                               : static_cast<gid_t>(caller_gid + 1);
+    };
+    std::string baseline_error;
+    if (!validate_dropped_identity_binding(evidence,
+                                           report,
+                                           peer,
+                                           root_peer,
+                                           root_proc,
+                                           topology,
+                                           executable,
+                                           dropped_argv,
+                                           caller_uid,
+                                           caller_gid,
+                                           true,
+                                           true,
+                                           baseline_error))
+        return {false, "baseline.extracted", baseline_error};
+    auto candidate = evidence;
+    Peer changed_peer = peer;
+    changed_peer.pid = peer.pid == std::numeric_limits<pid_t>::max() ? peer.pid - 1 : peer.pid + 1;
+    MutationDiagnostic result =
+        check("peer.pid", !accepted(candidate, report, changed_peer, root_peer));
+    if (!result.success) return result;
+    changed_peer = peer;
+    changed_peer.uid = distinct_uid();
+    result = check("peer.uid", !accepted(candidate, report, changed_peer, root_peer));
+    if (!result.success) return result;
+    changed_peer = peer;
+    changed_peer.gid = distinct_gid();
+    result = check("peer.gid", !accepted(candidate, report, changed_peer, root_peer));
+    if (!result.success) return result;
+
+    const auto report_mutation = [&](const char* label, auto mutate) {
+        Report changed = report;
+        mutate(changed);
+        return check(label, !accepted(candidate, changed, peer, root_peer));
+    };
+    result = report_mutation("report.target_pid", [](Report& value) { ++value.target_pid; });
+    if (!result.success) return result;
+    result = report_mutation("report.wrapper_pid", [](Report& value) { ++value.wrapper_pid; });
+    if (!result.success) return result;
+    result = report_mutation("report.start", [](Report& value) { ++value.start; });
+    if (!result.success) return result;
+    result = report_mutation("report.pgid", [](Report& value) { ++value.pgid; });
+    if (!result.success) return result;
+    result = report_mutation("report.uid", [&](Report& value) { value.uid = distinct_uid(); });
+    if (!result.success) return result;
+    result = report_mutation("report.gid", [&](Report& value) { value.gid = distinct_gid(); });
+    if (!result.success) return result;
+    result = report_mutation("report.netns", [](Report& value) { ++value.netns; });
+    if (!result.success) return result;
+    result = report_mutation("report.exe", [](Report& value) { value.exe.push_back('x'); });
+    if (!result.success) return result;
+    result = report_mutation("report.exe_dev", [](Report& value) { ++value.exe_dev; });
+    if (!result.success) return result;
+    result = report_mutation("report.exe_ino", [](Report& value) { ++value.exe_ino; });
+    if (!result.success) return result;
+    result = report_mutation("report.argv", [](Report& value) { value.argv.push_back('\0'); });
+    if (!result.success) return result;
+    result = report_mutation("report.no_new_privs", [](Report& value) { value.no_new_privs = 0; });
+    if (!result.success) return result;
+    result = report_mutation("report.capabilities_clear",
+                             [](Report& value) { value.capabilities_clear = 0; });
+    if (!result.success) return result;
+    result = report_mutation("report.groups_clear", [](Report& value) { value.groups_clear = 0; });
+    if (!result.success) return result;
+    result = report_mutation("report.groups_unchanged",
+                             [](Report& value) { value.groups_unchanged = 1; });
+    if (!result.success) return result;
+    result = report_mutation("report.mode", [](Report& value) { value.mode = "other"; });
+    if (!result.success) return result;
+
+    const auto identity_mutation = [&](const char* label, auto mutate) {
+        auto changed = evidence;
+        mutate(changed.identity);
+        return check(label, !accepted(changed, report, peer, root_peer));
+    };
+    result = identity_mutation("identity.pid", [&](auto& value) { value.pid = peer.pid + 1; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.start", [](auto& value) { value.start = 0; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.ppid", [](auto& value) { ++value.ppid; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.pgid", [](auto& value) { ++value.pgid; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.sid", [](auto& value) { ++value.sid; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.uid", [&](auto& value) { value.uid = distinct_uid(); });
+    if (!result.success) return result;
+    result = identity_mutation("identity.gid", [&](auto& value) { value.gid = distinct_gid(); });
+    if (!result.success) return result;
+    result = identity_mutation("identity.netns", [](auto& value) { ++value.netns; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.exe_dev", [](auto& value) { ++value.exe_dev; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.exe_ino", [](auto& value) { ++value.exe_ino; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.argv_length", [](auto& value) { ++value.argv_length; });
+    if (!result.success) return result;
+    result = identity_mutation("identity.argv_hash", [](auto& value) { ++value.argv_hash; });
+    if (!result.success) return result;
+    auto changed = evidence;
+    auto changed_cmdline = evidence;
+    changed_cmdline.cmdline.push_back('\0');
+    result = check("identity.cmdline", !accepted(changed_cmdline, report, peer, root_peer));
+    if (!result.success) return result;
+    auto changed_pidfd = evidence;
+    changed_pidfd.pidfd_live = false;
+    result = check("identity.pidfd_live", !accepted(changed_pidfd, report, peer, root_peer));
+    if (!result.success) return result;
+    changed = evidence;
+    changed.state = '\0';
+    result = check("identity.state.unknown", !accepted(changed, report, peer, root_peer));
+    if (!result.success) return result;
+    changed = evidence;
+
+    for (size_t slot = 0; slot != evidence.status.uid_values.size(); ++slot) {
+        auto changed = evidence;
+        changed.status.uid_values[slot] = distinct_uid();
+        result = check("status.uid.slot", !accepted(changed, report, peer, root_peer));
+        if (!result.success) return result;
+    }
+    for (size_t slot = 0; slot != evidence.status.gid_values.size(); ++slot) {
+        auto changed = evidence;
+        changed.status.gid_values[slot] = distinct_gid();
+        result = check("status.gid.slot", !accepted(changed, report, peer, root_peer));
+        if (!result.success) return result;
+    }
+    changed.status.supplementary_groups.push_back(distinct_gid());
+    result = check("status.groups.nonempty", !accepted(changed, report, peer, root_peer));
+    if (!result.success) return result;
+    changed = evidence;
+    changed.status.no_new_privs = false;
+    result = check("status.nnp", !accepted(changed, report, peer, root_peer));
+    if (!result.success) return result;
+    for (const auto field : {0, 1, 2}) {
+        changed = evidence;
+        if (field == 0) changed.status.cap_inh_clear = false;
+        if (field == 1) changed.status.cap_prm_clear = false;
+        if (field == 2) changed.status.cap_eff_clear = false;
+        result = check(field == 0   ? "status.cap_inh"
+                       : field == 1 ? "status.cap_prm"
+                                    : "status.cap_eff",
+                       !accepted(changed, report, peer, root_peer));
+        if (!result.success) return result;
+    }
+    Peer changed_root = root_peer;
+    changed_root.pid++;
+    result = check("root.peer.pid", !accepted(candidate, report, peer, changed_root));
+    if (!result.success) return result;
+    changed_root = root_peer;
+    changed_root.uid = 1;
+    result = check("root.peer.uid", !accepted(candidate, report, peer, changed_root));
+    if (!result.success) return result;
+    changed_root = root_peer;
+    changed_root.gid = 1;
+    result = check("root.peer.gid", !accepted(candidate, report, peer, changed_root));
+    if (!result.success) return result;
+    result = check("root.control.lease", !accepted(candidate, report, peer, root_peer, false));
+    if (!result.success) return result;
+    result =
+        check("endpoint.stability", !accepted(candidate, report, peer, root_peer, true, false));
+    return result;
 }
 
 static bool validate_identity_manifest_binding(
@@ -3833,92 +4147,117 @@ static bool run_session(const std::string& sudo_path,
             dropped_failure("report.decode");
             break;
         }
-        if (broker_peer.pid == root_peer.pid) {
+        if (broker_peer.pid <= 1 || broker_peer.pid == root_peer.pid ||
+            broker_peer.uid != getuid() || broker_peer.gid != getgid() ||
+            broker_report.target_pid != static_cast<u64>(broker_peer.pid)) {
             dropped_failure("peer.distinct_root");
             break;
         }
-        if (!read_proc(broker_peer.pid, broker_proc)) {
-            error = "dropped broker identity transition failed: proc.read; " +
-                    probe_diagnostic(broker_peer.pid);
+        if (!send_frame(broker_fd, Frame{kDroppedIdentityRequest, token, {}}, kHandshakeMs)) {
+            dropped_failure("proof.request.send");
             break;
         }
-        const std::string dropped_detail = dropped_identity_detail(
-            broker_peer, broker_report, broker_proc, broker_proc.cmdline, dropped_argv);
-        if (broker_proc.start == root_proc.start) {
-            dropped_failure("proc.start_distinct");
-            error += "; " + dropped_detail;
+        identity_bundle::RoleBundle received_dropped;
+        std::string dropped_identity_error;
+        if (!identity_bundle::receive_dropped_role(
+                broker_fd,
+                received_dropped,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeMs),
+                dropped_identity_error)) {
+            dropped_failure("proof.receive");
+            error += ": " + dropped_identity_error;
             break;
         }
-        if (broker_peer.uid != getuid()) {
-            dropped_failure("peer.uid");
-            error += "; " + dropped_detail;
+        identity_bundle::DroppedIdentityEvidence dropped_evidence;
+        if (!identity_bundle::extract_dropped_identity_evidence(
+                received_dropped, dropped_evidence, dropped_identity_error)) {
+            dropped_failure("proof.extract");
+            error += ": " + dropped_identity_error;
             break;
         }
-        if (broker_peer.gid != getgid()) {
-            dropped_failure("peer.gid");
-            error += "; " + dropped_detail;
+        Peer root_control_peer;
+        const bool root_control_ok =
+            !control_lease_lost(root_fd) && get_peer(root_fd, root_control_peer) &&
+            root_control_peer.pid == root_peer.pid && root_control_peer.uid == root_peer.uid &&
+            root_control_peer.gid == root_peer.gid;
+        const bool dropped_endpoint_ok = endpoint_unchanged(endpoint);
+        std::string dropped_binding_error;
+        if (!validate_dropped_identity_binding(dropped_evidence,
+                                               broker_report,
+                                               broker_peer,
+                                               root_peer,
+                                               root_proc,
+                                               topology,
+                                               executable,
+                                               dropped_argv,
+                                               getuid(),
+                                               getgid(),
+                                               root_control_ok,
+                                               dropped_endpoint_ok,
+                                               dropped_binding_error)) {
+            dropped_failure(root_control_ok
+                                ? (dropped_endpoint_ok ? "proof.cross_bind" : "endpoint.stability")
+                                : "root.lease");
+            error += ": " + dropped_binding_error;
             break;
         }
-        if (broker_proc.uid != getuid()) {
-            dropped_failure("proc.uid");
-            error += "; " + dropped_detail;
+        if (strcmp(scenario, "normal") == 0) {
+            const MutationDiagnostic dropped_mutations =
+                dropped_identity_mutation_checks(dropped_evidence,
+                                                 broker_report,
+                                                 broker_peer,
+                                                 root_peer,
+                                                 root_proc,
+                                                 topology,
+                                                 executable,
+                                                 dropped_argv,
+                                                 getuid(),
+                                                 getgid());
+            if (!dropped_mutations.success) {
+                dropped_failure("proof.mutation");
+                error += ": " + dropped_mutations.failed_label + ": " + dropped_mutations.detail;
+                break;
+            }
+        }
+        // Re-extract from the same received descriptors immediately before the
+        // sole target authorization.  This is the final FD-backed proof; no
+        // report or parent /proc read is substituted for it.
+        identity_bundle::DroppedIdentityEvidence final_dropped_evidence;
+        if (!identity_bundle::extract_dropped_identity_evidence(
+                received_dropped, final_dropped_evidence, dropped_identity_error)) {
+            dropped_failure("proof.final_extract");
+            error += ": " + dropped_identity_error;
             break;
         }
-        if (broker_proc.gid != getgid()) {
-            dropped_failure("proc.gid");
-            error += "; " + dropped_detail;
+        Peer final_broker_peer;
+        if (!get_peer(broker_fd, final_broker_peer) || final_broker_peer.pid != broker_peer.pid ||
+            final_broker_peer.uid != broker_peer.uid || final_broker_peer.gid != broker_peer.gid) {
+            dropped_failure("proof.final_peer");
             break;
         }
-        if (broker_proc.ppid != root_peer.pid) {
-            dropped_failure("proc.ppid");
-            error += "; " + dropped_detail;
+        const bool final_root_control_ok =
+            !control_lease_lost(root_fd) && get_peer(root_fd, root_control_peer) &&
+            root_control_peer.pid == root_peer.pid && root_control_peer.uid == root_peer.uid &&
+            root_control_peer.gid == root_peer.gid;
+        if (!validate_dropped_identity_binding(final_dropped_evidence,
+                                               broker_report,
+                                               final_broker_peer,
+                                               root_peer,
+                                               root_proc,
+                                               topology,
+                                               executable,
+                                               dropped_argv,
+                                               getuid(),
+                                               getgid(),
+                                               final_root_control_ok,
+                                               endpoint_unchanged(endpoint),
+                                               dropped_binding_error)) {
+            dropped_failure(final_root_control_ok ? "proof.final_cross_bind" : "root.lease");
+            error += ": " + dropped_binding_error;
             break;
         }
-        if (broker_peer.pid == static_cast<pid_t>(root_report.wrapper_pid)) {
-            dropped_failure("peer.not_root_wrapper");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (broker_proc.supplementary_groups != 0) {
-            dropped_failure("proc.groups_clear");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (broker_proc.netns != topology.holder_netns) {
-            dropped_failure("proc.netns");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (broker_report.mode != "broker-dropped") {
-            dropped_failure("report.mode");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (broker_report.wrapper_pid != static_cast<u64>(root_peer.pid)) {
-            dropped_failure("report.wrapper_pid");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (!identity_matches_report(broker_report,
-                                     broker_peer,
-                                     broker_proc,
-                                     executable,
-                                     dropped_argv,
-                                     "broker-dropped",
-                                     token,
-                                     token,
-                                     true,
-                                     false,
-                                     true)) {
-            dropped_failure("identity_matches_report");
-            error += "; " + dropped_detail;
-            break;
-        }
-        if (!endpoint_unchanged(endpoint)) {
-            dropped_failure("endpoint.stability");
-            error += "; " + dropped_detail;
-            break;
-        }
+        broker_proc = proc_from_dropped_evidence(final_dropped_evidence, executable);
+        received_dropped.close();
         if (!send_frame(broker_fd, Frame{kLaunchTarget, token, {}}, kHandshakeMs) ||
             !accept_bounded(endpoint.listener, target_fd)) {
             error = "target launch/connection failed";
