@@ -482,6 +482,17 @@ if(RUT_ENABLE_JIT)
         SKIP_RETURN_CODE 77
     )
     add_test(
+        NAME test_nginx_issue358_ipv4_listener_fixture_spike
+        COMMAND test_nginx_differential --ipv4-listener-fixture-spike
+    )
+    set_tests_properties(test_nginx_issue358_ipv4_listener_fixture_spike PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
         NAME test_nginx_coalesced_ingress_gate
         COMMAND test_nginx_differential --nginx-coalesced-ingress-gate
                 $<TARGET_FILE:test_nginx_downstream_gate_preload>
