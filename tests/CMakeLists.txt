@@ -6,6 +6,16 @@ target_include_directories(test_framework PRIVATE
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 
+# Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
+# has no Docker/network label and runs in ordinary CI on an unprivileged host.
+add_executable(test_fixture_worker_protocol test_fixture_worker_protocol.cc)
+add_test(NAME test_fixture_worker_protocol COMMAND test_fixture_worker_protocol)
+set_tests_properties(test_fixture_worker_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
