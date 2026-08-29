@@ -649,6 +649,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue372_root_empty_query_proxy_uri_oracle
+        COMMAND test_nginx_differential --pinned-nginx-root-empty-query-proxy-uri-oracle
+    )
+    set_tests_properties(test_nginx_issue372_root_empty_query_proxy_uri_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue362_request_length_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-oracle
     )
