@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -115,7 +116,8 @@ static bool run_command(const std::vector<std::string>& arguments,
                         int timeout_ms = 15000,
                         bool report_success_as_timeout = false,
                         bool inject_descendant = false,
-                        DescendantProbe* descendant_probe = nullptr) {
+                        DescendantProbe* descendant_probe = nullptr,
+                        size_t output_limit = 65536) {
     result = {};
     if (arguments.empty()) return false;
     int pipe_fds[2] = {-1, -1};
@@ -230,7 +232,7 @@ static bool run_command(const std::vector<std::string>& arguments,
         for (;;) {
             const ssize_t count = read(pipe_fds[0], buffer, sizeof(buffer));
             if (count > 0) {
-                if (result.output.size() + static_cast<size_t>(count) > 65536) {
+                if (result.output.size() + static_cast<size_t>(count) > output_limit) {
                     if (!terminate_group_bounded(child))
                         runner_fail_stop(child, "output limit PGID remained alive");
                     for (;;) {
@@ -380,6 +382,22 @@ struct Network {
     bool exists = false;
 };
 
+struct IPv4Range {
+    u32 low = 0;
+    u32 high = 0;
+    unsigned prefix = 0;
+};
+
+struct NetworkPlan {
+    std::string subnet;
+    std::string gateway;
+};
+
+struct SubnetPlan {
+    NetworkPlan network_a;
+    NetworkPlan network_b;
+};
+
 struct Endpoint {
     std::string network_name;
     std::string network_id;
@@ -436,12 +454,6 @@ static std::string proc_hex(u32 value) {
     return text.str();
 }
 
-static std::string proc_mask_hex(u32 value) {
-    std::ostringstream text;
-    text << std::uppercase << std::setfill('0') << std::setw(8) << std::hex << value;
-    return text.str();
-}
-
 struct ProcIdentity {
     u64 start = 0;
     ino_t netns = 0;
@@ -482,19 +494,322 @@ static bool parse_ipv4(const std::string& text, u32& value) {
     return true;
 }
 
-static bool parse_cidr(const std::string& text, u32& low, u32& high) {
+static bool format_ipv4(u32 value, std::string& text) {
+    const in_addr address{htonl(value)};
+    char printed[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &address, printed, sizeof(printed)) == nullptr) return false;
+    text = printed;
+    return true;
+}
+
+static bool parse_cidr_range(const std::string& text,
+                             bool require_network_address,
+                             IPv4Range& range) {
     const size_t slash = text.find('/');
-    if (slash == std::string::npos) return false;
-    u32 address = 0;
-    if (!parse_ipv4(text.substr(0, slash), address)) return false;
-    char* end = nullptr;
+    if (slash == std::string::npos || slash == 0 || slash + 1 == text.size() ||
+        text.find('/', slash + 1) != std::string::npos)
+        return false;
+    const std::string address_text = text.substr(0, slash);
     const std::string prefix_text = text.substr(slash + 1);
+    if (prefix_text.size() > 1 && prefix_text[0] == '0') return false;
+    for (const char character : prefix_text)
+        if (character < '0' || character > '9') return false;
+    char* end = nullptr;
     const unsigned long prefix = strtoul(prefix_text.c_str(), &end, 10);
-    if (end == prefix_text.c_str() || *end != '\0' || prefix == 0 || prefix > 30) return false;
+    if (end == prefix_text.c_str() || *end != '\0' || prefix > 32) return false;
+    u32 address = 0;
+    std::string canonical_address;
+    if (!parse_ipv4(address_text, address) || !format_ipv4(address, canonical_address) ||
+        canonical_address != address_text)
+        return false;
     const u32 mask = prefix == 0 ? 0u : 0xffffffffu << (32u - static_cast<u32>(prefix));
-    low = address & mask;
-    if (address != low) return false;
-    high = low | ~mask;
+    range.low = address & mask;
+    range.high = range.low | ~mask;
+    range.prefix = static_cast<unsigned>(prefix);
+    return !require_network_address || address == range.low;
+}
+
+static bool parse_cidr(const std::string& text, u32& low, u32& high) {
+    IPv4Range range;
+    if (!parse_cidr_range(text, true, range) || range.prefix == 0 || range.prefix > 30)
+        return false;
+    low = range.low;
+    high = range.high;
+    return true;
+}
+
+static bool ranges_overlap(const IPv4Range& left, const IPv4Range& right) {
+    return left.low <= right.high && right.low <= left.high;
+}
+
+static bool private_rfc1918(const IPv4Range& range) {
+    return (range.low >= 0x0a000000u && range.high <= 0x0affffffu) ||
+           (range.low >= 0xac100000u && range.high <= 0xac1fffffu) ||
+           (range.low >= 0xc0a80000u && range.high <= 0xc0a8ffffu);
+}
+
+static bool valid_network_plan(const NetworkPlan& plan, IPv4Range* parsed = nullptr) {
+    IPv4Range subnet;
+    u32 gateway = 0;
+    std::string canonical_gateway;
+    if (!parse_cidr_range(plan.subnet, true, subnet) || subnet.prefix != 28 ||
+        !private_rfc1918(subnet) || !parse_ipv4(plan.gateway, gateway) ||
+        !format_ipv4(gateway, canonical_gateway) || canonical_gateway != plan.gateway ||
+        gateway != subnet.low + 1 || gateway >= subnet.high)
+        return false;
+    if (parsed != nullptr) *parsed = subnet;
+    return true;
+}
+
+static bool valid_subnet_plan(const SubnetPlan& plan) {
+    IPv4Range network_a;
+    IPv4Range network_b;
+    return valid_network_plan(plan.network_a, &network_a) &&
+           valid_network_plan(plan.network_b, &network_b) && !ranges_overlap(network_a, network_b);
+}
+
+static bool network_plan_equal(const NetworkPlan& left, const NetworkPlan& right) {
+    return left.subnet == right.subnet && left.gateway == right.gateway;
+}
+
+static bool subnet_plan_equal(const SubnetPlan& left, const SubnetPlan& right) {
+    return network_plan_equal(left.network_a, right.network_a) &&
+           network_plan_equal(left.network_b, right.network_b);
+}
+
+static const std::vector<SubnetPlan>& subnet_candidates() {
+    static const std::vector<SubnetPlan> candidates = {
+        SubnetPlan{NetworkPlan{"10.253.240.0/28", "10.253.240.1"},
+                   NetworkPlan{"10.253.241.0/28", "10.253.241.1"}},
+        SubnetPlan{NetworkPlan{"10.254.240.0/28", "10.254.240.1"},
+                   NetworkPlan{"10.254.241.0/28", "10.254.241.1"}},
+        SubnetPlan{NetworkPlan{"172.30.240.0/28", "172.30.240.1"},
+                   NetworkPlan{"172.30.241.0/28", "172.30.241.1"}},
+        SubnetPlan{NetworkPlan{"172.31.240.0/28", "172.31.240.1"},
+                   NetworkPlan{"172.31.241.0/28", "172.31.241.1"}},
+        SubnetPlan{NetworkPlan{"192.168.250.0/28", "192.168.250.1"},
+                   NetworkPlan{"192.168.251.0/28", "192.168.251.1"}},
+    };
+    return candidates;
+}
+
+static bool select_subnet_plan(const std::vector<IPv4Range>& conflicts,
+                               const std::vector<SubnetPlan>& candidates,
+                               SubnetPlan& selected) {
+    for (const SubnetPlan& candidate : candidates) {
+        IPv4Range network_a;
+        IPv4Range network_b;
+        if (!valid_network_plan(candidate.network_a, &network_a) ||
+            !valid_network_plan(candidate.network_b, &network_b) ||
+            ranges_overlap(network_a, network_b))
+            continue;
+        bool collision = false;
+        for (const IPv4Range& conflict : conflicts) {
+            if (conflict.prefix == 0 && conflict.low == 0 && conflict.high == 0xffffffffu) continue;
+            if (ranges_overlap(network_a, conflict) || ranges_overlap(network_b, conflict)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) {
+            selected = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> network_create_argv(const NetworkPlan& plan,
+                                                    const std::string& token,
+                                                    const std::string& name) {
+    return {"docker",
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--subnet",
+            plan.subnet,
+            "--gateway",
+            plan.gateway,
+            "--label",
+            kStageLabel,
+            "--label",
+            "rut.token=" + token,
+            name};
+}
+
+static bool exact_network_create_argv(const std::vector<std::string>& argv,
+                                      const NetworkPlan& plan,
+                                      const std::string& token,
+                                      const std::string& name) {
+    const auto count = [&](const char* flag) {
+        return static_cast<size_t>(std::count(argv.begin(), argv.end(), flag));
+    };
+    return count("--subnet") == 1 && count("--gateway") == 1 &&
+           argv == network_create_argv(plan, token, name);
+}
+
+static bool route_type(const std::string& token) {
+    return token == "unicast" || token == "local" || token == "broadcast" || token == "multicast" ||
+           token == "throw" || token == "unreachable" || token == "prohibit" ||
+           token == "blackhole" || token == "nat" || token == "anycast";
+}
+
+static bool parse_host_routes(const std::string& output,
+                              std::vector<IPv4Range>& ranges,
+                              std::string& error) {
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string token;
+        std::vector<std::string> tokens;
+        while (fields >> token) tokens.push_back(token);
+        if (tokens.empty()) continue;
+        size_t destination_index = route_type(tokens[0]) ? 1 : 0;
+        if (destination_index >= tokens.size()) {
+            error = "host route lacked a concrete IPv4 destination: " + line;
+            return false;
+        }
+        std::string destination = tokens[destination_index];
+        if (destination == "default") destination = "0.0.0.0/0";
+        if (destination.find('/') == std::string::npos) destination += "/32";
+        IPv4Range range;
+        if (!parse_cidr_range(destination, true, range)) {
+            error = "host route exposed malformed/noncanonical IPv4 destination: " + line;
+            return false;
+        }
+        ranges.push_back(range);
+    }
+    return true;
+}
+
+static bool parse_interface_cidrs(const std::string& output,
+                                  std::vector<IPv4Range>& ranges,
+                                  std::string& error) {
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string token;
+        bool found = false;
+        while (fields >> token) {
+            if (token != "inet") continue;
+            std::string cidr;
+            IPv4Range range;
+            if (found || !(fields >> cidr)) {
+                error = "host interface exposed malformed/noncanonical IPv4 CIDR: " + line;
+                return false;
+            }
+            if (cidr.find('/') == std::string::npos) cidr += "/32";
+            if (!parse_cidr_range(cidr, false, range)) {
+                error = "host interface exposed malformed/noncanonical IPv4 CIDR: " + line;
+                return false;
+            }
+            ranges.push_back(range);
+            found = true;
+        }
+        if (!line.empty() && !found) {
+            error = "host IPv4 interface record lacked an inet CIDR: " + line;
+            return false;
+        }
+        fields.clear();
+        fields.str(line);
+        while (fields >> token) {
+            if (token != "peer") continue;
+            std::string peer;
+            IPv4Range range;
+            if (!(fields >> peer)) {
+                error = "host interface exposed malformed/noncanonical IPv4 peer CIDR: " + line;
+                return false;
+            }
+            if (peer.find('/') == std::string::npos) peer += "/32";
+            if (!parse_cidr_range(peer, false, range)) {
+                error = "host interface exposed malformed/noncanonical IPv4 peer CIDR: " + line;
+                return false;
+            }
+            ranges.push_back(range);
+        }
+    }
+    return true;
+}
+
+static bool collect_ipv4_conflicts(const std::string& ip_path,
+                                   std::vector<IPv4Range>& conflicts,
+                                   std::string& error) {
+    static constexpr size_t kInventoryOutputLimit = 4u * 1024u * 1024u;
+    CommandResult result;
+    if (!run_command({ip_path, "-4", "-o", "route", "show", "table", "all"},
+                     result,
+                     15000,
+                     false,
+                     false,
+                     nullptr,
+                     kInventoryOutputLimit) ||
+        !exited_zero(result) || !parse_host_routes(result.output, conflicts, error)) {
+        if (error.empty())
+            error = "concrete host IPv4 route collection failed: " + trim(result.output);
+        return false;
+    }
+    if (!run_command({ip_path, "-4", "-o", "address", "show"},
+                     result,
+                     15000,
+                     false,
+                     false,
+                     nullptr,
+                     kInventoryOutputLimit) ||
+        !exited_zero(result) || !parse_interface_cidrs(result.output, conflicts, error)) {
+        if (error.empty())
+            error = "host IPv4 interface CIDR collection failed: " + trim(result.output);
+        return false;
+    }
+
+    if (!run_command({"docker", "network", "ls", "-q"},
+                     result,
+                     15000,
+                     false,
+                     false,
+                     nullptr,
+                     kInventoryOutputLimit) ||
+        !exited_zero(result)) {
+        error = "Docker network enumeration failed: " + trim(result.output);
+        return false;
+    }
+    std::istringstream ids(result.output);
+    std::string id;
+    while (ids >> id) {
+        CommandResult inspect;
+        if (!run_command({"docker",
+                          "network",
+                          "inspect",
+                          "-f",
+                          "{{range .IPAM.Config}}{{println .Subnet}}{{end}}",
+                          id},
+                         inspect,
+                         15000,
+                         false,
+                         false,
+                         nullptr,
+                         kInventoryOutputLimit) ||
+            !exited_zero(inspect)) {
+            error = "Docker network IPv4 subnet inspection failed for " + id + ": " +
+                    trim(inspect.output);
+            return false;
+        }
+        std::istringstream subnet_lines(inspect.output);
+        std::string subnet;
+        while (std::getline(subnet_lines, subnet)) {
+            subnet = trim(subnet);
+            if (subnet.empty() || subnet.find(':') != std::string::npos) continue;
+            IPv4Range range;
+            if (!parse_cidr_range(subnet, true, range)) {
+                error = "Docker network exposed malformed/noncanonical IPv4 subnet: " + id + " " +
+                        subnet;
+                return false;
+            }
+            conflicts.push_back(range);
+        }
+    }
     return true;
 }
 
@@ -564,6 +879,15 @@ public:
     pid_t holder_pid() const { return holder_pid_; }
     u64 holder_start() const { return holder_start_; }
     const std::string& holder_id() const { return holder_id_; }
+
+    bool set_subnet_plan(const SubnetPlan& plan) {
+        if (!valid_subnet_plan(plan)) return false;
+        network_a_.subnet = plan.network_a.subnet;
+        network_a_.gateway = plan.network_a.gateway;
+        network_b_.subnet = plan.network_b.subnet;
+        network_b_.gateway = plan.network_b.gateway;
+        return true;
+    }
 
     bool create_networks(FailurePoint point, std::string& error) {
         if (!create_network(network_a_, point, error)) return false;
@@ -768,8 +1092,8 @@ public:
             error = "holder route validation saw malformed subnet";
             return false;
         }
-        const u32 mask_a = high_a ^ low_a;
-        const u32 mask_b = high_b ^ low_b;
+        const u32 mask_a = ~(high_a ^ low_a);
+        const u32 mask_b = ~(high_b ^ low_b);
         bool route_a = false, route_b = false;
         std::istringstream route_lines(routes);
         std::string route_line;
@@ -780,8 +1104,8 @@ public:
             if (!(route_fields >> iface >> destination >> gateway >> flags >> refs >> use >>
                   metric >> mask))
                 continue;
-            route_a = route_a || (destination == proc_hex(low_a) && mask == proc_mask_hex(mask_a));
-            route_b = route_b || (destination == proc_hex(low_b) && mask == proc_mask_hex(mask_b));
+            route_a = route_a || (destination == proc_hex(low_a) && mask == proc_hex(mask_a));
+            route_b = route_b || (destination == proc_hex(low_b) && mask == proc_hex(mask_b));
         }
         if (!route_a || !route_b) {
             error = "holder routes did not contain both exact Docker-managed subnets";
@@ -913,19 +1237,10 @@ private:
         CommandResult result;
         const bool reported_timeout =
             point == FailurePoint::AfterNetworkACreationReportedTimeout && &network == &network_a_;
-        if (!run_command({"docker",
-                          "network",
-                          "create",
-                          "--driver",
-                          "bridge",
-                          "--label",
-                          kStageLabel,
-                          "--label",
-                          "rut.token=" + token_,
-                          network.name},
-                         result,
-                         15000,
-                         reported_timeout) ||
+        const NetworkPlan plan{network.subnet, network.gateway};
+        if (!valid_network_plan(plan) ||
+            !run_command(
+                network_create_argv(plan, token_, network.name), result, 15000, reported_timeout) ||
             !exited_zero(result)) {
             error = "network creation failed: " + trim(result.output);
             if (reported_timeout && result.timed_out) {
@@ -969,12 +1284,11 @@ private:
             return false;
         }
         std::istringstream fields(trim(result.output));
-        std::string id, name, driver, scope, stage, token;
-        if (!(fields >> id >> name >> driver >> scope >> network.subnet >> network.gateway >>
-              stage >> token) ||
+        std::string id, name, driver, scope, subnet, gateway, stage, token;
+        if (!(fields >> id >> name >> driver >> scope >> subnet >> gateway >> stage >> token) ||
             id.empty() || id != network.id || name != network.name || driver != "bridge" ||
             scope != "local" || stage != "358-stage2a2" || token != token_ ||
-            network.subnet.empty() || network.gateway.empty() ||
+            subnet != network.subnet || gateway != network.gateway ||
             !valid_gateway(network.subnet, network.gateway)) {
             error = "network ID/name/driver/scope/IPAM/labels were not exact";
             return false;
@@ -1134,7 +1448,7 @@ static bool write_manifest(const TempDir& temp, const Fixture& fixture) {
     return close(fd) == 0;
 }
 
-static bool preflight(const Fixture& fixture, std::string& error) {
+static bool preflight(Fixture& fixture, std::string& error) {
 #ifndef __linux__
     error = "Linux is required";
     return false;
@@ -1149,8 +1463,13 @@ static bool preflight(const Fixture& fixture, std::string& error) {
         error = "exact pinned image unavailable: " + trim(result.output);
         return false;
     }
-    if (access("/sbin/ip", X_OK) != 0 && access("/usr/sbin/ip", X_OK) != 0 &&
-        access("/bin/ip", X_OK) != 0 && access("/usr/bin/ip", X_OK) != 0) {
+    std::string ip_path;
+    for (const char* candidate : {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"})
+        if (access(candidate, X_OK) == 0) {
+            ip_path = candidate;
+            break;
+        }
+    if (ip_path.empty()) {
         error = "host ip capability is unavailable";
         return false;
     }
@@ -1160,6 +1479,17 @@ static bool preflight(const Fixture& fixture, std::string& error) {
             error = "exact target name already exists: " + name;
             return false;
         }
+    }
+    std::vector<IPv4Range> conflicts;
+    if (!collect_ipv4_conflicts(ip_path, conflicts, error)) return false;
+    SubnetPlan plan;
+    if (!select_subnet_plan(conflicts, subnet_candidates(), plan)) {
+        error = "no collision-free RFC1918 /28 topology subnet pair is available";
+        return false;
+    }
+    if (!fixture.set_subnet_plan(plan)) {
+        error = "selected topology subnet pair failed exact plan validation";
+        return false;
     }
     return true;
 #endif
@@ -1209,6 +1539,140 @@ bool pure_validation_self_checks(std::string& error) {
     }
     if (!valid_gateway("10.0.0.0/24", "10.0.0.1")) {
         error = "valid gateway was rejected";
+        return false;
+    }
+    const auto& candidates = subnet_candidates();
+    if (candidates.size() != 5 || !valid_subnet_plan(candidates[0]) ||
+        !valid_subnet_plan(candidates[1]) || !valid_subnet_plan(candidates[2]) ||
+        !valid_subnet_plan(candidates[3]) || !valid_subnet_plan(candidates[4]) ||
+        candidates[0].network_a.subnet != "10.253.240.0/28" ||
+        candidates[0].network_b.subnet != "10.253.241.0/28" ||
+        candidates[4].network_a.subnet != "192.168.250.0/28" ||
+        candidates[4].network_b.subnet != "192.168.251.0/28") {
+        error = "fixed ordered RFC1918 /28 candidate pairs were not exact";
+        return false;
+    }
+    for (const NetworkPlan& invalid : {NetworkPlan{"10.253.240/28", "10.253.240.1"},
+                                       NetworkPlan{"10.253.240.1/28", "10.253.240.1"},
+                                       NetworkPlan{"10.253.240.0/031", "10.253.240.1"},
+                                       NetworkPlan{"10.253.240.0/31", "10.253.240.1"},
+                                       NetworkPlan{"192.0.2.0/28", "192.0.2.1"},
+                                       NetworkPlan{"169.254.1.0/28", "169.254.1.1"},
+                                       NetworkPlan{"10.253.240.0/28", "10.253.240.0"},
+                                       NetworkPlan{"10.253.240.0/28", "10.253.240.15"},
+                                       NetworkPlan{"10.253.240.0/28", "10.253.240.2"},
+                                       NetworkPlan{"10.253.240.0/28", "10.253.241.1"}}) {
+        if (valid_network_plan(invalid)) {
+            error = "malformed/noncanonical/reserved/prefix/gateway-edge plan was accepted";
+            return false;
+        }
+    }
+    SubnetPlan overlapping_pair = candidates[0];
+    overlapping_pair.network_b = overlapping_pair.network_a;
+    if (valid_subnet_plan(overlapping_pair)) {
+        error = "overlapping topology subnet pair was accepted";
+        return false;
+    }
+    IPv4Range default_route;
+    IPv4Range route_conflict;
+    IPv4Range docker_conflict;
+    if (!parse_cidr_range("0.0.0.0/0", true, default_route) ||
+        !parse_cidr_range("10.253.240.8/29", true, route_conflict) ||
+        !parse_cidr_range("10.254.241.0/28", true, docker_conflict)) {
+        error = "pure selection conflict fixtures were malformed";
+        return false;
+    }
+    SubnetPlan selected_plan;
+    if (!select_subnet_plan({default_route}, candidates, selected_plan) ||
+        !subnet_plan_equal(selected_plan, candidates[0])) {
+        error = "only the default IPv4 route was not ignored for collision selection";
+        return false;
+    }
+    if (!select_subnet_plan({route_conflict}, candidates, selected_plan) ||
+        !subnet_plan_equal(selected_plan, candidates[1])) {
+        error = "host route overlap did not deterministically reject the first pair";
+        return false;
+    }
+    if (!select_subnet_plan({route_conflict, docker_conflict}, candidates, selected_plan) ||
+        !subnet_plan_equal(selected_plan, candidates[2])) {
+        error = "route/Docker cross-pair overlap allowed mixed or nondeterministic selection";
+        return false;
+    }
+    SubnetPlan cross_swapped = candidates[2];
+    std::swap(cross_swapped.network_a, cross_swapped.network_b);
+    if (subnet_plan_equal(cross_swapped, candidates[2])) {
+        error = "cross-swapped subnet selection mutation was accepted";
+        return false;
+    }
+    std::vector<IPv4Range> exhaust_candidates;
+    for (const SubnetPlan& candidate : candidates) {
+        IPv4Range candidate_a;
+        if (!valid_network_plan(candidate.network_a, &candidate_a)) {
+            error = "candidate exhaustion fixture was invalid";
+            return false;
+        }
+        exhaust_candidates.push_back(candidate_a);
+    }
+    if (select_subnet_plan(exhaust_candidates, candidates, selected_plan)) {
+        error = "exhausted candidate pairs unexpectedly selected a subnet plan";
+        return false;
+    }
+    std::vector<IPv4Range> parsed_observations;
+    std::string parse_error;
+    if (!parse_host_routes("default via 192.168.1.1 dev eth0\n"
+                           "10.253.240.8/29 dev test0 scope link\n",
+                           parsed_observations,
+                           parse_error) ||
+        parsed_observations.size() != 2 || parsed_observations[0].prefix != 0 ||
+        parsed_observations[1].low != route_conflict.low ||
+        parse_host_routes("10.253.240.1/28 dev test0\n", parsed_observations, parse_error)) {
+        error = "host route parsing/default/noncanonical causal checks failed";
+        return false;
+    }
+    parsed_observations.clear();
+    parse_error.clear();
+    if (!parse_interface_cidrs(
+            "2: eth0 inet 10.253.240.9/28 scope global eth0\n", parsed_observations, parse_error) ||
+        parsed_observations.size() != 1 || parsed_observations[0].low != 0x0afdf000u ||
+        parse_interface_cidrs("2: eth0 inet 10.253.240.009/28 scope global eth0\n",
+                              parsed_observations,
+                              parse_error)) {
+        error = "host interface CIDR/noncanonical causal checks failed";
+        return false;
+    }
+    parsed_observations.clear();
+    parse_error.clear();
+    if (!parse_interface_cidrs(
+            "4: point0 inet 10.100.15.6 peer 10.100.15.5/32 scope global point0\n",
+            parsed_observations,
+            parse_error) ||
+        parsed_observations.size() != 2 || parsed_observations[0].prefix != 32 ||
+        parsed_observations[1].prefix != 32) {
+        error = "point-to-point host interface/peer CIDRs were not both collected";
+        return false;
+    }
+    const NetworkPlan argv_plan = candidates[0].network_a;
+    const std::string argv_token = "0123456789abcdef";
+    const std::string argv_name = "rut358-a-test";
+    const std::vector<std::string> exact_argv =
+        network_create_argv(argv_plan, argv_token, argv_name);
+    if (!exact_network_create_argv(exact_argv, argv_plan, argv_token, argv_name)) {
+        error = "exact subnet/gateway network-create argv was rejected";
+        return false;
+    }
+    std::vector<std::string> removed_argv = exact_argv;
+    removed_argv.erase(removed_argv.begin() + 5, removed_argv.begin() + 7);
+    std::vector<std::string> swapped_argv = exact_argv;
+    std::swap(swapped_argv[6], swapped_argv[8]);
+    std::vector<std::string> changed_argv = exact_argv;
+    changed_argv[6] = "10.253.242.0/28";
+    std::vector<std::string> duplicated_argv = exact_argv;
+    duplicated_argv.insert(duplicated_argv.begin() + 7, {"--subnet", argv_plan.subnet});
+    if (exact_network_create_argv(removed_argv, argv_plan, argv_token, argv_name) ||
+        exact_network_create_argv(swapped_argv, argv_plan, argv_token, argv_name) ||
+        exact_network_create_argv(changed_argv, argv_plan, argv_token, argv_name) ||
+        exact_network_create_argv(duplicated_argv, argv_plan, argv_token, argv_name)) {
+        error = "network-create subnet/gateway removal/swap/value/count mutation was accepted";
         return false;
     }
     std::string selected;
