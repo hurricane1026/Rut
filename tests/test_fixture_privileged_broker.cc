@@ -604,10 +604,30 @@ static bool prove_retained_sudo_wrapper(DirectLaunch& launch,
         launch.reason = reason;
         return false;
     }
-    const bool caller =
-        evidence.uid == launch.anchor.caller_uid && evidence.gid == launch.anchor.caller_gid;
-    const bool root = evidence.uid == 0 && evidence.gid == 0;
-    if ((!caller && !root) || evidence.cmdline != launch.allowed.sudo_stage.argv) {
+    const auto all_uid_values_equal = [&](uid_t expected) {
+        return std::all_of(evidence.uid_values.begin(),
+                           evidence.uid_values.end(),
+                           [expected](uid_t value) { return value == expected; });
+    };
+    const auto all_gid_values_equal = [&](gid_t expected) {
+        return std::all_of(evidence.gid_values.begin(),
+                           evidence.gid_values.end(),
+                           [expected](gid_t value) { return value == expected; });
+    };
+    const bool caller = all_uid_values_equal(launch.anchor.caller_uid) &&
+                        all_gid_values_equal(launch.anchor.caller_gid);
+    // A retained sudo transition has caller ownership only in the real UID
+    // slot; sudo changes effective/saved/fs UIDs and every GID slot to root.
+    const bool retained_sudo = evidence.uid_values[0] == launch.anchor.caller_uid &&
+                               evidence.uid_values[1] == 0 && evidence.uid_values[2] == 0 &&
+                               evidence.uid_values[3] == 0 && all_gid_values_equal(0);
+    // Preserve the separately reachable all-root state explicitly.  This is
+    // the elevated branch of stage_context_valid(), reached when the exact
+    // sudo stage has already transitioned every credential slot to root; it
+    // is distinct from the retained caller-to-root transition.
+    const bool root = all_uid_values_equal(0) && all_gid_values_equal(0);
+    if ((!caller && !retained_sudo && !root) ||
+        evidence.cmdline != launch.allowed.sudo_stage.argv) {
         reason = "retained sudo status/cmdline was not the exact allowed sudo stage";
         launch.reason = reason;
         return false;
@@ -619,8 +639,11 @@ static bool prove_retained_sudo_wrapper(DirectLaunch& launch,
     direct.pgid = evidence.pgid;
     direct.sid = evidence.sid;
     direct.start = evidence.start;
-    direct.uid = evidence.uid;
-    direct.gid = evidence.gid;
+    // ProcIdentity exposes the effective credential pair used by the existing
+    // launch-stage validator; acceptance above independently binds all status
+    // UID/GID slots, including the real UID retained by sudo.
+    direct.uid = evidence.uid_values[1];
+    direct.gid = evidence.gid_values[1];
     direct.cmdline = evidence.cmdline;
     // This tests-only fixture has already proved the immutable fork marker,
     // retained pidfd/stat identity, and exact Launcher->Root bundle chain.  The
@@ -1987,6 +2010,44 @@ static bool retained_anchor_self_check(std::string& error) {
                candidate.launcher_valid;
     };
     ok = ok && accepted(retained, launcher);
+    RetainedAnchorEvidence retained_sudo = retained;
+    retained_sudo.uid_values = {anchor.caller_uid, 0, 0, 0};
+    retained_sudo.gid_values = {0, 0, 0, 0};
+    retained_sudo.uid = retained_sudo.uid_values[0];
+    retained_sudo.gid = retained_sudo.gid_values[0];
+    RetainedAnchorEvidence root_credentials = retained_sudo;
+    root_credentials.uid_values.fill(0);
+    root_credentials.uid = 0;
+    const auto uid_sentinel = [&](uid_t caller) {
+        if (caller == 0) return static_cast<uid_t>(1);
+        if (caller == 1) return static_cast<uid_t>(2);
+        if (caller == std::numeric_limits<uid_t>::max())
+            return static_cast<uid_t>(caller - static_cast<uid_t>(1));
+        return static_cast<uid_t>(caller + static_cast<uid_t>(1));
+    };
+    const auto rejects_uid_slot = [&](size_t slot) {
+        RetainedAnchorEvidence changed = retained_sudo;
+        const uid_t before = changed.uid_values[slot];
+        if (slot == 0) {
+            changed.uid_values[slot] = uid_sentinel(anchor.caller_uid);
+        } else {
+            changed.uid_values[slot] =
+                anchor.caller_uid == 0 ? static_cast<uid_t>(1) : anchor.caller_uid;
+        }
+        changed.uid = changed.uid_values[0];
+        return changed.uid_values[slot] != before && !accepted(changed, launcher);
+    };
+    const auto rejects_gid_slot = [&](size_t slot) {
+        RetainedAnchorEvidence changed = retained_sudo;
+        const gid_t before = changed.gid_values[slot];
+        changed.gid_values[slot] =
+            anchor.caller_gid == 0 ? static_cast<gid_t>(1) : anchor.caller_gid;
+        changed.gid = changed.gid_values[0];
+        return changed.gid_values[slot] != before && !accepted(changed, launcher);
+    };
+    ok = ok && accepted(retained_sudo, launcher) && accepted(root_credentials, launcher) &&
+         rejects_uid_slot(0) && rejects_uid_slot(1) && rejects_uid_slot(2) && rejects_uid_slot(3) &&
+         rejects_gid_slot(0) && rejects_gid_slot(1) && rejects_gid_slot(2) && rejects_gid_slot(3);
     const auto rejects_retained = [&](auto mutation) {
         RetainedAnchorEvidence changed = retained;
         mutation(changed);
