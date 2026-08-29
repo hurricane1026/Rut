@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <dirent.h>
@@ -2838,6 +2839,29 @@ static bool groups_evidence_matches(const Report& report,
     return root.supplementary_groups == launcher.supplementary_groups;
 }
 
+struct MutationDiagnostic {
+    bool success = true;
+    std::string failed_label;
+    std::string detail;
+};
+
+static MutationDiagnostic first_failed_mutation(
+    const std::vector<std::pair<const char*, bool>>& checks) {
+    for (const auto& check : checks)
+        if (!check.second) return {false, check.first, "mutation accepted unexpectedly"};
+    return {};
+}
+
+static std::string group_mutation_detail(const Report& report,
+                                         const BundleStatusEvidence& launcher,
+                                         const BundleStatusEvidence& root) {
+    std::ostringstream detail;
+    detail << "groups{clear=" << report.groups_clear << ",unchanged=" << report.groups_unchanged
+           << ",launcher_count=" << launcher.supplementary_groups.size()
+           << ",root_count=" << root.supplementary_groups.size() << '}';
+    return detail.str();
+}
+
 static bool validate_identity_manifest_binding(
     const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount>& manifests,
     const Report& report,
@@ -2994,6 +3018,12 @@ static bool identity_bundle_integration_self_check(std::string& error) {
         groups_evidence_matches(clear_groups, nonempty_launcher_groups, empty_root_groups) &&
         !groups_evidence_matches(unchanged_groups, nonempty_launcher_groups, empty_root_groups) &&
         !groups_evidence_matches(clear_groups, empty_launcher_groups, nonempty_root_groups);
+    const MutationDiagnostic first_failed = first_failed_mutation(
+        {{"mutation.first", true}, {"mutation.second", false}, {"mutation.third", false}});
+    const MutationDiagnostic all_passed =
+        first_failed_mutation({{"mutation.first", true}, {"mutation.second", true}});
+    ok = ok && !first_failed.success && first_failed.failed_label == "mutation.second" &&
+         all_passed.success && all_passed.failed_label.empty();
 
     identity_bundle::IdentityBundle source;
     std::string bundle_error;
@@ -3070,15 +3100,16 @@ static bool identity_bundle_integration_self_check(std::string& error) {
     return true;
 }
 
-static bool live_identity_bundle_mutation_checks(const identity_bundle::IdentityBundle& bundle,
-                                                 const Report& report,
-                                                 const Peer& peer,
-                                                 const HeldTopologySnapshot& topology,
-                                                 const std::string& executable,
-                                                 const std::string& root_argv,
-                                                 const std::string& launcher_argv,
-                                                 const RetainedAnchorEvidence* retained_anchor,
-                                                 const DirectLaunch& live_launch) {
+static MutationDiagnostic live_identity_bundle_mutation_checks(
+    const identity_bundle::IdentityBundle& bundle,
+    const Report& report,
+    const Peer& peer,
+    const HeldTopologySnapshot& topology,
+    const std::string& executable,
+    const std::string& root_argv,
+    const std::string& launcher_argv,
+    const RetainedAnchorEvidence* retained_anchor,
+    const DirectLaunch& live_launch) {
     ProcIdentity ignored_root;
     ProcIdentity ignored_launcher;
     std::string ignored_error;
@@ -3095,14 +3126,14 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
                                            ignored_root,
                                            ignored_launcher,
                                            ignored_error))
-        return false;
+        return {false, "baseline.repeated_semantic", "repeated full identity validation failed"};
     const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount> manifests{
         bundle.roles[0].manifest, bundle.roles[1].manifest};
     BundleStatusEvidence launcher_status;
     BundleStatusEvidence root_status;
     if (!read_bundle_status_evidence(bundle.roles[0], launcher_status) ||
         !read_bundle_status_evidence(bundle.roles[1], root_status))
-        return false;
+        return {false, "status_fd.reread", "Launcher/Root status reread failed"};
     const auto accepted_with_evidence = [&](const auto& candidate_manifests,
                                             const Report& candidate_report,
                                             const Peer& candidate_peer,
@@ -3133,7 +3164,8 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
         return accepted_with_evidence(
             candidate_manifests, candidate_report, candidate_peer, launcher_status, root_status);
     };
-    if (!accepted(manifests, report, peer)) return false;
+    if (!accepted(manifests, report, peer))
+        return {false, "baseline.repeated_semantic", "repeated full identity validation failed"};
     const auto rejects = [&](auto mutation) {
         auto changed = manifests;
         mutation(changed);
@@ -3170,39 +3202,96 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
     detached[1].ppid = detached[0].pid;
     Report detached_report = report;
     detached_report.wrapper_pid = static_cast<u64>(detached[0].pid);
-    return !accepted(manifests, report, changed_peer) &&
-           !accepted(manifests, changed_report, peer) &&
-           !accepted(manifests, changed_nnp_report, peer) &&
-           !accepted(manifests, changed_caps_report, peer) &&
-           !accepted(manifests, changed_groups_report, peer) &&
-           !accepted_with_evidence(
-               manifests, report, peer, launcher_status, changed_nnp_evidence) &&
-           !accepted_with_evidence(
-               manifests, report, peer, launcher_status, changed_caps_evidence) &&
-           !accepted_with_evidence(manifests, report, peer, launcher_status, changed_root_groups) &&
-           !accepted_with_evidence(manifests, report, peer, changed_launcher_groups, root_status) &&
-           rejects([](auto& value) { ++value[1].pid; }) &&
-           rejects([](auto& value) { ++value[0].pid; }) &&
-           rejects([](auto& value) { ++value[1].ppid; }) &&
-           rejects([](auto& value) { ++value[0].ppid; }) &&
-           rejects([](auto& value) { ++value[1].start; }) &&
-           rejects([](auto& value) { ++value[0].start; }) &&
-           rejects([](auto& value) { ++value[1].netns; }) &&
-           rejects([](auto& value) { ++value[0].netns; }) &&
-           rejects([](auto& value) { ++value[1].exe_dev; }) &&
-           rejects([](auto& value) { ++value[1].exe_ino; }) &&
-           rejects([](auto& value) { ++value[0].exe_dev; }) &&
-           rejects([](auto& value) { ++value[0].exe_ino; }) &&
-           rejects([](auto& value) { ++value[1].argv_length; }) &&
-           rejects([](auto& value) { ++value[1].argv_hash; }) &&
-           rejects([](auto& value) { ++value[0].argv_length; }) &&
-           rejects([](auto& value) { ++value[0].argv_hash; }) &&
-           rejects([](auto& value) { ++value[1].uid; }) &&
-           rejects([](auto& value) { ++value[1].gid; }) &&
-           rejects([](auto& value) { ++value[0].uid; }) &&
-           rejects([](auto& value) { ++value[0].gid; }) &&
-           rejects([](auto& value) { std::swap(value[0], value[1]); }) &&
-           !accepted(detached, detached_report, peer);
+    const auto check =
+        [&](const char* label, bool rejected, std::string detail = {}) -> MutationDiagnostic {
+        if (rejected) return {};
+        if (detail.empty()) detail = "mutation accepted unexpectedly";
+        return {false, label, std::move(detail)};
+    };
+    MutationDiagnostic diagnostic;
+    diagnostic = check("peer.pid", !accepted(manifests, report, changed_peer));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("report.target_pid", !accepted(manifests, changed_report, peer));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("report.no_new_privs", !accepted(manifests, changed_nnp_report, peer));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("report.capabilities_clear", !accepted(manifests, changed_caps_report, peer));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("report.groups_flags",
+                       !accepted(manifests, changed_groups_report, peer),
+                       group_mutation_detail(changed_groups_report, launcher_status, root_status));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check(
+        "status.root.no_new_privs",
+        !accepted_with_evidence(manifests, report, peer, launcher_status, changed_nnp_evidence));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check(
+        "status.root.capabilities",
+        !accepted_with_evidence(manifests, report, peer, launcher_status, changed_caps_evidence));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check(
+        "status.root.groups",
+        !accepted_with_evidence(manifests, report, peer, launcher_status, changed_root_groups),
+        group_mutation_detail(report, launcher_status, changed_root_groups));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check(
+        "status.launcher.groups",
+        !accepted_with_evidence(manifests, report, peer, changed_launcher_groups, root_status),
+        group_mutation_detail(report, changed_launcher_groups, root_status));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.pid", rejects([](auto& value) { ++value[1].pid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.pid", rejects([](auto& value) { ++value[0].pid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.ppid", rejects([](auto& value) { ++value[1].ppid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.ppid", rejects([](auto& value) { ++value[0].ppid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.start", rejects([](auto& value) { ++value[1].start; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.start", rejects([](auto& value) { ++value[0].start; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.netns", rejects([](auto& value) { ++value[1].netns; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.netns", rejects([](auto& value) { ++value[0].netns; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.exe_dev", rejects([](auto& value) { ++value[1].exe_dev; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.exe_ino", rejects([](auto& value) { ++value[1].exe_ino; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.launcher.exe_dev", rejects([](auto& value) { ++value[0].exe_dev; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.launcher.exe_ino", rejects([](auto& value) { ++value[0].exe_ino; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.root.argv_length", rejects([](auto& value) { ++value[1].argv_length; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.root.argv_hash", rejects([](auto& value) { ++value[1].argv_hash; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.argv_length",
+                       rejects([](auto& value) { ++value[0].argv_length; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.launcher.argv_hash", rejects([](auto& value) { ++value[0].argv_hash; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.uid", rejects([](auto& value) { ++value[1].uid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.root.gid", rejects([](auto& value) { ++value[1].gid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.uid", rejects([](auto& value) { ++value[0].uid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("manifest.launcher.gid", rejects([](auto& value) { ++value[0].gid; }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic =
+        check("manifest.role_swap", rejects([](auto& value) { std::swap(value[0], value[1]); }));
+    if (!diagnostic.success) return diagnostic;
+    diagnostic = check("detached.lineage", !accepted(detached, detached_report, peer));
+    if (!diagnostic.success) return diagnostic;
+    return diagnostic;
 }
 
 struct DestructiveAuth {
@@ -3614,29 +3703,42 @@ static bool run_session(const std::string& sudo_path,
         }
         const RetainedAnchorEvidence* retained_anchor_ptr =
             retained_anchor ? &*retained_anchor : nullptr;
-        if (!validate_received_identity_bundle(received_identity.bundle(),
-                                               root_report,
-                                               root_peer,
-                                               topology,
-                                               executable,
-                                               root_argv,
-                                               launcher_argv,
-                                               retained_anchor_ptr,
-                                               sudo_child,
-                                               root_proc,
-                                               launcher_proc,
-                                               identity_error) ||
-            !endpoint_unchanged(endpoint) ||
-            (strcmp(scenario, "normal") == 0 &&
-             !live_identity_bundle_mutation_checks(received_identity.bundle(),
-                                                   root_report,
-                                                   root_peer,
-                                                   topology,
-                                                   executable,
-                                                   root_argv,
-                                                   launcher_argv,
-                                                   retained_anchor_ptr,
-                                                   sudo_child))) {
+        const bool semantic_baseline_ok =
+            validate_received_identity_bundle(received_identity.bundle(),
+                                              root_report,
+                                              root_peer,
+                                              topology,
+                                              executable,
+                                              root_argv,
+                                              launcher_argv,
+                                              retained_anchor_ptr,
+                                              sudo_child,
+                                              root_proc,
+                                              launcher_proc,
+                                              identity_error);
+        const bool endpoint_ok = semantic_baseline_ok && endpoint_unchanged(endpoint);
+        MutationDiagnostic mutation_diagnostic;
+        if (semantic_baseline_ok && endpoint_ok && strcmp(scenario, "normal") == 0)
+            mutation_diagnostic = live_identity_bundle_mutation_checks(received_identity.bundle(),
+                                                                       root_report,
+                                                                       root_peer,
+                                                                       topology,
+                                                                       executable,
+                                                                       root_argv,
+                                                                       launcher_argv,
+                                                                       retained_anchor_ptr,
+                                                                       sudo_child);
+        if (!semantic_baseline_ok || !endpoint_ok ||
+            (strcmp(scenario, "normal") == 0 && !mutation_diagnostic.success)) {
+            if (!semantic_baseline_ok)
+                identity_error =
+                    "baseline.semantic: " +
+                    (identity_error.empty() ? "full identity validation failed" : identity_error);
+            else if (!endpoint_ok)
+                identity_error = "endpoint.stability: endpoint identity changed";
+            else if (semantic_baseline_ok && !mutation_diagnostic.failed_label.empty())
+                identity_error = mutation_diagnostic.failed_label + std::string(": ") +
+                                 mutation_diagnostic.detail;
             error = "root broker bundle provenance validation failed: " + identity_error + "; " +
                     direct_launch_diagnostic(sudo_child);
             if (retained_anchor)
