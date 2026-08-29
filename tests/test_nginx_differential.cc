@@ -46806,6 +46806,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
                                                   HeldLoopbackPorts& reservations,
                                                   u16 frontend_port,
                                                   u16 backend_port,
+                                                  bool split_header_delivery,
                                                   std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#362 converter differential requires an executable absolute RUT path";
@@ -46844,6 +46845,7 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     };
     Recorder backend;
     RecorderGuard backend_guard{&backend};
+    backend.wait_response_peer_close = split_header_delivery;
     backend.observe_extra_requests_until_stop = true;
     if (!handoff_held_loopback_port(
             &reservations.fds[1], backend_port, "#362 generated RUT Recorder bind", error) ||
@@ -46875,6 +46877,18 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
         if (error.empty()) error = "#362 generated ordinary RUT failed before readiness";
         return false;
     }
+    if (split_header_delivery) {
+        static constexpr char kPoison[] = "invalid-after-owned-issue370-source-load\n";
+        std::string overwritten;
+        if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) ||
+            !read_exact_return204_log(
+                temp.source, "#370 overwritten generated source", overwritten, error) ||
+            overwritten != kPoison || poll_child(runtime.child)) {
+            if (error.empty())
+                error = "#370 generated RUT did not retain its loaded source after overwrite";
+            return false;
+        }
+    }
     const auto live_with_counts = [&](u32 expected) {
         return !poll_child(runtime.child) && backend.running.load(std::memory_order_acquire) &&
                backend.thread_alive.load(std::memory_order_acquire) &&
@@ -46901,39 +46915,108 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
+    if (client.fd < 0) {
+        error = split_header_delivery ? "#370 generated-RUT client connect failed"
+                                      : "#362 generated-RUT client connect failed";
+        return false;
+    }
+    if (split_header_delivery) {
+        if (!send_all(client.fd,
+                      kRequestLengthSplitHeaderFirstSend,
+                      sizeof(kRequestLengthSplitHeaderFirstSend) - 1u)) {
+            error = "#370 generated RUT exact 45-byte first application send failed";
+            return false;
+        }
+        const auto split_quiet_started = std::chrono::steady_clock::now();
+        const auto split_quiet_deadline = split_quiet_started + std::chrono::milliseconds(500);
+        for (;;) {
+            std::string access_bytes;
+            if (!live_with_counts(0u) ||
+                !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
+                !access_bytes.empty() ||
+                !observe_client_open_and_quiet_nonconsuming(client.fd, 25, error)) {
+                if (error.empty())
+                    error = "#370 generated incomplete-header state was not live and quiet";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= split_quiet_deadline) break;
+        }
+
+        // Mandatory final causal snapshot: access, non-consuming client peek,
+        // child/Recorder liveness, and Recorder atomics last. Send the suffix
+        // immediately after validating these actual observations.
+        std::string final_quiet_access;
+        const bool final_access_quiet =
+            read_request_length_access_file(temp.rut_access_log, final_quiet_access, error) &&
+            final_quiet_access.empty();
+        const bool final_client_quiet =
+            observe_client_open_and_quiet_nonconsuming(client.fd, 0, error);
+        const bool final_child_live = !poll_child(runtime.child);
+        const bool final_recorder_live = backend.running.load(std::memory_order_acquire) &&
+                                         backend.thread_alive.load(std::memory_order_acquire) &&
+                                         !backend.listener_failed.load(std::memory_order_acquire);
+        const u32 final_accepted = backend.accepted.load(std::memory_order_acquire);
+        const u32 final_requests = backend.requests.load(std::memory_order_acquire);
+        const u32 final_response_sends =
+            backend.response_send_all_calls.load(std::memory_order_acquire);
+        const auto quiet_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - split_quiet_started);
+        if (!validate_request_length_split_header(kRequestLengthSplitHeaderFirstSend,
+                                                  kRequestLengthSplitHeaderSecondSend,
+                                                  quiet_elapsed,
+                                                  final_child_live,
+                                                  final_recorder_live,
+                                                  final_accepted,
+                                                  final_requests,
+                                                  final_response_sends,
+                                                  final_access_quiet,
+                                                  final_client_quiet,
+                                                  error) ||
+            !send_all(client.fd,
+                      kRequestLengthSplitHeaderSecondSend,
+                      sizeof(kRequestLengthSplitHeaderSecondSend) - 1u)) {
+            if (error.empty()) error = "#370 generated RUT exact 57-byte suffix send failed";
+            return false;
+        }
+    } else if (!send_all(client.fd,
+                         kRequestLengthOracleClientRequest,
+                         sizeof(kRequestLengthOracleClientRequest) - 1u)) {
+        error = "#362 generated RUT exact 102-byte application send failed";
+        return false;
+    }
     std::vector<char> response;
-    if (client.fd < 0 ||
-        !send_all(client.fd,
-                  kRequestLengthOracleClientRequest,
-                  sizeof(kRequestLengthOracleClientRequest) - 1u) ||
-        !read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
+    if (!read_response(client.fd, response, error) || !read_eof(client.fd, error) ||
         !validate_exact_normalized_response(response, kSuccessResponseNormalized, error)) {
-        if (error.empty()) error = "#362 generated-RUT exact request/response episode failed";
+        if (error.empty())
+            error = split_header_delivery
+                        ? "#370 generated-RUT split request/response episode failed"
+                        : "#362 generated-RUT exact request/response episode failed";
         return false;
     }
     close(client.fd);
     client.fd = -1;
-    if (!wait_for_live_complete_origin_episode(backend, runtime.child, "#362 generated RUT", error))
+    if (!wait_for_live_complete_origin_episode(
+            backend,
+            runtime.child,
+            split_header_delivery ? "#370 generated RUT" : "#362 generated RUT",
+            error))
         return false;
 
     const std::string expected_upstream =
         "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
         "\r\nX-Test: keep\r\n\r\n";
     const std::vector<char> expected_wire(expected_upstream.begin(), expected_upstream.end());
-    const std::string actual =
-        backend.history.size() == 1u
-            ? std::string(backend.history[0].begin(), backend.history[0].end())
-            : std::string{};
-    if (expected_upstream.size() != 66u ||
-        sizeof(kRequestLengthOracleClientRequest) - 1u == expected_upstream.size() ||
-        backend.history.size() != 1u || backend.history[0] != expected_wire ||
-        count_text(actual, "Host: 127.0.0.1:") != 1u ||
-        count_text(actual, "X-Test: keep\r\n") != 1u ||
-        actual.find("client.example") != std::string::npos ||
-        actual.find("Connection:") != std::string::npos || actual.find('\t') != std::string::npos) {
-        if (!backend.history.empty())
-            dump_wire("#362 generated RUT backend wire", backend.history[0]);
-        error = "#362 generated RUT did not produce the exact 66-byte rebuilt upstream wire";
+    const u64 response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+    const u64 response_peer_closed_ns =
+        backend.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (split_header_delivery &&
+        (!live_with_counts(1u) || response_sent_ns == 0u ||
+         !backend.response_peer_closed.load(std::memory_order_acquire) ||
+         response_peer_closed_ns < response_sent_ns ||
+         response_peer_closed_ns - response_sent_ns > 2'000'000'000ull ||
+         backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+         backend.response_peer_observation_failed.load(std::memory_order_acquire))) {
+        error = "#370 generated RUT lacked prompt live origin FIN/no-late-byte evidence";
         return false;
     }
 
@@ -46961,10 +47044,20 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (std::chrono::steady_clock::now() < stable_deadline) {
         std::string access_bytes;
+        const u64 stable_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+        const u64 stable_closed_ns =
+            backend.response_peer_closed_ns.load(std::memory_order_acquire);
         if (!live_with_counts(1u) ||
+            (split_header_delivery &&
+             (stable_sent_ns != response_sent_ns || stable_closed_ns != response_peer_closed_ns ||
+              !backend.response_peer_closed.load(std::memory_order_acquire) ||
+              backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+              backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
             !read_request_length_access_file(temp.rut_access_log, access_bytes, error) ||
             !validate_request_length_access_bytes(access_bytes, error)) {
-            if (error.empty()) error = "#362 generated-RUT live evidence was not stable";
+            if (error.empty())
+                error = split_header_delivery ? "#370 generated-RUT live evidence was not stable"
+                                              : "#362 generated-RUT live evidence was not stable";
             return false;
         }
         usleep(5000);
@@ -46976,18 +47069,39 @@ static bool run_converter_request_length_rut_side(TempDir& temp,
     }
     backend.stop();
     backend_guard.recorder = nullptr;
+    const std::string actual =
+        backend.history.size() == 1u
+            ? std::string(backend.history[0].begin(), backend.history[0].end())
+            : std::string{};
     std::string final_access;
     std::string runtime_log;
     if (backend.thread_alive.load(std::memory_order_acquire) ||
         backend.listener_failed.load(std::memory_order_acquire) ||
         !complete_origin_episode_is_exact(backend) || backend.history.size() != 1u ||
-        backend.history[0] != expected_wire ||
+        backend.request != expected_wire || backend.history[0] != expected_wire ||
+        expected_upstream.size() != 66u ||
+        sizeof(kRequestLengthOracleClientRequest) - 1u == expected_upstream.size() ||
+        count_text(actual, "Host: 127.0.0.1:") != 1u ||
+        count_text(actual, "X-Test: keep\r\n") != 1u ||
+        actual.find("client.example") != std::string::npos ||
+        actual.find("Connection:") != std::string::npos || actual.find('\t') != std::string::npos ||
+        (split_header_delivery &&
+         (!backend.response_peer_closed.load(std::memory_order_acquire) ||
+          backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+          backend.response_peer_observation_failed.load(std::memory_order_acquire))) ||
         !read_request_length_access_file(temp.rut_access_log, final_access, error) ||
         !validate_request_length_access_bytes(final_access, error) ||
         !read_exact_return204_log(
             temp.rut_log, "#362 generated RUT runtime log", runtime_log, error) ||
         !validate_rut_exact_ipv4_runtime_log(runtime_log, temp.source, frontend_port, error)) {
-        if (error.empty()) error = "#362 generated-RUT final lifecycle evidence was not exact";
+        if (!backend.history.empty())
+            dump_wire(split_header_delivery ? "#370 generated RUT backend wire"
+                                            : "#362 generated RUT backend wire",
+                      backend.history[0]);
+        if (error.empty())
+            error = split_header_delivery
+                        ? "#370 generated-RUT final lifecycle evidence was not exact"
+                        : "#362 generated-RUT final lifecycle evidence was not exact";
         return false;
     }
     return true;
@@ -47008,7 +47122,23 @@ static bool run_converter_request_length_differential(TempDir& temp,
     }
     if (!run_pinned_request_length_oracle(temp, container_name, error)) return false;
     return run_converter_request_length_rut_side(
-        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, error);
+        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, false, error);
+}
+
+static bool run_converter_request_length_split_header_differential(
+    TempDir& temp, const std::string& container_name, const char* rut_path, std::string& error) {
+    HeldLoopbackPorts rut_reservations;
+    u16 rut_frontend_port = 0u;
+    u16 rut_backend_port = 0u;
+    if (!rut_reservations.reserve(0u, rut_frontend_port) ||
+        !rut_reservations.reserve_four_digit(1u, rut_backend_port) ||
+        rut_frontend_port == rut_backend_port) {
+        error = "#370 could not pre-hold isolated generated-RUT frontend/backend ports";
+        return false;
+    }
+    if (!run_pinned_request_length_split_header_oracle(temp, container_name, error)) return false;
+    return run_converter_request_length_rut_side(
+        temp, rut_path, rut_reservations, rut_frontend_port, rut_backend_port, true, error);
 }
 
 static bool validate_converter_request_length_fixed_body_source(const std::string& source,
@@ -47888,6 +48018,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-split-fixed-body-oracle") == 0;
     const bool converter_request_length_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-differential") == 0;
+    const bool converter_request_length_split_header_differential =
+        argc == 3 && strcmp(argv[1], "--converter-request-length-split-header-differential") == 0;
     const bool converter_request_length_fixed_body_differential =
         argc == 3 && strcmp(argv[1], "--converter-request-length-fixed-body-differential") == 0;
     const bool converter_request_length_split_fixed_body_differential =
@@ -48050,6 +48182,7 @@ int main(int argc, char** argv) {
          !request_length_split_header_oracle && !rut_initial_header_split_public &&
          !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
          !converter_request_length_differential &&
+         !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
          !exact_loopback_return204_oracle && !exact_loopback_bodyful_return_oracle &&
@@ -48106,6 +48239,7 @@ int main(int argc, char** argv) {
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (rut_initial_header_split_public && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
+        (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
         (converter_request_length_split_fixed_body_differential && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
@@ -48198,6 +48332,9 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-request-length-split-fixed-body-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-request-length-differential <absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-request-length-split-header-differential "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-request-length-fixed-body-differential "
                      "<absolute-rut-executable>\n"
@@ -48404,20 +48541,23 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (request_length_oracle || request_length_split_header_oracle ||
-        converter_request_length_differential) {
+        converter_request_length_differential ||
+        converter_request_length_split_header_differential) {
         std::string self_check_error;
         if (!run_request_length_oracle_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 request-length oracle self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
-        if (request_length_split_header_oracle &&
+        if ((request_length_split_header_oracle ||
+             converter_request_length_split_header_differential) &&
             !run_request_length_split_header_self_checks(self_check_error)) {
             std::cerr << "FAIL [#370 split-header request-length self-check]: " << self_check_error
                       << "\n";
             return 1;
         }
-        if (converter_request_length_differential &&
+        if ((converter_request_length_differential ||
+             converter_request_length_split_header_differential) &&
             !run_converter_request_length_self_checks(self_check_error)) {
             std::cerr << "FAIL [#362 converter request-length self-check]: " << self_check_error
                       << "\n";
@@ -49200,6 +49340,36 @@ int main(int argc, char** argv) {
                "parse_http_profile plus lower_to_rut(HttpProfile), survived input/output-owner "
                "destruction, and ran through the public executable with source accessLog live "
                "publication and no CLI logging workaround\n";
+        return 0;
+    }
+    if (converter_request_length_split_header_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-370-request-length-split-header-diff-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string differential_error;
+        if (!run_converter_request_length_split_header_differential(
+                temp, container_name, argv[2], differential_error)) {
+            std::cerr << "FAIL [#370 converter split-header request-length differential]: "
+                      << differential_error << "\n";
+            dump_log(temp.nginx_config, "#370 pinned nginx config");
+            dump_log(temp.nginx_access_log, "#370 pinned nginx access log");
+            dump_log(temp.nginx_log, "#370 pinned nginx process log");
+            dump_log(temp.source, "#370 poisoned converter-generated ordinary RUT source");
+            dump_log(temp.rut_access_log, "#370 generated RUT SourceLive access log");
+            dump_log(temp.rut_log, "#370 generated RUT process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #370 pinned nginx 1.29.7 and converter-generated ordinary RUT loaded "
+               "through the public CLI/JIT/io_uring each preserve the unchanged exact 102-byte "
+               "bodyless GET across two application sends of a 45-byte incomplete-header "
+               "prefix and 57-byte suffix separated by at least 500ms of live "
+               "backend/access/client quiet; both rebuild one exact 66-byte upstream request, "
+               "return the exact Date-normalized 118-byte response/EOF, observe one prompt "
+               "origin FIN with no retry or late bytes, and publish exactly `102\\n` live and "
+               "after clean shutdown (converter-generated ordinary-RUT exact application-send "
+               "slice only; no TCP/read/CQE or general fragmentation claim)\n";
         return 0;
     }
     if (converter_request_length_fixed_body_differential) {

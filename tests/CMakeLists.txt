@@ -719,6 +719,20 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue370_converter_request_length_split_header_differential
+        COMMAND test_nginx_differential
+                --converter-request-length-split-header-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue370_converter_request_length_split_header_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue367_converter_request_length_fixed_body_differential
         COMMAND test_nginx_differential --converter-request-length-fixed-body-differential
                 $<TARGET_FILE:rut>
