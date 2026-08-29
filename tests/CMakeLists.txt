@@ -673,6 +673,16 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue371_rut_initial_header_split_public
+        COMMAND test_nginx_differential --rut-initial-header-split-public $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue371_rut_initial_header_split_public PROPERTIES
+        LABELS "integration;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+    )
+    add_test(
         NAME test_nginx_issue367_request_length_fixed_body_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-fixed-body-oracle
     )
