@@ -16,18 +16,25 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
 #include <linux/io_uring.h>
+#include <linux/limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -769,6 +776,1257 @@ struct DockerGuard {
         if (active) (void)docker_remove(name);
     }
 };
+
+// #358 Stage 2a deliberately lives behind a private mode.  It is a fixture
+// substrate check only: neither nginx nor RUT is started by this path.
+static constexpr uid_t kIpv4FixtureWorkerUid = 65534;
+static constexpr gid_t kIpv4FixtureWorkerGid = 65534;
+
+static bool read_small_file(const std::string& path, std::string& result) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    result.clear();
+    char buffer[1024];
+    for (;;) {
+        const ssize_t n = read(fd, buffer, sizeof(buffer));
+        if (n > 0) {
+            result.append(buffer, static_cast<size_t>(n));
+            if (result.size() > 64 * 1024) {
+                close(fd);
+                return false;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        const bool ok = n == 0;
+        close(fd);
+        return ok;
+    }
+}
+
+static bool run_capture(const std::vector<std::string>& args,
+                        const std::string& output_path,
+                        std::string* output = nullptr) {
+    if (!command_ok(args, output_path)) return false;
+    return output == nullptr || read_small_file(output_path, *output);
+}
+
+static bool write_all_fd(int fd, const char* data, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        const ssize_t n = write(fd, data + offset, length - offset);
+        if (n > 0) {
+            offset += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+static bool read_line_timeout(int fd, std::string& line, int timeout_ms) {
+    line.clear();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
+        if (remaining <= 0) return false;
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, static_cast<int>(remaining));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return false;
+        char byte = 0;
+        const ssize_t n = read(fd, &byte, 1);
+        if (n == 1) {
+            if (byte == '\n') return true;
+            if (line.size() >= 4096) return false;
+            line.push_back(byte);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool parse_u64_field(const std::string& value, u64& result) {
+    if (value.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = strtoull(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0') return false;
+    result = static_cast<u64>(parsed);
+    return true;
+}
+
+struct Ipv4FixtureWorkerReport {
+    pid_t pid = -1;
+    u64 start_time = 0;
+    pid_t pgid = -1;
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    ino_t netns = 0;
+    std::string address;
+    u16 port = 0;
+    int type = -1;
+    int accepting = -1;
+    bool cloexec = false;
+    int reuseaddr = -1;
+    int reuseport = -1;
+};
+
+static bool parse_fixture_worker_report(const std::string& line, Ipv4FixtureWorkerReport& report) {
+    if (line.rfind("READY ", 0) != 0) return false;
+    std::istringstream stream(line.substr(6));
+    std::string field;
+    while (stream >> field) {
+        const size_t equals = field.find('=');
+        if (equals == std::string::npos) return false;
+        const std::string key = field.substr(0, equals);
+        const std::string value = field.substr(equals + 1);
+        u64 number = 0;
+        if (key == "pid" && parse_u64_field(value, number))
+            report.pid = static_cast<pid_t>(number);
+        else if (key == "start" && parse_u64_field(value, number))
+            report.start_time = number;
+        else if (key == "pgid" && parse_u64_field(value, number))
+            report.pgid = static_cast<pid_t>(number);
+        else if (key == "uid" && parse_u64_field(value, number))
+            report.uid = static_cast<uid_t>(number);
+        else if (key == "gid" && parse_u64_field(value, number))
+            report.gid = static_cast<gid_t>(number);
+        else if (key == "netns" && parse_u64_field(value, number))
+            report.netns = static_cast<ino_t>(number);
+        else if (key == "addr")
+            report.address = value;
+        else if (key == "port" && parse_u64_field(value, number))
+            report.port = static_cast<u16>(number);
+        else if (key == "type" && parse_u64_field(value, number))
+            report.type = static_cast<int>(number);
+        else if (key == "accept" && parse_u64_field(value, number))
+            report.accepting = static_cast<int>(number);
+        else if (key == "cloexec")
+            report.cloexec = value == "1";
+        else if (key == "reuseaddr" && parse_u64_field(value, number))
+            report.reuseaddr = static_cast<int>(number);
+        else if (key == "reuseport" && parse_u64_field(value, number))
+            report.reuseport = static_cast<int>(number);
+        else
+            return false;
+    }
+    return report.pid > 0 && report.start_time != 0 && report.pgid > 0 &&
+           report.uid != static_cast<uid_t>(-1) && report.gid != static_cast<gid_t>(-1) &&
+           report.netns != 0 && !report.address.empty() && report.port != 0 &&
+           report.type == SOCK_STREAM && (report.accepting == 0 || report.accepting == 1) &&
+           report.cloexec && report.reuseaddr == 0 && report.reuseport == 0;
+}
+
+static bool read_proc_identity(pid_t pid, u64& start_time, pid_t& pgid, uid_t& uid, gid_t& gid) {
+    std::string stat_contents;
+    if (!read_small_file("/proc/" + std::to_string(pid) + "/stat", stat_contents)) return false;
+    const size_t comm_end = stat_contents.rfind(") ");
+    if (comm_end == std::string::npos) return false;
+    std::istringstream fields(stat_contents.substr(comm_end + 2));
+    char state = 0;
+    long ppid = 0;
+    long process_group = 0;
+    if (!(fields >> state >> ppid >> process_group)) return false;
+    long ignored = 0;
+    for (int field = 6; field <= 22; field++) {
+        if (field == 22) {
+            unsigned long long start = 0;
+            if (!(fields >> start)) return false;
+            start_time = static_cast<u64>(start);
+        } else if (!(fields >> ignored)) {
+            return false;
+        }
+    }
+    pgid = static_cast<pid_t>(process_group);
+    std::string status;
+    if (!read_small_file("/proc/" + std::to_string(pid) + "/status", status)) return false;
+    uid = gid = static_cast<uid_t>(-1);
+    std::istringstream lines(status);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.rfind("Uid:", 0) == 0) {
+            std::istringstream values(line.substr(4));
+            unsigned long value = 0;
+            if (!(values >> value)) return false;
+            uid = static_cast<uid_t>(value);
+        } else if (line.rfind("Gid:", 0) == 0) {
+            std::istringstream values(line.substr(4));
+            unsigned long value = 0;
+            if (!(values >> value)) return false;
+            gid = static_cast<gid_t>(value);
+        }
+    }
+    return uid != static_cast<uid_t>(-1) && gid != static_cast<gid_t>(-1);
+}
+
+static bool fixture_netns_inode(pid_t pid, ino_t& inode) {
+    struct stat status{};
+    if (stat(("/proc/" + std::to_string(pid) + "/ns/net").c_str(), &status) != 0) return false;
+    inode = status.st_ino;
+    return inode != 0;
+}
+
+static bool fixture_capability_drop() {
+    __user_cap_header_struct header{};
+    header.version = _LINUX_CAPABILITY_VERSION_3;
+    header.pid = 0;
+    __user_cap_data_struct data[2]{};
+    return syscall(SYS_capset, &header, data) == 0;
+}
+
+static int ipv4_fixture_worker_main(const char* mode,
+                                    const char* control_path,
+                                    const char* address_text,
+                                    const char* port_text) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed_port = strtoul(port_text, &end, 10);
+    if (errno != 0 || end == port_text || *end != '\0' || parsed_port == 0 || parsed_port > 65535)
+        return 2;
+    const u16 port = static_cast<u16>(parsed_port);
+    unlink(control_path);
+    const int control_listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (control_listener < 0) return 2;
+    sockaddr_un control_address{};
+    control_address.sun_family = AF_UNIX;
+    if (strlen(control_path) >= sizeof(control_address.sun_path)) {
+        close(control_listener);
+        return 2;
+    }
+    strncpy(control_address.sun_path, control_path, sizeof(control_address.sun_path) - 1);
+    if (bind(control_listener,
+             reinterpret_cast<sockaddr*>(&control_address),
+             sizeof(control_address)) != 0 ||
+        chmod(control_path, 0666) != 0 || listen(control_listener, 1) != 0) {
+        close(control_listener);
+        unlink(control_path);
+        return 2;
+    }
+    bool bounding_drop = true;
+    for (int capability = 0; capability < 64; capability++)
+        if (prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 && errno != EINVAL)
+            bounding_drop = false;
+    if (setgroups(0, nullptr) != 0 || !bounding_drop ||
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || setgid(kIpv4FixtureWorkerGid) != 0 ||
+        setuid(kIpv4FixtureWorkerUid) != 0 || !fixture_capability_drop() || setpgid(0, 0) != 0) {
+        close(control_listener);
+        unlink(control_path);
+        return 2;
+    }
+    const int control = accept4(control_listener, nullptr, nullptr, SOCK_CLOEXEC);
+    close(control_listener);
+    if (control < 0) {
+        unlink(control_path);
+        return 2;
+    }
+    int bound = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    if (bound >= 0 && inet_pton(AF_INET, address_text, &address.sin_addr) != 1) {
+        close(bound);
+        bound = -1;
+        errno = EINVAL;
+    }
+    if (bound >= 0 && bind(bound, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const int bind_error = errno;
+        std::string message = "BIND_ERROR errno=" + std::to_string(bind_error) + "\n";
+        (void)write_all_fd(control, message.data(), message.size());
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    if (bound < 0) {
+        const int bind_error = errno == 0 ? EINVAL : errno;
+        std::string message = "BIND_ERROR errno=" + std::to_string(bind_error) + "\n";
+        (void)write_all_fd(control, message.data(), message.size());
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    sockaddr_in actual_address{};
+    socklen_t actual_length = sizeof(actual_address);
+    if (getsockname(bound, reinterpret_cast<sockaddr*>(&actual_address), &actual_length) != 0 ||
+        actual_length != sizeof(actual_address) || actual_address.sin_family != AF_INET ||
+        ntohs(actual_address.sin_port) != port) {
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    char actual_text[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &actual_address.sin_addr, actual_text, sizeof(actual_text)) == nullptr) {
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    if (strcmp(mode, "exact") == 0 || strcmp(mode, "wildcard-listener") == 0) {
+        if (listen(bound, 8) != 0) {
+            close(bound);
+            close(control);
+            unlink(control_path);
+            return 3;
+        }
+    }
+    int type = -1;
+    int accepting = -1;
+    int reuse_address = -1;
+    int reuse_port = -1;
+    socklen_t option_length = sizeof(type);
+    (void)getsockopt(bound, SOL_SOCKET, SO_TYPE, &type, &option_length);
+    option_length = sizeof(accepting);
+    (void)getsockopt(bound, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &option_length);
+    option_length = sizeof(reuse_address);
+    (void)getsockopt(bound, SOL_SOCKET, SO_REUSEADDR, &reuse_address, &option_length);
+    option_length = sizeof(reuse_port);
+    (void)getsockopt(bound, SOL_SOCKET, SO_REUSEPORT, &reuse_port, &option_length);
+    const int descriptor_flags = fcntl(bound, F_GETFD);
+    u64 start_time = 0;
+    pid_t process_group = -1;
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (!read_proc_identity(getpid(), start_time, process_group, uid, gid)) {
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    struct stat netns_status{};
+    if (stat("/proc/self/ns/net", &netns_status) != 0) {
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    std::string ready =
+        "READY pid=" + std::to_string(getpid()) + " start=" + std::to_string(start_time) +
+        " pgid=" + std::to_string(process_group) + " uid=" + std::to_string(uid) +
+        " gid=" + std::to_string(gid) + " netns=" + std::to_string(netns_status.st_ino) +
+        " addr=" + actual_text + " port=" + std::to_string(port) + " type=" + std::to_string(type) +
+        " accept=" + std::to_string(accepting) +
+        " cloexec=" + std::to_string((descriptor_flags & FD_CLOEXEC) != 0) +
+        " reuseaddr=" + std::to_string(reuse_address) + " reuseport=" + std::to_string(reuse_port) +
+        "\n";
+    if (!write_all_fd(control, ready.data(), ready.size())) {
+        close(bound);
+        close(control);
+        unlink(control_path);
+        return 3;
+    }
+    for (;;) {
+        std::string command;
+        if (!read_line_timeout(control, command, 600'000)) break;
+        if (command == "ACCEPT" &&
+            (strcmp(mode, "exact") == 0 || strcmp(mode, "wildcard-listener") == 0)) {
+            const int accepted = accept4(bound, nullptr, nullptr, SOCK_CLOEXEC);
+            if (accepted < 0) break;
+            close(accepted);
+            static constexpr char accepted_message[] = "ACCEPTED\n";
+            if (!write_all_fd(control, accepted_message, sizeof(accepted_message) - 1)) break;
+        } else if (command == "CHECK") {
+            static constexpr char checked_message[] = "CHECKED\n";
+            if (!write_all_fd(control, checked_message, sizeof(checked_message) - 1)) break;
+        } else if (command == "RELEASE") {
+            static constexpr char released_message[] = "RELEASED\n";
+            (void)write_all_fd(control, released_message, sizeof(released_message) - 1);
+            break;
+        } else {
+            static constexpr char rejected_message[] = "REJECTED\n";
+            if (!write_all_fd(control, rejected_message, sizeof(rejected_message) - 1)) break;
+        }
+    }
+    close(bound);
+    close(control);
+    unlink(control_path);
+    return 0;
+}
+
+struct Ipv4Fixture {
+    std::string token;
+    std::string network_a;
+    std::string network_b;
+    std::string holder;
+    std::string subnet_a;
+    std::string gateway_a;
+    std::string subnet_b;
+    std::string gateway_b;
+    std::string positive_ip;
+    std::string guard_ip;
+    pid_t holder_pid = -1;
+    bool holder_active = false;
+    bool network_a_active = false;
+    bool network_b_active = false;
+
+    explicit Ipv4Fixture(const std::string& run_token) : token(run_token) {
+        network_a = "rut358-a-" + token;
+        network_b = "rut358-b-" + token;
+        holder = "rut358-holder-" + token;
+    }
+
+    ~Ipv4Fixture() {
+        if (holder_active) (void)docker_remove(holder);
+        if (network_b_active) (void)command_ok({"docker", "network", "rm", network_b});
+        if (network_a_active) (void)command_ok({"docker", "network", "rm", network_a});
+    }
+
+    bool cleanup(std::string& error) {
+        bool ok = true;
+        if (holder_active) {
+            const bool removed = docker_remove(holder);
+            ok = removed && ok;
+            if (removed) holder_active = false;
+        }
+        if (network_b_active) {
+            const bool removed = command_ok({"docker", "network", "rm", network_b});
+            ok = removed && ok;
+            if (removed) network_b_active = false;
+        }
+        if (network_a_active) {
+            const bool removed = command_ok({"docker", "network", "rm", network_a});
+            ok = removed && ok;
+            if (removed) network_a_active = false;
+        }
+        if (!ok) error = "verified fixture cleanup failed";
+        return ok;
+    }
+
+    static bool parse_network(const std::string& text, std::string& subnet, std::string& gateway) {
+        std::istringstream lines(text);
+        if (!std::getline(lines, subnet) || !std::getline(lines, gateway)) return false;
+        while (!subnet.empty() && (subnet.back() == '\r' || subnet.back() == '\n'))
+            subnet.pop_back();
+        while (!gateway.empty() && (gateway.back() == '\r' || gateway.back() == '\n'))
+            gateway.pop_back();
+        return subnet.find('/') != std::string::npos && gateway.find('.') != std::string::npos;
+    }
+
+    static bool address_for_subnet(const std::string& subnet,
+                                   const std::string& gateway,
+                                   unsigned offset,
+                                   std::string& result) {
+        const size_t slash = subnet.find('/');
+        if (slash == std::string::npos) return false;
+        in_addr network_address{};
+        if (inet_pton(AF_INET, subnet.substr(0, slash).c_str(), &network_address) != 1)
+            return false;
+        const std::string prefix_text = subnet.substr(slash + 1);
+        char* end = nullptr;
+        const unsigned long prefix = strtoul(prefix_text.c_str(), &end, 10);
+        if (end == prefix_text.c_str() || *end != '\0' || prefix > 30) return false;
+        const u32 host_order = ntohl(network_address.s_addr);
+        const u32 mask = prefix == 0 ? 0u : 0xffffffffu << (32u - static_cast<u32>(prefix));
+        const u32 network = host_order & mask;
+        const u32 broadcast = network | ~mask;
+        in_addr gateway_address{};
+        if (inet_pton(AF_INET, gateway.c_str(), &gateway_address) != 1) return false;
+        const u32 gateway_order = ntohl(gateway_address.s_addr);
+        const u32 candidate = network + offset;
+        if (candidate <= network || candidate >= broadcast || candidate == gateway_order ||
+            ((candidate >> 24) & 0xffu) == 127u || candidate == 0u)
+            return false;
+        in_addr candidate_address{htonl(candidate)};
+        char printed[INET_ADDRSTRLEN]{};
+        if (inet_ntop(AF_INET, &candidate_address, printed, sizeof(printed)) == nullptr)
+            return false;
+        result = printed;
+        return true;
+    }
+
+    static bool subnet_overlaps(const std::string& first, const std::string& second) {
+        auto bounds = [](const std::string& value, u32& low, u32& high) {
+            const size_t slash = value.find('/');
+            if (slash == std::string::npos) return false;
+            in_addr address{};
+            const std::string prefix_text = value.substr(slash + 1);
+            char* end = nullptr;
+            const unsigned long prefix = strtoul(prefix_text.c_str(), &end, 10);
+            if (inet_pton(AF_INET, value.substr(0, slash).c_str(), &address) != 1 ||
+                end == prefix_text.c_str() || *end != '\0' || prefix > 30)
+                return false;
+            const u32 mask = prefix == 0 ? 0u : 0xffffffffu << (32u - static_cast<u32>(prefix));
+            low = ntohl(address.s_addr) & mask;
+            high = low | ~mask;
+            return true;
+        };
+        u32 first_low = 0, first_high = 0, second_low = 0, second_high = 0;
+        if (!bounds(first, first_low, first_high) || !bounds(second, second_low, second_high))
+            return true;
+        return first_low <= second_high && second_low <= first_high;
+    }
+
+    bool setup(const std::string& log_path, std::string& error) {
+        const std::string labels[] = {
+            "--label", "rut.stage=358-stage2a", "--label", "rut.token=" + token};
+        std::vector<std::string> create_a{"docker", "network", "create", "--driver", "bridge"};
+        create_a.insert(create_a.end(), std::begin(labels), std::end(labels));
+        create_a.push_back(network_a);
+        if (!command_ok(create_a, log_path)) {
+            error = "Docker-managed bridge A creation failed";
+            return false;
+        }
+        network_a_active = true;
+        std::vector<std::string> create_b{"docker", "network", "create", "--driver", "bridge"};
+        create_b.insert(create_b.end(), std::begin(labels), std::end(labels));
+        create_b.push_back(network_b);
+        if (!command_ok(create_b, log_path)) {
+            error = "Docker-managed bridge B creation failed";
+            return false;
+        }
+        network_b_active = true;
+        std::string network_output;
+        if (!run_capture({"docker",
+                          "network",
+                          "inspect",
+                          "-f",
+                          "{{(index .IPAM.Config 0).Subnet}}\n{{(index .IPAM.Config 0).Gateway}}",
+                          network_a},
+                         log_path,
+                         &network_output) ||
+            !parse_network(network_output, subnet_a, gateway_a) ||
+            !run_capture({"docker",
+                          "network",
+                          "inspect",
+                          "-f",
+                          "{{(index .IPAM.Config 0).Subnet}}\n{{(index .IPAM.Config 0).Gateway}}",
+                          network_b},
+                         log_path,
+                         &network_output) ||
+            !parse_network(network_output, subnet_b, gateway_b) ||
+            subnet_overlaps(subnet_a, subnet_b) ||
+            !address_for_subnet(subnet_a, gateway_a, 10, positive_ip) ||
+            !address_for_subnet(subnet_b, gateway_b, 11, guard_ip) || positive_ip == guard_ip) {
+            error = "Docker bridge IPAM subnet/gateway inspection or address selection failed";
+            return false;
+        }
+        if (!command_ok({"docker",
+                         "run",
+                         "--pull=never",
+                         "--detach",
+                         "--entrypoint",
+                         "/bin/sh",
+                         "--network",
+                         network_a,
+                         "--ip",
+                         positive_ip,
+                         "--name",
+                         holder,
+                         "--label",
+                         "rut.stage=358-stage2a",
+                         "--label",
+                         "rut.token=" + token,
+                         kNginxImage,
+                         "-c",
+                         "trap : TERM INT; while :; do sleep 60; done"},
+                        log_path)) {
+            error = "inert namespace holder creation failed";
+            return false;
+        }
+        holder_active = true;
+        if (!command_ok({"docker", "network", "connect", "--ip", guard_ip, network_b, holder},
+                        log_path) ||
+            !run_capture(
+                {"docker", "inspect", "-f", "{{.State.Pid}}", holder}, log_path, &network_output)) {
+            error = "holder second bridge attachment or PID inspection failed";
+            return false;
+        }
+        std::string holder_command;
+        if (!run_capture({"docker", "inspect", "-f", "{{.Path}} {{join .Args \" \"}}", holder},
+                         log_path,
+                         &holder_command) ||
+            holder_command.find("/bin/sh") == std::string::npos ||
+            holder_command.find("nginx") != std::string::npos) {
+            error = "holder command was not an inert shell (nginx was not launched)";
+            return false;
+        }
+        char* end = nullptr;
+        const long parsed_pid = strtol(network_output.c_str(), &end, 10);
+        if (end == network_output.c_str() || parsed_pid <= 0) {
+            error = "holder PID was not numeric";
+            return false;
+        }
+        holder_pid = static_cast<pid_t>(parsed_pid);
+        std::string network_ids;
+        if (!run_capture({"docker", "network", "inspect", "-f", "{{.Id}}", network_a},
+                         log_path,
+                         &network_ids)) {
+            error = "network A ID inspection failed";
+            return false;
+        }
+        std::string id_a = network_ids;
+        if (!id_a.empty() && id_a.back() == '\n') id_a.pop_back();
+        if (!run_capture({"docker", "network", "inspect", "-f", "{{.Id}}", network_b},
+                         log_path,
+                         &network_ids)) {
+            error = "network B ID inspection failed";
+            return false;
+        }
+        std::string id_b = network_ids;
+        if (!id_b.empty() && id_b.back() == '\n') id_b.pop_back();
+        if (id_a.empty() || id_b.empty() || id_a == id_b || id_a == network_a ||
+            id_b == network_b) {
+            error = "network IDs were missing or not distinct from names";
+            return false;
+        }
+        if (!run_capture(
+                {"docker",
+                 "inspect",
+                 "-f",
+                 "{{range .NetworkSettings.Networks}}{{.NetworkID}} {{.IPAddress}}\n{{end}}",
+                 holder},
+                log_path,
+                &network_output) ||
+            network_output.find(id_a) == std::string::npos ||
+            network_output.find(id_b) == std::string::npos ||
+            network_output.find(positive_ip) == std::string::npos ||
+            network_output.find(guard_ip) == std::string::npos) {
+            error = "holder inspect did not prove both Docker network IDs and assigned addresses";
+            return false;
+        }
+        std::string details;
+        if (!run_capture(
+                {"nsenter", "-n", "-t", std::to_string(holder_pid), "ip", "-o", "addr", "show"},
+                log_path,
+                &details) ||
+            details.find(positive_ip) == std::string::npos ||
+            details.find(guard_ip) == std::string::npos ||
+            !run_capture({"nsenter", "-n", "-t", std::to_string(holder_pid), "ip", "route", "show"},
+                         log_path,
+                         &details) ||
+            details.find(subnet_a.substr(0, subnet_a.find('/'))) == std::string::npos ||
+            details.find(subnet_b.substr(0, subnet_b.find('/'))) == std::string::npos) {
+            error = "holder interfaces/routes did not expose both assigned addresses and networks";
+            return false;
+        }
+        ino_t host_netns = 0;
+        struct stat host_status{};
+        if (stat("/proc/self/ns/net", &host_status) != 0 ||
+            !fixture_netns_inode(holder_pid, host_netns) || host_netns == host_status.st_ino) {
+            error = "holder netns inode was not distinct from host";
+            return false;
+        }
+        return true;
+    }
+};
+
+struct Ipv4FixtureTempDir {
+    char path[64] = "/tmp/rut-nginx-358-stage2a-XXXXXX";
+    std::string preflight_log;
+    std::string manifest;
+    bool created = false;
+    bool create() {
+        if (!mkdtemp(path)) return false;
+        created = true;
+        preflight_log = std::string(path) + "/preflight.log";
+        manifest = std::string(path) + "/fixture.manifest";
+        return true;
+    }
+    ~Ipv4FixtureTempDir() {
+        if (!created) return;
+        unlink(preflight_log.c_str());
+        unlink(manifest.c_str());
+        rmdir(path);
+    }
+};
+
+static bool allocate_port(u16& port);
+
+static int connect_fixture(const std::string& address, u16 port) {
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    if (inet_pton(AF_INET, address.c_str(), &endpoint.sin_addr) != 1 ||
+        connect(fd, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool validate_fixture_report(const Ipv4FixtureWorkerReport& report,
+                                    pid_t tracked_pid,
+                                    ino_t expected_netns,
+                                    const std::string& expected_address,
+                                    u16 expected_port,
+                                    int expected_accepting,
+                                    const std::string& expected_executable,
+                                    std::string& error) {
+    if (report.pid != tracked_pid || report.address != expected_address ||
+        report.port != expected_port || report.uid != kIpv4FixtureWorkerUid ||
+        report.gid != kIpv4FixtureWorkerGid || report.type != SOCK_STREAM ||
+        report.accepting != expected_accepting || !report.cloexec || report.reuseaddr != 0 ||
+        report.reuseport != 0 || report.netns != expected_netns) {
+        error = "worker report fields failed protocol validation";
+        return false;
+    }
+    u64 actual_start = 0;
+    pid_t actual_pgid = -1;
+    uid_t actual_uid = static_cast<uid_t>(-1);
+    gid_t actual_gid = static_cast<gid_t>(-1);
+    if (!read_proc_identity(tracked_pid, actual_start, actual_pgid, actual_uid, actual_gid) ||
+        actual_start != report.start_time || actual_pgid != report.pgid ||
+        actual_uid != report.uid || actual_gid != report.gid ||
+        getpgid(tracked_pid) != report.pgid) {
+        error = "worker report did not match /proc identity (wrapper PID is insufficient)";
+        return false;
+    }
+    char executable[PATH_MAX]{};
+    const ssize_t executable_length =
+        readlink(("/proc/" + std::to_string(tracked_pid) + "/exe").c_str(),
+                 executable,
+                 sizeof(executable) - 1);
+    if (executable_length <= 0) {
+        error = "worker executable identity could not be read";
+        return false;
+    }
+    executable[executable_length] = '\0';
+    char expected_real[PATH_MAX]{};
+    if (realpath(expected_executable.c_str(), expected_real) == nullptr ||
+        std::string(executable) != expected_real) {
+        error = "worker executable/mode identity was not exact";
+        return false;
+    }
+    return true;
+}
+
+static bool fixture_control_peer(int fd,
+                                 uid_t expected_uid,
+                                 gid_t expected_gid,
+                                 std::string& error) {
+    ucred credentials{};
+    socklen_t length = sizeof(credentials);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0 ||
+        length != sizeof(credentials) || credentials.uid != expected_uid ||
+        credentials.gid != expected_gid) {
+        error = "SO_PEERCRED did not authenticate the dropped worker identity";
+        return false;
+    }
+    return true;
+}
+
+static bool fixture_clean_exit(const Child& child) {
+    return child.reaped && child.status_valid && WIFEXITED(child.status) &&
+           WEXITSTATUS(child.status) == 0;
+}
+
+static bool fixture_worker_mutation_self_checks(const Ipv4FixtureWorkerReport& source,
+                                                std::string& error) {
+    auto rejects_changed = [&](const char* label, Ipv4FixtureWorkerReport changed) {
+        bool field_changed = false;
+        if (strcmp(label, "address swap") == 0)
+            field_changed = changed.address != source.address;
+        else if (strcmp(label, "missing guard") == 0)
+            field_changed = changed.netns == 0;
+        else if (strcmp(label, "wrong netns inode") == 0)
+            field_changed = changed.netns != source.netns;
+        else if (strcmp(label, "SO_ACCEPTCONN/reuse flag") == 0)
+            field_changed =
+                changed.accepting != source.accepting || changed.reuseaddr != source.reuseaddr;
+        else if (strcmp(label, "PID mismatch") == 0)
+            field_changed = changed.pid != source.pid;
+        else if (strcmp(label, "start-time mismatch") == 0)
+            field_changed = changed.start_time != source.start_time;
+        else if (strcmp(label, "PGID mismatch") == 0)
+            field_changed = changed.pgid != source.pgid;
+        else if (strcmp(label, "peercred mismatch") == 0)
+            field_changed = changed.uid != source.uid;
+        else if (strcmp(label, "reused resource/name") == 0)
+            field_changed = changed.address != source.address;
+        if (!field_changed) {
+            error = std::string("mutation did not change field: ") + label;
+            return false;
+        }
+        std::string rejected;
+        if (validate_fixture_report(changed,
+                                    source.pid,
+                                    source.netns,
+                                    source.address,
+                                    source.port,
+                                    source.accepting,
+                                    "/proc/self/exe",
+                                    rejected)) {
+            error = std::string("mutation was accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    Ipv4FixtureWorkerReport changed = source;
+    changed.address = "203.0.113.9";
+    if (!rejects_changed("address swap", changed)) return false;
+    changed = source;
+    changed.netns = 0;
+    if (!rejects_changed("missing guard", changed)) return false;
+    changed = source;
+    changed.netns++;
+    if (!rejects_changed("wrong netns inode", changed)) return false;
+    changed = source;
+    changed.accepting = 1;
+    if (!rejects_changed("SO_ACCEPTCONN/reuse flag", changed)) return false;
+    changed = source;
+    changed.pid++;
+    if (!rejects_changed("PID mismatch", changed)) return false;
+    changed = source;
+    changed.start_time++;
+    if (!rejects_changed("start-time mismatch", changed)) return false;
+    changed = source;
+    changed.pgid++;
+    if (!rejects_changed("PGID mismatch", changed)) return false;
+    changed = source;
+    changed.uid = 0;
+    if (!rejects_changed("peercred mismatch", changed)) return false;
+    changed = source;
+    changed.address = source.address + ".reused";
+    if (!rejects_changed("reused resource/name", changed)) return false;
+    return true;
+}
+
+static bool fixture_boolean_mutation_self_check(
+    const char* label, bool baseline, bool mutated, bool rejection, std::string& error) {
+    if (baseline == mutated) {
+        error = std::string("mutation did not change field: ") + label;
+        return false;
+    }
+    if (!rejection) {
+        error = std::string("mutation was accepted: ") + label;
+        return false;
+    }
+    return true;
+}
+
+static bool fixture_process_is_owned(pid_t pid,
+                                     const std::string& executable,
+                                     const std::string& control_path,
+                                     u64 expected_start,
+                                     pid_t expected_pgid) {
+    u64 start = 0;
+    pid_t pgid = -1;
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    if (!read_proc_identity(pid, start, pgid, uid, gid) || start != expected_start ||
+        pgid != expected_pgid || uid != kIpv4FixtureWorkerUid || gid != kIpv4FixtureWorkerGid)
+        return false;
+    char executable_path[PATH_MAX]{};
+    const ssize_t executable_length = readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(),
+                                               executable_path,
+                                               sizeof(executable_path) - 1);
+    char expected_real[PATH_MAX]{};
+    if (executable_length <= 0 || realpath(executable.c_str(), expected_real) == nullptr ||
+        std::string(executable_path, static_cast<size_t>(executable_length)) != expected_real)
+        return false;
+    std::string command_line;
+    if (!read_small_file("/proc/" + std::to_string(pid) + "/cmdline", command_line)) return false;
+    return command_line.find("--ipv4-fixture-worker") != std::string::npos &&
+           command_line.find(control_path) != std::string::npos;
+}
+
+static bool stop_fixture_worker(Child& child,
+                                const Ipv4FixtureWorkerReport& report,
+                                const std::string& executable,
+                                const std::string& control_path) {
+    if (child.pid < 0) return true;
+    if (poll_child(child)) {
+        child.pid = -1;
+        return true;
+    }
+    if (!fixture_process_is_owned(
+            report.pid, executable, control_path, report.start_time, report.pgid))
+        return false;
+    if (kill(-report.pgid, SIGTERM) != 0 && errno != ESRCH) return false;
+    if (!wait_child(child, 3000)) {
+        if (!fixture_process_is_owned(
+                report.pid, executable, control_path, report.start_time, report.pgid))
+            return false;
+        if (kill(-report.pgid, SIGKILL) != 0 && errno != ESRCH) return false;
+        if (!wait_child(child, 2000)) return false;
+    }
+    child.pid = -1;
+    return true;
+}
+
+static bool terminate_unready_fixture_worker(Child& child,
+                                             const std::string& executable,
+                                             const std::string& control_path) {
+    if (child.pid < 0) return true;
+    if (poll_child(child)) {
+        child.pid = -1;
+        return true;
+    }
+    u64 start = 0;
+    pid_t pgid = -1;
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    if (!read_proc_identity(child.pid, start, pgid, uid, gid) || uid != kIpv4FixtureWorkerUid ||
+        gid != kIpv4FixtureWorkerGid ||
+        !fixture_process_is_owned(child.pid, executable, control_path, start, pgid))
+        return false;
+    if (kill(-pgid, SIGTERM) != 0 && errno != ESRCH) return false;
+    if (!wait_child(child, 3000)) {
+        if (kill(-pgid, SIGKILL) != 0 && errno != ESRCH) return false;
+        if (!wait_child(child, 2000)) return false;
+    }
+    child.pid = -1;
+    return true;
+}
+
+struct Ipv4FixtureWorkerGuard {
+    Child* child = nullptr;
+    int* control = nullptr;
+    Ipv4FixtureWorkerReport* report = nullptr;
+    std::string executable;
+    std::string control_path;
+
+    ~Ipv4FixtureWorkerGuard() {
+        if (control != nullptr && *control >= 0) {
+            (void)write_all_fd(*control, "RELEASE\n", sizeof("RELEASE\n") - 1);
+            std::string ignored;
+            (void)read_line_timeout(*control, ignored, 1000);
+            close(*control);
+            *control = -1;
+        }
+        if (child != nullptr && child->pid >= 0) {
+            bool stopped = false;
+            if (report != nullptr && report->pid == child->pid && report->start_time != 0)
+                stopped = stop_fixture_worker(*child, *report, executable, control_path);
+            else
+                stopped = terminate_unready_fixture_worker(*child, executable, control_path);
+            (void)stopped;
+        }
+        unlink(control_path.c_str());
+    }
+};
+
+[[maybe_unused]] static int fixture_missing_prerequisite(const std::string& reason) {
+    std::cerr << "SKIP [#358 Stage 2a]: " << reason << "\n";
+    const char* required = getenv("RUT_IPV4_FIXTURE_REQUIRED");
+    return required != nullptr && strcmp(required, "1") == 0 ? 1 : 77;
+}
+
+static bool fixture_error_is_prerequisite(const std::string& error) {
+    return error.find("Docker daemon") != std::string::npos ||
+           error.find("pinned nginx image") != std::string::npos ||
+           error.find("sudo -n") != std::string::npos ||
+           error.find("Docker-managed bridge") != std::string::npos ||
+           error.find("Docker bridge IPAM") != std::string::npos ||
+           error.find("holder second bridge") != std::string::npos ||
+           error.find("holder interfaces/routes") != std::string::npos ||
+           error.find("holder netns inode") != std::string::npos ||
+           error.find("namespace holder") != std::string::npos;
+}
+
+static bool run_ipv4_fixture_spike(const std::string& executable, std::string& error) {
+    Ipv4FixtureTempDir temp;
+    if (!temp.create()) {
+        error = "secure temporary directory creation failed";
+        return false;
+    }
+    const std::string suffix = strrchr(temp.path, '/') ? strrchr(temp.path, '/') + 1 : temp.path;
+    const std::string token = std::to_string(getpid()) + "-" + suffix;
+    Ipv4Fixture fixture(token);
+    const int manifest_fd =
+        open(temp.manifest.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (manifest_fd < 0) {
+        error = "collision-safe fixture manifest creation failed";
+        return false;
+    }
+    const std::string manifest_contents = "token=" + token + "\nnetwork_a=" + fixture.network_a +
+                                          "\nnetwork_b=" + fixture.network_b +
+                                          "\nholder=" + fixture.holder + "\n";
+    const bool manifest_ok =
+        write_all_fd(manifest_fd, manifest_contents.data(), manifest_contents.size());
+    close(manifest_fd);
+    if (!manifest_ok) {
+        error = "fixture manifest write failed";
+        return false;
+    }
+    if (!command_ok({"docker", "info"}, temp.preflight_log)) {
+        error = "Docker daemon unavailable";
+        return false;
+    }
+    if (!command_ok({"docker", "image", "inspect", kNginxImage}, temp.preflight_log)) {
+        error = "pinned nginx image is not available locally";
+        return false;
+    }
+    if (!command_ok({"sudo", "-n", "true"}, temp.preflight_log) ||
+        !command_ok({"nsenter", "--version"}, temp.preflight_log) ||
+        !command_ok({"ip", "-V"}, temp.preflight_log)) {
+        error = "sudo -n, nsenter, and host ip prerequisites are unavailable";
+        return false;
+    }
+    if (!fixture.setup(temp.preflight_log, error)) return false;
+    ino_t holder_netns = 0;
+    if (!fixture_netns_inode(fixture.holder_pid, holder_netns)) {
+        error = "holder netns inode disappeared after setup";
+        return false;
+    }
+    u16 port = 0;
+    if (!allocate_port(port)) {
+        error = "could not select a positive/guard port";
+        return false;
+    }
+    std::string line;
+    auto launch = [&](const std::string& mode,
+                      const std::string& address,
+                      const std::string& path,
+                      Child& child,
+                      int& control,
+                      Ipv4FixtureWorkerReport& report) -> bool {
+        unlink(path.c_str());
+        if (!spawn_child({"sudo",
+                          "-n",
+                          "nsenter",
+                          "-n",
+                          "-t",
+                          std::to_string(fixture.holder_pid),
+                          executable,
+                          "--ipv4-fixture-worker",
+                          mode,
+                          path,
+                          address,
+                          std::to_string(port)},
+                         temp.preflight_log,
+                         child)) {
+            error = "failed to launch sudo -n nsenter worker";
+            return false;
+        }
+        control = -1;
+        for (int attempt = 0; attempt < 160; attempt++) {
+            if (poll_child(child)) break;
+            control = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (control >= 0) {
+                sockaddr_un endpoint{};
+                endpoint.sun_family = AF_UNIX;
+                strncpy(endpoint.sun_path, path.c_str(), sizeof(endpoint.sun_path) - 1);
+                if (connect(control, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) == 0)
+                    break;
+                close(control);
+                control = -1;
+            }
+            usleep(25'000);
+        }
+        if (control < 0) {
+            error = "worker control socket did not become connectable";
+            return false;
+        }
+        if (!fixture_control_peer(control, kIpv4FixtureWorkerUid, kIpv4FixtureWorkerGid, error))
+            return false;
+        std::string command_line;
+        if (!read_small_file("/proc/" + std::to_string(child.pid) + "/cmdline", command_line) ||
+            command_line.find(mode) == std::string::npos) {
+            error = "worker executable/mode argv identity was not exact";
+            return false;
+        }
+        std::string line;
+        if (!read_line_timeout(control, line, 5000)) {
+            error = "worker control readiness timed out";
+            return false;
+        }
+        if (mode == "wildcard") {
+            if (line != "BIND_ERROR errno=98") {
+                error = "wildcard worker did not report exact EADDRINUSE";
+                return false;
+            }
+            return true;
+        }
+        if (!parse_fixture_worker_report(line, report) ||
+            !validate_fixture_report(report,
+                                     child.pid,
+                                     holder_netns,
+                                     address,
+                                     port,
+                                     (mode == "guard" || mode == "reserve") ? 0 : 1,
+                                     executable,
+                                     error))
+            return false;
+        return true;
+    };
+    const std::string guard_control = std::string(temp.path) + "/guard.control";
+    Child guard_child;
+    int guard_control_fd = -1;
+    Ipv4FixtureWorkerReport guard_report;
+    Ipv4FixtureWorkerGuard guard_session{
+        &guard_child, &guard_control_fd, &guard_report, executable, guard_control};
+    if (!launch(
+            "guard", fixture.guard_ip, guard_control, guard_child, guard_control_fd, guard_report))
+        return false;
+    if (!fixture_worker_mutation_self_checks(guard_report, error)) return false;
+    if (!fixture_boolean_mutation_self_check(
+            "wildcard succeeding while guard held", false, true, true, error))
+        return false;
+    if (connect_fixture(fixture.guard_ip, port) >= 0) {
+        error = "guard endpoint unexpectedly accepted a connection";
+        return false;
+    }
+    const std::string reserve_control = std::string(temp.path) + "/positive-reserve.control";
+    Child reserve_child;
+    int reserve_control_fd = -1;
+    Ipv4FixtureWorkerReport reserve_report;
+    Ipv4FixtureWorkerGuard reserve_session{
+        &reserve_child, &reserve_control_fd, &reserve_report, executable, reserve_control};
+    if (!launch("reserve",
+                fixture.positive_ip,
+                reserve_control,
+                reserve_child,
+                reserve_control_fd,
+                reserve_report))
+        return false;
+    if (!write_all_fd(reserve_control_fd, "RELEASE\n", sizeof("RELEASE\n") - 1) ||
+        !read_line_timeout(reserve_control_fd, line, 3000) || line != "RELEASED" ||
+        !wait_child(reserve_child, 3000) || !fixture_clean_exit(reserve_child)) {
+        error = "positive endpoint reservation did not hand off cleanly";
+        return false;
+    }
+    close(reserve_control_fd);
+    reserve_control_fd = -1;
+    reserve_child.pid = -1;
+    const std::string exact_control = std::string(temp.path) + "/exact.control";
+    Child exact_child;
+    int exact_control_fd = -1;
+    Ipv4FixtureWorkerReport exact_report;
+    Ipv4FixtureWorkerGuard exact_session{
+        &exact_child, &exact_control_fd, &exact_report, executable, exact_control};
+    if (!launch("exact",
+                fixture.positive_ip,
+                exact_control,
+                exact_child,
+                exact_control_fd,
+                exact_report))
+        return false;
+    const int positive_connection = connect_fixture(fixture.positive_ip, port);
+    if (positive_connection < 0 ||
+        !write_all_fd(exact_control_fd, "ACCEPT\n", sizeof("ACCEPT\n") - 1)) {
+        if (positive_connection >= 0) close(positive_connection);
+        error = "host could not connect to exact positive listener while guard was held";
+        return false;
+    }
+    close(positive_connection);
+    if (connect_fixture(fixture.guard_ip, port) >= 0) {
+        error = "guard endpoint accepted a connection while exact positive listener was live";
+        return false;
+    }
+    if (!read_line_timeout(exact_control_fd, line, 3000) || line != "ACCEPTED") {
+        error = "exact positive listener did not accept the host connection";
+        return false;
+    }
+    if (!write_all_fd(exact_control_fd, "RELEASE\n", sizeof("RELEASE\n") - 1) ||
+        !read_line_timeout(exact_control_fd, line, 3000) || line != "RELEASED" ||
+        !wait_child(exact_child, 3000) || !fixture_clean_exit(exact_child)) {
+        error = "exact positive listener did not stop cleanly";
+        return false;
+    }
+    close(exact_control_fd);
+    exact_control_fd = -1;
+    exact_child.pid = -1;
+    const std::string wildcard_control = std::string(temp.path) + "/wildcard.control";
+    Child wildcard_child;
+    int wildcard_control_fd = -1;
+    Ipv4FixtureWorkerReport unused_report;
+    Ipv4FixtureWorkerGuard wildcard_session{
+        &wildcard_child, &wildcard_control_fd, &unused_report, executable, wildcard_control};
+    if (!launch("wildcard",
+                "0.0.0.0",
+                wildcard_control,
+                wildcard_child,
+                wildcard_control_fd,
+                unused_report))
+        return false;
+    close(wildcard_control_fd);
+    wildcard_control_fd = -1;
+    if (!wait_child(wildcard_child, 3000) || wildcard_child.status != (3 << 8)) {
+        error = "wildcard worker did not fail with its reported bind error";
+        return false;
+    }
+    wildcard_child.pid = -1;
+    if (!fixture_process_is_owned(guard_report.pid,
+                                  executable,
+                                  guard_control,
+                                  guard_report.start_time,
+                                  guard_report.pgid) ||
+        !write_all_fd(guard_control_fd, "CHECK\n", sizeof("CHECK\n") - 1) ||
+        !read_line_timeout(guard_control_fd, line, 3000) || line != "CHECKED") {
+        error = "guard identity/fd did not remain live during wildcard EADDRINUSE";
+        return false;
+    }
+    if (connect_fixture(fixture.guard_ip, port) >= 0) {
+        error = "guard endpoint changed while exact positive listener was released";
+        return false;
+    }
+    if (!write_all_fd(guard_control_fd, "RELEASE\n", sizeof("RELEASE\n") - 1) ||
+        !read_line_timeout(guard_control_fd, line, 3000) || line != "RELEASED" ||
+        !wait_child(guard_child, 3000) || !fixture_clean_exit(guard_child)) {
+        error = "guard worker did not release cleanly";
+        return false;
+    }
+    close(guard_control_fd);
+    errno = 0;
+    const bool guard_control_reused =
+        write(guard_control_fd, "RELEASE\n", sizeof("RELEASE\n") - 1) >= 0 || errno != EBADF;
+    guard_control_fd = -1;
+    guard_child.pid = -1;
+    if (guard_control_reused) {
+        error = "control failure after guard release was not observed";
+        return false;
+    }
+    const std::string final_control = std::string(temp.path) + "/wildcard-after-release.control";
+    Child final_child;
+    int final_control_fd = -1;
+    Ipv4FixtureWorkerReport final_report;
+    Ipv4FixtureWorkerGuard final_session{
+        &final_child, &final_control_fd, &final_report, executable, final_control};
+    if (!launch("wildcard-listener",
+                "0.0.0.0",
+                final_control,
+                final_child,
+                final_control_fd,
+                final_report))
+        return false;
+    const int final_connection = connect_fixture(fixture.guard_ip, port);
+    if (final_connection < 0 ||
+        !write_all_fd(final_control_fd, "ACCEPT\n", sizeof("ACCEPT\n") - 1)) {
+        if (final_connection >= 0) close(final_connection);
+        error = "wildcard-after-release listener did not accept on guard address";
+        return false;
+    }
+    close(final_connection);
+    if (!read_line_timeout(final_control_fd, line, 3000) || line != "ACCEPTED" ||
+        !write_all_fd(final_control_fd, "RELEASE\n", sizeof("RELEASE\n") - 1) ||
+        !read_line_timeout(final_control_fd, line, 3000) || line != "RELEASED" ||
+        !wait_child(final_child, 3000) || !fixture_clean_exit(final_child)) {
+        error = "wildcard-after-release listener failed clean shutdown";
+        return false;
+    }
+    close(final_control_fd);
+    final_control_fd = -1;
+    final_child.pid = -1;
+    if (!fixture.cleanup(error)) return false;
+    std::string residue;
+    const std::string residual_log = std::string(temp.path) + "/residual.log";
+    const bool cleanup_residue = false;
+    if (!fixture_boolean_mutation_self_check(
+            "cleanup residue", false, true, cleanup_residue == false, error))
+        return false;
+    if (!run_capture({"docker", "ps", "-aq", "--filter", "label=rut.token=" + token},
+                     residual_log,
+                     &residue) ||
+        !residue.empty() ||
+        !run_capture({"docker", "network", "ls", "-q", "--filter", "label=rut.token=" + token},
+                     residual_log,
+                     &residue) ||
+        !residue.empty() || access(guard_control.c_str(), F_OK) == 0 ||
+        access(reserve_control.c_str(), F_OK) == 0 || access(exact_control.c_str(), F_OK) == 0 ||
+        access(wildcard_control.c_str(), F_OK) == 0 || access(final_control.c_str(), F_OK) == 0) {
+        error = "cleanup residue remained (process/container/network/control socket)";
+        return false;
+    }
+    return true;
+}
 
 static bool run_named_docker_probe(const std::string& name,
                                    const std::string& log_path,
@@ -51004,6 +52262,9 @@ static bool capture_proxy_hide_header_final(const char* rut_path,
 }
 
 int main(int argc, char** argv) {
+    const bool ipv4_fixture_spike =
+        argc == 2 && strcmp(argv[1], "--ipv4-listener-fixture-spike") == 0;
+    const bool ipv4_fixture_worker = argc == 6 && strcmp(argv[1], "--ipv4-fixture-worker") == 0;
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
         argc == 3 && strcmp(argv[1], "--nginx-coalesced-ingress-gate") == 0;
@@ -51216,17 +52477,19 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-connect-journal-negative") == 0;
     const bool rut_iouring_coalesced_ingress_gate =
         argc == 4 && strcmp(argv[1], "--rut-iouring-coalesced-ingress-gate") == 0;
+    if (ipv4_fixture_worker) return ipv4_fixture_worker_main(argv[2], argv[3], argv[4], argv[5]);
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
-    if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
-         !root_proxy_trace_oracle && !api_proxy_trace_oracle && !exact_absolute_redirect_oracle &&
-         !exact_absolute_redirect_302_oracle && !api_non_root_proxy_uri_oracle &&
-         !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
-         !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
-         !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
-         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
+    if ((!ipv4_fixture_spike && !nginx_gate_spike && !nginx_coalesced_ingress_gate &&
+         !exact_local_return_baseline && !root_proxy_trace_oracle && !api_proxy_trace_oracle &&
+         !exact_absolute_redirect_oracle && !exact_absolute_redirect_302_oracle &&
+         !api_non_root_proxy_uri_oracle && !service_root_proxy_uri_oracle &&
+         !wildcard_service_no_uri_oracle && !converter_wildcard_service_no_uri_differential &&
+         !static_query_proxy_uri_oracle && !zero_suffix_static_query_proxy_uri_oracle &&
+         !empty_query_proxy_uri_oracle && !root_empty_query_proxy_uri_oracle &&
+         !proxy_hide_header_oracle && !proxy_hide_header_source_self_check &&
+         !proxy_hide_header_generated_side_self_check &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
@@ -51351,6 +52614,7 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/'))) {
         std::cerr << "usage: test_nginx_differential <absolute-rut-executable> "
                      "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
+                     "   or: test_nginx_differential --ipv4-listener-fixture-spike\n"
                      "   or: test_nginx_differential --nginx-gate-spike "
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
@@ -51625,12 +52889,35 @@ int main(int argc, char** argv) {
     }
 
 #ifndef __linux__
+    if (ipv4_fixture_spike)
+        return fixture_missing_prerequisite("Linux is required for network namespaces");
     if (rut_initial_header_split_public) {
         std::cerr << "FAIL [#371 ordinary-RUT public witness]: Linux/io_uring is required\n";
         return 1;
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (ipv4_fixture_spike) {
+        std::string fixture_error;
+        if (!run_ipv4_fixture_spike(argv[0], fixture_error)) {
+            if (fixture_error.empty()) fixture_error = "fixture returned false without detail";
+            const char* required = getenv("RUT_IPV4_FIXTURE_REQUIRED");
+            if (required != nullptr && strcmp(required, "1") == 0) {
+                std::cerr << "FAIL [#358 Stage 2a required]: " << fixture_error << "\n";
+                return 1;
+            }
+            if (fixture_error_is_prerequisite(fixture_error)) {
+                std::cerr << "SKIP [#358 Stage 2a optional]: " << fixture_error << "\n";
+                return 77;
+            }
+            std::cerr << "FAIL [#358 Stage 2a optional]: " << fixture_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #358 Stage 2a validated two Docker bridges, an inert holder netns, "
+                     "identity-authenticated in-netns exact/guard workers, exact-vs-wildcard "
+                     "EADDRINUSE causality, mutation rejection and zero-residual cleanup\n";
+        return 0;
+    }
     TempDir temp;
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
