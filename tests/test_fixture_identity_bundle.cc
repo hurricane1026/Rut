@@ -597,10 +597,20 @@ int main() {
                                   std::chrono::steady_clock::now() +
                                       std::chrono::milliseconds(kTransportTimeoutMs)),
                 "send dropped role");
+    const std::array<int, kDroppedFdCount> dropped_source_fds = dropped_source.fds;
+    bool dropped_source_fds_valid = true;
+    for (size_t i = 0; i != dropped_source_fds.size(); ++i) {
+        dropped_source_fds_valid = dropped_source_fds_valid && dropped_source_fds[i] >= 0;
+        for (size_t j = i + 1; j != dropped_source_fds.size(); ++j)
+            dropped_source_fds_valid =
+                dropped_source_fds_valid && dropped_source_fds[i] != dropped_source_fds[j];
+    }
+    ok &= check(dropped_source_fds_valid, "dropped source FD snapshot valid and unique");
     dropped_source.close();
-    for (int fd : dropped_source.fds) {
+    for (int fd : dropped_source_fds) {
         errno = 0;
-        ok &= check(fcntl(fd, F_GETFD) < 0 && errno == EBADF, "dropped source close ownership");
+        ok &= check(fcntl(fd, F_GETFD) < 0 && errno == EBADF,
+                    "dropped exact source FD closed causally");
     }
     ok &= check(receive_dropped_role(dropped_sockets[1],
                                      dropped_received,
