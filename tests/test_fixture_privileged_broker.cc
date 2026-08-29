@@ -87,6 +87,9 @@ static bool endpoint_unchanged(const ParentEndpoint& endpoint);
 static bool endpoint_replacement_self_check(std::string& error);
 static bool bounded_wait_and_signal_self_check(std::string& error);
 static bool group_lease_self_check(std::string& error);
+static bool lease_loss_owner_cascade_self_check(std::string& error);
+static bool launcher_error_order_self_check(std::string& error);
+static bool prelaunch_close_first_self_check(std::string& error);
 static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
@@ -610,32 +613,158 @@ static OwnedReapResult reap_owned_child_bounded(pid_t child) {
     return wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
 }
 
+// This is the same gate used by launcher_main: adopted children are only
+// drained after the direct broker has been positively reaped.
+static bool broker_reap_allows_adopted_drain(OwnedReapResult result) {
+    return result == OwnedReapResult::Reaped;
+}
+
 class OwnedChildCleanup {
 public:
     explicit OwnedChildCleanup(pid_t child,
                                int* downstream_fd = nullptr,
                                bool* cleanup_error = nullptr)
-        : child_(child), downstream_fd_(downstream_fd), cleanup_error_(cleanup_error) {}
+        : child_(child), cleanup_error_(cleanup_error) {
+        if (downstream_fd != nullptr) downstream_fds_.push_back(downstream_fd);
+    }
     OwnedChildCleanup(const OwnedChildCleanup&) = delete;
     OwnedChildCleanup& operator=(const OwnedChildCleanup&) = delete;
     ~OwnedChildCleanup() {
         if (!armed_) return;
-        if (downstream_fd_ != nullptr && *downstream_fd_ >= 0) {
-            close(*downstream_fd_);
-            *downstream_fd_ = -1;
+        for (int* downstream_fd : downstream_fds_) {
+            if (downstream_fd != nullptr && *downstream_fd >= 0) {
+                close(*downstream_fd);
+                *downstream_fd = -1;
+            }
         }
         if (reap_owned_child_bounded(child_) != OwnedReapResult::Reaped &&
             cleanup_error_ != nullptr)
             *cleanup_error_ = true;
     }
+    void add_downstream_fd(int* downstream_fd) {
+        if (downstream_fd != nullptr) downstream_fds_.push_back(downstream_fd);
+    }
     void disarm() { armed_ = false; }
 
 private:
     pid_t child_;
-    int* downstream_fd_;
+    std::vector<int*> downstream_fds_;
     bool* cleanup_error_ = nullptr;
     bool armed_ = true;
 };
+
+static bool lease_loss_owner_cascade_self_check(std::string& error) {
+    int lease_pipe[2] = {-1, -1};
+    int event_pipe[2] = {-1, -1};
+    if (pipe2(lease_pipe, O_CLOEXEC) != 0 || pipe2(event_pipe, O_CLOEXEC) != 0) {
+        if (lease_pipe[0] >= 0) close(lease_pipe[0]);
+        if (lease_pipe[1] >= 0) close(lease_pipe[1]);
+        if (event_pipe[0] >= 0) close(event_pipe[0]);
+        if (event_pipe[1] >= 0) close(event_pipe[1]);
+        error = "lease-loss cascade harness pipe setup failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(lease_pipe[0]);
+        close(lease_pipe[1]);
+        close(event_pipe[0]);
+        close(event_pipe[1]);
+        error = "lease-loss cascade harness fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(lease_pipe[1]);
+        close(event_pipe[0]);
+        char byte = 0;
+        const ssize_t received = read(lease_pipe[0], &byte, 1);
+        close(lease_pipe[0]);
+        const unsigned char eof_seen = received == 0 ? 0xe1 : 0xee;
+        (void)write(event_pipe[1], &eof_seen, 1);
+        close(event_pipe[1]);
+        _exit(received == 0 ? 0 : 1);
+    }
+    close(lease_pipe[0]);
+    close(event_pipe[1]);
+    close(lease_pipe[1]);
+    unsigned char event = 0;
+    const bool downstream_eof = read_exact(event_pipe[0], &event, 1, kCleanupMs) && event == 0xe1;
+    close(event_pipe[0]);
+    const bool reaped = reap_owned_child_bounded(child) == OwnedReapResult::Reaped;
+    if (!downstream_eof || !reaped) {
+        error = "lease-loss cascade did not close downstream before owner reap";
+        return false;
+    }
+    return true;
+}
+
+static bool launcher_error_order_self_check(std::string& error) {
+    for (const OwnedReapResult result :
+         {OwnedReapResult::Reaped, OwnedReapResult::TimedOut, OwnedReapResult::Error}) {
+        std::vector<int> events;
+        bool disarmed = false;
+        events.push_back(1);  // broker bounded reap completed/failed
+        if (broker_reap_allows_adopted_drain(result)) {
+            disarmed = true;
+            events.push_back(2);  // owner guard disarmed only after Reaped
+            events.push_back(3);  // adopted drain
+        }
+        const bool expected = result == OwnedReapResult::Reaped;
+        if (disarmed != expected || (expected && events != std::vector<int>{1, 2, 3}) ||
+            (!expected && events != std::vector<int>{1})) {
+            error = "launcher error cleanup order/disarm decision was unsafe";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool prelaunch_close_first_self_check(std::string& error) {
+    int release_pipe[2] = {-1, -1};
+    int event_pipe[2] = {-1, -1};
+    if (pipe2(release_pipe, O_CLOEXEC) != 0 || pipe2(event_pipe, O_CLOEXEC) != 0) {
+        if (release_pipe[0] >= 0) close(release_pipe[0]);
+        if (release_pipe[1] >= 0) close(release_pipe[1]);
+        if (event_pipe[0] >= 0) close(event_pipe[0]);
+        if (event_pipe[1] >= 0) close(event_pipe[1]);
+        error = "pre-launch close-first harness pipe setup failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(release_pipe[0]);
+        close(release_pipe[1]);
+        close(event_pipe[0]);
+        close(event_pipe[1]);
+        error = "pre-launch close-first harness fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(release_pipe[1]);
+        close(event_pipe[0]);
+        char byte = 0;
+        const ssize_t received = read(release_pipe[0], &byte, 1);
+        close(release_pipe[0]);
+        const unsigned char eof_seen = received == 0 ? 0xc1 : 0xcf;
+        (void)write(event_pipe[1], &eof_seen, 1);
+        close(event_pipe[1]);
+        _exit(received == 0 ? 0 : 1);
+    }
+    close(release_pipe[0]);
+    close(event_pipe[1]);
+    // This models a pre-launch return: close the writer first, then reap the
+    // blocked target.  The target's successful exit is the no-signal proof.
+    close(release_pipe[1]);
+    unsigned char event = 0;
+    const bool downstream_eof = read_exact(event_pipe[0], &event, 1, kCleanupMs) && event == 0xc1;
+    close(event_pipe[0]);
+    const bool reaped = reap_owned_child_bounded(child) == OwnedReapResult::Reaped;
+    if (!downstream_eof || !reaped) {
+        error = "pre-launch writer close did not let blocked target exit naturally";
+        return false;
+    }
+    return true;
+}
 
 static OwnedWaitResult wait_owned_child_bounded(pid_t child,
                                                 const std::string& expected_exe,
@@ -825,6 +954,11 @@ static int dropped_broker_main(const char* executable,
     close(trace_pipe[1]);
     int control = -1;
     OwnedChildCleanup target_cleanup(target, &control);
+    // These are all downstream leases owned by this dropped broker.  Close
+    // them before reaping on every pre-launch return so a blocked target gets
+    // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
+    target_cleanup.add_downstream_fd(&launch_pipe[1]);
+    target_cleanup.add_downstream_fd(&trace_pipe[0]);
     if (!secure_as(caller_uid, caller_gid)) return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
@@ -839,6 +973,7 @@ static int dropped_broker_main(const char* executable,
         write(launch_pipe[1], "L", 1) != 1)
         return 32;
     close(launch_pipe[1]);
+    launch_pipe[1] = -1;
     std::array<unsigned char, 7> trace{};
     if (!read_exact(trace_pipe[0], trace.data(), trace.size(), kHandshakeMs)) return 36;
     char extra = 0;
@@ -847,6 +982,7 @@ static int dropped_broker_main(const char* executable,
         extra_count = read(trace_pipe[0], &extra, 1);
     } while (extra_count < 0 && errno == EINTR);
     close(trace_pipe[0]);
+    trace_pipe[0] = -1;
     if (extra_count != 0 ||
         !send_frame(
             control,
@@ -1090,10 +1226,15 @@ static int launcher_main(const char* executable,
                                  status);
     if (broker_wait_result != OwnedWaitResult::Exited) {
         const OwnedReapResult broker_reap = reap_owned_child_bounded(broker);
+        // Adopted children may only be drained after the direct broker has
+        // been positively reaped.  Keep the owner guard armed on timeout or
+        // wait error; its bounded destructor remains responsible for the
+        // broker and no adopted drain can race a live broker.
+        if (!broker_reap_allows_adopted_drain(broker_reap)) return 15;
         broker_cleanup.disarm();
         const bool drained = drain_adopted_children_until(
             std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 2));
-        return broker_reap == OwnedReapResult::Reaped && drained ? 13 : 15;
+        return drained ? 13 : 15;
     }
     broker_cleanup.disarm();
     // Reap any target adopted after an intentionally early broker death.
@@ -2841,7 +2982,9 @@ int main(int argc, char** argv) {
     const bool required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED") != nullptr &&
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
     if (!pure_protocol_self_checks(error) || !endpoint_replacement_self_check(error) ||
-        !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error)) {
+        !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
+        !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
+        !prelaunch_close_first_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
