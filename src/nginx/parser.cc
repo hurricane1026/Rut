@@ -979,6 +979,11 @@ private:
 
     enum class UrlParseStatus : u8 { Ok, InvalidInteger, InvalidUri, Unsupported };
 
+    static bool parser_proxy_pass_replacement_uri_is_modeled(Str uri) {
+        return (uri.ptr != nullptr && uri.len == 2u && uri.ptr[0] == '/' && uri.ptr[1] == '?') ||
+               proxy_pass_replacement_uri_is_clean(uri);
+    }
+
     static UrlParseStatus parse_url(Str text, Span span, ProxyPass& out) {
         constexpr Str kPrefix = lit_str("http://");
         if (text.len <= kPrefix.len || !text.slice(0, kPrefix.len).eq(kPrefix))
@@ -1013,7 +1018,8 @@ private:
         if (text.ptr[pos] != '/') return UrlParseStatus::InvalidInteger;
         out.uri = text.slice(pos, text.len);
         out.uri_span = Span{span.start + pos, span.end, span.line, span.col + pos};
-        if (!proxy_pass_replacement_uri_is_clean(out.uri)) return UrlParseStatus::InvalidUri;
+        if (!parser_proxy_pass_replacement_uri_is_modeled(out.uri))
+            return UrlParseStatus::InvalidUri;
         out.has_uri = true;
         return UrlParseStatus::Ok;
     }
