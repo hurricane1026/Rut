@@ -33,7 +33,8 @@ jobs:
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/issue358-stage2a3b-logs"
           mkdir -p "$log_dir"
-          touch "$log_dir/direct.log" "$log_dir/ctest.log"
+          touch "$log_dir/topology-direct.log" "$log_dir/topology-ctest.log" \
+            "$log_dir/direct.log" "$log_dir/ctest.log"
           : > "$log_dir/audit.log"
 
       - name: Check out exact WIP head
@@ -146,12 +147,30 @@ jobs:
             -DRUT_ENABLE_JIT=ON \
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
 
-      - name: Build privileged broker fixture only
+      - name: Build topology and privileged broker fixtures only
         id: build
         shell: bash
         run: |
           set -euo pipefail
-          ninja -C build test_fixture_privileged_broker
+          ninja -C build test_ipv4_fixture_topology test_fixture_privileged_broker
+
+      - name: Run required topology fixture directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            timeout --signal=TERM --kill-after=10s 180s \
+              ./build/tests/test_ipv4_fixture_topology 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-direct.log"
+
+      - name: Run required focused topology CTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            ctest --test-dir build --output-on-failure --no-tests=error \
+              -j 1 --timeout 180 -R '^test_ipv4_fixture_topology$' 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-ctest.log"
 
       - name: Run required broker fixture directly
         shell: bash
@@ -163,7 +182,6 @@ jobs:
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/direct.log"
 
       - name: Run required focused CTest
-        if: ${{ always() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -179,12 +197,13 @@ jobs:
           set -euo pipefail
           log_dir="${RUNNER_TEMP}/issue358-stage2a3b-logs"
           mkdir -p "$log_dir"
-          touch "$log_dir/direct.log" "$log_dir/ctest.log"
+          touch "$log_dir/topology-direct.log" "$log_dir/topology-ctest.log" \
+            "$log_dir/direct.log" "$log_dir/ctest.log"
 
           audit() {
             local residue=0
             local audit_error=0
-            local id path pid cmdline
+            local id path pid cmdline proc_dir recheck_rc
             local containers_file="$log_dir/audit-containers.txt"
             local networks_file="$log_dir/audit-networks.txt"
             local proc_paths_file="$log_dir/audit-proc-paths.bin"
@@ -192,6 +211,7 @@ jobs:
             local proc_read_error="$log_dir/audit-proc-read.stderr"
             local tmp_paths_file="$log_dir/audit-tmp-paths.bin"
             local tmp_find_error="$log_dir/audit-tmp-find.stderr"
+            local sudo=/usr/bin/sudo
 
             echo "read-only residual audit for rut.stage=358-stage2a2"
 
@@ -224,7 +244,8 @@ jobs:
             fi
 
             : > "$proc_find_error"
-            if ! /usr/bin/find /proc -maxdepth 2 -type f -name cmdline -print0 \
+            if ! "$sudo" -n /usr/bin/find /proc -ignore_readdir_race \
+                -mindepth 2 -maxdepth 2 -type f -name cmdline -print0 \
                 > "$proc_paths_file" 2> "$proc_find_error"; then
               echo "unable to complete /proc cmdline traversal" >&2
               audit_error=1
@@ -239,13 +260,29 @@ jobs:
               pid=${path#/proc/}
               pid=${pid%/cmdline}
               : > "$proc_read_error"
-              if ! cmdline=$(/usr/bin/cat -- "$path" 2> "$proc_read_error" | \
+              if ! cmdline=$("$sudo" -n /usr/bin/cat -- "$path" 2> "$proc_read_error" | \
                   /usr/bin/tr '\0' ' '); then
-                printf 'unable to read proc cmdline: path=%q pid=%q\n' "$path" "$pid" >&2
-                if [[ -s "$proc_read_error" ]]; then
-                  /usr/bin/cat "$proc_read_error" >&2
+                proc_dir=${path%/cmdline}
+                if "$sudo" -n /usr/bin/test -e "$proc_dir"; then
+                  printf 'existing proc cmdline is unreadable: path=%q pid=%q\n' \
+                    "$path" "$pid" >&2
+                  if [[ -s "$proc_read_error" ]]; then
+                    /usr/bin/cat "$proc_read_error" >&2
+                  fi
+                  audit_error=1
+                else
+                  recheck_rc=$?
+                  if (( recheck_rc == 1 )); then
+                    printf 'snapshotted process disappeared before cmdline read: pid=%q\n' "$pid"
+                  else
+                    printf 'unable to recheck proc identity after cmdline read failure: pid=%q rc=%d\n' \
+                      "$pid" "$recheck_rc" >&2
+                    if [[ -s "$proc_read_error" ]]; then
+                      /usr/bin/cat "$proc_read_error" >&2
+                    fi
+                    audit_error=1
+                  fi
                 fi
-                audit_error=1
                 continue
               fi
               if [[ -s "$proc_read_error" ]]; then
@@ -265,8 +302,9 @@ jobs:
             done < "$proc_paths_file"
 
             : > "$tmp_find_error"
-            if ! /usr/bin/find /tmp -xdev -maxdepth 3 \
-                \( -path '/tmp/rut358-topology-*' -o -path '/tmp/rut358-broker-*' \) \
+            if ! "$sudo" -n /usr/bin/find /tmp -xdev -mindepth 1 -maxdepth 1 \
+                \( -name 'rut358-topology-*' -o -name 'rut358-broker-*' -o \
+                   -name 'rut358-proto-*' \) \
                 -print0 > "$tmp_paths_file" 2> "$tmp_find_error"; then
               echo "unable to complete /tmp rut358 residue traversal" >&2
               audit_error=1
@@ -277,8 +315,11 @@ jobs:
               audit_error=1
             fi
             while IFS= read -r -d '' path; do
-              /usr/bin/stat --printf='temporary path=%n type=%F owner=%u:%g mode=%a\n' "$path" || \
+              if ! "$sudo" -n /usr/bin/stat \
+                  --printf='temporary path=%n type=%F owner=%u:%g mode=%a\n' "$path"; then
+                printf 'unable to read exact temporary residue: path=%q\n' "$path" >&2
                 audit_error=1
+              fi
               residue=$((residue + 1))
             done < "$tmp_paths_file"
 
@@ -298,6 +339,8 @@ jobs:
         with:
           name: issue358-stage2a3b-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            ${{ runner.temp }}/issue358-stage2a3b-logs/topology-direct.log
+            ${{ runner.temp }}/issue358-stage2a3b-logs/topology-ctest.log
             ${{ runner.temp }}/issue358-stage2a3b-logs/direct.log
             ${{ runner.temp }}/issue358-stage2a3b-logs/ctest.log
             ${{ runner.temp }}/issue358-stage2a3b-logs/audit.log
