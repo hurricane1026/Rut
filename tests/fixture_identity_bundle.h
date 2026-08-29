@@ -24,10 +24,17 @@ constexpr size_t kRoleManifestBytes = 14 * sizeof(u64);
 constexpr size_t kPayloadBytes = kRoleCount * kRoleManifestBytes;
 constexpr size_t kWireBytes = kHeaderBytes + kPayloadBytes;
 constexpr int kTransportTimeoutMs = 1000;
+// Dropped is deliberately a separate, manifest-free six-FD record.  Its
+// magic/version and fixed header are independent from the Launcher+Root wire.
+constexpr u32 kDroppedMagic = 0x31444644u;  // "DDF1"
+constexpr u16 kDroppedVersion = 1;
+constexpr size_t kDroppedHeaderBytes = 16;
+constexpr size_t kDroppedFdCount = kFdsPerRole;
+static_assert(kDroppedFdCount == 6 && kDroppedHeaderBytes == kHeaderBytes);
 static_assert(kRoleCount == 2 && kFdsPerRole == 6 && kBundleFdCount == 12);
 static_assert(kRoleManifestBytes == 112 && kWireBytes == 240);
 
-enum class Role : u16 { Launcher = 1, Root = 2 };
+enum class Role : u16 { Launcher = 1, Root = 2, Dropped = 3 };
 
 enum class FdSlot : size_t {
     Stat = 0,
@@ -109,5 +116,12 @@ bool receive_bundle(int fd,
                     ReceivedBundle& bundle,
                     std::chrono::steady_clock::time_point deadline,
                     std::string& error);
+bool send_dropped_role(int fd,
+                       const RoleBundle& role,
+                       std::chrono::steady_clock::time_point deadline);
+bool receive_dropped_role(int fd,
+                          RoleBundle& role,
+                          std::chrono::steady_clock::time_point deadline,
+                          std::string& error);
 
 }  // namespace rut::test::fixture_identity_bundle

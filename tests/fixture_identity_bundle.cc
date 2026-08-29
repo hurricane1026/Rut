@@ -396,6 +396,31 @@ static bool parse_rights(struct msghdr& message, std::array<int, kBundleFdCount>
     return true;
 }
 
+static bool parse_dropped_rights(struct msghdr& message, std::array<int, kDroppedFdCount>& fds) {
+    size_t count = 0;
+    bool found = false;
+    std::array<int, kDroppedFdCount> parsed{};
+    parsed.fill(-1);
+    for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || found ||
+            header->cmsg_len > message.msg_controllen ||
+            header->cmsg_len != CMSG_LEN(kDroppedFdCount * sizeof(int)))
+            return false;
+        found = true;
+        const size_t bytes = header->cmsg_len - CMSG_LEN(0);
+        if (bytes != kDroppedFdCount * sizeof(int)) return false;
+        const int* values = reinterpret_cast<const int*>(CMSG_DATA(header));
+        for (size_t i = 0; i != kDroppedFdCount; ++i) {
+            if (values[i] < 0) return false;
+            parsed[count++] = values[i];
+        }
+    }
+    if (!found || count != kDroppedFdCount) return false;
+    fds = parsed;
+    return true;
+}
+
 static void close_rights_in_message(const struct msghdr& message) {
     for (cmsghdr* header = CMSG_FIRSTHDR(const_cast<struct msghdr*>(&message)); header != nullptr;
          header = CMSG_NXTHDR(const_cast<struct msghdr*>(&message), header)) {
@@ -411,6 +436,13 @@ static void close_rights_in_message(const struct msghdr& message) {
 }
 
 static void close_fds(std::array<int, kBundleFdCount>& fds) {
+    for (int& fd : fds) {
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+}
+
+static void close_dropped_fds(std::array<int, kDroppedFdCount>& fds) {
     for (int& fd : fds) {
         if (fd >= 0) close(fd);
         fd = -1;
@@ -578,6 +610,41 @@ bool validate_bundle(const IdentityBundle& bundle, std::string& error) {
     return validate_role(bundle.roles[0], error) && validate_role(bundle.roles[1], error);
 }
 
+static std::vector<unsigned char> encode_dropped_header() {
+    std::vector<unsigned char> output;
+    output.reserve(kDroppedHeaderBytes);
+    put32(output, kDroppedMagic);
+    put16(output, kDroppedVersion);
+    put16(output, static_cast<u16>(Role::Dropped));
+    put16(output, static_cast<u16>(kDroppedFdCount));
+    put16(output, 0);
+    put32(output, 0);
+    return output;
+}
+
+static bool parse_dropped_header(const std::array<unsigned char, kDroppedHeaderBytes>& wire) {
+    size_t at = 0;
+    u32 magic = 0;
+    u16 version = 0;
+    u16 role = 0;
+    u16 fds = 0;
+    u16 reserved = 0;
+    u32 payload = 0;
+    return get32(wire.data(), wire.size(), at, magic) &&
+           get16(wire.data(), wire.size(), at, version) &&
+           get16(wire.data(), wire.size(), at, role) && get16(wire.data(), wire.size(), at, fds) &&
+           get16(wire.data(), wire.size(), at, reserved) &&
+           get32(wire.data(), wire.size(), at, payload) && magic == kDroppedMagic &&
+           version == kDroppedVersion && role == static_cast<u16>(Role::Dropped) &&
+           fds == kDroppedFdCount && reserved == 0 && payload == 0 && at == wire.size();
+}
+
+static bool valid_dropped_sender(const RoleBundle& role) {
+    if (role.manifest.role != Role::Dropped) return false;
+    std::string error;
+    return validate_role(role, error);
+}
+
 bool send_bundle(int fd,
                  const IdentityBundle& bundle,
                  std::chrono::steady_clock::time_point deadline) {
@@ -722,6 +789,138 @@ bool receive_bundle(int fd,
         return false;
     }
     received.bundle() = std::move(decoded);
+    return true;
+}
+
+bool send_dropped_role(int fd,
+                       const RoleBundle& role,
+                       std::chrono::steady_clock::time_point deadline) {
+    if (fd < 0 || !valid_dropped_sender(role)) return false;
+    const std::vector<unsigned char> wire = encode_dropped_header();
+    alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(kDroppedFdCount * sizeof(int))> control{};
+    iovec vector{const_cast<unsigned char*>(wire.data()), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(kDroppedFdCount * sizeof(int));
+    memcpy(CMSG_DATA(header), role.fds.data(), kDroppedFdCount * sizeof(int));
+    if (!wait_fd(fd, POLLOUT, deadline)) return false;
+    ssize_t sent;
+    do {
+        sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent <= 0) return false;
+    return static_cast<size_t>(sent) == wire.size() ||
+           send_bytes(fd, wire.data() + sent, wire.size() - static_cast<size_t>(sent), deadline);
+}
+
+bool receive_dropped_role(int fd,
+                          RoleBundle& role,
+                          std::chrono::steady_clock::time_point deadline,
+                          std::string& error) {
+    role.close();
+    if (fd < 0 || !wait_fd(fd, POLLIN, deadline)) {
+        error = "dropped identity receive deadline/descriptor failure";
+        return false;
+    }
+    std::array<unsigned char, kDroppedHeaderBytes> wire{};
+    std::array<int, kDroppedFdCount> fds{};
+    fds.fill(-1);
+    size_t done = 0;
+    bool first = true;
+    while (done != wire.size()) {
+        if (!wait_fd(fd, POLLIN, deadline)) {
+            close_dropped_fds(fds);
+            error = "dropped identity header fragment deadline/descriptor failure";
+            return false;
+        }
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(kDroppedFdCount * sizeof(int))>
+            control{};
+        iovec vector{wire.data() + done, wire.size() - done};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        ssize_t count;
+        do {
+            count = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0 || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+            close_rights_in_message(message);
+            close_dropped_fds(fds);
+            error = "dropped identity header was truncated or EOF";
+            return false;
+        }
+        if (first) {
+            if (!parse_dropped_rights(message, fds)) {
+                close_rights_in_message(message);
+                error = "dropped identity ancillary rights were not exactly six SCM_RIGHTS";
+                return false;
+            }
+            first = false;
+        } else if (CMSG_FIRSTHDR(&message) != nullptr) {
+            close_rights_in_message(message);
+            close_dropped_fds(fds);
+            error = "dropped identity header had ancillary data after its first fragment";
+            return false;
+        }
+        done += static_cast<size_t>(count);
+    }
+    if (!parse_dropped_header(wire)) {
+        close_dropped_fds(fds);
+        error = "dropped identity fixed header was invalid";
+        return false;
+    }
+    // This zero-time probe rejects only data already queued behind the fixed
+    // record under the caller's request/wait barrier; it is not a race-free
+    // generic stream boundary and does not consume a legitimate next frame.
+    pollfd trailing{fd, POLLIN, 0};
+    int trailing_poll;
+    do {
+        trailing_poll = poll(&trailing, 1, 0);
+    } while (trailing_poll < 0 && errno == EINTR);
+    if (trailing_poll < 0) {
+        close_dropped_fds(fds);
+        error = "dropped identity trailing-data poll failed";
+        return false;
+    }
+    if ((trailing.revents & POLLIN) != 0) {
+        unsigned char byte = 0;
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> control{};
+        iovec vector{&byte, sizeof(byte)};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        ssize_t count;
+        do {
+            count = recvmsg(fd, &message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        } while (count < 0 && errno == EINTR);
+        if (count > 0 || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
+            CMSG_FIRSTHDR(&message) != nullptr) {
+            close_rights_in_message(message);
+            close_dropped_fds(fds);
+            error = "dropped identity record had trailing data or ancillary records";
+            return false;
+        }
+        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            close_rights_in_message(message);
+            close_dropped_fds(fds);
+            error = "dropped identity trailing-data receive failed";
+            return false;
+        }
+    }
+    if (!adopt_role(Role::Dropped, fds, role, error)) {
+        close_dropped_fds(fds);
+        return false;
+    }
     return true;
 }
 

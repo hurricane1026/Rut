@@ -52,6 +52,12 @@ static std::array<int, kBundleFdCount> flatten(const IdentityBundle& bundle) {
     return result;
 }
 
+static std::array<int, kDroppedFdCount> flatten_role(const RoleBundle& role) {
+    std::array<int, kDroppedFdCount> result{};
+    result = role.fds;
+    return result;
+}
+
 static u64 read_wire_u64(const std::vector<unsigned char>& wire, size_t offset) {
     u64 value = 0;
     for (unsigned shift = 0; shift != 64; shift += 8)
@@ -67,6 +73,86 @@ static bool xor_nonzero_wire_u64(std::vector<unsigned char>& wire, size_t offset
         wire[offset + byte] ^= 0x01;
     }
     return false;
+}
+
+static bool send_dropped_raw(int fd,
+                             const std::vector<unsigned char>& wire,
+                             const std::array<int, kDroppedFdCount>& fds,
+                             CmsgShape shape,
+                             size_t first_bytes,
+                             bool trailing = false,
+                             bool complete = true) {
+    if (first_bytes > wire.size()) return false;
+    const size_t count = shape == CmsgShape::Short  ? kDroppedFdCount - 1
+                         : shape == CmsgShape::Long ? kDroppedFdCount + 1
+                                                    : kDroppedFdCount;
+    std::array<int, kDroppedFdCount + 1> rights{};
+    std::copy(fds.begin(), fds.end(), rights.begin());
+    alignas(cmsghdr) std::array<unsigned char,
+                                CMSG_SPACE((kDroppedFdCount + 1) * sizeof(int)) +
+                                    CMSG_SPACE(sizeof(struct ucred))>
+        control{};
+    iovec vector{const_cast<unsigned char*>(wire.data()), first_bytes};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    if (shape != CmsgShape::Missing) {
+        message.msg_control = control.data();
+        message.msg_controllen = CMSG_SPACE(count * sizeof(int));
+        if (shape == CmsgShape::ExtraCredentials)
+            message.msg_controllen += CMSG_SPACE(sizeof(struct ucred));
+        cmsghdr* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(count * sizeof(int));
+        memcpy(CMSG_DATA(header), rights.data(), count * sizeof(int));
+        if (shape == CmsgShape::ExtraCredentials) {
+            cmsghdr* credentials_header = CMSG_NXTHDR(&message, header);
+            if (credentials_header == nullptr) return false;
+            const struct ucred credentials{getpid(), getuid(), getgid()};
+            credentials_header->cmsg_level = SOL_SOCKET;
+            credentials_header->cmsg_type = SCM_CREDENTIALS;
+            credentials_header->cmsg_len = CMSG_LEN(sizeof(credentials));
+            memcpy(CMSG_DATA(credentials_header), &credentials, sizeof(credentials));
+        }
+    }
+    ssize_t sent;
+    do {
+        sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent < 0) return false;
+    if (static_cast<size_t>(sent) != first_bytes &&
+        !send_plain(fd,
+                    wire.data() + sent,
+                    first_bytes - static_cast<size_t>(sent),
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500)))
+        return false;
+    if (complete && first_bytes != wire.size() &&
+        !send_plain(fd,
+                    wire.data() + first_bytes,
+                    wire.size() - first_bytes,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500)))
+        return false;
+    if (trailing) {
+        alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
+        unsigned char byte = 0;
+        iovec trailing_vector{&byte, sizeof(byte)};
+        msghdr trailing_message{};
+        trailing_message.msg_iov = &trailing_vector;
+        trailing_message.msg_iovlen = 1;
+        trailing_message.msg_control = trailing_control.data();
+        trailing_message.msg_controllen = trailing_control.size();
+        cmsghdr* header = CMSG_FIRSTHDR(&trailing_message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(header), &fds[0], sizeof(int));
+        do {
+            sent = sendmsg(fd, &trailing_message, MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+        if (sent != 1) return false;
+    }
+    return true;
 }
 
 static bool send_raw(int fd,
@@ -184,6 +270,67 @@ static size_t fd_count() {
     while (readdir(directory) != nullptr) ++count;
     closedir(directory);
     return count;
+}
+
+static bool receive_dropped_fails(const std::vector<unsigned char>& wire,
+                                  const std::array<int, kDroppedFdCount>& fds,
+                                  CmsgShape shape,
+                                  size_t first_bytes,
+                                  bool trailing = false,
+                                  bool complete = true) {
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    const size_t before = fd_count();
+    if (shape == CmsgShape::ExtraCredentials) {
+        int enabled = 1;
+        if (setsockopt(sockets[1], SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) != 0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            return false;
+        }
+    }
+    const bool sent =
+        send_dropped_raw(sockets[0], wire, fds, shape, first_bytes, trailing, complete);
+    const int send_errno = sent ? 0 : errno;
+    shutdown(sockets[0], SHUT_WR);
+    RoleBundle received;
+    std::string error;
+    const bool accepted =
+        receive_dropped_role(sockets[1],
+                             received,
+                             std::chrono::steady_clock::now() + std::chrono::milliseconds(250),
+                             error);
+    received.close();
+    const bool no_leak = fd_count() == before;
+    close(sockets[0]);
+    close(sockets[1]);
+    if (!sent) {
+        if (shape == CmsgShape::ExtraCredentials && send_errno == EINVAL) {
+            std::fprintf(stderr, "kernel rejected dropped SCM_CREDENTIALS ancillary\n");
+            return true;
+        }
+        return false;
+    }
+    return !accepted && no_leak;
+}
+
+static std::vector<unsigned char> dropped_header() {
+    std::vector<unsigned char> wire;
+    const auto put16 = [&](u16 value) {
+        wire.push_back(static_cast<unsigned char>(value));
+        wire.push_back(static_cast<unsigned char>(value >> 8));
+    };
+    const auto put32 = [&](u32 value) {
+        for (unsigned shift = 0; shift != 32; shift += 8)
+            wire.push_back(static_cast<unsigned char>(value >> shift));
+    };
+    put32(kDroppedMagic);
+    put16(kDroppedVersion);
+    put16(static_cast<u16>(Role::Dropped));
+    put16(static_cast<u16>(kDroppedFdCount));
+    put16(0);
+    put32(0);
+    return wire;
 }
 
 static bool receive_fails(const std::vector<unsigned char>& wire,
@@ -438,6 +585,189 @@ int main() {
     ok &= check(compare_manifests(bundle, fragmented.bundle()), "fragmented exact decoded payload");
     close(sockets[0]);
     close(sockets[1]);
+
+    RoleBundle dropped_source;
+    ok &= check(open_role(child, Role::Dropped, dropped_source, error), "open dropped role");
+    int dropped_sockets[2] = {-1, -1};
+    ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, dropped_sockets) == 0,
+                "dropped success socketpair");
+    RoleBundle dropped_received;
+    ok &= check(send_dropped_role(dropped_sockets[0],
+                                  dropped_source,
+                                  std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(kTransportTimeoutMs)),
+                "send dropped role");
+    dropped_source.close();
+    for (int fd : dropped_source.fds) {
+        errno = 0;
+        ok &= check(fcntl(fd, F_GETFD) < 0 && errno == EBADF, "dropped source close ownership");
+    }
+    ok &= check(receive_dropped_role(dropped_sockets[1],
+                                     dropped_received,
+                                     std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(kTransportTimeoutMs),
+                                     error),
+                "receive dropped role");
+    const auto same_role_manifest = [&](const RoleManifest& a, const RoleManifest& b) {
+        return a.role == b.role && a.pid == b.pid && a.start == b.start && a.ppid == b.ppid &&
+               a.pgid == b.pgid && a.sid == b.sid && a.uid == b.uid && a.gid == b.gid &&
+               a.netns == b.netns && a.exe_dev == b.exe_dev && a.exe_ino == b.exe_ino &&
+               a.argv_length == b.argv_length && a.argv_hash == b.argv_hash;
+    };
+    ok &= check(same_role_manifest(dropped_source.manifest, dropped_received.manifest),
+                "dropped receiver-derived manifest exact");
+    ok &= check(dropped_received.manifest.role == Role::Dropped &&
+                    dropped_received.manifest.pid == child &&
+                    dropped_received.manifest.start != 0 && dropped_received.manifest.ppid > 0 &&
+                    dropped_received.manifest.pgid > 0 && dropped_received.manifest.sid > 0,
+                "dropped receiver-derived manifest");
+    for (int fd : dropped_received.fds)
+        ok &= check((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0, "dropped received CLOEXEC");
+    dropped_received.close();
+    close(dropped_sockets[0]);
+    close(dropped_sockets[1]);
+
+    RoleBundle dropped_negative;
+    ok &= check(open_role(child, Role::Dropped, dropped_negative, error),
+                "reopen dropped role for mutations");
+    const std::array<int, kDroppedFdCount> dropped_fds = flatten_role(dropped_negative);
+    const std::vector<unsigned char> dropped_wire = dropped_header();
+    auto dropped_header_mutation = [&](size_t offset, u32 value, size_t bytes) {
+        std::vector<unsigned char> changed = dropped_wire;
+        for (size_t index = 0; index != bytes; ++index)
+            changed[offset + index] = static_cast<unsigned char>(value >> (index * 8));
+        return changed;
+    };
+    std::vector<unsigned char> bad_dropped_magic = dropped_wire;
+    bad_dropped_magic[0] ^= 0x01;
+    ok &= check(receive_dropped_fails(
+                    bad_dropped_magic, dropped_fds, CmsgShape::Exact, bad_dropped_magic.size()),
+                "dropped wrong magic rejected");
+    ok &= check(
+        receive_dropped_fails(
+            dropped_header_mutation(4, 2, 2), dropped_fds, CmsgShape::Exact, dropped_wire.size()),
+        "dropped wrong version rejected");
+    ok &=
+        check(receive_dropped_fails(dropped_header_mutation(6, static_cast<u16>(Role::Launcher), 2),
+                                    dropped_fds,
+                                    CmsgShape::Exact,
+                                    dropped_wire.size()),
+              "dropped wrong role rejected");
+    ok &= check(receive_dropped_fails(dropped_header_mutation(8, kDroppedFdCount - 1, 2),
+                                      dropped_fds,
+                                      CmsgShape::Exact,
+                                      dropped_wire.size()),
+                "dropped wrong FD count rejected");
+    ok &= check(
+        receive_dropped_fails(
+            dropped_header_mutation(10, 1, 2), dropped_fds, CmsgShape::Exact, dropped_wire.size()),
+        "dropped reserved field rejected");
+    ok &= check(
+        receive_dropped_fails(
+            dropped_header_mutation(12, 1, 4), dropped_fds, CmsgShape::Exact, dropped_wire.size()),
+        "dropped payload field rejected");
+    ok &= check(
+        receive_dropped_fails(dropped_wire, dropped_fds, CmsgShape::Missing, dropped_wire.size()),
+        "dropped missing rights rejected");
+    ok &= check(
+        receive_dropped_fails(dropped_wire, dropped_fds, CmsgShape::Short, dropped_wire.size()),
+        "dropped short rights rejected");
+    ok &= check(
+        receive_dropped_fails(dropped_wire, dropped_fds, CmsgShape::Long, dropped_wire.size()),
+        "dropped long rights rejected");
+    ok &= check(receive_dropped_fails(
+                    dropped_wire, dropped_fds, CmsgShape::ExtraCredentials, dropped_wire.size()),
+                "dropped extra credentials rejected");
+    ok &= check(receive_dropped_fails(dropped_wire, dropped_fds, CmsgShape::Exact, 3, false, false),
+                "dropped truncated header rejected");
+    ok &= check(receive_dropped_fails(dropped_wire, dropped_fds, CmsgShape::Exact, 3, true),
+                "dropped trailing/coalesced bytes rejected");
+    std::vector<int> dropped_reordered_vector(dropped_fds.begin(), dropped_fds.end());
+    std::swap(dropped_reordered_vector[0], dropped_reordered_vector[1]);
+    std::array<int, kDroppedFdCount> dropped_reordered{};
+    std::copy(dropped_reordered_vector.begin(),
+              dropped_reordered_vector.end(),
+              dropped_reordered.begin());
+    ok &= check(receive_dropped_fails(
+                    dropped_wire, dropped_reordered, CmsgShape::Exact, dropped_wire.size()),
+                "dropped reordered FD rejected");
+    std::array<int, kDroppedFdCount> dropped_duplicate = dropped_fds;
+    dropped_duplicate[1] = dropped_duplicate[0];
+    ok &= check(receive_dropped_fails(
+                    dropped_wire, dropped_duplicate, CmsgShape::Exact, dropped_wire.size()),
+                "dropped duplicate FD rejected");
+    const int dropped_foreign = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ok &= check(dropped_foreign >= 0, "dropped foreign FD setup");
+    std::array<int, kDroppedFdCount> dropped_foreign_array = dropped_fds;
+    dropped_foreign_array[0] = dropped_foreign;
+    ok &= check(receive_dropped_fails(
+                    dropped_wire, dropped_foreign_array, CmsgShape::Exact, dropped_wire.size()),
+                "dropped foreign FD rejected");
+    close(dropped_foreign);
+    int fragment_sockets[2] = {-1, -1};
+    ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fragment_sockets) == 0,
+                "dropped fragment socketpair");
+    RoleBundle dropped_fragment;
+    ok &=
+        check(send_dropped_raw(fragment_sockets[0], dropped_wire, dropped_fds, CmsgShape::Exact, 3),
+              "dropped fragmented send");
+    ok &= check(receive_dropped_role(fragment_sockets[1],
+                                     dropped_fragment,
+                                     std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(kTransportTimeoutMs),
+                                     error),
+                "dropped fragmented receive");
+    ok &= check(same_role_manifest(dropped_negative.manifest, dropped_fragment.manifest),
+                "dropped fragmented manifest exact");
+    dropped_fragment.close();
+    close(fragment_sockets[0]);
+    close(fragment_sockets[1]);
+    int partial_deadline_sockets[2] = {-1, -1};
+    ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, partial_deadline_sockets) == 0,
+                "dropped partial deadline socketpair");
+    const size_t partial_before = fd_count();
+    ok &= check(send_dropped_raw(partial_deadline_sockets[0],
+                                 dropped_wire,
+                                 dropped_fds,
+                                 CmsgShape::Exact,
+                                 3,
+                                 false,
+                                 false),
+                "dropped incomplete header send");
+    RoleBundle dropped_partial;
+    ok &= check(
+        !receive_dropped_role(partial_deadline_sockets[1],
+                              dropped_partial,
+                              std::chrono::steady_clock::now() + std::chrono::milliseconds(20),
+                              error) &&
+            fd_count() == partial_before,
+        "dropped incomplete header deadline and FD cleanup");
+    dropped_partial.close();
+    close(partial_deadline_sockets[0]);
+    close(partial_deadline_sockets[1]);
+    int deadline_sockets[2] = {-1, -1};
+    ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, deadline_sockets) == 0,
+                "dropped deadline socketpair");
+    RoleBundle dropped_timed_out;
+    ok &= check(
+        !receive_dropped_role(deadline_sockets[1],
+                              dropped_timed_out,
+                              std::chrono::steady_clock::now() + std::chrono::milliseconds(20),
+                              error),
+        "dropped receive deadline rejected");
+    close(deadline_sockets[0]);
+    close(deadline_sockets[1]);
+    dropped_negative.close();
+
+    std::vector<unsigned char> old_launcher_dropped = wire;
+    old_launcher_dropped[kHeaderBytes + 0] = static_cast<unsigned char>(Role::Dropped);
+    ok &= check(
+        receive_fails(old_launcher_dropped, fds, CmsgShape::Exact, old_launcher_dropped.size()),
+        "old bundle Dropped Launcher slot rejected");
+    std::vector<unsigned char> old_root_dropped = wire;
+    old_root_dropped[kHeaderBytes + kRoleManifestBytes] = static_cast<unsigned char>(Role::Dropped);
+    ok &= check(receive_fails(old_root_dropped, fds, CmsgShape::Exact, old_root_dropped.size()),
+                "old bundle Dropped Root slot rejected");
 
     bundle.close();
     kill(child, SIGKILL);
