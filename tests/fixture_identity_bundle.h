@@ -61,6 +61,24 @@ struct RoleManifest {
     u64 argv_hash = 0;
 };
 
+struct DroppedStatusEvidence {
+    std::array<uid_t, 4> uid_values{};
+    std::array<gid_t, 4> gid_values{};
+    std::vector<gid_t> supplementary_groups;
+    bool no_new_privs = false;
+    bool cap_inh_clear = false;
+    bool cap_prm_clear = false;
+    bool cap_eff_clear = false;
+};
+
+struct DroppedIdentityEvidence {
+    RoleManifest identity;
+    char state = '\0';
+    DroppedStatusEvidence status;
+    std::string cmdline;
+    bool pidfd_live = false;
+};
+
 struct RoleBundle {
     RoleManifest manifest;
     std::array<int, kFdsPerRole> fds{};
@@ -123,5 +141,11 @@ bool receive_dropped_role(int fd,
                           RoleBundle& role,
                           std::chrono::steady_clock::time_point deadline,
                           std::string& error);
+bool parse_dropped_status_evidence(const std::string& status,
+                                   DroppedStatusEvidence& evidence,
+                                   std::string& error);
+bool extract_dropped_identity_evidence(const RoleBundle& role,
+                                       DroppedIdentityEvidence& evidence,
+                                       std::string& error);
 
 }  // namespace rut::test::fixture_identity_bundle

@@ -401,9 +401,136 @@ static bool check(bool condition, const char* message) {
     return condition;
 }
 
+static bool read_path(const std::string& path, std::string& output) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    output.clear();
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        const ssize_t count = read(fd, buffer.data(), buffer.size());
+        if (count > 0) {
+            if (output.size() > 16384 - static_cast<size_t>(count)) {
+                close(fd);
+                return false;
+            }
+            output.append(buffer.data(), static_cast<size_t>(count));
+            continue;
+        }
+        if (count == 0) {
+            close(fd);
+            return true;
+        }
+        if (errno == EINTR) continue;
+        close(fd);
+        return false;
+    }
+}
+
+static std::string replace_once(std::string value,
+                                const std::string& before,
+                                const std::string& after) {
+    const size_t at = value.find(before);
+    if (at == std::string::npos) return {};
+    value.replace(at, before.size(), after);
+    return value;
+}
+
+static std::string remove_line(std::string value, const std::string& prefix) {
+    const size_t at = value.find(prefix);
+    if (at == std::string::npos) return {};
+    const size_t end = value.find('\n', at);
+    value.erase(at, end == std::string::npos ? value.size() - at : end + 1 - at);
+    return value;
+}
+
 }  // namespace
 
 int main() {
+    const std::string strict_status =
+        "Name:\tevidence\n"
+        "Uid:\t11\t12\t13\t14\n"
+        "Gid:\t21\t22\t23\t24\n"
+        "Groups:\t31 32 31\n"
+        "NoNewPrivs:\t1\n"
+        "CapInh:\t0000000000000000\n"
+        "CapPrm:\t0000000000000001\n"
+        "CapEff:\tABCDEF0123456789\n";
+    DroppedStatusEvidence strict_evidence;
+    std::string strict_error;
+    bool ok = check(parse_dropped_status_evidence(strict_status, strict_evidence, strict_error) &&
+                        strict_evidence.uid_values == std::array<uid_t, 4>{11, 12, 13, 14} &&
+                        strict_evidence.gid_values == std::array<gid_t, 4>{21, 22, 23, 24} &&
+                        strict_evidence.supplementary_groups == std::vector<gid_t>{31, 32, 31} &&
+                        strict_evidence.no_new_privs && strict_evidence.cap_inh_clear &&
+                        !strict_evidence.cap_prm_clear && !strict_evidence.cap_eff_clear,
+                    "strict dropped status evidence retains every field");
+    const std::string empty_groups_status =
+        replace_once(strict_status, "Groups:\t31 32 31", "Groups:\t");
+    const std::string nnp_zero_status =
+        replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\t0");
+    DroppedStatusEvidence empty_groups_evidence;
+    DroppedStatusEvidence nnp_zero_evidence;
+    ok &= check(
+        parse_dropped_status_evidence(empty_groups_status, empty_groups_evidence, strict_error) &&
+            empty_groups_evidence.supplementary_groups.empty() &&
+            parse_dropped_status_evidence(nnp_zero_status, nnp_zero_evidence, strict_error) &&
+            !nnp_zero_evidence.no_new_privs,
+        "strict status extraction does not impose later group/NNP expectations");
+    const auto status_rejected = [&](const std::string& status) {
+        DroppedStatusEvidence ignored;
+        std::string error;
+        return !status.empty() && !parse_dropped_status_evidence(status, ignored, error) &&
+               !error.empty();
+    };
+    const std::string uid_overflow = std::to_string(std::numeric_limits<uid_t>::max()) + "0";
+    const std::string gid_overflow = std::to_string(std::numeric_limits<gid_t>::max()) + "0";
+    ok &= check(status_rejected(remove_line(strict_status, "Uid:")) &&
+                    status_rejected(strict_status + "Uid:\t1 2 3 4\n") &&
+                    status_rejected(replace_once(
+                        strict_status, "Uid:\t11\t12\t13\t14", "Uid:\t11 12 13 14 15")) &&
+                    status_rejected(replace_once(
+                        strict_status, "Uid:\t11\t12\t13\t14", "Uid:\t11 bad 13 14")) &&
+                    status_rejected(replace_once(
+                        strict_status, "Uid:\t11\t12\t13\t14", "Uid:\t11 12 13 " + uid_overflow)),
+                "strict Uid missing/duplicate/extra/malformed/range mutations rejected");
+    ok &= check(status_rejected(remove_line(strict_status, "Gid:")) &&
+                    status_rejected(strict_status + "Gid:\t1 2 3 4\n") &&
+                    status_rejected(replace_once(
+                        strict_status, "Gid:\t21\t22\t23\t24", "Gid:\t21 22 23 24 25")) &&
+                    status_rejected(replace_once(
+                        strict_status, "Gid:\t21\t22\t23\t24", "Gid:\t21 22 bad 24")) &&
+                    status_rejected(replace_once(
+                        strict_status, "Gid:\t21\t22\t23\t24", "Gid:\t21 22 23 " + gid_overflow)),
+                "strict Gid missing/duplicate/extra/malformed/range mutations rejected");
+    ok &= check(status_rejected(remove_line(strict_status, "Groups:")) &&
+                    status_rejected(strict_status + "Groups:\t1\n") &&
+                    status_rejected(
+                        replace_once(strict_status, "Groups:\t31 32 31", "Groups:\t31 bad 31")) &&
+                    status_rejected(replace_once(
+                        strict_status, "Groups:\t31 32 31", "Groups:\t31 " + gid_overflow)),
+                "strict Groups missing/duplicate/malformed/range mutations rejected");
+    ok &= check(
+        status_rejected(remove_line(strict_status, "NoNewPrivs:")) &&
+            status_rejected(strict_status + "NoNewPrivs:\t1\n") &&
+            status_rejected(replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\t1 0")) &&
+            status_rejected(replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\tbad")) &&
+            status_rejected(replace_once(strict_status, "NoNewPrivs:\t1", "NoNewPrivs:\t2")),
+        "strict NoNewPrivs missing/duplicate/extra/malformed/range mutations rejected");
+    for (const char* capability : {"CapInh", "CapPrm", "CapEff"}) {
+        const std::string prefix = std::string(capability) + ":";
+        const size_t start = strict_status.find(prefix);
+        const size_t end = strict_status.find('\n', start);
+        const std::string line = strict_status.substr(start, end + 1 - start);
+        ok &= check(start != std::string::npos &&
+                        status_rejected(remove_line(strict_status, prefix)) &&
+                        status_rejected(strict_status + line) &&
+                        status_rejected(replace_once(strict_status, line, prefix + "\t0 0\n")) &&
+                        status_rejected(replace_once(strict_status, line, prefix + "\txyz\n")) &&
+                        status_rejected(
+                            replace_once(strict_status, line, prefix + "\t00000000000000000\n")),
+                    "strict capability missing/duplicate/extra/nonhex/width mutations rejected");
+    }
+
     int ready[2] = {-1, -1};
     if (!check(pipe2(ready, O_CLOEXEC) == 0, "ready pipe setup")) return 1;
     const pid_t child = fork();
@@ -446,7 +573,7 @@ int main() {
     }
     const std::vector<unsigned char> wire = encode_bundle(bundle);
     const std::array<int, kBundleFdCount> fds = flatten(bundle);
-    bool ok = check(wire.size() == kWireBytes && kPayloadBytes != 0, "fixed nonempty payload");
+    ok &= check(wire.size() == kWireBytes && kPayloadBytes != 0, "fixed nonempty payload");
 
     int sockets[2] = {-1, -1};
     ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0,
@@ -587,7 +714,14 @@ int main() {
     close(sockets[1]);
 
     RoleBundle dropped_source;
-    ok &= check(open_role(child, Role::Dropped, dropped_source, error), "open dropped role");
+    std::string self_status;
+    std::string self_cmdline;
+    DroppedStatusEvidence expected_self_status;
+    ok &= check(read_path("/proc/self/status", self_status) &&
+                    read_path("/proc/self/cmdline", self_cmdline) &&
+                    parse_dropped_status_evidence(self_status, expected_self_status, error),
+                "read strict self dropped evidence");
+    ok &= check(open_role(getpid(), Role::Dropped, dropped_source, error), "open dropped role");
     int dropped_sockets[2] = {-1, -1};
     ok &= check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, dropped_sockets) == 0,
                 "dropped success socketpair");
@@ -627,13 +761,34 @@ int main() {
     ok &= check(same_role_manifest(dropped_source.manifest, dropped_received.manifest),
                 "dropped receiver-derived manifest exact");
     ok &= check(dropped_received.manifest.role == Role::Dropped &&
-                    dropped_received.manifest.pid == child &&
+                    dropped_received.manifest.pid == getpid() &&
                     dropped_received.manifest.start != 0 && dropped_received.manifest.ppid > 0 &&
                     dropped_received.manifest.pgid > 0 && dropped_received.manifest.sid > 0,
                 "dropped receiver-derived manifest");
     for (int fd : dropped_received.fds)
         ok &= check((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0, "dropped received CLOEXEC");
+    DroppedIdentityEvidence dropped_evidence;
+    const bool dropped_extracted =
+        extract_dropped_identity_evidence(dropped_received, dropped_evidence, error);
+    const Role saved_role = dropped_received.manifest.role;
+    dropped_received.manifest.role = Role::Launcher;
+    DroppedIdentityEvidence wrong_role_evidence;
+    ok &= check(!extract_dropped_identity_evidence(dropped_received, wrong_role_evidence, error),
+                "extractor rejects wrong role");
+    dropped_received.manifest.role = saved_role;
     dropped_received.close();
+    ok &= check(dropped_extracted && dropped_evidence.identity.pid == getpid() &&
+                    dropped_evidence.state != '\0' &&
+                    dropped_evidence.status.uid_values == expected_self_status.uid_values &&
+                    dropped_evidence.status.gid_values == expected_self_status.gid_values &&
+                    dropped_evidence.status.supplementary_groups ==
+                        expected_self_status.supplementary_groups &&
+                    dropped_evidence.status.no_new_privs == expected_self_status.no_new_privs &&
+                    dropped_evidence.status.cap_inh_clear == expected_self_status.cap_inh_clear &&
+                    dropped_evidence.status.cap_prm_clear == expected_self_status.cap_prm_clear &&
+                    dropped_evidence.status.cap_eff_clear == expected_self_status.cap_eff_clear &&
+                    dropped_evidence.cmdline == self_cmdline && dropped_evidence.pidfd_live,
+                "extracted self evidence remains owned after source/received FD close");
     close(dropped_sockets[0]);
     close(dropped_sockets[1]);
 
@@ -779,8 +934,29 @@ int main() {
     ok &= check(receive_fails(old_root_dropped, fds, CmsgShape::Exact, old_root_dropped.size()),
                 "old bundle Dropped Root slot rejected");
 
+    RoleBundle dead_dropped;
+    ok &= check(open_role(child, Role::Dropped, dead_dropped, error),
+                "open owned child dropped evidence before death");
+    ok &= check(kill(child, SIGKILL) == 0, "kill owned child for dead evidence");
+    siginfo_t dead_info{};
+    int waitid_result;
+    do {
+        waitid_result = waitid(P_PID, child, &dead_info, WEXITED | WNOWAIT);
+    } while (waitid_result < 0 && errno == EINTR);
+    DroppedIdentityEvidence dead_evidence;
+    ok &= check(waitid_result == 0 && dead_info.si_pid == child &&
+                    !extract_dropped_identity_evidence(dead_dropped, dead_evidence, error),
+                "zombie dropped stat/pidfd evidence rejected");
+    int dead_status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &dead_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ok &= check(
+        waited == child && !extract_dropped_identity_evidence(dead_dropped, dead_evidence, error),
+        "reaped dropped stat/pidfd evidence rejected");
+    dead_dropped.close();
+
     bundle.close();
-    kill(child, SIGKILL);
-    waitpid(child, nullptr, 0);
     return ok ? 0 : 1;
 }
