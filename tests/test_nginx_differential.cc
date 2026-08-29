@@ -28793,6 +28793,7 @@ struct StaticQueryProxyOracleObservation {
     std::string log_path;
     std::string access_path;
     std::string process_identity;
+    std::string access_scope;
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> forward_history;
     std::vector<std::string> access_common_projection;
@@ -28801,7 +28802,88 @@ struct StaticQueryProxyOracleObservation {
     u32 forward_sends = 0u;
     u16 frontend_port = 0u;
     u16 backend_port = 0u;
+    std::string original_config;
+    std::string source_poison;
+    bool source_poisoned = false;
+    u32 origin_peer_close_count = 0u;
+    u64 origin_response_sent_ns = 0u;
+    u64 origin_peer_closed_ns = 0u;
 };
+
+static constexpr char kProxyHideHeaderClientRequest[] =
+    "GET / HTTP/1.1\r\n"
+    "Host: hidden.example\r\n"
+    "Connection: close\r\n"
+    "X-Dupe: one\r\n"
+    "X-Dupe: two\r\n"
+    "\r\n";
+
+static constexpr char kProxyHideHeaderOriginResponse[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n"
+    "Server: origin\r\n"
+    "X-Compat-Hidden: first\r\n"
+    "x-compat-hidden: second\r\n"
+    "X-Compat-Visible: keep\r\n"
+    "Set-Cookie: a=1\r\n"
+    "Set-Cookie: b=2\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "ok";
+
+static constexpr char kProxyHideHeaderResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "X-Compat-Visible: keep\r\n"
+    "Set-Cookie: a=1\r\n"
+    "Set-Cookie: b=2\r\n"
+    "\r\n"
+    "ok";
+
+static constexpr const char* kProxyHideHeaderClientTargets[1] = {"/"};
+static constexpr const char* kProxyHideHeaderUpstreamTargets[1] = {"/"};
+static constexpr size_t kProxyHideHeaderClientRequestSizes[1] = {85u};
+static constexpr size_t kProxyHideHeaderUpstreamRequestSizes[1] = {66u};
+
+static_assert(sizeof(kProxyHideHeaderClientRequest) - 1u == 85u);
+static_assert(sizeof(kProxyHideHeaderOriginResponse) - 1u == 219u);
+static_assert(sizeof(kProxyHideHeaderResponseNormalized) - 1u == 176u);
+
+static bool read_proxy_hide_header_access(const std::string& path,
+                                          std::string& contents,
+                                          std::string& error) {
+    contents.clear();
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return true;
+        error = "#373 could not open access log";
+        return false;
+    }
+    char bytes[2048];
+    for (;;) {
+        const ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n > 0) {
+            contents.append(bytes, static_cast<size_t>(n));
+            if (contents.size() > sizeof(bytes)) {
+                close(fd);
+                error = "#373 access log exceeded its one-record bound";
+                return false;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        const int saved = errno;
+        close(fd);
+        if (n == 0) return true;
+        errno = saved;
+        error = "#373 access log read failed";
+        return false;
+    }
+}
 
 static constexpr const char* kStaticQueryClientTargets[2] = {
     "/api/users?x=1",
@@ -28913,6 +28995,13 @@ struct StaticQueryProxyOracleProfile {
     bool require_exact_generated_policies = false;
     bool require_common_access_projection = false;
     bool require_prompt_origin_close = false;
+    const char* client_host = "static-query.example";
+    const char* location_path = "/api/";
+    const char* origin_response = kBackendResponse;
+    size_t origin_response_size = sizeof(kBackendResponse) - 1u;
+    const char* normalized_response = kSuccessResponseNormalized;
+    size_t normalized_response_size = sizeof(kSuccessResponseNormalized) - 1u;
+    bool proxy_hide_header_profile = false;
 };
 
 static constexpr StaticQueryProxyOracleProfile kStaticQueryProxyOracleProfile{
@@ -28969,12 +29058,40 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     true,
     true,
     true};
+static constexpr StaticQueryProxyOracleProfile kProxyHideHeaderOracleProfile{
+    "#373",
+    "373",
+    "",
+    kProxyHideHeaderClientTargets,
+    kProxyHideHeaderUpstreamTargets,
+    nullptr,
+    1u,
+    1u,
+    true,
+    true,
+    true,
+    true,
+    kProxyHideHeaderClientRequestSizes,
+    kProxyHideHeaderUpstreamRequestSizes,
+    false,
+    0u,
+    0u,
+    false,
+    false,
+    true,
+    "hidden.example",
+    "/",
+    kProxyHideHeaderOriginResponse,
+    sizeof(kProxyHideHeaderOriginResponse) - 1u,
+    kProxyHideHeaderResponseNormalized,
+    sizeof(kProxyHideHeaderResponseNormalized) - 1u,
+    true};
 
 static std::string static_query_proxy_request(
     const char* target,
     const StaticQueryProxyOracleProfile& profile = kStaticQueryProxyOracleProfile) {
-    return std::string("GET ") + target +
-           " HTTP/1.1\r\nHost: static-query.example\r\nConnection: close\r\n" +
+    return std::string("GET ") + target + " HTTP/1.1\r\nHost: " + profile.client_host +
+           "\r\nConnection: close\r\n" +
            (profile.duplicate_headers ? "X-Dupe: one\r\nX-Dupe: two\r\n" : "") + "\r\n";
 }
 
@@ -29001,7 +29118,8 @@ static std::vector<std::string> static_query_access_common_projection(
             std::string("GET ") + profile.client_targets[i] +
             (forwarded ? " status=200" : " status=301") + " request_size=" +
             std::to_string(static_query_proxy_request(profile.client_targets[i], profile).size()) +
-            " host=static-query.example upstream=" + (forwarded ? "nginx_upstream:200" : "-");
+            " host=" + std::string(profile.client_host) +
+            " upstream=" + (forwarded ? "nginx_upstream:200" : "-");
         // Redirect response bytes contain the side-specific frontend port in
         // Location/body. Each raw schema validates that exact size separately;
         // the common projection intentionally does not compare those digits.
@@ -29032,12 +29150,13 @@ static std::string make_static_query_proxy_fragment(
     const std::string listen = "  listen " +
                                std::string(profile.exact_loopback_listener ? "127.0.0.1:" : "") +
                                std::to_string(frontend_port) + ";\n";
+    const std::string proxy = "    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+                              profile.configured_uri + ";\n";
+    const std::string hide = "    proxy_hide_header X-Compat-Hidden;\n";
     const std::string location =
-        "  location /api/ {\n"
-        "    proxy_pass http://127.0.0.1:" +
-        std::to_string(backend_port) + profile.configured_uri +
-        ";\n"
-        "  }\n";
+        "  location " + std::string(profile.location_path) + " {\n" +
+        (profile.proxy_hide_header_profile && listen_first ? hide : "") + proxy +
+        (profile.proxy_hide_header_profile && !listen_first ? hide : "") + "  }\n";
     return "server {\n" + (listen_first ? listen + location : location + listen) + "}\n";
 }
 
@@ -29065,9 +29184,21 @@ static bool validate_static_query_proxy_observation(
                 " static-query observation lost its exact side/order/vector inventory";
         return false;
     }
+    if (profile.proxy_hide_header_profile &&
+        (observation.original_config.empty() || !observation.source_poisoned ||
+         observation.source_poison != "destroyed-after-373-nginx-load\n" ||
+         observation.access_scope.empty() || observation.origin_peer_close_count != 1u ||
+         observation.origin_response_sent_ns == 0u ||
+         observation.origin_peer_closed_ns < observation.origin_response_sent_ns ||
+         observation.origin_peer_closed_ns - observation.origin_response_sent_ns >
+             2'000'000'000ull)) {
+        error =
+            "#373 observation lost config ownership, source poison, scope, or prompt origin FIN";
+        return false;
+    }
     const std::vector<char> expected_response(
-        kSuccessResponseNormalized,
-        kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u);
+        profile.normalized_response,
+        profile.normalized_response + profile.normalized_response_size);
     for (size_t i = 0u; i < profile.vector_count; i++) {
         const std::string request = static_query_proxy_request(profile.client_targets[i], profile);
         if (profile.client_request_sizes != nullptr &&
@@ -29076,6 +29207,17 @@ static bool validate_static_query_proxy_observation(
                     " static-query observation client request length mismatch at vector " +
                     std::to_string(i + 1u);
             return false;
+        }
+        if (profile.proxy_hide_header_profile) {
+            const std::string raw_response(observation.wires[i].begin(),
+                                           observation.wires[i].end());
+            if (raw_response.find("X-Compat-Hidden:") != std::string::npos ||
+                raw_response.find("x-compat-hidden:") != std::string::npos ||
+                raw_response.find("Server: origin\r\n") != std::string::npos ||
+                raw_response.find("Date: Wed, 26 Aug 2026 23:57:18 GMT\r\n") != std::string::npos) {
+                error = "#373 raw response leaked hidden, origin Server, or origin Date bytes";
+                return false;
+            }
         }
         std::vector<char> normalized = observation.wires[i];
         const std::vector<char> expected =
@@ -29089,6 +29231,23 @@ static bool validate_static_query_proxy_observation(
                     std::to_string(i + 1u);
             return false;
         }
+        if (profile.proxy_hide_header_profile) {
+            const std::string response(normalized.begin(), normalized.end());
+            if (response.size() != 176u ||
+                count_text(response, "X-Compat-Visible: keep\r\n") != 1u ||
+                count_text(response, "Set-Cookie: a=1\r\n") != 1u ||
+                count_text(response, "Set-Cookie: b=2\r\n") != 1u ||
+                response.find("Set-Cookie: a=1\r\nSet-Cookie: b=2\r\n") == std::string::npos ||
+                response.find("X-Compat-Hidden:") != std::string::npos ||
+                response.find("x-compat-hidden:") != std::string::npos ||
+                response.find("Server: origin\r\n") != std::string::npos ||
+                response.find("Wed, 26 Aug 2026 23:57:18 GMT") != std::string::npos) {
+                error =
+                    "#373 response leaked hidden/origin headers or lost exact visible/cookie "
+                    "inventory";
+                return false;
+            }
+        }
         if (i < profile.forward_count) {
             const std::vector<char> expected_upstream =
                 static_query_expected_upstream(profile.upstream_targets[i], backend_port, profile);
@@ -29101,6 +29260,24 @@ static bool validate_static_query_proxy_observation(
                         "mismatch at vector " +
                         std::to_string(i + 1u);
                 return false;
+            }
+            if (profile.proxy_hide_header_profile) {
+                const std::string upstream(observation.forward_history[i].begin(),
+                                           observation.forward_history[i].end());
+                if (upstream.size() != 66u ||
+                    count_text(upstream,
+                               "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n") != 1u ||
+                    count_text(upstream, "X-Dupe: one\r\n") != 1u ||
+                    count_text(upstream, "X-Dupe: two\r\n") != 1u ||
+                    upstream.find("X-Dupe: one\r\nX-Dupe: two\r\n") == std::string::npos ||
+                    upstream.find("hidden.example") != std::string::npos ||
+                    upstream.find("Connection:") != std::string::npos ||
+                    upstream.find("Content-Length:") != std::string::npos ||
+                    upstream.find("Transfer-Encoding:") != std::string::npos ||
+                    upstream.rfind("\r\n\r\n") != upstream.size() - 4u) {
+                    error = "#373 upstream lost exact Host/duplicate-order/bodyless inventory";
+                    return false;
+                }
             }
         }
     }
@@ -29130,8 +29307,8 @@ static bool parse_static_query_proxy_access(
             scope + " raw=\"GET " + profile.client_targets[i] +
             " HTTP/1.1\" status=" + (forwarded ? "200" : "301") +
             " request_size=" + std::to_string(request.size()) +
-            " response_size=" + std::to_string(observation.wires[i].size()) +
-            " host=\"static-query.example\" upstream_addr=\"" +
+            " response_size=" + std::to_string(observation.wires[i].size()) + " host=\"" +
+            std::string(profile.client_host) + "\" upstream_addr=\"" +
             (forwarded ? "127.0.0.1:" + std::to_string(backend_port) : "-") +
             "\" upstream_status=" + (forwarded ? "200" : "-");
         if (records[i] != expected) {
@@ -29175,11 +29352,13 @@ static bool validate_static_query_proxy_pair(
                                       &observations[0].log_path,
                                       &observations[0].access_path,
                                       &observations[0].process_identity,
+                                      &observations[0].access_scope,
                                       &observations[1].temp_path,
                                       &observations[1].config_path,
                                       &observations[1].log_path,
                                       &observations[1].access_path,
-                                      &observations[1].process_identity};
+                                      &observations[1].process_identity,
+                                      &observations[1].access_scope};
     for (size_t i = 0u; i < sizeof(resources) / sizeof(resources[0]); i++) {
         if (resources[i]->empty()) {
             error = std::string(profile.issue) + " nginx-only oracle resource identity was empty";
@@ -29257,6 +29436,7 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(
     bool listen_first,
     const StaticQueryProxyOracleProfile& profile = kStaticQueryProxyOracleProfile) {
     static constexpr char kDate[] = "Wed, 26 Aug 2026 23:57:18 GMT";
+    static constexpr char kProxyHideDate[] = "Sat, 29 Aug 2026 12:00:00 GMT";
     StaticQueryProxyOracleObservation value;
     value.side = "pinned-nginx";
     value.order = listen_first ? "listen-first" : "location-first";
@@ -29266,20 +29446,21 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(
     value.log_path = value.temp_path + "/nginx.log";
     value.access_path = value.temp_path + "/access.log";
     value.process_identity = std::string("process-") + profile.scope_id + "-" + value.order;
+    value.access_scope = std::string("scope-") + profile.scope_id + "-" + value.order;
     value.frontend_port = frontend_port;
     value.backend_port = backend_port;
     value.forward_accepts = value.forward_requests = value.forward_sends = profile.forward_count;
     for (size_t i = 0u; i < profile.vector_count; i++) {
         std::vector<char> wire =
             i < profile.forward_count
-                ? std::vector<char>(
-                      kSuccessResponseNormalized,
-                      kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                ? std::vector<char>(profile.normalized_response,
+                                    profile.normalized_response + profile.normalized_response_size)
                 : static_query_expected_redirect(
                       frontend_port, profile.redirect_suffixes[i - profile.forward_count]);
         const std::string marker(29u, 'X');
         const auto date = std::search(wire.begin(), wire.end(), marker.begin(), marker.end());
-        if (date != wire.end()) std::copy_n(kDate, 29u, date);
+        if (date != wire.end())
+            std::copy_n(profile.proxy_hide_header_profile ? kProxyHideDate : kDate, 29u, date);
         value.wires.push_back(std::move(wire));
         if (i < profile.forward_count)
             value.forward_history.push_back(
@@ -29287,6 +29468,15 @@ static StaticQueryProxyOracleObservation make_static_query_proxy_self_check(
     }
     if (profile.require_common_access_projection)
         value.access_common_projection = static_query_access_common_projection(value, profile);
+    if (profile.proxy_hide_header_profile) {
+        value.original_config =
+            make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
+        value.source_poison = "destroyed-after-373-nginx-load\n";
+        value.source_poisoned = true;
+        value.origin_peer_close_count = 1u;
+        value.origin_response_sent_ns = 10u;
+        value.origin_peer_closed_ns = 20u;
+    }
     (void)frontend_port;
     return value;
 }
@@ -29303,8 +29493,8 @@ static std::string static_query_proxy_access_fixture(
             scope + " raw=\"GET " + profile.client_targets[i] +
             " HTTP/1.1\" status=" + (forwarded ? "200" : "301") + " request_size=" +
             std::to_string(static_query_proxy_request(profile.client_targets[i], profile).size()) +
-            " response_size=" + std::to_string(observation.wires[i].size()) +
-            " host=\"static-query.example\" upstream_addr=\"" +
+            " response_size=" + std::to_string(observation.wires[i].size()) + " host=\"" +
+            std::string(profile.client_host) + "\" upstream_addr=\"" +
             (forwarded ? "127.0.0.1:" + std::to_string(backend_port) : "-") +
             "\" upstream_status=" + (forwarded ? "200\n" : "-\n");
     }
@@ -30037,6 +30227,149 @@ static bool run_root_empty_query_proxy_oracle_self_checks(std::string& error) {
     return true;
 }
 
+static bool validate_proxy_hide_header_fragment(const std::string& fragment,
+                                                u16 frontend_port,
+                                                u16 backend_port,
+                                                bool listen_first,
+                                                std::string& error) {
+    const auto& profile = kProxyHideHeaderOracleProfile;
+    const std::string expected =
+        make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
+    const std::string listen = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
+    const std::string proxy = "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+    const std::string hide = "proxy_hide_header X-Compat-Hidden;";
+    const size_t hide_at = fragment.find(hide);
+    const size_t proxy_at = fragment.find(proxy);
+    if (backend_port < 1024u || backend_port > 9999u || frontend_port == 0u ||
+        frontend_port == backend_port || fragment != expected ||
+        count_text(fragment, listen) != 1u || count_text(fragment, proxy) != 1u ||
+        count_text(fragment, hide) != 1u || count_text(fragment, "location / {") != 1u ||
+        count_text(fragment, "server {") != 1u || count_text(fragment, "proxy_pass ") != 1u ||
+        count_text(fragment, "proxy_hide_header ") != 1u || hide_at == std::string::npos ||
+        proxy_at == std::string::npos || (listen_first ? hide_at > proxy_at : proxy_at > hide_at)) {
+        error = "#373 config lost exact root proxy/hide declaration inventory or order";
+        return false;
+    }
+    return true;
+}
+
+static bool run_proxy_hide_header_oracle_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {15480u, 9000u, 15481u, 9001u};
+    const auto& profile = kProxyHideHeaderOracleProfile;
+    if (static_query_proxy_request("/", profile) != kProxyHideHeaderClientRequest ||
+        static_query_expected_upstream("/", kPorts[1], profile).size() != 66u ||
+        profile.origin_response_size != 219u || profile.normalized_response_size != 176u) {
+        error = "#373 fixed request/response byte arithmetic self-check failed";
+        return false;
+    }
+    const std::string fragments[2] = {
+        make_static_query_proxy_fragment(kPorts[0], kPorts[1], true, profile),
+        make_static_query_proxy_fragment(kPorts[2], kPorts[3], false, profile)};
+    if (!validate_proxy_hide_header_fragment(fragments[0], kPorts[0], kPorts[1], true, error) ||
+        !validate_proxy_hide_header_fragment(fragments[1], kPorts[2], kPorts[3], false, error))
+        return false;
+    const auto rejects_fragment = [&](const char* needle, const char* replacement) {
+        std::string changed = fragments[0];
+        const size_t at = changed.find(needle);
+        if (at == std::string::npos ||
+            changed.find(needle, at + strlen(needle)) != std::string::npos) {
+            error = "#373 config mutation target was absent or ambiguous";
+            return false;
+        }
+        changed.replace(at, strlen(needle), replacement);
+        std::string detail;
+        if (!validate_proxy_hide_header_fragment(changed, kPorts[0], kPorts[1], true, detail))
+            return true;
+        error = "#373 config validator accepted a directive/name/order/semicolon mutation";
+        return false;
+    };
+    if (!rejects_fragment("proxy_hide_header", "proxy_pass_header") ||
+        !rejects_fragment("X-Compat-Hidden", "X-Compat-Visible") ||
+        !rejects_fragment("X-Compat-Hidden;", "X-Compat-Hidden") ||
+        !rejects_fragment(
+            "proxy_hide_header X-Compat-Hidden;",
+            "proxy_hide_header X-Compat-Hidden;\n    proxy_hide_header X-Compat-Hidden;"))
+        return false;
+    std::string reordered = fragments[0];
+    const std::string hide_line = "    proxy_hide_header X-Compat-Hidden;\n";
+    const std::string proxy_line = "    proxy_pass http://127.0.0.1:9000;\n";
+    const size_t hide_at = reordered.find(hide_line);
+    const size_t proxy_at = reordered.find(proxy_line);
+    if (hide_at == std::string::npos || proxy_at == std::string::npos || hide_at > proxy_at) {
+        error = "#373 config order mutation fixture was malformed";
+        return false;
+    }
+    reordered.replace(hide_at, hide_line.size() + proxy_line.size(), proxy_line + hide_line);
+    std::string reorder_detail;
+    if (validate_proxy_hide_header_fragment(
+            reordered, kPorts[0], kPorts[1], true, reorder_detail)) {
+        error = "#373 config validator accepted swapped hide/proxy directive order";
+        return false;
+    }
+
+    StaticQueryProxyOracleObservation valid[2] = {
+        make_static_query_proxy_self_check(kPorts[0], kPorts[1], true, profile),
+        make_static_query_proxy_self_check(kPorts[2], kPorts[3], false, profile)};
+    if (!validate_static_query_proxy_pair(valid, kPorts, error, profile)) return false;
+    const auto rejects_pair = [&](StaticQueryProxyOracleObservation changed[2], const char* name) {
+        std::string detail;
+        if (!validate_static_query_proxy_pair(changed, kPorts, detail, profile)) return true;
+        error = std::string("#373 observation mutation accepted: ") + name;
+        return false;
+    };
+    StaticQueryProxyOracleObservation changed[2] = {valid[0], valid[1]};
+    std::string wire(changed[1].wires[0].begin(), changed[1].wires[0].end());
+    wire.insert(wire.find("X-Compat-Visible:"), "X-Compat-Hidden: leaked\r\n");
+    changed[1].wires[0].assign(wire.begin(), wire.end());
+    if (!rejects_pair(changed, "hidden-leak")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    changed[1].forward_history[0].pop_back();
+    if (!rejects_pair(changed, "upstream-wire")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    changed[1].origin_peer_close_count = 0u;
+    if (!rejects_pair(changed, "missing-fin")) return false;
+    changed[0] = valid[0];
+    changed[1] = valid[1];
+    changed[1].source_poisoned = false;
+    if (!rejects_pair(changed, "source-poison")) return false;
+
+    const std::string access =
+        static_query_proxy_access_fixture(valid[0], valid[0].access_scope, kPorts[1], profile);
+    if (!parse_static_query_proxy_access(
+            access, valid[0].access_scope, valid[0], kPorts[1], error, profile))
+        return false;
+    for (const std::pair<const char*, const char*>& mutation :
+         {std::pair<const char*, const char*>{"response_size=176", "response_size=175"},
+          {"response_size=176", "response_size=219"},
+          {"request_size=85", "request_size=66"},
+          {" upstream_status=200", " upstream_status=502"}}) {
+        std::string candidate = access;
+        const size_t at = candidate.find(mutation.first);
+        if (at == std::string::npos) {
+            error = "#373 access mutation fixture was malformed";
+            return false;
+        }
+        candidate.replace(at, strlen(mutation.first), mutation.second);
+        std::string detail;
+        if (parse_static_query_proxy_access(
+                candidate, valid[0].access_scope, valid[0], kPorts[1], detail, profile)) {
+            error = "#373 access validator accepted size/status mutation";
+            return false;
+        }
+    }
+    std::string detail;
+    if (parse_static_query_proxy_access(
+            "", valid[0].access_scope, valid[0], kPorts[1], detail, profile) ||
+        parse_static_query_proxy_access(
+            access + access, valid[0].access_scope, valid[0], kPorts[1], detail, profile)) {
+        error = "#373 access validator accepted missing/duplicate record";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_static_query_proxy_oracle_side(
     u16 frontend_port,
     u16 backend_port,
@@ -30096,6 +30429,7 @@ static bool capture_static_query_proxy_oracle_side(
         make_static_query_proxy_fragment(frontend_port, backend_port, listen_first, profile);
     const std::string scope = "rut-nginx-" + std::string(profile.scope_id) + "-static-query-" +
                               observation.order + "-" + std::to_string(getpid());
+    observation.access_scope = scope;
     const std::string config =
         "error_log stderr notice;\n"
         "events {}\n"
@@ -30107,15 +30441,20 @@ static bool capture_static_query_proxy_oracle_side(
         "upstream_status=$upstream_status';\n"
         "  access_log " +
         temp.nginx_access_log + " static_query_proxy_oracle;\n" + fragment + "}\n";
+    observation.original_config = config;
     const std::string exact_listen =
         "listen " + std::string(profile.exact_loopback_listener ? "127.0.0.1:" : "") +
         std::to_string(frontend_port) + ";";
     if (count_text(config,
                    "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
                        profile.configured_uri + ";") != 1u ||
-        count_text(config, "proxy_pass ") != 1u || count_text(config, "location /api/") != 1u ||
+        count_text(config, "proxy_pass ") != 1u ||
+        count_text(config, "location " + std::string(profile.location_path)) != 1u ||
         count_text(config, "server {") != 1u || count_text(config, "listen ") != 1u ||
         count_text(config, exact_listen) != 1u ||
+        (profile.proxy_hide_header_profile &&
+         (count_text(config, "proxy_hide_header X-Compat-Hidden;") != 1u ||
+          count_text(config, "proxy_hide_header ") != 1u)) ||
         !write_file(temp.nginx_config, config.data(), config.size())) {
         error = std::string(profile.issue) +
                 " nginx-only oracle failed to persist its exact minimal static-query config";
@@ -30141,8 +30480,8 @@ static bool capture_static_query_proxy_oracle_side(
     *backend_reservation = -1;
     if (!backend.setup(backend_port,
                        static_cast<u32>(profile.forward_count),
-                       kBackendResponse,
-                       sizeof(kBackendResponse) - 1u)) {
+                       profile.origin_response,
+                       static_cast<u32>(profile.origin_response_size))) {
         error = std::string(profile.issue) +
                 " nginx-only oracle recorder could not bind its reserved backend port";
         return false;
@@ -30205,6 +30544,8 @@ static bool capture_static_query_proxy_oracle_side(
                     " pinned nginx source overwrite/readback was not exact";
             return false;
         }
+        observation.source_poison = destroyed;
+        observation.source_poisoned = true;
     }
 
     const auto observe_count =
@@ -30241,6 +30582,14 @@ static bool capture_static_query_proxy_oracle_side(
         return false;
     };
     if (!observe_count(0u, "pre-request zero window", std::chrono::milliseconds(100))) return false;
+    if (profile.proxy_hide_header_profile) {
+        std::string pre_request_access;
+        if (!read_proxy_hide_header_access(temp.nginx_access_log, pre_request_access, error) ||
+            !pre_request_access.empty()) {
+            if (error.empty()) error = "#373 access log was not absent/empty before the request";
+            return false;
+        }
+    }
     for (size_t i = 0u; i < profile.vector_count; i++) {
         if (poll_child(nginx.child) || !recorder_live(backend)) {
             error = std::string(profile.issue) +
@@ -30266,9 +30615,8 @@ static bool capture_static_query_proxy_oracle_side(
         std::vector<char> normalized = observation.wires[i];
         const std::vector<char> expected =
             i < profile.forward_count
-                ? std::vector<char>(
-                      kSuccessResponseNormalized,
-                      kSuccessResponseNormalized + sizeof(kSuccessResponseNormalized) - 1u)
+                ? std::vector<char>(profile.normalized_response,
+                                    profile.normalized_response + profile.normalized_response_size)
                 : static_query_expected_redirect(
                       frontend_port, profile.redirect_suffixes[i - profile.forward_count]);
         if (!normalize_date(normalized) || normalized != expected) {
@@ -30302,6 +30650,57 @@ static bool capture_static_query_proxy_oracle_side(
                         " nginx-only oracle did not observe prompt clean origin FIN/no-late-bytes";
                 return false;
             }
+            if (profile.proxy_hide_header_profile) {
+                const u64 sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+                const u64 closed_ns =
+                    backend.response_peer_closed_ns.load(std::memory_order_acquire);
+                if (sent_ns == 0u || closed_ns < sent_ns ||
+                    closed_ns - sent_ns > 2'000'000'000ull) {
+                    error = "#373 live origin FIN timestamp was absent, reversed, or too late";
+                    return false;
+                }
+            }
+        }
+    }
+    if (profile.proxy_hide_header_profile) {
+        const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::string access_contents;
+            if (poll_child(nginx.child) || !recorder_live(backend) ||
+                !read_proxy_hide_header_access(temp.nginx_access_log, access_contents, error)) {
+                if (error.empty()) error = "#373 failed while awaiting live exact access record";
+                return false;
+            }
+            if (!access_contents.empty()) {
+                if (!parse_static_query_proxy_access(
+                        access_contents, scope, observation, backend_port, error, profile))
+                    return false;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= access_deadline) {
+                error = "#373 access record was not visible while nginx remained live";
+                return false;
+            }
+            usleep(1000);
+        }
+        const auto access_stable_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < access_stable_deadline) {
+            std::string access_contents;
+            if (poll_child(nginx.child) || !recorder_live(backend) ||
+                backend.accepted.load(std::memory_order_acquire) != 1u ||
+                backend.requests.load(std::memory_order_acquire) != 1u ||
+                backend.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                backend.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                backend.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                backend.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                !read_proxy_hide_header_access(temp.nginx_access_log, access_contents, error) ||
+                !parse_static_query_proxy_access(
+                    access_contents, scope, observation, backend_port, error, profile)) {
+                if (error.empty()) error = "#373 live access/origin/episode evidence was unstable";
+                return false;
+            }
+            usleep(5000);
         }
     }
     if (!observe_count(static_cast<u32>(profile.forward_count),
@@ -30325,6 +30724,11 @@ static bool capture_static_query_proxy_oracle_side(
     observation.forward_requests = backend.requests.load(std::memory_order_acquire);
     observation.forward_sends = backend.response_send_all_calls.load(std::memory_order_acquire);
     observation.forward_history = backend.history;
+    observation.origin_peer_close_count =
+        backend.response_peer_close_count.load(std::memory_order_acquire);
+    observation.origin_response_sent_ns = backend.response_sent_ns.load(std::memory_order_acquire);
+    observation.origin_peer_closed_ns =
+        backend.response_peer_closed_ns.load(std::memory_order_acquire);
     if (backend.thread_alive.load(std::memory_order_acquire) ||
         backend.listener_failed.load(std::memory_order_acquire) ||
         observation.forward_accepts != profile.forward_count ||
@@ -32073,6 +32477,9 @@ static void dump_static_query_proxy_oracle_observation(
             std::string(profile.issue) + " nginx-only upstream " + std::to_string(i + 1u);
         dump_wire(label.c_str(), observation.forward_history[i]);
     }
+    if (!observation.original_config.empty())
+        std::cerr << profile.issue << " original loaded nginx config:\n"
+                  << observation.original_config;
     if (!observation.config_path.empty())
         dump_log(observation.config_path,
                  (std::string(profile.issue) + " nginx-only pinned nginx config").c_str());
@@ -48654,6 +49061,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-empty-query-proxy-uri-oracle") == 0;
     const bool root_empty_query_proxy_uri_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-root-empty-query-proxy-uri-oracle") == 0;
+    const bool proxy_hide_header_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -48833,11 +49242,12 @@ int main(int argc, char** argv) {
          !service_root_proxy_uri_oracle && !wildcard_service_no_uri_oracle &&
          !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
-         !root_empty_query_proxy_uri_oracle && !wildcard_listen_oracle &&
-         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
-         !request_length_oracle && !request_length_split_header_oracle &&
-         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
-         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
+         !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
+         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
+         !exact_loopback_listen_oracle && !request_length_oracle &&
+         !request_length_split_header_oracle && !rut_initial_header_split_public &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -48975,6 +49385,7 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-empty-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
+                     "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -49451,6 +49862,14 @@ int main(int argc, char** argv) {
             !run_root_empty_query_proxy_differential_self_checks(self_check_error)) {
             std::cerr << "FAIL [#372 generated-source/access/four-side self-check]: "
                       << self_check_error << "\n";
+            return 1;
+        }
+    }
+    if (proxy_hide_header_oracle) {
+        std::string self_check_error;
+        if (!run_proxy_hide_header_oracle_self_checks(self_check_error)) {
+            std::cerr << "FAIL [#373 proxy-hide-header oracle self-check]: " << self_check_error
+                      << "\n";
             return 1;
         }
     }
@@ -51582,6 +52001,44 @@ int main(int argc, char** argv) {
                      "generated-RUT, generic capability, or behavior-equivalence claim; other "
                      "prefixes/URIs/normalization/methods/bodies/framing/retry/reuse/protocol/TLS "
                      "excluded)\n";
+        return 0;
+    }
+
+    if (proxy_hide_header_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_prefix =
+            "rut-nginx-373-proxy-hide-header-" + std::to_string(getpid()) + "-" + source_suffix;
+        StaticQueryProxyOracleObservation listen_first;
+        StaticQueryProxyOracleObservation location_first;
+        std::string oracle_error;
+        if (!run_pinned_static_query_proxy_oracle(container_prefix,
+                                                  listen_first,
+                                                  location_first,
+                                                  oracle_error,
+                                                  kProxyHideHeaderOracleProfile)) {
+            std::cerr << "FAIL [#373 pinned nginx-only proxy_hide_header oracle]: " << oracle_error
+                      << "\n";
+            dump_static_query_proxy_oracle_observation(listen_first, kProxyHideHeaderOracleProfile);
+            dump_static_query_proxy_oracle_observation(location_first,
+                                                       kProxyHideHeaderOracleProfile);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #373 pinned nginx 1.29.7 Stage 1 nginx-only oracle proves that one "
+               "literal proxy_hide_header X-Compat-Hidden on the exact-loopback root proxy "
+               "removes both X-Compat-Hidden and x-compat-hidden origin fields while retaining "
+               "X-Compat-Visible and two ordered Set-Cookie fields. Listen-first/hide-first and "
+               "location-first/proxy-first sides each observed one exact fresh bodyless "
+               "explicit-close H1.1 GET: 85 downstream bytes, 66 Host-rebuilt/Connection-omitted "
+               "upstream bytes, one 219-byte origin response, one exact 176-byte normalized "
+               "downstream response with EOF, prompt live origin FIN/no late bytes, stable "
+               "one/no-retry counts, exact live/final access, source poison/readback, disjoint "
+               "held resources, clean lifecycle and no warn-or-higher diagnostics. This is "
+               "pinned-nginx-only evidence for one literal ordinary response header; it makes "
+               "no parser, converter, generated-RUT, generic capability, behavior-equivalence, "
+               "inheritance, proxy_pass_header, control-header, body/reuse/protocol, or broad "
+               "#253 compatibility claim.\n";
         return 0;
     }
 
