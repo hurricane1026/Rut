@@ -22122,7 +22122,7 @@ route GET "/fixed" {
         all_connections_settled &=
             conn.fd == -1 && conn.pending_ops == 0 && conn.request_config == nullptr &&
             conn.upstream_attempts == 0 && conn.retry_req_send_len == 0 &&
-            conn.upstream_retiring_episode == 0 && conn.pipeline_depth == 0 &&
+            http1_pipeline_successor_tombstone_is_safe(conn) && conn.pipeline_depth == 0 &&
             conn.pipeline_stash_len == 0 && conn.recv_buf.len() == 0 && conn.send_buf.len() == 0 &&
             http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
             conn.response_read_deadline_owner_is_neutral();

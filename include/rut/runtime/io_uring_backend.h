@@ -98,6 +98,34 @@ struct IoUringBackend {
     // separately. The worker writes it; the control thread polls it.
     std::atomic<i32> fatal_error{0};
 
+    // A downstream multishot recv can publish more than one positive CQE before
+    // the event loop gets to dispatch the first one.  The backend must not copy
+    // the later payload into the connection buffer early: doing so would let the
+    // first callback observe bytes that are ordered after it.  Keep the exact
+    // unadvanced CQ head here so the next wait can validate and resume it.
+    struct DeferredDownstreamRecv {
+        u64 user_data = 0;
+        u32 head = 0;
+        u32 frozen_tail = 0;
+        bool active = false;
+        bool prior_terminal = false;
+    } deferred_downstream_recv;
+
+    // A terminal CQE may be followed in the already-observed CQ interval by
+    // stale positive selected-buffer records carrying the same generation-less
+    // downstream recv target token.  Tagged cancel bookkeeping remains visible
+    // to the event loop and owns an independent pending-op count.
+    // Dispatching the terminal can rearm or reuse the numeric connection slot,
+    // so only records strictly before the frozen tail are known to belong to
+    // the old owner.  The fixed inventory is bounded by one wait batch.
+    struct DownstreamRecvTerminalWindow {
+        u64 user_data = 0;
+        u32 tail_exclusive = 0;
+    } downstream_recv_terminal_windows[kMaxEventsPerWait];
+    u32 downstream_recv_terminal_window_count = 0;
+    u32 downstream_recv_progress_head = 0;
+    bool downstream_recv_progress_valid = false;
+
     // --- Interface methods ---
 
     // Initialize the io_uring instance for this shard.
@@ -274,6 +302,14 @@ private:
 
     void record_enter_error(i32 result) {
         if (result < 0 && result != -EINTR) fatal_error.store(-result, std::memory_order_release);
+    }
+
+    void reset_downstream_recv_wait_state() {
+        deferred_downstream_recv = {};
+        for (auto& window : downstream_recv_terminal_windows) window = {};
+        downstream_recv_terminal_window_count = 0;
+        downstream_recv_progress_head = 0;
+        downstream_recv_progress_valid = false;
     }
 };
 

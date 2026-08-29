@@ -3457,6 +3457,20 @@ public:
                         if (conn.fd < 0 && conn.pending_ops == 0) reclaim_slot(conn.id);
                         break;
                     }
+                    // A close-path downstream recv target and the cancel SQE
+                    // submitted for it own separate pending-op counts.  The
+                    // cancel's tagged completion carries no bytes and must not
+                    // clear/rearm the target's recv_armed state.
+                    if (ev.type == IoEventType::Recv && ev.aux == kDownstreamCloseCancelAux) {
+                        if (ev.more || conn.pending_ops == 0) {
+                            backend.fatal_error.store(EPROTO, std::memory_order_release);
+                            running_.store(false, std::memory_order_release);
+                            break;
+                        }
+                        conn.pending_ops--;
+                        if (conn.fd < 0 && conn.pending_ops == 0) reclaim_slot(conn.id);
+                        break;
+                    }
                     // A strict-retirement boundary may coexist with the
                     // long-lived downstream multishot recv. wait() has already
                     // copied positive provided-buffer bytes into recv_buf; keep

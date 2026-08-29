@@ -169,6 +169,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     timer_fd = -1;
     timer_read_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
+    reset_downstream_recv_wait_state();
     for (u32 i = 0; i < kMaxSendState; i++) {
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
@@ -691,8 +692,10 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
     // SQ/CQ capacity with no-op cancels that produce -ENOENT completions.
     u32 submitted = 0;
     if (recv_armed) {
-        if (cancel_by_user_data(
-                encode_user_data(conn_id, IoEventType::Recv), conn_id, IoEventType::Recv))
+        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::Recv),
+                                conn_id,
+                                IoEventType::Recv,
+                                kDownstreamCloseCancelAux))
             submitted++;
     }
     if (send_armed) {
@@ -796,7 +799,92 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     u32 mask = *cq_ring_mask;
     u32 count = 0;
 
-    while (head != tail && count < max_events) {
+    auto protocol_failure = [&]() { fatal_error.store(EPROTO, std::memory_order_release); };
+    if (tail - head > cq_ring_entries ||
+        (downstream_recv_progress_valid && downstream_recv_progress_head != head) ||
+        (!downstream_recv_progress_valid &&
+         (deferred_downstream_recv.active || downstream_recv_terminal_window_count != 0))) {
+        protocol_failure();
+        return 0;
+    }
+
+    auto terminal_window_index = [&](u64 user_data) -> i32 {
+        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
+            const auto& window = downstream_recv_terminal_windows[i];
+            if (window.tail_exclusive - head > cq_ring_entries) return -2;
+            if (window.user_data == user_data && head != window.tail_exclusive)
+                return static_cast<i32>(i);
+        }
+        return -1;
+    };
+    auto expire_terminal_windows = [&]() {
+        bool expired = false;
+        u32 retained = 0;
+        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
+            const auto window = downstream_recv_terminal_windows[i];
+            if (window.tail_exclusive - head > cq_ring_entries) {
+                protocol_failure();
+                return false;
+            }
+            if (window.tail_exclusive == head) {
+                expired = true;
+                continue;
+            }
+            downstream_recv_terminal_windows[retained++] = window;
+        }
+        for (u32 i = retained; i < downstream_recv_terminal_window_count; i++)
+            downstream_recv_terminal_windows[i] = {};
+        downstream_recv_terminal_window_count = retained;
+        // Reaching a frozen tail is an event-loop boundary.  Never classify a
+        // CQE appended after it in the same wait invocation.
+        return !expired;
+    };
+    auto valid_positive_downstream_buffer = [&](const io_uring_cqe& cqe) {
+        if ((cqe.flags & IORING_CQE_F_BUFFER) == 0 || static_cast<u32>(cqe.res) > kProvidedBufSize)
+            return false;
+        const u16 buf_id = static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+        return buf_id < kProvidedBufCount;
+    };
+    auto add_terminal_window = [&](u64 user_data, u32 tail_exclusive) {
+        if (tail_exclusive - head > cq_ring_entries ||
+            downstream_recv_terminal_window_count >= kMaxEventsPerWait) {
+            protocol_failure();
+            return false;
+        }
+        downstream_recv_terminal_windows[downstream_recv_terminal_window_count++] = {
+            user_data, tail_exclusive};
+        return true;
+    };
+
+    u64 positive_downstream_tokens[kMaxEventsPerWait]{};
+    u32 positive_downstream_token_count = 0;
+
+    if (deferred_downstream_recv.active) {
+        if (head == tail || deferred_downstream_recv.head != head ||
+            deferred_downstream_recv.frozen_tail - head > cq_ring_entries) {
+            protocol_failure();
+        } else {
+            const io_uring_cqe& deferred = cq_entries[head & mask];
+            u32 deferred_conn = 0;
+            u32 deferred_aux = 0;
+            u32 deferred_episode = 0;
+            IoEventType deferred_type = IoEventType::Count;
+            decode_user_data(
+                deferred.user_data, deferred_conn, deferred_type, deferred_aux, deferred_episode);
+            const i32 window = terminal_window_index(deferred.user_data);
+            if (deferred.user_data != deferred_downstream_recv.user_data ||
+                deferred_type != IoEventType::Recv || deferred_aux != 0 || deferred.res <= 0 ||
+                !valid_positive_downstream_buffer(deferred) || window == -2 ||
+                (deferred_downstream_recv.prior_terminal &&
+                 (window < 0 || downstream_recv_terminal_windows[window].tail_exclusive !=
+                                    deferred_downstream_recv.frozen_tail)) ||
+                (!deferred_downstream_recv.prior_terminal && window >= 0))
+                protocol_failure();
+        }
+    }
+
+    while (failure_code() == 0 && head != tail && count < max_events) {
+        if (!expire_terminal_windows()) break;
         io_uring_cqe* cqe = &cq_entries[head & mask];
 
         // The destination array is reused across waits.  Clear the complete
@@ -815,6 +903,77 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             head++;
             continue;
         }
+
+        const bool downstream_recv_target = type == IoEventType::Recv && aux == 0;
+        const bool downstream_recv_close_cancel =
+            type == IoEventType::Recv && aux == kDownstreamCloseCancelAux;
+        if (type == IoEventType::Recv && !downstream_recv_target && !downstream_recv_close_cancel) {
+            protocol_failure();
+            break;
+        }
+        // The close cancel's own CQE can report a positive cancellation count,
+        // but it never owns a selected buffer or F_MORE.  Only the aux-0 recv
+        // target can expose future payload and participate in the barrier.
+        if (downstream_recv_close_cancel &&
+            (cqe->flags & (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE)) != 0) {
+            protocol_failure();
+            break;
+        }
+        const bool positive_downstream_recv = downstream_recv_target && cqe->res > 0;
+        if (downstream_recv_target && cqe->res <= 0 && (cqe->flags & IORING_CQE_F_BUFFER) != 0) {
+            protocol_failure();
+            break;
+        }
+        const i32 quarantined_window = terminal_window_index(cqe->user_data);
+        if (quarantined_window == -2) {
+            protocol_failure();
+            break;
+        }
+        if (positive_downstream_recv && !valid_positive_downstream_buffer(*cqe)) {
+            protocol_failure();
+            break;
+        }
+        bool positive_downstream_already_seen = false;
+        if (positive_downstream_recv) {
+            for (u32 i = 0; i < positive_downstream_token_count; i++)
+                positive_downstream_already_seen |= positive_downstream_tokens[i] == cqe->user_data;
+            if (positive_downstream_already_seen) {
+                deferred_downstream_recv = {
+                    cqe->user_data,
+                    head,
+                    quarantined_window >= 0
+                        ? downstream_recv_terminal_windows[quarantined_window].tail_exclusive
+                        : tail,
+                    true,
+                    quarantined_window >= 0};
+                break;
+            }
+        }
+        if (quarantined_window >= 0 && downstream_recv_target) {
+            // This exact token is inside a tail snapshot taken before its
+            // terminal callback could rearm/reuse the slot. It owns no live
+            // Connection accounting. Return a positive record's validated
+            // selected buffer exactly once; duplicate target terminals/errors
+            // have no buffer and are consumed without publication. The tagged
+            // close-cancel completion has different user_data and remains
+            // visible because it owns a separate pending-op count.
+            if (positive_downstream_recv) {
+                const u16 buf_id = static_cast<u16>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+                return_buffer(buf_id);
+            }
+            if (deferred_downstream_recv.active) deferred_downstream_recv = {};
+            head++;
+            continue;
+        }
+
+        if (positive_downstream_recv) {
+            if (positive_downstream_token_count >= kMaxEventsPerWait) {
+                protocol_failure();
+                break;
+            }
+            positive_downstream_tokens[positive_downstream_token_count++] = cqe->user_data;
+        }
+        if (deferred_downstream_recv.active) deferred_downstream_recv = {};
 
         // --- #3: Timer tick handling ---
         if (conn_id == kTimerConnId && type == IoEventType::Timeout) {
@@ -886,7 +1045,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 }
             }
             const bool valid_buffer_id = buf_id < kProvidedBufCount;
-            if (cqe->res > 0 && conn_id < max_conns && !stale_upstream && valid_buffer_id) {
+            const bool stale_downstream =
+                type == IoEventType::Recv &&
+                (conns == nullptr || conn_id >= max_conns || conns[conn_id].fd < 0);
+            if (cqe->res > 0 && conn_id < max_conns && !stale_upstream && !stale_downstream &&
+                valid_buffer_id) {
                 u32 nbytes = static_cast<u32>(cqe->res);
                 // TLS client connections receive ciphertext: land it in
                 // tls_in_buf so the event-loop TLS layer can decrypt into
@@ -962,6 +1125,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].upstream_episode = upstream_episode;
             head++;
             count++;
+            if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
+                !add_terminal_window(cqe->user_data, tail))
+                break;
             continue;
         }
 
@@ -1107,15 +1273,26 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
 
         head++;
         count++;
+        if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
+            !add_terminal_window(cqe->user_data, tail))
+            break;
     }
 
     __atomic_store_n(cq_head, head, __ATOMIC_RELEASE);
+    if (deferred_downstream_recv.active || downstream_recv_terminal_window_count != 0) {
+        downstream_recv_progress_head = head;
+        downstream_recv_progress_valid = true;
+    } else {
+        downstream_recv_progress_head = 0;
+        downstream_recv_progress_valid = false;
+    }
     return count;
 }
 
 // --- Shutdown ---
 
 void IoUringBackend::shutdown() {
+    reset_downstream_recv_wait_state();
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;

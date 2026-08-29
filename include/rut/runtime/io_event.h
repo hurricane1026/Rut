@@ -127,6 +127,10 @@ inline constexpr u8 kUpstreamRetirementCancelAux = 3;
 // (the operation target), this completion owns the cancel SQE's pending-op
 // count. Keeping it distinct prevents either record from stealing the other.
 inline constexpr u8 kUpstreamCloseCancelAux = 4;
+// Close-path ownership for a downstream recv ASYNC_CANCEL SQE.  The recv
+// target remains aux 0; keeping the cancel completion distinct prevents its
+// positive cancellation count from being mistaken for selected-buffer data.
+inline constexpr u8 kDownstreamCloseCancelAux = 5;
 
 inline constexpr u8 kUpstreamOpConnect = 1u << 0;
 inline constexpr u8 kUpstreamOpRecv = 1u << 1;

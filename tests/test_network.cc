@@ -27725,6 +27725,598 @@ bool harvest_http1_boundary_recv(IoUringEventLoop* loop,
     return true;
 }
 
+struct RawDownstreamRecvBatch {
+    ScopedIoUringLoopForRetirement guard;
+    Connection* conns[2] = {nullptr, nullptr};
+    u16 next_buf_id = 101;
+
+    bool init(u32 count = 1) {
+        if (count == 0 || count > 2 || !guard.init()) return false;
+        for (u32 i = 0; i < count; i++) {
+            conns[i] = guard.loop->alloc_conn();
+            if (conns[i] == nullptr) return false;
+            conns[i]->fd = static_cast<i32>(42 + i);
+            conns[i]->recv_armed = true;
+            conns[i]->pending_ops = 1;
+        }
+        // Synthetic CQEs below are already visible.  Keep the init-time timer
+        // SQE out of these exact raw-CQ ownership tests.
+        guard.loop->backend.pending = 0;
+        return true;
+    }
+
+    u32 head() const { return __atomic_load_n(guard.loop->backend.cq_head, __ATOMIC_ACQUIRE); }
+
+    u32 tail() const { return __atomic_load_n(guard.loop->backend.cq_tail, __ATOMIC_ACQUIRE); }
+
+    u16 buffer_tail() const {
+        return __atomic_load_n(&guard.loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+    }
+
+    bool append_recv(
+        Connection& conn, const u8* bytes, u32 len, bool more, u16 forced_buf_id = UINT16_MAX) {
+        if (bytes == nullptr || len == 0 || len > kProvidedBufSize) return false;
+        const u16 buf_id = forced_buf_id == UINT16_MAX ? next_buf_id++ : forced_buf_id;
+        if (buf_id >= kProvidedBufCount) return false;
+        __builtin_memcpy(
+            guard.loop->backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize, bytes, len);
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
+        cqe.res = static_cast<i32>(len);
+        cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT) |
+                    (more ? IORING_CQE_F_MORE : 0u);
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    void append_terminal(Connection& conn, i32 result) {
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
+        cqe.res = result;
+        cqe.flags = 0;
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    }
+
+    void append_close_cancel(Connection& conn, i32 result) {
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data =
+            IoUringBackend::encode_user_data(conn.id, IoEventType::Recv, kDownstreamCloseCancelAux);
+        cqe.res = result;
+        cqe.flags = 0;
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    }
+
+    void append_tagged_recv(Connection& conn, i32 result, u32 aux, u32 flags) {
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data = IoUringBackend::encode_user_data(conn.id, IoEventType::Recv, aux);
+        cqe.res = result;
+        cqe.flags = flags;
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    }
+
+    void append_timeout(u32 witness) {
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({0, IoEventType::Timeout, 0});
+        cqe.res = static_cast<i32>(witness);
+        cqe.flags = 0;
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    }
+
+    u32 wait(IoEvent* events, u32 max_events = 8) {
+        guard.loop->backend.pending = 0;
+        return guard.loop->backend.wait(
+            events, max_events, guard.loop->conns, IoUringEventLoop::kMaxConns);
+    }
+};
+
+static constexpr u8 kSplitHeaderPrefix[] =
+    "GET /ledger?q=raw HTTP/1.1\r\n"
+    "Host: client.exam";
+static constexpr u8 kSplitHeaderSuffix[] =
+    "ple.with.a.long.name\r\n"
+    "Connection: close\r\n"
+    "X-Test: keep\r\n"
+    "\r\n";
+static_assert(sizeof(kSplitHeaderPrefix) - 1u == 45u);
+static_assert(sizeof(kSplitHeaderSuffix) - 1u == 57u);
+
+TEST(iouring_downstream_recv_barrier, split_positive_is_copied_one_per_wait) {
+    for (const bool terminal_suffix : {false, true}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        const u32 initial_head = fixture.head();
+        const u16 initial_buffer_tail = fixture.buffer_tail();
+        REQUIRE(
+            fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+        REQUIRE(fixture.append_recv(
+            conn, kSplitHeaderSuffix, sizeof(kSplitHeaderSuffix) - 1u, !terminal_suffix));
+
+        IoEvent events[4]{};
+        REQUIRE_EQ(fixture.wait(events, 4), 1u);
+        CHECK_EQ(events[0].type, IoEventType::Recv);
+        CHECK_EQ(events[0].result, 45);
+        CHECK_EQ(events[0].more, 1u);
+        CHECK_EQ(conn.recv_buf.len(), 45u);
+        CHECK_EQ(memcmp(conn.recv_buf.data(), kSplitHeaderPrefix, 45), 0);
+        CHECK_EQ(fixture.head(), initial_head + 1u);
+        CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(initial_buffer_tail + 1u));
+        REQUIRE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+        CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.head, initial_head + 1u);
+        CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.user_data,
+                 encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0}));
+
+        REQUIRE_EQ(fixture.wait(events, 4), 1u);
+        CHECK_EQ(events[0].type, IoEventType::Recv);
+        CHECK_EQ(events[0].result, 57);
+        CHECK_EQ(events[0].more, terminal_suffix ? 0u : 1u);
+        CHECK_EQ(conn.recv_buf.len(), 102u);
+        CHECK_EQ(memcmp(conn.recv_buf.data(), kSplitHeaderPrefix, 45), 0);
+        CHECK_EQ(memcmp(conn.recv_buf.data() + 45, kSplitHeaderSuffix, 57), 0);
+        CHECK_EQ(fixture.head(), initial_head + 2u);
+        CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(initial_buffer_tail + 2u));
+        CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+    }
+}
+
+TEST(iouring_downstream_recv_barrier, cq_order_stops_before_suffix_in_both_interleavings) {
+    for (const bool timeout_before_suffix : {false, true}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        REQUIRE(
+            fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+        if (timeout_before_suffix) fixture.append_timeout(17);
+        REQUIRE(
+            fixture.append_recv(conn, kSplitHeaderSuffix, sizeof(kSplitHeaderSuffix) - 1u, true));
+        if (!timeout_before_suffix) fixture.append_timeout(17);
+
+        IoEvent events[4]{};
+        const u32 first_count = fixture.wait(events, 4);
+        REQUIRE_EQ(first_count, timeout_before_suffix ? 2u : 1u);
+        CHECK_EQ(events[0].type, IoEventType::Recv);
+        CHECK_EQ(conn.recv_buf.len(), 45u);
+        if (timeout_before_suffix) {
+            CHECK_EQ(events[1].type, IoEventType::Timeout);
+            CHECK_EQ(events[1].result, 17);
+        }
+
+        const u32 second_count = fixture.wait(events, 4);
+        REQUIRE_EQ(second_count, timeout_before_suffix ? 1u : 2u);
+        CHECK_EQ(events[0].type, IoEventType::Recv);
+        CHECK_EQ(conn.recv_buf.len(), 102u);
+        if (!timeout_before_suffix) {
+            CHECK_EQ(events[1].type, IoEventType::Timeout);
+            CHECK_EQ(events[1].result, 17);
+        }
+    }
+}
+
+TEST(iouring_downstream_recv_barrier, different_connections_and_terminals_do_not_barrier) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init(2)) SKIP("io_uring unavailable");
+    Connection& a = *fixture.conns[0];
+    Connection& b = *fixture.conns[1];
+    static constexpr u8 kA[] = "a";
+    static constexpr u8 kB[] = "bb";
+    REQUIRE(fixture.append_recv(a, kA, sizeof(kA) - 1u, true));
+    REQUIRE(fixture.append_recv(b, kB, sizeof(kB) - 1u, true));
+    fixture.append_terminal(a, 0);
+    fixture.append_terminal(b, -ECONNRESET);
+
+    IoEvent events[6]{};
+    REQUIRE_EQ(fixture.wait(events, 6), 4u);
+    CHECK_EQ(events[0].conn_id, a.id);
+    CHECK_EQ(events[0].result, 1);
+    CHECK_EQ(events[1].conn_id, b.id);
+    CHECK_EQ(events[1].result, 2);
+    CHECK_EQ(events[2].conn_id, a.id);
+    CHECK_EQ(events[2].result, 0);
+    CHECK_EQ(events[3].conn_id, b.id);
+    CHECK_EQ(events[3].result, -ECONNRESET);
+    CHECK_EQ(a.recv_buf.len(), 1u);
+    CHECK_EQ(b.recv_buf.len(), 2u);
+    CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_recv_barrier, close_cancel_count_is_not_payload_and_accounts_both_orders) {
+    for (const bool cancel_first : {false, true}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        const u32 conn_id = conn.id;
+        const u16 buffer_tail_before = fixture.buffer_tail();
+        conn.pending_ops = 2;  // recv target + close cancel SQE
+        if (cancel_first) {
+            fixture.append_close_cancel(conn, 1);
+            fixture.append_terminal(conn, -ECANCELED);
+        } else {
+            fixture.append_terminal(conn, -ECANCELED);
+            fixture.append_close_cancel(conn, 1);
+        }
+        conn.fd = -1;
+        fixture.guard.loop->free_conn(conn);
+        REQUIRE_EQ(fixture.guard.loop->pending_free_count, 1u);
+
+        IoEvent events[2]{};
+        REQUIRE_EQ(fixture.wait(events, 2), 2u);
+        CHECK_EQ(events[cancel_first ? 0u : 1u].type, IoEventType::Recv);
+        CHECK_EQ(events[cancel_first ? 0u : 1u].result, 1);
+        CHECK_EQ(events[cancel_first ? 0u : 1u].aux, kDownstreamCloseCancelAux);
+        CHECK_EQ(events[cancel_first ? 1u : 0u].type, IoEventType::Recv);
+        CHECK_EQ(events[cancel_first ? 1u : 0u].result, -ECANCELED);
+        CHECK_EQ(events[cancel_first ? 1u : 0u].aux, 0u);
+        CHECK_EQ(fixture.buffer_tail(), buffer_tail_before);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+
+        fixture.guard.loop->dispatch(events[0]);
+        CHECK_EQ(fixture.guard.loop->pending_free_count, 1u);
+        CHECK_EQ(fixture.guard.loop->conns[conn_id].pending_ops, 1u);
+        fixture.guard.loop->dispatch(events[1]);
+        CHECK_EQ(fixture.guard.loop->pending_free_count, 0u);
+        CHECK_EQ(fixture.guard.loop->free_top, IoUringEventLoop::kMaxConns);
+    }
+}
+
+TEST(iouring_downstream_recv_barrier, frozen_duplicate_target_cannot_steal_cancel_accounting) {
+    for (const bool cancel_first : {false, true}) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        const u32 conn_id = conn.id;
+        conn.pending_ops = 2;  // recv target + close cancel SQE; duplicate owns neither
+        if (cancel_first) fixture.append_close_cancel(conn, 1);
+        fixture.append_terminal(conn, -ECANCELED);
+        fixture.append_terminal(conn, -ECANCELED);
+        if (!cancel_first) fixture.append_close_cancel(conn, 1);
+        conn.fd = -1;
+        fixture.guard.loop->free_conn(conn);
+        REQUIRE_EQ(fixture.guard.loop->pending_free_count, 1u);
+
+        IoEvent events[3]{};
+        REQUIRE_EQ(fixture.wait(events, 3), 2u);
+        const u32 cancel_index = cancel_first ? 0u : 1u;
+        const u32 target_index = cancel_first ? 1u : 0u;
+        CHECK_EQ(events[cancel_index].type, IoEventType::Recv);
+        CHECK_EQ(events[cancel_index].result, 1);
+        CHECK_EQ(events[cancel_index].aux, kDownstreamCloseCancelAux);
+        CHECK_EQ(events[target_index].type, IoEventType::Recv);
+        CHECK_EQ(events[target_index].result, -ECANCELED);
+        CHECK_EQ(events[target_index].aux, 0u);
+        CHECK_EQ(fixture.head(), fixture.tail());
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+
+        fixture.guard.loop->dispatch(events[0]);
+        CHECK_EQ(fixture.guard.loop->pending_free_count, 1u);
+        CHECK_EQ(fixture.guard.loop->conns[conn_id].pending_ops, 1u);
+        fixture.guard.loop->dispatch(events[1]);
+        CHECK_EQ(fixture.guard.loop->pending_free_count, 0u);
+        CHECK_EQ(fixture.guard.loop->free_top, IoUringEventLoop::kMaxConns);
+    }
+}
+
+TEST(iouring_downstream_recv_barrier, terminal_window_quarantines_old_records_and_hands_off) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    static constexpr u8 kTerminal[] = "terminal";
+    static constexpr u8 kOldOne[] = "old-one";
+    static constexpr u8 kOldTwo[] = "old-two";
+    static constexpr u8 kNew[] = "new-owner";
+    const u16 buffer_tail_before = fixture.buffer_tail();
+    REQUIRE(fixture.append_recv(conn, kTerminal, sizeof(kTerminal) - 1u, false));
+    REQUIRE(fixture.append_recv(conn, kOldOne, sizeof(kOldOne) - 1u, true));
+    fixture.append_timeout(23);
+    REQUIRE(fixture.append_recv(conn, kOldTwo, sizeof(kOldTwo) - 1u, true));
+    fixture.append_close_cancel(conn, 1);  // separate close-cancel ownership remains visible
+
+    IoEvent events[4]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // max-events interrupts the frozen interval
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kTerminal) - 1u));
+    REQUIRE_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 1u);
+    const u32 frozen_tail =
+        fixture.guard.loop->backend.downstream_recv_terminal_windows[0].tail_exclusive;
+
+    // The terminal callback may install a new owner with the same generation-
+    // less token.  Append its CQE after the frozen tail before resuming.
+    conn.recv_buf.reset();
+    conn.fd = 77;
+    conn.recv_armed = true;
+    conn.pending_ops = 9;
+    REQUIRE(fixture.append_recv(conn, kNew, sizeof(kNew) - 1u, true));
+
+    REQUIRE_EQ(fixture.wait(events, 4), 2u);
+    CHECK_EQ(events[0].type, IoEventType::Timeout);
+    CHECK_EQ(events[0].result, 23);
+    CHECK_EQ(events[1].type, IoEventType::Recv);
+    CHECK_EQ(events[1].result, 1);
+    CHECK_EQ(events[1].aux, kDownstreamCloseCancelAux);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.pending_ops, 9u);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 3u));
+    CHECK_EQ(fixture.head(), frozen_tail);
+    CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
+
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kNew) - 1u));
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kNew) - 1u);
+    CHECK_EQ(memcmp(conn.recv_buf.data(), kNew, sizeof(kNew) - 1u), 0);
+    CHECK_EQ(conn.pending_ops, 9u);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 4u));
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_recv_barrier, terminal_second_positive_uses_exact_deferred_marker) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    static constexpr u8 kTerminal[] = "terminal";
+    static constexpr u8 kOld[] = "old-after-terminal";
+    REQUIRE(fixture.append_recv(conn, kTerminal, sizeof(kTerminal) - 1u, false));
+    REQUIRE(fixture.append_recv(conn, kOld, sizeof(kOld) - 1u, true));
+    fixture.append_timeout(29);
+    const u16 buffer_tail_before = fixture.buffer_tail();
+    IoEvent events[3]{};
+    REQUIRE_EQ(fixture.wait(events, 3), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    REQUIRE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK(fixture.guard.loop->backend.deferred_downstream_recv.prior_terminal);
+    CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.head, fixture.head());
+    CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.frozen_tail, fixture.tail());
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 1u));
+
+    REQUIRE_EQ(fixture.wait(events, 3), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Timeout);
+    CHECK_EQ(events[0].result, 29);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kTerminal) - 1u);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 2u));
+    CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_recv_barrier, max_event_terminal_keeps_empty_frozen_boundary) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    IoEvent event{};
+    REQUIRE_EQ(fixture.wait(&event, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Recv);
+    CHECK_EQ(event.result, 0);
+    REQUIRE_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_windows[0].tail_exclusive,
+             fixture.head());
+
+    static constexpr u8 kNew[] = "new-after-empty-boundary";
+    conn.recv_buf.reset();
+    conn.fd = 91;
+    conn.recv_armed = true;
+    conn.pending_ops = 5;
+    REQUIRE(fixture.append_recv(conn, kNew, sizeof(kNew) - 1u, true));
+    CHECK_EQ(fixture.wait(&event, 1), 0u);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.pending_ops, 5u);
+    CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
+    REQUIRE_EQ(fixture.wait(&event, 1), 1u);
+    CHECK_EQ(event.result, static_cast<i32>(sizeof(kNew) - 1u));
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kNew) - 1u);
+}
+
+TEST(iouring_downstream_recv_barrier, deferred_closed_owner_drains_without_copy) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    REQUIRE(fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+    REQUIRE(fixture.append_recv(conn, kSplitHeaderSuffix, sizeof(kSplitHeaderSuffix) - 1u, false));
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    const u32 conn_id = conn.id;
+    conn.fd = -1;
+    fixture.guard.loop->free_conn(conn);
+    Connection& closed = fixture.guard.loop->conns[conn_id];
+    REQUIRE_EQ(fixture.guard.loop->pending_free_count, 1u);
+    REQUIRE_EQ(closed.pending_ops, 1u);
+    const u16 before = fixture.buffer_tail();
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    CHECK_EQ(events[0].result, 57);
+    CHECK_EQ(events[0].more, 0u);
+    CHECK_EQ(closed.recv_buf.len(), 0u);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(before + 1u));
+    fixture.guard.loop->dispatch(events[0]);
+    CHECK_EQ(fixture.guard.loop->free_top, IoUringEventLoop::kMaxConns);
+}
+
+TEST(iouring_downstream_recv_barrier, tls_ciphertext_and_upstream_classification_are_exact) {
+    {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        u8 tls_storage[256]{};
+        conn.tls_active = true;
+        conn.tls_in_buf.bind(tls_storage, sizeof(tls_storage));
+        static constexpr u8 kTlsOne[] = "cipher-one";
+        static constexpr u8 kTlsTwo[] = "cipher-two";
+        REQUIRE(fixture.append_recv(conn, kTlsOne, sizeof(kTlsOne) - 1u, true));
+        REQUIRE(fixture.append_recv(conn, kTlsTwo, sizeof(kTlsTwo) - 1u, true));
+        IoEvent events[2]{};
+        REQUIRE_EQ(fixture.wait(events, 2), 1u);
+        CHECK_EQ(conn.tls_in_buf.len(), sizeof(kTlsOne) - 1u);
+        CHECK_EQ(conn.recv_buf.len(), 0u);
+        REQUIRE_EQ(fixture.wait(events, 2), 1u);
+        CHECK_EQ(conn.tls_in_buf.len(), sizeof(kTlsOne) + sizeof(kTlsTwo) - 2u);
+    }
+
+    {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        conn.protocol = ConnProtocol::Http2;
+        static constexpr u8 kH2cOne[] = "h2c-one";
+        static constexpr u8 kH2cTwo[] = "h2c-two";
+        REQUIRE(fixture.append_recv(conn, kH2cOne, sizeof(kH2cOne) - 1u, true));
+        REQUIRE(fixture.append_recv(conn, kH2cTwo, sizeof(kH2cTwo) - 1u, true));
+        IoEvent events[2]{};
+        REQUIRE_EQ(fixture.wait(events, 2), 1u);
+        CHECK_EQ(conn.recv_buf.len(), sizeof(kH2cOne) - 1u);
+        REQUIRE_EQ(fixture.wait(events, 2), 1u);
+        CHECK_EQ(conn.recv_buf.len(), sizeof(kH2cOne) + sizeof(kH2cTwo) - 2u);
+    }
+
+    // UpstreamRecv deliberately retains its existing batch behavior.
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    REQUIRE(fixture.guard.loop->alloc_upstream_buf(conn));
+    conn.upstream_episode = 7;
+    conn.upstream_recv_armed = true;
+    static constexpr u8 kOne[] = "up-one";
+    static constexpr u8 kTwo[] = "up-two";
+    auto append_upstream = [&](const u8* bytes, u32 len, u16 buf_id) {
+        __builtin_memcpy(
+            fixture.guard.loop->backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize,
+            bytes,
+            len);
+        const u32 cursor = fixture.tail();
+        auto& cqe = fixture.guard.loop->backend
+                        .cq_entries[cursor & *fixture.guard.loop->backend.cq_ring_mask];
+        cqe.user_data = IoUringBackend::encode_upstream_user_data(
+            conn.id, IoEventType::UpstreamRecv, conn.upstream_episode);
+        cqe.res = static_cast<i32>(len);
+        cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                    (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+        __atomic_store_n(fixture.guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    };
+    append_upstream(kOne, sizeof(kOne) - 1u, 201);
+    append_upstream(kTwo, sizeof(kTwo) - 1u, 202);
+    IoEvent upstream_events[3]{};
+    REQUIRE_EQ(fixture.wait(upstream_events, 3), 2u);
+    CHECK_EQ(upstream_events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(upstream_events[1].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kOne) + sizeof(kTwo) - 2u);
+}
+
+TEST(iouring_downstream_recv_barrier, marker_mutation_and_invalid_buffer_fail_sticky) {
+    {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        REQUIRE(
+            fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+        REQUIRE(
+            fixture.append_recv(conn, kSplitHeaderSuffix, sizeof(kSplitHeaderSuffix) - 1u, true));
+        IoEvent events[2]{};
+        REQUIRE_EQ(fixture.wait(events, 2), 1u);
+        fixture.guard.loop->backend.deferred_downstream_recv.user_data ^= 1u;
+        const u32 head_before = fixture.head();
+        const u16 buffer_tail_before = fixture.buffer_tail();
+        CHECK_EQ(fixture.wait(events, 2), 0u);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), EPROTO);
+        CHECK_EQ(fixture.head(), head_before);
+        CHECK_EQ(fixture.buffer_tail(), buffer_tail_before);
+    }
+
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    REQUIRE(fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+    u32 cursor = fixture.tail();
+    auto& invalid =
+        fixture.guard.loop->backend.cq_entries[cursor & *fixture.guard.loop->backend.cq_ring_mask];
+    invalid.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
+    invalid.res = 1;
+    invalid.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                    (static_cast<u32>(kProvidedBufCount) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(fixture.guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    IoEvent event{};
+    REQUIRE_EQ(fixture.wait(&event, 1), 1u);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+    CHECK_EQ(fixture.wait(&event, 1), 0u);
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), EPROTO);
+}
+
+TEST(iouring_downstream_recv_barrier, recv_aux_and_cancel_metadata_mutations_fail_sticky) {
+    struct Mutation {
+        u32 aux;
+        i32 result;
+        u32 flags;
+    };
+    constexpr u16 kValidBufId = 41;
+    const Mutation mutations[] = {
+        {kDownstreamCloseCancelAux + 1u, 0, 0},
+        {kDownstreamCloseCancelAux,
+         1,
+         IORING_CQE_F_BUFFER | (static_cast<u32>(kValidBufId) << IORING_CQE_BUFFER_SHIFT)},
+        {kDownstreamCloseCancelAux, 1, IORING_CQE_F_MORE},
+        {0, 0, IORING_CQE_F_BUFFER | (static_cast<u32>(kValidBufId) << IORING_CQE_BUFFER_SHIFT)},
+    };
+    for (const auto& mutation : mutations) {
+        RawDownstreamRecvBatch fixture;
+        if (!fixture.init()) SKIP("io_uring unavailable");
+        Connection& conn = *fixture.conns[0];
+        fixture.append_tagged_recv(conn, mutation.result, mutation.aux, mutation.flags);
+        const u32 head_before = fixture.head();
+        const u16 buffer_tail_before = fixture.buffer_tail();
+        IoEvent event{};
+        CHECK_EQ(fixture.wait(&event, 1), 0u);
+        CHECK_EQ(fixture.guard.loop->backend.failure_code(), EPROTO);
+        CHECK_EQ(fixture.head(), head_before);
+        CHECK_EQ(fixture.buffer_tail(), buffer_tail_before);
+    }
+}
+
+TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_clears_state) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    Connection& conn = *fixture.conns[0];
+    REQUIRE_EQ(fixture.head(), fixture.tail());
+    constexpr u32 kWrappedStart = UINT32_MAX - 1u;
+    __atomic_store_n(fixture.guard.loop->backend.cq_head, kWrappedStart, __ATOMIC_RELEASE);
+    __atomic_store_n(fixture.guard.loop->backend.cq_tail, kWrappedStart, __ATOMIC_RELEASE);
+    REQUIRE(fixture.append_recv(conn, kSplitHeaderPrefix, sizeof(kSplitHeaderPrefix) - 1u, true));
+    REQUIRE(fixture.append_recv(conn, kSplitHeaderSuffix, sizeof(kSplitHeaderSuffix) - 1u, true));
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    CHECK_EQ(fixture.head(), UINT32_MAX);
+    REQUIRE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.head, UINT32_MAX);
+    CHECK_EQ(fixture.guard.loop->backend.deferred_downstream_recv.frozen_tail, 0u);
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    CHECK_EQ(fixture.head(), 0u);
+    CHECK_EQ(conn.recv_buf.len(), 102u);
+
+    fixture.guard.loop->backend.deferred_downstream_recv = {17, 19, 23, true, true};
+    fixture.guard.loop->backend.downstream_recv_terminal_windows[0] = {17, 23};
+    fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
+    fixture.guard.loop->backend.downstream_recv_progress_head = 19;
+    fixture.guard.loop->backend.downstream_recv_progress_valid = true;
+    fixture.guard.loop->backend.shutdown();
+    fixture.guard.initialized = false;
+    CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
+
+    fixture.guard.loop->backend.deferred_downstream_recv = {31, 37, 41, true, true};
+    fixture.guard.loop->backend.downstream_recv_terminal_windows[0] = {31, 41};
+    fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
+    fixture.guard.loop->backend.downstream_recv_progress_head = 37;
+    fixture.guard.loop->backend.downstream_recv_progress_valid = true;
+    REQUIRE(fixture.guard.loop->backend.init(0, -1).has_value());
+    CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
+    CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
+    fixture.guard.loop->backend.shutdown();
+}
+
 u32 g_boundary_current_callback_count = 0;
 IoEvent g_boundary_current_event{};
 
