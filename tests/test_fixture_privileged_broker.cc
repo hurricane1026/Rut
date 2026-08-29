@@ -98,7 +98,9 @@ enum class GroupScanResult { Exact, Unreadable };
 static GroupScanResult scan_group_stat(pid_t pgid,
                                        int& member_count,
                                        bool& live_member,
-                                       pid_t permitted_zombie);
+                                       pid_t permitted_zombie,
+                                       pid_t& sole_member,
+                                       std::uint64_t& sole_start);
 static GroupScanResult group_member_count(pid_t pgid, int& count);
 struct GroupLease;
 static bool cleanup_group_lease(GroupLease& lease,
@@ -287,6 +289,9 @@ static std::string probe_diagnostic(pid_t pid) {
 }
 
 enum class DirectWaitDisposition { Reaped, Retry, Error };
+enum class OwnedReapResult { Reaped, TimedOut, Error };
+
+static OwnedReapResult reap_owned_child_bounded(pid_t child);
 
 static DirectWaitDisposition classify_direct_wait(pid_t waited, pid_t expected, int wait_errno) {
     if (waited == expected) return DirectWaitDisposition::Reaped;
@@ -337,19 +342,25 @@ struct GroupLease {
         // /proc group scan is the safe pre-reap equivalent of ESRCH here.
         int count = 0;
         bool live = true;
+        pid_t sole_member = -1;
+        std::uint64_t sole_start = 0;
         return child_exited_wnowait(pid) &&
-               scan_group_stat(pgid, count, live, pid) == GroupScanResult::Exact && count == 1 &&
-               !live;
+               scan_group_stat(pgid, count, live, pid, sole_member, sole_start) ==
+                   GroupScanResult::Exact &&
+               count == 1 && sole_member == pid && sole_start == start && !live;
     }
 
     bool empty_group_exact() const {
         int count = 0;
         bool live = false;
+        pid_t sole_member = -1;
+        std::uint64_t sole_start = 0;
         errno = 0;
         const bool esrch = kill(-pgid, 0) < 0 && errno == ESRCH;
         return pgid > 1 && esrch &&
-               scan_group_stat(pgid, count, live, -1) == GroupScanResult::Exact && count == 0 &&
-               !live;
+               scan_group_stat(pgid, count, live, -1, sole_member, sole_start) ==
+                   GroupScanResult::Exact &&
+               count == 0 && !live;
     }
 
     bool signal_single(int signal_number) const {
@@ -556,6 +567,7 @@ static bool pure_protocol_self_checks(std::string& error) {
         !parse_probe_stat("(partial) R 1 2", malformed_sid, malformed_start) &&
         !probe_proc(0).stat_read && !probe_proc(0).status_read &&
         probe_diagnostic(0).find("stat{read=0,parse=0") != std::string::npos;
+    const bool no_signal_on_echild = reap_owned_child_bounded(getpid()) == OwnedReapResult::Error;
     if (!parse_credentials(credentials, parsed_uid, parsed_gid) || parsed_uid != uid ||
         parsed_gid != gid || !parse_credentials(changed_credentials, changed_uid, changed_gid) ||
         (changed_uid == uid && changed_gid == gid) ||
@@ -565,7 +577,7 @@ static bool pure_protocol_self_checks(std::string& error) {
         !valid_security_trace(trace) || valid_security_trace(reordered_trace) ||
         valid_security_trace(duplicate_trace) || valid_security_trace(short_trace) ||
         !socket_helper_rejected || !pipe_helper_accepted || !release_exact || !wait_decisions ||
-        !probe_success_is_diagnostic_only || !probe_parse_mutations) {
+        !probe_success_is_diagnostic_only || !probe_parse_mutations || !no_signal_on_echild) {
         error = "credential/security-trace mutation self-check failed";
         return false;
     }
@@ -574,39 +586,54 @@ static bool pure_protocol_self_checks(std::string& error) {
 
 enum class OwnedWaitResult { Exited, LeaseLost, Error };
 
-static bool reap_owned_child_bounded(pid_t child) {
-    if (child <= 1) return false;
+static OwnedReapResult reap_owned_child_bounded(pid_t child) {
+    if (child <= 1) return OwnedReapResult::Error;
     int status = 0;
     const auto wait_for_child = [&](std::chrono::steady_clock::time_point deadline) {
         while (std::chrono::steady_clock::now() < deadline) {
             const pid_t waited = waitpid(child, &status, WNOHANG);
-            if (waited == child) return true;
-            if (waited < 0 && errno != EINTR) return false;
+            if (waited == child) return OwnedReapResult::Reaped;
+            if (waited < 0 && errno != EINTR) return OwnedReapResult::Error;
             (void)poll(nullptr, 0, 10);
         }
-        return false;
+        return OwnedReapResult::TimedOut;
     };
-    if (wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs)))
-        return true;
-    if (kill(child, SIGTERM) != 0 && errno != ESRCH) return false;
-    if (wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs)))
-        return true;
-    if (kill(child, SIGKILL) != 0 && errno != ESRCH) return false;
+    const OwnedReapResult initial =
+        wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
+    if (initial == OwnedReapResult::Reaped || initial == OwnedReapResult::Error) return initial;
+    if (kill(child, SIGTERM) != 0 && errno != ESRCH) return OwnedReapResult::Error;
+    const OwnedReapResult after_term =
+        wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
+    if (after_term == OwnedReapResult::Reaped || after_term == OwnedReapResult::Error)
+        return after_term;
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) return OwnedReapResult::Error;
     return wait_for_child(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
 }
 
 class OwnedChildCleanup {
 public:
-    explicit OwnedChildCleanup(pid_t child) : child_(child) {}
+    explicit OwnedChildCleanup(pid_t child,
+                               int* downstream_fd = nullptr,
+                               bool* cleanup_error = nullptr)
+        : child_(child), downstream_fd_(downstream_fd), cleanup_error_(cleanup_error) {}
     OwnedChildCleanup(const OwnedChildCleanup&) = delete;
     OwnedChildCleanup& operator=(const OwnedChildCleanup&) = delete;
     ~OwnedChildCleanup() {
-        if (armed_) (void)reap_owned_child_bounded(child_);
+        if (!armed_) return;
+        if (downstream_fd_ != nullptr && *downstream_fd_ >= 0) {
+            close(*downstream_fd_);
+            *downstream_fd_ = -1;
+        }
+        if (reap_owned_child_bounded(child_) != OwnedReapResult::Reaped &&
+            cleanup_error_ != nullptr)
+            *cleanup_error_ = true;
     }
     void disarm() { armed_ = false; }
 
 private:
     pid_t child_;
+    int* downstream_fd_;
+    bool* cleanup_error_ = nullptr;
     bool armed_ = true;
 };
 
@@ -663,7 +690,8 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
     // same EOF: this owner still has to reap its child.
     result =
         wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs), false);
-    if (result == OwnedWaitResult::Exited) return OwnedWaitResult::Exited;
+    if (result == OwnedWaitResult::Exited)
+        return lease_revoked ? OwnedWaitResult::LeaseLost : OwnedWaitResult::Exited;
     ProcIdentity after_term;
     if (!read_proc(child, after_term, require_capabilities_clear) ||
         !same_process_identity(before, after_term) || after_term.ppid != getpid() ||
@@ -795,9 +823,10 @@ static int dropped_broker_main(const char* executable,
     }
     close(launch_pipe[0]);
     close(trace_pipe[1]);
-    OwnedChildCleanup target_cleanup(target);
+    int control = -1;
+    OwnedChildCleanup target_cleanup(target, &control);
     if (!secure_as(caller_uid, caller_gid)) return 29;
-    int control = connect_control(control_path);
+    control = connect_control(control_path);
     if (control < 0) return 30;
     Report dropped_report;
     if (!fill_report("broker-dropped", static_cast<u64>(root_broker), dropped_report, true) ||
@@ -939,10 +968,12 @@ static int root_broker_main(const char* executable,
         _exit(56);
     }
     close(credential_pair[1]);
-    OwnedChildCleanup dropped_cleanup(dropped);
+    OwnedChildCleanup dropped_cleanup(dropped, &credential_pair[0]);
     if (!send_frame(credential_pair[0],
                     Frame{kCallerCredentials, token, credentials.payload},
                     kHandshakeMs)) {
+        close(credential_pair[0]);
+        credential_pair[0] = -1;
         int abandoned_status = 0;
         const OwnedWaitResult abandoned =
             wait_owned_child_bounded(dropped,
@@ -955,8 +986,7 @@ static int root_broker_main(const char* executable,
                                      true,
                                      kCleanupMs,
                                      abandoned_status,
-                                     root_control,
-                                     &credential_pair[0]);
+                                     root_control);
         close(root_control);
         if (credential_pair[0] >= 0) close(credential_pair[0]);
         if (abandoned != OwnedWaitResult::Error) dropped_cleanup.disarm();
@@ -1059,10 +1089,11 @@ static int launcher_main(const char* executable,
                                  kBrokerDeadlineMs,
                                  status);
     if (broker_wait_result != OwnedWaitResult::Exited) {
+        const OwnedReapResult broker_reap = reap_owned_child_bounded(broker);
+        broker_cleanup.disarm();
         const bool drained = drain_adopted_children_until(
             std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 2));
-        if (broker_wait_result == OwnedWaitResult::LeaseLost) broker_cleanup.disarm();
-        return drained ? 13 : 15;
+        return broker_reap == OwnedReapResult::Reaped && drained ? 13 : 15;
     }
     broker_cleanup.disarm();
     // Reap any target adopted after an intentionally early broker death.
@@ -1498,7 +1529,12 @@ static bool child_exited_wnowait(pid_t pid) {
            (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED);
 }
 
-static GroupScanResult scan_group_stat(pid_t pgid, int& count, bool& live, pid_t permitted_zombie) {
+static GroupScanResult scan_group_stat(pid_t pgid,
+                                       int& count,
+                                       bool& live,
+                                       pid_t permitted_zombie,
+                                       pid_t& sole_member,
+                                       std::uint64_t& sole_start) {
     const int directory = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return GroupScanResult::Unreadable;
     DIR* entries = fdopendir(directory);
@@ -1508,6 +1544,8 @@ static GroupScanResult scan_group_stat(pid_t pgid, int& count, bool& live, pid_t
     }
     count = 0;
     live = false;
+    sole_member = -1;
+    sole_start = 0;
     GroupScanResult result = GroupScanResult::Exact;
     while (dirent* entry = readdir(entries)) {
         if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
@@ -1535,7 +1573,29 @@ static GroupScanResult scan_group_stat(pid_t pgid, int& count, bool& live, pid_t
             result = GroupScanResult::Unreadable;
             break;
         }
-        if (process_group == pgid) ++count;
+        std::uint64_t start = 0;
+        for (int field = 6; field <= 22; ++field) {
+            if (field == 22) {
+                unsigned long long value = 0;
+                if (!(fields >> value)) {
+                    result = GroupScanResult::Unreadable;
+                    break;
+                }
+                start = static_cast<std::uint64_t>(value);
+            } else {
+                long long value = 0;
+                if (!(fields >> value)) {
+                    result = GroupScanResult::Unreadable;
+                    break;
+                }
+            }
+        }
+        if (result == GroupScanResult::Unreadable) break;
+        if (process_group == pgid) {
+            ++count;
+            sole_member = pid;
+            sole_start = start;
+        }
         if (process_group == pgid && pid != permitted_zombie && state != 'Z' && state != 'X')
             live = true;
     }
@@ -1545,7 +1605,9 @@ static GroupScanResult scan_group_stat(pid_t pgid, int& count, bool& live, pid_t
 
 static GroupScanResult group_member_count(pid_t pgid, int& count) {
     bool live = false;
-    return scan_group_stat(pgid, count, live, -1);
+    pid_t sole_member = -1;
+    std::uint64_t sole_start = 0;
+    return scan_group_stat(pgid, count, live, -1, sole_member, sole_start);
 }
 
 static bool cleanup_group_lease(GroupLease& lease,
