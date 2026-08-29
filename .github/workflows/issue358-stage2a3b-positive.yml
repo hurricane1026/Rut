@@ -187,6 +187,11 @@ jobs:
             local id path pid cmdline
             local containers_file="$log_dir/audit-containers.txt"
             local networks_file="$log_dir/audit-networks.txt"
+            local proc_paths_file="$log_dir/audit-proc-paths.bin"
+            local proc_find_error="$log_dir/audit-proc-find.stderr"
+            local proc_read_error="$log_dir/audit-proc-read.stderr"
+            local tmp_paths_file="$log_dir/audit-tmp-paths.bin"
+            local tmp_find_error="$log_dir/audit-tmp-find.stderr"
 
             echo "read-only residual audit for rut.stage=358-stage2a2"
 
@@ -218,11 +223,36 @@ jobs:
               audit_error=1
             fi
 
+            : > "$proc_find_error"
+            if ! /usr/bin/find /proc -maxdepth 2 -type f -name cmdline -print0 \
+                > "$proc_paths_file" 2> "$proc_find_error"; then
+              echo "unable to complete /proc cmdline traversal" >&2
+              audit_error=1
+            fi
+            if [[ -s "$proc_find_error" ]]; then
+              echo "/proc cmdline traversal reported errors:" >&2
+              /usr/bin/cat "$proc_find_error" >&2
+              audit_error=1
+            fi
+
             while IFS= read -r -d '' path; do
               pid=${path#/proc/}
               pid=${pid%/cmdline}
-              if ! cmdline=$(/usr/bin/tr '\0' ' ' < "$path" 2> /dev/null); then
+              : > "$proc_read_error"
+              if ! cmdline=$(/usr/bin/cat -- "$path" 2> "$proc_read_error" | \
+                  /usr/bin/tr '\0' ' '); then
+                printf 'unable to read proc cmdline: path=%q pid=%q\n' "$path" "$pid" >&2
+                if [[ -s "$proc_read_error" ]]; then
+                  /usr/bin/cat "$proc_read_error" >&2
+                fi
+                audit_error=1
                 continue
+              fi
+              if [[ -s "$proc_read_error" ]]; then
+                printf 'proc cmdline read reported errors: path=%q pid=%q\n' \
+                  "$path" "$pid" >&2
+                /usr/bin/cat "$proc_read_error" >&2
+                audit_error=1
               fi
               case "$cmdline" in
                 *test_fixture_privileged_broker*|*--fixture-broker-launcher*|\
@@ -232,15 +262,25 @@ jobs:
                   residue=$((residue + 1))
                   ;;
               esac
-            done < <(/usr/bin/find /proc -maxdepth 2 -type f -name cmdline -print0 2> /dev/null)
+            done < "$proc_paths_file"
 
+            : > "$tmp_find_error"
+            if ! /usr/bin/find /tmp -xdev -maxdepth 3 \
+                \( -path '/tmp/rut358-topology-*' -o -path '/tmp/rut358-broker-*' \) \
+                -print0 > "$tmp_paths_file" 2> "$tmp_find_error"; then
+              echo "unable to complete /tmp rut358 residue traversal" >&2
+              audit_error=1
+            fi
+            if [[ -s "$tmp_find_error" ]]; then
+              echo "/tmp rut358 residue traversal reported errors:" >&2
+              /usr/bin/cat "$tmp_find_error" >&2
+              audit_error=1
+            fi
             while IFS= read -r -d '' path; do
               /usr/bin/stat --printf='temporary path=%n type=%F owner=%u:%g mode=%a\n' "$path" || \
                 audit_error=1
               residue=$((residue + 1))
-            done < <(/usr/bin/find /tmp -xdev -maxdepth 3 \
-              \( -path '/tmp/rut358-topology-*' -o -path '/tmp/rut358-broker-*' \) \
-              -print0 2> /dev/null)
+            done < "$tmp_paths_file"
 
             printf 'residual-count=%d audit-error=%d\n' "$residue" "$audit_error"
             if (( audit_error != 0 || residue != 0 )); then
