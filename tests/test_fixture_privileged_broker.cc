@@ -1531,11 +1531,11 @@ static bool cleanup_group_lease(GroupLease& lease,
                                 DirectLaunch& launch,
                                 bool authority,
                                 std::string& error) {
+    if (lease.gone()) return true;
     if (!authority) {
         error = "direct launch group cleanup lacked caller authority";
         return false;
     }
-    if (lease.gone()) return true;
     const auto signal_group = [&](int signal_number) {
         // An unprivileged parent may only signal its exact direct child.  A
         // privileged parent may signal the revalidated launch group.
