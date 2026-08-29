@@ -673,6 +673,16 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue373_converter_proxy_hide_header_source_self_check
+        COMMAND test_nginx_differential --converter-proxy-hide-header-source-self-check
+    )
+    set_tests_properties(test_nginx_issue373_converter_proxy_hide_header_source_self_check PROPERTIES
+        LABELS "nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 30
+    )
+    add_test(
         NAME test_nginx_issue362_request_length_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-oracle
     )

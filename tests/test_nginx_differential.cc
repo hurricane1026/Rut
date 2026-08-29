@@ -49030,6 +49030,329 @@ static bool run_rut_initial_header_split_public(TempDir& temp,
     return true;
 }
 
+struct ProxyHideHeaderGeneratedSourceEvidence {
+    std::string fragment;
+    std::string source;
+    std::string order;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+};
+
+static bool validate_proxy_hide_header_generated_source(const std::string& source,
+                                                        u16 frontend_port,
+                                                        u16 backend_port,
+                                                        std::string& error) {
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const std::string four_headers =
+        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]";
+    const std::string three_headers = "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]";
+    const u32 routes =
+        (source.rfind("route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nroute ");
+    const u32 forwards = count_text(source, "return forward(nginx_upstream");
+    if (source.empty() || source.size() != 5366u || source.find('\0') != std::string::npos ||
+        source.size() + 1u > rut::nginx::RutSource::kCapacity ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 579u ||
+        count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
+        forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
+        count_text(source, "route GET \"/\" {") != 1u ||
+        count_text(source, "route \"/\" {") != 1u || count_text(source, "return redirect(") != 0u ||
+        count_text(source, four_headers) != 3u || count_text(source, "X-Compat-Hidden") != 3u ||
+        count_text(source, three_headers) != 0u ||
+        source.find("target_transform") != std::string::npos ||
+        source.find("strip_prefix") != std::string::npos ||
+        source.find("replace_prefix") != std::string::npos ||
+        source.find("proxy_hide_header") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos ||
+        source.find("accessLog") != std::string::npos) {
+        error = "#373 generated source failed exact 5366-byte policy/route/ownership validation";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_proxy_hide_header_generated_model(const std::string& fragment,
+                                                       u16 frontend_port,
+                                                       u16 backend_port,
+                                                       bool listen_first,
+                                                       std::string& source,
+                                                       std::string& error) {
+    if (fragment.empty() ||
+        fragment != make_static_query_proxy_fragment(
+                        frontend_port, backend_port, listen_first, kProxyHideHeaderOracleProfile)) {
+        error = "#373 fragment was not the exact side-specific declaration order";
+        return false;
+    }
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed) {
+        error = "#373 exact fragment failed genuine nginx parsing";
+        return false;
+    }
+    const auto& server = parsed.value();
+    const auto& location = server.location;
+    const auto& proxy = location.proxy_pass;
+    const auto& hidden = location.proxy_hide_header;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(fragment.data());
+    const auto borrowed = [&](rut::Str value, rut::Span span) {
+        return value.ptr != nullptr && span.end >= span.start &&
+               span.end - span.start == value.len &&
+               reinterpret_cast<uintptr_t>(value.ptr) == base + span.start;
+    };
+    const std::string listen_value = "127.0.0.1:" + std::to_string(frontend_port);
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        server.listen.ipv4_host != 0x7f000001u || server.listen.port != frontend_port ||
+        !server.listen.value.eq({listen_value.data(), static_cast<u32>(listen_value.size())}) ||
+        !borrowed(server.listen.value, server.listen.value_span) ||
+        !location.path.eq(rut::lit_str("/")) || !borrowed(location.path, location.path_span) ||
+        proxy.has_uri || proxy.uri.ptr != nullptr || proxy.uri.len != 0u ||
+        proxy.uri_span.start != 0u || proxy.uri_span.end != 0u || proxy.port != backend_port ||
+        proxy.address[0] != 127u || proxy.address[1] != 0u || proxy.address[2] != 0u ||
+        proxy.address[3] != 1u || location.proxy_read_timeout.present ||
+        location.proxy_read_timeout.milliseconds != 0u || server.exact_local_return.present ||
+        server.exact_no_content_return.present || server.exact_absolute_redirect.present ||
+        !hidden.present ||
+        server.pre_route_trace.profile !=
+            rut::nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405 ||
+        server.pre_route_trace.span.start != server.span.start ||
+        server.pre_route_trace.span.end != server.span.end ||
+        server.pre_route_trace.span.line != server.span.line ||
+        server.pre_route_trace.span.col != server.span.col ||
+        !hidden.name.eq(rut::lit_str("X-Compat-Hidden")) ||
+        !borrowed(hidden.name, hidden.name_span) || hidden.span.end <= hidden.span.start ||
+        hidden.name_span.start < hidden.span.start || hidden.name_span.end >= hidden.span.end ||
+        hidden.span.end > fragment.size() ||
+        fragment.compare(hidden.span.start, 17u, "proxy_hide_header") != 0 ||
+        fragment[hidden.span.end - 1u] != ';' || !lowered) {
+        error =
+            "#373 parsed model lost exact listener/root/no-URI/hidden provenance or admitted an "
+            "action/timeout";
+        return false;
+    }
+    const rut::Str output = lowered.value().view();
+    if (output.ptr == nullptr || output.len == 0u ||
+        output.len >= rut::nginx::RutSource::kCapacity || output.ptr[output.len] != '\0') {
+        error = "#373 lower result lacked a safe terminal NUL and usable length";
+        return false;
+    }
+    source.assign(output.ptr, output.len);
+    return validate_proxy_hide_header_generated_source(source, frontend_port, backend_port, error);
+}
+
+static bool build_proxy_hide_header_generated_source(
+    u16 frontend_port,
+    u16 backend_port,
+    bool listen_first,
+    ProxyHideHeaderGeneratedSourceEvidence& evidence,
+    std::string& error) {
+    evidence = ProxyHideHeaderGeneratedSourceEvidence{};
+    evidence.order = listen_first ? "listen-first" : "location-first";
+    evidence.frontend_port = frontend_port;
+    evidence.backend_port = backend_port;
+    evidence.fragment = make_static_query_proxy_fragment(
+        frontend_port, backend_port, listen_first, kProxyHideHeaderOracleProfile);
+    if (!validate_proxy_hide_header_generated_model(
+            evidence.fragment, frontend_port, backend_port, listen_first, evidence.source, error))
+        return false;
+    if (evidence.source.empty() || evidence.source == evidence.fragment) {
+        error = "#373 lower result did not produce distinct ordinary-RUT source bytes";
+        return false;
+    }
+    return true;
+}
+
+static bool run_proxy_hide_header_source_self_checks(std::string& error) {
+    static constexpr u16 kPorts[4] = {8080u, 9000u, 8081u, 9001u};
+    ProxyHideHeaderGeneratedSourceEvidence evidence[2];
+    if (!build_proxy_hide_header_generated_source(kPorts[0], kPorts[1], true, evidence[0], error)) {
+        if (error.empty()) error = "#373 first generated source build failed without detail";
+        return false;
+    }
+    if (!build_proxy_hide_header_generated_source(
+            kPorts[2], kPorts[3], false, evidence[1], error)) {
+        if (error.empty()) error = "#373 second generated source build failed without detail";
+        return false;
+    }
+    // Individual endpoint validation must precede this normalization.
+    std::string canonical[2] = {evidence[0].source, evidence[1].source};
+    const bool canonicalized =
+        canonicalize_unique_port(canonical[0],
+                                 "listen 127.0.0.1:" + std::to_string(kPorts[0]) + "\n",
+                                 "listen 127.0.0.1:FRONTEND\n") &&
+        canonicalize_unique_port(
+            canonical[0],
+            "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(kPorts[1]) + "\"\n",
+            "upstream nginx_upstream at \"127.0.0.1:BACKEND\"\n") &&
+        canonicalize_unique_port(canonical[1],
+                                 "listen 127.0.0.1:" + std::to_string(kPorts[2]) + "\n",
+                                 "listen 127.0.0.1:FRONTEND\n") &&
+        canonicalize_unique_port(
+            canonical[1],
+            "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(kPorts[3]) + "\"\n",
+            "upstream nginx_upstream at \"127.0.0.1:BACKEND\"\n");
+    if (!canonicalized || canonical[0] != canonical[1]) {
+        error = "#373 independently lowered declaration orders did not canonicalize equally";
+        return false;
+    }
+    const auto reject_fragment = [&](std::string candidate, bool order, const char* label) {
+        if (candidate == evidence[order ? 0u : 1u].fragment) {
+            error = std::string("#373 mutation did not change fixture: ") + label;
+            return false;
+        }
+        std::string ignored;
+        std::string detail;
+        const bool accepted =
+            validate_proxy_hide_header_generated_model(candidate,
+                                                       order ? kPorts[0] : kPorts[2],
+                                                       order ? kPorts[1] : kPorts[3],
+                                                       order,
+                                                       ignored,
+                                                       detail);
+        if (accepted) {
+            error = std::string("#373 fragment mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    std::string candidate = evidence[0].fragment;
+    const std::string hide = "proxy_hide_header X-Compat-Hidden;";
+    const size_t hide_at = candidate.find(hide);
+    if (hide_at == std::string::npos) {
+        error = "#373 hide mutation fixture missing directive";
+        return false;
+    }
+    if (!reject_fragment(candidate.substr(0u, hide_at) + candidate.substr(hide_at + hide.size()),
+                         true,
+                         "missing-hide") ||
+        !reject_fragment(evidence[0].fragment + "\n", true, "length-change") ||
+        !reject_fragment(
+            std::string("server { proxy_hide_header X-Compat-Hidden; }\n") + evidence[0].fragment,
+            true,
+            "wrong-context") ||
+        !reject_fragment(std::string(evidence[0].fragment)
+                             .replace(hide_at, hide.size(), "proxy_hide_header X-Compat-Visible;"),
+                         true,
+                         "renamed-hide"))
+        return false;
+    candidate = evidence[1].fragment;
+    const size_t hide2 = candidate.find(hide);
+    if (!reject_fragment(candidate.substr(0u, hide2) + hide + candidate.substr(hide2),
+                         false,
+                         "duplicate-hide") ||
+        !reject_fragment(candidate.substr(0u, hide2) + "proxy_hide_header X-Compat-Hidden;\n" +
+                             candidate.substr(hide2),
+                         false,
+                         "moved-hide"))
+        return false;
+    const auto reject_source = [&](std::string changed, size_t side, const char* label) {
+        if (changed == evidence[side].source) {
+            error = std::string("#373 source mutation unchanged: ") + label;
+            return false;
+        }
+        std::string detail;
+        if (validate_proxy_hide_header_generated_source(
+                changed, evidence[side].frontend_port, evidence[side].backend_port, detail)) {
+            error = std::string("#373 source mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    candidate = evidence[0].source;
+    std::string redirect_mutation = evidence[0].source;
+    const size_t body_at = redirect_mutation.find("body: b\"");
+    if (body_at == std::string::npos) {
+        error = "#373 redirect mutation fixture lacked a body";
+        return false;
+    }
+    redirect_mutation += "\nreturn redirect(nginx_upstream)";
+    redirect_mutation.erase(body_at + strlen("body: b\""),
+                            strlen("\nreturn redirect(nginx_upstream)"));
+    if (redirect_mutation.size() != evidence[0].source.size() ||
+        count_text(redirect_mutation, "return forward(nginx_upstream") != 3u ||
+        count_text(redirect_mutation, "return redirect(") != 1u ||
+        !reject_source(std::move(redirect_mutation), 0u, "equal-length-redirect"))
+        return false;
+    if (!reject_source(candidate + "\n", 0u, "source-length") ||
+        !reject_source(std::string(evidence[0].source)
+                           .replace(evidence[0].source.find("X-Compat-Hidden"),
+                                    strlen("X-Compat-Hidden"),
+                                    "X-Compat-Visible"),
+                       0u,
+                       "wrong-case-name") ||
+        !reject_source(
+            std::string(evidence[0].source)
+                .replace(
+                    evidence[0].source.find(
+                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]"),
+                    strlen("hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]"),
+                    "hide_headers: [\"Date\", \"Server\", \"X-Pad\"]"),
+            0u,
+            "missing-fourth-header") ||
+        !reject_source(evidence[0].source + "proxy_hide_header nginx.conf accessLog",
+                       0u,
+                       "injected-nginx-hook"))
+        return false;
+    std::string endpoint = evidence[0].source;
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(kPorts[0]);
+    const std::string backend = "127.0.0.1:" + std::to_string(kPorts[1]);
+    if (!reject_source(
+            std::string(endpoint).replace(endpoint.find(listener),
+                                          listener.size(),
+                                          "listen 127.0.0.1:" + std::to_string(kPorts[1])),
+            0u,
+            "endpoint-swap") ||
+        !reject_source(std::string(endpoint).replace(
+                           endpoint.find(backend), backend.size(), backend + backend),
+                       0u,
+                       "endpoint-duplicate"))
+        return false;
+    const auto reject_unique_source_mutation =
+        [&](const std::string& needle, const std::string& replacement, const char* label) {
+            std::string changed = evidence[0].source;
+            const size_t at = changed.find(needle);
+            if (needle.empty() || at == std::string::npos) {
+                error = std::string("#373 source mutation precondition failed: ") + label;
+                return false;
+            }
+            changed.replace(at, needle.size(), replacement);
+            return reject_source(std::move(changed), 0u, label);
+        };
+    if (!reject_unique_source_mutation(
+            "route HEAD \"/\" {", "route GET \"/\" {", "missing-head-route") ||
+        !reject_unique_source_mutation(
+            "route GET \"/\" {", "route GET \"/\" {\nroute GET \"/\" {", "duplicate-get-route") ||
+        !reject_unique_source_mutation("return forward(nginx_upstream",
+                                       "return redirect(nginx_upstream",
+                                       "unexpected-redirect") ||
+        !reject_unique_source_mutation(
+            "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]",
+            "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\", "
+            "\"X-Compat-Hidden\"]",
+            "duplicate-fourth-header") ||
+        !reject_unique_source_mutation(
+            "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]",
+            "hide_headers: [\"Date\", \"X-Compat-Hidden\", \"Server\", \"X-Pad\"]",
+            "reordered-header-list") ||
+        !reject_unique_source_mutation("X-Compat-Hidden", "x-compat-hidden", "wrong-case-header") ||
+        !reject_unique_source_mutation(
+            "route HEAD \"/\" {", "route HEAD \"/extra\" {", "route-target-mismatch") ||
+        !reject_unique_source_mutation("response_policy: {",
+                                       "response_policy: {\n            strip_prefix: \"/\",",
+                                       "unexpected-strip-transform") ||
+        !reject_unique_source_mutation("route \"/\" {", "route \"/x\" {", "any-route-mismatch") ||
+        !reject_fragment(evidence[1].fragment, true, "cross-order-fragment") ||
+        !reject_fragment(
+            std::string("server { listen 127.0.0.1:8080; return 204; }\n") + evidence[0].fragment,
+            true,
+            "wrong-context-action"))
+        return false;
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -49063,6 +49386,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-root-empty-query-proxy-uri-oracle") == 0;
     const bool proxy_hide_header_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
+    const bool proxy_hide_header_source_self_check =
+        argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -49243,11 +49568,11 @@ int main(int argc, char** argv) {
          !converter_wildcard_service_no_uri_differential && !static_query_proxy_uri_oracle &&
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
-         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
-         !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_split_header_oracle && !rut_initial_header_split_public &&
-         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
-         !converter_request_length_differential &&
+         !proxy_hide_header_source_self_check && !wildcard_listen_oracle &&
+         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
+         !request_length_oracle && !request_length_split_header_oracle &&
+         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
+         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -49584,6 +49909,21 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    if (proxy_hide_header_source_self_check) {
+        std::string source_error;
+        if (!run_proxy_hide_header_source_self_checks(source_error)) {
+            if (source_error.empty())
+                source_error = "#373 source self-check returned false without detail";
+            std::cerr << "FAIL [#373 generated source/model self-check]: " << source_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #373 independently parsed/lowered both declaration orders, proved "
+               "exact generated source ownership and rejected causal source/model mutations\n";
+        return 0;
+    }
+
 #ifndef __linux__
     if (rut_initial_header_split_public) {
         std::cerr << "FAIL [#371 ordinary-RUT public witness]: Linux/io_uring is required\n";
