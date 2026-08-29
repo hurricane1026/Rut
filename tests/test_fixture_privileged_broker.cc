@@ -338,7 +338,8 @@ struct GroupLease {
         int count = 0;
         bool live = true;
         return child_exited_wnowait(pid) &&
-               scan_group_stat(pgid, count, live, pid) == GroupScanResult::Exact && !live;
+               scan_group_stat(pgid, count, live, pid) == GroupScanResult::Exact && count == 1 &&
+               !live;
     }
 
     bool empty_group_exact() const {
@@ -619,10 +620,20 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
                                                 bool require_capabilities_clear,
                                                 int timeout_ms,
                                                 int& status,
-                                                int lease_fd = -1) {
-    const auto wait_until = [&](std::chrono::steady_clock::time_point deadline) {
+                                                int lease_fd = -1,
+                                                int* downstream_lease_fd = nullptr) {
+    bool lease_revoked = false;
+    const auto wait_until = [&](std::chrono::steady_clock::time_point deadline,
+                                bool monitor_lease) {
         while (std::chrono::steady_clock::now() < deadline) {
-            if (control_lease_lost(lease_fd)) return OwnedWaitResult::LeaseLost;
+            if (monitor_lease && control_lease_lost(lease_fd)) {
+                if (downstream_lease_fd != nullptr && *downstream_lease_fd >= 0) {
+                    close(*downstream_lease_fd);
+                    *downstream_lease_fd = -1;
+                }
+                lease_revoked = true;
+                return OwnedWaitResult::LeaseLost;
+            }
             const pid_t waited = waitpid(child, &status, WNOHANG);
             if (waited == child) return OwnedWaitResult::Exited;
             if (waited < 0 && errno != EINTR) return OwnedWaitResult::Error;
@@ -631,9 +642,16 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
         return OwnedWaitResult::Error;
     };
     OwnedWaitResult result =
-        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms), true);
     if (result == OwnedWaitResult::Exited) return result;
-    const bool lease_lost = result == OwnedWaitResult::LeaseLost;
+    lease_revoked = result == OwnedWaitResult::LeaseLost;
+    if (lease_revoked) {
+        // The downstream lease was closed by wait_until.  Give this owner a
+        // full bounded natural-reap window before any identity-safe signal.
+        result = wait_until(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs), false);
+        if (result == OwnedWaitResult::Exited) return OwnedWaitResult::LeaseLost;
+    }
     ProcIdentity before;
     if (child <= 1 || expected_pgid <= 1 || !read_proc(child, before, require_capabilities_clear) ||
         before.pid != child || before.ppid != getpid() || before.pgid != expected_pgid ||
@@ -641,19 +659,20 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
         before.netns != expected_netns || before.exe != expected_exe ||
         before.cmdline != expected_argv || kill(child, SIGTERM) != 0)
         return OwnedWaitResult::Error;
-    result = wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
-    if (result == OwnedWaitResult::Exited)
-        return lease_lost ? OwnedWaitResult::LeaseLost : OwnedWaitResult::Exited;
-    if (result == OwnedWaitResult::Error && control_lease_lost(lease_fd))
-        return OwnedWaitResult::Error;
+    // Once EOF has revoked the lease, cleanup must not short-circuit on that
+    // same EOF: this owner still has to reap its child.
+    result =
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs), false);
+    if (result == OwnedWaitResult::Exited) return OwnedWaitResult::Exited;
     ProcIdentity after_term;
     if (!read_proc(child, after_term, require_capabilities_clear) ||
         !same_process_identity(before, after_term) || after_term.ppid != getpid() ||
         after_term.pgid != expected_pgid || kill(child, SIGKILL) != 0)
         return OwnedWaitResult::Error;
-    result = wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
+    result =
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs), false);
     if (result != OwnedWaitResult::Exited) return OwnedWaitResult::Error;
-    return lease_lost ? OwnedWaitResult::LeaseLost : OwnedWaitResult::Exited;
+    return lease_revoked ? OwnedWaitResult::LeaseLost : OwnedWaitResult::Exited;
 }
 
 static int secured_target_main(const char* control_path,
@@ -832,7 +851,8 @@ static int dropped_broker_main(const char* executable,
                                  true,
                                  target_wait_ms,
                                  target_status,
-                                 kCredentialFd);
+                                 kCredentialFd,
+                                 &control);
     if (target_wait_result != OwnedWaitResult::Exited) {
         if (target_wait_result == OwnedWaitResult::LeaseLost) target_cleanup.disarm();
         close(kCredentialFd);
@@ -923,7 +943,6 @@ static int root_broker_main(const char* executable,
     if (!send_frame(credential_pair[0],
                     Frame{kCallerCredentials, token, credentials.payload},
                     kHandshakeMs)) {
-        close(credential_pair[0]);
         int abandoned_status = 0;
         const OwnedWaitResult abandoned =
             wait_owned_child_bounded(dropped,
@@ -936,9 +955,10 @@ static int root_broker_main(const char* executable,
                                      true,
                                      kCleanupMs,
                                      abandoned_status,
-                                     root_control);
+                                     root_control,
+                                     &credential_pair[0]);
         close(root_control);
-        close(credential_pair[0]);
+        if (credential_pair[0] >= 0) close(credential_pair[0]);
         if (abandoned != OwnedWaitResult::Error) dropped_cleanup.disarm();
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
@@ -954,19 +974,33 @@ static int root_broker_main(const char* executable,
                                  true,
                                  kBrokerDeadlineMs,
                                  status,
-                                 root_control);
+                                 root_control,
+                                 &credential_pair[0]);
     if (dropped_wait_result != OwnedWaitResult::Exited) {
         if (dropped_wait_result == OwnedWaitResult::LeaseLost) dropped_cleanup.disarm();
         close(root_control);
-        close(credential_pair[0]);
+        if (credential_pair[0] >= 0) close(credential_pair[0]);
         return 29;
     }
     dropped_cleanup.disarm();
     close(root_control);
-    close(credential_pair[0]);
+    if (credential_pair[0] >= 0) close(credential_pair[0]);
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 30;
+}
+
+static bool drain_adopted_children_until(std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        int status = 0;
+        const pid_t adopted = waitpid(-1, &status, WNOHANG);
+        if (adopted > 0) continue;
+        if (adopted < 0 && errno == EINTR) continue;
+        if (adopted < 0 && errno == ECHILD) return true;
+        if (adopted < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        (void)poll(nullptr, 0, 10);
+    }
 }
 
 static int launcher_main(const char* executable,
@@ -1025,31 +1059,18 @@ static int launcher_main(const char* executable,
                                  kBrokerDeadlineMs,
                                  status);
     if (broker_wait_result != OwnedWaitResult::Exited) {
+        const bool drained = drain_adopted_children_until(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 2));
         if (broker_wait_result == OwnedWaitResult::LeaseLost) broker_cleanup.disarm();
-        return 13;
+        return drained ? 13 : 15;
     }
     broker_cleanup.disarm();
     // Reap any target adopted after an intentionally early broker death.
     const bool broker_abnormal =
         WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
-    bool adopted_drained = !broker_abnormal;
-    const auto adopted_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 2);
-    while (broker_abnormal && !adopted_drained) {
-        int adopted_status = 0;
-        const pid_t adopted = waitpid(-1, &adopted_status, WNOHANG);
-        if (adopted > 0) continue;
-        if (adopted < 0 && errno == EINTR) continue;
-        if (adopted < 0 && errno == ECHILD) {
-            adopted_drained = true;
-            break;
-        }
-        if (adopted == 0 && std::chrono::steady_clock::now() < adopted_deadline) {
-            (void)poll(nullptr, 0, 10);
-            continue;
-        }
-        break;
-    }
+    const bool adopted_drained =
+        !broker_abnormal || drain_adopted_children_until(std::chrono::steady_clock::now() +
+                                                         std::chrono::milliseconds(kCleanupMs * 2));
     if (!adopted_drained) return 15;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
@@ -1999,7 +2020,6 @@ struct DestructiveAuth {
 static DestructiveAuth authorize_destructive_close(const ParentEndpoint& endpoint,
                                                    const Report& report,
                                                    const Peer& peer,
-                                                   const ProcIdentity& proc,
                                                    const Token& expected_token,
                                                    const Token& frame_token,
                                                    const HeldTopologySnapshot& topology,
@@ -2009,15 +2029,12 @@ static DestructiveAuth authorize_destructive_close(const ParentEndpoint& endpoin
                                                    DirectLaunch& launch) {
     (void)expected_launcher_argv;
     (void)launch;
-    const bool basic_report =
-        peer.pid > 1 && peer.uid == 0 && peer.gid == 0 &&
-        report.target_pid == static_cast<u64>(peer.pid) &&
-        report.target_pid == static_cast<u64>(proc.pid) && report.wrapper_pid > 1 &&
-        report.start == proc.start && report.pgid == static_cast<u64>(proc.pgid) &&
-        report.uid == 0 && report.gid == 0 && report.netns == topology.holder_netns &&
-        proc.netns == topology.holder_netns && report.exe == executable && proc.exe == executable &&
-        report.argv == expected_argv && proc.cmdline == expected_argv &&
-        report.mode == "broker-root" && proc.ppid == static_cast<pid_t>(report.wrapper_pid);
+    const bool basic_report = peer.pid > 1 && peer.uid == 0 && peer.gid == 0 &&
+                              report.target_pid == static_cast<u64>(peer.pid) &&
+                              report.wrapper_pid > 1 && report.pgid > 1 && report.start != 0 &&
+                              report.uid == 0 && report.gid == 0 &&
+                              report.netns == topology.holder_netns && report.exe == executable &&
+                              report.argv == expected_argv && report.mode == "broker-root";
     return {endpoint_unchanged(endpoint) && token_equal(expected_token, frame_token) &&
             basic_report};
 }
@@ -2262,9 +2279,9 @@ static bool safe_signal_target(const Report& report,
     return kill(current.pid, signal_number) == 0;
 }
 
-static bool wait_identity_gone_or_reused(const ProcIdentity& expected, int timeout_ms) {
+static bool wait_identity_gone_or_reused_until(const ProcIdentity& expected,
+                                               std::chrono::steady_clock::time_point deadline) {
     if (expected.pid <= 1 || expected.start == 0) return true;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
         ProcIdentity current;
         if (read_proc(expected.pid, current, false)) {
@@ -2276,25 +2293,6 @@ static bool wait_identity_gone_or_reused(const ProcIdentity& expected, int timeo
         if (std::chrono::steady_clock::now() >= deadline) return false;
         (void)poll(nullptr, 0, 10);
     }
-}
-
-static bool terminate_verified(const Report& report,
-                               const Peer& peer,
-                               const ProcIdentity& expected) {
-    if (target_gone_or_reused(expected)) return true;
-    if (!safe_signal_target(report, peer, expected, SIGTERM)) return false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (target_gone_or_reused(expected)) return true;
-        (void)poll(nullptr, 0, 10);
-    }
-    if (!safe_signal_target(report, peer, expected, SIGKILL)) return false;
-    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (target_gone_or_reused(expected)) return true;
-        (void)poll(nullptr, 0, 10);
-    }
-    return target_gone_or_reused(expected);
 }
 
 static bool run_session(const std::string& sudo_path,
@@ -2355,13 +2353,6 @@ static bool run_session(const std::string& sudo_path,
                                                     root_report,
                                                     root_frame_token,
                                                     error);
-        const bool root_proc_ok =
-            root_hello_ok && root_peer.pid > 1 && read_proc(root_peer.pid, root_proc, false);
-        if (!root_hello_ok || !root_proc_ok) {
-            if (error.empty()) error = "root broker HELLO/peer identity failed";
-            if (!root_proc_ok) error += "; " + probe_diagnostic(root_peer.pid);
-            break;
-        }
         const std::string root_argv = exact_argv({executable,
                                                   "--fixture-privileged-broker",
                                                   endpoint.socket,
@@ -2374,17 +2365,9 @@ static bool run_session(const std::string& sudo_path,
                                                       token_text(token),
                                                       std::to_string(topology.holder_netns),
                                                       scenario});
-        const std::string dropped_argv = exact_argv({executable,
-                                                     "--fixture-privileged-dropped-broker",
-                                                     endpoint.socket,
-                                                     token_text(token),
-                                                     std::to_string(topology.holder_netns),
-                                                     scenario,
-                                                     std::to_string(kCredentialFd)});
         const DestructiveAuth destructive_auth = authorize_destructive_close(endpoint,
                                                                              root_report,
                                                                              root_peer,
-                                                                             root_proc,
                                                                              token,
                                                                              root_frame_token,
                                                                              topology,
@@ -2392,8 +2375,21 @@ static bool run_session(const std::string& sudo_path,
                                                                              root_argv,
                                                                              launcher_argv,
                                                                              sudo_child);
-        if (!destructive_auth.valid ||
-            !validate_root_broker(root_report,
+        const bool root_proc_ok =
+            root_hello_ok && root_peer.pid > 1 && read_proc(root_peer.pid, root_proc, false);
+        if (!root_hello_ok || !destructive_auth.valid || !root_proc_ok) {
+            if (error.empty()) error = "root broker HELLO/peer identity failed";
+            if (!root_proc_ok) error += "; " + probe_diagnostic(root_peer.pid);
+            break;
+        }
+        const std::string dropped_argv = exact_argv({executable,
+                                                     "--fixture-privileged-dropped-broker",
+                                                     endpoint.socket,
+                                                     token_text(token),
+                                                     std::to_string(topology.holder_netns),
+                                                     scenario,
+                                                     std::to_string(kCredentialFd)});
+        if (!validate_root_broker(root_report,
                                   root_peer,
                                   root_proc,
                                   topology,
@@ -2606,15 +2602,11 @@ static bool run_session(const std::string& sudo_path,
         // Closing leases is the first failure action.  The root/dropped/target
         // PDEATHSIG/EOF chain owns its descendants; allow that chain to settle
         // before considering any identity-safe fallback.
-        (void)wait_identity_gone_or_reused(target_proc, kCleanupMs);
-        (void)wait_identity_gone_or_reused(broker_proc, kCleanupMs);
-        (void)wait_identity_gone_or_reused(root_proc, kCleanupMs);
-        if (target_peer.pid > 1 && target_proc.pid == target_peer.pid &&
-            process_alive(target_peer.pid))
-            (void)terminate_verified(target_report, target_peer, target_proc);
-        if (broker_peer.pid > 1 && broker_proc.pid == broker_peer.pid &&
-            process_alive(broker_peer.pid))
-            (void)terminate_verified(broker_report, broker_peer, broker_proc);
+        const auto cleanup_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 3);
+        (void)wait_identity_gone_or_reused_until(target_proc, cleanup_deadline);
+        (void)wait_identity_gone_or_reused_until(broker_proc, cleanup_deadline);
+        (void)wait_identity_gone_or_reused_until(root_proc, cleanup_deadline);
     }
     if (!success) {
         std::string lease_error;
