@@ -99,7 +99,7 @@ bool send_frame(int fd, const Frame& frame, int timeout_ms);
 bool valid_frame_header(const unsigned char* header, const Token& expected);
 bool receive_frame(int fd, Frame& frame, int timeout_ms);
 bool token_equal(const Token& a, const Token& b);
-bool read_proc(pid_t pid, ProcIdentity& result);
+bool read_proc(pid_t pid, ProcIdentity& result, bool require_capabilities_clear = true);
 bool get_peer(int fd, Peer& peer);
 int connect_control(const char* path);
 bool child_security_setup(u64& groups_clear);

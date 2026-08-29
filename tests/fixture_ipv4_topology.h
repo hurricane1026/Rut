@@ -1,6 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+
+#include <sys/types.h>
 
 namespace rut::test::ipv4_topology {
 
@@ -28,7 +32,32 @@ struct RunResult {
     std::string error;
 };
 
+// Immutable evidence exposed only while the topology fixture remains alive.
+// The fixture retains exclusive ownership of every Docker resource.
+struct HeldTopologySnapshot {
+    std::string token;
+    std::string network_a_name;
+    std::string network_a_id;
+    std::string network_a_subnet;
+    std::string network_a_gateway;
+    std::string network_b_name;
+    std::string network_b_id;
+    std::string network_b_subnet;
+    std::string network_b_gateway;
+    std::string holder_name;
+    std::string holder_id;
+    std::string positive_ip;
+    std::string guard_ip;
+    pid_t holder_pid = -1;
+    std::uint64_t holder_start = 0;
+    ino_t holder_netns = 0;
+};
+
+using HeldTopologyCallback =
+    std::function<bool(const HeldTopologySnapshot& snapshot, std::string& error)>;
+
 RunResult run(FailurePoint failure_point);
+RunResult run_with_held_topology(const HeldTopologyCallback& callback);
 bool audit_zero_residue(const std::string& token,
                         const std::string& network_a_name,
                         const std::string& network_b_name,

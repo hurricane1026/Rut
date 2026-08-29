@@ -172,7 +172,7 @@ bool token_equal(const Token& a, const Token& b) {
     return a.bytes == b.bytes;
 }
 
-bool read_proc(pid_t pid, ProcIdentity& result) {
+bool read_proc(pid_t pid, ProcIdentity& result, bool require_capabilities_clear) {
     if (pid <= 0) return false;
     std::string stat_text;
     if (!read_file("/proc/" + std::to_string(pid) + "/stat", stat_text, 8192)) return false;
@@ -260,7 +260,8 @@ bool read_proc(pid_t pid, ProcIdentity& result) {
     if (length <= 0) return false;
     result.exe.assign(exe.data(), static_cast<size_t>(length));
     if (!read_file("/proc/" + std::to_string(pid) + "/cmdline", result.cmdline, 8192)) return false;
-    return result.netns != 0 && result.start != 0 && result.pgid > 0 && result.capabilities_clear;
+    return result.netns != 0 && result.start != 0 && result.pgid > 0 &&
+           (!require_capabilities_clear || result.capabilities_clear);
 }
 
 bool get_peer(int fd, Peer& peer) {

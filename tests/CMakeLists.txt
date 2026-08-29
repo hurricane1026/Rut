@@ -498,6 +498,25 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 120
         SKIP_RETURN_CODE 77
     )
+    add_executable(test_fixture_privileged_broker
+        test_fixture_privileged_broker.cc
+        fixture_ipv4_topology.cc
+    )
+    target_link_libraries(test_fixture_privileged_broker PRIVATE fixture_worker_protocol)
+    target_include_directories(test_fixture_privileged_broker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(test_fixture_privileged_broker PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_test(NAME test_fixture_privileged_broker COMMAND test_fixture_privileged_broker)
+    set_tests_properties(test_fixture_privileged_broker PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
     add_test(
         NAME test_nginx_downstream_gate_spike
         COMMAND test_nginx_differential --nginx-gate-spike

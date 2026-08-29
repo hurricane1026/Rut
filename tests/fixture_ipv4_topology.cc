@@ -562,6 +562,8 @@ public:
     const std::string& positive_ip() const { return positive_ip_; }
     const std::string& guard_ip() const { return guard_ip_; }
     pid_t holder_pid() const { return holder_pid_; }
+    u64 holder_start() const { return holder_start_; }
+    const std::string& holder_id() const { return holder_id_; }
 
     bool create_networks(FailurePoint point, std::string& error) {
         if (!create_network(network_a_, point, error)) return false;
@@ -1369,6 +1371,93 @@ RunResult run(FailurePoint failure_point) {
     if (!audit(residue_error)) {
         result.error = residue_error;
         result.success = false;
+        return result;
+    }
+    result.success = true;
+    return result;
+}
+
+RunResult run_with_held_topology(const HeldTopologyCallback& callback) {
+    RunResult result;
+    std::string token;
+    if (!callback || !high_entropy_token(token)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        result.error = callback ? "high-entropy token generation unavailable"
+                                : "held-topology callback was empty";
+        return result;
+    }
+    Fixture fixture(token);
+    const auto audit = [&](std::string& error) {
+        return audit_zero_residue(token,
+                                  fixture.network_a().name,
+                                  fixture.network_b().name,
+                                  fixture.holder_name(),
+                                  error);
+    };
+    TempDir temp;
+    if (!temp.create() || !write_manifest(temp, fixture) || !preflight(fixture, result.error)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe =
+            result.error.find("exact target name already exists") == std::string::npos;
+        if (result.error.empty()) result.error = "held-topology preflight failed";
+        return result;
+    }
+    const auto fail_after_cleanup = [&] {
+        std::string cleanup_error;
+        if (!fixture.cleanup(cleanup_error)) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += cleanup_error;
+        }
+        std::string residue_error;
+        if (!audit(residue_error)) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += residue_error;
+        }
+        result.success = false;
+        return result;
+    };
+    if (!fixture.create_networks(FailurePoint::None, result.error) ||
+        !fixture.create_holder(FailurePoint::None, result.error) ||
+        !fixture.attach_holder(FailurePoint::None, result.error) ||
+        !fixture.verify_topology(FailurePoint::None, result.error))
+        return fail_after_cleanup();
+
+    static constexpr u16 kProbePort = 41857;
+    if (!fixture.probe_port_absent(kProbePort, result.error) ||
+        !fixture.probe_refused(fixture.positive_ip(), kProbePort, result.error) ||
+        !fixture.probe_refused(fixture.guard_ip(), kProbePort, result.error))
+        return fail_after_cleanup();
+
+    ProcIdentity holder_identity{};
+    if (!proc_identity(fixture.holder_pid(), holder_identity, false) ||
+        !container_netns_inode(fixture.holder_name(), holder_identity.netns) ||
+        holder_identity.start != fixture.holder_start()) {
+        result.error = "held topology lost exact holder process identity";
+        return fail_after_cleanup();
+    }
+    HeldTopologySnapshot snapshot;
+    snapshot.token = fixture.token();
+    snapshot.network_a_name = fixture.network_a().name;
+    snapshot.network_a_id = fixture.network_a().id;
+    snapshot.network_a_subnet = fixture.network_a().subnet;
+    snapshot.network_a_gateway = fixture.network_a().gateway;
+    snapshot.network_b_name = fixture.network_b().name;
+    snapshot.network_b_id = fixture.network_b().id;
+    snapshot.network_b_subnet = fixture.network_b().subnet;
+    snapshot.network_b_gateway = fixture.network_b().gateway;
+    snapshot.holder_name = fixture.holder_name();
+    snapshot.holder_id = fixture.holder_id();
+    snapshot.positive_ip = fixture.positive_ip();
+    snapshot.guard_ip = fixture.guard_ip();
+    snapshot.holder_pid = fixture.holder_pid();
+    snapshot.holder_start = fixture.holder_start();
+    snapshot.holder_netns = holder_identity.netns;
+    if (!callback(snapshot, result.error)) return fail_after_cleanup();
+    if (!fixture.cleanup(result.error)) return fail_after_cleanup();
+    std::string residue_error;
+    if (!audit(residue_error)) {
+        result.error = residue_error;
         return result;
     }
     result.success = true;
