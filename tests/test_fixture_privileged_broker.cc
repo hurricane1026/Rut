@@ -2862,6 +2862,27 @@ static std::string group_mutation_detail(const Report& report,
     return detail.str();
 }
 
+static std::string dropped_identity_detail(const Peer& peer,
+                                           const Report& report,
+                                           const ProcIdentity& proc,
+                                           const std::string& observed_argv,
+                                           const std::string& expected_argv) {
+    std::ostringstream detail;
+    detail << "peer{pid=" << peer.pid << ",uid=" << peer.uid << ",gid=" << peer.gid
+           << "},report{target_pid=" << report.target_pid << ",wrapper_pid=" << report.wrapper_pid
+           << ",start=" << report.start << ",pgid=" << report.pgid << ",uid=" << report.uid
+           << ",gid=" << report.gid << ",netns=" << report.netns << "},proc{pid=" << proc.pid
+           << ",start=" << proc.start << ",ppid=" << proc.ppid << ",pgid=" << proc.pgid
+           << ",sid=" << proc.sid << ",uid=" << proc.uid << ",gid=" << proc.gid
+           << ",netns=" << proc.netns << ",groups=" << proc.supplementary_groups
+           << ",nnp=" << proc.no_new_privs << ",caps=" << proc.capabilities_clear
+           << ",exe_dev=" << proc.exe_dev << ",exe_ino=" << proc.exe_ino
+           << "},argv{observed_length=" << observed_argv.size() << ",observed_hash=0x" << std::hex
+           << probe_hash(observed_argv) << std::dec << ",expected_length=" << expected_argv.size()
+           << ",expected_hash=0x" << std::hex << probe_hash(expected_argv) << std::dec << '}';
+    return detail.str();
+}
+
 static bool validate_identity_manifest_binding(
     const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount>& manifests,
     const Report& report,
@@ -3022,8 +3043,32 @@ static bool identity_bundle_integration_self_check(std::string& error) {
         {{"mutation.first", true}, {"mutation.second", false}, {"mutation.third", false}});
     const MutationDiagnostic all_passed =
         first_failed_mutation({{"mutation.first", true}, {"mutation.second", true}});
+    const std::array<const char*, 3> first_labels{
+        "mutation.first", "mutation.second", "mutation.third"};
+    bool every_first_label = true;
+    for (size_t first = 0; first != first_labels.size(); ++first) {
+        std::vector<std::pair<const char*, bool>> checks;
+        for (size_t index = 0; index != first_labels.size(); ++index)
+            checks.emplace_back(first_labels[index], index != first);
+        const MutationDiagnostic selected = first_failed_mutation(checks);
+        every_first_label =
+            every_first_label && !selected.success && selected.failed_label == first_labels[first];
+    }
+    const Peer equal_start_peer{321, 0, 0};
+    const Peer equal_start_root{320, 0, 0};
+    ProcIdentity equal_start_proc;
+    ProcIdentity equal_start_root_proc;
+    equal_start_proc.pid = equal_start_peer.pid;
+    equal_start_root_proc.pid = equal_start_root.pid;
+    equal_start_proc.start = 77;
+    equal_start_root_proc.start = 77;
+    const MutationDiagnostic equal_start_diagnostic = first_failed_mutation(
+        {{"peer.distinct_root", equal_start_peer.pid != equal_start_root.pid},
+         {"proc.start_distinct", equal_start_proc.start != equal_start_root_proc.start}});
     ok = ok && !first_failed.success && first_failed.failed_label == "mutation.second" &&
-         all_passed.success && all_passed.failed_label.empty();
+         all_passed.success && all_passed.failed_label.empty() && every_first_label &&
+         !equal_start_diagnostic.success &&
+         equal_start_diagnostic.failed_label == "proc.start_distinct";
 
     identity_bundle::IdentityBundle source;
     std::string bundle_error;
@@ -3760,17 +3805,101 @@ static bool run_session(const std::string& sudo_path,
             error = "identity bundle ACK/caller credential frame failed";
             break;
         }
-        if (!accept_bounded(endpoint.listener, broker_fd) ||
-            !decode_ready(broker_fd, kBrokerDropped, token, broker_peer, broker_report) ||
-            broker_peer.pid == root_peer.pid || !read_proc(broker_peer.pid, broker_proc) ||
-            broker_proc.start == root_proc.start || broker_peer.uid != getuid() ||
-            broker_peer.gid != getgid() || broker_proc.uid != getuid() ||
-            broker_proc.gid != getgid() || broker_proc.ppid != root_peer.pid ||
-            broker_peer.pid == static_cast<pid_t>(root_report.wrapper_pid) ||
-            broker_proc.supplementary_groups != 0 || broker_proc.netns != topology.holder_netns ||
-            broker_report.mode != "broker-dropped" ||
-            broker_report.wrapper_pid != static_cast<u64>(root_peer.pid) ||
-            !identity_matches_report(broker_report,
+        const auto dropped_failure = [&](const char* label) {
+            error = std::string("dropped broker identity transition failed: ") + label;
+        };
+        if (!accept_bounded(endpoint.listener, broker_fd)) {
+            dropped_failure("accept");
+            break;
+        }
+        if (!get_peer(broker_fd, broker_peer)) {
+            dropped_failure("peercred");
+            break;
+        }
+        Frame dropped_frame;
+        if (!receive_frame(broker_fd, dropped_frame, kHandshakeMs)) {
+            dropped_failure("frame.receive");
+            break;
+        }
+        if (dropped_frame.type != kBrokerDropped) {
+            dropped_failure("frame.type");
+            break;
+        }
+        if (!token_equal(dropped_frame.token, token)) {
+            dropped_failure("frame.token");
+            break;
+        }
+        if (!decode_report(dropped_frame.payload, broker_report)) {
+            dropped_failure("report.decode");
+            break;
+        }
+        if (broker_peer.pid == root_peer.pid) {
+            dropped_failure("peer.distinct_root");
+            break;
+        }
+        if (!read_proc(broker_peer.pid, broker_proc)) {
+            error = "dropped broker identity transition failed: proc.read; " +
+                    probe_diagnostic(broker_peer.pid);
+            break;
+        }
+        const std::string dropped_detail = dropped_identity_detail(
+            broker_peer, broker_report, broker_proc, broker_proc.cmdline, dropped_argv);
+        if (broker_proc.start == root_proc.start) {
+            dropped_failure("proc.start_distinct");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_peer.uid != getuid()) {
+            dropped_failure("peer.uid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_peer.gid != getgid()) {
+            dropped_failure("peer.gid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_proc.uid != getuid()) {
+            dropped_failure("proc.uid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_proc.gid != getgid()) {
+            dropped_failure("proc.gid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_proc.ppid != root_peer.pid) {
+            dropped_failure("proc.ppid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_peer.pid == static_cast<pid_t>(root_report.wrapper_pid)) {
+            dropped_failure("peer.not_root_wrapper");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_proc.supplementary_groups != 0) {
+            dropped_failure("proc.groups_clear");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_proc.netns != topology.holder_netns) {
+            dropped_failure("proc.netns");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_report.mode != "broker-dropped") {
+            dropped_failure("report.mode");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (broker_report.wrapper_pid != static_cast<u64>(root_peer.pid)) {
+            dropped_failure("report.wrapper_pid");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (!identity_matches_report(broker_report,
                                      broker_peer,
                                      broker_proc,
                                      executable,
@@ -3780,9 +3909,14 @@ static bool run_session(const std::string& sudo_path,
                                      token,
                                      true,
                                      false,
-                                     true) ||
-            !endpoint_unchanged(endpoint)) {
-            error = "dropped broker identity transition failed";
+                                     true)) {
+            dropped_failure("identity_matches_report");
+            error += "; " + dropped_detail;
+            break;
+        }
+        if (!endpoint_unchanged(endpoint)) {
+            dropped_failure("endpoint.stability");
+            error += "; " + dropped_detail;
             break;
         }
         if (!send_frame(broker_fd, Frame{kLaunchTarget, token, {}}, kHandshakeMs) ||
