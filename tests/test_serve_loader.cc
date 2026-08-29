@@ -2049,6 +2049,118 @@ TEST(serve_loader, nginx_exact_loopback_fixed_replacement_output_is_owned_and_re
     std::filesystem::remove(path);
 }
 
+TEST(serve_loader, issue372_root_empty_query_transform_is_owned_and_reload_clears_slots) {
+    const std::string dir = "/tmp/rut_serve_loader_nginx_issue372_root_empty_query";
+    const std::string path = dir + "/app.rut";
+    std::string generated;
+    {
+        char source[] =
+            "server { listen 127.0.0.1:8088; location /api/ { proxy_pass "
+            "http://127.0.0.1:9002/?; } }";
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        REQUIRE_EQ(lowered.value().len, 3343u);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(source, 'x', sizeof(source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'y');
+
+    LoadedProgram program;
+    LoadError error;
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK(program.listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(program.listener.port, 8088u);
+    CHECK_EQ(program.listener.ipv4_host, 0x7f000001u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK((Str{reinterpret_cast<const char*>(program.config.routes[0].path),
+               program.config.routes[0].path_len}
+               .eq(lit_str("/api"))));
+    REQUIRE_EQ(program.config.target_transform_count, 1u);
+    REQUIRE_EQ(program.config.target_transform_bytes_used, 7u);
+    REQUIRE_EQ(program.rir.module.target_transform_count, 1u);
+    CHECK(program.rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
+    CHECK(program.rir.module.target_transforms[0].replace_prefix.eq(lit_str("/?")));
+    u16 transform_id = 0u;
+    u32 forwards = 0u;
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    for (u32 block = 0u; block < program.rir.module.functions[0].block_count; block++) {
+        const auto& rir_block = program.rir.module.functions[0].blocks[block];
+        for (u32 instruction = 0u; instruction < rir_block.inst_count; instruction++) {
+            if (rir_block.insts[instruction].op != rir::Opcode::RetForwardBundle) continue;
+            forwards++;
+            REQUIRE_GT(instruction, 0u);
+            const auto& set_transform = rir_block.insts[instruction - 1u];
+            REQUIRE(set_transform.op == rir::Opcode::ReqSetTargetTransform);
+            REQUIRE_GT(set_transform.imm.i32_val, 0);
+            transform_id = static_cast<u16>(set_transform.imm.i32_val);
+        }
+    }
+    REQUIRE_EQ(forwards, 1u);
+    REQUIRE(program.config.target_transform_id_is_valid(transform_id));
+    const auto check_owned_transform = [&]() {
+        const auto& transform = program.config.target_transforms[transform_id - 1u];
+        CHECK(transform.strip_prefix.eq(lit_str("/api/")));
+        CHECK(transform.replace_prefix.eq(lit_str("/?")));
+        const uintptr_t pool = reinterpret_cast<uintptr_t>(program.config.target_transform_bytes);
+        const uintptr_t pool_end = pool + program.config.target_transform_bytes_used;
+        for (Str value : {transform.strip_prefix, transform.replace_prefix}) {
+            const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+            REQUIRE_GE(address, pool);
+            REQUIRE_LE(address, pool_end);
+            CHECK_LE(value.len, pool_end - address);
+        }
+    };
+    check_owned_transform();
+
+    program.engine.shutdown();
+    program.jit_inited = false;
+    program.rir.destroy();
+    REQUIRE_EQ(munmap(program.src_map, program.src_map_len), 0);
+    program.src_map = nullptr;
+    program.src_map_len = 0u;
+    REQUIRE(std::filesystem::remove(path));
+    check_owned_transform();
+    program.destroy();
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    for (const auto& stale : program.config.target_transforms) {
+        CHECK(stale.strip_prefix.ptr == nullptr);
+        CHECK_EQ(stale.strip_prefix.len, 0u);
+        CHECK(stale.replace_prefix.ptr == nullptr);
+        CHECK_EQ(stale.replace_prefix.len, 0u);
+    }
+
+    {
+        char source[] =
+            "server { listen 127.0.0.1:8089; location /api/ { proxy_pass "
+            "http://127.0.0.1:9003; } }";
+        const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        generated.assign(lowered.value().data, lowered.value().len);
+        memset(source, 'z', sizeof(source) - 1u);
+    }
+    write_file(dir, "app.rut", generated.c_str());
+    std::fill(generated.begin(), generated.end(), 'w');
+    REQUIRE(load_rut_program(path.c_str(), program, error));
+    CHECK_EQ(program.rir.module.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_count, 0u);
+    CHECK_EQ(program.config.target_transform_bytes_used, 0u);
+    for (const auto& stale : program.config.target_transforms) {
+        CHECK(stale.strip_prefix.ptr == nullptr);
+        CHECK_EQ(stale.strip_prefix.len, 0u);
+        CHECK(stale.replace_prefix.ptr == nullptr);
+        CHECK_EQ(stale.replace_prefix.len, 0u);
+    }
+    program.destroy();
+    std::filesystem::remove(path);
+    std::filesystem::remove(dir);
+}
+
 TEST(serve_loader, nginx_exact_loopback_api_no_uri_output_is_owned_and_reuses_cleanly) {
     const std::string dir = "/tmp/rut_serve_loader_nginx_exact_api_no_uri";
     const std::string path = dir + "/app.rut";

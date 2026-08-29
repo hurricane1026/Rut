@@ -359,6 +359,33 @@ bool listener_endpoint_matches(uintptr_t source_base,
     return parsed_port != 0u && parsed_port == expected_port;
 }
 
+// Call only after validate_proxy_location has established the complete common-source
+// provenance and source positions for both borrows.
+bool is_exact_api_root_empty_query_composition(const Location& location) {
+    return location.path.len == 5u && location.proxy_pass.uri.len == 2u &&
+           eq(location.path, "/api/", sizeof("/api/") - 1u) &&
+           eq(location.proxy_pass.uri, "/?", sizeof("/?") - 1u);
+}
+
+// Call only after the exact composition's common-source borrows and source positions
+// have been established. This closes coordinated span/length/delimiter forgeries while
+// preserving lexer whitespace and comments before the terminating semicolon.
+bool exact_api_root_empty_query_source_is_coherent(uintptr_t source_base,
+                                                   const Location& location) {
+    const ProxyPass& proxy = location.proxy_pass;
+    if (proxy.span.end - proxy.span.start < 15u ||
+        !eq({trusted_source_at(source_base, proxy.span.start), 10u}, "proxy_pass", 10u) ||
+        *trusted_source_at(source_base, proxy.span.end - 1u) != ';')
+        return false;
+    u32 endpoint_start = proxy.span.start + 10u;
+    if (!advance_trusted_source_gap(source_base, endpoint_start, proxy.uri_span.start) ||
+        endpoint_start >= proxy.uri_span.start ||
+        !no_uri_proxy_endpoint_matches(source_base, endpoint_start, proxy.uri_span.start, proxy) ||
+        !trusted_source_gap_is_exact(source_base, proxy.uri_span.end, proxy.span.end - 1u))
+        return false;
+    return true;
+}
+
 FrontendResult<bool> validate_listener(const Server& server,
                                        ProxyLocationProfile proxy_profile,
                                        bool has_exact_absolute_redirect) {
@@ -427,6 +454,11 @@ FrontendResult<bool> validate_listener(const Server& server,
                                        listener.port))
             return unsupported(listener.value_span,
                                lit_str("invalid wildcard listen endpoint model"));
+        if (proxy_profile == ProxyLocationProfile::PrefixWithUri &&
+            is_exact_api_root_empty_query_composition(server.location))
+            return unsupported(
+                listener.span,
+                lit_str("root empty-query proxy URI requires exact loopback listen"));
         return false;
     }
 
@@ -446,7 +478,8 @@ FrontendResult<bool> validate_listener(const Server& server,
         ((proxy.uri.len == 1u && proxy.uri.ptr[0] == '/') ||
          (server.location.path.len == 5u &&
           eq(server.location.path, "/api/", sizeof("/api/") - 1u) && proxy.uri.len == 4u &&
-          eq(proxy.uri, "/v1/", sizeof("/v1/") - 1u)));
+          eq(proxy.uri, "/v1/", sizeof("/v1/") - 1u)) ||
+         is_exact_api_root_empty_query_composition(server.location));
     const bool exact_prefix_without_uri = proxy_profile == ProxyLocationProfile::PrefixWithoutUri &&
                                           !proxy.has_uri && has_no_exact_action;
     const bool exact_root_profile =
@@ -552,8 +585,12 @@ FrontendResult<ProxyLocationProfile> validate_proxy_location(const Server& serve
     if (!proxy_location_path_is_clean(location.path))
         return unsupported(location.path_span,
                            lit_str("invalid bounded proxy location path model"));
-    if (!proxy_pass_replacement_uri_is_clean(proxy.uri))
+    const bool exact_root_empty_query = is_exact_api_root_empty_query_composition(location);
+    if (!proxy_pass_replacement_uri_is_clean(proxy.uri) && !exact_root_empty_query)
         return unsupported(proxy.uri_span, lit_str("invalid bounded proxy_pass URI model"));
+    if (exact_root_empty_query && proxy.port != 0u &&
+        !exact_api_root_empty_query_source_is_coherent(source_base, location))
+        return unsupported(proxy.span, lit_str("invalid proxy_pass source syntax"));
     return ProxyLocationProfile::PrefixWithUri;
 }
 

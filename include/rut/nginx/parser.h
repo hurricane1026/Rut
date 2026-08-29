@@ -27,10 +27,11 @@ struct Listen {
 static constexpr u32 kMaxProxyPassUriLen = 128;
 
 // Validate the current lowering grammar for the complete bounded replacement
-// URI retained by ProxyPass. The parser additionally models exact `/?`, whose
-// lowering remains fail-closed pending separate compatibility evidence. Callers
-// must provide a readable view; converter callers establish source provenance
-// before invoking it.
+// URI retained by ProxyPass. The parser additionally models exact `/?`; the
+// converter privately admits only its proven exact-loopback `/api/` composition
+// after complete provenance and listener validation. Callers must provide a
+// readable view; converter callers establish source provenance before invoking
+// it.
 bool proxy_pass_replacement_uri_is_clean(Str uri);
 
 struct ProxyPass {

@@ -2901,7 +2901,7 @@ TEST(nginx_parser, issue360_models_terminal_empty_query_with_exact_provenance_an
     CHECK_EQ(absent_proxy.uri_span.col, 1u);
 }
 
-TEST(nginx_parser, issue372_models_root_empty_query_in_both_orders_and_lowering_stays_closed) {
+TEST(nginx_parser, issue372_models_root_empty_query_in_both_orders_with_exact_provenance) {
     char listen_first[] =
         "server {\n"
         "  listen 127.0.0.1:8080;\n"
@@ -3052,31 +3052,6 @@ TEST(nginx_parser, issue372_models_root_empty_query_in_both_orders_and_lowering_
         CHECK_EQ(copied.location.path.ptr, location.path.ptr);
         CHECK_EQ(copied.location.proxy_pass.uri.ptr, proxy.uri.ptr);
         CHECK(copied.location.proxy_pass.uri.eq(lit_str("/?")));
-
-        const auto lowered = nginx::lower_to_rut(server);
-        REQUIRE_FALSE(lowered);
-        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lowered.error().detail.eq(lit_str("invalid bounded proxy_pass URI model")));
-        CHECK_EQ(lowered.error().span.start, proxy.uri_span.start);
-        CHECK_EQ(lowered.error().span.end, proxy.uri_span.end);
-        CHECK_EQ(lowered.error().span.line, proxy.uri_span.line);
-        CHECK_EQ(lowered.error().span.col, proxy.uri_span.col);
-
-        std::vector<char> independent(source, source + source_len);
-        auto forged = server;
-        forged.location.proxy_pass.uri.ptr =
-            independent.data() + forged.location.proxy_pass.uri_span.start;
-        const auto cross_source = nginx::lower_to_rut(forged);
-        REQUIRE_FALSE(cross_source);
-        CHECK(cross_source.error().detail.eq(lit_str("invalid proxy_pass URI provenance")));
-        CHECK_EQ(cross_source.error().span.start, proxy.uri_span.start);
-        forged = server;
-        forged.location.proxy_pass.uri.ptr =
-            reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
-        const auto unreadable = nginx::lower_to_rut(forged);
-        REQUIRE_FALSE(unreadable);
-        CHECK(unreadable.error().detail.eq(lit_str("invalid proxy_pass URI provenance")));
-        CHECK_EQ(unreadable.error().span.start, proxy.uri_span.start);
 
         const Span retained_server_span = copied.span;
         const Span retained_listen_span = copied.listen.span;
@@ -9259,7 +9234,8 @@ TEST(nginx_converter, emitted_generic_non_root_replacement_reaches_owned_runtime
 static void check_query_replacement_reaches_owned_runtime_config(rut::test::TestCase* _tc,
                                                                  const char* configured_uri,
                                                                  u32 configured_uri_len,
-                                                                 u32 expected_owned_bytes) {
+                                                                 u32 expected_owned_bytes,
+                                                                 bool exact_loopback = false) {
     const Str expected_replacement{configured_uri, configured_uri_len};
     auto populated = std::make_unique<RouteConfig>();
     uintptr_t nginx_begin = 0;
@@ -9274,8 +9250,9 @@ static void check_query_replacement_reaches_owned_runtime_config(rut::test::Test
         char nginx_source[256]{};
         const int nginx_source_len = snprintf(nginx_source,
                                               sizeof(nginx_source),
-                                              "server { listen 8080; location /api/ { proxy_pass "
+                                              "server { listen %s; location /api/ { proxy_pass "
                                               "http://127.0.0.1:9000%.*s; } }",
+                                              exact_loopback ? "127.0.0.1:8080" : "8080",
                                               static_cast<int>(configured_uri_len),
                                               configured_uri);
         REQUIRE_GT(nginx_source_len, 0);
@@ -9455,6 +9432,10 @@ TEST(nginx_converter, emitted_static_query_replacement_reaches_owned_runtime_con
 
 TEST(nginx_converter, issue360_empty_query_replacement_reaches_owned_runtime_config) {
     check_query_replacement_reaches_owned_runtime_config(_tc, "/v1/?", 5u, 10u);
+}
+
+TEST(nginx_converter, issue372_root_empty_query_reaches_owned_generic_transform_pipeline) {
+    check_query_replacement_reaches_owned_runtime_config(_tc, "/?", 2u, 7u, true);
 }
 
 TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
@@ -15744,6 +15725,288 @@ TEST(nginx_converter, issue354_exact_loopback_fixed_replacement_has_canonical_or
     CHECK_EQ(hir_forward.forward_timeout_failure_policy_id, 0u);
     CHECK_EQ(hir_forward.forward_response_read_timeout_seconds, 0u);
     CHECK(hir_forward.forward_response_buffering == ForwardResponseBufferingMode::None);
+}
+
+static std::string issue372_expected_rut_source(const char* listener_port,
+                                                const char* upstream_address,
+                                                const char* upstream_port) {
+    std::string source = "listen 127.0.0.1:" + std::string(listener_port) +
+                         "\nupstream nginx_upstream at \"" + upstream_address + ":" +
+                         upstream_port + "\"\n";
+    source += R"rut(pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "suppress_body", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route "/api" {
+    if req.method == GET && req.pathOnly == "/api" {
+        return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
+            path: "static", query: "preserve_raw", date: "current", connection: "close",
+            status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
+            content_type: "text/html", target_path: "/api/", body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
+    } else {
+        return forward(nginx_upstream, target_transform: {
+            strip_prefix: "/api/",
+            replace_prefix: "/?"
+        }, request_policy: {
+            version: "HTTP/1.1",
+            host: "upstream",
+            connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        }, response_policy: {
+            version: "HTTP/1.1",
+            framing: "content_length",
+            connection: "request",
+            server: "nginx/1.29.7",
+            date: "current",
+            hide_headers: ["Date", "Server", "X-Pad"]
+        }, failure_policy: {
+            version: "HTTP/1.1",
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: "current",
+            connection: "request",
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        })
+    }
+}
+)rut";
+    return source;
+}
+
+TEST(nginx_converter, issue372_exact_loopback_root_empty_query_has_independent_canonical_golden) {
+    char listen_first[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/?; } }";
+    char location_first[] =
+        "server { location /api/ { proxy_pass http://127.0.0.1:9000/?; } "
+        "listen 127.0.0.1:8080; }";
+    const auto lower = [](char* source, u32 len) -> FrontendResult<nginx::RutSource> {
+        const auto parsed = nginx::parse({source, len});
+        if (!parsed) return core::make_unexpected(parsed.error());
+        return nginx::lower_to_rut(parsed.value());
+    };
+    const auto actual_a = lower(listen_first, sizeof(listen_first) - 1u);
+    const auto actual_b = lower(location_first, sizeof(location_first) - 1u);
+    REQUIRE(actual_a);
+    REQUIRE(actual_b);
+    const std::string expected = issue372_expected_rut_source("8080", "127.0.0.1", "9000");
+
+    REQUIRE_EQ(expected.size(), 3343u);
+    REQUIRE_EQ(actual_a.value().len, 3343u);
+    REQUIRE_EQ(actual_b.value().len, 3343u);
+    CHECK_EQ(std::string(actual_a.value().data, actual_a.value().len), expected);
+    CHECK_EQ(std::string(actual_b.value().data, actual_b.value().len), expected);
+    CHECK_EQ(actual_a.value().data[actual_a.value().len], '\0');
+    CHECK_EQ(actual_b.value().data[actual_b.value().len], '\0');
+    CHECK_LT(actual_a.value().len, nginx::RutSource::kCapacity);
+    CHECK_EQ(count_text(expected, "target_transform:"), 1u);
+    CHECK_EQ(count_text(expected, "strip_prefix: \"/api/\""), 1u);
+    CHECK_EQ(count_text(expected, "            replace_prefix: \"/?\"\n"), 1u);
+    CHECK_EQ(count_text(expected, "replace_prefix: \"/v1/\""), 0u);
+    CHECK_EQ(count_route_declarations(expected), 1u);
+    CHECK_EQ(count_upstream_declarations(expected), 1u);
+    CHECK_EQ(expected.rfind("listen 127.0.0.1:8080\n", 0u), 0u);
+
+    memset(listen_first, 'x', sizeof(listen_first) - 1u);
+    memset(location_first, 'y', sizeof(location_first) - 1u);
+    CHECK_EQ(std::string(actual_a.value().data, actual_a.value().len), expected);
+    CHECK_EQ(std::string(actual_b.value().data, actual_b.value().len), expected);
+
+    static constexpr char kMaximum[] =
+        "server { listen 127.0.0.1:65535; location /api/ { proxy_pass "
+        "http://255.255.255.255:65535/?; } }";
+    const auto maximum_parsed = nginx::parse({kMaximum, sizeof(kMaximum) - 1u});
+    REQUIRE(maximum_parsed);
+    const auto maximum = nginx::lower_to_rut(maximum_parsed.value());
+    REQUIRE(maximum);
+    const std::string maximum_expected =
+        issue372_expected_rut_source("65535", "255.255.255.255", "65535");
+    REQUIRE_EQ(maximum_expected.size(), 3351u);
+    REQUIRE_EQ(maximum.value().len, 3351u);
+    CHECK_EQ(std::string(maximum.value().data, maximum.value().len), maximum_expected);
+    CHECK_EQ(maximum.value().data[maximum.value().len], '\0');
+    CHECK_EQ(nginx::RutSource::kCapacity - maximum.value().len, 2595u);
+
+    static constexpr char kExactSlash[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/; } }";
+    static constexpr char kExactV1[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/; } }";
+    static constexpr char kWildcardEmptyQuery[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/?; } }";
+    static constexpr char kStaticQuery[] =
+        "server { listen 8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/?fixed=1; } }";
+    static constexpr char kNoUri[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    for (Str source : {Str{kExactSlash, sizeof(kExactSlash) - 1u},
+                       Str{kExactV1, sizeof(kExactV1) - 1u},
+                       Str{kWildcardEmptyQuery, sizeof(kWildcardEmptyQuery) - 1u},
+                       Str{kStaticQuery, sizeof(kStaticQuery) - 1u},
+                       Str{kNoUri, sizeof(kNoUri) - 1u}}) {
+        const auto parsed = nginx::parse(source);
+        REQUIRE(parsed);
+        REQUIRE(nginx::lower_to_rut(parsed.value()));
+    }
+}
+
+TEST(nginx_converter, issue372_exact_composition_mutations_fail_closed_after_provenance) {
+    char source[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/?; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const nginx::Server accepted = parsed.value();
+    REQUIRE(nginx::lower_to_rut(accepted));
+    const auto& path_span = accepted.location.path_span;
+    const auto& proxy_span = accepted.location.proxy_pass.span;
+    const auto& uri_span = accepted.location.proxy_pass.uri_span;
+    const auto& listener_value_span = accepted.listen.value_span;
+    const auto reject = [&](const nginx::Server& candidate, Str detail, Span span) {
+        const auto result = nginx::lower_to_rut(candidate);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+        CHECK_EQ(result.error().span.start, span.start);
+        CHECK_EQ(result.error().span.end, span.end);
+        CHECK_EQ(result.error().span.line, span.line);
+        CHECK_EQ(result.error().span.col, span.col);
+    };
+
+    auto forged = accepted;
+    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    reject(forged, lit_str("invalid proxy_pass source provenance"), path_span);
+    forged = accepted;
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    reject(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
+    std::vector<char> independent(source, source + sizeof(source));
+    forged = accepted;
+    forged.location.path.ptr = independent.data() + forged.location.path_span.start;
+    reject(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
+    forged = accepted;
+    forged.location.proxy_pass.uri.ptr =
+        independent.data() + forged.location.proxy_pass.uri_span.start;
+    reject(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
+    forged = accepted;
+    forged.location.proxy_pass.uri.len--;
+    reject(forged, lit_str("invalid proxy location spans"), uri_span);
+    forged = accepted;
+    forged.location.proxy_pass.uri_span.end--;
+    reject(forged, lit_str("invalid proxy location spans"), forged.location.proxy_pass.uri_span);
+    forged = accepted;
+    forged.location.path.len--;
+    reject(forged, lit_str("invalid proxy location spans"), path_span);
+    forged = accepted;
+    forged.location.path_span.start++;
+    reject(forged, lit_str("invalid proxy location spans"), forged.location.path_span);
+
+    const char saved_path = source[path_span.start + 1u];
+    source[path_span.start + 1u] = 'x';
+    reject(accepted, lit_str("invalid bounded proxy_pass URI model"), uri_span);
+    source[path_span.start + 1u] = saved_path;
+    const char saved_uri = source[uri_span.start + 1u];
+    source[uri_span.start + 1u] = '/';
+    reject(accepted, lit_str("invalid bounded proxy_pass URI model"), uri_span);
+    source[uri_span.start + 1u] = saved_uri;
+    const char saved_delimiter = source[proxy_span.end - 1u];
+    source[proxy_span.end - 1u] = ':';
+    reject(accepted, lit_str("invalid proxy_pass source syntax"), proxy_span);
+    source[proxy_span.end - 1u] = saved_delimiter;
+    forged = accepted;
+    forged.location.proxy_pass.port = 9001u;
+    reject(forged, lit_str("invalid proxy_pass source syntax"), proxy_span);
+    const char saved_proxy_keyword = source[proxy_span.start];
+    source[proxy_span.start] = 'x';
+    reject(accepted, lit_str("invalid proxy_pass source syntax"), proxy_span);
+    source[proxy_span.start] = saved_proxy_keyword;
+
+    forged = accepted;
+    forged.listen.value.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    reject(forged, lit_str("invalid listen source provenance"), listener_value_span);
+    forged = accepted;
+    forged.listen.value.ptr = independent.data() + forged.listen.value_span.start;
+    reject(forged, lit_str("invalid listen source provenance"), listener_value_span);
+    forged = accepted;
+    forged.listen.value_span.end--;
+    reject(forged, lit_str("invalid listen source provenance"), forged.listen.value_span);
+    forged = accepted;
+    forged.listen.port = 8081u;
+    reject(forged, lit_str("invalid exact listen endpoint model"), listener_value_span);
+    const char saved_listener_token = source[accepted.listen.span.start];
+    source[accepted.listen.span.start] = 'x';
+    reject(accepted, lit_str("invalid listen source provenance"), listener_value_span);
+    source[accepted.listen.span.start] = saved_listener_token;
+    forged = accepted;
+    forged.listen.port = 0u;
+    const auto zero_listener = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(zero_listener);
+    CHECK_EQ(zero_listener.error().code, FrontendError::InvalidInteger);
+    CHECK(zero_listener.error().detail.eq(lit_str("invalid model listen port")));
+    forged = accepted;
+    forged.location.proxy_pass.port = 0u;
+    const auto zero_upstream = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(zero_upstream);
+    CHECK_EQ(zero_upstream.error().code, FrontendError::InvalidInteger);
+    CHECK(zero_upstream.error().detail.eq(lit_str("invalid model upstream port")));
+
+    forged = accepted;
+    forged.location.proxy_read_timeout.milliseconds = 1000u;
+    reject(forged, lit_str("invalid absent proxy_read_timeout model"), accepted.location.span);
+    forged = accepted;
+    forged.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
+    forged.pre_route_trace.span = {};
+    reject(forged, lit_str("missing pre-route TRACE model"), accepted.location.span);
+    forged = accepted;
+    forged.exact_no_content_return.response.status = 204u;
+    reject(forged, lit_str("invalid absent exact no-content return model"), accepted.span);
+    forged = accepted;
+    forged.listen.span.line++;
+    reject(forged, lit_str("invalid model listen spans"), listener_value_span);
+
+    static constexpr char kWildcard[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/?; } }";
+    const auto wildcard = nginx::parse({kWildcard, sizeof(kWildcard) - 1u});
+    REQUIRE(wildcard);
+    reject(wildcard.value(),
+           lit_str("root empty-query proxy URI requires exact loopback listen"),
+           wildcard.value().listen.span);
+    static constexpr char kOtherPath[] =
+        "server { listen 127.0.0.1:8080; location /service/ { proxy_pass "
+        "http://127.0.0.1:9000/?; } }";
+    const auto other_path = nginx::parse({kOtherPath, sizeof(kOtherPath) - 1u});
+    REQUIRE(other_path);
+    reject(other_path.value(),
+           lit_str("invalid bounded proxy_pass URI model"),
+           other_path.value().location.proxy_pass.uri_span);
+    static constexpr char kAdjacentUri[] =
+        "server { listen 127.0.0.1:8080; location /api/ { proxy_pass "
+        "http://127.0.0.1:9000/v1/?; } }";
+    const auto adjacent = nginx::parse({kAdjacentUri, sizeof(kAdjacentUri) - 1u});
+    REQUIRE(adjacent);
+    reject(adjacent.value(),
+           lit_str("exact listen requires the minimal root proxy profile"),
+           adjacent.value().listen.span);
 }
 
 TEST(nginx_parser, rejects_non_loopback_and_malformed_exact_listen_endpoints) {
