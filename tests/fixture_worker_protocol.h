@@ -44,6 +44,7 @@ struct Frame {
 struct ProcIdentity {
     pid_t pid = -1;
     pid_t ppid = -1;
+    pid_t sid = -1;
     u64 start = 0;
     pid_t pgid = -1;
     uid_t uid = static_cast<uid_t>(-1);
@@ -94,6 +95,7 @@ bool read_file(const std::string& path, std::string& out, size_t limit = 128 * 1
 bool wait_fd(int fd, short events, std::chrono::steady_clock::time_point deadline);
 bool write_exact(int fd, const unsigned char* data, size_t size, int timeout_ms);
 bool read_exact(int fd, unsigned char* data, size_t size, int timeout_ms);
+bool receive_frame_until(int fd, Frame& frame, std::chrono::steady_clock::time_point deadline);
 std::vector<unsigned char> frame_bytes(const Frame& frame);
 bool send_frame(int fd, const Frame& frame, int timeout_ms);
 bool valid_frame_header(const unsigned char* header, const Token& expected);

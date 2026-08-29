@@ -18,7 +18,13 @@ static_assert(std::is_const_v<decltype(DirectLaunch::anchor)>);
 static_assert(std::is_const_v<decltype(DirectLaunch::allowed)>);
 
 DirectLaunch make_launch(bool marker = true) {
-    DirectLaunchAnchor anchor{kDirectPid, 9001, kLaunchPgid, kCallerUid, kCallerGid, kHostNetns};
+    DirectLaunchAnchor anchor{};
+    anchor.pid = kDirectPid;
+    anchor.start = 9001;
+    anchor.pgid = kLaunchPgid;
+    anchor.caller_uid = kCallerUid;
+    anchor.caller_gid = kCallerGid;
+    anchor.host_netns = kHostNetns;
     AllowedStages allowed{{11, 12, "sudo\0-n\0--\0"s},
                           {21, 22, "nsenter\0--net=/proc/99/ns/net\0--\0launcher\0"s},
                           {31, 32, "launcher\0--fixture-broker-launcher\0"s},

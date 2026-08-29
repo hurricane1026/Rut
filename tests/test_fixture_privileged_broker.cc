@@ -86,11 +86,22 @@ static bool endpoint_matches(const ParentEndpoint& endpoint, const EndpointIdent
 static bool endpoint_unchanged(const ParentEndpoint& endpoint);
 static bool endpoint_replacement_self_check(std::string& error);
 static bool bounded_wait_and_signal_self_check(std::string& error);
+static bool group_lease_self_check(std::string& error);
 static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
                                int signal_number);
 static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int timeout_ms);
+static bool stable_proc_identity(pid_t pid, ProcIdentity& identity);
+static bool child_exited_wnowait(pid_t pid);
+static bool group_has_live_member(pid_t pgid);
+static int group_member_count(pid_t pgid);
+struct GroupLease;
+static bool cleanup_group_lease(GroupLease& lease,
+                                DirectLaunch& launch,
+                                bool authority,
+                                std::string& error);
+static bool has_group_authority(const DirectLaunch& launch);
 
 enum class DirectWaitDisposition { Reaped, Retry, Error };
 
@@ -99,6 +110,53 @@ static DirectWaitDisposition classify_direct_wait(pid_t waited, pid_t expected, 
     if (waited == 0 || (waited < 0 && wait_errno == EINTR)) return DirectWaitDisposition::Retry;
     return DirectWaitDisposition::Error;
 }
+
+struct GroupLease {
+    pid_t pid = -1;
+    pid_t pgid = -1;
+    pid_t sid = -1;
+    std::uint64_t start = 0;
+    int pidfd = -1;
+
+    ~GroupLease() {
+        if (pidfd >= 0) close(pidfd);
+    }
+
+    bool establish(const ProcIdentity& identity) {
+        pid = identity.pid;
+        pgid = identity.pgid;
+        sid = identity.sid;
+        start = identity.start;
+        if (pid <= 1 || pgid != pid || sid <= 1 || start == 0 || group_member_count(pgid) != 1)
+            return false;
+#ifdef SYS_pidfd_open
+        pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+        if (pidfd < 0 && errno != ENOSYS) return false;
+#endif
+        return true;
+    }
+
+    bool revalidate() const {
+        ProcIdentity current;
+        return pid > 1 && pgid == pid && sid > 1 && start != 0 &&
+               stable_proc_identity(pid, current) && current.pid == pid && current.start == start &&
+               current.pgid == pgid && current.sid == sid && kill(-pgid, 0) == 0;
+    }
+
+    bool gone() const {
+        if (pgid <= 1) return false;
+        errno = 0;
+        if (kill(-pgid, 0) < 0 && errno == ESRCH) return true;
+        // A direct child remains a zombie until its owning parent waitpid()s it;
+        // Linux keeps that zombie's process group addressable.  WNOWAIT plus a
+        // /proc group scan is the safe pre-reap equivalent of ESRCH here.
+        return child_exited_wnowait(pid) && !group_has_live_member(pgid);
+    }
+
+    bool signal_contained(int signal_number) const {
+        return revalidate() && kill(-pgid, signal_number) == 0;
+    }
+};
 
 static bool parse_u64(const char* text, u64& value) {
     if (text == nullptr || *text == '\0') return false;
@@ -954,8 +1012,19 @@ static bool bounded_wait_and_signal_self_check(std::string& error) {
                                 observed.netns == parent.netns && observed.exe == parent.exe &&
                                 observed.cmdline == parent.cmdline;
     const StageDescriptor self_stage{observed.exe_dev, observed.exe_ino, observed.cmdline};
-    DirectLaunch direct({child, observed.start, child, parent.uid, parent.gid, parent.netns},
-                        {self_stage, self_stage, self_stage, parent.netns + 1});
+    DirectLaunchAnchor self_anchor{};
+    self_anchor.pid = child;
+    self_anchor.start = observed.start;
+    self_anchor.pgid = child;
+    self_anchor.caller_uid = parent.uid;
+    self_anchor.caller_gid = parent.gid;
+    self_anchor.host_netns = parent.netns;
+    self_anchor.sid = observed.sid;
+    self_anchor.exe_dev = observed.exe_dev;
+    self_anchor.exe_ino = observed.exe_ino;
+    self_anchor.exe = observed.exe;
+    self_anchor.cmdline = observed.cmdline;
+    DirectLaunch direct(self_anchor, {self_stage, self_stage, self_stage, parent.netns + 1});
     std::string launch_reason;
     const bool observed_exact = identity_exact && observe_direct(direct, observed, launch_reason);
     DirectLaunch stale = direct;
@@ -1035,7 +1104,10 @@ static bool reap_failed_direct(pid_t child, std::optional<DirectLaunch>& launch)
         const pid_t waited = waitpid(child, &status, WNOHANG);
         const DirectWaitDisposition disposition =
             classify_direct_wait(waited, child, waited < 0 ? errno : 0);
-        if (disposition == DirectWaitDisposition::Reaped) return true;
+        if (disposition == DirectWaitDisposition::Reaped) {
+            if (launch) launch->reaped = true;
+            return true;
+        }
         if (disposition == DirectWaitDisposition::Error) {
             if (launch)
                 launch->reason =
@@ -1054,39 +1126,242 @@ static bool reap_failed_direct(pid_t child, std::optional<DirectLaunch>& launch)
     return false;
 }
 
-static bool observe_launch_until_launcher(DirectLaunch& launch,
-                                          int timeout_ms,
-                                          std::string& error) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    std::string last_reason = "no stable /proc observation";
-    while (std::chrono::steady_clock::now() < deadline) {
-        ProcIdentity identity;
-        if (stable_proc_identity(launch.anchor.pid, identity)) {
-            std::string reason;
-            if (observe_direct(launch, identity, reason) && launch.current_valid &&
-                launch.current_stage == LaunchStage::Launcher)
-                return true;
-            if (!reason.empty()) last_reason = reason;
-        } else {
-            last_reason = "transient /proc identity was unavailable";
-        }
-        (void)poll(nullptr, 0, 5);
-    }
-    error = "no stable exact sudo/nsenter/launcher stage observed within " +
-            std::to_string(timeout_ms) + "ms (last observation: " + last_reason + ")";
-    launch.reason = error;
-    return false;
+static bool is_pre_exec_anchor(const DirectLaunch& launch, const ProcIdentity& identity) {
+    return identity.pid == launch.anchor.pid && identity.start == launch.anchor.start &&
+           identity.pgid == launch.anchor.pgid && identity.sid == launch.anchor.sid &&
+           identity.uid == launch.anchor.caller_uid && identity.gid == launch.anchor.caller_gid &&
+           identity.netns == launch.anchor.host_netns &&
+           identity.exe_dev == launch.anchor.exe_dev && identity.exe_ino == launch.anchor.exe_ino &&
+           identity.exe == launch.anchor.exe && identity.cmdline == launch.anchor.cmdline;
 }
 
-static bool launch_sudo(const std::string& sudo_path,
-                        const std::string& nsenter_path,
-                        const std::string& executable,
-                        const HeldTopologySnapshot& topology,
-                        const ParentEndpoint& endpoint,
-                        const Token& token,
-                        const char* scenario,
-                        std::optional<DirectLaunch>& launch,
-                        std::string& error) {
+static bool wait_group_gone(const GroupLease& lease, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (lease.gone()) return true;
+        (void)poll(nullptr, 0, 5);
+    }
+    return lease.gone();
+}
+
+static bool child_exited_wnowait(pid_t pid) {
+    siginfo_t info{};
+    if (pid <= 1 || waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0)
+        return false;
+    return info.si_pid == pid &&
+           (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED);
+}
+
+static int group_member_count(pid_t pgid) {
+    const int directory = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) return -1;
+    DIR* entries = fdopendir(directory);
+    if (entries == nullptr) {
+        close(directory);
+        return -1;
+    }
+    int count = 0;
+    while (dirent* entry = readdir(entries)) {
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        char* end = nullptr;
+        const long parsed = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || parsed <= 1) continue;
+        const pid_t pid = static_cast<pid_t>(parsed);
+        std::string stat_text;
+        const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+        if (!read_file(path, stat_text, 8192)) continue;
+        const size_t comm_end = stat_text.rfind(") ");
+        if (comm_end == std::string::npos) {
+            count = -1;
+            break;
+        }
+        std::istringstream fields(stat_text.substr(comm_end + 2));
+        char state = 0;
+        long ppid = 0;
+        long process_group = 0;
+        if (!(fields >> state >> ppid >> process_group)) {
+            count = -1;
+            break;
+        }
+        if (process_group == pgid) ++count;
+    }
+    closedir(entries);
+    return count;
+}
+
+static bool group_has_live_member(pid_t pgid) {
+    const int directory = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) return true;
+    DIR* entries = fdopendir(directory);
+    if (entries == nullptr) {
+        close(directory);
+        return true;
+    }
+    bool live = false;
+    while (dirent* entry = readdir(entries)) {
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        char* end = nullptr;
+        const long parsed = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || parsed <= 1) continue;
+        const pid_t pid = static_cast<pid_t>(parsed);
+        ProcIdentity identity;
+        if (!read_proc(pid, identity, false)) {
+            errno = 0;
+            if (kill(pid, 0) == 0 || errno == EPERM) live = true;
+            if (live) break;
+            continue;
+        }
+        if (identity.pgid != pgid) continue;
+        std::string stat_text;
+        const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+        const size_t comm_end =
+            read_file(path, stat_text, 8192) ? stat_text.rfind(") ") : std::string::npos;
+        if (comm_end == std::string::npos || comm_end + 2 >= stat_text.size() ||
+            (stat_text[comm_end + 2] != 'Z' && stat_text[comm_end + 2] != 'X')) {
+            live = true;
+            break;
+        }
+    }
+    closedir(entries);
+    return live;
+}
+
+static bool cleanup_group_lease(GroupLease& lease,
+                                DirectLaunch& launch,
+                                bool authority,
+                                std::string& error) {
+    if (!authority) {
+        error = "direct launch group cleanup lacked caller authority";
+        return false;
+    }
+    if (lease.gone()) return true;
+    const auto signal_group = [&](int signal_number) {
+        if (launch.current_valid) return safe_signal_direct_child(launch, signal_number);
+        // A stable PID/start/PGID/SID lease is sufficient for cleanup
+        // containment; an unknown stage is never accepted as a launch result.
+        return lease.signal_contained(signal_number);
+    };
+    if (!signal_group(SIGTERM)) {
+        error = "direct launch group TERM failed identity/authority revalidation";
+        return false;
+    }
+    if (wait_group_gone(lease, kCleanupMs)) return true;
+    if (!signal_group(SIGKILL)) {
+        error = "direct launch group KILL failed identity/authority revalidation";
+        return false;
+    }
+    if (!wait_group_gone(lease, kCleanupMs)) {
+        error = "direct launch group did not reach ESRCH after bounded KILL";
+        return false;
+    }
+    return true;
+}
+
+static bool launcher_gone_or_wnowait(const DirectLaunch& launch) {
+    if (!launch.launcher_valid || launch.launcher_identity.pid <= 1) return false;
+    if (launch.launcher_identity.pid == launch.anchor.pid)
+        return child_exited_wnowait(launch.anchor.pid);
+    return !process_alive(launch.launcher_identity.pid);
+}
+
+static bool has_group_authority(const DirectLaunch& launch) {
+    return geteuid() == 0 || launch.anchor.caller_uid == static_cast<uid_t>(geteuid()) ||
+           (launch.current_valid && launch.current_identity.uid == static_cast<uid_t>(geteuid()));
+}
+
+static bool group_lease_self_check(std::string& error) {
+    int ready[2] = {-1, -1};
+    if (pipe2(ready, O_CLOEXEC) != 0) {
+        error = "GroupLease WNOWAIT harness pipe failed";
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        error = "GroupLease WNOWAIT harness fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(ready[0]);
+        const unsigned char marker = 0x57;
+        if (setpgid(0, 0) != 0 || write(ready[1], &marker, 1) != 1) _exit(71);
+        close(ready[1]);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    unsigned char marker = 0;
+    ProcIdentity identity;
+    const bool ready_exact = read_exact(ready[0], &marker, 1, kHandshakeMs) && marker == 0x57 &&
+                             stable_proc_identity(child, identity);
+    close(ready[0]);
+    GroupLease lease;
+    const bool lease_exact = ready_exact && lease.establish(identity) && lease.revalidate();
+    const auto saved_start = lease.start;
+    lease.start++;
+    const bool stale_pidfd_rejected = !lease.revalidate();
+    lease.start = saved_start;
+    const pid_t saved_pgid = lease.pgid;
+    lease.pgid = 1;
+    const bool unsafe_pgid_rejected = !lease.revalidate();
+    lease.pgid = saved_pgid;
+    siginfo_t live{};
+    const bool live_wnowait =
+        lease_exact &&
+        waitid(P_PID, static_cast<id_t>(child), &live, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+        live.si_pid == 0;
+    const bool signaled = lease_exact && lease.signal_contained(SIGKILL);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    bool exited_wnowait = false;
+    while (std::chrono::steady_clock::now() < deadline && !exited_wnowait) {
+        exited_wnowait = child_exited_wnowait(child);
+        if (!exited_wnowait) (void)poll(nullptr, 0, 5);
+    }
+    int status = 0;
+    bool reaped = false;
+    const auto reap_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < reap_deadline) {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            reaped = true;
+            break;
+        }
+        if (waited < 0 && errno != EINTR) break;
+        (void)poll(nullptr, 0, 5);
+    }
+    const bool group_disappeared = reaped && wait_group_gone(lease, kCleanupMs);
+    if (!ready_exact || !lease_exact || !stale_pidfd_rejected || !unsafe_pgid_rejected ||
+        !live_wnowait || !signaled || !exited_wnowait || !group_disappeared || !reaped ||
+        !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        error = "GroupLease WNOWAIT/PGID disappearance harness failed";
+        if (!reaped && lease_exact && lease.revalidate()) (void)kill(-lease.pgid, SIGKILL);
+        if (!reaped) {
+            const auto reap_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+            while (std::chrono::steady_clock::now() < reap_deadline) {
+                const pid_t waited = waitpid(child, &status, WNOHANG);
+                if (waited == child || (waited < 0 && errno == ECHILD)) break;
+                if (waited < 0 && errno != EINTR) break;
+                (void)poll(nullptr, 0, 5);
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool begin_launch(const std::string& sudo_path,
+                         const std::string& nsenter_path,
+                         const std::string& executable,
+                         const HeldTopologySnapshot& topology,
+                         const ParentEndpoint& endpoint,
+                         const Token& token,
+                         const char* scenario,
+                         std::optional<DirectLaunch>& launch,
+                         std::optional<GroupLease>& lease,
+                         std::chrono::steady_clock::time_point& hello_deadline,
+                         std::string& error) {
     const std::string netns = "/proc/" + std::to_string(topology.holder_pid) + "/ns/net";
     const std::string netns_arg = "--net=" + netns;
     const std::string expected_netns = std::to_string(topology.holder_netns);
@@ -1201,28 +1476,52 @@ static bool launch_sudo(const std::string& sudo_path,
         anchor_identity.netns == parent.netns && anchor_identity.exe_dev == parent.exe_dev &&
         anchor_identity.exe_ino == parent.exe_ino && anchor_identity.cmdline == parent.cmdline;
     if (anchor_exact)
-        launch.emplace(
-            DirectLaunchAnchor{
-                child, anchor_identity.start, child, parent.uid, parent.gid, parent.netns},
-            allowed,
-            true);
+        launch.emplace(DirectLaunchAnchor{child,
+                                          anchor_identity.start,
+                                          child,
+                                          parent.uid,
+                                          parent.gid,
+                                          parent.netns,
+                                          anchor_identity.sid,
+                                          anchor_identity.exe_dev,
+                                          anchor_identity.exe_ino,
+                                          anchor_identity.exe,
+                                          anchor_identity.cmdline},
+                       allowed,
+                       true);
+    if (launch && anchor_exact) {
+        lease.emplace();
+        if (!lease->establish(anchor_identity)) {
+            lease.reset();
+            launch->reason = "direct launch group lease could not be established";
+        }
+    }
     const unsigned char release = 0x4c;
-    const bool released =
-        anchor_exact && write_pipe_exact(release_pipe[1], &release, 1, kHandshakeMs);
+    hello_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeMs);
+    const bool released = anchor_exact && lease && lease->revalidate() &&
+                          write_pipe_exact(release_pipe[1], &release, 1, kHandshakeMs);
     close(release_pipe[1]);
     close(marker_pipe[0]);
     if (!anchor_exact || !released) {
         error = !marker_exact   ? "missing or invalid child launch marker"
                 : !anchor_exact ? "fork/marker immutable /proc anchor was not exact"
                                 : "release pipe write failed before the exact launch gate";
-        if (!reap_failed_direct(child, launch) && launch)
+        bool cleaned = false;
+        if (launch && lease) {
+            std::string lease_error;
+            cleaned =
+                cleanup_group_lease(*lease, *launch, has_group_authority(*launch), lease_error);
+            if (cleaned && !launch->reaped && lease->gone())
+                cleaned = wait_direct(*launch, kCleanupMs);
+            if (!cleaned && !lease_error.empty()) error += "; " + lease_error;
+        } else {
+            cleaned = reap_failed_direct(child, launch);
+        }
+        if (!cleaned && launch)
             error += "; direct launch cleanup failed: " + direct_launch_diagnostic(*launch);
         return false;
     }
-    if (launch && observe_launch_until_launcher(*launch, 250, error)) return true;
-    if (launch && !reap_failed_direct(child, launch))
-        error += "; direct launch cleanup failed: " + direct_launch_diagnostic(*launch);
-    return false;
+    return true;
 }
 
 static bool decode_ready(
@@ -1231,6 +1530,81 @@ static bool decode_ready(
     return get_peer(fd, peer) && receive_frame(fd, frame, kHandshakeMs) &&
            frame.type == expected_type && token_equal(frame.token, token) &&
            decode_report(frame.payload, report);
+}
+
+static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now())
+                               .count();
+    if (remaining <= 0) return 0;
+    return static_cast<int>(std::min<std::int64_t>(remaining, std::numeric_limits<int>::max()));
+}
+
+static bool await_root_hello(const ParentEndpoint& endpoint,
+                             DirectLaunch& launch,
+                             const Token& token,
+                             std::chrono::steady_clock::time_point deadline,
+                             int& root_fd,
+                             Peer& peer,
+                             Report& report,
+                             std::string& error) {
+    root_fd = -1;
+    std::string last_observation = "no direct /proc observation";
+    for (;;) {
+        const int remaining = remaining_deadline_ms(deadline);
+        if (remaining == 0) break;
+        ProcIdentity identity;
+        if (stable_proc_identity(launch.anchor.pid, identity)) {
+            std::string reason;
+            if (!observe_direct(launch, identity, reason)) {
+                if (is_pre_exec_anchor(launch, identity)) {
+                    last_observation = "blocked pre-exec anchor";
+                } else if (reason == "executable/argv is not an exact allowed launch stage") {
+                    error = "stable direct launch identity was not an allowed stage";
+                    launch.reason = error;
+                    return false;
+                } else {
+                    last_observation = reason;
+                }
+            } else {
+                last_observation =
+                    std::string("exact stage ") +
+                    rut::test::fixture_direct_launch::launch_stage_name(launch.current_stage);
+            }
+        } else {
+            last_observation = "transient /proc identity was unavailable";
+        }
+
+        pollfd descriptor{endpoint.listener, POLLIN, 0};
+        const int polled = poll(&descriptor, 1, std::min(remaining, 10));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled < 0) {
+            error = "root HELLO listener poll failed";
+            return false;
+        }
+        if (polled == 0 || (descriptor.revents & POLLIN) == 0) continue;
+        root_fd = accept4(endpoint.listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (root_fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            error = "root HELLO accept failed";
+            return false;
+        }
+        if (!get_peer(root_fd, peer)) {
+            error = "root HELLO SO_PEERCRED failed";
+            return false;
+        }
+        Frame frame;
+        if (!receive_frame_until(root_fd, frame, deadline) || frame.type != kBrokerRootHello ||
+            !token_equal(frame.token, token) || !decode_report(frame.payload, report)) {
+            error = "root HELLO frame was invalid before the absolute deadline";
+            return false;
+        }
+        return true;
+    }
+    error = "root HELLO missed the absolute post-release deadline (last observation: " +
+            last_observation + ")";
+    launch.reason = error;
+    return false;
 }
 
 static bool read_launcher_ancestry(const ProcIdentity& launcher,
@@ -1561,31 +1935,54 @@ static bool run_session(const std::string& sudo_path,
     Token token;
     if (!new_token(token) || !create_parent_endpoint(endpoint, error)) return false;
     std::optional<DirectLaunch> direct_launch;
+    std::optional<GroupLease> group_lease;
+    std::chrono::steady_clock::time_point hello_deadline;
     std::string launch_error;
-    if (!launch_sudo(sudo_path,
-                     nsenter_path,
-                     executable,
-                     topology,
-                     endpoint,
-                     token,
-                     scenario,
-                     direct_launch,
-                     launch_error)) {
+    if (!begin_launch(sudo_path,
+                      nsenter_path,
+                      executable,
+                      topology,
+                      endpoint,
+                      token,
+                      scenario,
+                      direct_launch,
+                      group_lease,
+                      hello_deadline,
+                      launch_error)) {
         error = "sudo/nsenter launch failed: " + launch_error;
         if (direct_launch) error += "; " + direct_launch_diagnostic(*direct_launch);
+        if (direct_launch && group_lease) {
+            std::string cleanup_error;
+            if (!cleanup_group_lease(*group_lease,
+                                     *direct_launch,
+                                     has_group_authority(*direct_launch),
+                                     cleanup_error) ||
+                !group_lease->gone()) {
+                if (!error.empty()) error += "; ";
+                error +=
+                    cleanup_error.empty() ? "direct launch group cleanup failed" : cleanup_error;
+            }
+        }
         return false;
     }
     DirectLaunch& sudo_child = *direct_launch;
+    GroupLease& launch_lease = *group_lease;
     int root_fd = -1, broker_fd = -1, target_fd = -1;
     Report root_report, broker_report, target_report;
     Peer root_peer, broker_peer, target_peer;
     ProcIdentity root_proc, broker_proc, target_proc;
     bool success = false;
     do {
-        if (!accept_bounded(endpoint.listener, root_fd) ||
-            !decode_ready(root_fd, kBrokerRootHello, token, root_peer, root_report) ||
+        if (!await_root_hello(endpoint,
+                              sudo_child,
+                              token,
+                              hello_deadline,
+                              root_fd,
+                              root_peer,
+                              root_report,
+                              error) ||
             !read_proc(root_peer.pid, root_proc, false)) {
-            error = "root broker HELLO/peer identity failed";
+            if (error.empty()) error = "root broker HELLO/peer identity failed";
             break;
         }
         const std::string root_argv = exact_argv({executable,
@@ -1794,14 +2191,19 @@ static bool run_session(const std::string& sudo_path,
                 break;
             }
         }
-        if (!wait_direct(sudo_child, kBrokerDeadlineMs) || !sudo_child.reaped ||
+        if (!wait_group_gone(launch_lease, kCleanupMs) || !launcher_gone_or_wnowait(sudo_child) ||
             !endpoint_unchanged(endpoint) || process_alive(root_peer.pid) ||
             (target_peer.pid > 1 && process_alive(target_peer.pid)) ||
-            !no_process_with_token(token_text(token)) || !WIFEXITED(sudo_child.status) ||
+            !no_process_with_token(token_text(token))) {
+            error = "sudo/broker/target disappearance or endpoint ownership failed";
+            break;
+        }
+        if (!wait_direct(sudo_child, kBrokerDeadlineMs) || !sudo_child.reaped ||
+            !WIFEXITED(sudo_child.status) ||
             (strcmp(scenario, "broker-early") == 0        ? WEXITSTATUS(sudo_child.status) != 86
              : strcmp(scenario, "broker-lease-loss") == 0 ? WEXITSTATUS(sudo_child.status) != 35
                                                           : WEXITSTATUS(sudo_child.status) != 0)) {
-            error = "sudo/broker/target disappearance or endpoint ownership failed";
+            error = "sudo child did not reap with the expected bounded status";
             break;
         }
         success = true;
@@ -1815,8 +2217,21 @@ static bool run_session(const std::string& sudo_path,
     if (!success && broker_peer.pid > 1 && broker_proc.pid == broker_peer.pid &&
         process_alive(broker_peer.pid))
         (void)terminate_verified(broker_report, broker_peer, broker_proc);
+    if (!success) {
+        std::string lease_error;
+        if (!cleanup_group_lease(
+                launch_lease, sudo_child, has_group_authority(sudo_child), lease_error)) {
+            if (!error.empty()) error += "; ";
+            error += lease_error;
+            success = false;
+        }
+    }
     if (!sudo_child.reaped && sudo_child.anchor.pid > 1) {
-        if (!wait_direct(sudo_child, kCleanupMs)) {
+        if (!launch_lease.gone()) {
+            if (!error.empty()) error += "; ";
+            error += "refused direct wait before launch group reached ESRCH";
+            success = false;
+        } else if (!wait_direct(sudo_child, kCleanupMs)) {
             if (!safe_signal_direct_child(sudo_child, SIGTERM)) {
                 if (!error.empty()) error += "; ";
                 error += "refused unsafe direct-launch cleanup signal: " +
@@ -1966,7 +2381,7 @@ int main(int argc, char** argv) {
     const bool required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED") != nullptr &&
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
     if (!pure_protocol_self_checks(error) || !endpoint_replacement_self_check(error) ||
-        !bounded_wait_and_signal_self_check(error)) {
+        !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }

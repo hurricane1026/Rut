@@ -32,6 +32,11 @@ struct DirectLaunchAnchor {
     uid_t caller_uid = static_cast<uid_t>(-1);
     gid_t caller_gid = static_cast<gid_t>(-1);
     ino_t host_netns = 0;
+    pid_t sid = -1;
+    dev_t exe_dev = 0;
+    ino_t exe_ino = 0;
+    std::string exe;
+    std::string cmdline;
 };
 
 inline constexpr std::array<unsigned char, 8> kLaunchMarker{
