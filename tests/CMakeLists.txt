@@ -694,6 +694,17 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue373_converter_proxy_hide_header_generated_pair_self_check
+        COMMAND test_nginx_differential --converter-proxy-hide-header-generated-pair-self-check $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue373_converter_proxy_hide_header_generated_pair_self_check PROPERTIES
+        LABELS "integration;io_uring;network;nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue362_request_length_oracle
         COMMAND test_nginx_differential --pinned-nginx-request-length-oracle
     )

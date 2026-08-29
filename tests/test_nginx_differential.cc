@@ -50133,6 +50133,453 @@ static bool run_proxy_hide_header_generated_observation_self_checks(
     return true;
 }
 
+// Stage 4b2 deliberately composes two independently captured generated sides.
+// This remains an RUT-vs-RUT declaration-order witness; pinned nginx and the
+// eventual four-way comparison belong to the following stage.
+struct ProxyHideHeaderGeneratedPair {
+    ProxyHideHeaderGeneratedObservation sides[2];
+};
+
+static bool canonicalize_generated_upstream_host(const std::vector<char>& wire,
+                                                 u16 backend_port,
+                                                 std::string& canonical,
+                                                 std::string& error) {
+    if (wire.size() != 66u) {
+        error = "#373 generated pair upstream wire was not exactly 66 bytes";
+        return false;
+    }
+    const std::string value(wire.begin(), wire.end());
+    const std::string endpoint = "127.0.0.1:" + std::to_string(backend_port);
+    const size_t at = value.find(endpoint);
+    if (at == std::string::npos ||
+        value.find(endpoint, at + endpoint.size()) != std::string::npos || at < strlen("Host: ") ||
+        value.compare(at - strlen("Host: "), strlen("Host: "), "Host: ") != 0 ||
+        value.compare(at + endpoint.size(), 2u, "\r\n") != 0) {
+        error = "#373 generated pair upstream Host endpoint was not one complete validated token";
+        return false;
+    }
+    canonical = value;
+    canonical.replace(at, endpoint.size(), "127.0.0.1:BACKEND");
+    return true;
+}
+
+static bool validate_proxy_hide_header_generated_pair(const ProxyHideHeaderGeneratedPair& pair,
+                                                      std::string& error) {
+    const auto& first = pair.sides[0];
+    const auto& second = pair.sides[1];
+    if (!validate_proxy_hide_header_generated_observation(first, error) ||
+        !validate_proxy_hide_header_generated_observation(second, error))
+        return false;
+    if (first.order != "listen-first" || second.order != "location-first" ||
+        first.frontend_port == second.frontend_port || first.frontend_port == second.backend_port ||
+        first.backend_port == second.frontend_port || first.backend_port == second.backend_port ||
+        first.frontend_port < 1024u || first.frontend_port > 9999u || first.backend_port < 1024u ||
+        first.backend_port > 9999u || second.frontend_port < 1024u ||
+        second.frontend_port > 9999u || second.backend_port < 1024u ||
+        second.backend_port > 9999u) {
+        error = "#373 generated pair endpoint/order binding or four-digit uniqueness failed";
+        return false;
+    }
+    const std::string* const strings[] = {&first.temp_path,
+                                          &second.temp_path,
+                                          &first.source_path,
+                                          &second.source_path,
+                                          &first.runtime_log_path,
+                                          &second.runtime_log_path,
+                                          &first.access_probe_path,
+                                          &second.access_probe_path,
+                                          &first.process_identity,
+                                          &second.process_identity};
+    for (size_t i = 0u; i < std::size(strings); i++)
+        for (size_t j = i + 1u; j < std::size(strings); j++)
+            if (*strings[i] == *strings[j]) {
+                error = "#373 generated pair resource/process identities were reused";
+                return false;
+            }
+    if (first.child_pid <= 0 || second.child_pid <= 0 || first.child_pid == second.child_pid ||
+        first.source.size() != 5366u || second.source.size() != 5366u ||
+        first.source.size() != second.source.size() ||
+        first.rut_executable != second.rut_executable) {
+        error = "#373 generated pair source size or PID identity failed";
+        return false;
+    }
+    if (first.response.size() != 176u || second.response.size() != 176u) {
+        error = "#373 generated pair downstream wire size failed";
+        return false;
+    }
+    std::vector<char> first_downstream = first.response;
+    std::vector<char> second_downstream = second.response;
+    if (!normalize_date(first_downstream) || !normalize_date(second_downstream) ||
+        first_downstream != second_downstream) {
+        error =
+            "#373 generated declaration orders did not produce the same Date-normalized 176-byte "
+            "downstream wire";
+        return false;
+    }
+    std::string first_upstream;
+    std::string second_upstream;
+    if (first.upstream_history.size() != 1u || second.upstream_history.size() != 1u ||
+        !canonicalize_generated_upstream_host(
+            first.upstream_history[0], first.backend_port, first_upstream, error) ||
+        !canonicalize_generated_upstream_host(
+            second.upstream_history[0], second.backend_port, second_upstream, error) ||
+        first_upstream != second_upstream) {
+        if (error.empty())
+            error =
+                "#373 generated declaration orders did not produce the same canonical upstream "
+                "wire";
+        return false;
+    }
+    std::string first_source = first.source;
+    std::string second_source = second.source;
+    const bool sources_canonical =
+        canonicalize_unique_port(first_source,
+                                 "listen 127.0.0.1:" + std::to_string(first.frontend_port) + "\n",
+                                 "listen 127.0.0.1:FRONTEND\n") &&
+        canonicalize_unique_port(
+            first_source,
+            "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(first.backend_port) + "\"\n",
+            "upstream nginx_upstream at \"127.0.0.1:BACKEND\"\n") &&
+        canonicalize_unique_port(second_source,
+                                 "listen 127.0.0.1:" + std::to_string(second.frontend_port) + "\n",
+                                 "listen 127.0.0.1:FRONTEND\n") &&
+        canonicalize_unique_port(second_source,
+                                 "upstream nginx_upstream at \"127.0.0.1:" +
+                                     std::to_string(second.backend_port) + "\"\n",
+                                 "upstream nginx_upstream at \"127.0.0.1:BACKEND\"\n");
+    if (!sources_canonical || first_source != second_source) {
+        error =
+            "#373 generated declaration-order sources differed beyond validated endpoint tokens";
+        return false;
+    }
+    // Each side's observation validator already proves the exact count, one
+    // FIN, no-late-data, EOF, stable window, clean exit and disabled access
+    // probe. Keep these assertions explicit at the pair boundary so future
+    // edits cannot accidentally turn this into a source-only comparison.
+    if (first.accepted != second.accepted || first.requests != second.requests ||
+        first.sends != second.sends || first.response_peer_close_count != 1u ||
+        second.response_peer_close_count != 1u || !first.response_peer_closed ||
+        !second.response_peer_closed || first.response_peer_unexpected_data ||
+        second.response_peer_unexpected_data || first.response_peer_observation_failed ||
+        second.response_peer_observation_failed || !first.eof || !second.eof ||
+        !first.stable_window || !second.stable_window || !first.exited_zero ||
+        !second.exited_zero || !first.access_enoent_before || !second.access_enoent_before ||
+        !first.access_enoent_after || !second.access_enoent_after || !first.access_enoent_final ||
+        !second.access_enoent_final || first.response_sent_ns == 0u ||
+        second.response_sent_ns == 0u || first.response_peer_closed_ns < first.response_sent_ns ||
+        second.response_peer_closed_ns < second.response_sent_ns ||
+        first.response_peer_closed_ns - first.response_sent_ns > 2'000'000'000ull ||
+        second.response_peer_closed_ns - second.response_sent_ns > 2'000'000'000ull) {
+        error =
+            "#373 generated pair count/FIN/timestamp/EOF/stability/access/lifecycle contract "
+            "failed";
+        return false;
+    }
+    return true;
+}
+
+static bool run_proxy_hide_header_generated_pair_self_checks(
+    const ProxyHideHeaderGeneratedPair& baseline, std::string& error) {
+    if (!validate_proxy_hide_header_generated_pair(baseline, error)) return false;
+    const auto rejects = [&](ProxyHideHeaderGeneratedPair candidate,
+                             const char* field,
+                             bool differs,
+                             const char* label) {
+        if (!differs) {
+            error =
+                std::string("#373 generated pair mutation did not change ") + field + ": " + label;
+            return false;
+        }
+        std::string detail;
+        if (validate_proxy_hide_header_generated_pair(candidate, detail)) {
+            error = std::string("#373 generated pair mutation accepted: ") + label;
+            return false;
+        }
+        return true;
+    };
+    auto candidate = baseline;
+    std::swap(candidate.sides[0].order, candidate.sides[1].order);
+    if (!rejects(candidate,
+                 "order",
+                 candidate.sides[0].order != baseline.sides[0].order &&
+                     candidate.sides[1].order != baseline.sides[1].order,
+                 "swapped order"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].frontend_port = baseline.sides[0].frontend_port;
+    if (!rejects(candidate,
+                 "frontend_port",
+                 candidate.sides[1].frontend_port != baseline.sides[1].frontend_port,
+                 "reused frontend endpoint"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].backend_port = baseline.sides[0].backend_port;
+    if (!rejects(candidate,
+                 "backend_port",
+                 candidate.sides[1].backend_port != baseline.sides[1].backend_port,
+                 "reused backend endpoint"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].frontend_port = baseline.sides[1].backend_port;
+    if (!rejects(candidate,
+                 "frontend_port",
+                 candidate.sides[1].frontend_port != baseline.sides[1].frontend_port,
+                 "frontend/backend collision"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].source = candidate.sides[0].source;
+    if (!rejects(candidate,
+                 "source",
+                 candidate.sides[1].source != baseline.sides[1].source,
+                 "source identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].temp_path = candidate.sides[0].temp_path;
+    if (!rejects(candidate,
+                 "temp_path",
+                 candidate.sides[1].temp_path != baseline.sides[1].temp_path,
+                 "temp identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].source_path = candidate.sides[0].source_path;
+    if (!rejects(candidate,
+                 "source_path",
+                 candidate.sides[1].source_path != baseline.sides[1].source_path,
+                 "source-path identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].runtime_log_path = candidate.sides[0].runtime_log_path;
+    if (!rejects(candidate,
+                 "runtime_log_path",
+                 candidate.sides[1].runtime_log_path != baseline.sides[1].runtime_log_path,
+                 "runtime-log identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].access_probe_path = candidate.sides[0].access_probe_path;
+    if (!rejects(candidate,
+                 "access_probe_path",
+                 candidate.sides[1].access_probe_path != baseline.sides[1].access_probe_path,
+                 "access-probe identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].process_identity = candidate.sides[0].process_identity;
+    if (!rejects(candidate,
+                 "process_identity",
+                 candidate.sides[1].process_identity != baseline.sides[1].process_identity,
+                 "process identity reuse"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].process_argv[6] = "1";
+    if (!rejects(candidate,
+                 "process_argv",
+                 candidate.sides[1].process_argv != baseline.sides[1].process_argv,
+                 "argv mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].process_argv.push_back("--access-log");
+    if (!rejects(candidate,
+                 "process_argv",
+                 candidate.sides[1].process_argv != baseline.sides[1].process_argv,
+                 "argv access sink"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].child_pid = candidate.sides[0].child_pid;
+    if (!rejects(candidate,
+                 "child_pid",
+                 candidate.sides[1].child_pid != baseline.sides[1].child_pid,
+                 "PID identity reuse"))
+        return false;
+    candidate = baseline;
+    std::swap(candidate.sides[0].source, candidate.sides[1].source);
+    if (!rejects(candidate,
+                 "source",
+                 candidate.sides[0].source != baseline.sides[0].source &&
+                     candidate.sides[1].source != baseline.sides[1].source,
+                 "side source swap"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].response[100] = 'X';
+    if (!rejects(candidate,
+                 "response",
+                 candidate.sides[1].response != baseline.sides[1].response,
+                 "downstream mismatch"))
+        return false;
+    candidate = baseline;
+    {
+        std::string wire(candidate.sides[1].upstream_history[0].begin(),
+                         candidate.sides[1].upstream_history[0].end());
+        const std::string host =
+            "Host: 127.0.0.1:" + std::to_string(candidate.sides[1].backend_port) + "\r\n";
+        const size_t at = wire.find(host);
+        if (at == std::string::npos) return false;
+        const u16 alternate = candidate.sides[1].backend_port == 9999u
+                                  ? 9998u
+                                  : static_cast<u16>(candidate.sides[1].backend_port + 1u);
+        const std::string replacement = "Host: 127.0.0.1:" + std::to_string(alternate) + "\r\n";
+        if (replacement == host) return false;
+        wire.replace(at, host.size(), replacement);
+        candidate.sides[1].upstream_history[0].assign(wire.begin(), wire.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.sides[1].upstream_history != baseline.sides[1].upstream_history,
+                 "upstream Host mismatch"))
+        return false;
+    candidate = baseline;
+    {
+        std::string wire(candidate.sides[1].upstream_history[0].begin(),
+                         candidate.sides[1].upstream_history[0].end());
+        const size_t at = wire.find("X-Dupe: one");
+        if (at == std::string::npos) return false;
+        const std::string replacement = "X-Dupe: xxx";
+        if (replacement == "X-Dupe: one") return false;
+        wire.replace(at, strlen("X-Dupe: one"), replacement);
+        candidate.sides[1].upstream_history[0].assign(wire.begin(), wire.end());
+    }
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.sides[1].upstream_history != baseline.sides[1].upstream_history,
+                 "upstream header mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].upstream_history[0].clear();
+    if (!rejects(candidate,
+                 "upstream_history",
+                 candidate.sides[1].upstream_history != baseline.sides[1].upstream_history,
+                 "upstream count/EOF mismatch"))
+        return false;
+    for (const u32 value : {0u, 2u}) {
+        candidate = baseline;
+        candidate.sides[1].accepted = value;
+        const std::string label = "accepted=" + std::to_string(value);
+        if (!rejects(candidate,
+                     "accepted",
+                     candidate.sides[1].accepted != baseline.sides[1].accepted,
+                     label.c_str()))
+            return false;
+    }
+    for (const u32 value : {0u, 2u}) {
+        candidate = baseline;
+        candidate.sides[1].requests = value;
+        const std::string label = "requests=" + std::to_string(value);
+        if (!rejects(candidate,
+                     "requests",
+                     candidate.sides[1].requests != baseline.sides[1].requests,
+                     label.c_str()))
+            return false;
+    }
+    for (const u32 value : {0u, 2u}) {
+        candidate = baseline;
+        candidate.sides[1].sends = value;
+        const std::string label = "sends=" + std::to_string(value);
+        if (!rejects(candidate,
+                     "sends",
+                     candidate.sides[1].sends != baseline.sides[1].sends,
+                     label.c_str()))
+            return false;
+    }
+    candidate = baseline;
+    candidate.sides[1].response_peer_close_count = 2u;
+    if (!rejects(candidate,
+                 "response_peer_close_count",
+                 candidate.sides[1].response_peer_close_count !=
+                     baseline.sides[1].response_peer_close_count,
+                 "FIN count mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].response_peer_closed_ns =
+        candidate.sides[1].response_sent_ns + 2'000'000'001ull;
+    if (!rejects(
+            candidate,
+            "response_peer_closed_ns",
+            candidate.sides[1].response_peer_closed_ns != baseline.sides[1].response_peer_closed_ns,
+            "FIN timestamp mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].eof = false;
+    if (!rejects(candidate,
+                 "eof",
+                 candidate.sides[1].eof != baseline.sides[1].eof,
+                 "downstream EOF mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].stable_window = false;
+    if (!rejects(candidate,
+                 "stable_window",
+                 candidate.sides[1].stable_window != baseline.sides[1].stable_window,
+                 "lifecycle stability mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].exited_zero = false;
+    if (!rejects(candidate,
+                 "exited_zero",
+                 candidate.sides[1].exited_zero != baseline.sides[1].exited_zero,
+                 "clean-exit mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].access_enoent_final = false;
+    if (!rejects(candidate,
+                 "access_enoent_final",
+                 candidate.sides[1].access_enoent_final != baseline.sides[1].access_enoent_final,
+                 "access mismatch"))
+        return false;
+    candidate = baseline;
+    candidate.sides[1].runtime_log += "fatal\n";
+    if (!rejects(candidate,
+                 "runtime_log",
+                 candidate.sides[1].runtime_log != baseline.sides[1].runtime_log,
+                 "lifecycle log mismatch"))
+        return false;
+    return true;
+}
+
+static bool capture_proxy_hide_header_generated_pair(const char* rut_path,
+                                                     ProxyHideHeaderGeneratedPair& pair,
+                                                     std::string& error) {
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create()) {
+        error = "#373 generated pair could not create two independent secure TempDir trees";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4] = {};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve_four_digit(i, ports[i])) {
+            error =
+                "#373 generated pair could not reserve all four unique four-digit ports before "
+                "launch";
+            return false;
+        }
+    }
+    if (ports[0] == ports[1] || ports[0] == ports[2] || ports[0] == ports[3] ||
+        ports[1] == ports[2] || ports[1] == ports[3] || ports[2] == ports[3]) {
+        error = "#373 generated pair reserved a duplicate endpoint";
+        return false;
+    }
+    // Capture consumes exactly its side's backend then frontend reservations;
+    // the other side's two reservations remain held throughout the first run.
+    if (!capture_proxy_hide_header_generated_side(ports[0],
+                                                  ports[1],
+                                                  temps[0],
+                                                  rut_path,
+                                                  true,
+                                                  pair.sides[0],
+                                                  error,
+                                                  &reservations.fds[0],
+                                                  &reservations.fds[1]) ||
+        !capture_proxy_hide_header_generated_side(ports[2],
+                                                  ports[3],
+                                                  temps[1],
+                                                  rut_path,
+                                                  false,
+                                                  pair.sides[1],
+                                                  error,
+                                                  &reservations.fds[2],
+                                                  &reservations.fds[3]))
+        return false;
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -50171,6 +50618,9 @@ int main(int argc, char** argv) {
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
+    const bool proxy_hide_header_generated_pair_self_check =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-proxy-hide-header-generated-pair-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -50352,11 +50802,11 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
-         !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_split_header_oracle && !rut_initial_header_split_public &&
-         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
-         !converter_request_length_differential &&
+         !proxy_hide_header_generated_pair_self_check && !wildcard_listen_oracle &&
+         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
+         !request_length_oracle && !request_length_split_header_oracle &&
+         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
+         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -50414,7 +50864,9 @@ int main(int argc, char** argv) {
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (rut_initial_header_split_public && argv[2][0] != '/') ||
-        (proxy_hide_header_generated_side_self_check && argv[2][0] != '/') ||
+        ((proxy_hide_header_generated_side_self_check ||
+          proxy_hide_header_generated_pair_self_check) &&
+         argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
@@ -50498,6 +50950,9 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-generated-side-self-check "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-proxy-hide-header-generated-pair-self-check "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
@@ -50721,6 +51176,15 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (proxy_hide_header_generated_pair_self_check) {
+        struct stat executable_stat{};
+        if (argv[2] == nullptr || argv[2][0] != '/' || stat(argv[2], &executable_stat) != 0 ||
+            !S_ISREG(executable_stat.st_mode) || access(argv[2], X_OK) != 0) {
+            std::cerr << "FAIL [#373 generated-pair preflight]: RUT path must be an executable "
+                         "absolute regular file\n";
+            return 1;
+        }
+    }
 
 #ifndef __linux__
     if (rut_initial_header_split_public) {
@@ -50798,6 +51262,24 @@ int main(int argc, char** argv) {
                      "origin response, 176-byte hidden-header-filtered response/EOF, poison "
                      "liveness, ENOENT disabled access, live FIN stability and clean lifecycle; "
                      "generated-side witness only (no four-way equivalence claim)\n";
+        return 0;
+    }
+    if (proxy_hide_header_generated_pair_self_check) {
+        ProxyHideHeaderGeneratedPair pair;
+        std::string pair_error;
+        if (!capture_proxy_hide_header_generated_pair(argv[2], pair, pair_error) ||
+            !run_proxy_hide_header_generated_pair_self_checks(pair, pair_error)) {
+            if (pair_error.empty())
+                pair_error = "#373 generated pair self-check returned false without detail";
+            std::cerr << "FAIL [#373 generated-pair live self-check]: " << pair_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #373 independently parsed/lowered/persisted both declaration orders into "
+               "two isolated 5366-byte ordinary-RUT sources and proved exact paired "
+               "Date-normalized downstream/upstream wires, endpoint/resource/PID isolation, "
+               "poison liveness, FIN/EOF/stability, disabled access and clean io_uring lifecycle; "
+               "generated-pair witness only (no nginx/four-way equivalence claim)\n";
         return 0;
     }
     if (request_length_oracle || request_length_split_header_oracle ||
