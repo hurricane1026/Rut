@@ -1177,6 +1177,21 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue372_converter_root_empty_query_proxy_uri_differential
+        COMMAND test_nginx_differential
+                --converter-root-empty-query-proxy-uri-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue372_converter_root_empty_query_proxy_uri_differential PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 240
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_bounded_exact_local_path_oracle
         COMMAND test_nginx_differential --bounded-exact-local-path-oracle
     )
