@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -57,7 +58,8 @@ static bool send_raw(int fd,
                      CmsgShape shape,
                      size_t first_bytes,
                      bool trailing_rights = false,
-                     bool complete = true) {
+                     bool complete = true,
+                     bool rest_rights = false) {
     const size_t count = shape == CmsgShape::Short  ? kBundleFdCount - 1
                          : shape == CmsgShape::Long ? kBundleFdCount + 1
                                                     : kBundleFdCount;
@@ -104,12 +106,37 @@ static bool send_raw(int fd,
                     std::chrono::steady_clock::now() + std::chrono::milliseconds(500))) {
         return false;
     }
-    if (complete && first_bytes != wire.size() &&
-        !send_plain(fd,
-                    wire.data() + first_bytes,
-                    wire.size() - first_bytes,
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500))) {
-        return false;
+    if (complete && first_bytes != wire.size()) {
+        const size_t remaining = wire.size() - first_bytes;
+        if (rest_rights) {
+            alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> rest_control{};
+            iovec rest_vector{const_cast<unsigned char*>(wire.data() + first_bytes), remaining};
+            msghdr rest_message{};
+            rest_message.msg_iov = &rest_vector;
+            rest_message.msg_iovlen = 1;
+            rest_message.msg_control = rest_control.data();
+            rest_message.msg_controllen = rest_control.size();
+            cmsghdr* rest_header = CMSG_FIRSTHDR(&rest_message);
+            rest_header->cmsg_level = SOL_SOCKET;
+            rest_header->cmsg_type = SCM_RIGHTS;
+            rest_header->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(rest_header), &fds[0], sizeof(int));
+            do {
+                sent = sendmsg(fd, &rest_message, MSG_NOSIGNAL);
+            } while (sent < 0 && errno == EINTR);
+            if (sent < 0) return false;
+            if (static_cast<size_t>(sent) != remaining &&
+                !send_plain(fd,
+                            wire.data() + first_bytes + sent,
+                            remaining - static_cast<size_t>(sent),
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(500)))
+                return false;
+        } else if (!send_plain(fd,
+                               wire.data() + first_bytes,
+                               remaining,
+                               std::chrono::steady_clock::now() + std::chrono::milliseconds(500))) {
+            return false;
+        }
     }
     if (trailing_rights) {
         alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
@@ -147,7 +174,8 @@ static bool receive_fails(const std::vector<unsigned char>& wire,
                           CmsgShape shape,
                           size_t first_bytes,
                           bool trailing = false,
-                          bool complete = true) {
+                          bool complete = true,
+                          bool rest_rights = false) {
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
     const size_t before = fd_count();
@@ -159,7 +187,8 @@ static bool receive_fails(const std::vector<unsigned char>& wire,
             return false;
         }
     }
-    const bool sent = send_raw(sockets[0], wire, fds, shape, first_bytes, trailing, complete);
+    const bool sent =
+        send_raw(sockets[0], wire, fds, shape, first_bytes, trailing, complete, rest_rights);
     const int send_errno = sent ? 0 : errno;
     shutdown(sockets[0], SHUT_WR);
     ReceivedBundle received;
@@ -287,6 +316,8 @@ int main() {
                 "truncated header rejected");
     ok &= check(receive_fails(wire, fds, CmsgShape::Exact, kHeaderBytes + 2, false, false),
                 "truncated payload rejected");
+    ok &= check(receive_fails(wire, fds, CmsgShape::Exact, kHeaderBytes, false, true, true),
+                "payload ancillary rejected and closed");
     ok &= check(receive_fails(wire, fds, CmsgShape::Exact, wire.size(), true),
                 "trailing ancillary rejected");
     std::vector<unsigned char> oversized = wire;
@@ -325,7 +356,11 @@ int main() {
     ok &= check(foreign_child > 1, "foreign child setup");
     int foreign_child_pidfd = -1;
 #ifdef SYS_pidfd_open
-    if (foreign_child > 1) foreign_child_pidfd = syscall(SYS_pidfd_open, foreign_child, 0);
+    if (foreign_child > 1) {
+        const long raw_foreign_pidfd = syscall(SYS_pidfd_open, foreign_child, 0);
+        if (raw_foreign_pidfd >= 0 && raw_foreign_pidfd <= std::numeric_limits<int>::max())
+            foreign_child_pidfd = static_cast<int>(raw_foreign_pidfd);
+    }
 #endif
     std::array<int, kBundleFdCount> foreign_pidfd = fds;
     foreign_pidfd[11] = foreign_child_pidfd;

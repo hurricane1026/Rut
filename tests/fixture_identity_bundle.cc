@@ -312,6 +312,10 @@ static bool validate_role(const RoleBundle& role, std::string& error) {
         !read_pidfd_binding(role.fds[static_cast<size_t>(FdSlot::Pidfd)], m.pid))
         return invalid("fd filesystem type invalid");
 
+    // The transport boundary proves regular type plus dev/inode and opened
+    // proc content under the trusted fixture root.  A later integration layer
+    // must cross-check the expected binary; malicious-root and same-inode /
+    // hardlink attestation are deliberately outside this transport core.
     struct stat executable{};
     if (fstat(role.fds[static_cast<size_t>(FdSlot::Executable)], &executable) != 0 ||
         static_cast<u64>(executable.st_dev) != m.exe_dev ||
@@ -467,12 +471,13 @@ bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error
         return false;
     }
 #ifdef SYS_pidfd_open
-    role_bundle.fds[5] = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
-    if (role_bundle.fds[5] < 0) {
+    const long raw_pidfd = syscall(SYS_pidfd_open, pid, 0);
+    if (raw_pidfd < 0 || raw_pidfd > std::numeric_limits<int>::max()) {
         role_bundle.close();
         error = "identity bundle pidfd open failed";
         return false;
     }
+    role_bundle.fds[5] = static_cast<int>(raw_pidfd);
 #else
     role_bundle.close();
     error = "identity bundle pidfd is unavailable";
