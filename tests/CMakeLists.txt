@@ -479,6 +479,21 @@ if(RUT_ENABLE_JIT)
     if(TARGET test_rut_iouring_gate_preload)
         add_dependencies(test_nginx_differential test_rut_iouring_gate_preload)
     endif()
+    add_executable(test_ipv4_fixture_topology
+        test_ipv4_fixture_topology.cc
+        fixture_ipv4_topology.cc
+    )
+    target_compile_definitions(test_ipv4_fixture_topology PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_test(NAME test_ipv4_fixture_topology COMMAND test_ipv4_fixture_topology)
+    set_tests_properties(test_ipv4_fixture_topology PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
     add_test(
         NAME test_nginx_downstream_gate_spike
         COMMAND test_nginx_differential --nginx-gate-spike
