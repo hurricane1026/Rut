@@ -97,6 +97,7 @@ static bool lease_loss_owner_cascade_self_check(std::string& error);
 static bool launcher_error_order_self_check(std::string& error);
 static bool prelaunch_close_first_self_check(std::string& error);
 static bool identity_bundle_integration_self_check(std::string& error);
+static bool retained_anchor_self_check(std::string& error);
 static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
@@ -448,6 +449,179 @@ struct GroupLease {
 #endif
     }
 };
+
+struct RetainedAnchorEvidence {
+    pid_t pid = -1;
+    pid_t ppid = -1;
+    pid_t pgid = -1;
+    pid_t sid = -1;
+    std::uint64_t start = 0;
+    char state = 0;
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    std::string cmdline;
+    bool pidfd_live = false;
+};
+
+static bool parse_retained_anchor_stat(const std::string& text, RetainedAnchorEvidence& evidence) {
+    const size_t pid_end = text.find(' ');
+    if (pid_end == std::string::npos || pid_end == 0) return false;
+    const std::string pid_text = text.substr(0, pid_end);
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed_pid = strtoul(pid_text.c_str(), &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0' || parsed_pid <= 1 ||
+        parsed_pid > static_cast<unsigned long>(std::numeric_limits<pid_t>::max()))
+        return false;
+    const size_t comm_end = text.rfind(") ");
+    if (comm_end == std::string::npos) return false;
+    std::istringstream fields(text.substr(comm_end + 2));
+    long ppid = 0;
+    long pgid = 0;
+    long sid = 0;
+    if (!(fields >> evidence.state >> ppid >> pgid >> sid)) return false;
+    for (int field = 7; field <= 22; ++field) {
+        if (field == 22) {
+            unsigned long long start = 0;
+            if (!(fields >> start)) return false;
+            evidence.start = static_cast<std::uint64_t>(start);
+        } else {
+            long long ignored = 0;
+            if (!(fields >> ignored)) return false;
+        }
+    }
+    evidence.pid = static_cast<pid_t>(parsed_pid);
+    evidence.ppid = static_cast<pid_t>(ppid);
+    evidence.pgid = static_cast<pid_t>(pgid);
+    evidence.sid = static_cast<pid_t>(sid);
+    return evidence.ppid > 1 && evidence.pgid > 1 && evidence.sid > 1 && evidence.start != 0;
+}
+
+static bool parse_retained_anchor_status(const std::string& text,
+                                         RetainedAnchorEvidence& evidence) {
+    bool have_uid = false;
+    bool have_gid = false;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::istringstream value(line.substr(colon + 1));
+        if (line.rfind("Uid:", 0) == 0 || line.rfind("Gid:", 0) == 0) {
+            std::array<unsigned long long, 4> ids{};
+            for (auto& id : ids)
+                if (!(value >> id)) return false;
+            std::string extra;
+            if (value >> extra) return false;
+            if (line.rfind("Uid:", 0) == 0) {
+                if (ids[0] > std::numeric_limits<uid_t>::max()) return false;
+                evidence.uid = static_cast<uid_t>(ids[0]);
+                have_uid = true;
+            } else {
+                if (ids[0] > std::numeric_limits<gid_t>::max()) return false;
+                evidence.gid = static_cast<gid_t>(ids[0]);
+                have_gid = true;
+            }
+        }
+    }
+    return have_uid && have_gid;
+}
+
+static bool retained_pidfd_live(int pidfd) {
+    if (pidfd < 0 || fcntl(pidfd, F_GETFD) < 0) return false;
+    pollfd descriptor{pidfd, POLLIN, 0};
+    int result;
+    do {
+        result = poll(&descriptor, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
+}
+
+static bool capture_retained_anchor_evidence(const DirectLaunch& launch,
+                                             const GroupLease& lease,
+                                             RetainedAnchorEvidence& evidence,
+                                             std::string& reason) {
+    if (!launch.marker_valid || lease.pid != launch.anchor.pid ||
+        lease.start != launch.anchor.start || lease.pgid != launch.anchor.pgid ||
+        lease.sid != launch.anchor.sid || !retained_pidfd_live(lease.pidfd)) {
+        reason = "retained sudo anchor lease/pidfd binding was stale";
+        return false;
+    }
+    const std::string prefix = "/proc/" + std::to_string(launch.anchor.pid);
+    std::string first_text;
+    std::string second_text;
+    std::string status;
+    int probe_errno = 0;
+    RetainedAnchorEvidence first;
+    RetainedAnchorEvidence second;
+    if (!probe_file(prefix + "/stat", first_text, probe_errno) ||
+        !parse_retained_anchor_stat(first_text, first) ||
+        !probe_file(prefix + "/stat", second_text, probe_errno) ||
+        !parse_retained_anchor_stat(second_text, second) || first.pid != second.pid ||
+        first.ppid != second.ppid || first.pgid != second.pgid || first.sid != second.sid ||
+        first.start != second.start || first.state != second.state ||
+        !probe_file(prefix + "/status", status, probe_errno) ||
+        !parse_retained_anchor_status(status, second) ||
+        !probe_file(prefix + "/cmdline", second.cmdline, probe_errno)) {
+        reason = "retained sudo anchor stat/status/cmdline evidence was unavailable or unstable";
+        return false;
+    }
+    second.pidfd_live = retained_pidfd_live(lease.pidfd);
+    if (!second.pidfd_live || second.pid != launch.anchor.pid ||
+        second.start != launch.anchor.start || second.ppid != getpid() ||
+        second.pgid != launch.anchor.pgid || second.sid != launch.anchor.sid ||
+        second.state == 'Z' || second.state == 'X') {
+        reason = "retained sudo anchor kernel identity was stale, detached, or dead";
+        return false;
+    }
+    evidence = std::move(second);
+    return true;
+}
+
+static bool prove_retained_sudo_wrapper(DirectLaunch& launch,
+                                        const ProcIdentity& launcher,
+                                        const RetainedAnchorEvidence& evidence,
+                                        std::string& reason) {
+    if (!launch.marker_valid ||
+        launch.mode == rut::test::fixture_direct_launch::LaunchMode::ExecChain ||
+        !evidence.pidfd_live || evidence.pid != launch.anchor.pid ||
+        evidence.start != launch.anchor.start || evidence.ppid != getpid() ||
+        evidence.pgid != launch.anchor.pgid || evidence.sid != launch.anchor.sid ||
+        evidence.state == 'Z' || evidence.state == 'X' || launcher.pid == launch.anchor.pid ||
+        launcher.ppid != launch.anchor.pid || launcher.pgid != launch.anchor.pgid ||
+        launcher.sid != launch.anchor.sid) {
+        reason = "retained sudo anchor/launcher kernel chain was not exact";
+        launch.reason = reason;
+        return false;
+    }
+    const bool caller =
+        evidence.uid == launch.anchor.caller_uid && evidence.gid == launch.anchor.caller_gid;
+    const bool root = evidence.uid == 0 && evidence.gid == 0;
+    if ((!caller && !root) || evidence.cmdline != launch.allowed.sudo_stage.argv) {
+        reason = "retained sudo status/cmdline was not the exact allowed sudo stage";
+        launch.reason = reason;
+        return false;
+    }
+
+    ProcIdentity direct;
+    direct.pid = evidence.pid;
+    direct.ppid = evidence.ppid;
+    direct.pgid = evidence.pgid;
+    direct.sid = evidence.sid;
+    direct.start = evidence.start;
+    direct.uid = evidence.uid;
+    direct.gid = evidence.gid;
+    direct.cmdline = evidence.cmdline;
+    // This tests-only fixture has already proved the immutable fork marker,
+    // retained pidfd/stat identity, and exact Launcher->Root bundle chain.  The
+    // ordinary parent cannot stat a root sudo's exe or netns on Ubuntu, so only
+    // those inaccessible fields are completed from begin_launch's immutable
+    // exact sudo descriptor and pre-release host-netns boundary.
+    direct.exe_dev = launch.allowed.sudo_stage.exe_dev;
+    direct.exe_ino = launch.allowed.sudo_stage.exe_ino;
+    direct.netns = launch.anchor.host_netns;
+    return validate_launcher_ancestry(launch, launcher, {direct}, reason);
+}
 
 static bool parse_u64(const char* text, u64& value) {
     if (text == nullptr || *text == '\0') return false;
@@ -1673,6 +1847,123 @@ static bool stable_proc_identity(pid_t pid, ProcIdentity& identity) {
            same_process_identity(first, second) && (identity = std::move(second), true);
 }
 
+static bool retained_anchor_self_check(std::string& error) {
+    int ready[2] = {-1, -1};
+    if (pipe2(ready, O_CLOEXEC) != 0) {
+        error = "retained-anchor ready pipe failed";
+        return false;
+    }
+    const pid_t expected_parent = getpid();
+    const pid_t child = fork();
+    if (child < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        error = "retained-anchor child fork failed";
+        return false;
+    }
+    if (child == 0) {
+        close(ready[0]);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent ||
+            setpgid(0, 0) != 0)
+            _exit(125);
+        const unsigned char marker = 0xa7;
+        (void)write(ready[1], &marker, 1);
+        close(ready[1]);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    unsigned char marker = 0;
+    bool ok = read_exact(ready[0], &marker, 1, kCleanupMs) && marker == 0xa7;
+    close(ready[0]);
+
+    ProcIdentity direct_identity;
+    GroupLease lease;
+    ok = ok && stable_proc_identity(child, direct_identity) && lease.establish(direct_identity);
+    const ino_t holder_netns = direct_identity.netns + 1;
+    const std::string launcher_argv("retained-launcher\0", 18);
+    AllowedStages allowed{
+        {direct_identity.exe_dev, direct_identity.exe_ino, direct_identity.cmdline},
+        {direct_identity.exe_dev, direct_identity.exe_ino, "nsenter\0"},
+        {direct_identity.exe_dev, direct_identity.exe_ino, launcher_argv},
+        holder_netns};
+    const DirectLaunchAnchor anchor{child,
+                                    direct_identity.start,
+                                    child,
+                                    direct_identity.uid,
+                                    direct_identity.gid,
+                                    direct_identity.netns,
+                                    direct_identity.sid,
+                                    direct_identity.exe_dev,
+                                    direct_identity.exe_ino,
+                                    direct_identity.exe,
+                                    direct_identity.cmdline};
+    RetainedAnchorEvidence retained;
+    std::string reason;
+    ok = ok && capture_retained_anchor_evidence(
+                   DirectLaunch(anchor, allowed, true), lease, retained, reason);
+    ProcIdentity launcher;
+    launcher.pid = child + 100000;
+    launcher.ppid = child;
+    launcher.start = direct_identity.start + 1;
+    launcher.pgid = child;
+    launcher.sid = direct_identity.sid;
+    launcher.uid = 0;
+    launcher.gid = 0;
+    launcher.netns = holder_netns;
+    launcher.exe_dev = direct_identity.exe_dev;
+    launcher.exe_ino = direct_identity.exe_ino;
+    launcher.cmdline = launcher_argv;
+    const auto accepted = [&](const RetainedAnchorEvidence& candidate_retained,
+                              const ProcIdentity& candidate_launcher) {
+        DirectLaunch candidate(anchor, allowed, true);
+        std::string candidate_reason;
+        return prove_retained_sudo_wrapper(
+                   candidate, candidate_launcher, candidate_retained, candidate_reason) &&
+               candidate.mode == rut::test::fixture_direct_launch::LaunchMode::SudoWrapper &&
+               candidate.current_valid && candidate.current_stage == LaunchStage::Sudo &&
+               candidate.launcher_valid;
+    };
+    ok = ok && accepted(retained, launcher);
+    const auto rejects_retained = [&](auto mutation) {
+        RetainedAnchorEvidence changed = retained;
+        mutation(changed);
+        return !accepted(changed, launcher);
+    };
+    const auto rejects_launcher = [&](auto mutation) {
+        ProcIdentity changed = launcher;
+        mutation(changed);
+        return !accepted(retained, changed);
+    };
+    ok = ok && rejects_retained([](auto& value) { ++value.start; }) &&
+         rejects_retained([](auto& value) { ++value.pid; }) &&
+         rejects_retained([](auto& value) { ++value.ppid; }) &&
+         rejects_retained([](auto& value) { ++value.pgid; }) &&
+         rejects_retained([](auto& value) { ++value.sid; }) &&
+         rejects_retained([](auto& value) { value.pidfd_live = false; }) &&
+         rejects_retained([](auto& value) { value.state = 'Z'; }) &&
+         rejects_launcher([](auto& value) { value.ppid = 1; }) &&
+         rejects_launcher([](auto& value) { ++value.pgid; }) &&
+         rejects_launcher([](auto& value) { ++value.sid; }) &&
+         rejects_launcher([](auto& value) { ++value.exe_ino; }) &&
+         rejects_launcher([](auto& value) { value.cmdline.push_back('x'); });
+
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) ok = false;
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    RetainedAnchorEvidence dead;
+    DirectLaunch dead_launch(anchor, allowed, true);
+    ok = ok && waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL &&
+         !capture_retained_anchor_evidence(dead_launch, lease, dead, reason);
+    if (!ok) {
+        error = "retained sudo anchor/pidfd/launcher mutation self-check failed: " + reason;
+        return false;
+    }
+    return true;
+}
+
 static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int timeout_ms) {
     struct sigaction ignore{};
     struct sigaction old_action{};
@@ -2066,7 +2357,10 @@ static bool begin_launch(const std::string& sudo_path,
         close(marker_pipe[0]);
         close(release_pipe[1]);
         size_t offset = 0;
-        if (setpgid(0, 0) != 0) _exit(125);
+        const pid_t expected_parent = getppid();
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent ||
+            setpgid(0, 0) != 0)
+            _exit(125);
         while (offset != kLaunchMarker.size()) {
             const ssize_t count =
                 write(marker_pipe[1], kLaunchMarker.data() + offset, kLaunchMarker.size() - offset);
@@ -2263,6 +2557,7 @@ static bool validate_root_broker(const Report& report,
                                  const std::string& executable,
                                  const std::string& expected_argv,
                                  const std::string& expected_launcher_argv,
+                                 const RetainedAnchorEvidence* retained_anchor,
                                  DirectLaunch& sudo_launch) {
     if (peer.pid <= 1 || peer.uid != 0 || peer.gid != 0 ||
         report.target_pid != static_cast<u64>(peer.pid) ||
@@ -2286,22 +2581,23 @@ static bool validate_root_broker(const Report& report,
         launcher.cmdline != expected_launcher_argv ||
         report.no_new_privs != static_cast<u64>(proc.no_new_privs) ||
         report.capabilities_clear != static_cast<u64>(proc.capabilities_clear) ||
-        report.groups_clear != 0 || report.groups_unchanged != 1 ||
-        proc.supplementary_groups == 0) {
+        report.groups_clear > 1 || report.groups_unchanged > 1 ||
+        report.groups_clear + report.groups_unchanged != 1 ||
+        (report.groups_clear == 1 && proc.supplementary_groups != 0)) {
         sudo_launch.reason = "root broker report/peer/current /proc fields were not exact";
         return false;
     }
     std::vector<ProcIdentity> ancestry;
     std::string reason;
     if (launcher.pid != sudo_launch.anchor.pid) {
-        if (!sudo_launch.current_valid || launcher.ppid != sudo_launch.anchor.pid ||
-            child_exited_wnowait(sudo_launch.anchor.pid)) {
+        if (retained_anchor == nullptr ||
+            !prove_retained_sudo_wrapper(sudo_launch, launcher, *retained_anchor, reason)) {
             sudo_launch.reason = "live sudo-wrapper direct lineage was not exact";
             return false;
         }
-        ancestry.push_back(sudo_launch.current_identity);
+        return true;
     }
-    if ((launcher.pid == sudo_launch.anchor.pid && launcher.start != sudo_launch.anchor.start) ||
+    if (retained_anchor != nullptr || launcher.start != sudo_launch.anchor.start ||
         !validate_launcher_ancestry(sudo_launch, launcher, ancestry, reason)) {
         sudo_launch.reason =
             reason.empty() ? "root broker launcher provenance was not exact" : reason;
@@ -2329,8 +2625,14 @@ static ProcIdentity proc_from_bundle_role(const identity_bundle::RoleManifest& m
     return proc;
 }
 
+struct BundleStatusEvidence {
+    bool no_new_privs = false;
+    bool capabilities_clear = false;
+    std::vector<gid_t> supplementary_groups;
+};
+
 static bool read_bundle_status_evidence(const identity_bundle::RoleBundle& role,
-                                        ProcIdentity& proc) {
+                                        BundleStatusEvidence& evidence) {
     const int fd = role.fds[static_cast<size_t>(identity_bundle::FdSlot::Status)];
     if (fd < 0 || lseek(fd, 0, SEEK_SET) < 0) return false;
     std::string status;
@@ -2363,12 +2665,20 @@ static bool read_bundle_status_evidence(const identity_bundle::RoleBundle& role,
         if (line.rfind("NoNewPrivs:", 0) == 0) {
             int parsed = -1;
             if (!(value >> parsed) || (parsed != 0 && parsed != 1)) return false;
-            proc.no_new_privs = parsed == 1;
+            evidence.no_new_privs = parsed == 1;
             have_nnp = true;
         } else if (line.rfind("Groups:", 0) == 0) {
             std::string group;
-            proc.supplementary_groups = 0;
-            while (value >> group) ++proc.supplementary_groups;
+            evidence.supplementary_groups.clear();
+            while (value >> group) {
+                char* end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = strtoull(group.c_str(), &end, 10);
+                if (errno != 0 || end == group.c_str() || *end != '\0' ||
+                    parsed > std::numeric_limits<gid_t>::max())
+                    return false;
+                evidence.supplementary_groups.push_back(static_cast<gid_t>(parsed));
+            }
             have_groups = true;
         } else if (line.rfind("CapInh:", 0) == 0 || line.rfind("CapPrm:", 0) == 0 ||
                    line.rfind("CapEff:", 0) == 0) {
@@ -2389,8 +2699,18 @@ static bool read_bundle_status_evidence(const identity_bundle::RoleBundle& role,
             }
         }
     }
-    proc.capabilities_clear = clear_inh && clear_prm && clear_eff;
+    evidence.capabilities_clear = clear_inh && clear_prm && clear_eff;
     return have_nnp && have_groups && seen_inh && seen_prm && seen_eff;
+}
+
+static bool groups_evidence_matches(const Report& report,
+                                    const BundleStatusEvidence& launcher,
+                                    const BundleStatusEvidence& root) {
+    if (report.groups_clear > 1 || report.groups_unchanged > 1 ||
+        report.groups_clear + report.groups_unchanged != 1)
+        return false;
+    if (report.groups_clear == 1) return root.supplementary_groups.empty();
+    return root.supplementary_groups == launcher.supplementary_groups;
 }
 
 static bool validate_identity_manifest_binding(
@@ -2401,7 +2721,9 @@ static bool validate_identity_manifest_binding(
     const std::string& executable,
     const std::string& expected_root_argv,
     const std::string& expected_launcher_argv,
-    const ProcIdentity& root_status_evidence,
+    const BundleStatusEvidence& launcher_status_evidence,
+    const BundleStatusEvidence& root_status_evidence,
+    const RetainedAnchorEvidence* retained_anchor,
     DirectLaunch& sudo_launch,
     ProcIdentity& root_proc,
     ProcIdentity& launcher_proc,
@@ -2435,14 +2757,15 @@ static bool validate_identity_manifest_binding(
         report.exe_dev != root.exe_dev || report.exe_ino != root.exe_ino ||
         report.argv != expected_root_argv || report.uid != 0 || report.gid != 0 ||
         report.netns != topology.holder_netns || report.pgid != static_cast<u64>(root.pgid) ||
-        report.mode != "broker-root") {
+        report.mode != "broker-root" ||
+        !groups_evidence_matches(report, launcher_status_evidence, root_status_evidence)) {
         error = "identity bundle manifest/peer/report binding was not exact";
         return false;
     }
     root_proc = proc_from_bundle_role(root, executable, expected_root_argv);
     root_proc.no_new_privs = root_status_evidence.no_new_privs;
     root_proc.capabilities_clear = root_status_evidence.capabilities_clear;
-    root_proc.supplementary_groups = root_status_evidence.supplementary_groups;
+    root_proc.supplementary_groups = root_status_evidence.supplementary_groups.size();
     launcher_proc = proc_from_bundle_role(launcher, executable, expected_launcher_argv);
     if (!validate_root_broker(report,
                               peer,
@@ -2452,6 +2775,7 @@ static bool validate_identity_manifest_binding(
                               executable,
                               expected_root_argv,
                               expected_launcher_argv,
+                              retained_anchor,
                               sudo_launch)) {
         error = sudo_launch.reason;
         return false;
@@ -2466,6 +2790,7 @@ static bool validate_received_identity_bundle(const identity_bundle::IdentityBun
                                               const std::string& executable,
                                               const std::string& expected_root_argv,
                                               const std::string& expected_launcher_argv,
+                                              const RetainedAnchorEvidence* retained_anchor,
                                               DirectLaunch& sudo_launch,
                                               ProcIdentity& root_proc,
                                               ProcIdentity& launcher_proc,
@@ -2477,9 +2802,11 @@ static bool validate_received_identity_bundle(const identity_bundle::IdentityBun
     }
     const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount> manifests{
         bundle.roles[0].manifest, bundle.roles[1].manifest};
-    ProcIdentity root_status_evidence;
-    if (!read_bundle_status_evidence(bundle.roles[1], root_status_evidence)) {
-        error = "received Root status FD security evidence was invalid";
+    BundleStatusEvidence launcher_status_evidence;
+    BundleStatusEvidence root_status_evidence;
+    if (!read_bundle_status_evidence(bundle.roles[0], launcher_status_evidence) ||
+        !read_bundle_status_evidence(bundle.roles[1], root_status_evidence)) {
+        error = "received Launcher/Root status FD security evidence was invalid";
         return false;
     }
     return validate_identity_manifest_binding(manifests,
@@ -2489,7 +2816,9 @@ static bool validate_received_identity_bundle(const identity_bundle::IdentityBun
                                               executable,
                                               expected_root_argv,
                                               expected_launcher_argv,
+                                              launcher_status_evidence,
                                               root_status_evidence,
+                                              retained_anchor,
                                               sudo_launch,
                                               root_proc,
                                               launcher_proc,
@@ -2497,6 +2826,7 @@ static bool validate_received_identity_bundle(const identity_bundle::IdentityBun
 }
 
 static bool identity_bundle_integration_self_check(std::string& error) {
+    const pid_t expected_parent = getpid();
     int child_ready[2] = {-1, -1};
     if (pipe2(child_ready, O_CLOEXEC) != 0) {
         error = "identity integration child-ready pipe failed";
@@ -2511,6 +2841,7 @@ static bool identity_bundle_integration_self_check(std::string& error) {
     }
     if (child == 0) {
         close(child_ready[0]);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(125);
         const unsigned char ready = 0x91;
         (void)write(child_ready[1], &ready, 1);
         close(child_ready[1]);
@@ -2520,6 +2851,24 @@ static bool identity_bundle_integration_self_check(std::string& error) {
     unsigned char ready = 0;
     bool ok = read_exact(child_ready[0], &ready, 1, kCleanupMs) && ready == 0x91;
     close(child_ready[0]);
+
+    Report unchanged_groups;
+    unchanged_groups.groups_clear = 0;
+    unchanged_groups.groups_unchanged = 1;
+    Report clear_groups = unchanged_groups;
+    clear_groups.groups_clear = 1;
+    clear_groups.groups_unchanged = 0;
+    BundleStatusEvidence empty_launcher_groups;
+    BundleStatusEvidence empty_root_groups;
+    BundleStatusEvidence nonempty_launcher_groups;
+    nonempty_launcher_groups.supplementary_groups = {1};
+    BundleStatusEvidence nonempty_root_groups = nonempty_launcher_groups;
+    ok =
+        ok && groups_evidence_matches(unchanged_groups, empty_launcher_groups, empty_root_groups) &&
+        groups_evidence_matches(unchanged_groups, nonempty_launcher_groups, nonempty_root_groups) &&
+        groups_evidence_matches(clear_groups, nonempty_launcher_groups, empty_root_groups) &&
+        !groups_evidence_matches(unchanged_groups, nonempty_launcher_groups, empty_root_groups) &&
+        !groups_evidence_matches(clear_groups, empty_launcher_groups, nonempty_root_groups);
 
     identity_bundle::IdentityBundle source;
     std::string bundle_error;
@@ -2603,6 +2952,7 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
                                                  const std::string& executable,
                                                  const std::string& root_argv,
                                                  const std::string& launcher_argv,
+                                                 const RetainedAnchorEvidence* retained_anchor,
                                                  const DirectLaunch& live_launch) {
     ProcIdentity ignored_root;
     ProcIdentity ignored_launcher;
@@ -2615,6 +2965,7 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
                                            executable,
                                            root_argv,
                                            launcher_argv,
+                                           retained_anchor,
                                            full_baseline,
                                            ignored_root,
                                            ignored_launcher,
@@ -2622,10 +2973,16 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
         return false;
     const std::array<identity_bundle::RoleManifest, identity_bundle::kRoleCount> manifests{
         bundle.roles[0].manifest, bundle.roles[1].manifest};
+    BundleStatusEvidence launcher_status;
+    BundleStatusEvidence root_status;
+    if (!read_bundle_status_evidence(bundle.roles[0], launcher_status) ||
+        !read_bundle_status_evidence(bundle.roles[1], root_status))
+        return false;
     const auto accepted_with_evidence = [&](const auto& candidate_manifests,
                                             const Report& candidate_report,
                                             const Peer& candidate_peer,
-                                            const ProcIdentity& candidate_evidence) {
+                                            const BundleStatusEvidence& candidate_launcher_status,
+                                            const BundleStatusEvidence& candidate_root_status) {
         DirectLaunch launch = live_launch;
         ProcIdentity root_proc;
         ProcIdentity launcher_proc;
@@ -2637,7 +2994,9 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
                                                   executable,
                                                   root_argv,
                                                   launcher_argv,
-                                                  candidate_evidence,
+                                                  candidate_launcher_status,
+                                                  candidate_root_status,
+                                                  retained_anchor,
                                                   launch,
                                                   root_proc,
                                                   launcher_proc,
@@ -2647,7 +3006,7 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
                               const Report& candidate_report,
                               const Peer& candidate_peer) {
         return accepted_with_evidence(
-            candidate_manifests, candidate_report, candidate_peer, ignored_root);
+            candidate_manifests, candidate_report, candidate_peer, launcher_status, root_status);
     };
     if (!accepted(manifests, report, peer)) return false;
     const auto rejects = [&](auto mutation) {
@@ -2666,12 +3025,20 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
     Report changed_groups_report = report;
     changed_groups_report.groups_clear = 1;
     changed_groups_report.groups_unchanged = 0;
-    ProcIdentity changed_nnp_evidence = ignored_root;
+    BundleStatusEvidence changed_nnp_evidence = root_status;
     changed_nnp_evidence.no_new_privs = !changed_nnp_evidence.no_new_privs;
-    ProcIdentity changed_caps_evidence = ignored_root;
+    BundleStatusEvidence changed_caps_evidence = root_status;
     changed_caps_evidence.capabilities_clear = !changed_caps_evidence.capabilities_clear;
-    ProcIdentity changed_groups_evidence = ignored_root;
-    changed_groups_evidence.supplementary_groups = 0;
+    BundleStatusEvidence changed_root_groups = root_status;
+    changed_root_groups.supplementary_groups.push_back(
+        changed_root_groups.supplementary_groups.empty()
+            ? 1
+            : static_cast<gid_t>(changed_root_groups.supplementary_groups.back() + 1));
+    BundleStatusEvidence changed_launcher_groups = launcher_status;
+    changed_launcher_groups.supplementary_groups.push_back(
+        changed_launcher_groups.supplementary_groups.empty()
+            ? 1
+            : static_cast<gid_t>(changed_launcher_groups.supplementary_groups.back() + 1));
     auto detached = manifests;
     detached[0].pid += 100000;
     detached[0].ppid = 1;
@@ -2683,9 +3050,12 @@ static bool live_identity_bundle_mutation_checks(const identity_bundle::Identity
            !accepted(manifests, changed_nnp_report, peer) &&
            !accepted(manifests, changed_caps_report, peer) &&
            !accepted(manifests, changed_groups_report, peer) &&
-           !accepted_with_evidence(manifests, report, peer, changed_nnp_evidence) &&
-           !accepted_with_evidence(manifests, report, peer, changed_caps_evidence) &&
-           !accepted_with_evidence(manifests, report, peer, changed_groups_evidence) &&
+           !accepted_with_evidence(
+               manifests, report, peer, launcher_status, changed_nnp_evidence) &&
+           !accepted_with_evidence(
+               manifests, report, peer, launcher_status, changed_caps_evidence) &&
+           !accepted_with_evidence(manifests, report, peer, launcher_status, changed_root_groups) &&
+           !accepted_with_evidence(manifests, report, peer, changed_launcher_groups, root_status) &&
            rejects([](auto& value) { ++value[1].pid; }) &&
            rejects([](auto& value) { ++value[0].pid; }) &&
            rejects([](auto& value) { ++value[1].ppid; }) &&
@@ -2772,6 +3142,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                         const std::string& target_argv,
                                         const Token& token,
                                         DirectLaunch& sudo_child,
+                                        const RetainedAnchorEvidence* retained_anchor,
                                         const ParentEndpoint& endpoint) {
     DirectLaunch baseline_launch = sudo_child;
     const bool root_baseline = validate_root_broker(root_report,
@@ -2782,6 +3153,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                     executable,
                                                     root_argv,
                                                     launcher_argv,
+                                                    retained_anchor,
                                                     baseline_launch);
     Report changed_root = root_report;
     changed_root.netns++;
@@ -2803,6 +3175,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
+                                                      retained_anchor,
                                                       changed_report_launch) &&
                                 !validate_root_broker(root_report,
                                                       changed_root_peer,
@@ -2812,6 +3185,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
+                                                      retained_anchor,
                                                       changed_peer_launch) &&
                                 !validate_root_broker(root_report,
                                                       root_peer,
@@ -2821,6 +3195,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
+                                                      retained_anchor,
                                                       changed_proc_launch) &&
                                 !validate_root_broker(root_report,
                                                       root_peer,
@@ -2830,6 +3205,7 @@ static bool causal_mutation_self_checks(const Report& root_report,
                                                       executable,
                                                       root_argv,
                                                       launcher_argv,
+                                                      retained_anchor,
                                                       changed_sudo);
     const bool broker_baseline = identity_matches_report(broker_report,
                                                          broker_peer,
@@ -3096,6 +3472,18 @@ static bool run_session(const std::string& sudo_path,
                                                      scenario,
                                                      std::to_string(kCredentialFd)});
         std::string identity_error;
+        std::optional<RetainedAnchorEvidence> retained_anchor;
+        if (received_identity.bundle().roles[0].manifest.pid != sudo_child.anchor.pid) {
+            retained_anchor.emplace();
+            if (!capture_retained_anchor_evidence(
+                    sudo_child, launch_lease, *retained_anchor, identity_error)) {
+                error = "root broker retained sudo anchor validation failed: " + identity_error;
+                received_identity.reset();
+                break;
+            }
+        }
+        const RetainedAnchorEvidence* retained_anchor_ptr =
+            retained_anchor ? &*retained_anchor : nullptr;
         if (!validate_received_identity_bundle(received_identity.bundle(),
                                                root_report,
                                                root_peer,
@@ -3103,6 +3491,7 @@ static bool run_session(const std::string& sudo_path,
                                                executable,
                                                root_argv,
                                                launcher_argv,
+                                               retained_anchor_ptr,
                                                sudo_child,
                                                root_proc,
                                                launcher_proc,
@@ -3116,6 +3505,7 @@ static bool run_session(const std::string& sudo_path,
                                                    executable,
                                                    root_argv,
                                                    launcher_argv,
+                                                   retained_anchor_ptr,
                                                    sudo_child))) {
             error = "root broker bundle provenance validation failed: " + identity_error + "; " +
                     direct_launch_diagnostic(sudo_child);
@@ -3217,6 +3607,7 @@ static bool run_session(const std::string& sudo_path,
                                                                                 target_argv,
                                                                                 token,
                                                                                 sudo_child,
+                                                                                retained_anchor_ptr,
                                                                                 endpoint)) {
                 error = "broker/target causal mutation self-check failed";
                 break;
@@ -3505,7 +3896,7 @@ int main(int argc, char** argv) {
         !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
         !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
         !prelaunch_close_first_self_check(error) ||
-        !identity_bundle_integration_self_check(error)) {
+        !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
