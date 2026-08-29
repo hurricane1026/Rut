@@ -127,6 +127,10 @@ static bool cleanup_group_lease(GroupLease& lease,
                                 bool authority,
                                 std::string& error);
 static bool has_group_authority(const DirectLaunch& launch, const GroupLease& lease);
+static bool arm_parent_death(pid_t expected_parent);
+enum class ExactLiveness { Live, ExitedOrReused, Unknown };
+static ExactLiveness observe_exact_liveness(const ProcIdentity& expected);
+static bool exact_liveness_self_check(std::string& error);
 
 static bool validate_dropped_identity_binding(
     const identity_bundle::DroppedIdentityEvidence& evidence,
@@ -227,6 +231,185 @@ static bool control_lease_lost(int fd) {
     if (received > 0) return false;
     if (received == 0) return true;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+static bool arm_parent_death(pid_t expected_parent) {
+    if (expected_parent <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) return false;
+    int configured_signal = 0;
+    return prctl(PR_GET_PDEATHSIG, &configured_signal) == 0 && configured_signal == SIGKILL &&
+           getppid() == expected_parent;
+}
+
+struct ExactProcStat {
+    pid_t pid = -1;
+    char state = '\0';
+    std::uint64_t start = 0;
+};
+
+static bool parse_exact_proc_stat(const std::string& text, ExactProcStat& result) {
+    result = ExactProcStat{};
+    const size_t first_space = text.find(' ');
+    const size_t close_comm = text.rfind(')');
+    if (first_space == std::string::npos || close_comm == std::string::npos ||
+        close_comm + 2 >= text.size() || first_space >= close_comm)
+        return false;
+    std::istringstream pid_text(text.substr(0, first_space));
+    long long pid_value = 0;
+    if (!(pid_text >> pid_value) || pid_value <= 0 ||
+        pid_value > std::numeric_limits<pid_t>::max() ||
+        pid_text.peek() != std::char_traits<char>::eof())
+        return false;
+    std::istringstream fields(text.substr(close_comm + 2));
+    char state = '\0';
+    long long ignored = 0;
+    if (!(fields >> state >> ignored >> ignored >> ignored)) return false;
+    for (int field = 7; field <= 21; ++field)
+        if (!(fields >> ignored)) return false;
+    unsigned long long start = 0;
+    if (!(fields >> start) || start == 0) return false;
+    result.pid = static_cast<pid_t>(pid_value);
+    result.state = state;
+    result.start = static_cast<std::uint64_t>(start);
+    return true;
+}
+
+static bool exact_proc_stat(const ProcIdentity& expected, ExactProcStat& result) {
+    if (expected.pid <= 1 || expected.start == 0) return false;
+    std::string text;
+    errno = 0;
+    if (!read_file("/proc/" + std::to_string(expected.pid) + "/stat", text, 8192)) return false;
+    if (!parse_exact_proc_stat(text, result)) return false;
+    return result.pid == expected.pid;
+}
+
+static ExactLiveness observe_exact_liveness(const ProcIdentity& expected) {
+    if (expected.pid <= 1 || expected.start == 0) return ExactLiveness::Unknown;
+    ExactProcStat first;
+    ExactProcStat second;
+    errno = 0;
+    if (!exact_proc_stat(expected, first)) {
+        return errno == ENOENT || errno == ESRCH ? ExactLiveness::ExitedOrReused
+                                                 : ExactLiveness::Unknown;
+    }
+    if (first.start != expected.start) return ExactLiveness::ExitedOrReused;
+    errno = 0;
+    if (!exact_proc_stat(expected, second)) {
+        return errno == ENOENT || errno == ESRCH ? ExactLiveness::ExitedOrReused
+                                                 : ExactLiveness::Unknown;
+    }
+    if (second.start != expected.start) return ExactLiveness::ExitedOrReused;
+    if (second.start != first.start) return ExactLiveness::Unknown;
+    switch (second.state) {
+        case 'R':
+        case 'S':
+        case 'D':
+        case 'T':
+        case 't':
+        case 'W':
+        case 'K':
+        case 'P':
+        case 'I':
+            return ExactLiveness::Live;
+        case 'Z':
+        case 'X':
+        case 'x':
+            return ExactLiveness::ExitedOrReused;
+        default:
+            return ExactLiveness::Unknown;
+    }
+}
+
+static bool exact_liveness_self_check(std::string& error) {
+    int arm_pipe[2] = {-1, -1};
+    if (pipe2(arm_pipe, O_CLOEXEC) != 0) {
+        error = "PDEATHSIG self-check pipe failed";
+        return false;
+    }
+    const pid_t arm_child = fork();
+    if (arm_child < 0) {
+        close(arm_pipe[0]);
+        close(arm_pipe[1]);
+        error = "PDEATHSIG self-check fork failed";
+        return false;
+    }
+    if (arm_child == 0) {
+        close(arm_pipe[0]);
+        const unsigned char result = arm_parent_death(getppid()) ? 1 : 0;
+        (void)write(arm_pipe[1], &result, 1);
+        close(arm_pipe[1]);
+        _exit(result == 1 ? 0 : 1);
+    }
+    close(arm_pipe[1]);
+    unsigned char arm_result = 0;
+    const bool arm_ok = read_exact(arm_pipe[0], &arm_result, 1, kCleanupMs) && arm_result == 1;
+    close(arm_pipe[0]);
+    int arm_status = 0;
+    bool arm_reaped = false;
+    for (;;) {
+        const pid_t waited = waitpid(arm_child, &arm_status, 0);
+        if (waited == arm_child) {
+            arm_reaped = true;
+            break;
+        }
+        if (waited < 0 && errno == EINTR) continue;
+        break;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        error = "exact liveness self-check fork failed";
+        return false;
+    }
+    if (child == 0) {
+        for (;;) pause();
+    }
+    ProcIdentity expected;
+    const bool identity_ok =
+        read_proc(child, expected, false) && expected.pid == child && expected.start != 0;
+    const bool live = identity_ok && observe_exact_liveness(expected) == ExactLiveness::Live;
+    ProcIdentity wrong_start = expected;
+    ++wrong_start.start;
+    const bool wrong_start_gone =
+        identity_ok && observe_exact_liveness(wrong_start) == ExactLiveness::ExitedOrReused;
+    const bool killed = kill(child, SIGKILL) == 0;
+    siginfo_t info{};
+    bool wnowait_zombie = false;
+    if (killed) {
+        for (;;) {
+            const int waited = waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOWAIT);
+            if (waited == 0) {
+                wnowait_zombie = info.si_pid == child;
+                break;
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+    }
+    const bool zombie_not_live = identity_ok && wnowait_zombie &&
+                                 observe_exact_liveness(expected) == ExactLiveness::ExitedOrReused;
+    int status = 0;
+    bool reaped = false;
+    for (;;) {
+        const pid_t waited = waitpid(child, &status, 0);
+        if (waited == child) {
+            reaped = true;
+            break;
+        }
+        if (waited < 0 && errno == EINTR) continue;
+        break;
+    }
+    const bool gone =
+        identity_ok && reaped && observe_exact_liveness(expected) == ExactLiveness::ExitedOrReused;
+    ExactProcStat malformed;
+    const bool malformed_rejected = !parse_exact_proc_stat("not-a-stat", malformed);
+    ProcIdentity invalid;
+    const bool invalid_unknown = observe_exact_liveness(invalid) == ExactLiveness::Unknown;
+    if (!arm_ok || !arm_reaped || !WIFEXITED(arm_status) || WEXITSTATUS(arm_status) != 0 || !live ||
+        !wrong_start_gone || !zombie_not_live || !gone || !malformed_rejected || !invalid_unknown) {
+        error = "PDEATHSIG/exact PID-start-state liveness self-check failed";
+        return false;
+    }
+    return true;
 }
 
 struct ProcFailureProbe {
@@ -1234,8 +1417,7 @@ static int dropped_broker_main(const char* executable,
         credential_fd_value != kCredentialFd || geteuid() != 0)
         return 20;
     const pid_t root_broker = getppid();
-    if (root_broker <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != root_broker)
-        return 21;
+    if (!arm_parent_death(root_broker)) return 21;
     const std::string expected_root_argv = exact_argv({executable,
                                                        "--fixture-privileged-broker",
                                                        control_path,
@@ -1268,7 +1450,7 @@ static int dropped_broker_main(const char* executable,
         const pid_t broker_parent = getppid();
         close(launch_pipe[1]);
         close(trace_pipe[0]);
-        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != broker_parent) _exit(50);
+        if (!arm_parent_death(broker_parent)) _exit(50);
         char authorization = 0;
         ssize_t count;
         do {
@@ -1283,7 +1465,9 @@ static int dropped_broker_main(const char* executable,
             sigemptyset(&action.sa_mask);
             if (sigaction(SIGTERM, &action, nullptr) != 0) _exit(52);
         }
-        if (!secure_target(caller_uid, caller_gid, trace_pipe[1])) _exit(53);
+        if (!secure_target(caller_uid, caller_gid, trace_pipe[1]) ||
+            !arm_parent_death(broker_parent))
+            _exit(53);
         close(trace_pipe[1]);
         const std::string broker_pid = std::to_string(getppid());
         execl(executable,
@@ -1305,7 +1489,7 @@ static int dropped_broker_main(const char* executable,
     // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
     target_cleanup.add_downstream_fd(&launch_pipe[1]);
     target_cleanup.add_downstream_fd(&trace_pipe[0]);
-    if (!secure_as(caller_uid, caller_gid)) return 29;
+    if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker)) return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
     Report dropped_report;
@@ -4389,9 +4573,13 @@ static bool run_session(const std::string& sudo_path,
             broker_fd = -1;
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-            while (process_alive(target_peer.pid) && std::chrono::steady_clock::now() < deadline)
+            ExactLiveness target_liveness = observe_exact_liveness(target_proc);
+            while (target_liveness == ExactLiveness::Live &&
+                   std::chrono::steady_clock::now() < deadline) {
                 (void)poll(nullptr, 0, 10);
-            if (process_alive(target_peer.pid)) {
+                target_liveness = observe_exact_liveness(target_proc);
+            }
+            if (target_liveness != ExactLiveness::ExitedOrReused) {
                 error = "broker death left live target";
                 break;
             }
@@ -4427,9 +4615,20 @@ static bool run_session(const std::string& sudo_path,
         }
         if (!wait_group_gone(launch_lease, kCleanupMs) || !launcher_gone_or_wnowait(sudo_child) ||
             !endpoint_unchanged(endpoint) || process_alive(root_peer.pid) ||
-            (target_peer.pid > 1 && process_alive(target_peer.pid)) ||
             !no_process_with_token(token_text(token))) {
             error = "sudo/broker/target disappearance or endpoint ownership failed";
+            break;
+        }
+        ExactLiveness target_liveness = observe_exact_liveness(target_proc);
+        const auto target_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+        while (target_liveness != ExactLiveness::ExitedOrReused &&
+               std::chrono::steady_clock::now() < target_deadline) {
+            (void)poll(nullptr, 0, 10);
+            target_liveness = observe_exact_liveness(target_proc);
+        }
+        if (target_liveness != ExactLiveness::ExitedOrReused) {
+            error = "target exact PID/start did not reach a bounded non-live state";
             break;
         }
         if (!wait_direct(sudo_child, kBrokerDeadlineMs) || !sudo_child.reaped ||
@@ -4629,10 +4828,10 @@ int main(int argc, char** argv) {
     std::string sudo_path, nsenter_path, error;
     const bool required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED") != nullptr &&
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
-    if (!pure_protocol_self_checks(error) || !endpoint_replacement_self_check(error) ||
-        !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
-        !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
-        !prelaunch_close_first_self_check(error) ||
+    if (!pure_protocol_self_checks(error) || !exact_liveness_self_check(error) ||
+        !endpoint_replacement_self_check(error) || !bounded_wait_and_signal_self_check(error) ||
+        !group_lease_self_check(error) || !lease_loss_owner_cascade_self_check(error) ||
+        !launcher_error_order_self_check(error) || !prelaunch_close_first_self_check(error) ||
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
