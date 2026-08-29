@@ -20,6 +20,20 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Tests-only fixed privileged identity bundle transport.  This is a pure
+# socketpair/SCM_RIGHTS self-check and is not connected to the broker runtime.
+add_library(fixture_identity_bundle STATIC fixture_identity_bundle.cc)
+target_include_directories(fixture_identity_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_identity_bundle test_fixture_identity_bundle.cc)
+target_link_libraries(test_fixture_identity_bundle PRIVATE fixture_identity_bundle)
+add_test(NAME test_fixture_identity_bundle COMMAND test_fixture_identity_bundle)
+set_tests_properties(test_fixture_identity_bundle PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
 # Pure #358 Stage 2a3b sudo/nsenter/launcher causal state model.  This test
 # uses synthetic process identities and never invokes sudo or fakes a positive
 # privileged semantic run.

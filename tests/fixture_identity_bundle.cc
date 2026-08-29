@@ -1,0 +1,632 @@
+#include "fixture_identity_bundle.h"
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <sstream>
+
+#include <fcntl.h>
+#include <linux/limits.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace rut::test::fixture_identity_bundle {
+namespace {
+
+constexpr unsigned long kProcMagic = 0x9fa0;
+constexpr unsigned long kNsfsMagic = 0x6e736673;
+constexpr unsigned long kPidfdMagic = 0x50494446;
+
+static_assert(sizeof(pid_t) <= sizeof(u64));
+
+static u64 hash_bytes(const std::string& bytes) {
+    u64 hash = 1469598103934665603ULL;
+    for (const unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void put16(std::vector<unsigned char>& out, u16 value) {
+    out.push_back(static_cast<unsigned char>(value));
+    out.push_back(static_cast<unsigned char>(value >> 8));
+}
+
+static void put32(std::vector<unsigned char>& out, u32 value) {
+    for (unsigned shift = 0; shift != 32; shift += 8)
+        out.push_back(static_cast<unsigned char>(value >> shift));
+}
+
+static void put64(std::vector<unsigned char>& out, u64 value) {
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        out.push_back(static_cast<unsigned char>(value >> shift));
+}
+
+static bool get16(const unsigned char* data, size_t size, size_t& at, u16& value) {
+    if (at > size || size - at < 2) return false;
+    value = static_cast<u16>(data[at]) | static_cast<u16>(data[at + 1] << 8);
+    at += 2;
+    return true;
+}
+
+static bool get32(const unsigned char* data, size_t size, size_t& at, u32& value) {
+    if (at > size || size - at < 4) return false;
+    value = static_cast<u32>(data[at]) | (static_cast<u32>(data[at + 1]) << 8) |
+            (static_cast<u32>(data[at + 2]) << 16) | (static_cast<u32>(data[at + 3]) << 24);
+    at += 4;
+    return true;
+}
+
+static bool get64(const unsigned char* data, size_t size, size_t& at, u64& value) {
+    if (at > size || size - at < 8) return false;
+    value = 0;
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        value |= static_cast<u64>(data[at++]) << shift;
+    return true;
+}
+
+static bool wait_fd(int fd, short events, std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        if (left <= 0) return false;
+        pollfd descriptor{fd, events, 0};
+        const int result = poll(&descriptor, 1, static_cast<int>(left));
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) return false;
+        return (descriptor.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
+    }
+}
+
+static bool read_fd(int fd, std::string& output, size_t limit) {
+    output.clear();
+    if (lseek(fd, 0, SEEK_SET) < 0) return false;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        const ssize_t count = read(fd, buffer.data(), buffer.size());
+        if (count > 0) {
+            if (output.size() > limit - static_cast<size_t>(count)) return false;
+            output.append(buffer.data(), static_cast<size_t>(count));
+            continue;
+        }
+        if (count == 0) return true;
+        if (errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool parse_proc_stat(const std::string& text, RoleManifest& manifest) {
+    const size_t comm_end = text.rfind(") ");
+    if (comm_end == std::string::npos) return false;
+    std::istringstream fields(text.substr(comm_end + 2));
+    char state = 0;
+    long ppid = 0;
+    long pgid = 0;
+    if (!(fields >> state >> ppid >> pgid)) return false;
+    manifest.ppid = static_cast<pid_t>(ppid);
+    manifest.pgid = static_cast<pid_t>(pgid);
+    for (int field = 6; field <= 22; ++field) {
+        if (field == 6) {
+            long sid = 0;
+            if (!(fields >> sid)) return false;
+            manifest.sid = static_cast<pid_t>(sid);
+        } else if (field == 22) {
+            unsigned long long start = 0;
+            if (!(fields >> start)) return false;
+            manifest.start = static_cast<u64>(start);
+        } else {
+            long long ignored = 0;
+            if (!(fields >> ignored)) return false;
+        }
+    }
+    return manifest.start != 0 && manifest.ppid > 0 && manifest.pgid > 0 && manifest.sid > 0;
+}
+
+static bool parse_status_ids(const std::string& text, uid_t& uid, gid_t& gid) {
+    bool got_uid = false;
+    bool got_gid = false;
+    std::istringstream lines(text);
+    std::string key;
+    while (lines >> key) {
+        unsigned long long effective = 0;
+        if (key == "Uid:") {
+            if (!(lines >> effective) || effective > std::numeric_limits<uid_t>::max())
+                return false;
+            uid = static_cast<uid_t>(effective);
+            got_uid = true;
+        } else if (key == "Gid:") {
+            if (!(lines >> effective) || effective > std::numeric_limits<gid_t>::max())
+                return false;
+            gid = static_cast<gid_t>(effective);
+            got_gid = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return got_uid && got_gid;
+}
+
+static bool open_cloexec(const std::string& path, int flags, int& fd) {
+    fd = open(path.c_str(), flags | O_CLOEXEC);
+    return fd >= 0;
+}
+
+static bool fd_cloexec(int fd) {
+    const int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+static bool fd_fs_magic(int fd, unsigned long expected) {
+    struct statfs filesystem{};
+    return fstatfs(fd, &filesystem) == 0 &&
+           static_cast<unsigned long>(filesystem.f_type) == expected;
+}
+
+static bool fd_fs_readable(int fd) {
+    struct statfs filesystem{};
+    return fstatfs(fd, &filesystem) == 0 && filesystem.f_type != 0;
+}
+
+static bool fd_link(int fd, std::string& path) {
+    std::array<char, PATH_MAX> buffer{};
+    const ssize_t length =
+        readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), buffer.data(), buffer.size() - 1);
+    if (length < 0) return false;
+    path.assign(buffer.data(), static_cast<size_t>(length));
+    return true;
+}
+
+static bool decode_manifest(const unsigned char* data,
+                            size_t size,
+                            size_t& at,
+                            RoleManifest& manifest) {
+    u64 values[14]{};
+    for (u64& value : values)
+        if (!get64(data, size, at, value)) return false;
+    if (values[0] != static_cast<u16>(Role::Launcher) && values[0] != static_cast<u16>(Role::Root))
+        return false;
+    manifest.role = static_cast<Role>(values[0]);
+    manifest.pid = static_cast<pid_t>(values[1]);
+    manifest.start = values[2];
+    manifest.ppid = static_cast<pid_t>(values[3]);
+    manifest.pgid = static_cast<pid_t>(values[4]);
+    manifest.sid = static_cast<pid_t>(values[5]);
+    manifest.uid = static_cast<uid_t>(values[6]);
+    manifest.gid = static_cast<gid_t>(values[7]);
+    manifest.netns = values[8];
+    manifest.exe_dev = values[9];
+    manifest.exe_ino = values[10];
+    manifest.argv_length = values[11];
+    manifest.argv_hash = values[12];
+    return values[13] == 0;
+}
+
+static void encode_manifest(std::vector<unsigned char>& output, const RoleManifest& manifest) {
+    put64(output, static_cast<u64>(manifest.role));
+    put64(output, static_cast<u64>(manifest.pid));
+    put64(output, manifest.start);
+    put64(output, static_cast<u64>(manifest.ppid));
+    put64(output, static_cast<u64>(manifest.pgid));
+    put64(output, static_cast<u64>(manifest.sid));
+    put64(output, static_cast<u64>(manifest.uid));
+    put64(output, static_cast<u64>(manifest.gid));
+    put64(output, manifest.netns);
+    put64(output, manifest.exe_dev);
+    put64(output, manifest.exe_ino);
+    put64(output, manifest.argv_length);
+    put64(output, manifest.argv_hash);
+    put64(output, 0);
+}
+
+static bool parse_wire(const unsigned char* data, size_t size, IdentityBundle& bundle) {
+    if (size != kWireBytes) return false;
+    size_t at = 0;
+    u32 magic = 0;
+    u16 version = 0;
+    u16 roles = 0;
+    u16 fds = 0;
+    u16 reserved = 0;
+    u32 payload = 0;
+    if (!get32(data, size, at, magic) || !get16(data, size, at, version) ||
+        !get16(data, size, at, roles) || !get16(data, size, at, fds) ||
+        !get16(data, size, at, reserved) || !get32(data, size, at, payload) || magic != kMagic ||
+        version != kVersion || roles != kRoleCount || fds != kBundleFdCount || reserved != 0 ||
+        payload != kPayloadBytes)
+        return false;
+    for (RoleBundle& role : bundle.roles)
+        if (!decode_manifest(data, size, at, role.manifest)) return false;
+    return at == size;
+}
+
+static bool validate_role(const RoleBundle& role, std::string& error) {
+    const RoleManifest& m = role.manifest;
+    const auto invalid = [&](const char* reason) {
+        error = reason;
+        return false;
+    };
+    if (m.pid <= 1 || m.start == 0 || m.ppid <= 0 || m.pgid <= 0 || m.sid <= 0 || m.netns == 0 ||
+        m.exe_dev == 0 || m.exe_ino == 0 || m.argv_length == 0)
+        return invalid("manifest scalar invalid");
+    for (int fd : role.fds)
+        if (fd < 0 || !fd_cloexec(fd)) return invalid("fd cloexec invalid");
+    for (size_t i = 0; i != role.fds.size(); ++i)
+        for (size_t j = i + 1; j != role.fds.size(); ++j)
+            if (role.fds[i] == role.fds[j]) return invalid("duplicate fd");
+
+    const std::string prefix = "/proc/" + std::to_string(m.pid) + "/";
+    const char* names[] = {"stat", "status", "cmdline"};
+    for (size_t i = 0; i != 3; ++i) {
+        std::string link;
+        if (!fd_link(role.fds[i], link) || link != prefix + names[i] ||
+            !fd_fs_magic(role.fds[i], kProcMagic))
+            return invalid("proc fd type/path invalid");
+    }
+    if (!fd_fs_readable(role.fds[static_cast<size_t>(FdSlot::Executable)]) ||
+        !fd_fs_magic(role.fds[static_cast<size_t>(FdSlot::Netns)], kNsfsMagic) ||
+        !fd_fs_magic(role.fds[static_cast<size_t>(FdSlot::Pidfd)], kPidfdMagic))
+        return invalid("fd filesystem type invalid");
+
+    struct stat executable{};
+    if (fstat(role.fds[static_cast<size_t>(FdSlot::Executable)], &executable) != 0 ||
+        static_cast<u64>(executable.st_dev) != m.exe_dev ||
+        static_cast<u64>(executable.st_ino) != m.exe_ino || !S_ISREG(executable.st_mode))
+        return invalid("executable stat invalid");
+    std::string netns_link;
+    if (!fd_link(role.fds[static_cast<size_t>(FdSlot::Netns)], netns_link) ||
+        netns_link != "net:[" + std::to_string(m.netns) + "]")
+        return invalid("netns link invalid");
+    std::string stat_text;
+    RoleManifest observed = m;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Stat)], stat_text, 8192) ||
+        !parse_proc_stat(stat_text, observed))
+        return invalid("stat content invalid");
+    if (observed.start != m.start || observed.ppid != m.ppid || observed.pgid != m.pgid ||
+        observed.sid != m.sid)
+        return invalid("stat manifest mismatch");
+    std::string status_text;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Status)], status_text, 16384) ||
+        !parse_status_ids(status_text, uid, gid) || uid != m.uid || gid != m.gid)
+        return invalid("status content invalid");
+    std::string cmdline;
+    if (!read_fd(role.fds[static_cast<size_t>(FdSlot::Cmdline)], cmdline, 8192) ||
+        cmdline.size() != m.argv_length || hash_bytes(cmdline) != m.argv_hash)
+        return invalid("cmdline content invalid");
+    (void)error;
+    return true;
+}
+
+static bool send_bytes(int fd,
+                       const unsigned char* data,
+                       size_t size,
+                       std::chrono::steady_clock::time_point deadline) {
+    size_t offset = 0;
+    while (offset != size) {
+        if (!wait_fd(fd, POLLOUT, deadline)) return false;
+        const ssize_t count = send(fd, data + offset, size - offset, MSG_NOSIGNAL);
+        if (count > 0)
+            offset += static_cast<size_t>(count);
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else
+            return false;
+    }
+    return true;
+}
+
+static bool parse_rights(struct msghdr& message, std::array<int, kBundleFdCount>& fds) {
+    size_t count = 0;
+    bool found = false;
+    for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || found ||
+            header->cmsg_len > message.msg_controllen ||
+            header->cmsg_len != CMSG_LEN(kBundleFdCount * sizeof(int)))
+            return false;
+        found = true;
+        const size_t bytes = header->cmsg_len - CMSG_LEN(0);
+        if (bytes != kBundleFdCount * sizeof(int)) return false;
+        const int* values = reinterpret_cast<const int*>(CMSG_DATA(header));
+        for (size_t i = 0; i != kBundleFdCount; ++i) {
+            if (values[i] < 0) return false;
+            fds[count++] = values[i];
+        }
+    }
+    if (!found || count != kBundleFdCount) return false;
+    for (size_t i = 0; i != count; ++i)
+        for (size_t j = i + 1; j != count; ++j)
+            if (fds[i] == fds[j]) return false;
+    return true;
+}
+
+static void close_rights_in_message(const struct msghdr& message) {
+    for (cmsghdr* header = CMSG_FIRSTHDR(const_cast<struct msghdr*>(&message)); header != nullptr;
+         header = CMSG_NXTHDR(const_cast<struct msghdr*>(&message), header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len < CMSG_LEN(0) || header->cmsg_len > message.msg_controllen)
+            continue;
+        const size_t bytes = header->cmsg_len - CMSG_LEN(0);
+        if (bytes > (kBundleFdCount + 1) * sizeof(int)) continue;
+        const int* values = reinterpret_cast<const int*>(CMSG_DATA(header));
+        for (size_t i = 0; i != bytes / sizeof(int); ++i)
+            if (values[i] >= 0) close(values[i]);
+    }
+}
+
+static void close_fds(std::array<int, kBundleFdCount>& fds) {
+    for (int& fd : fds) {
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+}
+
+}  // namespace
+
+RoleBundle::RoleBundle() {
+    fds.fill(-1);
+}
+
+RoleBundle::~RoleBundle() {
+    close();
+}
+
+RoleBundle::RoleBundle(RoleBundle&& other) noexcept : manifest(other.manifest), fds(other.fds) {
+    other.fds.fill(-1);
+}
+
+RoleBundle& RoleBundle::operator=(RoleBundle&& other) noexcept {
+    if (this == &other) return *this;
+    close();
+    manifest = other.manifest;
+    fds = other.fds;
+    other.fds.fill(-1);
+    return *this;
+}
+
+void RoleBundle::close() {
+    for (int& fd : fds) {
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+    }
+}
+
+void IdentityBundle::close() {
+    for (RoleBundle& role : roles) role.close();
+}
+
+bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error) {
+    role_bundle.close();
+    role_bundle.manifest = RoleManifest{};
+    role_bundle.manifest.role = role;
+    role_bundle.manifest.pid = pid;
+    if (pid <= 1) {
+        error = "identity bundle pid was unsafe";
+        return false;
+    }
+    const std::string prefix = "/proc/" + std::to_string(pid);
+    if (!open_cloexec(prefix + "/stat", O_RDONLY, role_bundle.fds[0]) ||
+        !open_cloexec(prefix + "/status", O_RDONLY, role_bundle.fds[1]) ||
+        !open_cloexec(prefix + "/cmdline", O_RDONLY, role_bundle.fds[2]) ||
+        !open_cloexec(prefix + "/exe", O_PATH, role_bundle.fds[3]) ||
+        !open_cloexec(prefix + "/ns/net", O_PATH, role_bundle.fds[4])) {
+        role_bundle.close();
+        error = "identity bundle proc fd open failed";
+        return false;
+    }
+#ifdef SYS_pidfd_open
+    role_bundle.fds[5] = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+    if (role_bundle.fds[5] < 0) {
+        role_bundle.close();
+        error = "identity bundle pidfd open failed";
+        return false;
+    }
+#else
+    role_bundle.close();
+    error = "identity bundle pidfd is unavailable";
+    return false;
+#endif
+    std::string stat_text;
+    std::string status_text;
+    std::string cmdline;
+    if (!read_fd(role_bundle.fds[0], stat_text, 8192) ||
+        !parse_proc_stat(stat_text, role_bundle.manifest) ||
+        !read_fd(role_bundle.fds[1], status_text, 16384) ||
+        !parse_status_ids(status_text, role_bundle.manifest.uid, role_bundle.manifest.gid) ||
+        !read_fd(role_bundle.fds[2], cmdline, 8192)) {
+        role_bundle.close();
+        error = "identity bundle proc manifest parse failed";
+        return false;
+    }
+    struct stat executable{};
+    struct stat netns{};
+    if (fstat(role_bundle.fds[3], &executable) != 0 || fstat(role_bundle.fds[4], &netns) != 0) {
+        role_bundle.close();
+        error = "identity bundle executable/netns stat failed";
+        return false;
+    }
+    role_bundle.manifest.netns = static_cast<u64>(netns.st_ino);
+    role_bundle.manifest.exe_dev = static_cast<u64>(executable.st_dev);
+    role_bundle.manifest.exe_ino = static_cast<u64>(executable.st_ino);
+    role_bundle.manifest.argv_length = cmdline.size();
+    role_bundle.manifest.argv_hash = hash_bytes(cmdline);
+    if (!validate_role(role_bundle, error)) {
+        role_bundle.close();
+        return false;
+    }
+    return true;
+}
+
+std::vector<unsigned char> encode_bundle(const IdentityBundle& bundle) {
+    std::vector<unsigned char> output;
+    output.reserve(kWireBytes);
+    put32(output, kMagic);
+    put16(output, kVersion);
+    put16(output, kRoleCount);
+    put16(output, kBundleFdCount);
+    put16(output, 0);
+    put32(output, kPayloadBytes);
+    for (const RoleBundle& role : bundle.roles) encode_manifest(output, role.manifest);
+    return output;
+}
+
+bool validate_bundle(const IdentityBundle& bundle, std::string& error) {
+    if (bundle.roles[0].manifest.role != Role::Launcher ||
+        bundle.roles[1].manifest.role != Role::Root ||
+        bundle.roles[0].manifest.pid == bundle.roles[1].manifest.pid) {
+        error = "identity bundle role or pid relation was invalid";
+        return false;
+    }
+    return validate_role(bundle.roles[0], error) && validate_role(bundle.roles[1], error);
+}
+
+bool send_bundle(int fd,
+                 const IdentityBundle& bundle,
+                 std::chrono::steady_clock::time_point deadline) {
+    std::string error;
+    if (fd < 0 || !validate_bundle(bundle, error)) return false;
+    const std::vector<unsigned char> wire = encode_bundle(bundle);
+    std::array<int, kBundleFdCount> fds{};
+    size_t at = 0;
+    for (const RoleBundle& role : bundle.roles)
+        for (int value : role.fds) fds[at++] = value;
+    std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
+    iovec vector{const_cast<unsigned char*>(wire.data()), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(kBundleFdCount * sizeof(int));
+    memcpy(CMSG_DATA(header), fds.data(), kBundleFdCount * sizeof(int));
+    if (!wait_fd(fd, POLLOUT, deadline)) return false;
+    ssize_t sent;
+    do {
+        sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent <= 0) return false;
+    return static_cast<size_t>(sent) == wire.size() ||
+           send_bytes(fd, wire.data() + sent, wire.size() - static_cast<size_t>(sent), deadline);
+}
+
+bool receive_bundle(int fd,
+                    ReceivedBundle& received,
+                    std::chrono::steady_clock::time_point deadline,
+                    std::string& error) {
+    received.reset();
+    if (fd < 0 || !wait_fd(fd, POLLIN, deadline)) {
+        error = "identity bundle receive deadline/descriptor failure";
+        return false;
+    }
+    std::array<unsigned char, kWireBytes> wire{};
+    std::array<unsigned char, CMSG_SPACE(kBundleFdCount * sizeof(int))> control{};
+    iovec vector{wire.data(), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    ssize_t count;
+    do {
+        count = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+    } while (count < 0 && errno == EINTR);
+    if (count <= 0 || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+        close_rights_in_message(message);
+        error = "identity bundle initial frame was truncated or EOF";
+        return false;
+    }
+    std::array<int, kBundleFdCount> fds{};
+    fds.fill(-1);
+    if (!parse_rights(message, fds)) {
+        close_rights_in_message(message);
+        close_fds(fds);
+        error = "identity bundle ancillary rights were not exactly 12 SCM_RIGHTS";
+        return false;
+    }
+    size_t done = static_cast<size_t>(count);
+    while (done != wire.size()) {
+        if (!wait_fd(fd, POLLIN, deadline)) {
+            close_fds(fds);
+            error = "identity bundle frame was truncated before payload completion";
+            return false;
+        }
+        std::array<unsigned char, CMSG_SPACE(sizeof(int))> extra_control{};
+        iovec rest{wire.data() + done, wire.size() - done};
+        msghdr rest_message{};
+        rest_message.msg_iov = &rest;
+        rest_message.msg_iovlen = 1;
+        rest_message.msg_control = extra_control.data();
+        rest_message.msg_controllen = extra_control.size();
+        do {
+            count = recvmsg(fd, &rest_message, MSG_CMSG_CLOEXEC);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0 || (rest_message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
+            CMSG_FIRSTHDR(&rest_message) != nullptr) {
+            close_fds(fds);
+            error = "identity bundle payload read had EOF/truncation/ancillary data";
+            return false;
+        }
+        done += static_cast<size_t>(count);
+    }
+    // A bundle is one complete transport record.  A queued byte or ancillary
+    // record after it is never silently ignored (the caller may still use the
+    // socket in the opposite direction for its ACK).
+    pollfd trailing{fd, POLLIN, 0};
+    if (poll(&trailing, 1, 0) < 0 && errno != EINTR) {
+        close_fds(fds);
+        error = "identity bundle trailing-data poll failed";
+        return false;
+    }
+    if ((trailing.revents & POLLIN) != 0) {
+        unsigned char byte = 0;
+        std::array<unsigned char, CMSG_SPACE(sizeof(int))> trailing_control{};
+        iovec trailing_vector{&byte, sizeof(byte)};
+        msghdr trailing_message{};
+        trailing_message.msg_iov = &trailing_vector;
+        trailing_message.msg_iovlen = 1;
+        trailing_message.msg_control = trailing_control.data();
+        trailing_message.msg_controllen = trailing_control.size();
+        const ssize_t trailing_count =
+            recvmsg(fd, &trailing_message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        if (trailing_count > 0 || CMSG_FIRSTHDR(&trailing_message) != nullptr) {
+            close_rights_in_message(trailing_message);
+            close_fds(fds);
+            error = "identity bundle had trailing data or ancillary records";
+            return false;
+        }
+        if (trailing_count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            close_fds(fds);
+            error = "identity bundle trailing-data receive failed";
+            return false;
+        }
+    }
+    IdentityBundle decoded;
+    if (!parse_wire(wire.data(), wire.size(), decoded)) {
+        close_fds(fds);
+        error = "identity bundle manifest header/payload was invalid";
+        return false;
+    }
+    size_t at = 0;
+    for (RoleBundle& role : decoded.roles)
+        for (int& value : role.fds) value = fds[at++];
+    if (!validate_bundle(decoded, error)) {
+        decoded.close();
+        return false;
+    }
+    received.bundle() = std::move(decoded);
+    return true;
+}
+
+}  // namespace rut::test::fixture_identity_bundle
