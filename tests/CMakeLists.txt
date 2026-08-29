@@ -8,7 +8,11 @@ set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 
 # Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
 # has no Docker/network label and runs in ordinary CI on an unprivileged host.
+add_library(fixture_worker_protocol STATIC fixture_worker_protocol.cc)
+target_include_directories(fixture_worker_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_executable(test_fixture_worker_protocol test_fixture_worker_protocol.cc)
+target_link_libraries(test_fixture_worker_protocol PRIVATE fixture_worker_protocol)
 add_test(NAME test_fixture_worker_protocol COMMAND test_fixture_worker_protocol)
 set_tests_properties(test_fixture_worker_protocol PROPERTIES
     LABELS "unit"
