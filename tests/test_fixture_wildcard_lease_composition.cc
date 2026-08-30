@@ -41,10 +41,21 @@ bool check(bool condition, const char* message) {
     return condition;
 }
 
-bool same_live_fd_object(int fd, const struct stat& expected) {
-    struct stat current{};
-    return fstat(fd, &current) == 0 && current.st_dev == expected.st_dev &&
-           current.st_ino == expected.st_ino && current.st_mode == expected.st_mode;
+// The authority is test-owned observation only. It is never installed as a
+// capture/fixture owner and is closed explicitly after the exact-OFD proof.
+bool same_exact_ofd_with_cloexec(int slot, int authority) {
+    const int slot_flags = fcntl(slot, F_GETFD);
+    const int authority_flags = fcntl(authority, F_GETFD);
+    if (slot_flags < 0 || authority_flags < 0 || (slot_flags & FD_CLOEXEC) == 0 ||
+        (authority_flags & FD_CLOEXEC) == 0)
+        return false;
+#ifdef SYS_kcmp
+    errno = 0;
+    return syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, slot, authority) == 0;
+#else
+    errno = ENOSYS;
+    return false;
+#endif
 }
 
 bool fd_snapshot(std::vector<int>& descriptors) {
@@ -444,15 +455,14 @@ bool sparse_high_descriptor_closure() {
         return false;
     const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
     const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 512) : -1;
-    struct stat high_identity{};
-    const bool high_identity_known = high >= 0 && fstat(high, &high_identity) == 0;
+    const int high_authority = high >= 0 ? fcntl(high, F_DUPFD_CLOEXEC, 0) : -1;
     if (low >= 0) close(low);
     capture::AnonymousLogCapture output;
     capture::Diagnostic capture_diagnostic;
     child::PausedChildLease lease;
     child::Diagnostic diagnostic;
     bool ok =
-        check(high >= 512, "sparse high fd creation") &&
+        check(high >= 512 && high_authority >= 0, "sparse high fd creation") &&
         check(capture::AnonymousLogCapture::create(4096, output, capture_diagnostic),
               "sparse capture") &&
         check(child::PausedChildLease::create_prepared(
@@ -466,9 +476,10 @@ bool sparse_high_descriptor_closure() {
         check(lease.validate_prepared(deadline(), diagnostic), "sparse validation") &&
         check(lease.release(deadline(), diagnostic), "sparse release") &&
         check(settle_capture(output), "sparse capture settlement") &&
-        check(high_identity_known && same_live_fd_object(high, high_identity),
+        check(same_exact_ofd_with_cloexec(high, high_authority),
               "sparse foreign parent fd changed");
     if (high >= 0) close(high);
+    if (high_authority >= 0) close(high_authority);
     std::vector<int> final_fds;
     std::vector<pid_t> final_children;
     const bool fd_read = fd_snapshot(final_fds);
@@ -486,9 +497,9 @@ bool retained_high_descriptor_rejected() {
         return false;
     const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
     const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 640) : -1;
+    const int high_authority = high >= 0 ? fcntl(high, F_DUPFD_CLOEXEC, 0) : -1;
     if (low >= 0) close(low);
-    struct stat high_identity{};
-    const bool high_identity_known = high >= 640 && fstat(high, &high_identity) == 0;
+    const bool foreign_ready = high >= 640 && high_authority >= 0;
     capture::AnonymousLogCapture output;
     capture::Diagnostic capture_diagnostic;
     child::PausedChildLease lease;
@@ -497,10 +508,10 @@ bool retained_high_descriptor_rejected() {
     hooks.child_retain_fd_for_testing = high;
     const bool capture_created =
         capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
-    bool ok = check(high_identity_known, "retain high fd creation") &&
-              check(capture_created, "retain capture");
+    bool ok =
+        check(foreign_ready, "retain high fd creation") && check(capture_created, "retain capture");
     bool rejected = false;
-    if (high_identity_known && capture_created)
+    if (foreign_ready && capture_created)
         rejected = !child::PausedChildLease::create_prepared_with_hooks_for_testing(
             deadline(), {output.descriptor()}, hooks, lease, diagnostic);
     ok = check(rejected, "retained child fd set accepted") && ok;
@@ -513,12 +524,14 @@ bool retained_high_descriptor_rejected() {
     const bool child_inactive =
         !lease.active() && children_read && after_children == baseline_children;
     ok = check(child_inactive, "retained child residue") && ok;
-    ok = check(same_live_fd_object(high, high_identity), "retained parent fd changed") && ok;
+    ok = check(same_exact_ofd_with_cloexec(high, high_authority), "retained parent fd changed") &&
+         ok;
     if (capture_created && child_inactive)
         ok = check(settle_capture(output), "retain capture settlement") && ok;
     else if (capture_created)
         ok = check(false, "retain capture settlement withheld") && ok;
     if (high >= 0) close(high);
+    if (high_authority >= 0) close(high_authority);
     std::vector<int> final_fds;
     std::vector<pid_t> final_children;
     const bool fd_read = fd_snapshot(final_fds);
@@ -799,9 +812,9 @@ bool child_close_failure_and_independent_settlement() {
     capture::Diagnostic capture_diagnostic;
     const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
     const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 700) : -1;
+    const int high_authority = high >= 0 ? fcntl(high, F_DUPFD_CLOEXEC, 0) : -1;
     if (low >= 0) close(low);
-    struct stat high_identity{};
-    const bool high_identity_known = high >= 700 && fstat(high, &high_identity) == 0;
+    const bool foreign_ready = high >= 700 && high_authority >= 0;
     void* const evidence_mapping =
         mmap(nullptr, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     volatile int* const close_attempt_evidence =
@@ -812,7 +825,7 @@ bool child_close_failure_and_independent_settlement() {
     hooks.child_close_attempt_evidence = close_attempt_evidence;
     child::PausedChildLease lease;
     child::Diagnostic diagnostic;
-    bool ok = check(high_identity_known, "close failure high fd") &&
+    bool ok = check(foreign_ready, "close failure high fd") &&
               check(close_attempt_evidence != nullptr, "close failure evidence mapping");
     const bool source_created = create_source(directory, source_lease, source_diagnostic);
     ok = check(source_created, "close failure source") && ok;
@@ -820,8 +833,7 @@ bool child_close_failure_and_independent_settlement() {
         capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
     ok = check(capture_created, "close failure capture") && ok;
     bool child_rejected = false;
-    if (source_created && capture_created && high_identity_known &&
-        close_attempt_evidence != nullptr)
+    if (source_created && capture_created && foreign_ready && close_attempt_evidence != nullptr)
         child_rejected = !child::PausedChildLease::create_prepared_with_hooks_for_testing(
             deadline(), {output.descriptor()}, hooks, lease, diagnostic);
     ok = check(child_rejected, "child close EINTR accepted") && ok;
@@ -844,10 +856,11 @@ bool child_close_failure_and_independent_settlement() {
     else if (capture_created)
         ok = check(false, "failed child capture settlement withheld") && ok;
     if (source_removed) ok = check(directory.settle(), "failed child directory settlement") && ok;
-    ok = check(high_identity_known && same_live_fd_object(high, high_identity),
+    ok = check(foreign_ready && same_exact_ofd_with_cloexec(high, high_authority),
                "close failure changed foreign parent fd") &&
          ok;
     if (high >= 0) close(high);
+    if (high_authority >= 0) close(high_authority);
     if (evidence_mapping != MAP_FAILED)
         ok = check(munmap(evidence_mapping, sizeof(int)) == 0, "close evidence unmap") && ok;
     std::vector<int> final_fds;

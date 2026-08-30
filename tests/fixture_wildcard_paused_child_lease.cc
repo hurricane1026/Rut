@@ -374,7 +374,7 @@ void child_main(int ready_fd,
                 continue;
             if (fd == injected_close_failure_fd) {
                 const int close_result = close(fd);  // Exactly one real attempt.
-                if (close_attempt_evidence != nullptr)
+                if (prepared && close_attempt_evidence != nullptr)
                     *close_attempt_evidence =
                         close_result == 0 ? static_cast<int>(*close_attempt_evidence + 1) : -1;
                 errno = EINTR;
@@ -398,7 +398,7 @@ void child_main(int ready_fd,
         }
     }
     unsigned char ready = kReady;
-    if (close_attempt_evidence != nullptr) *close_attempt_evidence = 100;
+    if (prepared && close_attempt_evidence != nullptr) *close_attempt_evidence = 100;
     for (;;) {
         const ssize_t result = write(ready_fd, &ready, 1);
         if (result == 1) break;
