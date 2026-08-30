@@ -4262,7 +4262,9 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                 return finish_post_ack_escrow(
                     target, control, token, custody, rights, true, true, target_status);
             bool first_pending_check = true;
-            while (first_pending_check || std::chrono::steady_clock::now() < deadline) {
+            const auto pending_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+            while (first_pending_check || std::chrono::steady_clock::now() < pending_deadline) {
                 pollfd pending{custody_fd, POLLIN | POLLHUP, 0};
                 int pending_result;
                 const int timeout = first_pending_check ? 0 : 10;
@@ -4273,7 +4275,10 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                 if (pending_result < 0 || (pending.revents & POLLNVAL) != 0 ||
                     ((pending.revents & POLLERR) != 0 && (pending.revents & POLLHUP) == 0))
                     hold_listener_failure(root_lease, custody_fd);
-                if (pending_result == 0) continue;
+                if (pending_result == 0) {
+                    if (timeout == 0) return OwnedWaitResult::Exited;
+                    continue;
+                }
                 const ExactPostReapCustodyAction action = exact_post_reap_custody_action(
                     peek_exact_custody(custody_fd, (pending.revents & POLLHUP) != 0));
                 if (action == ExactPostReapCustodyAction::Receive) {
