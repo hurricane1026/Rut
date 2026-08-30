@@ -81,6 +81,17 @@ target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privilege
 add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
 set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# Pure #377 immutable wildcard-attempt source identity lease. This focused
+# self-check uses only private temporary files and starts no process or socket.
+add_library(fixture_wildcard_source_lease STATIC fixture_wildcard_source_lease.cc)
+target_include_directories(fixture_wildcard_source_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_wildcard_source_lease PUBLIC fixture_privileged_listener)
+
+add_executable(test_fixture_wildcard_source_lease test_fixture_wildcard_source_lease.cc)
+target_link_libraries(test_fixture_wildcard_source_lease PRIVATE fixture_wildcard_source_lease)
+add_test(NAME test_fixture_wildcard_source_lease COMMAND test_fixture_wildcard_source_lease)
+set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit" TIMEOUT 30)
+
 if(RUT_ENABLE_JIT)
     add_executable(test_fixture_privileged_listener_loader
         test_fixture_privileged_listener_loader.cc)
