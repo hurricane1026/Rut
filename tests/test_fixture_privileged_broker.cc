@@ -182,6 +182,35 @@ static bool listener_failure_integration(const char* scenario) {
     return strcmp(scenario, "listener-cleanup-observation-failure") == 0;
 }
 
+static_assert(kListenerDeadlineMs <= std::numeric_limits<int>::max() / 4);
+constexpr int kListenerFailureLauncherWaitMs = kListenerDeadlineMs * 4;
+constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
+
+static int launcher_broker_wait_ms(const char* scenario) {
+    return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
+                                                  : kBrokerDeadlineMs;
+}
+
+static int cleanup_response_wait_ms(const char* scenario) {
+    return listener_failure_integration(scenario) ? kListenerFailureFrame45WaitMs
+                                                  : kListenerDeadlineMs;
+}
+
+static bool listener_failure_bound_self_check(std::string& error) {
+    if (launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
+            kListenerDeadlineMs * 4 ||
+        cleanup_response_wait_ms("listener-cleanup-observation-failure") !=
+            kListenerDeadlineMs * 2 ||
+        launcher_broker_wait_ms("listener-guard-reservation") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("normal") != kListenerDeadlineMs) {
+        error = "listener failure extended deadline selection failed";
+        return false;
+    }
+    return true;
+}
+
 static bool exact_request(const Frame& request, u16 expected_type, const Token& token) {
     return request.type == expected_type && token_equal(request.token, token) &&
            request.payload.empty();
@@ -5233,7 +5262,7 @@ static int launcher_main(const char* executable,
                                  static_cast<ino_t>(expected_netns_value),
                                  getpgrp(),
                                  false,
-                                 kBrokerDeadlineMs,
+                                 launcher_broker_wait_ms(scenario),
                                  status);
     if (broker_wait_result != OwnedWaitResult::Exited) {
         const OwnedReapResult broker_reap = reap_owned_child_bounded(broker);
@@ -9622,7 +9651,8 @@ static bool run_session(const std::string& sudo_path,
             if (!send_frame(target_fd,
                             Frame{kExactRutCleanup, token, exact_cleanup_payload()},
                             kHandshakeMs) ||
-                !receive_frame(target_fd, exact_cleaned_frame, kListenerDeadlineMs)) {
+                !receive_frame(
+                    target_fd, exact_cleaned_frame, cleanup_response_wait_ms(scenario))) {
                 error = "exact public-RUT cleanup transport failed";
                 break;
             }
@@ -10097,10 +10127,10 @@ int main(int argc, char** argv) {
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
     if (!open_canonical_caller_executable(argv[1], rut_executable, error) ||
         !pure_protocol_self_checks(error) || !launch_argv_refactor_self_check(error) ||
-        !exact_liveness_self_check(error) || !endpoint_replacement_self_check(error) ||
-        !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
-        !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
-        !prelaunch_close_first_self_check(error) ||
+        !listener_failure_bound_self_check(error) || !exact_liveness_self_check(error) ||
+        !endpoint_replacement_self_check(error) || !bounded_wait_and_signal_self_check(error) ||
+        !group_lease_self_check(error) || !lease_loss_owner_cascade_self_check(error) ||
+        !launcher_error_order_self_check(error) || !prelaunch_close_first_self_check(error) ||
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error) ||
         !ancestry_probe_validation_self_check(error) ||
         !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error) ||
