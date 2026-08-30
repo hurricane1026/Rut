@@ -78,6 +78,8 @@ constexpr u16 kDroppedIdentityRequest = 29;
 constexpr u16 kAncestryProbeHello = 30;
 constexpr u16 kAncestryProbeRequest = 31;
 constexpr u16 kAncestryProbeRelease = 32;
+constexpr u16 kInitialAncestryRequest = 33;
+constexpr u16 kFinalAncestryRequest = 34;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kCredentialFd = 198;
 constexpr int kLauncherBundleFdBase = 220;
@@ -144,6 +146,20 @@ enum class ExactLiveness { Live, ExitedOrReused, Unknown };
 static ExactLiveness observe_exact_liveness(const ProcIdentity& expected);
 static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
+
+static bool exact_request(const Frame& request, u16 expected_type, const Token& token) {
+    return request.type == expected_type && token_equal(request.token, token) &&
+           request.payload.empty();
+}
+
+static bool receive_exact_request_until(int fd,
+                                        u16 expected_type,
+                                        const Token& token,
+                                        std::chrono::steady_clock::time_point deadline) {
+    Frame request;
+    return receive_frame_until(fd, request, deadline) &&
+           exact_request(request, expected_type, token);
+}
 
 static bool validate_dropped_identity_binding(
     const identity_bundle::DroppedIdentityEvidence& evidence,
@@ -1547,23 +1563,67 @@ static int root_broker_main(const char* executable,
         close(root_control);
         return 0;
     }
+    const auto authorization_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kBrokerDeadlineMs);
     Report root_report;
     if (!fill_report("broker-root", static_cast<u64>(launcher), root_report, false) ||
-        !send_frame(
-            root_control, Frame{kBrokerRootHello, token, encode_report(root_report)}, kHandshakeMs))
+        !send_frame(root_control,
+                    Frame{kBrokerRootHello, token, encode_report(root_report)},
+                    remaining_deadline_ms(authorization_deadline)))
         return 24;
     Frame bundle_request;
-    if (!receive_frame(root_control, bundle_request, kHandshakeMs) ||
+    if (!receive_frame_until(root_control, bundle_request, authorization_deadline) ||
         bundle_request.type != kIdentityBundleRequest ||
         !token_equal(bundle_request.token, token) || !bundle_request.payload.empty() ||
-        !identity_bundle::send_bundle(
-            root_control,
-            bundle,
-            std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(identity_bundle::kTransportTimeoutMs)))
+        !identity_bundle::send_bundle(root_control, bundle, authorization_deadline))
         return 24;
+    Peer ordinary_parent;
+    if (!get_peer(root_control, ordinary_parent) || ordinary_parent.pid <= 1 ||
+        ordinary_parent.uid == 0 || ordinary_parent.gid == 0 || ordinary_parent.pid == launcher ||
+        !receive_exact_request_until(
+            root_control, kInitialAncestryRequest, token, authorization_deadline))
+        return 24;
+    ancestry_bundle::AncestryBundle initial_ancestry;
+    std::string ancestry_diagnostic;
+    if (!collect_probe_ancestry(bundle.roles[0].manifest.ppid,
+                                ordinary_parent.pid,
+                                initial_ancestry,
+                                authorization_deadline,
+                                ancestry_diagnostic) ||
+        !ancestry_bundle::send_bundle(root_control, initial_ancestry, authorization_deadline)) {
+        initial_ancestry.close();
+        return 24;
+    }
+    initial_ancestry.close();
+    if (!receive_exact_request_until(
+            root_control, kFinalAncestryRequest, token, authorization_deadline))
+        return 24;
+    identity_bundle::ProcessIdentityEvidence launcher_evidence;
+    identity_bundle::ProcessIdentityEvidence root_evidence;
+    Peer final_parent;
+    if (!identity_bundle::extract_process_identity_evidence(
+            bundle.roles[0], identity_bundle::Role::Launcher, launcher_evidence, identity_error) ||
+        !identity_bundle::extract_process_identity_evidence(
+            bundle.roles[1], identity_bundle::Role::Root, root_evidence, identity_error) ||
+        launcher_evidence.identity.pid != launcher || root_evidence.identity.pid != getpid() ||
+        root_evidence.identity.ppid != launcher_evidence.identity.pid ||
+        launcher_evidence.identity.ppid != bundle.roles[0].manifest.ppid ||
+        !get_peer(root_control, final_parent) || final_parent.pid != ordinary_parent.pid ||
+        final_parent.uid != ordinary_parent.uid || final_parent.gid != ordinary_parent.gid)
+        return 24;
+    ancestry_bundle::AncestryBundle final_ancestry;
+    if (!collect_probe_ancestry(bundle.roles[0].manifest.ppid,
+                                ordinary_parent.pid,
+                                final_ancestry,
+                                authorization_deadline,
+                                ancestry_diagnostic) ||
+        !ancestry_bundle::send_bundle(root_control, final_ancestry, authorization_deadline)) {
+        final_ancestry.close();
+        return 24;
+    }
+    final_ancestry.close();
     Frame bundle_ack;
-    if (!receive_frame(root_control, bundle_ack, kHandshakeMs) ||
+    if (!receive_frame_until(root_control, bundle_ack, authorization_deadline) ||
         bundle_ack.type != kIdentityBundleAck || !token_equal(bundle_ack.token, token) ||
         !bundle_ack.payload.empty())
         return 24;
@@ -2755,9 +2815,11 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
                              Report& report,
                              Token& frame_token,
                              identity_bundle::ReceivedBundle& received_bundle,
+                             ancestry_bundle::AncestryBundle& initial_ancestry,
                              std::string& error) {
     root_fd = -1;
     received_bundle.reset();
+    initial_ancestry.close();
     std::string last_observation = "no direct /proc observation";
     for (;;) {
         const int remaining = remaining_deadline_ms(deadline);
@@ -2809,9 +2871,15 @@ static bool await_root_hello(const ParentEndpoint& endpoint,
             return false;
         }
         frame_token = frame.token;
-        if (!send_frame(root_fd, Frame{kIdentityBundleRequest, token, {}}, remaining) ||
-            !identity_bundle::receive_bundle(root_fd, received_bundle, deadline, error)) {
-            if (error.empty()) error = "root identity bundle request/receive failed";
+        if (!send_frame(root_fd,
+                        Frame{kIdentityBundleRequest, token, {}},
+                        remaining_deadline_ms(deadline)) ||
+            !identity_bundle::receive_bundle(root_fd, received_bundle, deadline, error) ||
+            !send_frame(root_fd,
+                        Frame{kInitialAncestryRequest, token, {}},
+                        remaining_deadline_ms(deadline)) ||
+            !ancestry_bundle::receive_bundle(root_fd, initial_ancestry, deadline, error)) {
+            if (error.empty()) error = "root IDB1/initial ANC1 request/receive failed";
             return false;
         }
         return true;
@@ -4374,6 +4442,227 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
     return true;
 }
 
+struct AuthorizationSnapshot {
+    identity_bundle::ProcessIdentityEvidence launcher;
+    identity_bundle::ProcessIdentityEvidence root;
+    identity_bundle::ProcessIdentityEvidence anchor;
+    RetainedAnchorEvidence retained_anchor;
+};
+
+static bool live_evidence_state(char state) {
+    return state != '\0' && state != 'Z' && state != 'X';
+}
+
+static bool same_manifest(const identity_bundle::RoleManifest& first,
+                          const identity_bundle::RoleManifest& second) {
+    return first.role == second.role && first.pid == second.pid && first.start == second.start &&
+           first.ppid == second.ppid && first.pgid == second.pgid && first.sid == second.sid &&
+           first.uid == second.uid && first.gid == second.gid && first.netns == second.netns &&
+           first.exe_dev == second.exe_dev && first.exe_ino == second.exe_ino &&
+           first.argv_length == second.argv_length && first.argv_hash == second.argv_hash;
+}
+
+static bool same_immutable_security_evidence(
+    const identity_bundle::ProcessIdentityEvidence& first,
+    const identity_bundle::ProcessIdentityEvidence& second) {
+    return live_evidence_state(first.state) && live_evidence_state(second.state) &&
+           first.pidfd_live && second.pidfd_live &&
+           same_manifest(first.identity, second.identity) &&
+           same_security_status(first.status, second.status) && first.cmdline == second.cmdline;
+}
+
+static bool extract_authorization_snapshot(const identity_bundle::IdentityBundle& identity,
+                                           const ancestry_bundle::AncestryBundle& ancestry,
+                                           AuthorizationSnapshot& snapshot,
+                                           std::string& error) {
+    std::vector<identity_bundle::ProcessIdentityEvidence> anchors;
+    if (!identity_bundle::extract_process_identity_evidence(
+            identity.roles[0], identity_bundle::Role::Launcher, snapshot.launcher, error) ||
+        !identity_bundle::extract_process_identity_evidence(
+            identity.roles[1], identity_bundle::Role::Root, snapshot.root, error) ||
+        !ancestry_bundle::extract_evidence(ancestry, anchors, error) || anchors.size() != 1 ||
+        !privileged_ancestry::bind_retained_anchor_evidence(
+            anchors, snapshot.retained_anchor, error)) {
+        if (error.empty()) error = "authorization snapshot extraction failed";
+        return false;
+    }
+    snapshot.anchor = std::move(anchors.front());
+    return true;
+}
+
+static bool same_authorization_snapshot(const AuthorizationSnapshot& initial,
+                                        const AuthorizationSnapshot& final) {
+    return same_immutable_security_evidence(initial.launcher, final.launcher) &&
+           same_immutable_security_evidence(initial.root, final.root) &&
+           same_immutable_security_evidence(initial.anchor, final.anchor);
+}
+
+static bool retained_lease_matches_snapshot(const GroupLease& lease,
+                                            const DirectLaunch& launch,
+                                            const AuthorizationSnapshot& snapshot) {
+    const RetainedAnchorEvidence& anchor = snapshot.retained_anchor;
+    return lease.pidfd >= 0 && retained_pidfd_live(lease.pidfd) && anchor.pidfd_live &&
+           lease.pid == launch.anchor.pid && lease.start == launch.anchor.start &&
+           lease.pgid == launch.anchor.pgid && lease.sid == launch.anchor.sid &&
+           anchor.pid == lease.pid && anchor.start == lease.start && anchor.pgid == lease.pgid &&
+           anchor.sid == lease.sid && anchor.ppid == getpid();
+}
+
+static bool validate_formal_ancestry_snapshot(const identity_bundle::IdentityBundle& identity,
+                                              const ancestry_bundle::AncestryBundle& ancestry,
+                                              const Peer& root_peer,
+                                              const std::string& executable,
+                                              const HeldTopologySnapshot& topology,
+                                              const std::string& root_argv,
+                                              const std::string& launcher_argv,
+                                              DirectLaunch& launch,
+                                              const GroupLease& lease,
+                                              AuthorizationSnapshot& snapshot,
+                                              std::string& error) {
+    return validate_ancestry_probe_evidence(identity,
+                                            ancestry,
+                                            root_peer,
+                                            executable,
+                                            topology,
+                                            root_argv,
+                                            launcher_argv,
+                                            launch,
+                                            lease,
+                                            error) &&
+           extract_authorization_snapshot(identity, ancestry, snapshot, error) &&
+           retained_lease_matches_snapshot(lease, launch, snapshot);
+}
+
+enum class AuthorizationEmission { Rejected, AckFailed, CredentialsFailed, Sent };
+
+static AuthorizationEmission emit_authorization_frames(
+    int fd, bool authorized, const Token& token, std::chrono::steady_clock::time_point deadline) {
+    if (!authorized) return AuthorizationEmission::Rejected;
+    if (!send_frame(fd, Frame{kIdentityBundleAck, token, {}}, remaining_deadline_ms(deadline)))
+        return AuthorizationEmission::AckFailed;
+    if (!send_frame(fd,
+                    Frame{kCallerCredentials, token, credentials_payload(getuid(), getgid())},
+                    remaining_deadline_ms(deadline)))
+        return AuthorizationEmission::CredentialsFailed;
+    return AuthorizationEmission::Sent;
+}
+
+static bool formal_authorization_policy_self_check(std::string& error) {
+    Token token;
+    if (!new_token(token)) {
+        error = "formal authorization token setup failed";
+        return false;
+    }
+    Token changed_token = token;
+    changed_token.bytes[0] ^= 1;
+    const Frame initial{kInitialAncestryRequest, token, {}};
+    const Frame final{kFinalAncestryRequest, token, {}};
+    if (kInitialAncestryRequest != 33 || kFinalAncestryRequest != 34 ||
+        !exact_request(initial, kInitialAncestryRequest, token) ||
+        !exact_request(final, kFinalAncestryRequest, token) ||
+        exact_request(initial, kFinalAncestryRequest, token) ||
+        exact_request(
+            Frame{kInitialAncestryRequest, changed_token, {}}, kInitialAncestryRequest, token) ||
+        exact_request(Frame{kInitialAncestryRequest, token, {1}}, kInitialAncestryRequest, token)) {
+        error = "formal ancestry request type/token/payload policy failed";
+        return false;
+    }
+
+    AuthorizationSnapshot baseline;
+    const auto fill = [](identity_bundle::ProcessIdentityEvidence& evidence,
+                         identity_bundle::Role role,
+                         pid_t pid) {
+        evidence.identity.role = role;
+        evidence.identity.pid = pid;
+        evidence.identity.start = static_cast<u64>(pid + 1000);
+        evidence.identity.ppid = pid - 1;
+        evidence.identity.pgid = 101;
+        evidence.identity.sid = 10;
+        evidence.identity.uid = 0;
+        evidence.identity.gid = 0;
+        evidence.identity.netns = 200;
+        evidence.identity.exe_dev = 300;
+        evidence.identity.exe_ino = 400;
+        evidence.identity.argv_length = 5;
+        evidence.identity.argv_hash = 500;
+        evidence.state = 'S';
+        evidence.status.uid_values = {0, 0, 0, 0};
+        evidence.status.gid_values = {0, 0, 0, 0};
+        evidence.status.supplementary_groups = {0};
+        evidence.status.cap_bnd = 1;
+        evidence.cmdline = "safe";
+        evidence.pidfd_live = true;
+    };
+    fill(baseline.launcher, identity_bundle::Role::Launcher, 103);
+    fill(baseline.root, identity_bundle::Role::Root, 104);
+    fill(baseline.anchor, identity_bundle::Role::Ancestry, 101);
+    AuthorizationSnapshot changed = baseline;
+    changed.root.state = 'R';
+    if (!same_authorization_snapshot(baseline, changed)) {
+        error = "formal authorization compared scheduler state for equality";
+        return false;
+    }
+    const auto rejected = [&](const auto& mutate) {
+        AuthorizationSnapshot candidate = baseline;
+        mutate(candidate);
+        return !same_authorization_snapshot(baseline, candidate);
+    };
+    if (!rejected([](auto& value) { ++value.anchor.identity.pid; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.start; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.ppid; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.pgid; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.sid; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.netns; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.exe_dev; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.exe_ino; }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.argv_hash; }) ||
+        !rejected([](auto& value) { value.anchor.status.uid_values[1] = 1; }) ||
+        !rejected([](auto& value) { value.anchor.status.gid_values[1] = 1; }) ||
+        !rejected([](auto& value) { value.anchor.status.supplementary_groups.push_back(1); }) ||
+        !rejected([](auto& value) { value.anchor.status.no_new_privs = true; }) ||
+        !rejected([](auto& value) { value.anchor.status.cap_eff = 1; }) ||
+        !rejected([](auto& value) { value.anchor.cmdline.push_back('x'); }) ||
+        !rejected([](auto& value) { value.anchor.state = 'Z'; }) ||
+        !rejected([](auto& value) { value.anchor.pidfd_live = false; }) ||
+        !rejected([](auto& value) { ++value.root.identity.pid; }) ||
+        !rejected([](auto& value) { ++value.launcher.status.cap_bnd; })) {
+        error = "formal authorization identity/security drift mutation was accepted";
+        return false;
+    }
+
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        error = "formal authorization no-emission socketpair failed";
+        return false;
+    }
+    const AuthorizationEmission emission = emit_authorization_frames(
+        sockets[0], false, token, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    pollfd readable{sockets[1], POLLIN, 0};
+    const int polled = poll(&readable, 1, 0);
+    if (emission != AuthorizationEmission::Rejected || polled != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        error = "formal authorization rejection emitted ACK or credentials";
+        return false;
+    }
+    const AuthorizationEmission sent = emit_authorization_frames(
+        sockets[0], true, token, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    Frame ack;
+    Frame credentials;
+    const bool exact_order =
+        sent == AuthorizationEmission::Sent && receive_frame(sockets[1], ack, kHandshakeMs) &&
+        ack.type == kIdentityBundleAck && token_equal(ack.token, token) && ack.payload.empty() &&
+        receive_frame(sockets[1], credentials, kHandshakeMs) &&
+        credentials.type == kCallerCredentials && token_equal(credentials.token, token);
+    close(sockets[0]);
+    close(sockets[1]);
+    if (!exact_order) {
+        error = "formal authorization ACK/credentials emission order failed";
+        return false;
+    }
+    return true;
+}
+
 static bool run_ancestry_probe_session(const std::string& sudo_path,
                                        const std::string& nsenter_path,
                                        const std::string& executable,
@@ -4555,7 +4844,7 @@ static bool run_session(const std::string& sudo_path,
                       endpoint,
                       token,
                       scenario,
-                      kHandshakeMs,
+                      kBrokerDeadlineMs,
                       direct_launch,
                       group_lease,
                       hello_deadline,
@@ -4584,6 +4873,8 @@ static bool run_session(const std::string& sudo_path,
     ProcIdentity root_proc, launcher_proc, broker_proc, target_proc;
     Token root_frame_token;
     identity_bundle::ReceivedBundle received_identity;
+    ancestry_bundle::AncestryBundle initial_ancestry;
+    ancestry_bundle::AncestryBundle final_ancestry;
     bool success = false;
     do {
         const bool root_hello_ok = await_root_hello(endpoint,
@@ -4595,6 +4886,7 @@ static bool run_session(const std::string& sudo_path,
                                                     root_report,
                                                     root_frame_token,
                                                     received_identity,
+                                                    initial_ancestry,
                                                     error);
         const std::string root_argv = exact_argv({executable,
                                                   "--fixture-privileged-broker",
@@ -4631,23 +4923,22 @@ static bool run_session(const std::string& sudo_path,
                                                      scenario,
                                                      std::to_string(kCredentialFd)});
         std::string identity_error;
-        std::optional<RetainedAnchorEvidence> retained_anchor;
-        if (received_identity.bundle().roles[0].manifest.pid != sudo_child.anchor.pid) {
-            retained_anchor.emplace();
-            if (!privileged_ancestry::capture_retained_anchor_evidence(
-                    sudo_child, retained_lease(launch_lease), *retained_anchor, identity_error)) {
-                error = "root broker retained sudo anchor validation failed: " + identity_error +
-                        "; " +
-                        retained_wrapper_diagnostic(sudo_child,
-                                                    launch_lease,
-                                                    *retained_anchor,
-                                                    received_identity.bundle().roles[0].manifest);
-                received_identity.reset();
-                break;
-            }
+        AuthorizationSnapshot initial_snapshot;
+        if (!validate_formal_ancestry_snapshot(received_identity.bundle(),
+                                               initial_ancestry,
+                                               root_peer,
+                                               executable,
+                                               topology,
+                                               root_argv,
+                                               launcher_argv,
+                                               sudo_child,
+                                               launch_lease,
+                                               initial_snapshot,
+                                               identity_error)) {
+            error = "root broker initial ancestry validation failed: " + identity_error;
+            break;
         }
-        const RetainedAnchorEvidence* retained_anchor_ptr =
-            retained_anchor ? &*retained_anchor : nullptr;
+        const RetainedAnchorEvidence* retained_anchor_ptr = &initial_snapshot.retained_anchor;
         const bool semantic_baseline_ok =
             validate_received_identity_bundle(received_identity.bundle(),
                                               root_report,
@@ -4686,23 +4977,70 @@ static bool run_session(const std::string& sudo_path,
                                  mutation_diagnostic.detail;
             error = "root broker bundle provenance validation failed: " + identity_error + "; " +
                     direct_launch_diagnostic(sudo_child);
-            if (retained_anchor)
-                error += "; " +
-                         retained_wrapper_diagnostic(sudo_child,
-                                                     launch_lease,
-                                                     *retained_anchor,
-                                                     received_identity.bundle().roles[0].manifest);
+            error +=
+                "; " + retained_wrapper_diagnostic(sudo_child,
+                                                   launch_lease,
+                                                   initial_snapshot.retained_anchor,
+                                                   received_identity.bundle().roles[0].manifest);
             received_identity.reset();
             break;
         }
-        received_identity.reset();
-        if (!send_frame(root_fd, Frame{kIdentityBundleAck, token, {}}, kHandshakeMs) ||
-            !send_frame(root_fd,
-                        Frame{kCallerCredentials, token, credentials_payload(getuid(), getgid())},
-                        kHandshakeMs)) {
-            error = "identity bundle ACK/caller credential frame failed";
+        if (!send_frame(root_fd,
+                        Frame{kFinalAncestryRequest, token, {}},
+                        remaining_deadline_ms(hello_deadline)) ||
+            !ancestry_bundle::receive_bundle(
+                root_fd, final_ancestry, hello_deadline, identity_error)) {
+            error = "root broker final ancestry request/receive failed: " + identity_error;
             break;
         }
+        AuthorizationSnapshot final_snapshot;
+        Peer final_root_peer;
+        DirectLaunch final_launch = sudo_child;
+        const bool final_authorized =
+            validate_formal_ancestry_snapshot(received_identity.bundle(),
+                                              final_ancestry,
+                                              root_peer,
+                                              executable,
+                                              topology,
+                                              root_argv,
+                                              launcher_argv,
+                                              final_launch,
+                                              launch_lease,
+                                              final_snapshot,
+                                              identity_error) &&
+            validate_received_identity_bundle(received_identity.bundle(),
+                                              root_report,
+                                              root_peer,
+                                              topology,
+                                              executable,
+                                              root_argv,
+                                              launcher_argv,
+                                              &final_snapshot.retained_anchor,
+                                              final_launch,
+                                              root_proc,
+                                              launcher_proc,
+                                              identity_error) &&
+            same_authorization_snapshot(initial_snapshot, final_snapshot) &&
+            retained_lease_matches_snapshot(launch_lease, final_launch, final_snapshot) &&
+            !control_lease_lost(root_fd) && get_peer(root_fd, final_root_peer) &&
+            final_root_peer.pid == root_peer.pid && final_root_peer.uid == root_peer.uid &&
+            final_root_peer.gid == root_peer.gid && endpoint_unchanged(endpoint);
+        if (!final_authorized) {
+            if (identity_error.empty()) identity_error = "final authorization evidence changed";
+            error = "root broker final pre-ACK authorization failed: " + identity_error;
+            break;
+        }
+        const AuthorizationEmission emission =
+            emit_authorization_frames(root_fd, final_authorized, token, hello_deadline);
+        if (emission != AuthorizationEmission::Sent) {
+            error = emission == AuthorizationEmission::AckFailed
+                        ? "identity bundle ACK frame failed"
+                        : "caller credential frame failed after identity bundle ACK";
+            break;
+        }
+        received_identity.reset();
+        initial_ancestry.close();
+        final_ancestry.close();
         const auto dropped_failure = [&](const char* label) {
             error = std::string("dropped broker identity transition failed: ") + label;
         };
@@ -5026,6 +5364,9 @@ static bool run_session(const std::string& sudo_path,
         }
         success = true;
     } while (false);
+    received_identity.reset();
+    initial_ancestry.close();
+    final_ancestry.close();
     if (root_fd >= 0) close(root_fd);
     if (broker_fd >= 0) close(broker_fd);
     if (target_fd >= 0) close(target_fd);
@@ -5227,7 +5568,8 @@ int main(int argc, char** argv) {
         !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
         !prelaunch_close_first_self_check(error) ||
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error) ||
-        !ancestry_probe_validation_self_check(error)) {
+        !ancestry_probe_validation_self_check(error) ||
+        !formal_authorization_policy_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
