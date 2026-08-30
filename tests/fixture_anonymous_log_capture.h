@@ -86,6 +86,9 @@ public:
     // the destination before moving another lease into a fresh object.
     AnonymousLogCapture& operator=(AnonymousLogCapture&&) = delete;
 
+    // create requires a fresh/never-cleaned object. Any explicit or
+    // destructor cleanup attempt makes that object terminal, including a
+    // successful close, so its retained CleanupState cannot be overwritten.
     static bool create(std::size_t max_bytes, AnonymousLogCapture& capture, Diagnostic& diagnostic);
     static bool create_with_hooks_for_testing(std::size_t max_bytes,
                                               const HooksForTesting& hooks,

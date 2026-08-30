@@ -494,6 +494,10 @@ bool close_move_and_no_path_test() {
     const bool wrote = write(moved.descriptor(), &value, 1u) == 1;
     const bool closed = moved.close(diagnostic);
     const bool state_ok = state->attempted && state->succeeded && moved.descriptor() < 0;
+    const bool successful_reuse_rejected =
+        !capture::AnonymousLogCapture::create(32u, moved, diagnostic) &&
+        diagnostic.phase == capture::FailurePhase::Close && moved.cleanup_state() == state &&
+        state->attempted && state->succeeded;
 
     capture::AnonymousLogCapture uncertain;
     CloseInjection injection;
@@ -586,7 +590,8 @@ bool close_move_and_no_path_test() {
         std::string(fd_target.data(), static_cast<std::size_t>(fd_target_size))
                 .find("memfd:rut377-anonymous-log") != std::string::npos &&
         ordinary_ok && ordinary_count == 8 && std::string(ordinary_bytes.data(), 8u) == "ordinary";
-    return check(moved_ok && wrote && closed && state_ok, "move or explicit close was unsafe") &&
+    return check(moved_ok && wrote && closed && state_ok && successful_reuse_rejected,
+                 "move or explicit close was unsafe") &&
            check(uncertainty_ok, "close uncertainty was not retained without retry") &&
            check(destructor_uncertainty_ok, "destructor close uncertainty was not retained") &&
            check(no_path, "anonymous capture interfered with a similarly named ordinary file");
