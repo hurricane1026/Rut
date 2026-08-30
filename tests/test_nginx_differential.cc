@@ -22358,6 +22358,73 @@ static bool wait_for_rut_iouring_gate_hook(rut_iouring_gate& gate,
     return false;
 }
 
+static bool validate_rut_iouring_startup_failure_log(const std::string& path, std::string& error) {
+    std::string contents;
+    if (!read_exact_return204_log(
+            path, "RUT io_uring expected startup-failure log", contents, error))
+        return false;
+
+    static constexpr char kBackend[] = "Backend: io_uring";
+    static constexpr char kListenerPrefix[] = "Listening on port ";
+    static constexpr char kListenerSuffix[] = " with 1 shard(s)";
+    static constexpr char kFatal[] = "Fatal I/O backend failure on shard 0 (errno=71)";
+    size_t backend_offset = std::string::npos;
+    size_t listener_offset = std::string::npos;
+    size_t fatal_offset = std::string::npos;
+    u32 backend_count = 0;
+    u32 listener_count = 0;
+    u32 fatal_count = 0;
+    for (size_t line_start = 0; line_start < contents.size();) {
+        const size_t line_end = contents.find('\n', line_start);
+        if (line_end == std::string::npos) {
+            error = "RUT io_uring expected startup-failure log ended with a partial record";
+            return false;
+        }
+        const size_t line_length = line_end - line_start;
+        if (line_length == sizeof(kBackend) - 1u &&
+            contents.compare(line_start, line_length, kBackend) == 0) {
+            backend_count++;
+            backend_offset = line_start;
+        } else if (line_length == sizeof(kFatal) - 1u &&
+                   contents.compare(line_start, line_length, kFatal) == 0) {
+            fatal_count++;
+            fatal_offset = line_start;
+        } else if (line_length > sizeof(kListenerPrefix) + sizeof(kListenerSuffix) - 2u &&
+                   contents.compare(line_start, sizeof(kListenerPrefix) - 1u, kListenerPrefix) ==
+                       0 &&
+                   contents.compare(line_end - (sizeof(kListenerSuffix) - 1u),
+                                    sizeof(kListenerSuffix) - 1u,
+                                    kListenerSuffix) == 0) {
+            const size_t port_start = line_start + sizeof(kListenerPrefix) - 1u;
+            const size_t port_end = line_end - (sizeof(kListenerSuffix) - 1u);
+            u32 port = 0;
+            bool valid_port = port_start < port_end;
+            for (size_t cursor = port_start; valid_port && cursor < port_end; cursor++) {
+                const char digit = contents[cursor];
+                valid_port = digit >= '0' && digit <= '9';
+                if (valid_port) {
+                    const u32 value = static_cast<u32>(digit - '0');
+                    valid_port = port <= (65535u - value) / 10u;
+                    if (valid_port) port = port * 10u + value;
+                }
+            }
+            if (valid_port && port != 0u) {
+                listener_count++;
+                listener_offset = line_start;
+            }
+        }
+        line_start = line_end + 1u;
+    }
+    if (backend_count != 1u || listener_count != 1u || fatal_count != 1u ||
+        !(backend_offset < listener_offset && listener_offset < fatal_offset)) {
+        error =
+            "RUT io_uring expected startup failure lacked one ordered io_uring backend, "
+            "listener, and shard-0 errno=71 fatal record";
+        return false;
+    }
+    return true;
+}
+
 static bool run_rut_iouring_gate_spike(u16 frontend_port,
                                        u16 backend_port,
                                        TempDir& temp,
@@ -22559,7 +22626,6 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         }
         return true;
     }
-    if (!wait_ready(frontend_port, rut_process.child, error)) return false;
     if (expect_identity_failure || expect_ready_mutation_failure) {
         if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_FAILED, 3000)) {
             error = expect_identity_failure
@@ -22567,27 +22633,56 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                         : "ready SQ mask mutation did not fail the RUT io_uring gate";
             return false;
         }
-        if (!stop_guard.settle_expected_failure()) {
-            error = "failed to TERM/reap RUT after identity rejection";
+        if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
+            rut_downstream_gate_load(&mapping.gate->error_code) != RUT_IOURING_GATE_ERROR_RING ||
+            rut_downstream_gate_load(&mapping.gate->ring_ready) != 0) {
+            error =
+                "RUT io_uring startup rejection did not publish exact FAILED/RING/"
+                "ring_ready=0 state";
             return false;
         }
+        if (!wait_child(rut_process.child, 3000)) {
+            error = "RUT io_uring startup rejection did not terminate naturally before deadline";
+            return false;
+        }
+        if (!rut_process.child.status_valid || !WIFEXITED(rut_process.child.status) ||
+            WEXITSTATUS(rut_process.child.status) != 1) {
+            error = "RUT io_uring startup rejection had unexpected natural termination (" +
+                    child_status_description(rut_process.child) + ")";
+            return false;
+        }
+        rut_process.child.pid = -1;
+        child_settled = true;
+        cleanup_clean = true;
         if (rut_downstream_gate_load(&mapping.gate->error_code) != RUT_IOURING_GATE_ERROR_RING ||
+            rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
             rut_downstream_gate_load(&mapping.gate->ring_ready) != 0 ||
             mapping.gate->ring_fd != -1 || mapping.gate->intercepted_fd != -1 ||
+            rut_downstream_gate_load(&mapping.gate->mode) != RUT_IOURING_GATE_MODE_NONE ||
             mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_length != 0 ||
             mapping.gate->intercepted_prefix_length != 0 ||
             mapping.gate->intercepted_user_data != 0 || mapping.gate->recv_user_data != 0 ||
             mapping.gate->sq_head_at_hit != 0 || mapping.gate->sq_tail_at_hit != 0 ||
             mapping.gate->cq_head_at_hit != 0 || mapping.gate->cq_tail_at_arrival != 0 ||
             mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0 ||
-            mapping.gate->connect_attempt_count != 0 ||
+            mapping.gate->witness_wire_length != 0 || mapping.gate->ingress_recv_sqe_count != 0 ||
+            mapping.gate->ingress_send_sqe_count != 0 || mapping.gate->connect_attempt_count != 0 ||
             mapping.gate->connect_journal_overflow != 0 ||
             mapping.gate->connect_journal_duplicate != 0) {
-            error = "identity failure published metadata after process settlement";
+            error = "startup failure published metadata after natural process settlement";
+            return false;
+        }
+        if (!validate_rut_iouring_startup_failure_log(temp.rut_log, error)) return false;
+        if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
+            rut_downstream_gate_load(&mapping.gate->error_code) != RUT_IOURING_GATE_ERROR_RING ||
+            rut_downstream_gate_load(&mapping.gate->ring_ready) != 0 ||
+            mapping.gate->ring_fd != -1) {
+            error = "RUT io_uring startup rejection revived after natural process settlement";
             return false;
         }
         return true;
     }
+    if (!wait_ready(frontend_port, rut_process.child, error)) return false;
     if (!wait_for_rut_iouring_gate_hook(*mapping.gate, 3000, error)) return false;
     if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
         mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_fd != -1 ||
