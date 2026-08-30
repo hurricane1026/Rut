@@ -92,6 +92,16 @@ target_link_libraries(test_fixture_wildcard_source_lease PRIVATE fixture_wildcar
 add_test(NAME test_fixture_wildcard_source_lease COMMAND test_fixture_wildcard_source_lease)
 set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# Pure #377 bounded anonymous stdout/stderr capture. This is an unprivileged
+# memfd/seals self-check and is not connected to a child, broker or runtime.
+add_library(fixture_anonymous_log_capture STATIC fixture_anonymous_log_capture.cc)
+target_include_directories(fixture_anonymous_log_capture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_anonymous_log_capture test_fixture_anonymous_log_capture.cc)
+target_link_libraries(test_fixture_anonymous_log_capture PRIVATE fixture_anonymous_log_capture)
+add_test(NAME test_fixture_anonymous_log_capture COMMAND test_fixture_anonymous_log_capture)
+set_tests_properties(test_fixture_anonymous_log_capture PROPERTIES LABELS "unit" TIMEOUT 30)
+
 if(RUT_ENABLE_JIT)
     add_executable(test_fixture_privileged_listener_loader
         test_fixture_privileged_listener_loader.cc)
