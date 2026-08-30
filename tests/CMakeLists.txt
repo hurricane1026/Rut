@@ -67,6 +67,19 @@ target_link_libraries(test_fixture_privileged_ancestry PRIVATE fixture_privilege
 add_test(NAME test_fixture_privileged_ancestry COMMAND test_fixture_privileged_ancestry)
 set_tests_properties(test_fixture_privileged_ancestry PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
 
+# Pure #358 listener plan/source/proc-table/collision-log evidence. This target
+# creates no sockets or processes and is not yet integrated with the broker.
+add_library(fixture_privileged_listener STATIC fixture_privileged_listener.cc)
+target_include_directories(fixture_privileged_listener PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(test_fixture_privileged_listener test_fixture_privileged_listener.cc)
+target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privileged_listener)
+add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
+set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
