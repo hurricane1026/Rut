@@ -1085,11 +1085,12 @@ struct ExactEscrowRights {
     }
 };
 
-constexpr std::size_t kExactSettledFields = 9u;
+constexpr std::size_t kExactSettledFields = 10u;
 struct ExactSettledRecord {
     u64 version = kExactCustodyVersion;
     u64 target_pid = 0u;
     u64 child_pid = 0u;
+    u64 child_start = 0u;
     u64 guard_inode = 0u;
     u64 adopted = 0u;
     u64 reaped = 0u;
@@ -1369,6 +1370,7 @@ static std::vector<unsigned char> encode_exact_settled(const ExactSettledRecord&
     for (u64 field : {settled.version,
                       settled.target_pid,
                       settled.child_pid,
+                      settled.child_start,
                       settled.guard_inode,
                       settled.adopted,
                       settled.reaped,
@@ -1387,8 +1389,8 @@ static bool decode_exact_settled(const std::vector<unsigned char>& payload,
     for (std::size_t i = 0; i != fields.size(); ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
     if (fields[0] != kExactCustodyVersion || fields[1] <= 1u || fields[2] <= 1u ||
-        fields[3] == 0u || fields[4] > 1u || fields[5] > 1u || fields[6] > 1u || fields[7] > 1u ||
-        fields[8] > 1u)
+        fields[3] == 0u || fields[4] == 0u || fields[5] > 1u || fields[6] > 1u || fields[7] > 1u ||
+        fields[8] > 1u || fields[9] > 1u)
         return false;
     settled = {fields[0],
                fields[1],
@@ -1398,8 +1400,15 @@ static bool decode_exact_settled(const std::vector<unsigned char>& payload,
                fields[5],
                fields[6],
                fields[7],
-               fields[8]};
+               fields[8],
+               fields[9]};
     return true;
+}
+
+static bool exact_settlement_matches_failure(const ExactSettledRecord& settled,
+                                             const ExactFailureReport& failure) {
+    return failure.escrow_required == 1u && settled.child_pid == failure.child_pid &&
+           settled.child_start == failure.child_start;
 }
 
 static bool receive_failed_target_lifecycle(int broker_fd,
@@ -1416,11 +1425,11 @@ static bool receive_failed_target_lifecycle(int broker_fd,
     }
     if (record.type == kExactEscrowSettled) {
         ExactSettledRecord settled;
-        if (failure.escrow_required != 1u || !token_equal(record.token, token) ||
-            !decode_exact_settled(record.payload, settled) ||
+        if (!token_equal(record.token, token) || !decode_exact_settled(record.payload, settled) ||
+            !exact_settlement_matches_failure(settled, failure) ||
             settled.target_pid != static_cast<u64>(expected_target) ||
-            settled.child_pid != failure.child_pid || settled.guard_inode != expected_guard_inode ||
-            settled.reaped != 1u || settled.listener_absent != 1u || settled.temps_absent != 1u ||
+            settled.guard_inode != expected_guard_inode || settled.reaped != 1u ||
+            settled.listener_absent != 1u || settled.temps_absent != 1u ||
             settled.guard_closed != 1u || !receive_frame(broker_fd, record, kHandshakeMs)) {
             error += "; malformed or incomplete failure-settled evidence";
             return false;
@@ -3540,25 +3549,46 @@ static int secured_target_main(const char* control_path,
     }
 }
 
-static bool validate_escrow_temp(
-    int directory, const char* name, u64 device, u64 inode, uid_t uid, gid_t gid) {
+static bool validate_escrow_temp(int directory,
+                                 const char* name,
+                                 u64 device,
+                                 u64 inode,
+                                 uid_t uid,
+                                 gid_t gid,
+                                 bool allow_absent) {
     struct stat status{};
     errno = 0;
-    if (fstatat(directory, name, &status, AT_SYMLINK_NOFOLLOW) < 0) return errno == ENOENT;
+    if (fstatat(directory, name, &status, AT_SYMLINK_NOFOLLOW) < 0)
+        return allow_absent && errno == ENOENT;
     return S_ISREG(status.st_mode) && status.st_dev == static_cast<dev_t>(device) &&
            status.st_ino == static_cast<ino_t>(inode) && status.st_uid == uid &&
            status.st_gid == gid && (status.st_mode & 0777) == 0600;
 }
 
+static bool exact_custody_child_identity_matches(const ProcIdentity& child,
+                                                 const ExactCustodyRecord& record,
+                                                 pid_t expected_parent,
+                                                 ino_t expected_netns,
+                                                 uid_t expected_uid,
+                                                 gid_t expected_gid) {
+    return child.pid == static_cast<pid_t>(record.child_pid) && child.ppid == expected_parent &&
+           child.start == record.child_start && child.exe_dev == record.child_exe_dev &&
+           child.exe_ino == record.child_exe_ino && child.netns == expected_netns &&
+           child.uid == expected_uid && child.gid == expected_gid;
+}
+
 static bool validate_exact_escrow(const ExactCustodyRecord& record,
                                   const ExactEscrowRights& rights,
-                                  const ProcIdentity& target,
+                                  pid_t expected_target,
+                                  u64 expected_target_start,
+                                  pid_t expected_child_parent,
                                   ino_t expected_netns,
                                   uid_t expected_uid,
                                   gid_t expected_gid) {
-    if (record.target_pid != static_cast<u64>(target.pid) || record.target_start != target.start ||
-        record.netns != static_cast<u64>(expected_netns) || target.uid != expected_uid ||
-        target.gid != expected_gid || rights.guard < 0 || rights.directory < 0)
+    if (record.target_pid != static_cast<u64>(expected_target) ||
+        record.target_start != expected_target_start ||
+        record.netns != static_cast<u64>(expected_netns) || rights.guard < 0 ||
+        rights.directory < 0)
         return false;
     struct stat guard_status{}, directory_status{};
     sockaddr_in endpoint{};
@@ -3586,13 +3616,15 @@ static bool validate_exact_escrow(const ExactCustodyRecord& record,
                               record.source_dev,
                               record.source_ino,
                               expected_uid,
-                              expected_gid) ||
+                              expected_gid,
+                              record.child_reaped != 0u) ||
         !validate_escrow_temp(rights.directory,
                               "exact-listener.log",
                               record.log_dev,
                               record.log_ino,
                               expected_uid,
-                              expected_gid))
+                              expected_gid,
+                              record.child_reaped != 0u))
         return false;
     ProcIdentity child;
     if (record.child_reaped != 0u) {
@@ -3602,10 +3634,12 @@ static bool validate_exact_escrow(const ExactCustodyRecord& record,
             observe_exact_liveness(child) != ExactLiveness::ExitedOrReused)
             return false;
     } else if (!read_proc(static_cast<pid_t>(record.child_pid), child, false) ||
-               child.pid != static_cast<pid_t>(record.child_pid) || child.ppid != target.pid ||
-               child.start != record.child_start || child.exe_dev != record.child_exe_dev ||
-               child.exe_ino != record.child_exe_ino || child.netns != expected_netns ||
-               child.uid != expected_uid || child.gid != expected_gid) {
+               !exact_custody_child_identity_matches(child,
+                                                     record,
+                                                     expected_child_parent,
+                                                     expected_netns,
+                                                     expected_uid,
+                                                     expected_gid)) {
         return false;
     }
     if (record.has_pidfd != 0u &&
@@ -3633,6 +3667,63 @@ static bool validate_exact_escrow(const ExactCustodyRecord& record,
             return false;
     }
     return true;
+}
+
+enum class ExactCustodyTargetState { Invalid, Live, ExitedAndAdopted };
+
+static ExactCustodyTargetState receive_and_validate_exact_custody(
+    int custody_fd,
+    const Token& token,
+    pid_t target,
+    u64 expected_target_start,
+    const std::string& target_executable,
+    const std::string& target_argv,
+    ino_t expected_netns,
+    uid_t expected_uid,
+    gid_t expected_gid,
+    bool target_reaped,
+    int& target_status,
+    std::chrono::steady_clock::time_point deadline,
+    ExactCustodyRecord& custody,
+    ExactEscrowRights& rights) {
+    if (!receive_exact_custody(
+            custody_fd, token, target, expected_uid, expected_gid, deadline, custody, rights) ||
+        custody.target_pid != static_cast<u64>(target) ||
+        custody.target_start != expected_target_start)
+        return ExactCustodyTargetState::Invalid;
+    ProcIdentity target_identity;
+    const bool target_live =
+        !target_reaped && read_proc(target, target_identity, false) &&
+        target_identity.pid == target && target_identity.ppid == getpid() &&
+        target_identity.start == expected_target_start &&
+        target_identity.exe == target_executable && target_identity.cmdline == target_argv &&
+        target_identity.netns == expected_netns && target_identity.uid == expected_uid &&
+        target_identity.gid == expected_gid;
+    if (target_live && validate_exact_escrow(custody,
+                                             rights,
+                                             target,
+                                             expected_target_start,
+                                             target,
+                                             expected_netns,
+                                             expected_uid,
+                                             expected_gid))
+        return ExactCustodyTargetState::Live;
+    if (!target_reaped) {
+        errno = 0;
+        const pid_t waited = waitpid(target, &target_status, WNOHANG);
+        if (waited != target) return ExactCustodyTargetState::Invalid;
+        target_reaped = true;
+    }
+    if (!validate_exact_escrow(custody,
+                               rights,
+                               target,
+                               expected_target_start,
+                               getpid(),
+                               expected_netns,
+                               expected_uid,
+                               expected_gid))
+        return ExactCustodyTargetState::Invalid;
+    return ExactCustodyTargetState::ExitedAndAdopted;
 }
 
 static bool wait_reap_adopted_exact(const ExactCustodyRecord& record,
@@ -3702,10 +3793,12 @@ static bool settle_exact_escrow(int control,
                                 const ExactCustodyRecord& record,
                                 ExactEscrowRights& rights,
                                 ExactSettlementProgress& progress,
-                                ExactSettledRecord& settled) {
+                                ExactSettledRecord& settled,
+                                bool publish_settlement) {
     settled.version = kExactCustodyVersion;
     settled.target_pid = record.target_pid;
     settled.child_pid = record.child_pid;
+    settled.child_start = record.child_start;
     settled.guard_inode = record.guard_inode;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
@@ -3752,8 +3845,16 @@ static bool settle_exact_escrow(int control,
         settled.guard_closed = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
     }
     if (rights.guard >= 0) return false;
-    return send_frame(
-        control, Frame{kExactEscrowSettled, token, encode_exact_settled(settled)}, kHandshakeMs);
+    return !publish_settlement ||
+           send_frame(control,
+                      Frame{kExactEscrowSettled, token, encode_exact_settled(settled)},
+                      kHandshakeMs);
+}
+
+static bool exact_target_numeric_signal_allowed(pid_t wait_result,
+                                                int wait_error,
+                                                bool identity_matches) {
+    return wait_result == 0 && wait_error == 0 && identity_matches;
 }
 
 static OwnedWaitResult finish_post_ack_escrow(pid_t target,
@@ -3762,22 +3863,34 @@ static OwnedWaitResult finish_post_ack_escrow(pid_t target,
                                               const ExactCustodyRecord& custody,
                                               ExactEscrowRights& rights,
                                               bool target_reaped,
+                                              bool publish_settlement,
                                               int& target_status) {
     bool kill_sent = false;
+    bool direct_wait_authority = true;
     auto target_deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
     while (!target_reaped) {
+        errno = 0;
         const pid_t waited = waitpid(target, &target_status, WNOHANG);
+        const int wait_error = waited < 0 ? errno : 0;
         if (waited == target) {
             target_reaped = true;
             break;
         }
-        if (waited < 0 && errno != EINTR) {
+        if (waited < 0 && wait_error != EINTR) {
+            direct_wait_authority = false;
             (void)poll(nullptr, 0, 10);
             continue;
         }
-        if (!kill_sent && std::chrono::steady_clock::now() >= target_deadline) {
-            if (kill(target, SIGKILL) == 0 || errno == ESRCH) kill_sent = true;
+        if (!kill_sent && direct_wait_authority &&
+            std::chrono::steady_clock::now() >= target_deadline) {
+            ProcIdentity identity;
+            const bool matches = read_proc(target, identity, false) && identity.pid == target &&
+                                 identity.ppid == getpid() &&
+                                 identity.start == custody.target_start;
+            if (exact_target_numeric_signal_allowed(waited, wait_error, matches) &&
+                (kill(target, SIGKILL) == 0 || errno == ESRCH))
+                kill_sent = true;
             target_deadline = new_exact_cleanup_deadline();
         }
         (void)poll(nullptr, 0, 10);
@@ -3785,7 +3898,8 @@ static OwnedWaitResult finish_post_ack_escrow(pid_t target,
     ExactSettlementProgress progress;
     for (;;) {
         ExactSettledRecord settled;
-        const bool sent = settle_exact_escrow(control, token, custody, rights, progress, settled);
+        const bool sent = settle_exact_escrow(
+            control, token, custody, rights, progress, settled, publish_settlement);
         if (rights.guard < 0) {
             rights.close_all();
             return sent ? OwnedWaitResult::Exited : OwnedWaitResult::Error;
@@ -3797,11 +3911,23 @@ static OwnedWaitResult finish_post_ack_escrow(pid_t target,
     }
 }
 
-[[noreturn]] static void hold_pre_ack_failure(int root_lease, int custody_fd) {
-    // The private channel authenticates the Target as the only possible
-    // sender.  Once its datagram has been observed but rejected, returning
-    // would trigger Target PDEATHSIG and release its still-owned guard.  Keep
-    // the Dropped broker alive with no success/control publication instead.
+enum class ExactListenerWaitEvent { Progress, RootLoss, WaitError, PollError, Deadline };
+
+static bool exact_listener_failure_requires_hold(bool custody_received,
+                                                 ExactListenerWaitEvent event) {
+    return !custody_received && event != ExactListenerWaitEvent::Progress;
+}
+
+static bool exact_listener_target_reaped(pid_t target, u64 expected_start, int& status) {
+    if (target <= 1 || expected_start == 0u) return false;
+    errno = 0;
+    return waitpid(target, &status, WNOHANG) == target;
+}
+
+[[noreturn]] static void hold_listener_failure(int root_lease, int custody_fd) {
+    // A listener Target may own the only guard while its exact-child safety is
+    // unknown.  Keep Dropped alive across lease, transport, and pre-ACK
+    // failures so Target PDEATHSIG cannot turn uncertainty into guard release.
     const std::array<pollfd, 2> descriptors{
         {{root_lease, POLLIN | POLLHUP | POLLERR, 0}, {custody_fd, POLLIN | POLLHUP | POLLERR, 0}}};
     for (;;) {
@@ -3815,6 +3941,7 @@ static OwnedWaitResult finish_post_ack_escrow(pid_t target,
 }
 
 static OwnedWaitResult wait_listener_target_bounded(pid_t target,
+                                                    u64 expected_target_start,
                                                     const std::string& target_executable,
                                                     const std::string& target_argv,
                                                     pid_t root_broker,
@@ -3831,24 +3958,43 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
     bool custody_received = false;
     ExactCustodyRecord custody;
     ExactEscrowRights rights;
+    const auto accept_custody = [&](bool target_reaped) -> std::optional<OwnedWaitResult> {
+        const ExactCustodyTargetState state =
+            receive_and_validate_exact_custody(custody_fd,
+                                               token,
+                                               target,
+                                               expected_target_start,
+                                               target_executable,
+                                               target_argv,
+                                               expected_netns,
+                                               expected_uid,
+                                               expected_gid,
+                                               target_reaped,
+                                               target_status,
+                                               deadline,
+                                               custody,
+                                               rights);
+        if (state == ExactCustodyTargetState::Invalid) {
+            rights.close_all();
+            hold_listener_failure(root_lease, custody_fd);
+        }
+        if (state == ExactCustodyTargetState::ExitedAndAdopted)
+            return finish_post_ack_escrow(
+                target, control, token, custody, rights, true, false, target_status);
+        if (control_lease_lost(root_lease) || getppid() != root_broker)
+            hold_listener_failure(root_lease, custody_fd);
+        while (!send_exact_custody_ack(custody_fd, token, new_exact_cleanup_deadline()))
+            (void)poll(nullptr, 0, 10);
+        custody_received = true;
+        return std::nullopt;
+    };
     while (std::chrono::steady_clock::now() < deadline) {
         const bool root_lost = control_lease_lost(root_lease) || getppid() != root_broker;
-        if (root_lost && !custody_received) return OwnedWaitResult::LeaseLost;
-        int status = 0;
-        const pid_t waited = waitpid(target, &status, WNOHANG);
-        if (waited == target) {
-            target_status = status;
-            if (custody_received)
-                return finish_post_ack_escrow(
-                    target, control, token, custody, rights, true, target_status);
-            return OwnedWaitResult::Exited;
-        }
-        if (waited < 0 && errno != EINTR) {
-            if (custody_received)
-                return finish_post_ack_escrow(
-                    target, control, token, custody, rights, false, target_status);
-            rights.close_all();
-            return OwnedWaitResult::Error;
+        if (root_lost && exact_listener_failure_requires_hold(custody_received,
+                                                              ExactListenerWaitEvent::RootLoss)) {
+            if (exact_listener_target_reaped(target, expected_target_start, target_status))
+                return OwnedWaitResult::Exited;
+            hold_listener_failure(root_lease, custody_fd);
         }
         pollfd descriptor{custody_fd, POLLIN, 0};
         int polled;
@@ -3858,51 +4004,73 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
         if (polled < 0) {
             if (custody_received)
                 return finish_post_ack_escrow(
-                    target, control, token, custody, rights, false, target_status);
-            rights.close_all();
-            return OwnedWaitResult::Error;
+                    target, control, token, custody, rights, false, true, target_status);
+            if (exact_listener_target_reaped(target, expected_target_start, target_status))
+                return OwnedWaitResult::Exited;
+            hold_listener_failure(root_lease, custody_fd);
         }
         if ((descriptor.revents & POLLIN) != 0) {
             if (custody_received)
                 return finish_post_ack_escrow(
-                    target, control, token, custody, rights, false, target_status);
-            ProcIdentity target_identity;
-            if (!read_proc(target, target_identity) || target_identity.pid != target ||
-                target_identity.ppid != getpid() || target_identity.start == 0u ||
-                target_identity.exe != target_executable ||
-                target_identity.cmdline != target_argv ||
-                !receive_exact_custody(custody_fd,
-                                       token,
-                                       target,
-                                       expected_uid,
-                                       expected_gid,
-                                       deadline,
-                                       custody,
-                                       rights) ||
-                !validate_exact_escrow(
-                    custody, rights, target_identity, expected_netns, expected_uid, expected_gid) ||
-                control_lease_lost(root_lease) || getppid() != root_broker ||
-                prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker) {
-                rights.close_all();
-                hold_pre_ack_failure(root_lease, custody_fd);
-            }
-            while (!send_exact_custody_ack(custody_fd, token, new_exact_cleanup_deadline()))
-                (void)poll(nullptr, 0, 10);
-            custody_received = true;
+                    target, control, token, custody, rights, false, true, target_status);
+            if (const auto result = accept_custody(false)) return *result;
         }
-        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             if (custody_received)
                 return finish_post_ack_escrow(
-                    target, control, token, custody, rights, false, target_status);
-            rights.close_all();
-            return OwnedWaitResult::Error;
+                    target, control, token, custody, rights, false, true, target_status);
+            if (exact_listener_target_reaped(target, expected_target_start, target_status))
+                return OwnedWaitResult::Exited;
+            hold_listener_failure(root_lease, custody_fd);
+        }
+        int status = 0;
+        errno = 0;
+        const pid_t waited = waitpid(target, &status, WNOHANG);
+        if (waited == target) {
+            target_status = status;
+            if (custody_received)
+                return finish_post_ack_escrow(
+                    target, control, token, custody, rights, true, true, target_status);
+            pollfd pending{custody_fd, POLLIN, 0};
+            int pending_result;
+            do {
+                pending_result = poll(&pending, 1, 0);
+            } while (pending_result < 0 && errno == EINTR);
+            if (pending_result > 0 && (pending.revents & POLLIN) != 0) {
+                if (const auto result = accept_custody(true)) return *result;
+            } else {
+                return OwnedWaitResult::Exited;
+            }
+        }
+        if (waited < 0 && errno != EINTR) {
+            if (custody_received)
+                return finish_post_ack_escrow(
+                    target, control, token, custody, rights, false, true, target_status);
+            hold_listener_failure(root_lease, custody_fd);
         }
     }
-    if (!custody_received) return OwnedWaitResult::Error;
-    return finish_post_ack_escrow(target, control, token, custody, rights, false, target_status);
+    if (exact_listener_failure_requires_hold(custody_received, ExactListenerWaitEvent::Deadline)) {
+        if (exact_listener_target_reaped(target, expected_target_start, target_status))
+            return OwnedWaitResult::Exited;
+        hold_listener_failure(root_lease, custody_fd);
+    }
+    return finish_post_ack_escrow(
+        target, control, token, custody, rights, false, true, target_status);
 }
 
 static bool exact_adoption_fault_self_check(std::string& error) {
+    if (!exact_listener_failure_requires_hold(false, ExactListenerWaitEvent::RootLoss) ||
+        !exact_listener_failure_requires_hold(false, ExactListenerWaitEvent::Deadline) ||
+        exact_listener_failure_requires_hold(true, ExactListenerWaitEvent::RootLoss)) {
+        error = "exact pre-custody root-loss/deadline hold decision failed";
+        return false;
+    }
+    if (exact_target_numeric_signal_allowed(-1, ECHILD, true) ||
+        exact_target_numeric_signal_allowed(0, 0, false) ||
+        !exact_target_numeric_signal_allowed(0, 0, true)) {
+        error = "exact Target waitpid-error signalling decision failed";
+        return false;
+    }
     const pid_t child = fork();
     if (child < 0) {
         error = "exact adoption PID-start self-check fork failed";
@@ -3933,6 +4101,14 @@ static bool exact_adoption_fault_self_check(std::string& error) {
     }
     ExactCustodyRecord correct = wrong;
     correct.child_start = identity.start;
+    if (!exact_custody_child_identity_matches(
+            identity, correct, getpid(), identity.netns, identity.uid, identity.gid) ||
+        exact_custody_child_identity_matches(
+            identity, correct, getpid() + 1, identity.netns, identity.uid, identity.gid)) {
+        (void)kill(child, SIGKILL);
+        error = "exact Target-exit/adopted-child identity branch failed";
+        return false;
+    }
     if (!wait_reap_adopted_exact(correct, rights, new_exact_cleanup_deadline(), adopted) ||
         !adopted) {
         (void)kill(child, SIGKILL);
@@ -4050,13 +4226,23 @@ static int dropped_broker_main(const char* executable,
     }
     int control = -1;
     OwnedChildCleanup target_cleanup(target, &control);
+    u64 listener_target_start = 0u;
     // These are all downstream leases owned by this dropped broker.  Close
     // them before reaping on every pre-launch return so a blocked target gets
     // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
     target_cleanup.add_downstream_fd(&launch_pipe[1]);
     target_cleanup.add_downstream_fd(&trace_pipe[0]);
     if (listener_scenario) target_cleanup.add_downstream_fd(&custody_pair[0]);
-    if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker)) return 29;
+    if (listener_scenario) {
+        ProcIdentity spawned_target;
+        if (!read_proc(target, spawned_target, false) || spawned_target.pid != target ||
+            spawned_target.ppid != getpid() || spawned_target.start == 0u)
+            return 28;
+        listener_target_start = spawned_target.start;
+    }
+    if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker) ||
+        (listener_scenario && (prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker)))
+        return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
     Report dropped_report;
@@ -4121,6 +4307,7 @@ static int dropped_broker_main(const char* executable,
         strcmp(scenario, "owned-wait-term-ignore") == 0 ? kCleanupMs : kBrokerDeadlineMs;
     const OwnedWaitResult target_wait_result =
         listener_scenario ? wait_listener_target_bounded(target,
+                                                         listener_target_start,
                                                          executable,
                                                          target_argv,
                                                          root_broker,
@@ -8213,6 +8400,7 @@ static bool guard_protocol_self_check(std::string& error) {
     ExactSettledRecord settled;
     settled.target_pid = 114u;
     settled.child_pid = 101u;
+    settled.child_start = 102u;
     settled.guard_inode = 106u;
     settled.adopted = settled.reaped = settled.listener_absent = settled.temps_absent =
         settled.guard_closed = 1u;
@@ -8220,7 +8408,7 @@ static bool guard_protocol_self_check(std::string& error) {
     std::vector<unsigned char> settled_payload = encode_exact_settled(settled);
     if (!decode_exact_settled(settled_payload, decoded_settled) ||
         decoded_settled.target_pid != settled.target_pid || decoded_settled.adopted != 1u ||
-        decoded_settled.guard_closed != 1u) {
+        decoded_settled.child_start != settled.child_start || decoded_settled.guard_closed != 1u) {
         error = "canonical exact failure-settled codec failed";
         return false;
     }
@@ -8240,6 +8428,32 @@ static bool guard_protocol_self_check(std::string& error) {
         error = "overflow exact failure-settled state was accepted";
         return false;
     }
+    settled.guard_closed = 1u;
+    ExactFailureReport settled_failure;
+    settled_failure.escrow_required = 1u;
+    settled_failure.child_pid = settled.child_pid;
+    settled_failure.child_start = settled.child_start;
+    if (!exact_settlement_matches_failure(settled, settled_failure)) {
+        error = "matching exact failure settlement was rejected";
+        return false;
+    }
+    ++settled.child_start;
+    if (exact_settlement_matches_failure(settled, settled_failure)) {
+        error = "mismatched exact failure settlement PID-start was accepted";
+        return false;
+    }
+    const int current_directory = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const std::string absent_temp = ".rut-exact-absent-" + std::to_string(getpid());
+    if (current_directory < 0 ||
+        validate_escrow_temp(
+            current_directory, absent_temp.c_str(), 1u, 1u, getuid(), getgid(), false) ||
+        !validate_escrow_temp(
+            current_directory, absent_temp.c_str(), 1u, 1u, getuid(), getgid(), true)) {
+        if (current_directory >= 0) close(current_directory);
+        error = "exact live/reaped temporary absence policy failed";
+        return false;
+    }
+    close(current_directory);
     return true;
 }
 
