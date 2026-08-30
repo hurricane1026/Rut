@@ -97,16 +97,20 @@ AnonymousLogCapture::AnonymousLogCapture(AnonymousLogCapture&& other) noexcept
       max_bytes_(other.max_bytes_),
       identity_(other.identity_),
       cleanup_state_(other.cleanup_state_),
+      identity_known_(other.identity_known_),
       pread_for_testing_(other.pread_for_testing_),
       close_for_testing_(other.close_for_testing_),
       after_final_seal_for_testing_(other.after_final_seal_for_testing_),
+      creation_failure_for_testing_(other.creation_failure_for_testing_),
       settled_(other.settled_) {
     other.fd_ = -1;
     other.max_bytes_ = 0u;
     other.identity_ = {};
+    other.identity_known_ = false;
     other.pread_for_testing_ = nullptr;
     other.close_for_testing_ = nullptr;
     other.after_final_seal_for_testing_ = nullptr;
+    other.creation_failure_for_testing_ = CreationFailurePoint::None;
     other.settled_ = false;
 }
 
@@ -139,8 +143,7 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
         fail(diagnostic, FailurePhase::Argument, EINVAL);
         return false;
     }
-    if (capture.cleanup_state_ != nullptr && capture.cleanup_state_->attempted &&
-        !capture.cleanup_state_->succeeded) {
+    if (capture.cleanup_state_ != nullptr && capture.cleanup_state_->attempted) {
         fail(diagnostic, FailurePhase::Close, EALREADY);
         return false;
     }
@@ -160,10 +163,13 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
     // Ownership starts at successful memfd_create. Every later failure closes
     // exactly once, without retrying an uncertain Linux close result.
     capture.fd_ = created;
+    capture.identity_known_ = false;
     capture.max_bytes_ = max_bytes;
     capture.pread_for_testing_ = hooks == nullptr ? nullptr : hooks->pread;
     capture.close_for_testing_ = hooks == nullptr ? nullptr : hooks->close;
     capture.after_final_seal_for_testing_ = hooks == nullptr ? nullptr : hooks->after_final_seal;
+    capture.creation_failure_for_testing_ =
+        hooks == nullptr ? CreationFailurePoint::None : hooks->creation_failure;
     capture.cleanup_state_ = std::make_shared<CleanupState>();
     capture.settled_ = false;
 
@@ -175,12 +181,18 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
         return false;
     };
 
+    if (capture.creation_failure_for_testing_ == CreationFailurePoint::Fchmod)
+        return fail_created(FailurePhase::Identity, EIO);
     if (fchmod(capture.fd_, 0600) != 0) return fail_created(FailurePhase::Identity, errno);
     int validation_error = 0;
+    if (capture.creation_failure_for_testing_ == CreationFailurePoint::GetFd)
+        return fail_created(FailurePhase::Identity, EIO);
     if (!valid_fd_flags(capture.fd_, validation_error))
         return fail_created(FailurePhase::Identity, validation_error);
 
     struct stat status{};
+    if (capture.creation_failure_for_testing_ == CreationFailurePoint::Fstat)
+        return fail_created(FailurePhase::Identity, EIO);
     if (fstat(capture.fd_, &status) != 0) return fail_created(FailurePhase::Identity, errno);
     if (!S_ISREG(status.st_mode) || status.st_dev == 0 || status.st_ino == 0 ||
         (status.st_mode & 07777) != 0600 || status.st_uid != getuid() ||
@@ -188,6 +200,7 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
         return fail_created(FailurePhase::Identity, EINVAL);
     }
     capture.identity_ = make_identity(status);
+    capture.identity_known_ = true;
 
     if (ftruncate(capture.fd_, static_cast<off_t>(max_bytes)) != 0)
         return fail_created(FailurePhase::Capacity, errno);
@@ -344,13 +357,15 @@ bool AnonymousLogCapture::close_owned(CloseForTesting operation, Diagnostic& dia
     }
     const int owned = fd_;
     int identity_error = 0;
-    if (!fd_matches_object(owned, identity_, identity_error)) {
+    if (identity_known_ && !fd_matches_object(owned, identity_, identity_error)) {
         fd_ = -1;
+        identity_known_ = false;
         fail(diagnostic, FailurePhase::Close, identity_error);
         record_cleanup(false, diagnostic);
         return false;
     }
     fd_ = -1;
+    identity_known_ = false;
     errno = 0;
     const int result = operation == nullptr ? ::close(owned) : operation(owned);
     if (result == 0) {

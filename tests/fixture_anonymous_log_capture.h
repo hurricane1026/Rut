@@ -51,15 +51,29 @@ using PreadForTesting = ssize_t (*)(int fd, void* buffer, std::size_t count, off
 using CloseForTesting = int (*)(int fd);
 using AfterFinalSealForTesting = void (*)(int fd);
 
+enum class CreationFailurePoint : std::uint8_t {
+    None,
+    Fchmod,
+    GetFd,
+    Fstat,
+};
+
 struct HooksForTesting {
     PreadForTesting pread = nullptr;
     CloseForTesting close = nullptr;
     AfterFinalSealForTesting after_final_seal = nullptr;
+    CreationFailurePoint creation_failure = CreationFailurePoint::None;
 };
 
-// A move-only, anonymous bounded stdout/stderr sink. The descriptor returned
-// by descriptor() is one shared open-file-description: dup2() in a child can
-// attach both stdout and stderr, and sequential writes advance one offset.
+// A move-only, anonymous bounded stdout/stderr sink. Ownership is exclusive to
+// the parent object and is not thread-safe: same-process code must not
+// concurrently close, dup2, close_range, or reuse the owner numeric FD. The
+// descriptor() result is borrowed. An ordinary fork child receives a separate
+// FD table and may dup2 its inherited copy onto stdout/stderr. Live snapshots
+// may observe a prefix while writers are active; settle()/close() are caller
+// operations after every writer has settled/reaped. The close identity guard
+// detects a prior numeric-FD replacement, but is not atomic cross-thread race
+// protection.
 class AnonymousLogCapture {
 public:
     AnonymousLogCapture();
@@ -120,9 +134,11 @@ private:
     std::size_t max_bytes_ = 0u;
     Identity identity_;
     std::shared_ptr<CleanupState> cleanup_state_;
+    bool identity_known_ = false;
     PreadForTesting pread_for_testing_ = nullptr;
     CloseForTesting close_for_testing_ = nullptr;
     AfterFinalSealForTesting after_final_seal_for_testing_ = nullptr;
+    CreationFailurePoint creation_failure_for_testing_ = CreationFailurePoint::None;
     bool settled_ = false;
 };
 

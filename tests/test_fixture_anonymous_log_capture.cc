@@ -157,6 +157,8 @@ ssize_t partial_read(int fd, void* buffer, std::size_t count, off_t offset) {
 
 struct CloseInjection {
     bool called = false;
+    unsigned calls = 0u;
+    int fd = -1;
 };
 
 CloseInjection* active_close_injection = nullptr;
@@ -166,6 +168,15 @@ int uncertain_close(int fd) {
     (void)fd;
     errno = EINTR;
     return -1;
+}
+
+int recording_close(int fd) {
+    if (active_close_injection != nullptr) {
+        active_close_injection->called = true;
+        ++active_close_injection->calls;
+        active_close_injection->fd = fd;
+    }
+    return close(fd);
 }
 
 void mutate_after_final_seal(int fd) {
@@ -198,6 +209,43 @@ bool identity_and_initial_seals_test() {
            check(flags >= 0 && (flags & FD_CLOEXEC) != 0, "capture FD is not CLOEXEC") &&
            check(seals == (F_SEAL_GROW | F_SEAL_SHRINK), "initial seals are not exact") &&
            check(invalid_zero && invalid_wide, "invalid capture bounds were accepted");
+}
+
+bool creation_failure_cleanup_test() {
+    const std::array<capture::CreationFailurePoint, 3> points = {
+        capture::CreationFailurePoint::Fchmod,
+        capture::CreationFailurePoint::GetFd,
+        capture::CreationFailurePoint::Fstat,
+    };
+    for (const capture::CreationFailurePoint point : points) {
+        capture::AnonymousLogCapture capture_under_test;
+        capture::Diagnostic diagnostic;
+        CloseInjection close_record;
+        active_close_injection = &close_record;
+        const capture::HooksForTesting hooks{nullptr, recording_close, nullptr, point};
+        errno = EAGAIN;
+        const bool created = capture::AnonymousLogCapture::create_with_hooks_for_testing(
+            64u, hooks, capture_under_test, diagnostic);
+        active_close_injection = nullptr;
+        const auto state = capture_under_test.cleanup_state();
+        const bool raw_fd_closed =
+            close_record.fd >= 0 && (fcntl(close_record.fd, F_GETFD) < 0 && errno == EBADF);
+        const bool failed_and_clean =
+            !created && diagnostic.phase == capture::FailurePhase::Identity &&
+            diagnostic.error_number == EIO && !capture_under_test.active() && raw_fd_closed &&
+            close_record.called && close_record.calls == 1u && state && state->attempted &&
+            state->succeeded;
+        const auto retained_state = state;
+        const bool reuse_rejected =
+            !capture::AnonymousLogCapture::create(64u, capture_under_test, diagnostic) &&
+            diagnostic.phase == capture::FailurePhase::Close &&
+            capture_under_test.cleanup_state() == retained_state && state->attempted &&
+            state->succeeded;
+        if (!check(failed_and_clean && close_record.calls == 1u && reuse_rejected,
+                   "creation-stage failure lost cleanup ownership/evidence"))
+            return false;
+    }
+    return true;
 }
 
 bool fork_stdout_stderr_and_snapshot_test() {
@@ -547,9 +595,10 @@ bool close_move_and_no_path_test() {
 }  // namespace
 
 int main() {
-    const bool ok = identity_and_initial_seals_test() && fork_stdout_stderr_and_snapshot_test() &&
-                    limit_and_settlement_test() && empty_eintr_and_validation_test() &&
-                    mutation_and_duplicate_settlement_test() && close_move_and_no_path_test();
+    const bool ok = identity_and_initial_seals_test() && creation_failure_cleanup_test() &&
+                    fork_stdout_stderr_and_snapshot_test() && limit_and_settlement_test() &&
+                    empty_eintr_and_validation_test() && mutation_and_duplicate_settlement_test() &&
+                    close_move_and_no_path_test();
     if (!ok) return 1;
     std::puts("PASS: #377 bounded anonymous log capture");
     return 0;
