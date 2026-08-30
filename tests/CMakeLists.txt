@@ -92,6 +92,19 @@ target_link_libraries(test_fixture_wildcard_source_lease PRIVATE fixture_wildcar
 add_test(NAME test_fixture_wildcard_source_lease COMMAND test_fixture_wildcard_source_lease)
 set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# Pure #377 paused direct-child wildcard-attempt lease. The source is borrowed;
+# this helper owns only its distinct log artifact and one direct child.
+add_library(fixture_wildcard_attempt_child STATIC fixture_wildcard_attempt_child.cc)
+target_include_directories(fixture_wildcard_attempt_child PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_wildcard_attempt_child PUBLIC
+    fixture_wildcard_source_lease fixture_worker_protocol)
+
+add_executable(test_fixture_wildcard_attempt_child test_fixture_wildcard_attempt_child.cc)
+target_link_libraries(test_fixture_wildcard_attempt_child PRIVATE fixture_wildcard_attempt_child)
+add_test(NAME test_fixture_wildcard_attempt_child COMMAND test_fixture_wildcard_attempt_child)
+set_tests_properties(test_fixture_wildcard_attempt_child PROPERTIES
+    LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
 if(RUT_ENABLE_JIT)
     add_executable(test_fixture_privileged_listener_loader
         test_fixture_privileged_listener_loader.cc)
