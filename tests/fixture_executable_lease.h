@@ -132,6 +132,7 @@ public:
 
     bool active() const { return active_; }
     int observation_fd() const { return observation_fd_; }
+    const std::string& canonical_path() const { return path_; }
     const ExecutableIdentity& identity() const { return identity_; }
     std::shared_ptr<const CleanupState> cleanup_state() const { return cleanup_state_; }
 
