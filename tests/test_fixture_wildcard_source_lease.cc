@@ -1,6 +1,7 @@
 #include "fixture_wildcard_source_lease.h"
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -122,6 +123,55 @@ bool replacement_intact(int directory, const char* name, const struct stat& expe
            current.st_dev == expected.st_dev && current.st_ino == expected.st_ino;
 }
 
+struct RemovalSwap {
+    bool succeeded = false;
+    struct stat replacement{};
+};
+
+void replace_at_removal_boundary(int directory, const char* name, void* opaque) {
+    auto& swap = *static_cast<RemovalSwap*>(opaque);
+    swap.succeeded = renameat(directory, name, directory, "boundary-original.rut") == 0 &&
+                     write_all_at(directory, name, expected_source(), O_CREAT | O_EXCL) &&
+                     fstatat(directory, name, &swap.replacement, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+struct FifoSwap {
+    bool succeeded = false;
+    struct stat replacement{};
+};
+
+void replace_before_reopen_with_fifo(int directory, const char* name, void* opaque) {
+    auto& swap = *static_cast<FifoSwap*>(opaque);
+    swap.succeeded = renameat(directory, name, directory, "fifo-original.rut") == 0 &&
+                     mkfifoat(directory, name, 0600) == 0 &&
+                     fstatat(directory, name, &swap.replacement, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+struct PreadInjection {
+    std::size_t expected_size = 0u;
+    unsigned data_interruptions = 0u;
+    unsigned trailing_interruptions = 0u;
+};
+
+PreadInjection* active_pread_injection = nullptr;
+
+ssize_t injecting_pread(int fd, void* buffer, std::size_t count, off_t offset) {
+    if (active_pread_injection != nullptr && offset == 0 &&
+        active_pread_injection->data_interruptions == 0u) {
+        ++active_pread_injection->data_interruptions;
+        errno = EINTR;
+        return -1;
+    }
+    if (active_pread_injection != nullptr &&
+        offset == static_cast<off_t>(active_pread_injection->expected_size) &&
+        active_pread_injection->trailing_interruptions == 0u) {
+        ++active_pread_injection->trailing_interruptions;
+        errno = EINTR;
+        return -1;
+    }
+    return pread(fd, buffer, count, offset);
+}
+
 bool canonical_creation_test() {
     PrivateDirectory directory;
     source_lease::WildcardAttemptSourceLease lease;
@@ -166,6 +216,115 @@ bool canonical_creation_test() {
     return ok && check(fstatat(directory.fd, kBasename, &absent, AT_SYMLINK_NOFOLLOW) < 0 &&
                            errno == ENOENT,
                        "canonical source pathname remained after removal");
+}
+
+bool embedded_nul_rejection_test() {
+    PrivateDirectory directory;
+    if (!directory.create()) return check(false, "embedded-NUL directory setup failed");
+
+    source_lease::Diagnostic diagnostic;
+    source_lease::WildcardAttemptSourceLease path_lease;
+    const std::string nul_path = directory.path + std::string("\0suffix", 7u);
+    const bool path_rejected =
+        !source_lease::WildcardAttemptSourceLease::create(
+            directory.fd, nul_path, kBasename, kPlan, path_lease, diagnostic) &&
+        diagnostic.phase == source_lease::FailurePhase::Argument &&
+        diagnostic.error_number == EINVAL;
+
+    source_lease::WildcardAttemptSourceLease basename_lease;
+    const std::string nul_basename("wildcard\0replacement.rut", 24u);
+    const bool basename_rejected =
+        !source_lease::WildcardAttemptSourceLease::create(
+            directory.fd, directory.path, nul_basename, kPlan, basename_lease, diagnostic) &&
+        diagnostic.phase == source_lease::FailurePhase::Argument &&
+        diagnostic.error_number == EINVAL;
+
+    struct stat absent{};
+    errno = 0;
+    return check(path_rejected && basename_rejected &&
+                     fstatat(directory.fd, kBasename, &absent, AT_SYMLINK_NOFOLLOW) < 0 &&
+                     errno == ENOENT,
+                 "embedded NUL path or basename was not rejected before creation");
+}
+
+bool removal_boundary_replacement_test() {
+    PrivateDirectory directory;
+    source_lease::WildcardAttemptSourceLease lease;
+    source_lease::Diagnostic diagnostic;
+    if (!directory.create() ||
+        !source_lease::WildcardAttemptSourceLease::create(
+            directory.fd, directory.path, kBasename, kPlan, lease, diagnostic))
+        return check(false, "removal-boundary replacement setup failed");
+
+    RemovalSwap swap;
+    const bool refused =
+        !lease.remove_with_hook_for_testing(replace_at_removal_boundary, &swap, diagnostic);
+    const bool replacement_preserved =
+        swap.succeeded && diagnostic.phase == source_lease::FailurePhase::Quarantine &&
+        diagnostic.error_number == ESTALE &&
+        replacement_intact(directory.fd, kBasename, swap.replacement);
+    if (unlinkat(directory.fd, kBasename, 0) != 0 ||
+        renameat(directory.fd, "boundary-original.rut", directory.fd, kBasename) != 0)
+        return check(false, "removal-boundary replacement restoration failed");
+    return check(refused && replacement_preserved,
+                 "atomic quarantine deleted or accepted the causal replacement") &&
+           check(lease.revalidate(diagnostic) && lease.remove(diagnostic),
+                 "restored causal-removal source did not clean up exactly");
+}
+
+bool fifo_reopen_is_bounded_test() {
+    PrivateDirectory directory;
+    StderrCapture capture;
+    if (!directory.create() || !capture.start())
+        return check(false, "FIFO reopen capture setup failed");
+
+    FifoSwap swap;
+    auto cleanup = std::shared_ptr<const source_lease::CleanupState>{};
+    bool rejected = false;
+    {
+        source_lease::WildcardAttemptSourceLease lease;
+        source_lease::Diagnostic diagnostic;
+        const source_lease::SourceLeaseHooksForTesting hooks{replace_before_reopen_with_fifo,
+                                                             &swap};
+        const auto started = std::chrono::steady_clock::now();
+        const bool created =
+            source_lease::WildcardAttemptSourceLease::create_with_hooks_for_testing(
+                directory.fd, directory.path, kBasename, kPlan, hooks, lease, diagnostic);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        cleanup = lease.cleanup_state();
+        rejected = !created && swap.succeeded && S_ISFIFO(swap.replacement.st_mode) &&
+                   elapsed < std::chrono::seconds(1) && cleanup && cleanup->attempted &&
+                   !cleanup->succeeded &&
+                   replacement_intact(directory.fd, kBasename, swap.replacement);
+        if (unlinkat(directory.fd, kBasename, 0) != 0 ||
+            unlinkat(directory.fd, "fifo-original.rut", 0) != 0)
+            rejected = false;
+    }
+    std::string captured;
+    const bool captured_ok = capture.finish(captured);
+    return check(rejected && captured_ok &&
+                     captured.find("#377 wildcard source lease destructor") != std::string::npos,
+                 "FIFO replacement did not reject promptly with observable cleanup uncertainty");
+}
+
+bool pread_eintr_retry_test() {
+    PrivateDirectory directory;
+    source_lease::WildcardAttemptSourceLease lease;
+    source_lease::Diagnostic diagnostic;
+    if (!directory.create() ||
+        !source_lease::WildcardAttemptSourceLease::create(
+            directory.fd, directory.path, kBasename, kPlan, lease, diagnostic))
+        return check(false, "pread EINTR setup failed");
+
+    PreadInjection injection{expected_source().size(), 0u, 0u};
+    active_pread_injection = &injection;
+    const bool read = source_lease::read_exact_bytes_for_testing(
+        lease.descriptor(), expected_source(), injecting_pread, diagnostic);
+    active_pread_injection = nullptr;
+    return check(
+               read && injection.data_interruptions == 1u && injection.trailing_interruptions == 1u,
+               "shared exact pread helper did not retry data and trailing EINTR") &&
+           check(lease.remove(diagnostic), "pread EINTR source cleanup failed");
 }
 
 bool rename_replacement_test() {
@@ -369,7 +528,9 @@ bool detached_lease_test() {
 }  // namespace
 
 int main() {
-    const bool ok = canonical_creation_test() && rename_replacement_test() &&
+    const bool ok = canonical_creation_test() && embedded_nul_rejection_test() &&
+                    removal_boundary_replacement_test() && fifo_reopen_is_bounded_test() &&
+                    pread_eintr_retry_test() && rename_replacement_test() &&
                     in_place_bytes_test() && unlink_recreate_and_removal_refusal_test() &&
                     symlink_replacement_test() && metadata_and_hardlink_test() &&
                     length_mutation_test(true) && length_mutation_test(false) &&
