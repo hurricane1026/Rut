@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define RUT_IOURING_GATE_MAGIC UINT64_C(0x525554494F475431)
-#define RUT_IOURING_GATE_VERSION UINT32_C(4)
+#define RUT_IOURING_GATE_VERSION UINT32_C(5)
 #define RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY UINT32_C(4)
 
 enum rut_iouring_gate_error {
@@ -84,6 +84,10 @@ struct rut_iouring_gate {
     uint32_t connect_attempt_count;
     uint32_t connect_journal_overflow;
     uint32_t connect_journal_duplicate;
+    /* Persistent causal failure evidence: each reached phase publishes exactly once. */
+    uint32_t duplicate_sq_injection_count;
+    uint32_t ready_mask_mutation_count;
+    uint32_t ready_mask_restoration_count;
     struct rut_iouring_gate_connect_attempt
         connect_attempts[RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY];
     uint32_t identity_mutex_initialized;
@@ -178,7 +182,7 @@ static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
 }
 
 #if defined(__cplusplus) && defined(__x86_64__)
-static_assert(sizeof(struct rut_iouring_gate) == 1360);
+static_assert(sizeof(struct rut_iouring_gate) == 1368);
 #elif defined(__x86_64__)
-_Static_assert(sizeof(struct rut_iouring_gate) == 1360, "RUT io_uring gate layout drift");
+_Static_assert(sizeof(struct rut_iouring_gate) == 1368, "RUT io_uring gate layout drift");
 #endif
