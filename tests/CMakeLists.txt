@@ -142,6 +142,28 @@ set_tests_properties(test_fixture_executable_lease PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30)
 
+# Pure #377 executable-OFD child handoff and bounded exec observation.  This
+# fixture launches no complete RUT session, listener, broker, or HTTP flow.
+add_library(fixture_executable_exec_handoff STATIC
+    fixture_executable_exec_handoff.cc)
+target_include_directories(fixture_executable_exec_handoff PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_executable_exec_handoff PUBLIC
+    fixture_executable_lease
+    fixture_wildcard_paused_child_lease
+    fixture_worker_protocol)
+
+add_executable(test_fixture_executable_exec_handoff
+    test_fixture_executable_exec_handoff.cc)
+target_link_libraries(test_fixture_executable_exec_handoff PRIVATE
+    fixture_executable_exec_handoff)
+add_test(NAME test_fixture_executable_exec_handoff
+    COMMAND test_fixture_executable_exec_handoff)
+set_tests_properties(test_fixture_executable_exec_handoff PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # #377 declaration-only paused-child descriptor preparation. This composes the
 # independently owned source, capture and child leases only for child dup2/FD
 # closure; release remains inert and no runtime/session is launched.

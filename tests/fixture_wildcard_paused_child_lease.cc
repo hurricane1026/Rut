@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -14,6 +15,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/kcmp.h>
+#include <linux/limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -358,6 +360,10 @@ void child_main(int ready_fd,
                 unsigned int post_release_delay_ms,
                 bool prepared,
                 int output_fd,
+                int null_input_fd,
+                int executable_fd,
+                int exec_status_fd,
+                ChildContinuation continuation,
                 const int* inherited_fds,
                 std::size_t inherited_fd_count,
                 int injected_close_failure_fd,
@@ -365,12 +371,14 @@ void child_main(int ready_fd,
                 volatile int* close_attempt_evidence) {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(120);
     if (prepared) {
-        if (dup2(output_fd, STDOUT_FILENO) != STDOUT_FILENO ||
+        if ((null_input_fd >= 0 && dup2(null_input_fd, STDIN_FILENO) != STDIN_FILENO) ||
+            dup2(output_fd, STDOUT_FILENO) != STDOUT_FILENO ||
             dup2(output_fd, STDERR_FILENO) != STDERR_FILENO)
             _exit(125);
         for (std::size_t index = 0; index < inherited_fd_count; ++index) {
             const int fd = inherited_fds[index];
-            if (fd < 3 || fd == ready_fd || fd == release_fd || fd == retained_fd_for_testing)
+            if (fd < 3 || fd == ready_fd || fd == release_fd || fd == executable_fd ||
+                fd == exec_status_fd || fd == retained_fd_for_testing)
                 continue;
             if (fd == injected_close_failure_fd) {
                 const int close_result = close(fd);  // Exactly one real attempt.
@@ -386,10 +394,28 @@ void child_main(int ready_fd,
         const int output_flags = fcntl(STDOUT_FILENO, F_GETFD);
         const int error_flags = fcntl(STDERR_FILENO, F_GETFD);
         const int release_flags = fcntl(release_fd, F_GETFD);
+        const int executable_flags = executable_fd < 0 ? FD_CLOEXEC : fcntl(executable_fd, F_GETFD);
+        const int status_writer_flags =
+            exec_status_fd < 0 ? FD_CLOEXEC : fcntl(exec_status_fd, F_GETFD);
         if (input_flags < 0 || output_flags < 0 || error_flags < 0 || release_flags < 0 ||
-            (output_flags & FD_CLOEXEC) != 0 || (error_flags & FD_CLOEXEC) != 0 ||
-            (release_flags & FD_CLOEXEC) == 0)
+            executable_flags < 0 || status_writer_flags < 0 || (output_flags & FD_CLOEXEC) != 0 ||
+            (error_flags & FD_CLOEXEC) != 0 || (input_flags & FD_CLOEXEC) != 0 ||
+            (release_flags & FD_CLOEXEC) == 0 || (executable_flags & FD_CLOEXEC) == 0 ||
+            (status_writer_flags & FD_CLOEXEC) == 0)
             _exit(127);
+        if (continuation.executable_mutation != 0) {
+            if (continuation.executable_mutation == 3) {
+                if (fcntl(executable_fd, F_SETFD, 0) != 0) _exit(133);
+            } else {
+                const char* replacement_path =
+                    continuation.executable_mutation == 1 ? continuation.argv0.data() : "/dev/null";
+                const int replacement = open(replacement_path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+                if (replacement < 0 ||
+                    dup3(replacement, executable_fd, O_CLOEXEC) != executable_fd ||
+                    close(replacement) != 0)
+                    _exit(133);
+            }
+        }
     }
     if (delay_ms != 0) {
         timespec delay{static_cast<time_t>(delay_ms / 1000u),
@@ -426,7 +452,55 @@ void child_main(int ready_fd,
         while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
         }
     }
-    _exit(release == kRelease ? 0 : 124);
+    if (release != kRelease) _exit(124);
+    if (continuation.kind == ChildContinuationKind::Execveat) {
+        const auto report = [&](unsigned char phase, int error_number) {
+            unsigned char frame[16] = {'R', 'E', 'X', '1', 1, phase, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            const unsigned int value =
+                static_cast<unsigned int>(error_number == 0 ? EIO : error_number);
+            frame[8] = static_cast<unsigned char>(value & 0xffu);
+            frame[9] = static_cast<unsigned char>((value >> 8u) & 0xffu);
+            frame[10] = static_cast<unsigned char>((value >> 16u) & 0xffu);
+            frame[11] = static_cast<unsigned char>((value >> 24u) & 0xffu);
+            (void)write(exec_status_fd, frame, sizeof(frame));
+        };
+        if (continuation.status_injection != 0) {
+            unsigned char frame[32] = {
+                'R', 'E', 'X', '1', 1, 2, 0, 0, ENOEXEC, 0, 0, 0, 0, 0, 0, 0};
+            if (continuation.status_injection == 2) frame[0] = 'X';
+            const std::size_t count =
+                continuation.status_injection == 1                                         ? 8u
+                : continuation.status_injection >= 3 && continuation.status_injection <= 4 ? 32u
+                                                                                           : 16u;
+            if (continuation.status_injection == 3)
+                std::memcpy(frame + 16, "trailing-garbage!", 16);
+            if (continuation.status_injection == 4) std::memcpy(frame + 16, frame, 16);
+            if (continuation.status_injection == 6) frame[4] = 2;
+            if (continuation.status_injection == 7) frame[5] = 3;
+            if (continuation.status_injection == 8) frame[6] = 1;
+            if (continuation.status_injection == 9) frame[8] = 0;
+            (void)write(exec_status_fd, frame, count);
+            if (continuation.status_injection == 5) {
+                for (;;) pause();
+            }
+            _exit(132);
+        }
+        if (continuation.inject_pre_exec_failure) {
+            report(1u, EIO);
+            _exit(130);
+        }
+        char* argv[] = {continuation.argv0.data(), nullptr};
+        char* environment[] = {nullptr};
+#ifdef SYS_execveat
+        syscall(SYS_execveat, executable_fd, "", argv, environment, AT_EMPTY_PATH);
+        const int exec_error = errno;
+#else
+        const int exec_error = ENOSYS;
+#endif
+        report(2u, exec_error);
+        _exit(131);
+    }
+    _exit(0);
 }
 
 }  // namespace
@@ -452,11 +526,21 @@ PausedChildLease::~PausedChildLease() {
         if (result == child_pid_) {
             child_reaped_ = true;
             reaped = true;
+            if (settlement_) {
+                settlement_->terminal = true;
+                settlement_->reaped = true;
+                settlement_->wait_status = child_status_;
+            }
         } else if (result < 0 && errno == ECHILD) {
             // Another bounded owner may already have reaped this direct
             // child. There is no child left to signal or wait for.
             child_reaped_ = true;
             reaped = true;
+            if (settlement_) {
+                settlement_->terminal = true;
+                settlement_->reaped = false;
+                settlement_->error_number = ECHILD;
+            }
         } else if (result < 0) {
             (void)close_once(release_fd_, diagnostic);
             do {
@@ -464,6 +548,12 @@ PausedChildLease::~PausedChildLease() {
             } while (result < 0 && errno == EINTR);
             child_reaped_ = result == child_pid_;
             reaped = child_reaped_;
+            if (settlement_) {
+                settlement_->terminal = result == child_pid_ || (result < 0 && errno == ECHILD);
+                settlement_->reaped = result == child_pid_;
+                settlement_->wait_status = child_status_;
+                settlement_->error_number = result < 0 ? errno : 0;
+            }
         } else if (result == 0) {
             const bool authority_valid =
                 valid_pidfd_unbounded(
@@ -475,6 +565,11 @@ PausedChildLease::~PausedChildLease() {
                 } while (result < 0 && errno == EINTR);
                 reaped = result == child_pid_;
                 child_reaped_ = reaped;
+                if (settlement_) {
+                    settlement_->terminal = reaped;
+                    settlement_->reaped = reaped;
+                    settlement_->wait_status = child_status_;
+                }
             } else {
                 (void)close_once(release_fd_, diagnostic);  // EOF is the safe fallback.
                 do {
@@ -482,6 +577,11 @@ PausedChildLease::~PausedChildLease() {
                 } while (result < 0 && errno == EINTR);
                 reaped = result == child_pid_;
                 child_reaped_ = reaped;
+                if (settlement_) {
+                    settlement_->terminal = reaped;
+                    settlement_->reaped = reaped;
+                    settlement_->wait_status = child_status_;
+                }
             }
         }
     }
@@ -569,6 +669,43 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
             fail(diagnostic, FailurePhase::Argument, EINVAL);
             return false;
         }
+        const bool exec_mode = plan->continuation.kind == ChildContinuationKind::Execveat;
+        if (exec_mode) {
+            if (plan->null_input_fd <= 2 || plan->executable_fd <= 2 || plan->exec_status_fd <= 2 ||
+                plan->exec_status_authority_fd <= 2 || plan->continuation.argv0.front() != '/' ||
+                plan->continuation.argv0.back() != '\0' ||
+                std::find(plan->continuation.argv0.begin(), plan->continuation.argv0.end(), '\0') ==
+                    plan->continuation.argv0.end()) {
+                fail(diagnostic, FailurePhase::Argument, EINVAL);
+                return false;
+            }
+            const int input_fd_flags = fcntl(plan->null_input_fd, F_GETFD);
+            const int input_status = fcntl(plan->null_input_fd, F_GETFL);
+            const int executable_flags = fcntl(plan->executable_fd, F_GETFD);
+            const int executable_status = fcntl(plan->executable_fd, F_GETFL);
+            const int writer_flags = fcntl(plan->exec_status_fd, F_GETFD);
+            const int writer_status = fcntl(plan->exec_status_fd, F_GETFL);
+            const int writer_authority_flags = fcntl(plan->exec_status_authority_fd, F_GETFD);
+            struct stat input_stat{};
+            struct stat null_stat{};
+            if (input_fd_flags < 0 || input_status < 0 || executable_flags < 0 ||
+                executable_status < 0 || writer_flags < 0 || writer_status < 0 ||
+                fstat(plan->null_input_fd, &input_stat) != 0 ||
+                stat("/dev/null", &null_stat) != 0 || !S_ISCHR(input_stat.st_mode) ||
+                input_stat.st_dev != null_stat.st_dev || input_stat.st_ino != null_stat.st_ino ||
+                input_stat.st_rdev != null_stat.st_rdev || (input_fd_flags & FD_CLOEXEC) == 0 ||
+                (input_status & O_ACCMODE) != O_RDONLY || (executable_flags & FD_CLOEXEC) == 0 ||
+                writer_authority_flags < 0 || (writer_authority_flags & FD_CLOEXEC) == 0 ||
+                (executable_status & O_PATH) != O_PATH || (writer_flags & FD_CLOEXEC) == 0 ||
+                (writer_status & O_ACCMODE) == O_RDONLY) {
+                fail(diagnostic, FailurePhase::Argument, errno == 0 ? EINVAL : errno);
+                return false;
+            }
+        } else if (plan->null_input_fd >= 0 || plan->executable_fd >= 0 ||
+                   plan->exec_status_fd >= 0 || plan->exec_status_authority_fd >= 0) {
+            fail(diagnostic, FailurePhase::Argument, EINVAL);
+            return false;
+        }
         for (const int standard_fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
             errno = 0;
             if (fcntl(standard_fd, F_GETFD) < 0) {
@@ -651,6 +788,10 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     }
     const pid_t parent = getpid();
     const int child_output_fd = prepared ? plan->combined_output_fd : -1;
+    const int child_input_fd = prepared ? plan->null_input_fd : -1;
+    const int child_executable_fd = prepared ? plan->executable_fd : -1;
+    const int child_exec_status_fd = prepared ? plan->exec_status_fd : -1;
+    const ChildContinuation continuation = prepared ? plan->continuation : ChildContinuation{};
     const int* const inherited_fd_data = inherited_fds.data();
     const std::size_t inherited_fd_count = inherited_fds.size();
     const unsigned int child_delay = hooks == nullptr ? 0u : hooks->child_delay_ms;
@@ -690,6 +831,10 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
                    post_release_delay,
                    prepared,
                    child_output_fd,
+                   child_input_fd,
+                   child_executable_fd,
+                   child_exec_status_fd,
+                   continuation,
                    inherited_fd_data,
                    inherited_fd_count,
                    child_close_failure_fd,
@@ -740,12 +885,19 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     candidate.mode_ = prepared ? Mode::Prepared : Mode::Plain;
     candidate.combined_output_fd_ = prepared ? plan->combined_output_fd : -1;
     candidate.child_release_fd_ = prepared ? release[0] : -1;
+    candidate.null_input_fd_ = prepared ? plan->null_input_fd : -1;
+    candidate.child_executable_fd_ = prepared ? plan->executable_fd : -1;
+    candidate.child_exec_status_fd_ = prepared ? plan->exec_status_fd : -1;
+    candidate.exec_status_authority_fd_ = prepared ? plan->exec_status_authority_fd : -1;
+    candidate.continuation_ = continuation;
     candidate.kcmp_file_hook_ = hooks == nullptr ? nullptr : hooks->kcmp_file;
     candidate.prepared_procfs_allowed_hook_ =
         hooks == nullptr ? nullptr : hooks->prepared_procfs_allowed;
     candidate.prepared_validation_context_ =
         hooks == nullptr ? nullptr : hooks->prepared_validation_context;
     candidate.active_ = true;
+    candidate.settlement_ = std::make_shared<SettlementReceipt>();
+    candidate.settlement_->child_pid = child;
     if (!candidate.validate_pidfd(observation, true, deadline, diagnostic) ||
         !candidate.validate_pidfd(authority, true, deadline, diagnostic)) {
         close_ignoring(candidate.release_fd_);
@@ -843,10 +995,17 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     lease.mode_ = candidate.mode_;
     lease.combined_output_fd_ = candidate.combined_output_fd_;
     lease.child_release_fd_ = candidate.child_release_fd_;
+    lease.null_input_fd_ = candidate.null_input_fd_;
+    lease.child_executable_fd_ = candidate.child_executable_fd_;
+    lease.child_exec_status_fd_ = candidate.child_exec_status_fd_;
+    lease.exec_status_authority_fd_ = candidate.exec_status_authority_fd_;
+    lease.continuation_ = candidate.continuation_;
     lease.kcmp_file_hook_ = candidate.kcmp_file_hook_;
     lease.prepared_procfs_allowed_hook_ = candidate.prepared_procfs_allowed_hook_;
     lease.prepared_validation_context_ = candidate.prepared_validation_context_;
     lease.active_ = true;
+    lease.settlement_ = candidate.settlement_;
+    lease.settlement_->identity = lease.identity_;
     candidate.ready_fd_ = -1;
     candidate.release_fd_ = -1;
     candidate.observation_pidfd_ = -1;
@@ -950,7 +1109,12 @@ bool PausedChildLease::validate_prepared_descriptors(std::chrono::steady_clock::
         fail(diagnostic, FailurePhase::Descriptors, errno == 0 ? EIO : errno);
         return false;
     }
+    const bool exec_mode = continuation_.kind == ChildContinuationKind::Execveat;
     std::vector<int> expected{STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, child_release_fd_};
+    if (exec_mode) {
+        expected.push_back(child_executable_fd_);
+        expected.push_back(child_exec_status_fd_);
+    }
     std::sort(expected.begin(), expected.end());
     if (descriptors != expected) {
         fail(diagnostic, FailurePhase::Descriptors, EPROTO);
@@ -959,34 +1123,44 @@ bool PausedChildLease::validate_prepared_descriptors(std::chrono::steady_clock::
     bool stdout_cloexec = true;
     bool stderr_cloexec = true;
     bool release_cloexec = false;
+    bool input_cloexec = true;
+    bool executable_cloexec = false;
+    bool status_writer_cloexec = false;
     if (!process_fd_cloexec(child_pid_, STDOUT_FILENO, stdout_cloexec) ||
         !process_fd_cloexec(child_pid_, STDERR_FILENO, stderr_cloexec) ||
-        !process_fd_cloexec(child_pid_, child_release_fd_, release_cloexec)) {
+        !process_fd_cloexec(child_pid_, child_release_fd_, release_cloexec) ||
+        !process_fd_cloexec(child_pid_, STDIN_FILENO, input_cloexec) ||
+        (exec_mode &&
+         (!process_fd_cloexec(child_pid_, child_executable_fd_, executable_cloexec) ||
+          !process_fd_cloexec(child_pid_, child_exec_status_fd_, status_writer_cloexec)))) {
         fail(diagnostic, FailurePhase::Descriptors, errno == 0 ? EIO : errno);
         return false;
     }
-    if (stdout_cloexec || stderr_cloexec || !release_cloexec) {
+    if (input_cloexec || stdout_cloexec || stderr_cloexec || !release_cloexec ||
+        (exec_mode && (!executable_cloexec || !status_writer_cloexec))) {
         fail(diagnostic, FailurePhase::Descriptors, EINVAL);
         return false;
     }
-    const auto compare = [&](int child_fd) {
+    const auto compare = [&](int parent_fd, int child_fd) {
         errno = 0;
         if (kcmp_file_hook_ != nullptr)
             return kcmp_file_hook_(parent_pid_,
                                    child_pid_,
-                                   combined_output_fd_,
+                                   parent_fd,
                                    child_fd,
                                    prepared_validation_context_) == 0;
 #ifdef SYS_kcmp
-        return syscall(
-                   SYS_kcmp, parent_pid_, child_pid_, KCMP_FILE, combined_output_fd_, child_fd) ==
-               0;
+        return syscall(SYS_kcmp, parent_pid_, child_pid_, KCMP_FILE, parent_fd, child_fd) == 0;
 #else
         errno = ENOSYS;
         return false;
 #endif
     };
-    if (!compare(STDOUT_FILENO) || !compare(STDERR_FILENO)) {
+    if (!compare(combined_output_fd_, STDOUT_FILENO) ||
+        !compare(combined_output_fd_, STDERR_FILENO) ||
+        (exec_mode && (!compare(null_input_fd_, STDIN_FILENO) ||
+                       !compare(child_executable_fd_, child_executable_fd_) ||
+                       !compare(exec_status_authority_fd_, child_exec_status_fd_)))) {
         fail(diagnostic, FailurePhase::Descriptors, errno == 0 ? EINVAL : errno);
         return false;
     }
@@ -1029,10 +1203,21 @@ bool PausedChildLease::wait_reap(std::chrono::steady_clock::time_point deadline,
         const pid_t result = waitpid(child_pid_, &child_status_, WNOHANG);
         if (result == child_pid_) {
             child_reaped_ = true;
+            if (settlement_) {
+                settlement_->terminal = true;
+                settlement_->reaped = true;
+                settlement_->wait_status = child_status_;
+                settlement_->error_number = 0;
+            }
             break;
         }
         if (result < 0 && errno == EINTR) continue;
         if (result < 0) {
+            if (settlement_) {
+                settlement_->terminal = true;
+                settlement_->reaped = false;
+                settlement_->error_number = errno;
+            }
             fail(diagnostic, FailurePhase::Wait, errno);
             return false;
         }
@@ -1081,24 +1266,13 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
         fail(diagnostic, FailurePhase::Argument, EALREADY);
         return false;
     }
-    bool observation_valid = false;
-    if (!release_sent_) {
-        if (!validate_bound_child(deadline, diagnostic) ||
-            (mode_ == Mode::Prepared && !validate_prepared_descriptors(deadline, diagnostic)))
-            return false;
-        observation_valid = true;
-        if (!write_byte_until(release_fd_, kRelease, deadline)) {
-            fail(diagnostic, FailurePhase::Release, ETIMEDOUT);
-            return false;
-        }
-        release_sent_ = true;
-        if (mode_ == Mode::Prepared) prepared_release_authorized_ = true;
-        Diagnostic close_diagnostic;
-        if (!close_fd(release_fd_, close_diagnostic)) {
-            diagnostic = close_diagnostic;
-            release_close_uncertain_ = true;
-        }
-    } else if (mode_ == Mode::Prepared && !prepared_release_authorized_) {
+    const bool observation_valid_before = !release_sent_;
+    Diagnostic release_close_diagnostic;
+    if (!release_sent_ && !send_release(deadline, diagnostic)) {
+        if (!release_sent_ || !release_close_uncertain_) return false;
+        release_close_diagnostic = diagnostic;
+    }
+    if (mode_ == Mode::Prepared && !prepared_release_authorized_) {
         fail(diagnostic, FailurePhase::Release, EPERM);
         return false;
     }
@@ -1107,6 +1281,7 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
         fail(diagnostic, FailurePhase::Release, EPROTO);
         return false;
     }
+    bool observation_valid = observation_valid_before;
     if (!observation_valid) {
         observation_valid = validate_pidfd(observation_pidfd_, false, deadline, diagnostic);
         if (!observation_valid) return false;
@@ -1115,10 +1290,54 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
     if (release_close_uncertain_) {
         active_ = false;
         released_ = true;
+        diagnostic = release_close_diagnostic.phase == FailurePhase::None
+                         ? Diagnostic{FailurePhase::Close, EIO}
+                         : release_close_diagnostic;
         record_cleanup(false, diagnostic);
         return false;
     }
     return closed;
+}
+
+bool PausedChildLease::send_release(std::chrono::steady_clock::time_point deadline,
+                                    Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (!active_ || released_ || release_sent_) {
+        fail(diagnostic, FailurePhase::Argument, EALREADY);
+        return false;
+    }
+    if (!validate_bound_child(deadline, diagnostic) ||
+        (mode_ == Mode::Prepared && !prepared_release_authorized_ &&
+         !validate_prepared_descriptors(deadline, diagnostic)))
+        return false;
+    if (!write_byte_until(release_fd_, kRelease, deadline)) {
+        fail(diagnostic, FailurePhase::Release, ETIMEDOUT);
+        return false;
+    }
+    release_sent_ = true;
+    if (mode_ == Mode::Prepared) prepared_release_authorized_ = true;
+    Diagnostic close_diagnostic;
+    if (!close_fd(release_fd_, close_diagnostic)) {
+        diagnostic = close_diagnostic;
+        release_close_uncertain_ = true;
+        return false;
+    }
+    return true;
+}
+
+bool PausedChildLease::authorize_exec_release(std::chrono::steady_clock::time_point deadline,
+                                              Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (!active_ || released_ || release_sent_ || mode_ != Mode::Prepared ||
+        continuation_.kind != ChildContinuationKind::Execveat || prepared_release_authorized_) {
+        fail(diagnostic, FailurePhase::Argument, EALREADY);
+        return false;
+    }
+    if (!validate_bound_child(deadline, diagnostic) ||
+        !validate_prepared_descriptors(deadline, diagnostic))
+        return false;
+    prepared_release_authorized_ = true;
+    return true;
 }
 
 bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
@@ -1141,7 +1360,19 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
             }
         }
     }
-    if (result == child_pid_) child_reaped_ = true;
+    if (result == child_pid_) {
+        child_reaped_ = true;
+        if (settlement_) {
+            settlement_->terminal = true;
+            settlement_->reaped = true;
+            settlement_->wait_status = child_status_;
+            settlement_->error_number = 0;
+        }
+    } else if (result < 0 && errno == ECHILD && settlement_) {
+        settlement_->terminal = true;
+        settlement_->reaped = false;
+        settlement_->error_number = ECHILD;
+    }
     bool observation_valid = false;
     if (!child_reaped_ && result == 0) {
         ProcIdentity current;
