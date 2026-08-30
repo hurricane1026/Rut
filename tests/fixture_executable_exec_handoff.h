@@ -2,6 +2,7 @@
 
 #include "fixture_executable_lease.h"
 #include "fixture_wildcard_paused_child_lease.h"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,13 @@ struct ExecObservation {
     child_fixture::ProcIdentity second;
 };
 
+struct CloseOutcome {
+    unsigned int attempts = 0;
+    bool attempted = false;
+    bool succeeded = false;
+    int error_number = 0;
+};
+
 struct CleanupState {
     unsigned int semantic_attempts = 0;
     bool semantic_validated = false;
@@ -60,10 +68,14 @@ struct CleanupState {
     bool release_close_attempted = false;
     bool release_close_succeeded = false;
     Diagnostic release_close_diagnostic;
+    child_fixture::ReleaseSendState child_release_send_state =
+        child_fixture::ReleaseSendState::NotSent;
     unsigned int cleanup_attempts = 0;
     bool cleanup_attempted = false;
     bool cleanup_succeeded = false;
     Diagnostic cleanup_diagnostic;
+    std::array<CloseOutcome, 3> status_reader_close;
+    std::array<CloseOutcome, 3> status_writer_close;
 };
 
 struct HooksForTesting {
@@ -84,6 +96,11 @@ struct HooksForTesting {
 // descriptors.  Its destructor never signals, waits, reaps, or dereferences a
 // source lease.  Defensive destructor closure is bounded to at most one H-slot
 // replacement; ambiguity preserves every unproven numeric slot.
+// This increment intentionally materializes only argv[0]; arbitrary additional
+// arguments belong to the later fresh-session composition increment.
+// Numeric accessors are observation-only causal-test seams; the exclusive
+// parent owner does not read them or mutate its FD table during an operation.
+// Deliberate test mutations are detected fail-closed before release or close.
 class ExecutableExecHandoffLease {
 public:
     ExecutableExecHandoffLease();
@@ -115,7 +132,20 @@ public:
 
     bool active() const { return active_; }
     int observation_fd() const { return executable_fd_; }
-    int status_reader_fd() const { return status_reader_fd_; }
+    int status_reader_fd_for_testing() const { return status_reader_fd_; }
+    int status_reader_authority_one_fd_for_testing() const {
+        return status_reader_authority_one_fd_;
+    }
+    int status_reader_authority_two_fd_for_testing() const {
+        return status_reader_authority_two_fd_;
+    }
+    int status_writer_fd_for_testing() const { return status_writer_fd_; }
+    int status_writer_authority_one_fd_for_testing() const {
+        return status_writer_authority_one_fd_;
+    }
+    int status_writer_authority_two_fd_for_testing() const {
+        return status_writer_authority_two_fd_;
+    }
     int authority_one_fd_for_testing() const { return authority_one_fd_; }
     int authority_two_fd_for_testing() const { return authority_two_fd_; }
     std::shared_ptr<const CleanupState> cleanup_state() const { return cleanup_; }
@@ -126,16 +156,34 @@ private:
                             ExecutableExecHandoffLease& lease,
                             Diagnostic& diagnostic);
     bool validate_custody(Diagnostic& diagnostic) const;
+    bool validate_status_custody(bool allow_retired_writer, Diagnostic& diagnostic) const;
+    bool validate_status_triad(int first,
+                               int second,
+                               int third,
+                               int access_mode,
+                               bool allow_one_detached,
+                               Diagnostic& diagnostic) const;
     bool same_ofd(pid_t first_pid, pid_t second_pid, int first, int second) const;
     bool close_one(int& fd, Diagnostic& diagnostic);
+    bool close_status_one(int& fd, CloseOutcome& outcome, Diagnostic& diagnostic);
+    void destructor_close_status_triad(int& first,
+                                       int& second,
+                                       int& third,
+                                       int access_mode,
+                                       std::array<CloseOutcome, 3>& outcomes);
     void destructor_cleanup();
 
     int executable_fd_ = -1;
     int authority_one_fd_ = -1;
     int authority_two_fd_ = -1;
     int status_reader_fd_ = -1;
+    int status_reader_authority_one_fd_ = -1;
+    int status_reader_authority_two_fd_ = -1;
     int status_writer_fd_ = -1;
-    int status_writer_authority_fd_ = -1;
+    int status_writer_authority_one_fd_ = -1;
+    int status_writer_authority_two_fd_ = -1;
+    std::uint64_t status_device_ = 0;
+    std::uint64_t status_inode_ = 0;
     bool active_ = false;
     bool plan_made_ = false;
     bool writer_retired_ = false;

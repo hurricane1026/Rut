@@ -51,6 +51,8 @@ struct SettlementReceipt {
 
 enum class ChildContinuationKind : std::uint8_t { Inert, Execveat };
 
+enum class ReleaseSendState : std::uint8_t { NotSent, Sent, SentCloseUncertain };
+
 // Fully materialized before fork.  The child only reads this POD and performs
 // async-signal-safe syscalls after fork.
 struct ChildContinuation {
@@ -126,9 +128,11 @@ public:
     bool validate_paused(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
     bool validate_prepared(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
     bool release(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
-    // Sends and certainly retires the release writer but deliberately neither
-    // waits nor reaps.  release() is the strict legacy wrapper around this seam.
-    bool send_release(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
+    // Attempts one release-byte send, detaches the numeric writer before its
+    // one close, and reports close uncertainty explicitly.  It neither waits
+    // nor reaps. release() remains the strict legacy settlement wrapper.
+    ReleaseSendState send_release(std::chrono::steady_clock::time_point deadline,
+                                  Diagnostic& diagnostic);
     bool authorize_exec_release(std::chrono::steady_clock::time_point deadline,
                                 Diagnostic& diagnostic);
     bool cleanup(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
@@ -141,6 +145,7 @@ public:
     std::shared_ptr<const CleanupState> cleanup_state() const { return cleanup_state_; }
     std::shared_ptr<const SettlementReceipt> settlement_receipt() const { return settlement_; }
     int child_executable_fd() const { return child_executable_fd_; }
+    int child_exec_status_fd() const { return child_exec_status_fd_; }
 
 private:
     static bool create_impl(std::chrono::steady_clock::time_point deadline,

@@ -399,7 +399,9 @@ void child_main(int ready_fd,
             exec_status_fd < 0 ? FD_CLOEXEC : fcntl(exec_status_fd, F_GETFD);
         if (input_flags < 0 || output_flags < 0 || error_flags < 0 || release_flags < 0 ||
             executable_flags < 0 || status_writer_flags < 0 || (output_flags & FD_CLOEXEC) != 0 ||
-            (error_flags & FD_CLOEXEC) != 0 || (input_flags & FD_CLOEXEC) != 0 ||
+            (error_flags & FD_CLOEXEC) != 0 ||
+            (continuation.kind == ChildContinuationKind::Execveat &&
+             (input_flags & FD_CLOEXEC) != 0) ||
             (release_flags & FD_CLOEXEC) == 0 || (executable_flags & FD_CLOEXEC) == 0 ||
             (status_writer_flags & FD_CLOEXEC) == 0)
             _exit(127);
@@ -462,7 +464,11 @@ void child_main(int ready_fd,
             frame[9] = static_cast<unsigned char>((value >> 8u) & 0xffu);
             frame[10] = static_cast<unsigned char>((value >> 16u) & 0xffu);
             frame[11] = static_cast<unsigned char>((value >> 24u) & 0xffu);
-            (void)write(exec_status_fd, frame, sizeof(frame));
+            for (;;) {
+                const ssize_t written = write(exec_status_fd, frame, sizeof(frame));
+                if (written < 0 && errno == EINTR) continue;
+                return written == static_cast<ssize_t>(sizeof(frame));
+            }
         };
         if (continuation.status_injection != 0) {
             unsigned char frame[32] = {
@@ -486,7 +492,7 @@ void child_main(int ready_fd,
             _exit(132);
         }
         if (continuation.inject_pre_exec_failure) {
-            report(1u, EIO);
+            if (!report(1u, EIO)) _exit(135);
             _exit(130);
         }
         char* argv[] = {continuation.argv0.data(), nullptr};
@@ -497,7 +503,7 @@ void child_main(int ready_fd,
 #else
         const int exec_error = ENOSYS;
 #endif
-        report(2u, exec_error);
+        if (!report(2u, exec_error)) _exit(135);
         _exit(131);
     }
     _exit(0);
@@ -1129,14 +1135,14 @@ bool PausedChildLease::validate_prepared_descriptors(std::chrono::steady_clock::
     if (!process_fd_cloexec(child_pid_, STDOUT_FILENO, stdout_cloexec) ||
         !process_fd_cloexec(child_pid_, STDERR_FILENO, stderr_cloexec) ||
         !process_fd_cloexec(child_pid_, child_release_fd_, release_cloexec) ||
-        !process_fd_cloexec(child_pid_, STDIN_FILENO, input_cloexec) ||
+        (exec_mode && !process_fd_cloexec(child_pid_, STDIN_FILENO, input_cloexec)) ||
         (exec_mode &&
          (!process_fd_cloexec(child_pid_, child_executable_fd_, executable_cloexec) ||
           !process_fd_cloexec(child_pid_, child_exec_status_fd_, status_writer_cloexec)))) {
         fail(diagnostic, FailurePhase::Descriptors, errno == 0 ? EIO : errno);
         return false;
     }
-    if (input_cloexec || stdout_cloexec || stderr_cloexec || !release_cloexec ||
+    if ((exec_mode && input_cloexec) || stdout_cloexec || stderr_cloexec || !release_cloexec ||
         (exec_mode && (!executable_cloexec || !status_writer_cloexec))) {
         fail(diagnostic, FailurePhase::Descriptors, EINVAL);
         return false;
@@ -1268,9 +1274,11 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
     }
     const bool observation_valid_before = !release_sent_;
     Diagnostic release_close_diagnostic;
-    if (!release_sent_ && !send_release(deadline, diagnostic)) {
-        if (!release_sent_ || !release_close_uncertain_) return false;
-        release_close_diagnostic = diagnostic;
+    if (!release_sent_) {
+        const ReleaseSendState send_state = send_release(deadline, diagnostic);
+        if (send_state == ReleaseSendState::NotSent) return false;
+        if (send_state == ReleaseSendState::SentCloseUncertain)
+            release_close_diagnostic = diagnostic;
     }
     if (mode_ == Mode::Prepared && !prepared_release_authorized_) {
         fail(diagnostic, FailurePhase::Release, EPERM);
@@ -1299,20 +1307,26 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
     return closed;
 }
 
-bool PausedChildLease::send_release(std::chrono::steady_clock::time_point deadline,
-                                    Diagnostic& diagnostic) {
+ReleaseSendState PausedChildLease::send_release(std::chrono::steady_clock::time_point deadline,
+                                                Diagnostic& diagnostic) {
     diagnostic = {};
     if (!active_ || released_ || release_sent_) {
         fail(diagnostic, FailurePhase::Argument, EALREADY);
-        return false;
+        return ReleaseSendState::NotSent;
+    }
+    const bool exec_mode =
+        mode_ == Mode::Prepared && continuation_.kind == ChildContinuationKind::Execveat;
+    if (exec_mode && !prepared_release_authorized_) {
+        fail(diagnostic, FailurePhase::Release, EPERM);
+        return ReleaseSendState::NotSent;
     }
     if (!validate_bound_child(deadline, diagnostic) ||
         (mode_ == Mode::Prepared && !prepared_release_authorized_ &&
          !validate_prepared_descriptors(deadline, diagnostic)))
-        return false;
+        return ReleaseSendState::NotSent;
     if (!write_byte_until(release_fd_, kRelease, deadline)) {
         fail(diagnostic, FailurePhase::Release, ETIMEDOUT);
-        return false;
+        return ReleaseSendState::NotSent;
     }
     release_sent_ = true;
     if (mode_ == Mode::Prepared) prepared_release_authorized_ = true;
@@ -1320,9 +1334,9 @@ bool PausedChildLease::send_release(std::chrono::steady_clock::time_point deadli
     if (!close_fd(release_fd_, close_diagnostic)) {
         diagnostic = close_diagnostic;
         release_close_uncertain_ = true;
-        return false;
+        return ReleaseSendState::SentCloseUncertain;
     }
-    return true;
+    return ReleaseSendState::Sent;
 }
 
 bool PausedChildLease::authorize_exec_release(std::chrono::steady_clock::time_point deadline,
