@@ -56,6 +56,17 @@ target_link_libraries(test_fixture_direct_launch PRIVATE fixture_direct_launch)
 add_test(NAME test_fixture_direct_launch COMMAND test_fixture_direct_launch)
 set_tests_properties(test_fixture_direct_launch PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# Tests-only retained-sudo ancestry collector and exact one-record binder.
+add_library(fixture_privileged_ancestry STATIC fixture_privileged_ancestry.cc)
+target_include_directories(fixture_privileged_ancestry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_privileged_ancestry PUBLIC
+    fixture_ancestry_bundle fixture_direct_launch fixture_identity_bundle fixture_worker_protocol)
+
+add_executable(test_fixture_privileged_ancestry test_fixture_privileged_ancestry.cc)
+target_link_libraries(test_fixture_privileged_ancestry PRIVATE fixture_privileged_ancestry)
+add_test(NAME test_fixture_privileged_ancestry COMMAND test_fixture_privileged_ancestry)
+set_tests_properties(test_fixture_privileged_ancestry PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -542,6 +553,7 @@ if(RUT_ENABLE_JIT)
         fixture_ancestry_bundle
         fixture_direct_launch
         fixture_identity_bundle
+        fixture_privileged_ancestry
         fixture_worker_protocol
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE

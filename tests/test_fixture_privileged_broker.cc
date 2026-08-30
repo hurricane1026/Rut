@@ -5,6 +5,7 @@
 #include "fixture_direct_launch.h"
 #include "fixture_identity_bundle.h"
 #include "fixture_ipv4_topology.h"
+#include "fixture_privileged_ancestry.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
 #include <array>
@@ -44,6 +45,7 @@ namespace {
 using namespace rut::test::fixture_worker_protocol;
 namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
+namespace privileged_ancestry = rut::test::fixture_privileged_ancestry;
 using rut::test::fixture_direct_launch::AllowedStages;
 using rut::test::fixture_direct_launch::current_allows_group_signal;
 using rut::test::fixture_direct_launch::direct_launch_diagnostic;
@@ -57,6 +59,11 @@ using rut::test::fixture_direct_launch::observe_direct;
 using rut::test::fixture_direct_launch::StageDescriptor;
 using rut::test::fixture_direct_launch::validate_launcher_ancestry;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
+using privileged_ancestry::RetainedAnchorEvidence;
+using privileged_ancestry::parse_retained_anchor_stat;
+using privileged_ancestry::parse_retained_anchor_status;
+using privileged_ancestry::prove_retained_sudo_wrapper;
+using privileged_ancestry::retained_pidfd_live;
 
 constexpr u16 kBrokerRootHello = 20;
 constexpr u16 kCallerCredentials = 21;
@@ -673,210 +680,8 @@ struct GroupLease {
     }
 };
 
-struct RetainedAnchorEvidence {
-    pid_t pid = -1;
-    pid_t ppid = -1;
-    pid_t pgid = -1;
-    pid_t sid = -1;
-    std::uint64_t start = 0;
-    char state = 0;
-    uid_t uid = static_cast<uid_t>(-1);
-    gid_t gid = static_cast<gid_t>(-1);
-    std::array<uid_t, 4> uid_values{};
-    std::array<gid_t, 4> gid_values{};
-    std::string cmdline;
-    bool pidfd_live = false;
-};
-
-static bool parse_retained_anchor_stat(const std::string& text, RetainedAnchorEvidence& evidence) {
-    const size_t pid_end = text.find(' ');
-    if (pid_end == std::string::npos || pid_end == 0) return false;
-    const std::string pid_text = text.substr(0, pid_end);
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long parsed_pid = strtoul(pid_text.c_str(), &end, 10);
-    if (errno != 0 || end == nullptr || *end != '\0' || parsed_pid <= 1 ||
-        parsed_pid > static_cast<unsigned long>(std::numeric_limits<pid_t>::max()))
-        return false;
-    const size_t comm_end = text.rfind(") ");
-    if (comm_end == std::string::npos) return false;
-    std::istringstream fields(text.substr(comm_end + 2));
-    long ppid = 0;
-    long pgid = 0;
-    long sid = 0;
-    if (!(fields >> evidence.state >> ppid >> pgid >> sid)) return false;
-    for (int field = 7; field <= 22; ++field) {
-        if (field == 22) {
-            unsigned long long start = 0;
-            if (!(fields >> start)) return false;
-            evidence.start = static_cast<std::uint64_t>(start);
-        } else {
-            long long ignored = 0;
-            if (!(fields >> ignored)) return false;
-        }
-    }
-    evidence.pid = static_cast<pid_t>(parsed_pid);
-    evidence.ppid = static_cast<pid_t>(ppid);
-    evidence.pgid = static_cast<pid_t>(pgid);
-    evidence.sid = static_cast<pid_t>(sid);
-    return evidence.ppid > 1 && evidence.pgid > 1 && evidence.sid > 1 && evidence.start != 0;
-}
-
-static bool parse_retained_anchor_status(const std::string& text,
-                                         RetainedAnchorEvidence& evidence) {
-    bool have_uid = false;
-    bool have_gid = false;
-    std::istringstream lines(text);
-    std::string line;
-    while (std::getline(lines, line)) {
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::istringstream value(line.substr(colon + 1));
-        if (line.rfind("Uid:", 0) == 0 || line.rfind("Gid:", 0) == 0) {
-            const bool is_uid = line.rfind("Uid:", 0) == 0;
-            bool& present = is_uid ? have_uid : have_gid;
-            if (present) return false;
-            std::array<unsigned long long, 4> ids{};
-            for (auto& id : ids)
-                if (!(value >> id)) return false;
-            std::string extra;
-            if (value >> extra) return false;
-            if (is_uid) {
-                for (size_t index = 0; index != ids.size(); ++index) {
-                    if (ids[index] > std::numeric_limits<uid_t>::max()) return false;
-                    evidence.uid_values[index] = static_cast<uid_t>(ids[index]);
-                }
-                evidence.uid = evidence.uid_values[0];
-            } else {
-                for (size_t index = 0; index != ids.size(); ++index) {
-                    if (ids[index] > std::numeric_limits<gid_t>::max()) return false;
-                    evidence.gid_values[index] = static_cast<gid_t>(ids[index]);
-                }
-                evidence.gid = evidence.gid_values[0];
-            }
-            present = true;
-        }
-    }
-    return have_uid && have_gid;
-}
-
-static bool retained_pidfd_live(int pidfd) {
-    if (pidfd < 0 || fcntl(pidfd, F_GETFD) < 0) return false;
-    pollfd descriptor{pidfd, POLLIN, 0};
-    int result;
-    do {
-        result = poll(&descriptor, 1, 0);
-    } while (result < 0 && errno == EINTR);
-    return result == 0;
-}
-
-static bool capture_retained_anchor_evidence(const DirectLaunch& launch,
-                                             const GroupLease& lease,
-                                             RetainedAnchorEvidence& evidence,
-                                             std::string& reason) {
-    if (!launch.marker_valid || lease.pid != launch.anchor.pid ||
-        lease.start != launch.anchor.start || lease.pgid != launch.anchor.pgid ||
-        lease.sid != launch.anchor.sid || !retained_pidfd_live(lease.pidfd)) {
-        reason = "retained sudo anchor lease/pidfd binding was stale";
-        return false;
-    }
-    const std::string prefix = "/proc/" + std::to_string(launch.anchor.pid);
-    std::string first_text;
-    std::string second_text;
-    std::string status;
-    int probe_errno = 0;
-    RetainedAnchorEvidence first;
-    RetainedAnchorEvidence second;
-    if (!probe_file(prefix + "/stat", first_text, probe_errno) ||
-        !parse_retained_anchor_stat(first_text, first) ||
-        !probe_file(prefix + "/stat", second_text, probe_errno) ||
-        !parse_retained_anchor_stat(second_text, second) || first.pid != second.pid ||
-        first.ppid != second.ppid || first.pgid != second.pgid || first.sid != second.sid ||
-        first.start != second.start || first.state != second.state ||
-        !probe_file(prefix + "/status", status, probe_errno) ||
-        !parse_retained_anchor_status(status, second) ||
-        !probe_file(prefix + "/cmdline", second.cmdline, probe_errno)) {
-        reason = "retained sudo anchor stat/status/cmdline evidence was unavailable or unstable";
-        return false;
-    }
-    second.pidfd_live = retained_pidfd_live(lease.pidfd);
-    if (!second.pidfd_live || second.pid != launch.anchor.pid ||
-        second.start != launch.anchor.start || second.ppid != getpid() ||
-        second.pgid != launch.anchor.pgid || second.sid != launch.anchor.sid ||
-        second.state == 'Z' || second.state == 'X') {
-        reason = "retained sudo anchor kernel identity was stale, detached, or dead";
-        return false;
-    }
-    evidence = std::move(second);
-    return true;
-}
-
-static bool prove_retained_sudo_wrapper(DirectLaunch& launch,
-                                        const ProcIdentity& launcher,
-                                        const RetainedAnchorEvidence& evidence,
-                                        std::string& reason) {
-    if (!launch.marker_valid ||
-        launch.mode == rut::test::fixture_direct_launch::LaunchMode::ExecChain ||
-        !evidence.pidfd_live || evidence.pid != launch.anchor.pid ||
-        evidence.start != launch.anchor.start || evidence.ppid != getpid() ||
-        evidence.pgid != launch.anchor.pgid || evidence.sid != launch.anchor.sid ||
-        evidence.state == 'Z' || evidence.state == 'X' || launcher.pid == launch.anchor.pid ||
-        launcher.ppid != launch.anchor.pid || launcher.pgid != launch.anchor.pgid ||
-        launcher.sid != launch.anchor.sid) {
-        reason = "retained sudo anchor/launcher kernel chain was not exact";
-        launch.reason = reason;
-        return false;
-    }
-    const auto all_uid_values_equal = [&](uid_t expected) {
-        return std::all_of(evidence.uid_values.begin(),
-                           evidence.uid_values.end(),
-                           [expected](uid_t value) { return value == expected; });
-    };
-    const auto all_gid_values_equal = [&](gid_t expected) {
-        return std::all_of(evidence.gid_values.begin(),
-                           evidence.gid_values.end(),
-                           [expected](gid_t value) { return value == expected; });
-    };
-    const bool caller = all_uid_values_equal(launch.anchor.caller_uid) &&
-                        all_gid_values_equal(launch.anchor.caller_gid);
-    // A retained sudo transition has caller ownership only in the real UID
-    // slot; sudo changes effective/saved/fs UIDs and every GID slot to root.
-    const bool retained_sudo = evidence.uid_values[0] == launch.anchor.caller_uid &&
-                               evidence.uid_values[1] == 0 && evidence.uid_values[2] == 0 &&
-                               evidence.uid_values[3] == 0 && all_gid_values_equal(0);
-    // Preserve the separately reachable all-root state explicitly.  This is
-    // the elevated branch of stage_context_valid(), reached when the exact
-    // sudo stage has already transitioned every credential slot to root; it
-    // is distinct from the retained caller-to-root transition.
-    const bool root = all_uid_values_equal(0) && all_gid_values_equal(0);
-    if ((!caller && !retained_sudo && !root) ||
-        evidence.cmdline != launch.allowed.sudo_stage.argv) {
-        reason = "retained sudo status/cmdline was not the exact allowed sudo stage";
-        launch.reason = reason;
-        return false;
-    }
-
-    ProcIdentity direct;
-    direct.pid = evidence.pid;
-    direct.ppid = evidence.ppid;
-    direct.pgid = evidence.pgid;
-    direct.sid = evidence.sid;
-    direct.start = evidence.start;
-    // ProcIdentity exposes the effective credential pair used by the existing
-    // launch-stage validator; acceptance above independently binds all status
-    // UID/GID slots, including the real UID retained by sudo.
-    direct.uid = evidence.uid_values[1];
-    direct.gid = evidence.gid_values[1];
-    direct.cmdline = evidence.cmdline;
-    // This tests-only fixture has already proved the immutable fork marker,
-    // retained pidfd/stat identity, and exact Launcher->Root bundle chain.  The
-    // ordinary parent cannot stat a root sudo's exe or netns on Ubuntu, so only
-    // those inaccessible fields are completed from begin_launch's immutable
-    // exact sudo descriptor and pre-release host-netns boundary.
-    direct.exe_dev = launch.allowed.sudo_stage.exe_dev;
-    direct.exe_ino = launch.allowed.sudo_stage.exe_ino;
-    direct.netns = launch.anchor.host_netns;
-    return validate_launcher_ancestry(launch, launcher, {direct}, reason);
+static const privileged_ancestry::RetainedAnchorLease retained_lease(const GroupLease& lease) {
+    return {lease.pid, lease.pgid, lease.sid, lease.start, lease.pidfd};
 }
 
 static std::string retained_wrapper_diagnostic(const DirectLaunch& launch,
@@ -1659,74 +1464,13 @@ static int dropped_broker_main(const char* executable,
     return 0;
 }
 
-static const char* identity_fd_slot_name(identity_bundle::FdSlot slot) {
-    switch (slot) {
-        case identity_bundle::FdSlot::Stat:
-            return "stat";
-        case identity_bundle::FdSlot::Status:
-            return "status";
-        case identity_bundle::FdSlot::Cmdline:
-            return "cmdline";
-        case identity_bundle::FdSlot::Executable:
-            return "exe";
-        case identity_bundle::FdSlot::Netns:
-            return "netns";
-        case identity_bundle::FdSlot::Pidfd:
-            return "pidfd";
-        case identity_bundle::FdSlot::Unknown:
-            return "unknown";
-    }
-    return "unknown";
-}
-
 static bool collect_probe_ancestry(pid_t first_parent,
                                    pid_t ordinary_parent,
                                    ancestry_bundle::AncestryBundle& ancestry,
+                                   std::chrono::steady_clock::time_point deadline,
                                    std::string& safe_diagnostic) {
-    ancestry.close();
-    if (first_parent <= 1 || ordinary_parent <= 1 || first_parent == ordinary_parent) {
-        safe_diagnostic = "node=0,pid=" + std::to_string(first_parent) +
-                          ",slot=unknown,phase=boundary,syscall=none,errno=0";
-        return false;
-    }
-    pid_t current = first_parent;
-    for (size_t index = 0; index != kMaxLaunchAncestry; ++index) {
-        for (const identity_bundle::RoleBundle& previous : ancestry.nodes)
-            if (previous.manifest.pid == current) {
-                safe_diagnostic = "node=" + std::to_string(index) +
-                                  ",pid=" + std::to_string(current) +
-                                  ",slot=unknown,phase=cycle,syscall=none,errno=0";
-                ancestry.close();
-                return false;
-            }
-        identity_bundle::RoleBundle node;
-        identity_bundle::OpenRoleFailure failure;
-        std::string open_error;
-        if (!identity_bundle::open_role(
-                current, identity_bundle::Role::Ancestry, node, failure, open_error)) {
-            safe_diagnostic = "node=" + std::to_string(index) + ",pid=" + std::to_string(current) +
-                              ",slot=" + identity_fd_slot_name(failure.slot) +
-                              ",phase=" + failure.phase + ",syscall=" + failure.operation +
-                              ",errno=" + std::to_string(failure.error_number);
-            ancestry.close();
-            return false;
-        }
-        const pid_t next = node.manifest.ppid;
-        ancestry.nodes.push_back(std::move(node));
-        if (next == ordinary_parent) return true;
-        if (next <= 1 || next == ordinary_parent || next == current) {
-            safe_diagnostic = "node=" + std::to_string(index) + ",pid=" + std::to_string(current) +
-                              ",slot=unknown,phase=parent_edge,syscall=none,errno=0";
-            ancestry.close();
-            return false;
-        }
-        current = next;
-    }
-    safe_diagnostic = "node=" + std::to_string(kMaxLaunchAncestry) +
-                      ",pid=" + std::to_string(current) +
-                      ",slot=unknown,phase=overflow,syscall=none,errno=0";
-    ancestry.close();
-    return false;
+    return privileged_ancestry::collect_ancestry(
+        first_parent, ordinary_parent, ancestry, deadline, safe_diagnostic);
 }
 
 static int root_broker_main(const char* executable,
@@ -1779,7 +1523,11 @@ static int root_broker_main(const char* executable,
         ancestry_bundle::AncestryBundle ancestry;
         std::string diagnostic;
         if (!collect_probe_ancestry(
-                bundle.roles[0].manifest.ppid, ordinary_parent.pid, ancestry, diagnostic)) {
+                bundle.roles[0].manifest.ppid,
+                ordinary_parent.pid,
+                ancestry,
+                deadline,
+                diagnostic)) {
             std::cerr << "FAIL [#358 ancestry access]: " << diagnostic << "\n";
             close(root_control);
             return 91;
@@ -2410,8 +2158,8 @@ static bool retained_anchor_self_check(std::string& error) {
                                     direct_identity.cmdline};
     RetainedAnchorEvidence retained;
     std::string reason;
-    ok = ok && capture_retained_anchor_evidence(
-                   DirectLaunch(anchor, allowed, true), lease, retained, reason);
+    ok = ok && privileged_ancestry::capture_retained_anchor_evidence(
+                   DirectLaunch(anchor, allowed, true), retained_lease(lease), retained, reason);
     ProcIdentity launcher;
     launcher.pid = child + 100000;
     launcher.ppid = child;
@@ -2505,7 +2253,8 @@ static bool retained_anchor_self_check(std::string& error) {
     RetainedAnchorEvidence dead;
     DirectLaunch dead_launch(anchor, allowed, true);
     ok = ok && waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL &&
-         !capture_retained_anchor_evidence(dead_launch, lease, dead, reason);
+         !privileged_ancestry::capture_retained_anchor_evidence(
+             dead_launch, retained_lease(lease), dead, reason);
     if (!ok) {
         error = "retained sudo anchor/pidfd/launcher mutation self-check failed: " + reason;
         return false;
@@ -4613,20 +4362,10 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
         return false;
     }
     if (!validate_probe_chain_facts(facts, error)) return false;
-    const identity_bundle::ProcessIdentityEvidence& anchor_evidence = ancestry_evidence.back();
     RetainedAnchorEvidence retained_anchor;
-    retained_anchor.pid = anchor_evidence.identity.pid;
-    retained_anchor.ppid = anchor_evidence.identity.ppid;
-    retained_anchor.pgid = anchor_evidence.identity.pgid;
-    retained_anchor.sid = anchor_evidence.identity.sid;
-    retained_anchor.start = anchor_evidence.identity.start;
-    retained_anchor.state = anchor_evidence.state;
-    retained_anchor.uid = anchor_evidence.identity.uid;
-    retained_anchor.gid = anchor_evidence.identity.gid;
-    retained_anchor.uid_values = anchor_evidence.status.uid_values;
-    retained_anchor.gid_values = anchor_evidence.status.gid_values;
-    retained_anchor.cmdline = anchor_evidence.cmdline;
-    retained_anchor.pidfd_live = anchor_evidence.pidfd_live;
+    if (!privileged_ancestry::bind_retained_anchor_evidence(
+            ancestry_evidence, retained_anchor, error))
+        return false;
     std::string ancestry_error;
     if (!prove_retained_sudo_wrapper(launch, launcher, retained_anchor, ancestry_error) ||
         launch.mode != rut::test::fixture_direct_launch::LaunchMode::SudoWrapper) {
@@ -4896,8 +4635,8 @@ static bool run_session(const std::string& sudo_path,
         std::optional<RetainedAnchorEvidence> retained_anchor;
         if (received_identity.bundle().roles[0].manifest.pid != sudo_child.anchor.pid) {
             retained_anchor.emplace();
-            if (!capture_retained_anchor_evidence(
-                    sudo_child, launch_lease, *retained_anchor, identity_error)) {
+            if (!privileged_ancestry::capture_retained_anchor_evidence(
+                    sudo_child, retained_lease(launch_lease), *retained_anchor, identity_error)) {
                 error = "root broker retained sudo anchor validation failed: " + identity_error +
                         "; " +
                         retained_wrapper_diagnostic(sudo_child,
