@@ -1638,7 +1638,7 @@ static int root_broker_main(const char* executable,
     uid_t caller_uid = 0;
     gid_t caller_gid = 0;
     if (!get_peer(root_control, parent_peer) ||
-        !receive_frame(root_control, credentials, kHandshakeMs) ||
+        !receive_frame_until(root_control, credentials, authorization_deadline) ||
         credentials.type != kCallerCredentials || !token_equal(credentials.token, token) ||
         !parse_credentials(credentials.payload, caller_uid, caller_gid) ||
         !credentials_match_peer(credentials.payload, parent_peer.uid, parent_peer.gid) ||
@@ -4635,8 +4635,14 @@ static bool formal_authorization_policy_self_check(std::string& error) {
         error = "formal authorization no-emission socketpair failed";
         return false;
     }
-    const AuthorizationEmission emission = emit_authorization_frames(
-        sockets[0], false, token, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    AuthorizationSnapshot rejected_snapshot = baseline;
+    ++rejected_snapshot.anchor.identity.pid;
+    const bool rejected_authorization = same_authorization_snapshot(baseline, rejected_snapshot);
+    const AuthorizationEmission emission =
+        emit_authorization_frames(sockets[0],
+                                  rejected_authorization,
+                                  token,
+                                  std::chrono::steady_clock::now() + std::chrono::seconds(1));
     pollfd readable{sockets[1], POLLIN, 0};
     const int polled = poll(&readable, 1, 0);
     if (emission != AuthorizationEmission::Rejected || polled != 0) {
@@ -4645,8 +4651,12 @@ static bool formal_authorization_policy_self_check(std::string& error) {
         error = "formal authorization rejection emitted ACK or credentials";
         return false;
     }
-    const AuthorizationEmission sent = emit_authorization_frames(
-        sockets[0], true, token, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    const bool accepted_authorization = same_authorization_snapshot(baseline, changed);
+    const AuthorizationEmission sent =
+        emit_authorization_frames(sockets[0],
+                                  accepted_authorization,
+                                  token,
+                                  std::chrono::steady_clock::now() + std::chrono::seconds(1));
     Frame ack;
     Frame credentials;
     const bool exact_order =
@@ -5025,17 +5035,17 @@ static bool run_session(const std::string& sudo_path,
             !control_lease_lost(root_fd) && get_peer(root_fd, final_root_peer) &&
             final_root_peer.pid == root_peer.pid && final_root_peer.uid == root_peer.uid &&
             final_root_peer.gid == root_peer.gid && endpoint_unchanged(endpoint);
-        if (!final_authorized) {
-            if (identity_error.empty()) identity_error = "final authorization evidence changed";
-            error = "root broker final pre-ACK authorization failed: " + identity_error;
-            break;
-        }
+        if (!final_authorized && identity_error.empty())
+            identity_error = "final authorization evidence changed";
         const AuthorizationEmission emission =
             emit_authorization_frames(root_fd, final_authorized, token, hello_deadline);
         if (emission != AuthorizationEmission::Sent) {
-            error = emission == AuthorizationEmission::AckFailed
-                        ? "identity bundle ACK frame failed"
-                        : "caller credential frame failed after identity bundle ACK";
+            if (emission == AuthorizationEmission::Rejected)
+                error = "root broker final pre-ACK authorization failed: " + identity_error;
+            else if (emission == AuthorizationEmission::AckFailed)
+                error = "identity bundle ACK frame failed";
+            else
+                error = "caller credential frame failed after identity bundle ACK";
             break;
         }
         received_identity.reset();
