@@ -40,6 +40,9 @@ struct CleanupState {
 struct HooksForTesting {
     int (*pidfd_open)(pid_t, unsigned int) = nullptr;
     bool fail_fork = false;
+    int (*close_fd)(int, void*) = nullptr;
+    void* close_context = nullptr;
+    unsigned int child_delay_ms = 0;
 };
 
 // A single-use, non-movable paused direct-child lease. The caller owns the
@@ -104,11 +107,14 @@ private:
     bool released_ = false;
     bool release_sent_ = false;
     bool child_reaped_ = false;
+    bool release_close_uncertain_ = false;
     int child_status_ = 0;
     dev_t observation_dev_ = 0;
     ino_t observation_ino_ = 0;
     dev_t authority_dev_ = 0;
     ino_t authority_ino_ = 0;
+    int (*close_hook_)(int, void*) = nullptr;
+    void* close_context_ = nullptr;
     std::shared_ptr<CleanupState> cleanup_state_;
 };
 

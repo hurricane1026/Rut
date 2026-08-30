@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/kcmp.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -17,6 +18,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut::test::fixture_wildcard_paused_child_lease {
@@ -163,6 +165,18 @@ bool same_fd_object(int fd, dev_t device, ino_t inode) {
            status.st_dev == device && status.st_ino == inode;
 }
 
+bool same_open_file_description(int first, int second) {
+#ifdef SYS_kcmp
+    errno = 0;
+    return syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, first, second) == 0;
+#else
+    (void)first;
+    (void)second;
+    errno = ENOSYS;
+    return false;
+#endif
+}
+
 bool valid_pidfd_unbounded(int fd, pid_t expected, bool require_live, dev_t device, ino_t inode) {
     const int flags = fcntl(fd, F_GETFD);
     if (flags < 0 || (flags & FD_CLOEXEC) == 0 || !same_fd_object(fd, device, inode) ||
@@ -220,8 +234,14 @@ int open_pidfd(pid_t pid) {
 #endif
 }
 
-void child_main(int ready_fd, int release_fd, pid_t expected_parent) {
+void child_main(int ready_fd, int release_fd, pid_t expected_parent, unsigned int delay_ms) {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(120);
+    if (delay_ms != 0) {
+        timespec delay{static_cast<time_t>(delay_ms / 1000u),
+                       static_cast<long>((delay_ms % 1000u) * 1000000u)};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+        }
+    }
     unsigned char ready = kReady;
     for (;;) {
         const ssize_t result = write(ready_fd, &ready, 1);
@@ -374,7 +394,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     if (child == 0) {
         close(ready[0]);
         close(release[1]);
-        child_main(ready[1], release[0], parent);
+        child_main(ready[1], release[0], parent, hooks == nullptr ? 0u : hooks->child_delay_ms);
     }
     close(ready[1]);
     close(release[0]);
@@ -415,6 +435,8 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     candidate.authority_pidfd_ = authority;
     candidate.parent_pid_ = parent;
     candidate.child_pid_ = child;
+    candidate.close_hook_ = hooks == nullptr ? nullptr : hooks->close_fd;
+    candidate.close_context_ = hooks == nullptr ? nullptr : hooks->close_context;
     candidate.active_ = true;
     if (!candidate.validate_pidfd(observation, true, deadline, diagnostic) ||
         !candidate.validate_pidfd(authority, true, deadline, diagnostic)) {
@@ -487,6 +509,8 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     lease.observation_ino_ = candidate.observation_ino_;
     lease.authority_dev_ = candidate.authority_dev_;
     lease.authority_ino_ = candidate.authority_ino_;
+    lease.close_hook_ = candidate.close_hook_;
+    lease.close_context_ = candidate.close_context_;
     lease.active_ = true;
     candidate.ready_fd_ = -1;
     candidate.release_fd_ = -1;
@@ -548,6 +572,10 @@ bool PausedChildLease::validate_bound_child(std::chrono::steady_clock::time_poin
     if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
         !validate_pidfd(authority_pidfd_, true, deadline, diagnostic))
         return false;
+    if (!same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+        return false;
+    }
     if (!validate_identity(deadline, diagnostic)) return false;
     std::vector<pid_t> children;
     if (!direct_children(deadline, children, diagnostic)) return false;
@@ -592,12 +620,22 @@ bool PausedChildLease::wait_reap(std::chrono::steady_clock::time_point deadline,
 }
 
 bool PausedChildLease::close_fd(int& fd, Diagnostic& diagnostic) {
-    return close_once(fd, diagnostic);
+    if (fd < 0) return true;
+    const int old = fd;
+    fd = -1;
+    const int result = close_hook_ == nullptr ? close(old) : close_hook_(old, close_context_);
+    if (result == 0) return true;
+    fail(diagnostic, FailurePhase::Close, errno == 0 ? EIO : errno);
+    return false;
 }
 
 bool PausedChildLease::close_after_reap(Diagnostic& diagnostic, bool observation_valid) {
     bool success = true;
     Diagnostic close_diagnostic;
+    if (observation_valid && !same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        fail(diagnostic, FailurePhase::Close, errno == 0 ? EINVAL : errno);
+        return false;
+    }
     if (observation_valid) success = close_fd(observation_pidfd_, close_diagnostic) && success;
     success = close_fd(authority_pidfd_, close_diagnostic) && success;
     success = close_fd(release_fd_, close_diagnostic) && success;
@@ -626,7 +664,10 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
         }
         release_sent_ = true;
         Diagnostic close_diagnostic;
-        if (!close_fd(release_fd_, close_diagnostic)) diagnostic = close_diagnostic;
+        if (!close_fd(release_fd_, close_diagnostic)) {
+            diagnostic = close_diagnostic;
+            release_close_uncertain_ = true;
+        }
     }
     if (!wait_reap(deadline, diagnostic)) return false;
     if (!WIFEXITED(child_status_) || WEXITSTATUS(child_status_) != 0) {
@@ -635,7 +676,14 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
     }
     if (!observation_valid)
         observation_valid = validate_pidfd(observation_pidfd_, false, deadline, diagnostic);
-    return close_after_reap(diagnostic, observation_valid);
+    const bool closed = close_after_reap(diagnostic, observation_valid);
+    if (release_close_uncertain_) {
+        active_ = false;
+        released_ = true;
+        record_cleanup(false, diagnostic);
+        return false;
+    }
+    return closed;
 }
 
 bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
@@ -664,6 +712,7 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
         ProcIdentity current;
         if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
             !validate_pidfd(authority_pidfd_, true, deadline, diagnostic) ||
+            !same_open_file_description(observation_pidfd_, authority_pidfd_) ||
             !read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
             current.ppid != parent_pid_) {
             fail(diagnostic, FailurePhase::Cleanup, ESTALE);
