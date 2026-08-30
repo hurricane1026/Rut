@@ -73,6 +73,19 @@ struct ProcTcpTable {
 
 bool parse_proc_net_tcp(const std::string& contents, ProcTcpTable& table, Diagnostic& diagnostic);
 
+struct GuardReservationEvidence {
+    std::uint64_t target_owned_inode = 0u;
+};
+
+// Linux does not publish a merely bound, non-listening TCP socket in
+// /proc/net/tcp. Require complete selected-port absence while preserving the
+// independently observed target-owned socket inode as the guard witness.
+bool classify_guard_reservation(const ProcTcpTable& table,
+                                const ListenerPlan& plan,
+                                std::uint64_t target_owned_socket_inode,
+                                GuardReservationEvidence& evidence,
+                                Diagnostic& diagnostic);
+
 enum class ListenerEvidenceKind : std::uint8_t {
     ExactPositive,
     Wildcard,

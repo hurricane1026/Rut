@@ -1,11 +1,14 @@
 // #358 Stage 2a3b: authenticated sudo/nsenter broker lifecycle only.
-// No HTTP listener, nginx process, RUT process, or AF_INET socket is created here.
+// The listener-guard-reservation scenario lets only the secured ordinary Target
+// create a non-listening AF_INET guard and bounded probe clients. No HTTP
+// listener, nginx process, or RUT process is created here.
 
 #include "fixture_ancestry_bundle.h"
 #include "fixture_direct_launch.h"
 #include "fixture_identity_bundle.h"
 #include "fixture_ipv4_topology.h"
 #include "fixture_privileged_ancestry.h"
+#include "fixture_privileged_listener.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
 #include <array>
@@ -23,11 +26,13 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/capability.h>
 #include <linux/limits.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -46,6 +51,7 @@ using namespace rut::test::fixture_worker_protocol;
 namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
 namespace privileged_ancestry = rut::test::fixture_privileged_ancestry;
+namespace privileged_listener = rut::test::fixture_privileged_listener;
 using privileged_ancestry::parse_retained_anchor_stat;
 using privileged_ancestry::parse_retained_anchor_status;
 using privileged_ancestry::prove_retained_sudo_wrapper;
@@ -80,6 +86,12 @@ constexpr u16 kAncestryProbeRequest = 31;
 constexpr u16 kAncestryProbeRelease = 32;
 constexpr u16 kInitialAncestryRequest = 33;
 constexpr u16 kFinalAncestryRequest = 34;
+constexpr u16 kGuardReserve = 35;
+constexpr u16 kGuardHeld = 36;
+constexpr u16 kGuardRelease = 37;
+constexpr u16 kGuardReleased = 38;
+constexpr u16 kGuardFinish = 39;
+constexpr u16 kGuardFinished = 40;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kCredentialFd = 198;
 constexpr int kLauncherBundleFdBase = 220;
@@ -901,6 +913,255 @@ static bool credentials_match_peer(const std::vector<unsigned char>& payload,
     return parse_credentials(payload, uid, gid) && uid == expected_uid && gid == expected_gid;
 }
 
+constexpr std::size_t kGuardReportFields = 19u;
+
+struct GuardReport {
+    privileged_listener::ListenerPlan plan;
+    u64 guard_fd = 0u;
+    u64 socket_inode = 0u;
+    u64 owner_pid = 0u;
+    u64 owner_start = 0u;
+    u64 netns = 0u;
+    u64 baseline_fd_count = 0u;
+    u64 current_fd_count = 0u;
+    u64 family = 0u;
+    u64 socket_type = 0u;
+    u64 fd_cloexec = 0u;
+    u64 accept_connection = 0u;
+    u64 reuse_port = 0u;
+    u64 reuse_address = 0u;
+    u64 connect_error = 0u;
+    u64 fd_invalidated = 0u;
+};
+
+static void append_u64(std::vector<unsigned char>& payload, u64 value) {
+    for (unsigned shift = 0u; shift != 64u; shift += 8u)
+        payload.push_back(static_cast<unsigned char>(value >> shift));
+}
+
+static u64 read_u64(const unsigned char* value) {
+    u64 result = 0u;
+    for (unsigned shift = 0u; shift != 64u; shift += 8u)
+        result |= static_cast<u64>(value[shift / 8u]) << shift;
+    return result;
+}
+
+static std::vector<unsigned char> guard_request_payload(u32 positive_ipv4, u32 guard_ipv4) {
+    std::vector<unsigned char> payload;
+    payload.reserve(2u * sizeof(u64));
+    append_u64(payload, positive_ipv4);
+    append_u64(payload, guard_ipv4);
+    return payload;
+}
+
+static bool parse_guard_request(const std::vector<unsigned char>& payload,
+                                u32& positive_ipv4,
+                                u32& guard_ipv4) {
+    if (payload.size() != 2u * sizeof(u64)) return false;
+    const u64 positive = read_u64(payload.data());
+    const u64 guard = read_u64(payload.data() + sizeof(u64));
+    if (positive > std::numeric_limits<u32>::max() || guard > std::numeric_limits<u32>::max())
+        return false;
+    positive_ipv4 = static_cast<u32>(positive);
+    guard_ipv4 = static_cast<u32>(guard);
+    privileged_listener::ListenerPlan plan{positive_ipv4, guard_ipv4, 1u};
+    privileged_listener::ListenerPlanText text;
+    privileged_listener::Diagnostic diagnostic;
+    return privileged_listener::validate_listener_plan(plan, text, diagnostic);
+}
+
+static std::vector<unsigned char> encode_guard_report(const GuardReport& report) {
+    const std::array<u64, kGuardReportFields> fields{
+        report.plan.positive_ipv4,
+        report.plan.guard_ipv4,
+        report.plan.port,
+        report.guard_fd,
+        report.socket_inode,
+        report.owner_pid,
+        report.owner_start,
+        report.netns,
+        report.baseline_fd_count,
+        report.current_fd_count,
+        report.family,
+        report.socket_type,
+        report.fd_cloexec,
+        report.accept_connection,
+        report.reuse_port,
+        report.reuse_address,
+        report.connect_error,
+        report.fd_invalidated,
+        1u,
+    };
+    std::vector<unsigned char> payload;
+    payload.reserve(fields.size() * sizeof(u64));
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool decode_guard_report(const std::vector<unsigned char>& payload, GuardReport& report) {
+    report = {};
+    if (payload.size() != kGuardReportFields * sizeof(u64)) return false;
+    std::array<u64, kGuardReportFields> fields{};
+    for (std::size_t i = 0u; i < fields.size(); ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    if (fields[18] != 1u) return false;
+    report.plan = {static_cast<u32>(fields[0]), static_cast<u32>(fields[1]), fields[2]};
+    if (fields[0] != report.plan.positive_ipv4 || fields[1] != report.plan.guard_ipv4) return false;
+    report.guard_fd = fields[3];
+    report.socket_inode = fields[4];
+    report.owner_pid = fields[5];
+    report.owner_start = fields[6];
+    report.netns = fields[7];
+    report.baseline_fd_count = fields[8];
+    report.current_fd_count = fields[9];
+    report.family = fields[10];
+    report.socket_type = fields[11];
+    report.fd_cloexec = fields[12];
+    report.accept_connection = fields[13];
+    report.reuse_port = fields[14];
+    report.reuse_address = fields[15];
+    report.connect_error = fields[16];
+    report.fd_invalidated = fields[17];
+    return true;
+}
+
+static bool count_open_fds(u64& count) {
+    count = 0u;
+    const int directory_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) return false;
+    DIR* directory = fdopendir(directory_fd);
+    if (directory == nullptr) {
+        close(directory_fd);
+        return false;
+    }
+    bool ok = true;
+    while (dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        errno = 0;
+        const long value = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0') continue;
+        if (errno != 0 || value < 0 || value > std::numeric_limits<int>::max()) {
+            ok = false;
+            break;
+        }
+        if (value != directory_fd) count++;
+        if (count > 1024u) {
+            ok = false;
+            break;
+        }
+    }
+    if (closedir(directory) != 0) ok = false;
+    return ok;
+}
+
+static bool bounded_connect_refused(u32 ipv4, u16 port, int& connect_error) {
+    connect_error = 0;
+    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (client < 0) return false;
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    endpoint.sin_addr.s_addr = htonl(ipv4);
+    int result = connect(client, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint));
+    if (result == 0) {
+        close(client);
+        return false;
+    }
+    connect_error = errno;
+    if (connect_error == EINPROGRESS) {
+        pollfd descriptor{client, POLLOUT, 0};
+        do {
+            result = poll(&descriptor, 1, kHandshakeMs);
+        } while (result < 0 && errno == EINTR);
+        if (result <= 0) {
+            close(client);
+            return false;
+        }
+        socklen_t size = sizeof(connect_error);
+        if (getsockopt(client, SOL_SOCKET, SO_ERROR, &connect_error, &size) != 0 ||
+            size != sizeof(connect_error)) {
+            close(client);
+            return false;
+        }
+    }
+    const bool refused = connect_error == ECONNREFUSED;
+    close(client);
+    return refused;
+}
+
+static bool fill_guard_socket_report(int guard_fd,
+                                     const privileged_listener::ListenerPlan& plan,
+                                     u64 baseline_fd_count,
+                                     GuardReport& report) {
+    report = {};
+    if (guard_fd < 0) return false;
+    ProcIdentity self;
+    struct stat socket_status{};
+    sockaddr_in endpoint{};
+    socklen_t endpoint_size = sizeof(endpoint);
+    int socket_type = 0, accept_connection = 0, reuse_port = 0, reuse_address = 0;
+    socklen_t option_size = sizeof(int);
+    const int fd_flags = fcntl(guard_fd, F_GETFD);
+    u64 current_fd_count = 0u;
+    int connect_error = 0;
+    if (!read_proc(getpid(), self) || !self.no_new_privs || !self.capabilities_clear ||
+        self.supplementary_groups != 0 || fstat(guard_fd, &socket_status) != 0 ||
+        !S_ISSOCK(socket_status.st_mode) ||
+        getsockname(guard_fd, reinterpret_cast<sockaddr*>(&endpoint), &endpoint_size) != 0 ||
+        endpoint_size != sizeof(endpoint) || endpoint.sin_family != AF_INET ||
+        getsockopt(guard_fd, SOL_SOCKET, SO_TYPE, &socket_type, &option_size) != 0 ||
+        option_size != sizeof(int) ||
+        getsockopt(guard_fd, SOL_SOCKET, SO_ACCEPTCONN, &accept_connection, &option_size) != 0 ||
+        option_size != sizeof(int) ||
+        getsockopt(guard_fd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, &option_size) != 0 ||
+        option_size != sizeof(int) ||
+        getsockopt(guard_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address, &option_size) != 0 ||
+        option_size != sizeof(int) || fd_flags < 0 || !count_open_fds(current_fd_count) ||
+        !bounded_connect_refused(plan.guard_ipv4, static_cast<u16>(plan.port), connect_error))
+        return false;
+    report.plan = plan;
+    report.guard_fd = static_cast<u64>(guard_fd);
+    report.socket_inode = socket_status.st_ino;
+    report.owner_pid = static_cast<u64>(self.pid);
+    report.owner_start = self.start;
+    report.netns = self.netns;
+    report.baseline_fd_count = baseline_fd_count;
+    report.current_fd_count = current_fd_count;
+    report.family = endpoint.sin_family;
+    report.socket_type = static_cast<u64>(socket_type);
+    report.fd_cloexec = (fd_flags & FD_CLOEXEC) != 0 ? 1u : 0u;
+    report.accept_connection = static_cast<u64>(accept_connection);
+    report.reuse_port = static_cast<u64>(reuse_port);
+    report.reuse_address = static_cast<u64>(reuse_address);
+    report.connect_error = static_cast<u64>(connect_error);
+    return ntohl(endpoint.sin_addr.s_addr) == plan.guard_ipv4 &&
+           ntohs(endpoint.sin_port) == plan.port;
+}
+
+static bool validate_guard_report(const GuardReport& report,
+                                  const privileged_listener::ListenerPlan& expected_plan,
+                                  const ProcIdentity& target,
+                                  bool released) {
+    privileged_listener::ListenerPlanText text;
+    privileged_listener::Diagnostic diagnostic;
+    const bool common =
+        privileged_listener::validate_listener_plan(report.plan, text, diagnostic) &&
+        report.plan.positive_ipv4 == expected_plan.positive_ipv4 &&
+        report.plan.guard_ipv4 == expected_plan.guard_ipv4 &&
+        report.plan.port == expected_plan.port &&
+        report.guard_fd <= static_cast<u64>(std::numeric_limits<int>::max()) &&
+        report.socket_inode != 0u && report.owner_pid == static_cast<u64>(target.pid) &&
+        report.owner_start == target.start && report.netns == target.netns &&
+        report.baseline_fd_count > 0u && report.baseline_fd_count < 1024u &&
+        report.family == AF_INET && report.socket_type == SOCK_STREAM && report.fd_cloexec == 1u &&
+        report.accept_connection == 0u && report.reuse_port == 0u && report.reuse_address == 0u &&
+        report.connect_error == static_cast<u64>(ECONNREFUSED);
+    return common && (released ? report.fd_invalidated == 1u &&
+                                     report.current_fd_count == report.baseline_fd_count
+                               : report.fd_invalidated == 0u &&
+                                     report.current_fd_count == report.baseline_fd_count + 1u);
+}
+
 static bool secure_as(uid_t uid, gid_t gid) {
     if (setgroups(0, nullptr) != 0 || setgid(gid) != 0 || setuid(uid) != 0 ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || !clear_caps() || setpgid(0, 0) != 0)
@@ -1280,9 +1541,92 @@ static int secured_target_main(const char* control_path,
     for (;;) {
         Frame command;
         if (!receive_frame(control, command, kBrokerDeadlineMs) ||
-            !token_equal(command.token, token) || !command.payload.empty()) {
+            !token_equal(command.token, token)) {
             close(control);
             return 0;
+        }
+        if (command.type == kGuardReserve && strcmp(scenario, "listener-guard-reservation") == 0) {
+            u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+            ProcIdentity secured_identity;
+            u64 baseline_fd_count = 0u;
+            if (!parse_guard_request(command.payload, positive_ipv4, guard_ipv4) ||
+                !read_proc(getpid(), secured_identity) || secured_identity.uid != geteuid() ||
+                secured_identity.gid != getegid() || secured_identity.supplementary_groups != 0 ||
+                !secured_identity.no_new_privs || !secured_identity.capabilities_clear ||
+                !count_open_fds(baseline_fd_count)) {
+                close(control);
+                return 45;
+            }
+            const int guard_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (guard_fd < 0) {
+                close(control);
+                return 46;
+            }
+            sockaddr_in endpoint{};
+            endpoint.sin_family = AF_INET;
+            endpoint.sin_port = 0;
+            endpoint.sin_addr.s_addr = htonl(guard_ipv4);
+            socklen_t endpoint_size = sizeof(endpoint);
+            if (bind(guard_fd, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0 ||
+                getsockname(guard_fd, reinterpret_cast<sockaddr*>(&endpoint), &endpoint_size) !=
+                    0 ||
+                endpoint_size != sizeof(endpoint) || endpoint.sin_family != AF_INET) {
+                close(guard_fd);
+                close(control);
+                return 47;
+            }
+            const privileged_listener::ListenerPlan plan{
+                positive_ipv4, guard_ipv4, ntohs(endpoint.sin_port)};
+            GuardReport held;
+            if (plan.port == 0u || ntohl(endpoint.sin_addr.s_addr) != guard_ipv4 ||
+                !fill_guard_socket_report(guard_fd, plan, baseline_fd_count, held) ||
+                !validate_guard_report(held, plan, secured_identity, false) ||
+                !send_frame(
+                    control, Frame{kGuardHeld, token, encode_guard_report(held)}, kHandshakeMs)) {
+                close(guard_fd);
+                close(control);
+                return 48;
+            }
+            Frame release;
+            if (!receive_frame(control, release, kBrokerDeadlineMs) ||
+                !exact_request(release, kGuardRelease, token)) {
+                close(guard_fd);
+                close(control);
+                return 49;
+            }
+            close(guard_fd);
+            errno = 0;
+            const bool invalidated = fcntl(guard_fd, F_GETFD) < 0 && errno == EBADF;
+            GuardReport released = held;
+            int connect_error = 0;
+            released.fd_invalidated = invalidated ? 1u : 0u;
+            if (!count_open_fds(released.current_fd_count) ||
+                !bounded_connect_refused(
+                    plan.guard_ipv4, static_cast<u16>(plan.port), connect_error)) {
+                close(control);
+                return 50;
+            }
+            released.connect_error = static_cast<u64>(connect_error);
+            if (!validate_guard_report(released, plan, secured_identity, true) ||
+                !send_frame(control,
+                            Frame{kGuardReleased, token, encode_guard_report(released)},
+                            kHandshakeMs)) {
+                close(control);
+                return 51;
+            }
+            Frame finish;
+            if (!receive_frame(control, finish, kBrokerDeadlineMs) ||
+                !exact_request(finish, kGuardFinish, token) ||
+                !send_frame(control, Frame{kGuardFinished, token, {}}, kHandshakeMs)) {
+                close(control);
+                return 52;
+            }
+            close(control);
+            return 0;
+        }
+        if (!command.payload.empty()) {
+            close(control);
+            return 44;
         }
         if (command.type == kPing) {
             if (!send_frame(control, Frame{kPong, token, {}}, kHandshakeMs)) return 43;
@@ -4834,6 +5178,235 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
     return success;
 }
 
+static bool parse_canonical_ipv4(const std::string& text, u32& ipv4) {
+    in_addr address{};
+    if (text.empty() || text.size() > INET_ADDRSTRLEN ||
+        inet_pton(AF_INET, text.c_str(), &address) != 1)
+        return false;
+    std::array<char, INET_ADDRSTRLEN> canonical{};
+    if (inet_ntop(AF_INET, &address, canonical.data(), canonical.size()) == nullptr ||
+        text != canonical.data())
+        return false;
+    ipv4 = ntohl(address.s_addr);
+    return true;
+}
+
+static bool target_socket_inode(pid_t target, int fd, u64 expected_inode) {
+    if (target <= 1 || fd < 0 || expected_inode == 0u) return false;
+    std::array<char, 64> link{};
+    const std::string path = "/proc/" + std::to_string(target) + "/fd/" + std::to_string(fd);
+    const ssize_t length = readlink(path.c_str(), link.data(), link.size() - 1u);
+    if (length <= 9 || static_cast<std::size_t>(length) >= link.size()) return false;
+    link[static_cast<std::size_t>(length)] = '\0';
+    const std::string value(link.data(), static_cast<std::size_t>(length));
+    if (value.rfind("socket:[", 0u) != 0u || value.back() != ']') return false;
+    const std::string inode_text = value.substr(8u, value.size() - 9u);
+    u64 inode = 0u;
+    return parse_u64(inode_text.c_str(), inode) && inode == expected_inode;
+}
+
+static bool target_fd_absent(pid_t target, int fd) {
+    if (target <= 1 || fd < 0) return false;
+    const std::string path = "/proc/" + std::to_string(target) + "/fd/" + std::to_string(fd);
+    std::array<char, 8> link{};
+    errno = 0;
+    return readlink(path.c_str(), link.data(), link.size()) < 0 && errno == ENOENT;
+}
+
+static bool count_target_fds(pid_t target, u64& count) {
+    count = 0u;
+    if (target <= 1) return false;
+    const std::string path = "/proc/" + std::to_string(target) + "/fd";
+    const int directory_fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) return false;
+    DIR* directory = fdopendir(directory_fd);
+    if (directory == nullptr) {
+        close(directory_fd);
+        return false;
+    }
+    bool ok = true;
+    while (dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        errno = 0;
+        const long value = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0') continue;
+        if (errno != 0 || value < 0 || value > std::numeric_limits<int>::max() || ++count > 1024u) {
+            ok = false;
+            break;
+        }
+    }
+    if (closedir(directory) != 0) ok = false;
+    return ok;
+}
+
+static bool read_target_tcp_table(pid_t target,
+                                  privileged_listener::ProcTcpTable& table,
+                                  std::string& error) {
+    std::string contents;
+    privileged_listener::Diagnostic diagnostic;
+    if (target <= 1 ||
+        !read_file("/proc/" + std::to_string(target) + "/net/tcp",
+                   contents,
+                   privileged_listener::kMaxProcBytes) ||
+        !privileged_listener::parse_proc_net_tcp(contents, table, diagnostic)) {
+        error = "bounded target /proc/net/tcp read or parse failed";
+        return false;
+    }
+    return true;
+}
+
+static bool observe_guard_held(const ProcIdentity& target,
+                               const privileged_listener::ListenerPlan& plan,
+                               const GuardReport& report,
+                               std::string& error) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeMs);
+    for (;;) {
+        ProcIdentity current;
+        privileged_listener::ProcTcpTable table;
+        u64 fd_count = 0u;
+        if (!read_proc(target.pid, current) || !same_process_identity(target, current) ||
+            !target_socket_inode(
+                target.pid, static_cast<int>(report.guard_fd), report.socket_inode) ||
+            !count_target_fds(target.pid, fd_count) || fd_count != report.current_fd_count ||
+            !read_target_tcp_table(target.pid, table, error)) {
+            if (error.empty()) error = "target guard owner identity or FD inode changed";
+            return false;
+        }
+        privileged_listener::GuardReservationEvidence evidence;
+        privileged_listener::Diagnostic diagnostic;
+        if (privileged_listener::classify_guard_reservation(
+                table, plan, report.socket_inode, evidence, diagnostic))
+            return evidence.target_owned_inode == report.socket_inode;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "target-owned guard reservation never reached exact proc evidence";
+            return false;
+        }
+        (void)poll(nullptr, 0, 5);
+    }
+}
+
+static bool observe_guard_released(const ProcIdentity& target,
+                                   const privileged_listener::ListenerPlan& plan,
+                                   const GuardReport& report,
+                                   std::string& error) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeMs);
+    for (;;) {
+        ProcIdentity current;
+        privileged_listener::ProcTcpTable table;
+        u64 fd_count = 0u;
+        if (!read_proc(target.pid, current) || !same_process_identity(target, current) ||
+            !target_fd_absent(target.pid, static_cast<int>(report.guard_fd)) ||
+            !count_target_fds(target.pid, fd_count) || fd_count != report.baseline_fd_count ||
+            !read_target_tcp_table(target.pid, table, error)) {
+            if (error.empty()) error = "released target guard FD or identity changed";
+            return false;
+        }
+        privileged_listener::ListenerEvidence evidence;
+        privileged_listener::Diagnostic diagnostic;
+        if (privileged_listener::classify_listener_evidence(
+                table,
+                plan,
+                {},
+                privileged_listener::ListenerEvidenceKind::PortAbsent,
+                evidence,
+                diagnostic))
+            return evidence.child_owned_inode == 0u && !evidence.guard_covered_by_listener;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "released guard selected port never reached complete proc absence";
+            return false;
+        }
+        (void)poll(nullptr, 0, 5);
+    }
+}
+
+static bool guard_protocol_self_check(std::string& error) {
+    constexpr u32 positive = 0x0a010203u;
+    constexpr u32 guard = 0x0a010204u;
+    u32 decoded_positive = 0u, decoded_guard = 0u;
+    std::vector<unsigned char> request = guard_request_payload(positive, guard);
+    if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
+        kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
+        !parse_guard_request(request, decoded_positive, decoded_guard) ||
+        decoded_positive != positive || decoded_guard != guard) {
+        error = "private guard frame/request codec self-check failed";
+        return false;
+    }
+    request.pop_back();
+    if (parse_guard_request(request, decoded_positive, decoded_guard) ||
+        parse_guard_request(
+            guard_request_payload(positive, positive), decoded_positive, decoded_guard)) {
+        error = "malformed guard request was accepted";
+        return false;
+    }
+    ProcIdentity target;
+    target.pid = 101;
+    target.start = 202u;
+    target.netns = 303u;
+    GuardReport held;
+    held.plan = {positive, guard, 8080u};
+    held.guard_fd = 9u;
+    held.socket_inode = 404u;
+    held.owner_pid = 101u;
+    held.owner_start = 202u;
+    held.netns = 303u;
+    held.baseline_fd_count = 4u;
+    held.current_fd_count = 5u;
+    held.family = AF_INET;
+    held.socket_type = SOCK_STREAM;
+    held.fd_cloexec = 1u;
+    held.connect_error = ECONNREFUSED;
+    GuardReport decoded;
+    const std::vector<unsigned char> encoded = encode_guard_report(held);
+    if (!decode_guard_report(encoded, decoded) ||
+        !validate_guard_report(decoded, held.plan, target, false)) {
+        error = "canonical held guard report codec/validation failed";
+        return false;
+    }
+    const auto rejects = [&](GuardReport mutation) {
+        return !validate_guard_report(mutation, held.plan, target, false);
+    };
+    GuardReport mutation = held;
+    mutation.reuse_port = 1u;
+    if (!rejects(mutation)) {
+        error = "SO_REUSEPORT guard mutation was accepted";
+        return false;
+    }
+    mutation = held;
+    mutation.accept_connection = 1u;
+    if (!rejects(mutation)) {
+        error = "listening guard mutation was accepted";
+        return false;
+    }
+    mutation = held;
+    mutation.owner_pid++;
+    if (!rejects(mutation)) {
+        error = "guard owner mutation was accepted";
+        return false;
+    }
+    mutation = held;
+    mutation.current_fd_count = mutation.baseline_fd_count;
+    if (!rejects(mutation)) {
+        error = "held guard FD baseline mutation was accepted";
+        return false;
+    }
+    GuardReport released = held;
+    released.current_fd_count = released.baseline_fd_count;
+    released.fd_invalidated = 1u;
+    if (!validate_guard_report(released, held.plan, target, true)) {
+        error = "canonical released guard report was rejected";
+        return false;
+    }
+    std::vector<unsigned char> bad_version = encoded;
+    bad_version.back() = 2u;
+    if (decode_guard_report(bad_version, decoded)) {
+        error = "unknown guard report version was accepted";
+        return false;
+    }
+    return true;
+}
+
 static bool run_session(const std::string& sudo_path,
                         const std::string& nsenter_path,
                         const std::string& executable,
@@ -5282,6 +5855,54 @@ static bool run_session(const std::string& sudo_path,
                 error = "target PING/PONG/release failed";
                 break;
             }
+        } else if (strcmp(scenario, "listener-guard-reservation") == 0) {
+            u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+            if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
+                !parse_canonical_ipv4(topology.guard_ip, guard_ipv4)) {
+                error = "held topology listener addresses were not canonical IPv4";
+                break;
+            }
+            Frame held_frame;
+            GuardReport held;
+            if (!send_frame(
+                    target_fd,
+                    Frame{kGuardReserve, token, guard_request_payload(positive_ipv4, guard_ipv4)},
+                    kHandshakeMs) ||
+                !receive_frame(target_fd, held_frame, kBrokerDeadlineMs) ||
+                held_frame.type != kGuardHeld || !token_equal(held_frame.token, token) ||
+                !decode_guard_report(held_frame.payload, held)) {
+                error = "secured target guard reservation/report failed";
+                break;
+            }
+            const privileged_listener::ListenerPlan plan{positive_ipv4, guard_ipv4, held.plan.port};
+            if (!validate_guard_report(held, plan, target_proc, false) ||
+                !observe_guard_held(target_proc, plan, held, error)) {
+                if (error.empty()) error = "held guard report/proc evidence was invalid";
+                break;
+            }
+            Frame released_frame;
+            GuardReport released;
+            if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
+                !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
+                released_frame.type != kGuardReleased ||
+                !token_equal(released_frame.token, token) ||
+                !decode_guard_report(released_frame.payload, released) ||
+                !validate_guard_report(released, plan, target_proc, true) ||
+                released.guard_fd != held.guard_fd || released.socket_inode != held.socket_inode ||
+                released.baseline_fd_count != held.baseline_fd_count ||
+                released.owner_pid != held.owner_pid || released.owner_start != held.owner_start ||
+                released.netns != held.netns ||
+                !observe_guard_released(target_proc, plan, released, error)) {
+                if (error.empty()) error = "released guard report/proc/FD evidence was invalid";
+                break;
+            }
+            Frame finished;
+            if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
+                !receive_frame(target_fd, finished, kHandshakeMs) ||
+                !exact_request(finished, kGuardFinished, token)) {
+                error = "guard lifecycle final release handshake failed";
+                break;
+            }
         } else if (strcmp(scenario, "term-ignore") == 0) {
             if (!safe_signal_target(target_report, target_peer, target_proc, SIGTERM)) {
                 error = "TERM-ignore identity-safe TERM failed";
@@ -5547,6 +6168,11 @@ static bool run_positive(const std::string& sudo_path,
             error = std::string(scenario) + ": " + error;
             return false;
         }
+    if (!run_session(
+            sudo_path, nsenter_path, executable, topology, "listener-guard-reservation", error)) {
+        error = "listener-guard-reservation: " + error;
+        return false;
+    }
     return true;
 }
 
@@ -5579,7 +6205,7 @@ int main(int argc, char** argv) {
         !prelaunch_close_first_self_check(error) ||
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error) ||
         !ancestry_probe_validation_self_check(error) ||
-        !formal_authorization_policy_self_check(error)) {
+        !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }

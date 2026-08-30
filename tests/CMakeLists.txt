@@ -67,8 +67,9 @@ target_link_libraries(test_fixture_privileged_ancestry PRIVATE fixture_privilege
 add_test(NAME test_fixture_privileged_ancestry COMMAND test_fixture_privileged_ancestry)
 set_tests_properties(test_fixture_privileged_ancestry PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
 
-# Pure #358 listener plan/source/proc-table/collision-log evidence. This target
-# creates no sockets or processes and is not yet integrated with the broker.
+# Pure #358 listener plan/source/proc-table/collision-log evidence. The library
+# is shared with the privileged broker; this focused unit creates no sockets or
+# processes.
 add_library(fixture_privileged_listener STATIC fixture_privileged_listener.cc)
 target_include_directories(fixture_privileged_listener PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -567,6 +568,7 @@ if(RUT_ENABLE_JIT)
         fixture_direct_launch
         fixture_identity_bundle
         fixture_privileged_ancestry
+        fixture_privileged_listener
         fixture_worker_protocol
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE

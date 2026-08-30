@@ -177,6 +177,46 @@ bool proc_parser_tests() {
     return ok;
 }
 
+bool guard_reservation_tests() {
+    listener::Diagnostic diagnostic;
+    listener::ProcTcpTable table;
+    listener::GuardReservationEvidence evidence;
+    const std::string exact = std::string(kHeader) + row("00000000:1F91", "0A", "333");
+    bool ok =
+        check(listener::parse_proc_net_tcp(exact, table, diagnostic) &&
+                  listener::classify_guard_reservation(table, kPlan, 222u, evidence, diagnostic) &&
+                  evidence.target_owned_inode == 222u &&
+                  diagnostic.phase == listener::DiagnosticPhase::None,
+              "exact target-owned guard reservation was not classified");
+    auto rejected = [&](const std::string& contents, std::uint64_t inode, const char* message) {
+        listener::ProcTcpTable mutation;
+        listener::Diagnostic failure;
+        listener::GuardReservationEvidence ignored;
+        ok = check(listener::parse_proc_net_tcp(contents, mutation, failure) &&
+                       !listener::classify_guard_reservation(
+                           mutation, kPlan, inode, ignored, failure) &&
+                       failure.phase != listener::DiagnosticPhase::None,
+                   message) &&
+             ok;
+    };
+    rejected(std::string(kHeader) + row("0402010A:1F90", "0A", "222"),
+             222u,
+             "selected-port listener was accepted beside a guard reservation");
+    rejected(std::string(kHeader) + row("0302010A:1F90", "07", "222"),
+             222u,
+             "selected-port TCP_CLOSE record was accepted beside a guard reservation");
+    rejected(std::string(kHeader) + row("0402010A:1F90", "07", "223"),
+             222u,
+             "unpublished selected-port record was accepted beside a guard reservation");
+    listener::GuardReservationEvidence ignored;
+    listener::Diagnostic failure;
+    ok = check(!listener::classify_guard_reservation(table, kPlan, 0u, ignored, failure) &&
+                   failure.phase == listener::DiagnosticPhase::Ownership,
+               "zero target-owned guard inode was accepted") &&
+         ok;
+    return ok;
+}
+
 bool evidence_tests() {
     listener::Diagnostic diagnostic;
     listener::ProcTcpTable exact;
@@ -412,8 +452,8 @@ bool collision_log_tests() {
 }  // namespace
 
 int main() {
-    const bool ok =
-        plan_and_source_tests() && proc_parser_tests() && evidence_tests() && collision_log_tests();
+    const bool ok = plan_and_source_tests() && proc_parser_tests() && guard_reservation_tests() &&
+                    evidence_tests() && collision_log_tests();
     if (!ok) return 1;
     std::puts("PASS: #358 pure listener evidence helper");
     return 0;

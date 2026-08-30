@@ -243,6 +243,38 @@ bool parse_proc_net_tcp(const std::string& contents, ProcTcpTable& table, Diagno
     return true;
 }
 
+bool classify_guard_reservation(const ProcTcpTable& table,
+                                const ListenerPlan& plan,
+                                std::uint64_t target_owned_socket_inode,
+                                GuardReservationEvidence& evidence,
+                                Diagnostic& diagnostic) {
+    evidence = {};
+    diagnostic = {};
+    ListenerPlanText text;
+    if (!validate_listener_plan(plan, text, diagnostic)) return false;
+    if (table.count > table.rows.size() || target_owned_socket_inode == 0u) {
+        fail(diagnostic,
+             DiagnosticPhase::Ownership,
+             table.count,
+             0u,
+             target_owned_socket_inode == 0u ? 0u : 1u);
+        return false;
+    }
+    const std::uint16_t selected_port = static_cast<std::uint16_t>(plan.port);
+    std::size_t port_records = 0u;
+    for (std::size_t i = 0u; i < table.count; ++i) {
+        const ProcTcpRecord& row = table.rows[i];
+        if (row.local_port == selected_port) port_records++;
+    }
+    if (port_records != 0u) {
+        fail(diagnostic, DiagnosticPhase::Evidence, table.count, port_records, 1u);
+        return false;
+    }
+    evidence.target_owned_inode = target_owned_socket_inode;
+    diagnostic = {DiagnosticPhase::None, table.count, 0u, 1u, 0};
+    return true;
+}
+
 bool classify_listener_evidence(const ProcTcpTable& table,
                                 const ListenerPlan& plan,
                                 const std::vector<std::uint64_t>& child_owned_socket_inodes,
