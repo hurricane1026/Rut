@@ -114,9 +114,10 @@ bool collect_ancestry(pid_t first_parent,
 bool parse_retained_anchor_stat(const std::string& text, RetainedAnchorEvidence& evidence) {
     const size_t pid_end = text.find(' ');
     if (pid_end == std::string::npos || pid_end == 0) return false;
+    const std::string pid_text = text.substr(0, pid_end);
     char* end = nullptr;
     errno = 0;
-    const unsigned long parsed_pid = strtoul(text.substr(0, pid_end).c_str(), &end, 10);
+    const unsigned long parsed_pid = strtoul(pid_text.c_str(), &end, 10);
     if (errno != 0 || end == nullptr || *end != '\0' || parsed_pid <= 1 ||
         parsed_pid > static_cast<unsigned long>(std::numeric_limits<pid_t>::max()))
         return false;

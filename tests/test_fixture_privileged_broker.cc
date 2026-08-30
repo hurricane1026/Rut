@@ -46,6 +46,11 @@ using namespace rut::test::fixture_worker_protocol;
 namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
 namespace privileged_ancestry = rut::test::fixture_privileged_ancestry;
+using privileged_ancestry::parse_retained_anchor_stat;
+using privileged_ancestry::parse_retained_anchor_status;
+using privileged_ancestry::prove_retained_sudo_wrapper;
+using privileged_ancestry::retained_pidfd_live;
+using privileged_ancestry::RetainedAnchorEvidence;
 using rut::test::fixture_direct_launch::AllowedStages;
 using rut::test::fixture_direct_launch::current_allows_group_signal;
 using rut::test::fixture_direct_launch::direct_launch_diagnostic;
@@ -59,11 +64,6 @@ using rut::test::fixture_direct_launch::observe_direct;
 using rut::test::fixture_direct_launch::StageDescriptor;
 using rut::test::fixture_direct_launch::validate_launcher_ancestry;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
-using privileged_ancestry::RetainedAnchorEvidence;
-using privileged_ancestry::parse_retained_anchor_stat;
-using privileged_ancestry::parse_retained_anchor_status;
-using privileged_ancestry::prove_retained_sudo_wrapper;
-using privileged_ancestry::retained_pidfd_live;
 
 constexpr u16 kBrokerRootHello = 20;
 constexpr u16 kCallerCredentials = 21;
@@ -1522,12 +1522,11 @@ static int root_broker_main(const char* executable,
         }
         ancestry_bundle::AncestryBundle ancestry;
         std::string diagnostic;
-        if (!collect_probe_ancestry(
-                bundle.roles[0].manifest.ppid,
-                ordinary_parent.pid,
-                ancestry,
-                deadline,
-                diagnostic)) {
+        if (!collect_probe_ancestry(bundle.roles[0].manifest.ppid,
+                                    ordinary_parent.pid,
+                                    ancestry,
+                                    deadline,
+                                    diagnostic)) {
             std::cerr << "FAIL [#358 ancestry access]: " << diagnostic << "\n";
             close(root_control);
             return 91;

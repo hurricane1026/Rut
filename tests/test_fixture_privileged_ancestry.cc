@@ -23,6 +23,38 @@ bool check(bool condition, const char* message) {
     return condition;
 }
 
+bool parser_tests() {
+    ancestry::RetainedAnchorEvidence stat;
+    std::string valid_stat = "1234 (fixture) S 42 1234 42";
+    for (int field = 7; field <= 21; ++field) valid_stat += " 0";
+    valid_stat += " 987654321";
+    bool ok =
+        check(ancestry::parse_retained_anchor_stat(valid_stat, stat) && stat.pid == 1234 &&
+                  stat.ppid == 42 && stat.pgid == 1234 && stat.sid == 42 && stat.start == 987654321,
+              "valid retained stat parser path failed");
+    ok = check(!ancestry::parse_retained_anchor_stat("pid (fixture) S 42 1234 42", stat),
+               "malformed retained stat PID was accepted") &&
+         ok;
+    ok = check(!ancestry::parse_retained_anchor_stat("1234x (fixture) S 42 1234 42", stat),
+               "retained stat PID suffix was accepted") &&
+         ok;
+
+    ancestry::RetainedAnchorEvidence status;
+    ok = check(ancestry::parse_retained_anchor_status("Uid: 1000 0 0 0\nGid: 0 0 0 0\n", status) &&
+                   status.uid_values == std::array<uid_t, 4>{1000, 0, 0, 0} &&
+                   status.gid_values == std::array<gid_t, 4>{0, 0, 0, 0},
+               "valid retained status parser path failed") &&
+         ok;
+    ok = check(!ancestry::parse_retained_anchor_status("Uid: 1000 0 0\nGid: 0 0 0 0\n", status),
+               "short retained UID tuple was accepted") &&
+         ok;
+    ok = check(!ancestry::parse_retained_anchor_status(
+                   "Uid: 1000 0 0 0\nUid: 1000 0 0 0\nGid: 0 0 0 0\n", status),
+               "duplicate retained UID field was accepted") &&
+         ok;
+    return ok;
+}
+
 size_t fd_count() {
     DIR* directory = opendir("/proc/self/fd");
     if (directory == nullptr) return 0;
@@ -35,7 +67,7 @@ size_t fd_count() {
 }  // namespace
 
 int main() {
-    bool ok = true;
+    bool ok = parser_tests();
     const pid_t parent = getpid();
     int ready[2] = {-1, -1};
     if (pipe2(ready, O_CLOEXEC) != 0) return 1;
