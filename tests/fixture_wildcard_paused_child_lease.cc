@@ -234,7 +234,11 @@ int open_pidfd(pid_t pid) {
 #endif
 }
 
-void child_main(int ready_fd, int release_fd, pid_t expected_parent, unsigned int delay_ms) {
+void child_main(int ready_fd,
+                int release_fd,
+                pid_t expected_parent,
+                unsigned int delay_ms,
+                unsigned int post_release_delay_ms) {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(120);
     if (delay_ms != 0) {
         timespec delay{static_cast<time_t>(delay_ms / 1000u),
@@ -258,6 +262,12 @@ void child_main(int ready_fd, int release_fd, pid_t expected_parent, unsigned in
         _exit(result == 0 ? 123 : 122);
     }
     close(release_fd);
+    if (release == kRelease && post_release_delay_ms != 0) {
+        timespec delay{static_cast<time_t>(post_release_delay_ms / 1000u),
+                       static_cast<long>((post_release_delay_ms % 1000u) * 1000000u)};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+        }
+    }
     _exit(release == kRelease ? 0 : 124);
 }
 
@@ -273,6 +283,8 @@ PausedChildLease::~PausedChildLease() {
     if (observation_pidfd_ >= 0)
         observation_valid = valid_pidfd_unbounded(
             observation_pidfd_, child_pid_, false, observation_dev_, observation_ino_);
+    if (observation_valid && !same_open_file_description(observation_pidfd_, authority_pidfd_))
+        observation_valid = false;
     bool reaped = child_reaped_;
     if (!reaped) {
         pid_t result = -1;
@@ -394,7 +406,11 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     if (child == 0) {
         close(ready[0]);
         close(release[1]);
-        child_main(ready[1], release[0], parent, hooks == nullptr ? 0u : hooks->child_delay_ms);
+        child_main(ready[1],
+                   release[0],
+                   parent,
+                   hooks == nullptr ? 0u : hooks->child_delay_ms,
+                   hooks == nullptr ? 0u : hooks->post_release_delay_ms);
     }
     close(ready[1]);
     close(release[0]);
@@ -480,7 +496,15 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
         close_ignoring(candidate.authority_pidfd_);
         return false;
     }
-    close_ignoring(candidate.ready_fd_);
+    Diagnostic ready_close_diagnostic;
+    if (!candidate.close_fd(candidate.ready_fd_, ready_close_diagnostic)) {
+        diagnostic = ready_close_diagnostic;
+        close_ignoring(candidate.release_fd_);
+        reap_failed_child();
+        close_ignoring(candidate.observation_pidfd_);
+        close_ignoring(candidate.authority_pidfd_);
+        return false;
+    }
     if (!read_proc(child, candidate.identity_) || candidate.identity_.ppid != parent) {
         fail(diagnostic, FailurePhase::Identity, ESTALE);
         close_ignoring(candidate.release_fd_);
@@ -711,9 +735,16 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
     if (!child_reaped_ && result == 0) {
         ProcIdentity current;
         if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
-            !validate_pidfd(authority_pidfd_, true, deadline, diagnostic) ||
-            !same_open_file_description(observation_pidfd_, authority_pidfd_) ||
-            !read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
+            !validate_pidfd(authority_pidfd_, true, deadline, diagnostic)) {
+            record_cleanup(false, diagnostic);
+            return false;
+        }
+        if (!same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+            fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+            record_cleanup(false, diagnostic);
+            return false;
+        }
+        if (!read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
             current.ppid != parent_pid_) {
             fail(diagnostic, FailurePhase::Cleanup, ESTALE);
             record_cleanup(false, diagnostic);

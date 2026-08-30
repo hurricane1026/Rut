@@ -43,6 +43,7 @@ struct HooksForTesting {
     int (*close_fd)(int, void*) = nullptr;
     void* close_context = nullptr;
     unsigned int child_delay_ms = 0;
+    unsigned int post_release_delay_ms = 0;
 };
 
 // A single-use, non-movable paused direct-child lease. The caller owns the

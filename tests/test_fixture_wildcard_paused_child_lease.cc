@@ -1,12 +1,15 @@
 #include "fixture_wildcard_paused_child_lease.h"
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -29,33 +32,46 @@ Clock::time_point deadline(int milliseconds = 2000) {
     return Clock::now() + std::chrono::milliseconds(milliseconds);
 }
 
-int fd_count() {
+std::vector<int> fd_snapshot() {
+    std::vector<int> snapshot;
     DIR* directory = opendir("/proc/self/fd");
-    if (directory == nullptr) return -1;
-    int count = 0;
-    while (readdir(directory) != nullptr) ++count;
+    if (directory == nullptr) return {};
+    const int directory_fd = dirfd(directory);
+    while (dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        const long value = std::strtol(entry->d_name, &end, 10);
+        if (end != entry->d_name && *end == '\0' && value >= 0 && value != directory_fd)
+            snapshot.push_back(static_cast<int>(value));
+    }
     closedir(directory);
-    return count;
+    std::sort(snapshot.begin(), snapshot.end());
+    return snapshot;
 }
 
-int child_count() {
+std::vector<pid_t> child_snapshot() {
+    std::vector<pid_t> snapshot;
     std::ifstream children("/proc/self/task/" + std::to_string(getpid()) + "/children");
-    if (!children) return -1;
-    int count = 0;
+    if (!children) return {};
     pid_t pid = 0;
-    while (children >> pid) ++count;
-    return count;
+    while (children >> pid) snapshot.push_back(pid);
+    std::sort(snapshot.begin(), snapshot.end());
+    return snapshot;
 }
 
 struct CloseHookState {
     int fail_fd = -1;
+    int fail_call = 0;
+    int calls = 0;
     bool fired = false;
 };
 
 int close_after_real_close(int fd, void* opaque) {
     auto* state = static_cast<CloseHookState*>(opaque);
     const int result = close(fd);
-    if (result == 0 && state != nullptr && (state->fail_fd < 0 || fd == state->fail_fd) &&
+    if (result == 0 && state != nullptr) ++state->calls;
+    if (result == 0 && state != nullptr &&
+        ((state->fail_fd >= 0 && fd == state->fail_fd) ||
+         (state->fail_fd < 0 && state->fail_call > 0 && state->calls == state->fail_call)) &&
         !state->fired) {
         state->fired = true;
         errno = EINTR;
@@ -81,8 +97,8 @@ void kill_by_pidfd(pid_t pid, const char* message) {
 }
 
 void canonical() {
-    const int baseline = fd_count();
-    check(baseline >= 0, "fd directory");
+    const auto baseline = fd_snapshot();
+    const auto children = child_snapshot();
     PausedChildLease lease;
     Diagnostic diagnostic;
     check(PausedChildLease::create(deadline(), lease, diagnostic), "canonical create");
@@ -91,7 +107,7 @@ void canonical() {
     check(lease.validate_paused(deadline(), diagnostic), "canonical validation");
     check(lease.release(deadline(), diagnostic), "canonical release");
     check(!lease.active() && lease.released(), "canonical settled");
-    check(fd_count() == baseline, "canonical fd baseline");
+    check(fd_snapshot() == baseline && child_snapshot() == children, "canonical residue");
 }
 
 void sibling_rejection() {
@@ -160,6 +176,31 @@ void cloexec_and_independent_pidfd() {
     close(original);
     close(replacement);
     check(lease.cleanup(deadline(), diagnostic), "independent recovery");
+}
+
+void destructor_preserves_replacement() {
+    Diagnostic diagnostic;
+    std::shared_ptr<const rut::test::fixture_wildcard_paused_child_lease::CleanupState> evidence;
+    int replacement = -1;
+    int slot = -1;
+    {
+        PausedChildLease lease;
+        check(PausedChildLease::create(deadline(), lease, diagnostic),
+              "destructor replacement create");
+        evidence = lease.cleanup_state();
+        slot = lease.observation_pidfd();
+        const int independent = static_cast<int>(syscall(SYS_pidfd_open, lease.child_pid(), 0u));
+        check(independent >= 0, "destructor independent pidfd");
+        replacement = dup(independent);
+        check(replacement >= 0 && dup2(independent, slot) == slot,
+              "destructor replace observation");
+        close(independent);
+    }
+    check(evidence->attempted && !evidence->succeeded, "destructor replacement evidence");
+    check(fcntl(slot, F_GETFD) >= 0 && fcntl(replacement, F_GETFD) >= 0,
+          "destructor closed replacement");
+    close(slot);
+    close(replacement);
 }
 
 void wrong_observation_recovery() {
@@ -231,22 +272,23 @@ int failing_pidfd(pid_t, unsigned int) {
 void creation_failures() {
     Diagnostic diagnostic;
     PausedChildLease lease;
-    const int baseline_fds = fd_count();
-    const int baseline_children = child_count();
+    const auto baseline_fds = fd_snapshot();
+    const auto baseline_children = child_snapshot();
     HooksForTesting fork_hooks;
     fork_hooks.fail_fork = true;
     check(
         !PausedChildLease::create_with_hooks_for_testing(deadline(), fork_hooks, lease, diagnostic),
         "fork failure accepted");
     check(diagnostic.phase == FailurePhase::Fork, "fork failure phase");
-    check(fd_count() == baseline_fds && child_count() == baseline_children, "fork failure residue");
+    check(fd_snapshot() == baseline_fds && child_snapshot() == baseline_children,
+          "fork failure residue");
     HooksForTesting pidfd_hooks;
     pidfd_hooks.pidfd_open = failing_pidfd;
     check(!PausedChildLease::create_with_hooks_for_testing(
               deadline(), pidfd_hooks, lease, diagnostic),
           "pidfd failure accepted");
     check(diagnostic.phase == FailurePhase::Pidfd, "pidfd failure phase");
-    check(fd_count() == baseline_fds && child_count() == baseline_children,
+    check(fd_snapshot() == baseline_fds && child_snapshot() == baseline_children,
           "pidfd failure residue");
 }
 
@@ -266,6 +308,7 @@ void injected_close_uncertainty() {
     HooksForTesting hooks;
     hooks.close_fd = close_after_real_close;
     hooks.close_context = &state;
+    state.fail_call = 2;  // ready close is call one; release writer is call two.
     PausedChildLease lease;
     check(PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
           "release close hook create");
@@ -283,6 +326,24 @@ void injected_close_uncertainty() {
     check(pidfd_state.fired, "pidfd close hook evidence");
 }
 
+void ready_close_uncertainty() {
+    Diagnostic diagnostic;
+    const auto baseline_fds = fd_snapshot();
+    const auto baseline_children = child_snapshot();
+    CloseHookState state;
+    state.fail_call = 1;
+    HooksForTesting hooks;
+    hooks.close_fd = close_after_real_close;
+    hooks.close_context = &state;
+    PausedChildLease lease;
+    check(!PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
+          "ready close uncertainty accepted");
+    check(diagnostic.phase == FailurePhase::Close && state.fired,
+          "ready close uncertainty evidence");
+    check(baseline_fds == fd_snapshot() && baseline_children == child_snapshot(),
+          "ready close residue");
+}
+
 void interrupted_waits() {
     struct sigaction action{};
     action.sa_handler = count_signal;
@@ -296,10 +357,13 @@ void interrupted_waits() {
     Diagnostic diagnostic;
     HooksForTesting hooks;
     hooks.child_delay_ms = 100;
+    hooks.post_release_delay_ms = 100;
     check(PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
           "eintr create");
     check(signal_count > 0, "no causal EINTR signal");
+    const sig_atomic_t before_release = signal_count;
     check(lease.release(deadline(), diagnostic), "eintr release");
+    check(signal_count > before_release, "no causal EINTR wait");
     timer = {};
     check(setitimer(ITIMER_REAL, &timer, nullptr) == 0, "stop alarm");
 }
@@ -313,11 +377,13 @@ int main() {
         sibling_after_ready();
         wrong_observation_recovery();
         cloexec_and_independent_pidfd();
+        destructor_preserves_replacement();
         dead_child_reap();
         expired_and_destructor();
         creation_failures();
         close_uncertainty();
         injected_close_uncertainty();
+        ready_close_uncertainty();
         interrupted_waits();
         std::cout << "paused wildcard child lease tests passed\n";
         return 0;
