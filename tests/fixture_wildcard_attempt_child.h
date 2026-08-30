@@ -41,8 +41,9 @@ struct CleanupState {
     Diagnostic diagnostic;
 };
 
-// A move-only paused direct-child lease. The source lease is borrowed: this
-// object never unlinks the source pathname and never closes its descriptor.
+// A move-only paused direct-child lease. The source lease is borrowed and must
+// outlive this object (including its destructor): this object never unlinks the
+// source pathname and never closes its descriptor.
 class WildcardAttemptChildLease {
 public:
     WildcardAttemptChildLease();

@@ -3,14 +3,17 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <exception>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <linux/limits.h>
+#include <linux/sched.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -62,7 +65,7 @@ bool same_regular(const struct stat& status, const source_lease::SourceIdentity&
            static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
            static_cast<std::uint64_t>(status.st_gid) == expected.gid && status.st_size >= 0 &&
            static_cast<std::uint64_t>(status.st_size) == expected.size &&
-           (status.st_mode & 0777) == 0600;
+           (status.st_mode & 0777) == 0600 && status.st_nlink == 1;
 }
 
 source_lease::SourceIdentity source_identity(const struct stat& status) {
@@ -125,13 +128,6 @@ bool pidfd_live(int fd) {
     return result == 0 && descriptor.revents == 0;
 }
 
-bool exact_fields(const ProcIdentity& actual, const ProcIdentity& expected) {
-    return actual.pid == expected.pid && actual.start == expected.start &&
-           actual.ppid == expected.ppid && actual.pgid == expected.pgid &&
-           actual.sid == expected.sid && actual.uid == expected.uid && actual.gid == expected.gid &&
-           actual.netns == expected.netns;
-}
-
 bool write_byte(int fd, unsigned char value) {
     for (;;) {
         const ssize_t result = write(fd, &value, 1u);
@@ -139,6 +135,22 @@ bool write_byte(int fd, unsigned char value) {
         if (result < 0 && errno == EINTR) continue;
         return false;
     }
+}
+
+bool write_byte_until(int fd, unsigned char value, std::chrono::steady_clock::time_point deadline) {
+    if (!wait_fd(fd, POLLOUT, deadline)) return false;
+    return write_byte(fd, value);
+}
+
+bool send_pidfd_signal(int pidfd, int signal_number) {
+#ifdef SYS_pidfd_send_signal
+    return syscall(SYS_pidfd_send_signal, pidfd, signal_number, nullptr, 0u) == 0;
+#else
+    (void)pidfd;
+    (void)signal_number;
+    errno = ENOSYS;
+    return false;
+#endif
 }
 
 bool write_all(int fd, const char* bytes, std::size_t size) {
@@ -223,38 +235,31 @@ WildcardAttemptChildLease::WildcardAttemptChildLease()
     : cleanup_state_(std::make_shared<CleanupState>()) {}
 
 WildcardAttemptChildLease::~WildcardAttemptChildLease() {
-    // Destruction is deliberately non-authoritative: no timeout is invented.
-    // A still-live child is signalled only after the pidfd and full identity
-    // have been checked; any uncertain artifact remains for the caller's audit.
+    // Destruction never invents a wait budget. A valid identity/pidfd permits
+    // one authoritative SIGKILL attempt and a nonblocking reap; uncertainty
+    // is retained as a failed observable cleanup rather than reported away.
+    bool process_clean = !active_;
     Diagnostic diagnostic;
-    if (active_) {
-        if (pidfd_ < 0) {
-            // pidfd_open itself failed before an identity lease existed. The
-            // process is still our unreaped direct child, so PID reuse is
-            // impossible; reap it without claiming a successful lease.
-            (void)kill(child_.pid, SIGKILL);
+    if (active_ && pidfd_ >= 0 && validate_pidfd(true, diagnostic)) {
+        ProcIdentity current;
+        if (validate_identity(current, diagnostic) && send_pidfd_signal(pidfd_, SIGKILL)) {
+            pollfd descriptor{pidfd_, POLLIN | POLLERR | POLLHUP, 0};
+            (void)poll(&descriptor, 1, 0);
             int status = 0;
-            if (waitpid(child_.pid, &status, 0) == child_.pid) {
+            if (waitpid(child_.pid, &status, WNOHANG) == child_.pid) {
                 child_.status = status;
                 child_.reaped = true;
-            }
-        } else if (validate_pidfd(true, diagnostic)) {
-            ProcIdentity current;
-            if (validate_identity(current, diagnostic)) {
-                (void)kill(child_.pid, SIGTERM);
-                int status = 0;
-                if (waitpid(child_.pid, &status, WNOHANG) == child_.pid) {
-                    child_.status = status;
-                    child_.reaped = true;
-                }
+                process_clean = true;
             }
         }
-        active_ = false;
+        if (!process_clean) record_cleanup(false, {FailurePhase::Cleanup, EAGAIN});
+    } else if (active_) {
+        record_cleanup(false, {FailurePhase::Cleanup, ESTALE});
     }
     if (log_cleanup_required_) {
         Diagnostic cleanup_diagnostic;
         const bool ok = quarantine_log(cleanup_diagnostic);
-        record_cleanup(ok, cleanup_diagnostic);
+        record_cleanup(process_clean && ok, ok ? Diagnostic{} : cleanup_diagnostic);
     }
     Diagnostic close_diagnostic;
     if (!close_descriptors(close_diagnostic)) record_cleanup(false, close_diagnostic);
@@ -266,7 +271,10 @@ WildcardAttemptChildLease::WildcardAttemptChildLease(WildcardAttemptChildLease&&
 
 WildcardAttemptChildLease& WildcardAttemptChildLease::operator=(
     WildcardAttemptChildLease&& other) noexcept {
-    if (this != &other && !active_ && !log_cleanup_required_) move_from(std::move(other));
+    if (this != &other) {
+        if (active_ || log_cleanup_required_) std::terminate();
+        move_from(std::move(other));
+    }
     return *this;
 }
 
@@ -397,15 +405,26 @@ bool WildcardAttemptChildLease::create_impl(const source_lease::WildcardAttemptS
         return false;
     }
     lease.parent_pid_ = getpid();
-    const pid_t child = fork();
+    int clone_pidfd = -1;
+    clone_args args{};
+    args.flags = CLONE_PIDFD;
+    args.pidfd = reinterpret_cast<std::uint64_t>(&clone_pidfd);
+    args.exit_signal = SIGCHLD;
+#ifdef SYS_clone3
+    const pid_t child = static_cast<pid_t>(syscall(SYS_clone3, &args, sizeof(args)));
+#else
+    const pid_t child = -1;
+    errno = ENOSYS;
+#endif
     if (child < 0) {
         fail(diagnostic, FailurePhase::Fork, errno);
         close(ready[0]);
         close(ready[1]);
         close(release[0]);
         close(release[1]);
+        const bool removed = lease.quarantine_log(diagnostic);
         lease.close_descriptors(diagnostic);
-        lease.record_cleanup(lease.quarantine_log(diagnostic), diagnostic);
+        lease.record_cleanup(removed, diagnostic);
         return false;
     }
     if (child == 0) {
@@ -419,22 +438,20 @@ bool WildcardAttemptChildLease::create_impl(const source_lease::WildcardAttemptS
     lease.release_fd_ = release[1];
     lease.child_.pid = child;
     lease.active_ = true;
-    (void)setpgid(child, child);
-#ifdef SYS_pidfd_open
-    const long raw_pidfd = syscall(SYS_pidfd_open, child, 0u);
-    if (raw_pidfd < 0 || raw_pidfd > std::numeric_limits<int>::max()) {
-        fail(diagnostic, FailurePhase::Pidfd, raw_pidfd < 0 ? errno : EOVERFLOW);
+    lease.pidfd_ = clone_pidfd;
+    if (lease.pidfd_ < 0 || fcntl(lease.pidfd_, F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(lease.pidfd_, F_GETFD) < 0 || (fcntl(lease.pidfd_, F_GETFD) & FD_CLOEXEC) == 0) {
+        fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
         Diagnostic cleanup_diagnostic;
         (void)lease.cleanup(deadline, cleanup_diagnostic);
         return false;
     }
-    lease.pidfd_ = static_cast<int>(raw_pidfd);
-#else
-    fail(diagnostic, FailurePhase::Pidfd, ENOSYS);
-    Diagnostic cleanup_diagnostic;
-    (void)lease.cleanup(deadline, cleanup_diagnostic);
-    return false;
-#endif
+    if (setpgid(child, child) != 0 && errno != EACCES) {
+        fail(diagnostic, FailurePhase::Identity, errno);
+        Diagnostic cleanup_diagnostic;
+        (void)lease.cleanup(deadline, cleanup_diagnostic);
+        return false;
+    }
     if (fcntl(lease.pidfd_, F_SETFD, FD_CLOEXEC) != 0 || fcntl(lease.pidfd_, F_GETFD) < 0 ||
         (fcntl(lease.pidfd_, F_GETFD) & FD_CLOEXEC) == 0 ||
         !read_pidfd_binding(lease.pidfd_, child) || !pidfd_live(lease.pidfd_)) {
@@ -456,7 +473,12 @@ bool WildcardAttemptChildLease::create_impl(const source_lease::WildcardAttemptS
         (void)lease.cleanup(deadline, cleanup_diagnostic);
         return false;
     }
-    close_checked(lease.ready_fd_);
+    if (!close_checked(lease.ready_fd_)) {
+        fail(diagnostic, FailurePhase::Close, errno == 0 ? EIO : errno);
+        Diagnostic cleanup_diagnostic;
+        (void)lease.cleanup(deadline, cleanup_diagnostic);
+        return false;
+    }
     if (std::chrono::steady_clock::now() >= deadline) {
         fail(diagnostic, FailurePhase::Readiness, ETIMEDOUT);
         Diagnostic cleanup_diagnostic;
@@ -504,8 +526,7 @@ bool WildcardAttemptChildLease::validate_pidfd(bool require_live, Diagnostic& di
 bool WildcardAttemptChildLease::validate_identity(ProcIdentity& current,
                                                   Diagnostic& diagnostic) const {
     diagnostic = {};
-    if (!read_proc(child_.pid, current, false) || !exact_fields(current, identity_) ||
-        !same_process_identity(current, identity_)) {
+    if (!read_proc(child_.pid, current, false) || !same_process_identity(current, identity_)) {
         fail(diagnostic, FailurePhase::Identity, ESTALE);
         return false;
     }
@@ -540,9 +561,15 @@ bool WildcardAttemptChildLease::validate_paused(std::chrono::steady_clock::time_
             return false;
         }
         // The release pipe remains empty and the child is re-read after a
-        // short scheduling boundary, proving it did not merely flash ready.
+        // scheduling boundary, proving it did not merely flash ready. The
+        // zero-time poll cannot overrun the caller's absolute deadline.
+        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            fail(diagnostic, FailurePhase::Readiness, ETIMEDOUT);
+            return false;
+        }
         pollfd child_wait{pidfd_, POLLIN | POLLERR | POLLHUP, 0};
-        const int result = poll(&child_wait, 1, 2);
+        const int result = poll(&child_wait, 1, 0);
         if (result < 0 && errno == EINTR) continue;
         if (result > 0) {
             fail(diagnostic, FailurePhase::Readiness, ECHILD);
@@ -584,10 +611,6 @@ bool WildcardAttemptChildLease::scan_direct_children(std::chrono::steady_clock::
         // a process that is demonstrably gone is the only safe exception.
         errno = 0;
         if (!proc_parent(pid, candidate_parent)) {
-            if (errno == ENOENT) {
-                errno = 0;
-                if (kill(pid, 0) != 0 && errno == ESRCH) continue;
-            }
             closedir(directory);
             fail(diagnostic, FailurePhase::Proc, ESTALE);
             return false;
@@ -637,26 +660,32 @@ bool WildcardAttemptChildLease::release(std::chrono::steady_clock::time_point de
         fail(diagnostic, FailurePhase::Argument, EALREADY);
         return false;
     }
-    if (!validate_pidfd(true, diagnostic)) return false;
+    if (!validate_source(diagnostic) || !validate_pidfd(true, diagnostic)) return false;
     ProcIdentity expected = identity_;
     ProcIdentity current;
-    if (!validate_identity(current, diagnostic) || !same_process_identity(current, expected) ||
-        !exact_fields(current, expected)) {
+    if (!validate_identity(current, diagnostic) || !same_process_identity(current, expected)) {
         fail(diagnostic, FailurePhase::Identity, ESTALE);
         return false;
     }
-    if (!write_byte(release_fd_, kReleaseByte)) {
-        fail(diagnostic, FailurePhase::Release, errno);
+    if (!scan_direct_children(deadline, diagnostic) || !validate_source(diagnostic) ||
+        !validate_pidfd(true, diagnostic) || !validate_identity(current, diagnostic) ||
+        !write_byte_until(release_fd_, kReleaseByte, deadline)) {
+        if (diagnostic.phase == FailurePhase::None)
+            fail(diagnostic, FailurePhase::Release, errno == 0 ? ETIMEDOUT : errno);
         return false;
     }
     released_ = true;
-    close_checked(release_fd_);
+    const bool release_closed = close_checked(release_fd_);
     if (!reap_until(deadline, diagnostic) || !WIFEXITED(child_.status) ||
         WEXITSTATUS(child_.status) != 0) {
         if (diagnostic.phase == FailurePhase::None) fail(diagnostic, FailurePhase::Release, ECHILD);
         return false;
     }
     active_ = false;
+    if (!release_closed) {
+        fail(diagnostic, FailurePhase::Close, errno == 0 ? EIO : errno);
+        return false;
+    }
     if (pidfd_ >= 0 && close(pidfd_) != 0) {
         pidfd_ = -1;
         fail(diagnostic, FailurePhase::Close, errno);
@@ -669,6 +698,12 @@ bool WildcardAttemptChildLease::release(std::chrono::steady_clock::time_point de
 bool WildcardAttemptChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
                                         Diagnostic& diagnostic) {
     diagnostic = {};
+    const auto fail_cleanup = [&](const Diagnostic& failure) {
+        diagnostic = failure;
+        record_cleanup(false, failure);
+        return false;
+    };
+    if (source_ == nullptr || !validate_source(diagnostic)) return fail_cleanup(diagnostic);
     if (active_) {
         if (!validate_pidfd(true, diagnostic)) {
             // A child may have died before the caller got to cleanup. A valid
@@ -681,8 +716,9 @@ bool WildcardAttemptChildLease::cleanup(std::chrono::steady_clock::time_point de
                 child_.reaped = true;
             } else {
                 Diagnostic dead_diagnostic;
-                if (!validate_pidfd(false, dead_diagnostic) || pidfd_live(pidfd_)) return false;
-                if (!reap_until(deadline, diagnostic)) return false;
+                if (!validate_pidfd(false, dead_diagnostic) || pidfd_live(pidfd_))
+                    return fail_cleanup(diagnostic);
+                if (!reap_until(deadline, diagnostic)) return fail_cleanup(diagnostic);
             }
         } else {
             ProcIdentity current;
@@ -693,33 +729,39 @@ bool WildcardAttemptChildLease::cleanup(std::chrono::steady_clock::time_point de
                     child_.status = status;
                     child_.reaped = true;
                 } else {
-                    if (!wait_fd(pidfd_, POLLIN, deadline)) return false;
-                    if (!reap_until(deadline, diagnostic)) return false;
+                    if (!wait_fd(pidfd_, POLLIN, deadline)) return fail_cleanup(diagnostic);
+                    if (!reap_until(deadline, diagnostic)) return fail_cleanup(diagnostic);
                 }
                 active_ = false;
                 released_ = false;
-                if (!cleanup_log(diagnostic)) return false;
+                if (!cleanup_log(diagnostic)) return fail_cleanup(diagnostic);
                 record_cleanup(true, diagnostic);
                 return true;
             }
-            if (kill(child_.pid, SIGTERM) != 0 && errno != ESRCH) {
+            if (!send_pidfd_signal(pidfd_, SIGTERM) && errno != ESRCH) {
                 fail(diagnostic, FailurePhase::Cleanup, errno);
-                return false;
+                return fail_cleanup(diagnostic);
             }
-            if (!reap_until(deadline, diagnostic)) {
-                if (!validate_pidfd(true, diagnostic) || !validate_identity(current, diagnostic))
-                    return false;
-                if (kill(child_.pid, SIGKILL) != 0 && errno != ESRCH) {
+            int status = 0;
+            const pid_t immediate = waitpid(child_.pid, &status, WNOHANG);
+            if (immediate == child_.pid) {
+                child_.status = status;
+                child_.reaped = true;
+            } else if (immediate == 0) {
+                if (!send_pidfd_signal(pidfd_, SIGKILL) && errno != ESRCH) {
                     fail(diagnostic, FailurePhase::Cleanup, errno);
-                    return false;
+                    return fail_cleanup(diagnostic);
                 }
-                if (!reap_until(deadline, diagnostic)) return false;
+                if (!reap_until(deadline, diagnostic)) return fail_cleanup(diagnostic);
+            } else if (errno != EINTR) {
+                fail(diagnostic, FailurePhase::Cleanup, errno);
+                return fail_cleanup(diagnostic);
             }
         }
         active_ = false;
         released_ = false;
     }
-    if (!cleanup_log(diagnostic)) return false;
+    if (!cleanup_log(diagnostic)) return fail_cleanup(diagnostic);
     record_cleanup(true, diagnostic);
     return true;
 }
@@ -727,6 +769,12 @@ bool WildcardAttemptChildLease::cleanup(std::chrono::steady_clock::time_point de
 bool WildcardAttemptChildLease::cleanup_log(Diagnostic& diagnostic) {
     if (!log_cleanup_required_) return true;
     if (log_fd_ >= 0) {
+        struct stat current{};
+        if (!log_identity_known_ || fstat(log_fd_, &current) != 0 ||
+            !same_regular(current, log_identity_)) {
+            fail(diagnostic, FailurePhase::Cleanup, errno == 0 ? ESTALE : errno);
+            return false;
+        }
         if (fsync(log_fd_) != 0) {
             fail(diagnostic, FailurePhase::Close, errno);
             return false;
@@ -821,9 +869,12 @@ bool WildcardAttemptChildLease::close_descriptors(Diagnostic& diagnostic) {
 }
 
 void WildcardAttemptChildLease::record_cleanup(bool succeeded, const Diagnostic& diagnostic) {
-    if (!cleanup_state_->attempted || !succeeded) {
+    if (!cleanup_state_->attempted) {
         cleanup_state_->attempted = true;
         cleanup_state_->succeeded = succeeded;
+        cleanup_state_->diagnostic = diagnostic;
+    } else if (!succeeded && cleanup_state_->succeeded) {
+        cleanup_state_->succeeded = false;
         cleanup_state_->diagnostic = diagnostic;
     }
 }
