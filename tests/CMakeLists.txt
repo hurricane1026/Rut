@@ -96,7 +96,6 @@ set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit"
 # memfd/seals self-check and is not connected to a child, broker or runtime.
 add_library(fixture_anonymous_log_capture STATIC fixture_anonymous_log_capture.cc)
 target_include_directories(fixture_anonymous_log_capture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fixture_anonymous_log_capture PUBLIC fixture_privileged_listener)
 
 add_executable(test_fixture_anonymous_log_capture test_fixture_anonymous_log_capture.cc)
 target_link_libraries(test_fixture_anonymous_log_capture PRIVATE fixture_anonymous_log_capture)

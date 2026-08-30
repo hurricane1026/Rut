@@ -44,7 +44,7 @@ bool valid_fd_flags(int fd) {
 
 bool valid_seals(int fd, int expected) {
     const int seals = fcntl(fd, F_GET_SEALS);
-    return seals >= 0 && (seals & expected) == expected;
+    return seals == expected;
 }
 
 }  // namespace
@@ -57,12 +57,14 @@ AnonymousLogCapture::AnonymousLogCapture(AnonymousLogCapture&& other) noexcept
       identity_(other.identity_),
       cleanup_state_(other.cleanup_state_),
       pread_for_testing_(other.pread_for_testing_),
-      close_for_testing_(other.close_for_testing_) {
+      close_for_testing_(other.close_for_testing_),
+      settled_(other.settled_) {
     other.fd_ = -1;
     other.max_bytes_ = 0u;
     other.identity_ = {};
     other.pread_for_testing_ = nullptr;
     other.close_for_testing_ = nullptr;
+    other.settled_ = false;
 }
 
 AnonymousLogCapture::~AnonymousLogCapture() {
@@ -94,6 +96,11 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
         fail(diagnostic, FailurePhase::Argument, EINVAL);
         return false;
     }
+    if (capture.cleanup_state_ != nullptr && capture.cleanup_state_->attempted &&
+        !capture.cleanup_state_->succeeded) {
+        fail(diagnostic, FailurePhase::Close, EALREADY);
+        return false;
+    }
 
 #ifdef SYS_memfd_create
     const int created = static_cast<int>(
@@ -114,6 +121,7 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
     capture.pread_for_testing_ = hooks == nullptr ? nullptr : hooks->pread;
     capture.close_for_testing_ = hooks == nullptr ? nullptr : hooks->close;
     capture.cleanup_state_ = std::make_shared<CleanupState>();
+    capture.settled_ = false;
 
     auto fail_created = [&](FailurePhase phase, int error_number) {
         Diagnostic original{phase, error_number};
@@ -168,7 +176,8 @@ bool AnonymousLogCapture::validate_identity_and_capacity(Diagnostic& diagnostic)
         fail(diagnostic, FailurePhase::Identity, errno == 0 ? EINVAL : errno);
         return false;
     }
-    if (!valid_seals(fd_, kInitialSeals)) {
+    const int expected_seals = settled_ ? kFinalSeals : kInitialSeals;
+    if (!valid_seals(fd_, expected_seals)) {
         fail(diagnostic, FailurePhase::Seal, errno == 0 ? EINVAL : errno);
         return false;
     }
@@ -254,6 +263,7 @@ bool AnonymousLogCapture::settle(Diagnostic& diagnostic) {
         fail(diagnostic, FailurePhase::Seal, errno == 0 ? EINVAL : errno);
         return false;
     }
+    settled_ = true;
     return true;
 }
 
@@ -266,7 +276,13 @@ void AnonymousLogCapture::record_cleanup(bool succeeded, const Diagnostic& diagn
 
 bool AnonymousLogCapture::close_owned(CloseForTesting operation, Diagnostic& diagnostic) {
     diagnostic = {};
-    if (fd_ < 0) return true;
+    if (fd_ < 0) {
+        if (cleanup_state_ != nullptr && cleanup_state_->attempted && !cleanup_state_->succeeded) {
+            diagnostic = cleanup_state_->diagnostic;
+            return false;
+        }
+        return true;
+    }
     const int owned = fd_;
     fd_ = -1;
     errno = 0;

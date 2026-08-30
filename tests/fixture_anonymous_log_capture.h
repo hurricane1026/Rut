@@ -1,6 +1,5 @@
 #pragma once
 
-#include "fixture_privileged_listener.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -10,7 +9,9 @@
 
 namespace rut::test::fixture_anonymous_log_capture {
 
-inline constexpr std::size_t kMaxCaptureBytes = fixture_privileged_listener::kMaxCollisionLogBytes;
+// Keep this local to the generic capture fixture. It is deliberately equal to
+// the existing collision-log bound (4096), but has no listener dependency.
+inline constexpr std::size_t kMaxCaptureBytes = 4096u;
 
 enum class FailurePhase : std::uint8_t {
     None,
@@ -76,6 +77,7 @@ public:
                                               Diagnostic& diagnostic);
 
     bool active() const { return fd_ >= 0; }
+    bool settled() const { return settled_; }
     int descriptor() const { return fd_; }
     std::size_t max_bytes() const { return max_bytes_; }
     const Identity& identity() const { return identity_; }
@@ -118,6 +120,7 @@ private:
     std::shared_ptr<CleanupState> cleanup_state_;
     PreadForTesting pread_for_testing_ = nullptr;
     CloseForTesting close_for_testing_ = nullptr;
+    bool settled_ = false;
 };
 
 }  // namespace rut::test::fixture_anonymous_log_capture
