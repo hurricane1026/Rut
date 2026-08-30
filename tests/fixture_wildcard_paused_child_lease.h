@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <type_traits>
 
 #include <sys/types.h>
@@ -55,6 +56,31 @@ struct SettlementReceipt {
 
 enum class PreparedChildUseState : std::uint8_t { OwnerLive, Claimed, Abandoned };
 
+enum class ChildContinuationKind : std::uint8_t { Inert, Execveat };
+
+enum class ReleaseSendState : std::uint8_t { NotSent, Sent, SentCloseUncertain };
+
+inline constexpr std::size_t kMaxExecArgumentCount = 9;
+inline constexpr std::size_t kExecArgumentBoundaryCount = 10;
+inline constexpr std::size_t kMaxExecArgumentEncodedBytes = 4096;
+inline constexpr std::size_t kMaxExecArgumentsEncodedBytes = 8192;
+
+// Owned bounded argv transport. offsets[0..argc] delimit the active encoded
+// arguments in arena; every interval contains payload followed by one NUL.
+struct BoundedExecArguments {
+    std::uint16_t argc = 0;
+    std::uint16_t encoded_bytes = 0;
+    std::array<std::uint16_t, kExecArgumentBoundaryCount> offsets{};
+    std::array<char, kMaxExecArgumentsEncodedBytes> arena{};
+};
+static_assert(std::is_trivially_copyable_v<BoundedExecArguments>);
+static_assert(std::is_standard_layout_v<BoundedExecArguments>);
+
+// The one structural validator used by both the parent packer and the
+// pre-fork consumer. canonical_argv0 is the exact pinned executable path.
+bool validate_bounded_exec_arguments(const BoundedExecArguments& arguments,
+                                     std::string_view canonical_argv0);
+
 // Parent-only single-use evidence joining a prepared descriptor plan to the
 // PausedChildLease that successfully claimed it.  It is never consulted by the
 // post-fork child continuation. Under the exclusive single-thread parent
@@ -72,17 +98,14 @@ private:
     PreparedChildUseState state_ = PreparedChildUseState::OwnerLive;
     pid_t child_pid_ = -1;
     std::shared_ptr<const SettlementReceipt> settlement_;
+    BoundedExecArguments expected_arguments_{};
 };
-
-enum class ChildContinuationKind : std::uint8_t { Inert, Execveat };
-
-enum class ReleaseSendState : std::uint8_t { NotSent, Sent, SentCloseUncertain };
 
 // Fully materialized before fork.  The child only reads this POD and performs
 // async-signal-safe syscalls after fork.
 struct ChildContinuation {
     ChildContinuationKind kind = ChildContinuationKind::Inert;
-    std::array<char, 4096> argv0{};
+    BoundedExecArguments arguments{};
     bool inject_pre_exec_failure = false;
     std::uint8_t status_injection = 0;
     std::uint8_t executable_mutation = 0;
@@ -104,6 +127,8 @@ struct HooksForTesting {
     int (*kcmp_file)(pid_t, pid_t, int, int, void*) = nullptr;
     bool (*prepared_procfs_allowed)(void*) = nullptr;
     void* prepared_validation_context = nullptr;
+    void (*pre_fork_continuation_mutation)(ChildContinuation&, void*) = nullptr;
+    void* pre_fork_continuation_context = nullptr;
 };
 
 // A declaration-only descriptor plan. The output descriptor remains borrowed
