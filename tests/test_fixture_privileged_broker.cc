@@ -4350,6 +4350,7 @@ struct ProbeChainFacts {
     pid_t lease_pgid = -1;
     pid_t lease_sid = -1;
     std::uint64_t lease_start = 0;
+    bool lease_pidfd_live = false;
     std::vector<ProbeNodeFact> nodes;
 };
 
@@ -4380,7 +4381,7 @@ static bool validate_probe_chain_facts(const ProbeChainFacts& facts, std::string
         anchor.pgid != facts.anchor_pgid || anchor.sid != facts.anchor_sid ||
         anchor.ppid != facts.ordinary_parent || facts.lease_pid != facts.anchor_pid ||
         facts.lease_start != facts.anchor_start || facts.lease_pgid != facts.anchor_pgid ||
-        facts.lease_sid != facts.anchor_sid) {
+        facts.lease_sid != facts.anchor_sid || !facts.lease_pidfd_live) {
         error = "probe final sudo anchor or GroupLease binding was invalid";
         return false;
     }
@@ -4415,6 +4416,7 @@ static bool ancestry_probe_validation_self_check(std::string& error) {
     direct.lease_pgid = 101;
     direct.lease_sid = 10;
     direct.lease_start = 1001;
+    direct.lease_pidfd_live = true;
     direct.nodes = {sudo};
     const auto accepts = [](const ProbeChainFacts& candidate) {
         std::string ignored;
@@ -4447,6 +4449,9 @@ static bool ancestry_probe_validation_self_check(std::string& error) {
     rejected.push_back(changed);
     changed = direct;
     changed.lease_start++;
+    rejected.push_back(changed);
+    changed = direct;
+    changed.lease_pidfd_live = false;
     rejected.push_back(changed);
     changed = direct;
     changed.ordinary_parent++;
@@ -4572,6 +4577,7 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
     facts.lease_pgid = lease.pgid;
     facts.lease_sid = lease.sid;
     facts.lease_start = lease.start;
+    facts.lease_pidfd_live = retained_pidfd_live(lease.pidfd);
     bool root_was_recorded = false;
     for (const auto& evidence : ancestry_evidence) {
         ProcIdentity process = proc_from_process_evidence(evidence);
@@ -4729,10 +4735,6 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
         }
         if (!endpoint_unchanged(endpoint)) {
             error = "ancestry probe endpoint identity changed";
-            break;
-        }
-        if (!lease.revalidate()) {
-            error = "ancestry probe launch GroupLease revalidation failed";
             break;
         }
         Peer final_root_peer;
