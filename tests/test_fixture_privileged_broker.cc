@@ -966,13 +966,11 @@ static LaunchArgv make_launch_argv(const std::string& sudo_path,
                                    const std::string& endpoint,
                                    const std::string& token,
                                    const std::string& expected_netns,
-                                   const std::string& scenario,
-                                   bool nsenter_fork) {
+                                   const std::string& scenario) {
     LaunchArgv argv;
     argv.launcher = {
         executable, "--fixture-broker-launcher", endpoint, token, expected_netns, scenario};
     argv.nsenter = {nsenter_path};
-    if (nsenter_fork) argv.nsenter.emplace_back("--fork");
     argv.nsenter.push_back(netns_arg);
     argv.nsenter.emplace_back("--");
     argv.nsenter.insert(argv.nsenter.end(), argv.launcher.begin(), argv.launcher.end());
@@ -989,8 +987,7 @@ static bool launch_argv_refactor_self_check(std::string& error) {
                                                "/endpoint",
                                                "token",
                                                "88",
-                                               "normal",
-                                               false);
+                                               "normal");
     const bool exact =
         exact_argv(formal.launcher) ==
             exact_argv(
@@ -1016,17 +1013,7 @@ static bool launch_argv_refactor_self_check(std::string& error) {
                                                        "token",
                                                        "88",
                                                        "normal"});
-    const LaunchArgv forked = make_launch_argv("/sudo",
-                                               "/nsenter",
-                                               "--net=/proc/7/ns/net",
-                                               "/fixture",
-                                               "/endpoint",
-                                               "token",
-                                               "88",
-                                               "ancestry-probe-fork",
-                                               true);
-    if (!exact || forked.nsenter.size() < 2 || forked.nsenter[1] != "--fork" ||
-        forked.sudo_command.size() < 5 || forked.sudo_command[4] != "--fork") {
+    if (!exact) {
         error = "shared formal/probe launch argv construction self-check failed";
         return false;
     }
@@ -1767,8 +1754,7 @@ static int root_broker_main(const char* executable,
     if (!read_proc(getpid(), identity, false) || identity.netns != expected_netns) return 22;
     const int root_control = connect_control(control_path);
     if (root_control < 0) return 23;
-    const bool ancestry_probe = strcmp(scenario, "ancestry-probe-direct") == 0 ||
-                                strcmp(scenario, "ancestry-probe-fork") == 0;
+    const bool ancestry_probe = strcmp(scenario, "ancestry-probe-direct") == 0;
     if (ancestry_probe) {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(kBrokerDeadlineMs);
@@ -2851,7 +2837,6 @@ static bool begin_launch(const std::string& sudo_path,
                          const ParentEndpoint& endpoint,
                          const Token& token,
                          const char* scenario,
-                         bool nsenter_fork,
                          int post_release_timeout_ms,
                          std::optional<DirectLaunch>& launch,
                          std::optional<GroupLease>& lease,
@@ -2877,8 +2862,7 @@ static bool begin_launch(const std::string& sudo_path,
                                               endpoint.socket,
                                               token_value,
                                               expected_netns,
-                                              scenario,
-                                              nsenter_fork);
+                                              scenario);
     const std::string launcher_argv = exact_argv(launch_argv.launcher);
     const std::string nsenter_argv = exact_argv(launch_argv.nsenter);
     const std::string sudo_argv = exact_argv(launch_argv.sudo_command);
@@ -4366,7 +4350,6 @@ struct ProbeChainFacts {
     pid_t lease_pgid = -1;
     pid_t lease_sid = -1;
     std::uint64_t lease_start = 0;
-    bool fork_shape = false;
     std::vector<ProbeNodeFact> nodes;
 };
 
@@ -4378,7 +4361,6 @@ static bool validate_probe_chain_facts(const ProbeChainFacts& facts, std::string
         error = "probe root/peer/launcher binding or ancestry entry was invalid";
         return false;
     }
-    bool saw_nsenter = false;
     pid_t expected = facts.launcher_ppid;
     std::vector<pid_t> seen;
     for (const ProbeNodeFact& node : facts.nodes) {
@@ -4390,7 +4372,6 @@ static bool validate_probe_chain_facts(const ProbeChainFacts& facts, std::string
             return false;
         }
         seen.push_back(node.pid);
-        saw_nsenter = saw_nsenter || node.stage == ProbeNodeStage::Nsenter;
         expected = node.ppid;
     }
     const ProbeNodeFact& anchor = facts.nodes.back();
@@ -4403,9 +4384,13 @@ static bool validate_probe_chain_facts(const ProbeChainFacts& facts, std::string
         error = "probe final sudo anchor or GroupLease binding was invalid";
         return false;
     }
-    if ((!facts.fork_shape && (facts.nodes.size() != 1 || saw_nsenter)) ||
-        (facts.fork_shape && (facts.nodes.size() < 2 || !saw_nsenter))) {
-        error = "probe retained-wrapper launch shape was not exact";
+    // Network-only nsenter execs Launcher and is therefore not a retained
+    // ancestor.  This access spike proves the one ancestor that exists on the
+    // required runner: the immutable retained sudo anchor.  Any future launch
+    // shape with extra intermediaries remains fail-closed until separately
+    // proven on a real runner.
+    if (facts.nodes.size() != 1 || facts.nodes.front().stage != ProbeNodeStage::Sudo) {
+        error = "probe retained sudo anchor launch shape was not exact";
         return false;
     }
     error.clear();
@@ -4414,7 +4399,6 @@ static bool validate_probe_chain_facts(const ProbeChainFacts& facts, std::string
 
 static bool ancestry_probe_validation_self_check(std::string& error) {
     const ProbeNodeFact sudo{101, 10, 101, 10, 1001, ProbeNodeStage::Sudo, true, true};
-    const ProbeNodeFact nsenter{102, 101, 101, 10, 1002, ProbeNodeStage::Nsenter, true, true};
     ProbeChainFacts direct;
     direct.peer_pid = 103;
     direct.root_pid = 103;
@@ -4432,36 +4416,25 @@ static bool ancestry_probe_validation_self_check(std::string& error) {
     direct.lease_sid = 10;
     direct.lease_start = 1001;
     direct.nodes = {sudo};
-    ProbeChainFacts forked = direct;
-    forked.launcher_ppid = 102;
-    forked.fork_shape = true;
-    forked.nodes = {nsenter, sudo};
     const auto accepts = [](const ProbeChainFacts& candidate) {
         std::string ignored;
         return validate_probe_chain_facts(candidate, ignored);
     };
-    if (!accepts(direct) || !accepts(forked)) {
-        error = "ancestry probe N=1/N>=2 baseline self-check failed";
+    if (!accepts(direct)) {
+        error = "ancestry probe retained sudo anchor baseline self-check failed";
         return false;
     }
     std::vector<ProbeChainFacts> rejected;
-    ProbeChainFacts changed = forked;
-    changed.nodes.erase(changed.nodes.begin());
+    ProbeChainFacts changed = direct;
+    changed.nodes.clear();
     rejected.push_back(changed);
-    changed = forked;
-    std::reverse(changed.nodes.begin(), changed.nodes.end());
-    rejected.push_back(changed);
-    changed = forked;
-    changed.nodes[1] = changed.nodes[0];
-    rejected.push_back(changed);
-    changed = forked;
-    changed.nodes[0].ppid++;
+    changed = direct;
+    changed.nodes.push_back(changed.nodes.front());
     rejected.push_back(changed);
     changed = direct;
     changed.anchor_start++;
     rejected.push_back(changed);
-    changed = forked;
-    changed.nodes[0].stage = ProbeNodeStage::Sudo;
+    changed.nodes[0].stage = ProbeNodeStage::Nsenter;
     rejected.push_back(changed);
     changed = direct;
     changed.peer_pid++;
@@ -4551,7 +4524,6 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
                                              const HeldTopologySnapshot& topology,
                                              const std::string& root_argv,
                                              const std::string& launcher_argv,
-                                             bool fork_shape,
                                              DirectLaunch& launch,
                                              const GroupLease& lease,
                                              std::string& error) {
@@ -4601,7 +4573,6 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
     facts.lease_pgid = lease.pgid;
     facts.lease_sid = lease.sid;
     facts.lease_start = lease.start;
-    facts.fork_shape = fork_shape;
     bool root_was_recorded = false;
     for (const auto& evidence : ancestry_evidence) {
         ProcIdentity process = proc_from_process_evidence(evidence);
@@ -4647,12 +4618,11 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
                                        const std::string& nsenter_path,
                                        const std::string& executable,
                                        const HeldTopologySnapshot& topology,
-                                       bool fork_shape,
                                        std::string& error) {
     ParentEndpoint endpoint;
     Token token;
     if (!new_token(token) || !create_parent_endpoint(endpoint, error)) return false;
-    const char* scenario = fork_shape ? "ancestry-probe-fork" : "ancestry-probe-direct";
+    constexpr const char* scenario = "ancestry-probe-direct";
     std::optional<DirectLaunch> direct_launch;
     std::optional<GroupLease> group_lease;
     std::chrono::steady_clock::time_point deadline;
@@ -4664,7 +4634,6 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
                       endpoint,
                       token,
                       scenario,
-                      fork_shape,
                       kBrokerDeadlineMs,
                       direct_launch,
                       group_lease,
@@ -4736,7 +4705,6 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
                                               topology,
                                               root_argv,
                                               launcher_argv,
-                                              fork_shape,
                                               launch,
                                               lease,
                                               error) ||
@@ -4824,7 +4792,6 @@ static bool run_session(const std::string& sudo_path,
                       endpoint,
                       token,
                       scenario,
-                      false,
                       kHandshakeMs,
                       direct_launch,
                       group_lease,
@@ -5398,10 +5365,7 @@ static bool run_preflight_command(const std::vector<std::string>& argv) {
     return false;
 }
 
-static bool preflight(std::string& sudo_path,
-                      std::string& nsenter_path,
-                      bool required,
-                      std::string& error) {
+static bool preflight(std::string& sudo_path, std::string& nsenter_path, std::string& error) {
 #ifndef __linux__
     error = "Linux is required";
     return false;
@@ -5423,19 +5387,17 @@ static bool preflight(std::string& sudo_path,
             nsenter_path = candidate;
             break;
         }
-    if (sudo_path.empty() || nsenter_path.empty() ||
-        !run_preflight_command({sudo_path, "-n", "--", "/bin/true"}) ||
-        !run_preflight_command(
-            {sudo_path, "-n", "--", nsenter_path, "--net=/proc/self/ns/net", "--", "/bin/true"}) ||
-        (required && !run_preflight_command({sudo_path,
-                                             "-n",
-                                             "--",
-                                             nsenter_path,
-                                             "--fork",
-                                             "--net=/proc/self/ns/net",
-                                             "--",
-                                             "/bin/true"}))) {
-        error = "passwordless sudo/nsenter network-namespace prerequisite unavailable";
+    if (sudo_path.empty() || nsenter_path.empty()) {
+        error = "root-owned sudo or nsenter executable unavailable";
+        return false;
+    }
+    if (!run_preflight_command({sudo_path, "-n", "--", "/bin/true"})) {
+        error = "passwordless sudo preflight failed";
+        return false;
+    }
+    if (!run_preflight_command(
+            {sudo_path, "-n", "--", nsenter_path, "--net=/proc/self/ns/net", "--", "/bin/true"})) {
+        error = "sudo nsenter network-namespace preflight failed";
         return false;
     }
     return true;
@@ -5456,8 +5418,7 @@ static bool run_positive(const std::string& sudo_path,
         return false;
     }
     if (required &&
-        (!run_ancestry_probe_session(sudo_path, nsenter_path, executable, topology, false, error) ||
-         !run_ancestry_probe_session(sudo_path, nsenter_path, executable, topology, true, error))) {
+        !run_ancestry_probe_session(sudo_path, nsenter_path, executable, topology, error)) {
         error = "required ancestry access probe: " + error;
         return false;
     }
@@ -5507,7 +5468,7 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
-    if (!preflight(sudo_path, nsenter_path, required, error)) {
+    if (!preflight(sudo_path, nsenter_path, error)) {
         std::cerr << (required ? "FAIL" : "SKIP") << " [#358 Stage 2a3b preflight]: " << error
                   << "\n";
         return required ? 1 : 77;
