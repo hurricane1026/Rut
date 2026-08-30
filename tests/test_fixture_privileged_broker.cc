@@ -99,6 +99,12 @@ constexpr u16 kExactRutCleanup = 43;
 constexpr u16 kExactRutCleaned = 44;
 constexpr u16 kExactRutFailure = 45;
 constexpr u16 kExactEscrowSettled = 46;
+// Values 47--50 belong to the already reviewed listener protocol namespace and
+// remain reserved.  Wildcard-attempt Stage 1 deliberately starts after it.
+constexpr u16 kWildcardAttemptCommand = 51;
+constexpr u16 kWildcardAttemptPhase = 52;
+constexpr u16 kWildcardAttemptDecision = 53;
+constexpr u16 kWildcardAttemptSettlement = 54;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
 constexpr int kCredentialFd = 198;
@@ -185,6 +191,7 @@ static bool listener_failure_integration(const char* scenario) {
 static_assert(kListenerDeadlineMs <= std::numeric_limits<int>::max() / 4);
 constexpr int kListenerFailureLauncherWaitMs = kListenerDeadlineMs * 4;
 constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
+constexpr int kWildcardAttemptAggregateWaitMs = kListenerDeadlineMs * 6;
 
 static int launcher_broker_wait_ms(const char* scenario) {
     return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
@@ -196,6 +203,13 @@ static int cleanup_response_wait_ms(const char* scenario) {
                                                   : kListenerDeadlineMs;
 }
 
+static int scenario_aggregate_wait_ms(const char* scenario) {
+    if (strcmp(scenario, "listener-wildcard-attempt") == 0) return kWildcardAttemptAggregateWaitMs;
+    if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
+    if (listener_scenario_name(scenario)) return kListenerDeadlineMs;
+    return kBrokerDeadlineMs;
+}
+
 static bool listener_failure_bound_self_check(std::string& error) {
     if (launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
             kListenerDeadlineMs * 4 ||
@@ -204,7 +218,16 @@ static bool listener_failure_bound_self_check(std::string& error) {
         launcher_broker_wait_ms("listener-guard-reservation") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
         launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
-        cleanup_response_wait_ms("normal") != kListenerDeadlineMs) {
+        cleanup_response_wait_ms("normal") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("normal") != kBrokerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-cleanup-observation-failure") !=
+            kListenerFailureLauncherWaitMs ||
+        scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
+            kWildcardAttemptAggregateWaitMs ||
+        kBrokerDeadlineMs != 5000 || kListenerDeadlineMs != 15000 ||
+        kListenerFailureFrame45WaitMs != 30000 || kListenerFailureLauncherWaitMs != 60000 ||
+        kWildcardAttemptAggregateWaitMs != 90000) {
         error = "listener failure extended deadline selection failed";
         return false;
     }
@@ -1205,6 +1228,614 @@ static u64 read_u64(const unsigned char* value) {
         result |= static_cast<u64>(value[shift / 8u]) << shift;
     return result;
 }
+
+constexpr u64 kWildcardAttemptVersion = 1u;
+
+enum class WildcardAttemptMode : u64 {
+    Canonical = 1u,
+    MissingCollision = 2u,
+    PrematureGuardRelease = 3u,
+    WrongListenerKind = 4u,
+    WrongListenerAddress = 5u,
+    WrongListenerInode = 6u,
+    FalsePostReleaseSuccess = 7u,
+};
+
+enum class WildcardAttemptPhase : u64 {
+    GuardHeld = 1u,
+    ExactRutWitness = 2u,
+    CollisionPrepared = 3u,
+    CollisionRejected = 4u,
+    ExactCleanedGuardHeld = 5u,
+    GuardReleased = 6u,
+    WildcardLive = 7u,
+};
+
+enum class WildcardAttemptDecisionKind : u64 {
+    AuthorizeCollisionExec = 1u,
+    AuthorizeExactCleanup = 2u,
+    AuthorizeGuardRelease = 3u,
+    AuthorizeWildcardExec = 4u,
+    AuthorizeWildcardCleanup = 5u,
+    RejectAndCleanup = 6u,
+    Finish = 7u,
+};
+
+enum class WildcardAttemptSettlementKind : u64 {
+    AttemptSettled = 1u,
+    MutationSettled = 2u,
+};
+
+struct WildcardAttemptCommandV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptPhaseV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptPhase phase = WildcardAttemptPhase::GuardHeld;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptDecisionV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptDecisionKind decision = WildcardAttemptDecisionKind::AuthorizeCollisionExec;
+    WildcardAttemptPhase for_phase = WildcardAttemptPhase::CollisionPrepared;
+    u64 sequence = 0u;
+};
+
+struct WildcardAttemptSettlementV1 {
+    u64 version = kWildcardAttemptVersion;
+    u64 transaction_id = 0u;
+    WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    WildcardAttemptSettlementKind settlement = WildcardAttemptSettlementKind::AttemptSettled;
+    WildcardAttemptPhase terminal_phase = WildcardAttemptPhase::WildcardLive;
+    u64 sequence = 0u;
+};
+
+static bool valid_wildcard_attempt_mode(WildcardAttemptMode mode) {
+    switch (mode) {
+        case WildcardAttemptMode::Canonical:
+        case WildcardAttemptMode::MissingCollision:
+        case WildcardAttemptMode::PrematureGuardRelease:
+        case WildcardAttemptMode::WrongListenerKind:
+        case WildcardAttemptMode::WrongListenerAddress:
+        case WildcardAttemptMode::WrongListenerInode:
+        case WildcardAttemptMode::FalsePostReleaseSuccess:
+            return true;
+    }
+    return false;
+}
+
+static bool valid_wildcard_attempt_phase(WildcardAttemptPhase phase) {
+    switch (phase) {
+        case WildcardAttemptPhase::GuardHeld:
+        case WildcardAttemptPhase::ExactRutWitness:
+        case WildcardAttemptPhase::CollisionPrepared:
+        case WildcardAttemptPhase::CollisionRejected:
+        case WildcardAttemptPhase::ExactCleanedGuardHeld:
+        case WildcardAttemptPhase::GuardReleased:
+        case WildcardAttemptPhase::WildcardLive:
+            return true;
+    }
+    return false;
+}
+
+static bool valid_wildcard_attempt_mode_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptMode::Canonical) &&
+           value <= static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess);
+}
+
+static bool valid_wildcard_attempt_phase_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptPhase::GuardHeld) &&
+           value <= static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+}
+
+static bool valid_wildcard_attempt_decision_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec) &&
+           value <= static_cast<u64>(WildcardAttemptDecisionKind::Finish);
+}
+
+static bool valid_wildcard_attempt_settlement_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled) &&
+           value <= static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled);
+}
+
+static u64 wildcard_phase_sequence(WildcardAttemptPhase phase) {
+    switch (phase) {
+        case WildcardAttemptPhase::GuardHeld:
+            return 1u;
+        case WildcardAttemptPhase::ExactRutWitness:
+            return 2u;
+        case WildcardAttemptPhase::CollisionPrepared:
+            return 3u;
+        case WildcardAttemptPhase::CollisionRejected:
+            return 5u;
+        case WildcardAttemptPhase::ExactCleanedGuardHeld:
+            return 7u;
+        case WildcardAttemptPhase::GuardReleased:
+            return 9u;
+        case WildcardAttemptPhase::WildcardLive:
+            return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_phase_sequence_value(u64 phase) {
+    switch (phase) {
+        case static_cast<u64>(WildcardAttemptPhase::GuardHeld):
+            return 1u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactRutWitness):
+            return 2u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionPrepared):
+            return 3u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionRejected):
+            return 5u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld):
+            return 7u;
+        case static_cast<u64>(WildcardAttemptPhase::GuardReleased):
+            return 9u;
+        case static_cast<u64>(WildcardAttemptPhase::WildcardLive):
+            return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_rejection_checkpoint_value(u64 mode) {
+    switch (mode) {
+        case static_cast<u64>(WildcardAttemptMode::MissingCollision):
+        case static_cast<u64>(WildcardAttemptMode::PrematureGuardRelease):
+            return static_cast<u64>(WildcardAttemptPhase::CollisionRejected);
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerKind):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerAddress):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerInode):
+        case static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess):
+            return static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+        case static_cast<u64>(WildcardAttemptMode::Canonical):
+            return 0u;
+    }
+    return 0u;
+}
+
+static WildcardAttemptPhase wildcard_rejection_checkpoint(WildcardAttemptMode mode) {
+    switch (mode) {
+        case WildcardAttemptMode::MissingCollision:
+        case WildcardAttemptMode::PrematureGuardRelease:
+            return WildcardAttemptPhase::CollisionRejected;
+        case WildcardAttemptMode::WrongListenerKind:
+        case WildcardAttemptMode::WrongListenerAddress:
+        case WildcardAttemptMode::WrongListenerInode:
+        case WildcardAttemptMode::FalsePostReleaseSuccess:
+            return WildcardAttemptPhase::WildcardLive;
+        case WildcardAttemptMode::Canonical:
+            break;
+    }
+    return static_cast<WildcardAttemptPhase>(0u);
+}
+
+template <std::size_t Size>
+static bool decode_wildcard_fields(const std::vector<unsigned char>& payload,
+                                   std::array<u64, Size>& fields) {
+    if (payload.size() != Size * sizeof(u64)) return false;
+    for (std::size_t i = 0u; i != fields.size(); ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    return true;
+}
+
+template <std::size_t Size>
+static std::vector<unsigned char> encode_wildcard_fields(const std::array<u64, Size>& fields) {
+    std::vector<unsigned char> payload;
+    payload.reserve(fields.size() * sizeof(u64));
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool valid_wildcard_command(const WildcardAttemptCommandV1& command) {
+    return command.version == kWildcardAttemptVersion && command.transaction_id != 0u &&
+           valid_wildcard_attempt_mode(command.mode) && command.sequence == 0u;
+}
+
+static std::vector<unsigned char> encode_wildcard_command(const WildcardAttemptCommandV1& command) {
+    return encode_wildcard_fields(std::array<u64, 4u>{
+        command.version, command.transaction_id, static_cast<u64>(command.mode), command.sequence});
+}
+
+static bool decode_wildcard_command(const std::vector<unsigned char>& payload,
+                                    WildcardAttemptCommandV1& command) {
+    std::array<u64, 4u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) || fields[3] != 0u)
+        return false;
+    const WildcardAttemptCommandV1 decoded{
+        fields[0], fields[1], static_cast<WildcardAttemptMode>(fields[2]), fields[3]};
+    command = decoded;
+    return true;
+}
+
+static bool valid_wildcard_phase(const WildcardAttemptPhaseV1& witness) {
+    return witness.version == kWildcardAttemptVersion && witness.transaction_id != 0u &&
+           valid_wildcard_attempt_mode(witness.mode) &&
+           valid_wildcard_attempt_phase(witness.phase) &&
+           witness.sequence == wildcard_phase_sequence(witness.phase);
+}
+
+static std::vector<unsigned char> encode_wildcard_phase(const WildcardAttemptPhaseV1& witness) {
+    return encode_wildcard_fields(std::array<u64, 5u>{witness.version,
+                                                      witness.transaction_id,
+                                                      static_cast<u64>(witness.mode),
+                                                      static_cast<u64>(witness.phase),
+                                                      witness.sequence});
+}
+
+static bool decode_wildcard_phase(const std::vector<unsigned char>& payload,
+                                  WildcardAttemptPhaseV1& witness) {
+    std::array<u64, 5u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_phase_value(fields[3]) ||
+        fields[4] != wildcard_phase_sequence_value(fields[3]))
+        return false;
+    const WildcardAttemptPhaseV1 decoded{fields[0],
+                                         fields[1],
+                                         static_cast<WildcardAttemptMode>(fields[2]),
+                                         static_cast<WildcardAttemptPhase>(fields[3]),
+                                         fields[4]};
+    witness = decoded;
+    return true;
+}
+
+static bool valid_wildcard_decision(const WildcardAttemptDecisionV1& decision) {
+    if (decision.version != kWildcardAttemptVersion || decision.transaction_id == 0u ||
+        !valid_wildcard_attempt_mode(decision.mode) ||
+        !valid_wildcard_attempt_phase(decision.for_phase))
+        return false;
+    switch (decision.decision) {
+        case WildcardAttemptDecisionKind::AuthorizeCollisionExec:
+            return decision.for_phase == WildcardAttemptPhase::CollisionPrepared &&
+                   decision.sequence == 4u;
+        case WildcardAttemptDecisionKind::AuthorizeExactCleanup:
+            return decision.for_phase == WildcardAttemptPhase::CollisionRejected &&
+                   decision.sequence == 6u;
+        case WildcardAttemptDecisionKind::AuthorizeGuardRelease:
+            return decision.for_phase == WildcardAttemptPhase::ExactCleanedGuardHeld &&
+                   decision.sequence == 8u;
+        case WildcardAttemptDecisionKind::AuthorizeWildcardExec:
+            return decision.for_phase == WildcardAttemptPhase::GuardReleased &&
+                   decision.sequence == 10u;
+        case WildcardAttemptDecisionKind::AuthorizeWildcardCleanup:
+            return decision.for_phase == WildcardAttemptPhase::WildcardLive &&
+                   decision.sequence == 12u;
+        case WildcardAttemptDecisionKind::RejectAndCleanup:
+            return decision.mode != WildcardAttemptMode::Canonical &&
+                   decision.for_phase == wildcard_rejection_checkpoint(decision.mode) &&
+                   decision.sequence == wildcard_phase_sequence(decision.for_phase);
+        case WildcardAttemptDecisionKind::Finish:
+            return decision.mode == WildcardAttemptMode::Canonical &&
+                   decision.for_phase == WildcardAttemptPhase::WildcardLive &&
+                   decision.sequence == 14u;
+    }
+    return false;
+}
+
+static std::vector<unsigned char> encode_wildcard_decision(
+    const WildcardAttemptDecisionV1& decision) {
+    return encode_wildcard_fields(std::array<u64, 6u>{decision.version,
+                                                      decision.transaction_id,
+                                                      static_cast<u64>(decision.mode),
+                                                      static_cast<u64>(decision.decision),
+                                                      static_cast<u64>(decision.for_phase),
+                                                      decision.sequence});
+}
+
+static bool decode_wildcard_decision(const std::vector<unsigned char>& payload,
+                                     WildcardAttemptDecisionV1& decision) {
+    std::array<u64, 6u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_decision_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    const u64 checkpoint = wildcard_rejection_checkpoint_value(fields[2]);
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionPrepared) &&
+                    fields[5] == 4u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeExactCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionRejected) &&
+                    fields[5] == 6u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeGuardRelease):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld) &&
+                    fields[5] == 8u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::GuardReleased) &&
+                    fields[5] == 10u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 12u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::RejectAndCleanup):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == checkpoint &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]);
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::Finish):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 14u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptDecisionV1 decoded{fields[0],
+                                            fields[1],
+                                            static_cast<WildcardAttemptMode>(fields[2]),
+                                            static_cast<WildcardAttemptDecisionKind>(fields[3]),
+                                            static_cast<WildcardAttemptPhase>(fields[4]),
+                                            fields[5]};
+    decision = decoded;
+    return true;
+}
+
+static bool valid_wildcard_settlement(const WildcardAttemptSettlementV1& settlement) {
+    if (settlement.version != kWildcardAttemptVersion || settlement.transaction_id == 0u ||
+        !valid_wildcard_attempt_mode(settlement.mode) ||
+        !valid_wildcard_attempt_phase(settlement.terminal_phase))
+        return false;
+    switch (settlement.settlement) {
+        case WildcardAttemptSettlementKind::AttemptSettled:
+            return settlement.mode == WildcardAttemptMode::Canonical &&
+                   settlement.terminal_phase == WildcardAttemptPhase::WildcardLive &&
+                   settlement.sequence == 13u;
+        case WildcardAttemptSettlementKind::MutationSettled:
+            return settlement.mode != WildcardAttemptMode::Canonical &&
+                   settlement.terminal_phase == wildcard_rejection_checkpoint(settlement.mode) &&
+                   settlement.sequence == wildcard_phase_sequence(settlement.terminal_phase) + 1u;
+    }
+    return false;
+}
+
+static std::vector<unsigned char> encode_wildcard_settlement(
+    const WildcardAttemptSettlementV1& settlement) {
+    return encode_wildcard_fields(std::array<u64, 6u>{settlement.version,
+                                                      settlement.transaction_id,
+                                                      static_cast<u64>(settlement.mode),
+                                                      static_cast<u64>(settlement.settlement),
+                                                      static_cast<u64>(settlement.terminal_phase),
+                                                      settlement.sequence});
+}
+
+static bool decode_wildcard_settlement(const std::vector<unsigned char>& payload,
+                                       WildcardAttemptSettlementV1& settlement) {
+    std::array<u64, 6u> fields{};
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_settlement_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 13u;
+            break;
+        case static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == wildcard_rejection_checkpoint_value(fields[2]) &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]) + 1u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptSettlementV1 decoded{fields[0],
+                                              fields[1],
+                                              static_cast<WildcardAttemptMode>(fields[2]),
+                                              static_cast<WildcardAttemptSettlementKind>(fields[3]),
+                                              static_cast<WildcardAttemptPhase>(fields[4]),
+                                              fields[5]};
+    settlement = decoded;
+    return true;
+}
+
+class WildcardAttemptStateMachine {
+public:
+    bool begin(const WildcardAttemptCommandV1& command) {
+        if (state_ != State::Empty || !valid_wildcard_command(command)) return fail();
+        version_ = command.version;
+        transaction_id_ = command.transaction_id;
+        mode_ = command.mode;
+        state_ = State::AwaitGuardHeld;
+        return true;
+    }
+
+    bool observe(const WildcardAttemptPhaseV1& witness) {
+        if (!bound(witness.version, witness.transaction_id, witness.mode) ||
+            !valid_wildcard_phase(witness))
+            return fail();
+        switch (state_) {
+            case State::AwaitGuardHeld:
+                return accept_phase(
+                    witness, WildcardAttemptPhase::GuardHeld, State::AwaitExactRutWitness);
+            case State::AwaitExactRutWitness:
+                return accept_phase(
+                    witness, WildcardAttemptPhase::ExactRutWitness, State::AwaitCollisionPrepared);
+            case State::AwaitCollisionPrepared:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::CollisionPrepared,
+                                    State::AwaitCollisionAuthorization);
+            case State::AwaitCollisionRejected:
+                if (wildcard_rejection_checkpoint(mode_) == WildcardAttemptPhase::CollisionRejected)
+                    return fail();
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::CollisionRejected,
+                                    State::AwaitExactCleanupAuthorization);
+            case State::AwaitExactCleanedGuardHeld:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                    State::AwaitGuardReleaseAuthorization);
+            case State::AwaitGuardReleased:
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::GuardReleased,
+                                    State::AwaitWildcardAuthorization);
+            case State::AwaitWildcardLive:
+                if (mode_ != WildcardAttemptMode::Canonical) return fail();
+                return accept_phase(witness,
+                                    WildcardAttemptPhase::WildcardLive,
+                                    State::AwaitWildcardCleanupAuthorization);
+            case State::Empty:
+            case State::AwaitCollisionAuthorization:
+            case State::AwaitExactCleanupAuthorization:
+            case State::AwaitGuardReleaseAuthorization:
+            case State::AwaitWildcardAuthorization:
+            case State::AwaitWildcardCleanupAuthorization:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitFinish:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
+                return fail();
+        }
+        return fail();
+    }
+
+    bool decide(const WildcardAttemptDecisionV1& decision) {
+        if (!bound(decision.version, decision.transaction_id, decision.mode) ||
+            !valid_wildcard_decision(decision))
+            return fail();
+        switch (state_) {
+            case State::AwaitCollisionAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                       State::AwaitCollisionRejected);
+            case State::AwaitCollisionRejected:
+            case State::AwaitWildcardLive:
+                if (decision.decision != WildcardAttemptDecisionKind::RejectAndCleanup ||
+                    mode_ == WildcardAttemptMode::Canonical ||
+                    decision.for_phase != wildcard_rejection_checkpoint(mode_))
+                    return fail();
+                state_ = State::AwaitMutationSettlement;
+                return true;
+            case State::AwaitExactCleanupAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                       State::AwaitExactCleanedGuardHeld);
+            case State::AwaitGuardReleaseAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                       State::AwaitGuardReleased);
+            case State::AwaitWildcardAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                       State::AwaitWildcardLive);
+            case State::AwaitWildcardCleanupAuthorization:
+                return accept_decision(decision,
+                                       WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                                       State::AwaitAttemptSettlement);
+            case State::AwaitFinish:
+                return accept_decision(
+                    decision, WildcardAttemptDecisionKind::Finish, State::Complete);
+            case State::Empty:
+            case State::AwaitGuardHeld:
+            case State::AwaitExactRutWitness:
+            case State::AwaitCollisionPrepared:
+            case State::AwaitExactCleanedGuardHeld:
+            case State::AwaitGuardReleased:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
+                return fail();
+        }
+        return fail();
+    }
+
+    bool settle(const WildcardAttemptSettlementV1& settlement) {
+        if (!bound(settlement.version, settlement.transaction_id, settlement.mode) ||
+            !valid_wildcard_settlement(settlement))
+            return fail();
+        if (state_ == State::AwaitAttemptSettlement &&
+            settlement.settlement == WildcardAttemptSettlementKind::AttemptSettled) {
+            state_ = State::AwaitFinish;
+            return true;
+        }
+        if (state_ == State::AwaitMutationSettlement &&
+            settlement.settlement == WildcardAttemptSettlementKind::MutationSettled) {
+            state_ = State::MutationRejected;
+            return true;
+        }
+        return fail();
+    }
+
+    bool complete() const { return state_ == State::Complete; }
+    bool mutation_rejected() const { return state_ == State::MutationRejected; }
+    bool failed() const { return state_ == State::Failed; }
+
+private:
+    enum class State {
+        Empty,
+        AwaitGuardHeld,
+        AwaitExactRutWitness,
+        AwaitCollisionPrepared,
+        AwaitCollisionAuthorization,
+        AwaitCollisionRejected,
+        AwaitExactCleanupAuthorization,
+        AwaitExactCleanedGuardHeld,
+        AwaitGuardReleaseAuthorization,
+        AwaitGuardReleased,
+        AwaitWildcardAuthorization,
+        AwaitWildcardLive,
+        AwaitWildcardCleanupAuthorization,
+        AwaitAttemptSettlement,
+        AwaitFinish,
+        AwaitMutationSettlement,
+        Complete,
+        MutationRejected,
+        Failed,
+    };
+
+    bool bound(u64 version, u64 transaction_id, WildcardAttemptMode mode) const {
+        return state_ != State::Empty && state_ != State::Complete &&
+               state_ != State::MutationRejected && state_ != State::Failed &&
+               version == version_ && transaction_id == transaction_id_ && mode == mode_;
+    }
+
+    bool accept_phase(const WildcardAttemptPhaseV1& witness,
+                      WildcardAttemptPhase expected,
+                      State next) {
+        if (witness.phase != expected) return fail();
+        state_ = next;
+        return true;
+    }
+
+    bool accept_decision(const WildcardAttemptDecisionV1& decision,
+                         WildcardAttemptDecisionKind expected,
+                         State next) {
+        if (decision.decision != expected) return fail();
+        state_ = next;
+        return true;
+    }
+
+    bool fail() {
+        state_ = State::Failed;
+        return false;
+    }
+
+    State state_ = State::Empty;
+    u64 version_ = 0u;
+    u64 transaction_id_ = 0u;
+    WildcardAttemptMode mode_ = WildcardAttemptMode::Canonical;
+};
 
 static std::vector<unsigned char> executable_lease_payload(const ExecutableLease& lease) {
     std::vector<unsigned char> payload;
@@ -8669,6 +9300,769 @@ static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canon
     return rejects(mutation);
 }
 
+static WildcardAttemptPhaseV1 wildcard_phase(WildcardAttemptMode mode,
+                                             WildcardAttemptPhase phase,
+                                             u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, phase, wildcard_phase_sequence(phase)};
+}
+
+static WildcardAttemptDecisionV1 wildcard_decision(WildcardAttemptMode mode,
+                                                   WildcardAttemptDecisionKind decision,
+                                                   WildcardAttemptPhase phase,
+                                                   u64 sequence,
+                                                   u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, decision, phase, sequence};
+}
+
+static WildcardAttemptSettlementV1 wildcard_settlement(WildcardAttemptMode mode,
+                                                       WildcardAttemptSettlementKind settlement,
+                                                       WildcardAttemptPhase phase,
+                                                       u64 sequence,
+                                                       u64 transaction_id = 0x377u) {
+    return {kWildcardAttemptVersion, transaction_id, mode, settlement, phase, sequence};
+}
+
+static bool wildcard_existing_frame_golden_self_check() {
+    if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
+        kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
+        kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
+        kExactRutCleaned != 44u || kExactRutFailure != 45u || kExactEscrowSettled != 46u ||
+        kWildcardAttemptCommand != 51u || kWildcardAttemptPhase != 52u ||
+        kWildcardAttemptDecision != 53u || kWildcardAttemptSettlement != 54u)
+        return false;
+    constexpr std::array<u16, 16u> existing_types{
+        35u,
+        36u,
+        37u,
+        38u,
+        39u,
+        40u,
+        41u,
+        42u,
+        43u,
+        44u,
+        45u,
+        46u,
+        47u,
+        48u,
+        49u,
+        50u,
+    };
+    Token token{};
+    for (u16 type : existing_types) {
+        const std::vector<unsigned char> wire = frame_bytes(Frame{type, token, {}});
+        std::array<unsigned char, kHeaderBytes> golden{};
+        golden[0] = 0x35u;
+        golden[1] = 0x33u;
+        golden[2] = 0x52u;
+        golden[3] = 0x31u;
+        golden[4] = 0x01u;
+        golden[6] = static_cast<unsigned char>(type);
+        golden[7] = static_cast<unsigned char>(type >> 8u);
+        if (wire.size() != golden.size() || !std::equal(wire.begin(), wire.end(), golden.begin()))
+            return false;
+    }
+    return true;
+}
+
+static bool same_wildcard_command(const WildcardAttemptCommandV1& left,
+                                  const WildcardAttemptCommandV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_phase(const WildcardAttemptPhaseV1& left,
+                                const WildcardAttemptPhaseV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.phase == right.phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_decision(const WildcardAttemptDecisionV1& left,
+                                   const WildcardAttemptDecisionV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.decision == right.decision &&
+           left.for_phase == right.for_phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_settlement(const WildcardAttemptSettlementV1& left,
+                                     const WildcardAttemptSettlementV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.settlement == right.settlement &&
+           left.terminal_phase == right.terminal_phase && left.sequence == right.sequence;
+}
+
+template <typename Value, typename Decoder, typename Equal>
+static bool rejects_without_mutating(const std::vector<unsigned char>& payload,
+                                     const Value& sentinel,
+                                     Decoder decoder,
+                                     Equal equal) {
+    Value output = sentinel;
+    return !decoder(payload, output) && equal(output, sentinel);
+}
+
+constexpr WildcardAttemptCommandV1 kWildcardCommandDecodeSentinel{
+    kWildcardAttemptVersion, 0x3771u, WildcardAttemptMode::WrongListenerInode, 0u};
+constexpr WildcardAttemptPhaseV1 kWildcardPhaseDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3772u,
+    WildcardAttemptMode::WrongListenerAddress,
+    WildcardAttemptPhase::GuardReleased,
+    9u};
+constexpr WildcardAttemptDecisionV1 kWildcardDecisionDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3773u,
+    WildcardAttemptMode::WrongListenerInode,
+    WildcardAttemptDecisionKind::RejectAndCleanup,
+    WildcardAttemptPhase::WildcardLive,
+    11u};
+constexpr WildcardAttemptSettlementV1 kWildcardSettlementDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3774u,
+    WildcardAttemptMode::FalsePostReleaseSuccess,
+    WildcardAttemptSettlementKind::MutationSettled,
+    WildcardAttemptPhase::WildcardLive,
+    12u};
+
+static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
+    if (!valid_wildcard_command(kWildcardCommandDecodeSentinel) ||
+        !valid_wildcard_phase(kWildcardPhaseDecodeSentinel) ||
+        !valid_wildcard_decision(kWildcardDecisionDecodeSentinel) ||
+        !valid_wildcard_settlement(kWildcardSettlementDecodeSentinel)) {
+        error = "wildcard decoder atomic-failure sentinel is not valid";
+        return false;
+    }
+
+    const std::array<u64, 4u> command_fields{
+        kWildcardAttemptVersion, 0x377u, static_cast<u64>(WildcardAttemptMode::Canonical), 0u};
+    for (std::size_t field = 0u; field != command_fields.size(); ++field) {
+        std::array<u64, 4u> invalid = command_fields;
+        invalid[field] = field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : 1u));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
+            error = "invalid raw wildcard command mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 5u> phase_fields{kWildcardAttemptVersion,
+                                           0x377u,
+                                           static_cast<u64>(WildcardAttemptMode::Canonical),
+                                           static_cast<u64>(WildcardAttemptPhase::GuardHeld),
+                                           1u};
+    for (std::size_t field = 0u; field != phase_fields.size(); ++field) {
+        std::array<u64, 5u> invalid = phase_fields;
+        invalid[field] =
+            field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : (field == 3u ? 8u : 0u)));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
+            error = "invalid raw wildcard phase mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 6u> decision_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec),
+        static_cast<u64>(WildcardAttemptPhase::CollisionPrepared),
+        4u};
+    for (std::size_t field = 0u; field != decision_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = decision_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 8u : (field == 4u ? 8u : 0u))));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
+            error = "invalid raw wildcard decision mutated decoder output";
+            return false;
+        }
+    }
+
+    const std::array<u64, 6u> settlement_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled),
+        static_cast<u64>(WildcardAttemptPhase::WildcardLive),
+        13u};
+    for (std::size_t field = 0u; field != settlement_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = settlement_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 3u : (field == 4u ? 8u : 0u))));
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
+            error = "invalid raw wildcard settlement mutated decoder output";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool wildcard_attempt_codec_self_check(std::string& error) {
+    constexpr std::array<WildcardAttemptMode, 7u> modes{
+        WildcardAttemptMode::Canonical,
+        WildcardAttemptMode::MissingCollision,
+        WildcardAttemptMode::PrematureGuardRelease,
+        WildcardAttemptMode::WrongListenerKind,
+        WildcardAttemptMode::WrongListenerAddress,
+        WildcardAttemptMode::WrongListenerInode,
+        WildcardAttemptMode::FalsePostReleaseSuccess,
+    };
+    constexpr std::array<WildcardAttemptPhase, 7u> phases{
+        WildcardAttemptPhase::GuardHeld,
+        WildcardAttemptPhase::ExactRutWitness,
+        WildcardAttemptPhase::CollisionPrepared,
+        WildcardAttemptPhase::CollisionRejected,
+        WildcardAttemptPhase::ExactCleanedGuardHeld,
+        WildcardAttemptPhase::GuardReleased,
+        WildcardAttemptPhase::WildcardLive,
+    };
+    if (!wildcard_existing_frame_golden_self_check()) {
+        error = "wildcard frame allocation changed an existing 35--50 wire header";
+        return false;
+    }
+    if (!wildcard_decoder_atomic_failure_self_check(error)) return false;
+    for (WildcardAttemptMode mode : modes) {
+        WildcardAttemptCommandV1 command{kWildcardAttemptVersion, 0x377u, mode, 0u};
+        WildcardAttemptCommandV1 decoded;
+        if (!decode_wildcard_command(encode_wildcard_command(command), decoded) ||
+            decoded.mode != mode || decoded.transaction_id != command.transaction_id) {
+            error = "wildcard command closed-mode round trip failed";
+            return false;
+        }
+    }
+    for (WildcardAttemptPhase phase : phases) {
+        const WildcardAttemptPhaseV1 witness =
+            wildcard_phase(WildcardAttemptMode::Canonical, phase);
+        WildcardAttemptPhaseV1 decoded;
+        if (!decode_wildcard_phase(encode_wildcard_phase(witness), decoded) ||
+            decoded.phase != phase || decoded.sequence != wildcard_phase_sequence(phase)) {
+            error = "wildcard phase round trip failed";
+            return false;
+        }
+    }
+    const std::array<WildcardAttemptDecisionV1, 6u> canonical_decisions{
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                          WildcardAttemptPhase::CollisionPrepared,
+                          4u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                          WildcardAttemptPhase::CollisionRejected,
+                          6u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                          WildcardAttemptPhase::ExactCleanedGuardHeld,
+                          8u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                          WildcardAttemptPhase::GuardReleased,
+                          10u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                          WildcardAttemptPhase::WildcardLive,
+                          12u),
+        wildcard_decision(WildcardAttemptMode::Canonical,
+                          WildcardAttemptDecisionKind::Finish,
+                          WildcardAttemptPhase::WildcardLive,
+                          14u),
+    };
+    for (const auto& decision : canonical_decisions) {
+        WildcardAttemptDecisionV1 decoded;
+        if (!decode_wildcard_decision(encode_wildcard_decision(decision), decoded) ||
+            decoded.decision != decision.decision || decoded.for_phase != decision.for_phase) {
+            error = "wildcard authorization round trip failed";
+            return false;
+        }
+    }
+    for (WildcardAttemptMode mode : modes) {
+        if (mode == WildcardAttemptMode::Canonical) continue;
+        const WildcardAttemptPhase checkpoint = wildcard_rejection_checkpoint(mode);
+        const WildcardAttemptDecisionV1 rejection =
+            wildcard_decision(mode,
+                              WildcardAttemptDecisionKind::RejectAndCleanup,
+                              checkpoint,
+                              wildcard_phase_sequence(checkpoint));
+        WildcardAttemptDecisionV1 decoded_decision;
+        const WildcardAttemptSettlementV1 settlement =
+            wildcard_settlement(mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                checkpoint,
+                                wildcard_phase_sequence(checkpoint) + 1u);
+        WildcardAttemptSettlementV1 decoded_settlement;
+        if (!decode_wildcard_decision(encode_wildcard_decision(rejection), decoded_decision) ||
+            !decode_wildcard_settlement(encode_wildcard_settlement(settlement),
+                                        decoded_settlement) ||
+            decoded_decision.mode != mode || decoded_settlement.mode != mode) {
+            error = "wildcard mutation terminal round trip failed";
+            return false;
+        }
+    }
+    WildcardAttemptSettlementV1 canonical_settlement =
+        wildcard_settlement(WildcardAttemptMode::Canonical,
+                            WildcardAttemptSettlementKind::AttemptSettled,
+                            WildcardAttemptPhase::WildcardLive,
+                            13u);
+    WildcardAttemptSettlementV1 decoded_settlement;
+    if (!decode_wildcard_settlement(encode_wildcard_settlement(canonical_settlement),
+                                    decoded_settlement)) {
+        error = "wildcard canonical settlement round trip failed";
+        return false;
+    }
+
+    WildcardAttemptCommandV1 command{
+        kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u};
+    std::vector<unsigned char> payload = encode_wildcard_command(command);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "truncated wildcard command was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_command(command);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "trailing wildcard command bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 4u; ++mutation) {
+        WildcardAttemptCommandV1 invalid = command;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else
+            invalid.sequence = 1u;
+        if (!rejects_without_mutating(encode_wildcard_command(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
+            error = "invalid wildcard command was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    WildcardAttemptPhaseV1 witness =
+        wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld);
+    payload = encode_wildcard_phase(witness);
+    payload.pop_back();
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "truncated wildcard phase was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_phase(witness);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "trailing wildcard phase bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 5u; ++mutation) {
+        WildcardAttemptPhaseV1 invalid = witness;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.phase = static_cast<WildcardAttemptPhase>(8u);
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_phase(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
+            error = "invalid wildcard phase was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    WildcardAttemptDecisionV1 decision = canonical_decisions.front();
+    payload = encode_wildcard_decision(decision);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "truncated wildcard decision was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_decision(decision);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "trailing wildcard decision bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
+        WildcardAttemptDecisionV1 invalid = decision;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.decision = static_cast<WildcardAttemptDecisionKind>(8u);
+        else if (mutation == 4u)
+            invalid.for_phase = static_cast<WildcardAttemptPhase>(8u);
+        else if (mutation == 5u)
+            invalid.for_phase = WildcardAttemptPhase::GuardHeld;
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_decision(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
+            error = "invalid wildcard decision was accepted or mutated decoder output";
+            return false;
+        }
+    }
+
+    payload = encode_wildcard_settlement(canonical_settlement);
+    payload.pop_back();
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "truncated wildcard settlement was accepted or mutated decoder output";
+        return false;
+    }
+    payload = encode_wildcard_settlement(canonical_settlement);
+    payload.push_back(0u);
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "trailing wildcard settlement bytes were accepted or mutated decoder output";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
+        WildcardAttemptSettlementV1 invalid = canonical_settlement;
+        if (mutation == 0u)
+            invalid.version++;
+        else if (mutation == 1u)
+            invalid.transaction_id = 0u;
+        else if (mutation == 2u)
+            invalid.mode = static_cast<WildcardAttemptMode>(8u);
+        else if (mutation == 3u)
+            invalid.settlement = static_cast<WildcardAttemptSettlementKind>(3u);
+        else if (mutation == 4u)
+            invalid.terminal_phase = static_cast<WildcardAttemptPhase>(8u);
+        else if (mutation == 5u)
+            invalid.terminal_phase = WildcardAttemptPhase::GuardReleased;
+        else
+            invalid.sequence++;
+        if (!rejects_without_mutating(encode_wildcard_settlement(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
+            error = "invalid wildcard settlement was accepted or mutated decoder output";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool drive_wildcard_canonical(WildcardAttemptStateMachine& machine,
+                                     u64 transaction_id = 0x377u) {
+    const WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+    return machine.begin({kWildcardAttemptVersion, transaction_id, mode, 0u}) &&
+           machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld, transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness, transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                            WildcardAttemptPhase::CollisionPrepared,
+                                            4u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::CollisionRejected, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                            WildcardAttemptPhase::CollisionRejected,
+                                            6u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::ExactCleanedGuardHeld, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                            WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                            8u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::GuardReleased, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                            WildcardAttemptPhase::GuardReleased,
+                                            10u,
+                                            transaction_id)) &&
+           machine.observe(
+               wildcard_phase(mode, WildcardAttemptPhase::WildcardLive, transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::AuthorizeWildcardCleanup,
+                                            WildcardAttemptPhase::WildcardLive,
+                                            12u,
+                                            transaction_id)) &&
+           machine.settle(wildcard_settlement(mode,
+                                              WildcardAttemptSettlementKind::AttemptSettled,
+                                              WildcardAttemptPhase::WildcardLive,
+                                              13u,
+                                              transaction_id)) &&
+           machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::Finish,
+                                            WildcardAttemptPhase::WildcardLive,
+                                            14u,
+                                            transaction_id)) &&
+           machine.complete();
+}
+
+static bool drive_wildcard_mutation(WildcardAttemptStateMachine& machine,
+                                    WildcardAttemptMode mode,
+                                    u64 transaction_id = 0x377u) {
+    if (mode == WildcardAttemptMode::Canonical ||
+        !machine.begin({kWildcardAttemptVersion, transaction_id, mode, 0u}) ||
+        !machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld, transaction_id)) ||
+        !machine.observe(
+            wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness, transaction_id)) ||
+        !machine.observe(
+            wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared, transaction_id)) ||
+        !machine.decide(wildcard_decision(mode,
+                                          WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                          WildcardAttemptPhase::CollisionPrepared,
+                                          4u,
+                                          transaction_id)))
+        return false;
+    const WildcardAttemptPhase checkpoint = wildcard_rejection_checkpoint(mode);
+    if (checkpoint == WildcardAttemptPhase::WildcardLive &&
+        (!machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::CollisionRejected, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                                           WildcardAttemptPhase::CollisionRejected,
+                                           6u,
+                                           transaction_id)) ||
+         !machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::ExactCleanedGuardHeld, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeGuardRelease,
+                                           WildcardAttemptPhase::ExactCleanedGuardHeld,
+                                           8u,
+                                           transaction_id)) ||
+         !machine.observe(
+             wildcard_phase(mode, WildcardAttemptPhase::GuardReleased, transaction_id)) ||
+         !machine.decide(wildcard_decision(mode,
+                                           WildcardAttemptDecisionKind::AuthorizeWildcardExec,
+                                           WildcardAttemptPhase::GuardReleased,
+                                           10u,
+                                           transaction_id))))
+        return false;
+    return machine.decide(wildcard_decision(mode,
+                                            WildcardAttemptDecisionKind::RejectAndCleanup,
+                                            checkpoint,
+                                            wildcard_phase_sequence(checkpoint),
+                                            transaction_id)) &&
+           machine.settle(wildcard_settlement(mode,
+                                              WildcardAttemptSettlementKind::MutationSettled,
+                                              checkpoint,
+                                              wildcard_phase_sequence(checkpoint) + 1u,
+                                              transaction_id)) &&
+           machine.mutation_rejected();
+}
+
+static bool wildcard_attempt_state_self_check(std::string& error) {
+    WildcardAttemptStateMachine canonical_replay;
+    if (!drive_wildcard_canonical(canonical_replay)) {
+        error = "canonical wildcard state sequence was rejected";
+        return false;
+    }
+    if (canonical_replay.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        !canonical_replay.failed() || canonical_replay.complete() ||
+        canonical_replay.mutation_rejected()) {
+        error = "valid replay after canonical completion did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine canonical_wrong_binding;
+    if (!drive_wildcard_canonical(canonical_wrong_binding) ||
+        canonical_wrong_binding.observe(wildcard_phase(
+            WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld, 0x378u)) ||
+        !canonical_wrong_binding.failed() || canonical_wrong_binding.complete() ||
+        canonical_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after canonical completion did not poison terminal state";
+        return false;
+    }
+    for (WildcardAttemptMode mode : {WildcardAttemptMode::MissingCollision,
+                                     WildcardAttemptMode::PrematureGuardRelease,
+                                     WildcardAttemptMode::WrongListenerKind,
+                                     WildcardAttemptMode::WrongListenerAddress,
+                                     WildcardAttemptMode::WrongListenerInode,
+                                     WildcardAttemptMode::FalsePostReleaseSuccess}) {
+        WildcardAttemptStateMachine mutation;
+        if (!drive_wildcard_mutation(mutation, mode)) {
+            error = "intended wildcard mutation rejection sequence failed";
+            return false;
+        }
+        if (!mutation.mutation_rejected() || mutation.complete() || mutation.failed()) {
+            error = "wildcard mutation did not retain its initial rejection terminal state";
+            return false;
+        }
+    }
+    constexpr WildcardAttemptMode terminal_mutation_mode = WildcardAttemptMode::MissingCollision;
+    constexpr WildcardAttemptPhase terminal_mutation_phase =
+        WildcardAttemptPhase::CollisionRejected;
+    WildcardAttemptStateMachine mutation_replay;
+    if (!drive_wildcard_mutation(mutation_replay, terminal_mutation_mode) ||
+        mutation_replay.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u)) ||
+        !mutation_replay.failed() || mutation_replay.complete() ||
+        mutation_replay.mutation_rejected()) {
+        error = "valid replay after mutation rejection did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine mutation_wrong_binding;
+    if (!drive_wildcard_mutation(mutation_wrong_binding, terminal_mutation_mode) ||
+        mutation_wrong_binding.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u,
+                                0x378u)) ||
+        !mutation_wrong_binding.failed() || mutation_wrong_binding.complete() ||
+        mutation_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after mutation rejection did not poison terminal state";
+        return false;
+    }
+
+    const auto new_machine_at_collision = [] {
+        WildcardAttemptStateMachine machine;
+        const WildcardAttemptMode mode = WildcardAttemptMode::MissingCollision;
+        (void)machine.begin({kWildcardAttemptVersion, 0x377u, mode, 0u});
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::GuardHeld));
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::ExactRutWitness));
+        (void)machine.observe(wildcard_phase(mode, WildcardAttemptPhase::CollisionPrepared));
+        (void)machine.decide(wildcard_decision(mode,
+                                               WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                               WildcardAttemptPhase::CollisionPrepared,
+                                               4u));
+        return machine;
+    };
+    WildcardAttemptStateMachine duplicate;
+    if (!duplicate.begin({kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u}) ||
+        !duplicate.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        duplicate.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        !duplicate.failed()) {
+        error = "duplicate wildcard phase did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine skipped;
+    if (!skipped.begin({kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u}) ||
+        skipped.observe(wildcard_phase(WildcardAttemptMode::Canonical,
+                                       WildcardAttemptPhase::ExactRutWitness)) ||
+        !skipped.failed()) {
+        error = "skipped/out-of-order wildcard phase did not fail closed";
+        return false;
+    }
+    for (unsigned mutation = 0u; mutation != 4u; ++mutation) {
+        WildcardAttemptStateMachine bound;
+        const WildcardAttemptMode mode = WildcardAttemptMode::Canonical;
+        if (!bound.begin({kWildcardAttemptVersion, 0x377u, mode, 0u})) return false;
+        WildcardAttemptPhaseV1 witness = wildcard_phase(mode, WildcardAttemptPhase::GuardHeld);
+        if (mutation == 0u)
+            witness.version++;
+        else if (mutation == 1u)
+            witness.transaction_id++;
+        else if (mutation == 2u)
+            witness.mode = WildcardAttemptMode::WrongListenerInode;
+        else
+            witness.sequence++;
+        if (bound.observe(witness) || !bound.failed()) {
+            error = "unbound wildcard version/transaction/mode/sequence was accepted";
+            return false;
+        }
+    }
+    WildcardAttemptStateMachine replay = new_machine_at_collision();
+    if (replay.decide(wildcard_decision(WildcardAttemptMode::MissingCollision,
+                                        WildcardAttemptDecisionKind::AuthorizeCollisionExec,
+                                        WildcardAttemptPhase::CollisionPrepared,
+                                        4u)) ||
+        !replay.failed()) {
+        error = "replayed wildcard authorization did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine settle_before_reject = new_machine_at_collision();
+    if (settle_before_reject.settle(
+            wildcard_settlement(WildcardAttemptMode::MissingCollision,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                WildcardAttemptPhase::CollisionRejected,
+                                6u)) ||
+        !settle_before_reject.failed()) {
+        error = "wildcard mutation settlement before rejection was accepted";
+        return false;
+    }
+    WildcardAttemptStateMachine authorize_after_reject = new_machine_at_collision();
+    if (!authorize_after_reject.decide(
+            wildcard_decision(WildcardAttemptMode::MissingCollision,
+                              WildcardAttemptDecisionKind::RejectAndCleanup,
+                              WildcardAttemptPhase::CollisionRejected,
+                              5u)) ||
+        authorize_after_reject.decide(
+            wildcard_decision(WildcardAttemptMode::MissingCollision,
+                              WildcardAttemptDecisionKind::AuthorizeExactCleanup,
+                              WildcardAttemptPhase::CollisionRejected,
+                              6u)) ||
+        !authorize_after_reject.failed()) {
+        error = "authorization after wildcard rejection did not fail closed";
+        return false;
+    }
+    WildcardAttemptStateMachine duplicate_command;
+    WildcardAttemptCommandV1 command{
+        kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u};
+    if (!duplicate_command.begin(command) || duplicate_command.begin(command) ||
+        !duplicate_command.failed()) {
+        error = "duplicate wildcard command did not fail closed";
+        return false;
+    }
+    return true;
+}
+
+static bool wildcard_attempt_protocol_self_check(std::string& error) {
+    return wildcard_attempt_codec_self_check(error) && wildcard_attempt_state_self_check(error) &&
+           listener_failure_bound_self_check(error);
+}
+
 static bool guard_protocol_self_check(std::string& error) {
     constexpr u32 positive = 0x0a010203u;
     constexpr u32 guard = 0x0a010204u;
@@ -10105,6 +11499,15 @@ static bool run_positive(const std::string& sudo_path,
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--wildcard-attempt-protocol-self-check") == 0) {
+        std::string error;
+        if (!wildcard_attempt_protocol_self_check(error)) {
+            std::cerr << "FAIL [#377 wildcard-attempt protocol self-check]: " << error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #377 wildcard-attempt protocol self-check\n";
+        return 0;
+    }
     if (argc == 6 && strcmp(argv[1], "--fixture-broker-launcher") == 0)
         return launcher_main(argv[0], argv[2], argv[3], argv[4], argv[5]);
     if (argc == 6 && strcmp(argv[1], "--fixture-privileged-broker") == 0)
