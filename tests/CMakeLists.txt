@@ -36,6 +36,9 @@ target_link_libraries(test_fixture_wildcard_paused_child_lease PRIVATE
     fixture_wildcard_paused_child_lease
 )
 target_include_directories(test_fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_wildcard_paused_child_lease PRIVATE -fexceptions)
+endif()
 add_test(NAME test_fixture_wildcard_paused_child_lease
          COMMAND test_fixture_wildcard_paused_child_lease)
 set_tests_properties(test_fixture_wildcard_paused_child_lease PROPERTIES

@@ -1,5 +1,6 @@
 #include "fixture_wildcard_paused_child_lease.h"
 
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -118,15 +119,14 @@ bool direct_children(std::chrono::steady_clock::time_point deadline,
                 return false;
             }
         }
-        std::size_t consumed = 0;
         unsigned long long value = 0;
-        try {
-            value = std::stoull(token, &consumed, 10);
-        } catch (...) {
+        const auto [end, parse_error] =
+            std::from_chars(token.data(), token.data() + token.size(), value, 10);
+        if (parse_error != std::errc{} || end != token.data() + token.size()) {
             fail(diagnostic, FailurePhase::Children, EPROTO);
             return false;
         }
-        if (consumed != token.size() || value <= 1 ||
+        if (value <= 1 ||
             value > static_cast<unsigned long long>(std::numeric_limits<pid_t>::max())) {
             fail(diagnostic, FailurePhase::Children, EPROTO);
             return false;
