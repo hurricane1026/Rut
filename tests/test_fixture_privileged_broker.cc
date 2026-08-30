@@ -173,6 +173,15 @@ static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
 static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
 
+static bool listener_scenario_name(const char* scenario) {
+    return strcmp(scenario, "listener-guard-reservation") == 0 ||
+           strcmp(scenario, "listener-cleanup-observation-failure") == 0;
+}
+
+static bool listener_failure_integration(const char* scenario) {
+    return strcmp(scenario, "listener-cleanup-observation-failure") == 0;
+}
+
 static bool exact_request(const Frame& request, u16 expected_type, const Token& token) {
     return request.type == expected_type && token_equal(request.token, token) &&
            request.payload.empty();
@@ -286,6 +295,24 @@ static bool control_lease_lost(int fd) {
     if (received > 0) return false;
     if (received == 0) return true;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+static bool wait_control_eof(int fd, std::chrono::steady_clock::time_point deadline) {
+    while (fd >= 0 && std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor{fd, static_cast<short>(POLLIN | POLLHUP | POLLERR), 0};
+        const int timeout = remaining_deadline_ms(deadline);
+        int polled;
+        do {
+            polled = poll(&descriptor, 1, timeout);
+        } while (polled < 0 && errno == EINTR);
+        if (polled <= 0 || (descriptor.revents & POLLNVAL) != 0) return false;
+        unsigned char byte = 0u;
+        const ssize_t received = recv(fd, &byte, 1u, MSG_PEEK | MSG_DONTWAIT);
+        if (received == 0) return true;
+        if (received > 0) return false;
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return false;
+    }
+    return false;
 }
 
 static bool arm_parent_death(pid_t expected_parent) {
@@ -1047,6 +1074,7 @@ struct ExactFailureReport {
 };
 
 constexpr u64 kExactCustodyVersion = 1u;
+constexpr u64 kExactSettledVersion = 2u;
 constexpr std::size_t kExactCustodyFields = 21u;
 struct ExactCustodyRecord {
     u64 version = kExactCustodyVersion;
@@ -1085,9 +1113,9 @@ struct ExactEscrowRights {
     }
 };
 
-constexpr std::size_t kExactSettledFields = 10u;
+constexpr std::size_t kExactSettledFields = 11u;
 struct ExactSettledRecord {
-    u64 version = kExactCustodyVersion;
+    u64 version = kExactSettledVersion;
     u64 target_pid = 0u;
     u64 child_pid = 0u;
     u64 child_start = 0u;
@@ -1096,6 +1124,7 @@ struct ExactSettledRecord {
     u64 reaped = 0u;
     u64 listener_absent = 0u;
     u64 temps_absent = 0u;
+    u64 competing_bind_error = 0u;
     u64 guard_closed = 0u;
 };
 
@@ -1376,6 +1405,7 @@ static std::vector<unsigned char> encode_exact_settled(const ExactSettledRecord&
                       settled.reaped,
                       settled.listener_absent,
                       settled.temps_absent,
+                      settled.competing_bind_error,
                       settled.guard_closed})
         append_u64(payload, field);
     return payload;
@@ -1388,9 +1418,10 @@ static bool decode_exact_settled(const std::vector<unsigned char>& payload,
     std::array<u64, kExactSettledFields> fields{};
     for (std::size_t i = 0; i != fields.size(); ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
-    if (fields[0] != kExactCustodyVersion || fields[1] <= 1u || fields[2] <= 1u ||
+    if (fields[0] != kExactSettledVersion || fields[1] <= 1u || fields[2] <= 1u ||
         fields[3] == 0u || fields[4] == 0u || fields[5] > 1u || fields[6] > 1u || fields[7] > 1u ||
-        fields[8] > 1u || fields[9] > 1u)
+        fields[8] > 1u || fields[9] > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        fields[10] > 1u)
         return false;
     settled = {fields[0],
                fields[1],
@@ -1401,8 +1432,20 @@ static bool decode_exact_settled(const std::vector<unsigned char>& payload,
                fields[6],
                fields[7],
                fields[8],
-               fields[9]};
+               fields[9],
+               fields[10]};
     return true;
+}
+
+static bool exact_settlement_complete(const ExactSettledRecord& settled,
+                                      pid_t expected_target,
+                                      u64 expected_guard_inode,
+                                      bool require_adopted = true) {
+    return settled.target_pid == static_cast<u64>(expected_target) &&
+           settled.guard_inode == expected_guard_inode &&
+           (!require_adopted || settled.adopted == 1u) && settled.reaped == 1u &&
+           settled.listener_absent == 1u && settled.temps_absent == 1u &&
+           settled.competing_bind_error == EADDRINUSE && settled.guard_closed == 1u;
 }
 
 static bool exact_settlement_matches_failure(const ExactSettledRecord& settled,
@@ -1411,12 +1454,35 @@ static bool exact_settlement_matches_failure(const ExactSettledRecord& settled,
            settled.child_start == failure.child_start;
 }
 
-static bool receive_failed_target_lifecycle(int broker_fd,
-                                            const Token& token,
-                                            pid_t expected_target,
-                                            const ExactFailureReport& failure,
-                                            u64 expected_guard_inode,
-                                            std::string& error) {
+static bool exact_injected_cleanup_failure(const ExactFailureReport& failure,
+                                           const ExactRutReport& witness) {
+    return failure.phase == ExactFailurePhase::Cleanup && failure.error_number == ETIMEDOUT &&
+           failure.count > 0u && failure.escrow_required == 1u &&
+           failure.child_pid == witness.child_pid && failure.child_start == witness.child_start;
+}
+
+enum class ExactFailureIntegrationStage { Failure, Settlement, TargetExit, Complete };
+
+static bool advance_exact_failure_integration(ExactFailureIntegrationStage& stage, u16 frame_type) {
+    if (stage == ExactFailureIntegrationStage::Failure && frame_type == kExactRutFailure)
+        stage = ExactFailureIntegrationStage::Settlement;
+    else if (stage == ExactFailureIntegrationStage::Settlement && frame_type == kExactEscrowSettled)
+        stage = ExactFailureIntegrationStage::TargetExit;
+    else if (stage == ExactFailureIntegrationStage::TargetExit && frame_type == kTargetExited)
+        stage = ExactFailureIntegrationStage::Complete;
+    else
+        return false;
+    return true;
+}
+
+static bool receive_failed_target_lifecycle(
+    int broker_fd,
+    const Token& token,
+    pid_t expected_target,
+    const ExactFailureReport& failure,
+    u64 expected_guard_inode,
+    std::string& error,
+    ExactFailureIntegrationStage* integration_stage = nullptr) {
     Frame record;
     bool settlement_received = false;
     if (!receive_frame(broker_fd, record, kListenerDeadlineMs)) {
@@ -1425,12 +1491,13 @@ static bool receive_failed_target_lifecycle(int broker_fd,
     }
     if (record.type == kExactEscrowSettled) {
         ExactSettledRecord settled;
-        if (!token_equal(record.token, token) || !decode_exact_settled(record.payload, settled) ||
+        if ((integration_stage != nullptr &&
+             !advance_exact_failure_integration(*integration_stage, record.type)) ||
+            !token_equal(record.token, token) || !decode_exact_settled(record.payload, settled) ||
             !exact_settlement_matches_failure(settled, failure) ||
-            settled.target_pid != static_cast<u64>(expected_target) ||
-            settled.guard_inode != expected_guard_inode || settled.reaped != 1u ||
-            settled.listener_absent != 1u || settled.temps_absent != 1u ||
-            settled.guard_closed != 1u || !receive_frame(broker_fd, record, kHandshakeMs)) {
+            !exact_settlement_complete(
+                settled, expected_target, expected_guard_inode, integration_stage != nullptr) ||
+            !receive_frame(broker_fd, record, kHandshakeMs)) {
             error += "; malformed or incomplete failure-settled evidence";
             return false;
         }
@@ -1440,7 +1507,9 @@ static bool receive_failed_target_lifecycle(int broker_fd,
         error += "; required failure-settled evidence was missing or out of order";
         return false;
     }
-    if (record.type != kTargetExited || !token_equal(record.token, token) ||
+    if ((integration_stage != nullptr &&
+         !advance_exact_failure_integration(*integration_stage, record.type)) ||
+        record.type != kTargetExited || !token_equal(record.token, token) ||
         record.payload.size() != 4u) {
         error += "; missing failed Target exit evidence";
         return false;
@@ -2175,7 +2244,8 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
                                                 int timeout_ms,
                                                 int& status,
                                                 int lease_fd = -1,
-                                                int* downstream_lease_fd = nullptr) {
+                                                int* downstream_lease_fd = nullptr,
+                                                bool return_immediately_on_lease_loss = false) {
     bool lease_revoked = false;
     const auto wait_until = [&](std::chrono::steady_clock::time_point deadline,
                                 bool monitor_lease) {
@@ -2199,6 +2269,7 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
         wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms), true);
     if (result == OwnedWaitResult::Exited) return result;
     lease_revoked = result == OwnedWaitResult::LeaseLost;
+    if (lease_revoked && return_immediately_on_lease_loss) return OwnedWaitResult::LeaseLost;
     if (lease_revoked) {
         // The downstream lease was closed by wait_until.  Give this owner a
         // full bounded natural-reap window before any identity-safe signal.
@@ -3434,7 +3505,8 @@ static int finish_exact_failure(int control,
                                 int guard_fd,
                                 ExactChildState& child,
                                 ExactFailureReport failure,
-                                int exit_code) {
+                                int exit_code,
+                                bool require_live_escrow = false) {
     while (!child.cleanup_complete) {
         if (!child.forked || child.identity.start == 0u) {
             if (cleanup_exact_child(
@@ -3446,6 +3518,10 @@ static int finish_exact_failure(int control,
         const ExactHandoffResult handoff =
             handoff_failed_exact_cleanup(token, held, guard_fd, child);
         if (handoff == ExactHandoffResult::NotSent) {
+            if (require_live_escrow) {
+                (void)poll(nullptr, 0, 10);
+                continue;
+            }
             if (cleanup_exact_child(
                     child, held, guard_fd, nullptr, false, new_exact_cleanup_deadline(), &failure))
                 break;
@@ -3491,7 +3567,7 @@ static int secured_target_main(const char* control_path,
     u64 broker = 0;
     if (!token_from_hex(token_string, token) || !parse_u64(broker_text, broker) || broker <= 1)
         return 40;
-    if (strcmp(scenario, "listener-guard-reservation") == 0 &&
+    if (listener_scenario_name(scenario) &&
         !validate_exact_custody_endpoint(kExactCustodyFd, static_cast<pid_t>(broker)))
         return 39;
     const int control = connect_control(control_path);
@@ -3515,7 +3591,7 @@ static int secured_target_main(const char* control_path,
             close(control);
             return 0;
         }
-        if (command.type == kGuardReserve && strcmp(scenario, "listener-guard-reservation") == 0) {
+        if (command.type == kGuardReserve && listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             ProcIdentity secured_identity;
             u64 baseline_fd_count = 0u;
@@ -3606,6 +3682,25 @@ static int secured_target_main(const char* control_path,
             const bool cleanup_command =
                 receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
                 exact_cleanup_request(exact_cleanup, token);
+            if (cleanup_command && listener_failure_integration(scenario)) {
+                ExactCleanupObservation injected;
+                const bool unexpectedly_absent =
+                    observe_exact_listener_absence(exact_child,
+                                                   held,
+                                                   new_exact_cleanup_deadline(),
+                                                   ExactCleanupFault::ProcFailure,
+                                                   injected);
+                exact_failure.phase = ExactFailurePhase::Cleanup;
+                exact_failure.error_number = static_cast<u64>(injected.error_number);
+                exact_failure.count = std::min<u64>(injected.attempts, 1024u);
+                if (unexpectedly_absent || exact_child.reaped || injected.proc_observed ||
+                    injected.listener_absent || injected.error_number != ETIMEDOUT ||
+                    injected.attempts == 0u) {
+                    exact_failure.error_number = EPROTO;
+                }
+                return finish_exact_failure(
+                    control, token, held, guard_fd, exact_child, exact_failure, 55, true);
+            }
             const bool cleanup_ok = cleanup_exact_child(exact_child,
                                                         held,
                                                         guard_fd,
@@ -3991,6 +4086,37 @@ struct ExactSettlementProgress {
     bool log_absent = false;
 };
 
+static int exact_competing_guard_bind_error(const ExactCustodyRecord& record,
+                                            const ExactEscrowRights& rights,
+                                            u64& observed_guard_inode) {
+    observed_guard_inode = 0u;
+    struct stat guard_status{};
+    if (rights.guard < 0 || fstat(rights.guard, &guard_status) != 0 ||
+        !S_ISSOCK(guard_status.st_mode))
+        return 0;
+    observed_guard_inode = static_cast<u64>(guard_status.st_ino);
+    if (observed_guard_inode != record.guard_inode) return 0;
+    const int competing = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (competing < 0) return errno;
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(static_cast<u16>(record.port));
+    endpoint.sin_addr.s_addr = htonl(static_cast<u32>(record.guard_ipv4));
+    errno = 0;
+    const int result =
+        bind(competing, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint));
+    const int bind_error = result == 0 ? 0 : errno;
+    close(competing);
+    return bind_error;
+}
+
+static bool exact_escrow_temp_absent(int directory, const char* name) {
+    struct stat status{};
+    errno = 0;
+    return directory >= 0 && fstatat(directory, name, &status, AT_SYMLINK_NOFOLLOW) < 0 &&
+           errno == ENOENT;
+}
+
 static bool settle_exact_escrow(int control,
                                 const Token& token,
                                 const ExactCustodyRecord& record,
@@ -3998,11 +4124,11 @@ static bool settle_exact_escrow(int control,
                                 ExactSettlementProgress& progress,
                                 ExactSettledRecord& settled,
                                 bool publish_settlement) {
-    settled.version = kExactCustodyVersion;
+    settled.version = kExactSettledVersion;
     settled.target_pid = record.target_pid;
     settled.child_pid = record.child_pid;
     settled.child_start = record.child_start;
-    settled.guard_inode = record.guard_inode;
+    settled.guard_inode = 0u;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
     if (record.child_reaped != 0u) {
@@ -4035,17 +4161,27 @@ static bool settle_exact_escrow(int control,
         progress.source_absent = remove_exact_temp(rights.directory, "exact-listener.rut", source);
     if (progress.reaped && !progress.log_absent)
         progress.log_absent = remove_exact_temp(rights.directory, "exact-listener.log", log);
-    const bool temps_absent = progress.source_absent && progress.log_absent;
+    const bool temps_absent = progress.source_absent && progress.log_absent &&
+                              exact_escrow_temp_absent(rights.directory, "exact-listener.rut") &&
+                              exact_escrow_temp_absent(rights.directory, "exact-listener.log");
     settled.adopted = progress.adopted ? 1u : 0u;
     settled.reaped = progress.reaped ? 1u : 0u;
     settled.listener_absent = progress.listener_absent ? 1u : 0u;
     settled.temps_absent = temps_absent ? 1u : 0u;
     if (progress.reaped && progress.listener_absent && temps_absent) {
-        const int old_guard = rights.guard;
-        close(rights.guard);
-        rights.guard = -1;
-        errno = 0;
-        settled.guard_closed = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
+        settled.competing_bind_error =
+            static_cast<u64>(exact_competing_guard_bind_error(record, rights, settled.guard_inode));
+        if (settled.competing_bind_error == EADDRINUSE) {
+            if (rights.pidfd >= 0) close(rights.pidfd);
+            rights.pidfd = -1;
+            close(rights.directory);
+            rights.directory = -1;
+            const int old_guard = rights.guard;
+            close(rights.guard);
+            rights.guard = -1;
+            errno = 0;
+            settled.guard_closed = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
+        }
     }
     if (rights.guard >= 0) return false;
     return !publish_settlement ||
@@ -4122,6 +4258,12 @@ static bool exact_listener_failure_requires_hold(bool custody_received,
     return !custody_received && event != ExactListenerWaitEvent::Progress;
 }
 
+static bool exact_failure_losses_complete(bool custody_received,
+                                          bool root_loss_observed,
+                                          bool custody_hup_observed) {
+    return custody_received && root_loss_observed && custody_hup_observed;
+}
+
 static bool exact_listener_target_reaped(pid_t target, u64 expected_start, int& status) {
     if (target <= 1 || expected_start == 0u) return false;
     errno = 0;
@@ -4154,8 +4296,10 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                                                     const std::string& target_executable,
                                                     const std::string& target_argv,
                                                     pid_t root_broker,
+                                                    u64 expected_root_start,
                                                     int root_lease,
                                                     int custody_fd,
+                                                    bool require_failure_losses,
                                                     int control,
                                                     const Token& token,
                                                     ino_t expected_netns,
@@ -4166,6 +4310,8 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs * 2);
     bool custody_received = false;
     bool custody_peer_closed = false;
+    bool root_loss_observed = false;
+    bool custody_hup_observed = false;
     ExactCustodyRecord custody;
     ExactEscrowRights rights;
     const auto accept_custody = [&](bool target_reaped) -> std::optional<OwnedWaitResult> {
@@ -4194,6 +4340,8 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             rights.close_all();
             hold_listener_failure(root_lease, custody_fd);
         }
+        if (state == ExactCustodyTargetState::ExitedAndAdopted && require_failure_losses)
+            hold_listener_failure(root_lease, custody_fd);
         if (state == ExactCustodyTargetState::ExitedAndAdopted)
             return finish_post_ack_escrow(
                 target, control, token, custody, rights, true, false, target_status);
@@ -4206,8 +4354,15 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
     };
     while (std::chrono::steady_clock::now() < deadline) {
         const bool root_lost = control_lease_lost(root_lease) || getppid() != root_broker;
+        ProcIdentity expected_root;
+        expected_root.pid = root_broker;
+        expected_root.start = expected_root_start;
+        if (custody_received && root_lost &&
+            observe_exact_liveness(expected_root) == ExactLiveness::ExitedOrReused)
+            root_loss_observed = true;
         if (root_lost && exact_listener_failure_requires_hold(custody_received,
                                                               ExactListenerWaitEvent::RootLoss)) {
+            if (require_failure_losses) hold_listener_failure(root_lease, custody_fd);
             if (exact_listener_target_reaped(target, expected_target_start, target_status))
                 return OwnedWaitResult::Exited;
             hold_listener_failure(root_lease, custody_fd);
@@ -4220,6 +4375,10 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             } while (polled < 0 && errno == EINTR);
         }
         if (polled < 0) {
+            if (custody_received && require_failure_losses &&
+                !exact_failure_losses_complete(
+                    custody_received, root_loss_observed, custody_hup_observed))
+                hold_listener_failure(root_lease, custody_fd);
             if (custody_received)
                 return finish_post_ack_escrow(
                     target, control, token, custody, rights, false, true, target_status);
@@ -4228,11 +4387,18 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             hold_listener_failure(root_lease, custody_fd);
         }
         if ((descriptor.revents & POLLIN) != 0) {
-            if (custody_received)
-                return finish_post_ack_escrow(
-                    target, control, token, custody, rights, false, true, target_status);
             const ExactCustodyPeek peek =
                 peek_exact_custody(custody_fd, (descriptor.revents & POLLHUP) != 0);
+            if (custody_received) {
+                if ((descriptor.revents & POLLHUP) != 0 && peek == ExactCustodyPeek::Eof)
+                    custody_hup_observed = true;
+                if (!require_failure_losses ||
+                    exact_failure_losses_complete(
+                        custody_received, root_loss_observed, custody_hup_observed))
+                    return finish_post_ack_escrow(
+                        target, control, token, custody, rights, false, true, target_status);
+                continue;
+            }
             if (peek == ExactCustodyPeek::Record) {
                 if (const auto result = accept_custody(false)) return *result;
             } else if (peek == ExactCustodyPeek::Eof) {
@@ -4243,15 +4409,32 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                 hold_listener_failure(root_lease, custody_fd);
             }
         }
-        if ((descriptor.revents & POLLHUP) != 0 && !custody_received) custody_peer_closed = true;
+        if ((descriptor.revents & POLLHUP) != 0) {
+            if (!custody_received)
+                custody_peer_closed = true;
+            else if (peek_exact_custody(custody_fd, true) == ExactCustodyPeek::Eof)
+                custody_hup_observed = true;
+        }
         if ((descriptor.revents & POLLNVAL) != 0 ||
             ((descriptor.revents & POLLERR) != 0 && !custody_peer_closed)) {
+            if (custody_received && require_failure_losses &&
+                !exact_failure_losses_complete(
+                    custody_received, root_loss_observed, custody_hup_observed))
+                hold_listener_failure(root_lease, custody_fd);
             if (custody_received)
                 return finish_post_ack_escrow(
                     target, control, token, custody, rights, false, true, target_status);
             if (exact_listener_target_reaped(target, expected_target_start, target_status))
                 return OwnedWaitResult::Exited;
             hold_listener_failure(root_lease, custody_fd);
+        }
+        if (custody_received && require_failure_losses) {
+            if (exact_failure_losses_complete(
+                    custody_received, root_loss_observed, custody_hup_observed))
+                return finish_post_ack_escrow(
+                    target, control, token, custody, rights, false, true, target_status);
+            (void)poll(nullptr, 0, 10);
+            continue;
         }
         int status = 0;
         errno = 0;
@@ -4301,6 +4484,9 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             exact_peer_closed_action(false, false) == ExactPeerClosedAction::WaitDirect)
             (void)poll(nullptr, 0, 10);
     }
+    if (custody_received && require_failure_losses &&
+        !exact_failure_losses_complete(custody_received, root_loss_observed, custody_hup_observed))
+        hold_listener_failure(root_lease, custody_fd);
     if (exact_listener_failure_requires_hold(custody_received, ExactListenerWaitEvent::Deadline)) {
         if (exact_listener_target_reaped(target, expected_target_start, target_status))
             return OwnedWaitResult::Exited;
@@ -4342,6 +4528,13 @@ static bool exact_adoption_fault_self_check(std::string& error) {
         !exact_listener_failure_requires_hold(false, ExactListenerWaitEvent::Deadline) ||
         exact_listener_failure_requires_hold(true, ExactListenerWaitEvent::RootLoss)) {
         error = "exact pre-custody root-loss/deadline hold decision failed";
+        return false;
+    }
+    if (exact_failure_losses_complete(false, true, true) ||
+        exact_failure_losses_complete(true, false, true) ||
+        exact_failure_losses_complete(true, true, false) ||
+        !exact_failure_losses_complete(true, true, true)) {
+        error = "exact custody/root-loss/HUP settlement gate failed";
         return false;
     }
     if (exact_target_numeric_signal_allowed(-1, ECHILD, true) ||
@@ -4472,7 +4665,7 @@ static int dropped_broker_main(const char* executable,
     int launch_pipe[2] = {-1, -1};
     int trace_pipe[2] = {-1, -1};
     if (pipe2(launch_pipe, O_CLOEXEC) != 0 || pipe2(trace_pipe, O_CLOEXEC) != 0) return 27;
-    const bool listener_scenario = strcmp(scenario, "listener-guard-reservation") == 0;
+    const bool listener_scenario = listener_scenario_name(scenario);
     int custody_pair[2] = {-1, -1};
     const int pass_credentials = 1;
     if (listener_scenario &&
@@ -4624,8 +4817,10 @@ static int dropped_broker_main(const char* executable,
                                                          executable,
                                                          target_argv,
                                                          root_broker,
+                                                         root_identity.start,
                                                          kCredentialFd,
                                                          custody_pair[0],
+                                                         listener_failure_integration(scenario),
                                                          control,
                                                          token,
                                                          static_cast<ino_t>(expected_netns),
@@ -4891,9 +5086,8 @@ static int root_broker_main(const char* executable,
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
     int status = 0;
-    const int dropped_wait_ms = strcmp(scenario, "listener-guard-reservation") == 0
-                                    ? kListenerDeadlineMs * 3
-                                    : kBrokerDeadlineMs;
+    const int dropped_wait_ms =
+        listener_scenario_name(scenario) ? kListenerDeadlineMs * 3 : kBrokerDeadlineMs;
     const OwnedWaitResult dropped_wait_result =
         wait_owned_child_bounded(dropped,
                                  executable,
@@ -4906,8 +5100,16 @@ static int root_broker_main(const char* executable,
                                  dropped_wait_ms,
                                  status,
                                  root_control,
-                                 &credential_pair[0]);
+                                 &credential_pair[0],
+                                 listener_failure_integration(scenario));
     if (dropped_wait_result != OwnedWaitResult::Exited) {
+        if (dropped_wait_result == OwnedWaitResult::LeaseLost &&
+            listener_failure_integration(scenario)) {
+            dropped_cleanup.disarm();
+            close(root_control);
+            if (credential_pair[0] >= 0) close(credential_pair[0]);
+            return 0;
+        }
         if (dropped_wait_result == OwnedWaitResult::LeaseLost) dropped_cleanup.disarm();
         close(root_control);
         if (credential_pair[0] >= 0) close(credential_pair[0]);
@@ -8411,7 +8613,7 @@ static bool guard_protocol_self_check(std::string& error) {
     if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
         kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
         kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
-        kExactRutCleaned != 44u || kExactRutFailure != 45u ||
+        kExactRutCleaned != 44u || kExactRutFailure != 45u || kExactEscrowSettled != 46u ||
         !parse_guard_request(request, decoded_positive, decoded_guard) ||
         decoded_positive != positive || decoded_guard != guard) {
         error = "private guard frame/request codec self-check failed";
@@ -8647,6 +8849,34 @@ static bool guard_protocol_self_check(std::string& error) {
         error = "canonical escrow-marked exact failure codec failed";
         return false;
     }
+    ExactFailureReport injected_failure = canonical_failure;
+    injected_failure.phase = ExactFailurePhase::Cleanup;
+    injected_failure.error_number = ETIMEDOUT;
+    injected_failure.count = 1u;
+    ExactRutReport injected_witness;
+    injected_witness.child_pid = injected_failure.child_pid;
+    injected_witness.child_start = injected_failure.child_start;
+    if (!exact_injected_cleanup_failure(injected_failure, injected_witness)) {
+        error = "canonical injected cleanup failure binding was rejected";
+        return false;
+    }
+    for (unsigned mutation_index = 0u; mutation_index != 5u; ++mutation_index) {
+        ExactFailureReport mutation = injected_failure;
+        if (mutation_index == 0u)
+            mutation.phase = ExactFailurePhase::ListenerLog;
+        else if (mutation_index == 1u)
+            mutation.error_number = EIO;
+        else if (mutation_index == 2u)
+            mutation.count = 0u;
+        else if (mutation_index == 3u)
+            mutation.child_pid++;
+        else
+            mutation.child_start++;
+        if (exact_injected_cleanup_failure(mutation, injected_witness)) {
+            error = "mutated injected cleanup failure binding was accepted";
+            return false;
+        }
+    }
     canonical_failure.child_start = 0u;
     if (decode_exact_failure(encode_exact_failure(canonical_failure), decoded_failure)) {
         error = "incomplete escrow-marked exact failure was accepted";
@@ -8731,11 +8961,13 @@ static bool guard_protocol_self_check(std::string& error) {
     settled.guard_inode = 106u;
     settled.adopted = settled.reaped = settled.listener_absent = settled.temps_absent =
         settled.guard_closed = 1u;
+    settled.competing_bind_error = EADDRINUSE;
     ExactSettledRecord decoded_settled;
     std::vector<unsigned char> settled_payload = encode_exact_settled(settled);
     if (!decode_exact_settled(settled_payload, decoded_settled) ||
         decoded_settled.target_pid != settled.target_pid || decoded_settled.adopted != 1u ||
-        decoded_settled.child_start != settled.child_start || decoded_settled.guard_closed != 1u) {
+        decoded_settled.child_start != settled.child_start ||
+        decoded_settled.competing_bind_error != EADDRINUSE || decoded_settled.guard_closed != 1u) {
         error = "canonical exact failure-settled codec failed";
         return false;
     }
@@ -8745,7 +8977,7 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     settled_payload = encode_exact_settled(settled);
-    settled_payload[0] = 2u;
+    settled_payload[0] = 3u;
     if (decode_exact_settled(settled_payload, decoded_settled)) {
         error = "unknown exact failure-settled version was accepted";
         return false;
@@ -8767,6 +8999,58 @@ static bool guard_protocol_self_check(std::string& error) {
     ++settled.child_start;
     if (exact_settlement_matches_failure(settled, settled_failure)) {
         error = "mismatched exact failure settlement PID-start was accepted";
+        return false;
+    }
+    --settled.child_start;
+    if (!exact_settlement_complete(settled, 114, 106u)) {
+        error = "complete exact failure settlement was rejected";
+        return false;
+    }
+    for (unsigned mutation_index = 0u; mutation_index != 7u; ++mutation_index) {
+        ExactSettledRecord mutation = settled;
+        switch (mutation_index) {
+            case 0u:
+                mutation.target_pid++;
+                break;
+            case 1u:
+                mutation.guard_inode++;
+                break;
+            case 2u:
+                mutation.adopted = 0u;
+                break;
+            case 3u:
+                mutation.reaped = 0u;
+                break;
+            case 4u:
+                mutation.listener_absent = 0u;
+                break;
+            case 5u:
+                mutation.temps_absent = 0u;
+                break;
+            default:
+                mutation.competing_bind_error = 0u;
+                break;
+        }
+        if (exact_settlement_complete(mutation, 114, 106u)) {
+            error = "incomplete exact failure settlement mutation was accepted";
+            return false;
+        }
+    }
+    ExactSettledRecord open_guard = settled;
+    open_guard.guard_closed = 0u;
+    if (exact_settlement_complete(open_guard, 114, 106u)) {
+        error = "open exact failure guard mutation was accepted";
+        return false;
+    }
+    ExactFailureIntegrationStage integration_stage = ExactFailureIntegrationStage::Failure;
+    if (!advance_exact_failure_integration(integration_stage, kExactRutFailure) ||
+        advance_exact_failure_integration(integration_stage, kExactRutCleaned) ||
+        advance_exact_failure_integration(integration_stage, kGuardRelease) ||
+        advance_exact_failure_integration(integration_stage, kGuardReleased) ||
+        !advance_exact_failure_integration(integration_stage, kExactEscrowSettled) ||
+        !advance_exact_failure_integration(integration_stage, kTargetExited) ||
+        integration_stage != ExactFailureIntegrationStage::Complete) {
+        error = "exact failure frame45/46/TargetExited ordering policy failed";
         return false;
     }
     const int current_directory = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -8837,6 +9121,7 @@ static bool run_session(const std::string& sudo_path,
     ancestry_bundle::AncestryBundle initial_ancestry;
     ancestry_bundle::AncestryBundle final_ancestry;
     bool success = false;
+    bool broker_lifecycle_complete = false;
     do {
         const bool root_hello_ok = await_root_hello(endpoint,
                                                     sudo_child,
@@ -9233,7 +9518,7 @@ static bool run_session(const std::string& sudo_path,
                 error = "target PING/PONG/release failed";
                 break;
             }
-        } else if (strcmp(scenario, "listener-guard-reservation") == 0) {
+        } else if (listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
                 !parse_canonical_ipv4(topology.guard_ip, guard_ipv4)) {
@@ -9306,53 +9591,103 @@ static bool run_session(const std::string& sudo_path,
                 error = "exact public-RUT cleanup transport failed";
                 break;
             }
-            if (exact_cleaned_frame.type == kExactRutFailure &&
-                token_equal(exact_cleaned_frame.token, token)) {
+            if (listener_failure_integration(scenario)) {
                 ExactFailureReport failure;
-                if (decode_exact_failure(exact_cleaned_frame.payload, failure))
-                    error = "exact public-RUT failed at phase " +
-                            std::string(exact_failure_phase_name(failure.phase)) +
-                            " errno=" + std::to_string(failure.error_number) +
-                            " count=" + std::to_string(failure.count);
-                else
-                    error = "exact public-RUT returned malformed cleanup failure evidence";
-                (void)receive_failed_target_lifecycle(
-                    broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
-                break;
-            }
-            if (exact_cleaned_frame.type != kExactRutCleaned ||
-                !token_equal(exact_cleaned_frame.token, token) ||
-                !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
-                !validate_exact_cleaned_report(
-                    exact_cleaned, exact_report, exact_child, endpoint, target_proc, held, error) ||
-                !exact_cleaned_mutation_self_check(
-                    exact_cleaned, exact_report, exact_child, endpoint, target_proc, held) ||
-                !observe_guard_held(target_proc, plan, held, error)) {
-                if (error.empty()) error = "exact public-RUT cleanup/guard-held evidence failed";
-                break;
-            }
-            Frame released_frame;
-            GuardReport released;
-            if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
-                !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
-                released_frame.type != kGuardReleased ||
-                !token_equal(released_frame.token, token) ||
-                !decode_guard_report(released_frame.payload, released) ||
-                !validate_guard_report(released, plan, target_proc, true) ||
-                released.guard_fd != held.guard_fd || released.socket_inode != held.socket_inode ||
-                released.baseline_fd_count != held.baseline_fd_count ||
-                released.owner_pid != held.owner_pid || released.owner_start != held.owner_start ||
-                released.netns != held.netns ||
-                !observe_guard_released(target_proc, plan, released, error)) {
-                if (error.empty()) error = "released guard report/proc/FD evidence was invalid";
-                break;
-            }
-            Frame finished;
-            if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
-                !receive_frame(target_fd, finished, kHandshakeMs) ||
-                !exact_request(finished, kGuardFinished, token)) {
-                error = "guard lifecycle final release handshake failed";
-                break;
+                ExactFailureIntegrationStage integration_stage =
+                    ExactFailureIntegrationStage::Failure;
+                if (!advance_exact_failure_integration(integration_stage,
+                                                       exact_cleaned_frame.type) ||
+                    !token_equal(exact_cleaned_frame.token, token) ||
+                    !decode_exact_failure(exact_cleaned_frame.payload, failure) ||
+                    !exact_injected_cleanup_failure(failure, exact_report)) {
+                    error = "injected cleanup failure evidence was malformed or misbound";
+                    break;
+                }
+                const auto target_eof_deadline = std::chrono::steady_clock::now() +
+                                                 std::chrono::milliseconds(kListenerDeadlineMs);
+                if (!wait_control_eof(target_fd, target_eof_deadline)) {
+                    error = "injected failure Target EOF was missing or out of order";
+                    break;
+                }
+                close(target_fd);
+                target_fd = -1;
+                close(root_fd);
+                root_fd = -1;
+                const auto root_loss_deadline = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(kListenerDeadlineMs);
+                if (!wait_identity_gone_or_reused_until(root_proc, root_loss_deadline)) {
+                    error = "exact Root PID/start survived deliberate lease loss";
+                    break;
+                }
+                if (!receive_failed_target_lifecycle(broker_fd,
+                                                     token,
+                                                     target_proc.pid,
+                                                     failure,
+                                                     held.socket_inode,
+                                                     error,
+                                                     &integration_stage) ||
+                    integration_stage != ExactFailureIntegrationStage::Complete) {
+                    if (error.empty())
+                        error = "injected failure settlement/exit lifecycle was incomplete";
+                    break;
+                }
+                broker_lifecycle_complete = true;
+            } else {
+                if (exact_cleaned_frame.type == kExactRutFailure &&
+                    token_equal(exact_cleaned_frame.token, token)) {
+                    ExactFailureReport failure;
+                    if (decode_exact_failure(exact_cleaned_frame.payload, failure))
+                        error = "exact public-RUT failed at phase " +
+                                std::string(exact_failure_phase_name(failure.phase)) +
+                                " errno=" + std::to_string(failure.error_number) +
+                                " count=" + std::to_string(failure.count);
+                    else
+                        error = "exact public-RUT returned malformed cleanup failure evidence";
+                    (void)receive_failed_target_lifecycle(
+                        broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
+                    break;
+                }
+                if (exact_cleaned_frame.type != kExactRutCleaned ||
+                    !token_equal(exact_cleaned_frame.token, token) ||
+                    !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
+                    !validate_exact_cleaned_report(exact_cleaned,
+                                                   exact_report,
+                                                   exact_child,
+                                                   endpoint,
+                                                   target_proc,
+                                                   held,
+                                                   error) ||
+                    !exact_cleaned_mutation_self_check(
+                        exact_cleaned, exact_report, exact_child, endpoint, target_proc, held) ||
+                    !observe_guard_held(target_proc, plan, held, error)) {
+                    if (error.empty())
+                        error = "exact public-RUT cleanup/guard-held evidence failed";
+                    break;
+                }
+                Frame released_frame;
+                GuardReport released;
+                if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
+                    !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
+                    released_frame.type != kGuardReleased ||
+                    !token_equal(released_frame.token, token) ||
+                    !decode_guard_report(released_frame.payload, released) ||
+                    !validate_guard_report(released, plan, target_proc, true) ||
+                    released.guard_fd != held.guard_fd ||
+                    released.socket_inode != held.socket_inode ||
+                    released.baseline_fd_count != held.baseline_fd_count ||
+                    released.owner_pid != held.owner_pid ||
+                    released.owner_start != held.owner_start || released.netns != held.netns ||
+                    !observe_guard_released(target_proc, plan, released, error)) {
+                    if (error.empty()) error = "released guard report/proc/FD evidence was invalid";
+                    break;
+                }
+                Frame finished;
+                if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
+                    !receive_frame(target_fd, finished, kHandshakeMs) ||
+                    !exact_request(finished, kGuardFinished, token)) {
+                    error = "guard lifecycle final release handshake failed";
+                    break;
+                }
             }
         } else if (strcmp(scenario, "term-ignore") == 0) {
             if (!safe_signal_target(target_report, target_peer, target_proc, SIGTERM)) {
@@ -9390,7 +9725,7 @@ static bool run_session(const std::string& sudo_path,
             close(broker_fd);
             broker_fd = -1;
         }
-        if (broker_fd >= 0 && strcmp(scenario, "broker-early") != 0 &&
+        if (broker_fd >= 0 && !broker_lifecycle_complete && strcmp(scenario, "broker-early") != 0 &&
             strcmp(scenario, "broker-lease-loss") != 0) {
             Frame exited, released;
             if (!receive_frame(broker_fd, exited, kHandshakeMs) || exited.type != kTargetExited ||
@@ -9414,9 +9749,11 @@ static bool run_session(const std::string& sudo_path,
                 break;
             }
         }
-        if (!wait_group_gone(launch_lease, kCleanupMs) || !launcher_gone_or_wnowait(sudo_child) ||
-            !endpoint_unchanged(endpoint) || process_alive(root_peer.pid) ||
-            !no_process_with_token(token_text(token))) {
+        const int group_gone_timeout =
+            listener_failure_integration(scenario) ? kListenerDeadlineMs : kCleanupMs;
+        if (!wait_group_gone(launch_lease, group_gone_timeout) ||
+            !launcher_gone_or_wnowait(sudo_child) || !endpoint_unchanged(endpoint) ||
+            process_alive(root_peer.pid) || !no_process_with_token(token_text(token))) {
             error = "sudo/broker/target disappearance or endpoint ownership failed";
             break;
         }
@@ -9674,6 +10011,16 @@ static bool run_positive(const std::string& sudo_path,
                      "listener-guard-reservation",
                      error)) {
         error = "listener-guard-reservation: " + error;
+        return false;
+    }
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
+                     "listener-cleanup-observation-failure",
+                     error)) {
+        error = "listener-cleanup-observation-failure: " + error;
         return false;
     }
     return true;
