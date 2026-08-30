@@ -20,6 +20,33 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Pure #377 paused direct-child lease. This owns only a forked readiness/release
+# barrier and pidfd authority; source, log, listener and runtime state remain
+# in separately reviewed fixtures.
+add_library(fixture_wildcard_paused_child_lease STATIC
+    fixture_wildcard_paused_child_lease.cc
+)
+target_link_libraries(fixture_wildcard_paused_child_lease PRIVATE fixture_worker_protocol)
+target_include_directories(fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_wildcard_paused_child_lease
+    test_fixture_wildcard_paused_child_lease.cc
+)
+target_link_libraries(test_fixture_wildcard_paused_child_lease PRIVATE
+    fixture_wildcard_paused_child_lease
+)
+target_include_directories(test_fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_wildcard_paused_child_lease PRIVATE -fexceptions)
+endif()
+add_test(NAME test_fixture_wildcard_paused_child_lease
+         COMMAND test_fixture_wildcard_paused_child_lease)
+set_tests_properties(test_fixture_wildcard_paused_child_lease PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
 # Tests-only fixed privileged identity bundle transport.  This is a pure
 # socketpair/SCM_RIGHTS self-check and is not connected to the broker runtime.
 add_library(fixture_identity_bundle STATIC fixture_identity_bundle.cc)
