@@ -129,6 +129,19 @@ target_link_libraries(test_fixture_anonymous_log_capture PRIVATE fixture_anonymo
 add_test(NAME test_fixture_anonymous_log_capture COMMAND test_fixture_anonymous_log_capture)
 set_tests_properties(test_fixture_anonymous_log_capture PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# Pure #377 caller-owned executable descriptor/name-binding custody. This
+# fixture does not fork, exec, launch a session, open a listener or run RUT.
+add_library(fixture_executable_lease STATIC fixture_executable_lease.cc)
+target_include_directories(fixture_executable_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_executable_lease test_fixture_executable_lease.cc)
+target_link_libraries(test_fixture_executable_lease PRIVATE fixture_executable_lease)
+add_test(NAME test_fixture_executable_lease COMMAND test_fixture_executable_lease)
+set_tests_properties(test_fixture_executable_lease PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # #377 declaration-only paused-child descriptor preparation. This composes the
 # independently owned source, capture and child leases only for child dup2/FD
 # closure; release remains inert and no runtime/session is launched.
