@@ -1476,6 +1476,14 @@ static void close_rights_in_message(msghdr& message) {
 }
 
 enum class ExactCustodyPeek { Record, Eof, Retry, Error };
+enum class ExactPostReapCustodyAction { Receive, ReturnExited, Retry, Hold };
+
+static ExactPostReapCustodyAction exact_post_reap_custody_action(ExactCustodyPeek peek) {
+    if (peek == ExactCustodyPeek::Record) return ExactPostReapCustodyAction::Receive;
+    if (peek == ExactCustodyPeek::Eof) return ExactPostReapCustodyAction::ReturnExited;
+    if (peek == ExactCustodyPeek::Retry) return ExactPostReapCustodyAction::Retry;
+    return ExactPostReapCustodyAction::Hold;
+}
 
 static ExactCustodyPeek peek_exact_custody(int fd, bool peer_hup) {
     unsigned char byte = 0u;
@@ -2822,6 +2830,17 @@ static bool exact_transaction_self_check(std::string& error) {
 enum class ExactCustodyMutation { Canonical, MissingRights, ExtraRights, Truncated, WrongCreds };
 
 static bool exact_custody_peek_self_check(std::string& error) {
+    if (exact_post_reap_custody_action(ExactCustodyPeek::Record) !=
+            ExactPostReapCustodyAction::Receive ||
+        exact_post_reap_custody_action(ExactCustodyPeek::Eof) !=
+            ExactPostReapCustodyAction::ReturnExited ||
+        exact_post_reap_custody_action(ExactCustodyPeek::Retry) !=
+            ExactPostReapCustodyAction::Retry ||
+        exact_post_reap_custody_action(ExactCustodyPeek::Error) !=
+            ExactPostReapCustodyAction::Hold) {
+        error = "exact post-reap custody record/EOF decision failed";
+        return false;
+    }
     for (bool queued_record : {true, false}) {
         u64 baseline = 0u;
         int sockets[2] = {-1, -1};
@@ -4242,16 +4261,30 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             if (custody_received)
                 return finish_post_ack_escrow(
                     target, control, token, custody, rights, true, true, target_status);
-            pollfd pending{custody_fd, POLLIN, 0};
-            int pending_result;
-            do {
-                pending_result = poll(&pending, 1, 0);
-            } while (pending_result < 0 && errno == EINTR);
-            if (pending_result > 0 && (pending.revents & POLLIN) != 0) {
-                if (const auto result = accept_custody(true)) return *result;
-            } else {
-                return OwnedWaitResult::Exited;
+            bool first_pending_check = true;
+            while (first_pending_check || std::chrono::steady_clock::now() < deadline) {
+                pollfd pending{custody_fd, POLLIN | POLLHUP, 0};
+                int pending_result;
+                const int timeout = first_pending_check ? 0 : 10;
+                first_pending_check = false;
+                do {
+                    pending_result = poll(&pending, 1, timeout);
+                } while (pending_result < 0 && errno == EINTR);
+                if (pending_result < 0 || (pending.revents & POLLNVAL) != 0 ||
+                    ((pending.revents & POLLERR) != 0 && (pending.revents & POLLHUP) == 0))
+                    hold_listener_failure(root_lease, custody_fd);
+                if (pending_result == 0) continue;
+                const ExactPostReapCustodyAction action = exact_post_reap_custody_action(
+                    peek_exact_custody(custody_fd, (pending.revents & POLLHUP) != 0));
+                if (action == ExactPostReapCustodyAction::Receive) {
+                    if (const auto result = accept_custody(true)) return *result;
+                } else if (action == ExactPostReapCustodyAction::ReturnExited) {
+                    return OwnedWaitResult::Exited;
+                } else if (action == ExactPostReapCustodyAction::Hold) {
+                    hold_listener_failure(root_lease, custody_fd);
+                }
             }
+            hold_listener_failure(root_lease, custody_fd);
         }
         if (waited < 0 && errno != EINTR) {
             if (custody_received)
