@@ -44,8 +44,11 @@ struct HooksForTesting {
     int (*close_fd)(int, void*) = nullptr;
     void* close_context = nullptr;
     unsigned int child_delay_ms = 0;
+    unsigned int child_post_ready_delay_ms = 0;
     unsigned int post_release_delay_ms = 0;
     int child_close_failure_fd = -1;
+    int child_retain_fd_for_testing = -1;
+    volatile int* child_close_attempt_evidence = nullptr;
     int (*kcmp_file)(pid_t, pid_t, int, int, void*) = nullptr;
     bool (*prepared_procfs_allowed)(void*) = nullptr;
     void* prepared_validation_context = nullptr;

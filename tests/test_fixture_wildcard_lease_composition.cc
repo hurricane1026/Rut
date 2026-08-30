@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <linux/kcmp.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -37,6 +39,12 @@ Clock::time_point deadline(int milliseconds = 2000) {
 bool check(bool condition, const char* message) {
     if (!condition) std::fprintf(stderr, "FAIL: %s (errno=%d)\n", message, errno);
     return condition;
+}
+
+bool same_live_fd_object(int fd, const struct stat& expected) {
+    struct stat current{};
+    return fstat(fd, &current) == 0 && current.st_dev == expected.st_dev &&
+           current.st_ino == expected.st_ino && current.st_mode == expected.st_mode;
 }
 
 bool fd_snapshot(std::vector<int>& descriptors) {
@@ -144,6 +152,23 @@ bool settle_capture(capture::AnonymousLogCapture& output) {
     return settled && snapshotted && empty && closed;
 }
 
+struct ParentCloseHookState {
+    int calls = 0;
+    bool fired = false;
+};
+
+int fail_second_parent_close_after_real_close(int fd, void* opaque) {
+    auto& state = *static_cast<ParentCloseHookState*>(opaque);
+    const int result = close(fd);
+    if (result == 0) ++state.calls;
+    if (result == 0 && state.calls == 2 && !state.fired) {
+        state.fired = true;
+        errno = EINTR;
+        return -1;
+    }
+    return result;
+}
+
 bool canonical_composition() {
     std::vector<int> baseline_fds;
     std::vector<pid_t> baseline_children;
@@ -212,7 +237,117 @@ bool plain_rejects_prepared_validation() {
            check(lease.release(deadline(), diagnostic), "plain release");
 }
 
-bool output_slot_mutation(bool clear_cloexec) {
+bool prepared_argument_diagnostics() {
+    std::vector<int> baseline_fds;
+    std::vector<pid_t> baseline_children;
+    if (!check(fd_snapshot(baseline_fds), "argument baseline fd snapshot") ||
+        !check(child_snapshot(baseline_children), "argument baseline child snapshot"))
+        return false;
+    capture::AnonymousLogCapture output;
+    capture::Diagnostic capture_diagnostic;
+    child::PausedChildLease lease;
+    child::Diagnostic diagnostic;
+    const bool capture_created =
+        capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
+    bool ok = check(capture_created, "argument capture");
+    errno = E2BIG;
+    ok = check(!child::PausedChildLease::create_prepared(
+                   deadline(), {STDOUT_FILENO}, lease, diagnostic) &&
+                   diagnostic.phase == child::FailurePhase::Argument &&
+                   diagnostic.error_number == EINVAL,
+               "argument output slot diagnostic") &&
+         ok;
+    if (capture_created) {
+        const int flags = fcntl(output.descriptor(), F_GETFD);
+        ok = check(flags >= 0 && fcntl(output.descriptor(), F_SETFD, flags & ~FD_CLOEXEC) == 0,
+                   "argument clear cloexec") &&
+             ok;
+        errno = E2BIG;
+        ok = check(!child::PausedChildLease::create_prepared(
+                       deadline(), {output.descriptor()}, lease, diagnostic) &&
+                       diagnostic.phase == child::FailurePhase::Argument &&
+                       diagnostic.error_number == EINVAL,
+                   "argument cloexec diagnostic") &&
+             ok;
+        ok = check(fcntl(output.descriptor(), F_SETFD, FD_CLOEXEC) == 0,
+                   "argument restore cloexec") &&
+             ok;
+    }
+    const int readonly = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    errno = E2BIG;
+    ok = check(readonly >= 0 &&
+                   !child::PausedChildLease::create_prepared(
+                       deadline(), {readonly}, lease, diagnostic) &&
+                   diagnostic.phase == child::FailurePhase::Argument &&
+                   diagnostic.error_number == EINVAL,
+               "argument readonly diagnostic") &&
+         ok;
+    if (readonly >= 0) close(readonly);
+    const int closed_slot = fcntl(output.descriptor(), F_DUPFD_CLOEXEC, 0);
+    if (closed_slot >= 0) close(closed_slot);
+    errno = E2BIG;
+    ok = check(closed_slot >= 0 &&
+                   !child::PausedChildLease::create_prepared(
+                       deadline(), {closed_slot}, lease, diagnostic) &&
+                   diagnostic.phase == child::FailurePhase::Argument &&
+                   diagnostic.error_number == EBADF,
+               "argument syscall errno diagnostic") &&
+         ok;
+    if (capture_created) ok = check(settle_capture(output), "argument capture settlement") && ok;
+    std::vector<int> final_fds;
+    std::vector<pid_t> final_children;
+    const bool fd_read = fd_snapshot(final_fds);
+    const bool child_read = child_snapshot(final_children);
+    ok = check(fd_read && final_fds == baseline_fds, "argument fd residue") && ok;
+    ok = check(child_read && final_children == baseline_children, "argument child residue") && ok;
+    return ok;
+}
+
+bool readiness_eof_timeout_diagnostic() {
+    std::vector<int> baseline_fds;
+    std::vector<pid_t> baseline_children;
+    if (!check(fd_snapshot(baseline_fds), "readiness baseline fd snapshot") ||
+        !check(child_snapshot(baseline_children), "readiness baseline child snapshot"))
+        return false;
+    capture::AnonymousLogCapture output;
+    capture::Diagnostic capture_diagnostic;
+    child::PausedChildLease lease;
+    child::Diagnostic diagnostic;
+    child::HooksForTesting hooks;
+    hooks.child_post_ready_delay_ms = 300;
+    const bool capture_created =
+        capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
+    bool rejected = false;
+    if (capture_created)
+        rejected = !child::PausedChildLease::create_prepared_with_hooks_for_testing(
+            deadline(100), {output.descriptor()}, hooks, lease, diagnostic);
+    bool ok = check(capture_created, "readiness capture") &&
+              check(rejected, "readiness EOF timeout accepted") &&
+              check(diagnostic.phase == child::FailurePhase::Readiness &&
+                        diagnostic.error_number == ETIMEDOUT,
+                    "readiness EOF timeout diagnostic");
+    std::vector<pid_t> after_children;
+    const bool children_read = child_snapshot(after_children);
+    const bool child_inactive =
+        !lease.active() && children_read && after_children == baseline_children;
+    ok = check(child_inactive, "readiness child residue") && ok;
+    if (capture_created && child_inactive)
+        ok = check(settle_capture(output), "readiness capture settlement") && ok;
+    else if (capture_created)
+        ok = check(false, "readiness capture settlement withheld") && ok;
+    std::vector<int> final_fds;
+    std::vector<pid_t> final_children;
+    const bool fd_read = fd_snapshot(final_fds);
+    const bool child_read = child_snapshot(final_children);
+    ok = check(fd_read && final_fds == baseline_fds, "readiness fd residue") && ok;
+    ok =
+        check(child_read && final_children == baseline_children, "readiness process residue") && ok;
+    return ok;
+}
+
+enum class OutputMutation { WrongObject, SameFileNewOfd, ClearCloexec };
+
+bool output_slot_mutation(OutputMutation mutation) {
     std::vector<int> baseline_fds;
     std::vector<pid_t> baseline_children;
     if (!check(fd_snapshot(baseline_fds), "mutation baseline fd snapshot") ||
@@ -238,11 +373,27 @@ bool output_slot_mutation(bool clear_cloexec) {
     const int saved = fcntl(slot, F_DUPFD_CLOEXEC, 0);
     int replacement = -1;
     bool mutation_ok = saved >= 0;
-    if (clear_cloexec) {
+    if (mutation == OutputMutation::ClearCloexec) {
         const int flags = fcntl(slot, F_GETFD);
         mutation_ok = mutation_ok && flags >= 0 && fcntl(slot, F_SETFD, flags & ~FD_CLOEXEC) == 0;
     } else {
-        replacement = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (mutation == OutputMutation::SameFileNewOfd) {
+            const std::string reopen_path = "/proc/self/fd/" + std::to_string(saved);
+            replacement = open(reopen_path.c_str(), O_RDWR | O_CLOEXEC);
+            struct stat saved_status{};
+            struct stat replacement_status{};
+            errno = 0;
+            const long comparison =
+                replacement >= 0
+                    ? syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, saved, replacement)
+                    : 0;
+            mutation_ok = mutation_ok && replacement >= 0 && fstat(saved, &saved_status) == 0 &&
+                          fstat(replacement, &replacement_status) == 0 &&
+                          saved_status.st_dev == replacement_status.st_dev &&
+                          saved_status.st_ino == replacement_status.st_ino && comparison > 0;
+        } else {
+            replacement = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        }
         mutation_ok = mutation_ok && replacement >= 0 && dup2(replacement, slot) == slot &&
                       fcntl(slot, F_SETFD, FD_CLOEXEC) == 0;
     }
@@ -293,6 +444,8 @@ bool sparse_high_descriptor_closure() {
         return false;
     const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
     const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 512) : -1;
+    struct stat high_identity{};
+    const bool high_identity_known = high >= 0 && fstat(high, &high_identity) == 0;
     if (low >= 0) close(low);
     capture::AnonymousLogCapture output;
     capture::Diagnostic capture_diagnostic;
@@ -312,7 +465,9 @@ bool sparse_high_descriptor_closure() {
               "sparse high fd inherited") &&
         check(lease.validate_prepared(deadline(), diagnostic), "sparse validation") &&
         check(lease.release(deadline(), diagnostic), "sparse release") &&
-        check(settle_capture(output), "sparse capture settlement");
+        check(settle_capture(output), "sparse capture settlement") &&
+        check(high_identity_known && same_live_fd_object(high, high_identity),
+              "sparse foreign parent fd changed");
     if (high >= 0) close(high);
     std::vector<int> final_fds;
     std::vector<pid_t> final_children;
@@ -320,6 +475,56 @@ bool sparse_high_descriptor_closure() {
     const bool child_read = child_snapshot(final_children);
     ok = check(fd_read && final_fds == baseline_fds, "sparse fd residue") && ok;
     ok = check(child_read && final_children == baseline_children, "sparse child residue") && ok;
+    return ok;
+}
+
+bool retained_high_descriptor_rejected() {
+    std::vector<int> baseline_fds;
+    std::vector<pid_t> baseline_children;
+    if (!check(fd_snapshot(baseline_fds), "retain baseline fd snapshot") ||
+        !check(child_snapshot(baseline_children), "retain baseline child snapshot"))
+        return false;
+    const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 640) : -1;
+    if (low >= 0) close(low);
+    struct stat high_identity{};
+    const bool high_identity_known = high >= 640 && fstat(high, &high_identity) == 0;
+    capture::AnonymousLogCapture output;
+    capture::Diagnostic capture_diagnostic;
+    child::PausedChildLease lease;
+    child::Diagnostic diagnostic;
+    child::HooksForTesting hooks;
+    hooks.child_retain_fd_for_testing = high;
+    const bool capture_created =
+        capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
+    bool ok = check(high_identity_known, "retain high fd creation") &&
+              check(capture_created, "retain capture");
+    bool rejected = false;
+    if (high_identity_known && capture_created)
+        rejected = !child::PausedChildLease::create_prepared_with_hooks_for_testing(
+            deadline(), {output.descriptor()}, hooks, lease, diagnostic);
+    ok = check(rejected, "retained child fd set accepted") && ok;
+    ok = check(diagnostic.phase == child::FailurePhase::Descriptors &&
+                   diagnostic.error_number == EPROTO,
+               "retained child fd diagnostic") &&
+         ok;
+    std::vector<pid_t> after_children;
+    const bool children_read = child_snapshot(after_children);
+    const bool child_inactive =
+        !lease.active() && children_read && after_children == baseline_children;
+    ok = check(child_inactive, "retained child residue") && ok;
+    ok = check(same_live_fd_object(high, high_identity), "retained parent fd changed") && ok;
+    if (capture_created && child_inactive)
+        ok = check(settle_capture(output), "retain capture settlement") && ok;
+    else if (capture_created)
+        ok = check(false, "retain capture settlement withheld") && ok;
+    if (high >= 0) close(high);
+    std::vector<int> final_fds;
+    std::vector<pid_t> final_children;
+    const bool fd_read = fd_snapshot(final_fds);
+    const bool child_read = child_snapshot(final_children);
+    ok = check(fd_read && final_fds == baseline_fds, "retain fd residue") && ok;
+    ok = check(child_read && final_children == baseline_children, "retain process residue") && ok;
     return ok;
 }
 
@@ -334,7 +539,7 @@ bool prepared_release_retry_latch() {
     child::PausedChildLease lease;
     child::Diagnostic diagnostic;
     child::HooksForTesting hooks;
-    hooks.post_release_delay_ms = 100;
+    hooks.post_release_delay_ms = 500;
     if (!check(capture::AnonymousLogCapture::create(4096, output, capture_diagnostic),
                "latch capture") ||
         !check(child::PausedChildLease::create_prepared_with_hooks_for_testing(
@@ -345,7 +550,7 @@ bool prepared_release_retry_latch() {
     const int saved = fcntl(slot, F_DUPFD_CLOEXEC, 0);
     const int replacement = open("/dev/null", O_WRONLY | O_CLOEXEC);
     bool ok = check(saved >= 0 && replacement >= 0, "latch mutation descriptors");
-    const bool first_release = lease.release(deadline(5), diagnostic);
+    const bool first_release = lease.release(deadline(150), diagnostic);
     ok = check(!first_release, "latch initial release did not time out") && ok;
     ok =
         check(diagnostic.phase == child::FailurePhase::Wait && diagnostic.error_number == ETIMEDOUT,
@@ -376,6 +581,129 @@ bool prepared_release_retry_latch() {
     const bool child_read = child_snapshot(final_children);
     ok = check(fd_read && final_fds == baseline_fds, "latch fd residue") && ok;
     ok = check(child_read && final_children == baseline_children, "latch child residue") && ok;
+    return ok;
+}
+
+bool post_reap_release_close_uncertainty() {
+    std::vector<int> baseline_fds;
+    std::vector<pid_t> baseline_children;
+    if (!check(fd_snapshot(baseline_fds), "post-reap baseline fd snapshot") ||
+        !check(child_snapshot(baseline_children), "post-reap baseline child snapshot"))
+        return false;
+    PrivateDirectory directory;
+    source::WildcardAttemptSourceLease source_lease;
+    source::Diagnostic source_diagnostic;
+    capture::AnonymousLogCapture output;
+    capture::Diagnostic capture_diagnostic;
+    child::PausedChildLease lease;
+    child::Diagnostic diagnostic;
+    ParentCloseHookState close_state;
+    child::HooksForTesting hooks;
+    hooks.close_fd = fail_second_parent_close_after_real_close;
+    hooks.close_context = &close_state;
+    const bool source_created = create_source(directory, source_lease, source_diagnostic);
+    const bool capture_created =
+        capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
+    bool child_created = false;
+    if (source_created && capture_created)
+        child_created = child::PausedChildLease::create_prepared_with_hooks_for_testing(
+            deadline(), {output.descriptor()}, hooks, lease, diagnostic);
+    bool ok = check(source_created, "post-reap source") &&
+              check(capture_created, "post-reap capture") &&
+              check(child_created, "post-reap child");
+    const auto cleanup_evidence = lease.cleanup_state();
+    bool release_result = true;
+    if (child_created) release_result = lease.release(deadline(), diagnostic);
+    ok = check(!release_result, "post-reap close uncertainty reported success") && ok;
+    ok = check(close_state.fired, "post-reap close hook did not fire") && ok;
+    const bool child_inactive = child_created && !lease.active() && lease.released();
+    ok = check(child_inactive, "post-reap child not inactive") && ok;
+    ok = check(cleanup_evidence != nullptr && cleanup_evidence->attempted &&
+                   !cleanup_evidence->succeeded &&
+                   cleanup_evidence->diagnostic.phase == child::FailurePhase::Close,
+               "post-reap failure evidence missing") &&
+         ok;
+    std::vector<pid_t> after_release_children;
+    const bool children_read = child_snapshot(after_release_children);
+    ok = check(children_read && after_release_children == baseline_children,
+               "post-reap child residue") &&
+         ok;
+
+    bool source_removed = false;
+    if (source_created) source_removed = source_lease.remove(source_diagnostic);
+    ok = check(source_removed, "post-reap source settlement") && ok;
+    bool capture_settled = false;
+    if (capture_created && child_inactive) capture_settled = settle_capture(output);
+    ok = check(capture_settled, "post-reap capture settlement") && ok;
+    if (source_removed) ok = check(directory.settle(), "post-reap directory settlement") && ok;
+    std::vector<int> final_fds;
+    std::vector<pid_t> final_children;
+    const bool fd_read = fd_snapshot(final_fds);
+    const bool child_read = child_snapshot(final_children);
+    ok = check(fd_read && final_fds == baseline_fds, "post-reap fd residue") && ok;
+    ok =
+        check(child_read && final_children == baseline_children, "post-reap process residue") && ok;
+    return ok;
+}
+
+bool prepared_child_early_death() {
+    std::vector<int> baseline_fds;
+    std::vector<pid_t> baseline_children;
+    if (!check(fd_snapshot(baseline_fds), "early-death baseline fd snapshot") ||
+        !check(child_snapshot(baseline_children), "early-death baseline child snapshot"))
+        return false;
+    PrivateDirectory directory;
+    source::WildcardAttemptSourceLease source_lease;
+    source::Diagnostic source_diagnostic;
+    capture::AnonymousLogCapture output;
+    capture::Diagnostic capture_diagnostic;
+    child::PausedChildLease lease;
+    child::Diagnostic diagnostic;
+    const bool source_created = create_source(directory, source_lease, source_diagnostic);
+    const bool capture_created =
+        capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
+    bool child_created = false;
+    if (source_created && capture_created)
+        child_created = child::PausedChildLease::create_prepared(
+            deadline(), {output.descriptor()}, lease, diagnostic);
+    bool ok = check(source_created, "early-death source") &&
+              check(capture_created, "early-death capture") &&
+              check(child_created, "early-death child");
+    bool signaled = false;
+    if (child_created) {
+#ifdef SYS_pidfd_send_signal
+        signaled =
+            syscall(SYS_pidfd_send_signal, lease.observation_pidfd(), SIGKILL, nullptr, 0u) == 0;
+#endif
+    }
+    ok = check(signaled, "early-death pidfd signal") && ok;
+    if (signaled) {
+        pollfd exited{lease.observation_pidfd(), POLLIN | POLLERR | POLLHUP, 0};
+        ok = check(poll(&exited, 1, 2000) == 1, "early-death pidfd exit") && ok;
+    }
+    const bool release_rejected = child_created && !lease.release(deadline(), diagnostic);
+    ok = check(release_rejected, "early-death release succeeded") && ok;
+
+    bool source_removed = false;
+    if (source_created) source_removed = source_lease.remove(source_diagnostic);
+    ok = check(source_removed, "early-death source settlement") && ok;
+    const bool child_cleaned = child_created && lease.cleanup(deadline(), diagnostic);
+    ok = check(child_cleaned && !lease.active(), "early-death cleanup/reap") && ok;
+    std::vector<pid_t> after_cleanup_children;
+    const bool children_read = child_snapshot(after_cleanup_children);
+    const bool child_absent = children_read && after_cleanup_children == baseline_children;
+    ok = check(child_absent, "early-death child residue") && ok;
+    bool capture_settled = false;
+    if (capture_created && child_absent) capture_settled = settle_capture(output);
+    ok = check(capture_settled, "early-death capture settlement") && ok;
+    if (source_removed) ok = check(directory.settle(), "early-death directory settlement") && ok;
+    std::vector<int> final_fds;
+    std::vector<pid_t> final_children;
+    const bool fd_read = fd_snapshot(final_fds);
+    const bool child_read = child_snapshot(final_children);
+    ok = check(fd_read && final_fds == baseline_fds, "early-death fd residue") && ok;
+    ok = check(child_read && final_children == baseline_children, "early-death process residue") &&
+         ok;
     return ok;
 }
 
@@ -472,21 +800,34 @@ bool child_close_failure_and_independent_settlement() {
     const int low = open("/dev/null", O_RDONLY | O_CLOEXEC);
     const int high = low >= 0 ? fcntl(low, F_DUPFD_CLOEXEC, 700) : -1;
     if (low >= 0) close(low);
+    struct stat high_identity{};
+    const bool high_identity_known = high >= 700 && fstat(high, &high_identity) == 0;
+    void* const evidence_mapping =
+        mmap(nullptr, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    volatile int* const close_attempt_evidence =
+        evidence_mapping == MAP_FAILED ? nullptr : static_cast<volatile int*>(evidence_mapping);
+    if (close_attempt_evidence != nullptr) *close_attempt_evidence = 0;
     child::HooksForTesting hooks;
     hooks.child_close_failure_fd = high;
+    hooks.child_close_attempt_evidence = close_attempt_evidence;
     child::PausedChildLease lease;
     child::Diagnostic diagnostic;
-    bool ok = check(high >= 700, "close failure high fd");
+    bool ok = check(high_identity_known, "close failure high fd") &&
+              check(close_attempt_evidence != nullptr, "close failure evidence mapping");
     const bool source_created = create_source(directory, source_lease, source_diagnostic);
     ok = check(source_created, "close failure source") && ok;
     const bool capture_created =
         capture::AnonymousLogCapture::create(4096, output, capture_diagnostic);
     ok = check(capture_created, "close failure capture") && ok;
     bool child_rejected = false;
-    if (source_created && capture_created && high >= 700)
+    if (source_created && capture_created && high_identity_known &&
+        close_attempt_evidence != nullptr)
         child_rejected = !child::PausedChildLease::create_prepared_with_hooks_for_testing(
             deadline(), {output.descriptor()}, hooks, lease, diagnostic);
     ok = check(child_rejected, "child close EINTR accepted") && ok;
+    ok = check(close_attempt_evidence != nullptr && *close_attempt_evidence == 1,
+               "child close was not attempted exactly once") &&
+         ok;
     ok = check(!lease.active(), "failed child lease became active") && ok;
     std::vector<pid_t> after_failure_children;
     const bool failure_children_read = child_snapshot(after_failure_children);
@@ -503,7 +844,12 @@ bool child_close_failure_and_independent_settlement() {
     else if (capture_created)
         ok = check(false, "failed child capture settlement withheld") && ok;
     if (source_removed) ok = check(directory.settle(), "failed child directory settlement") && ok;
+    ok = check(high_identity_known && same_live_fd_object(high, high_identity),
+               "close failure changed foreign parent fd") &&
+         ok;
     if (high >= 0) close(high);
+    if (evidence_mapping != MAP_FAILED)
+        ok = check(munmap(evidence_mapping, sizeof(int)) == 0, "close evidence unmap") && ok;
     std::vector<int> final_fds;
     std::vector<pid_t> final_children;
     const bool fd_read = fd_snapshot(final_fds);
@@ -520,10 +866,16 @@ int main() {
     bool ok = true;
     ok = canonical_composition() && ok;
     ok = plain_rejects_prepared_validation() && ok;
-    ok = output_slot_mutation(false) && ok;
-    ok = output_slot_mutation(true) && ok;
+    ok = prepared_argument_diagnostics() && ok;
+    ok = readiness_eof_timeout_diagnostic() && ok;
+    ok = output_slot_mutation(OutputMutation::WrongObject) && ok;
+    ok = output_slot_mutation(OutputMutation::SameFileNewOfd) && ok;
+    ok = output_slot_mutation(OutputMutation::ClearCloexec) && ok;
     ok = sparse_high_descriptor_closure() && ok;
+    ok = retained_high_descriptor_rejected() && ok;
     ok = prepared_release_retry_latch() && ok;
+    ok = post_reap_release_close_uncertainty() && ok;
+    ok = prepared_child_early_death() && ok;
     ok = fail_closed_validation_hooks() && ok;
     ok = child_close_failure_and_independent_settlement() && ok;
     if (!ok) return 1;

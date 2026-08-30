@@ -81,13 +81,29 @@ bool read_byte_until(int fd, unsigned char& byte, std::chrono::steady_clock::tim
     }
 }
 
-bool read_eof_until(int fd, std::chrono::steady_clock::time_point deadline) {
+bool read_eof_until(int fd, std::chrono::steady_clock::time_point deadline, int& error_number) {
     unsigned char byte = 0;
     for (;;) {
-        if (!wait_fd_until(fd, POLLIN, deadline)) return false;
+        const int timeout = remaining_ms(deadline);
+        if (timeout <= 0) {
+            error_number = ETIMEDOUT;
+            return false;
+        }
+        pollfd descriptor{fd, POLLIN, 0};
+        const int poll_result = poll(&descriptor, 1, timeout);
+        if (poll_result < 0 && errno == EINTR) continue;
+        if (poll_result == 0) {
+            error_number = ETIMEDOUT;
+            return false;
+        }
+        if (poll_result < 0 || (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
+            error_number = poll_result < 0 && errno != 0 ? errno : EIO;
+            return false;
+        }
         const ssize_t result = read(fd, &byte, 1);
         if (result == 0) return true;
         if (result < 0 && errno == EINTR) continue;
+        error_number = result > 0 ? EPROTO : (errno == 0 ? EIO : errno);
         return false;
     }
 }
@@ -338,12 +354,15 @@ void child_main(int ready_fd,
                 int release_fd,
                 pid_t expected_parent,
                 unsigned int delay_ms,
+                unsigned int post_ready_delay_ms,
                 unsigned int post_release_delay_ms,
                 bool prepared,
                 int output_fd,
                 const int* inherited_fds,
                 std::size_t inherited_fd_count,
-                int injected_close_failure_fd) {
+                int injected_close_failure_fd,
+                int retained_fd_for_testing,
+                volatile int* close_attempt_evidence) {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != expected_parent) _exit(120);
     if (prepared) {
         if (dup2(output_fd, STDOUT_FILENO) != STDOUT_FILENO ||
@@ -351,8 +370,13 @@ void child_main(int ready_fd,
             _exit(125);
         for (std::size_t index = 0; index < inherited_fd_count; ++index) {
             const int fd = inherited_fds[index];
-            if (fd < 3 || fd == ready_fd || fd == release_fd) continue;
+            if (fd < 3 || fd == ready_fd || fd == release_fd || fd == retained_fd_for_testing)
+                continue;
             if (fd == injected_close_failure_fd) {
+                const int close_result = close(fd);  // Exactly one real attempt.
+                if (close_attempt_evidence != nullptr)
+                    *close_attempt_evidence =
+                        close_result == 0 ? static_cast<int>(*close_attempt_evidence + 1) : -1;
                 errno = EINTR;
                 _exit(126);
             }
@@ -374,11 +398,18 @@ void child_main(int ready_fd,
         }
     }
     unsigned char ready = kReady;
+    if (close_attempt_evidence != nullptr) *close_attempt_evidence = 100;
     for (;;) {
         const ssize_t result = write(ready_fd, &ready, 1);
         if (result == 1) break;
         if (result < 0 && errno == EINTR) continue;
         _exit(121);
+    }
+    if (post_ready_delay_ms != 0) {
+        timespec delay{static_cast<time_t>(post_ready_delay_ms / 1000u),
+                       static_cast<long>((post_ready_delay_ms % 1000u) * 1000000u)};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+        }
     }
     if (close(ready_fd) != 0 && prepared) _exit(128);
     unsigned char release = 0;
@@ -516,14 +547,34 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     const bool prepared = plan != nullptr;
     if (prepared) {
         const int output_fd = plan->combined_output_fd;
-        const int output_flags = output_fd > 2 ? fcntl(output_fd, F_GETFD) : -1;
-        const int status_flags = output_fd > 2 ? fcntl(output_fd, F_GETFL) : -1;
-        if (output_fd <= 2 || output_flags < 0 || status_flags < 0 ||
-            (output_flags & FD_CLOEXEC) == 0 || (status_flags & O_ACCMODE) == O_RDONLY ||
-            fcntl(STDIN_FILENO, F_GETFD) < 0 || fcntl(STDOUT_FILENO, F_GETFD) < 0 ||
-            fcntl(STDERR_FILENO, F_GETFD) < 0) {
-            fail(diagnostic, FailurePhase::Argument, errno == 0 ? EINVAL : errno);
+        if (output_fd <= 2 ||
+            (hooks != nullptr && hooks->child_close_failure_fd >= 0 &&
+             hooks->child_close_failure_fd == hooks->child_retain_fd_for_testing)) {
+            fail(diagnostic, FailurePhase::Argument, EINVAL);
             return false;
+        }
+        errno = 0;
+        const int output_flags = fcntl(output_fd, F_GETFD);
+        if (output_flags < 0) {
+            fail(diagnostic, FailurePhase::Argument, errno == 0 ? EBADF : errno);
+            return false;
+        }
+        errno = 0;
+        const int status_flags = fcntl(output_fd, F_GETFL);
+        if (status_flags < 0) {
+            fail(diagnostic, FailurePhase::Argument, errno == 0 ? EBADF : errno);
+            return false;
+        }
+        if ((output_flags & FD_CLOEXEC) == 0 || (status_flags & O_ACCMODE) == O_RDONLY) {
+            fail(diagnostic, FailurePhase::Argument, EINVAL);
+            return false;
+        }
+        for (const int standard_fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+            errno = 0;
+            if (fcntl(standard_fd, F_GETFD) < 0) {
+                fail(diagnostic, FailurePhase::Argument, errno == 0 ? EBADF : errno);
+                return false;
+            }
         }
     }
     std::vector<pid_t> children;
@@ -548,12 +599,49 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
             plan->combined_output_fd == release[0] || plan->combined_output_fd == release[1] ||
             ready[0] <= 2 || ready[1] <= 2 || release[0] <= 2 || release[1] <= 2 ||
             ready[0] == ready[1] || ready[0] == release[0] || ready[0] == release[1] ||
-            ready[1] == release[0] || ready[1] == release[1] || release[0] == release[1] ||
-            fcntl(plan->combined_output_fd, F_GETFD) < 0 ||
-            (fcntl(plan->combined_output_fd, F_GETFD) & FD_CLOEXEC) == 0 ||
-            !open_fd_snapshot(inherited_fds, diagnostic)) {
-            if (diagnostic.phase == FailurePhase::None)
-                fail(diagnostic, FailurePhase::Descriptors, EINVAL);
+            ready[1] == release[0] || ready[1] == release[1] || release[0] == release[1]) {
+            fail(diagnostic, FailurePhase::Descriptors, EINVAL);
+            close_ignoring(ready[0]);
+            close_ignoring(ready[1]);
+            close_ignoring(release[0]);
+            close_ignoring(release[1]);
+            return false;
+        }
+        errno = 0;
+        const int current_output_flags = fcntl(plan->combined_output_fd, F_GETFD);
+        if (current_output_flags < 0) {
+            fail(diagnostic, FailurePhase::Descriptors, errno == 0 ? EBADF : errno);
+            close_ignoring(ready[0]);
+            close_ignoring(ready[1]);
+            close_ignoring(release[0]);
+            close_ignoring(release[1]);
+            return false;
+        }
+        if ((current_output_flags & FD_CLOEXEC) == 0) {
+            fail(diagnostic, FailurePhase::Descriptors, EINVAL);
+            close_ignoring(ready[0]);
+            close_ignoring(ready[1]);
+            close_ignoring(release[0]);
+            close_ignoring(release[1]);
+            return false;
+        }
+        if (!open_fd_snapshot(inherited_fds, diagnostic)) {
+            close_ignoring(ready[0]);
+            close_ignoring(ready[1]);
+            close_ignoring(release[0]);
+            close_ignoring(release[1]);
+            return false;
+        }
+        const auto valid_inherited_test_fd = [&](int fd) {
+            return fd < 0 || (fd > 2 && fd != ready[0] && fd != ready[1] && fd != release[0] &&
+                              fd != release[1] &&
+                              std::binary_search(inherited_fds.begin(), inherited_fds.end(), fd));
+        };
+        if (hooks != nullptr && (!valid_inherited_test_fd(hooks->child_close_failure_fd) ||
+                                 !valid_inherited_test_fd(hooks->child_retain_fd_for_testing) ||
+                                 (hooks->child_close_attempt_evidence != nullptr &&
+                                  hooks->child_close_failure_fd < 0))) {
+            fail(diagnostic, FailurePhase::Descriptors, EINVAL);
             close_ignoring(ready[0]);
             close_ignoring(ready[1]);
             close_ignoring(release[0]);
@@ -566,8 +654,12 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     const int* const inherited_fd_data = inherited_fds.data();
     const std::size_t inherited_fd_count = inherited_fds.size();
     const unsigned int child_delay = hooks == nullptr ? 0u : hooks->child_delay_ms;
+    const unsigned int post_ready_delay = hooks == nullptr ? 0u : hooks->child_post_ready_delay_ms;
     const unsigned int post_release_delay = hooks == nullptr ? 0u : hooks->post_release_delay_ms;
     const int child_close_failure_fd = hooks == nullptr ? -1 : hooks->child_close_failure_fd;
+    const int child_retain_fd = hooks == nullptr ? -1 : hooks->child_retain_fd_for_testing;
+    volatile int* const close_attempt_evidence =
+        hooks == nullptr ? nullptr : hooks->child_close_attempt_evidence;
     if (hooks != nullptr && hooks->fail_fork) {
         fail(diagnostic, FailurePhase::Fork, EAGAIN);
         close_ignoring(ready[0]);
@@ -594,12 +686,15 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
                    release[0],
                    parent,
                    child_delay,
+                   post_ready_delay,
                    post_release_delay,
                    prepared,
                    child_output_fd,
                    inherited_fd_data,
                    inherited_fd_count,
-                   child_close_failure_fd);
+                   child_close_failure_fd,
+                   child_retain_fd,
+                   close_attempt_evidence);
     }
     close(ready[1]);
     close(release[0]);
@@ -693,8 +788,11 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
         close_ignoring(candidate.authority_pidfd_);
         return false;
     }
-    if (prepared && !read_eof_until(candidate.ready_fd_, deadline)) {
-        fail(diagnostic, FailurePhase::Readiness, EPROTO);
+    int readiness_eof_error = 0;
+    if (prepared && !read_eof_until(candidate.ready_fd_, deadline, readiness_eof_error)) {
+        fail(diagnostic,
+             FailurePhase::Readiness,
+             readiness_eof_error == 0 ? EPROTO : readiness_eof_error);
         close_ignoring(candidate.release_fd_);
         reap_failed_child();
         close_ignoring(candidate.ready_fd_);
