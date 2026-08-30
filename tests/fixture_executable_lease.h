@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -45,15 +46,23 @@ struct CloseOutcome {
     int error_number = 0;
 };
 
+struct ValidationOutcome {
+    unsigned attempts = 0u;
+    bool succeeded = false;
+    Diagnostic diagnostic;
+};
+
 // Retaining this state makes explicit and destructor cleanup independently
 // auditable. Validation is separate from each descriptor's one-shot close
 // result. Destruction deliberately never sets reportable_success.
 struct CleanupState {
-    unsigned validation_attempts = 0u;
-    bool validation_succeeded = false;
-    Diagnostic validation_diagnostic;
+    ValidationOutcome semantic_validation;
+    ValidationOutcome custody_validation;
+    bool creation_cleanup = false;
+    Diagnostic creation_diagnostic;
     CloseOutcome observation;
-    CloseOutcome authority;
+    CloseOutcome authority_one;
+    CloseOutcome authority_two;
     bool destructor = false;
     bool reportable_success = false;
     Diagnostic diagnostic;
@@ -61,6 +70,7 @@ struct CleanupState {
 
 using KcmpForTesting = int (*)(int first, int second, void* context);
 using CloseForTesting = int (*)(int descriptor, void* context);
+using AccessForTesting = int (*)(int descriptor, void* context);
 
 enum class CreationFailurePoint : std::uint8_t {
     None,
@@ -72,6 +82,7 @@ enum class CreationFailurePoint : std::uint8_t {
 struct HooksForTesting {
     KcmpForTesting kcmp = nullptr;
     CloseForTesting close = nullptr;
+    AccessForTesting access = nullptr;
     void* context = nullptr;
     CreationFailurePoint creation_failure = CreationFailurePoint::None;
 };
@@ -85,9 +96,16 @@ struct HooksForTesting {
 //
 // Lifecycle is single-use Fresh -> Active -> Terminal. The object is
 // noncopyable, nonmovable and non-thread-safe. observation_fd() is borrowed;
-// the exact duplicate authority is private. If an excluded caller mutation
+// two exact duplicate authorities are private. If an excluded caller mutation
 // replaces the observation slot, revalidation and close fail closed without
 // closing the foreign descriptor; restoring an exact duplicate permits retry.
+// Destructor cleanup can settle an original two-member exact-OFD majority
+// after any one numeric-slot replacement; without a unique majority, or when
+// kcmp cannot provide exact evidence, every unproven slot is preserved.
+// Initial ctime is retained as diagnostic evidence. Because nlink is not an
+// invariant, revalidation checks only current ctime agreement among the path
+// and all pinned members; it cannot attest against excluded restored metadata,
+// ACL, or same-size/mtime-restored content mutations.
 class ExecutableLease {
 public:
     ExecutableLease();
@@ -120,28 +138,29 @@ private:
                             ExecutableLease& lease,
                             Diagnostic& diagnostic);
     bool validate_custody(Diagnostic& diagnostic) const;
+    bool authorize_cleanup(bool require_cloexec,
+                           std::array<bool, 3>& original_members,
+                           Diagnostic& diagnostic) const;
     bool validate_descriptor(int descriptor, bool require_metadata, Diagnostic& diagnostic) const;
     bool validate_policy(int descriptor, Diagnostic& diagnostic) const;
     bool same_open_file_description(int first, int second, Diagnostic& diagnostic) const;
     bool fail_after_acquire(const Diagnostic& original, Diagnostic& diagnostic);
     bool close_active(bool destructor, Diagnostic& diagnostic);
     bool close_one(int& descriptor, CloseOutcome& outcome, Diagnostic& diagnostic);
-    void record_validation(bool succeeded, const Diagnostic& diagnostic) const;
+    void record_semantic_validation(bool succeeded, const Diagnostic& diagnostic) const;
+    void record_custody_validation(bool succeeded, const Diagnostic& diagnostic) const;
 
     int observation_fd_ = -1;
-    int authority_fd_ = -1;
+    int authority_one_fd_ = -1;
+    int authority_two_fd_ = -1;
     bool active_ = false;
     bool terminal_ = false;
     std::string path_;
     ExecutableIdentity identity_;
-    // The initial full identity remains immutable evidence. Linux ctime can
-    // advance for accepted nlink/name-binding transitions, so the current
-    // common ctime baseline is tracked separately.
-    mutable std::int64_t accepted_ctime_seconds_ = 0;
-    mutable std::int64_t accepted_ctime_nanoseconds_ = 0;
     std::shared_ptr<CleanupState> cleanup_state_;
     KcmpForTesting kcmp_for_testing_ = nullptr;
     CloseForTesting close_for_testing_ = nullptr;
+    AccessForTesting access_for_testing_ = nullptr;
     void* hook_context_ = nullptr;
 };
 

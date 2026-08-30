@@ -3,7 +3,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
-#include <limits>
+#include <cstdlib>
 
 #include <fcntl.h>
 #include <linux/kcmp.h>
@@ -48,12 +48,12 @@ bool same_metadata_except_ctime(const struct stat& status, const ExecutableIdent
            static_cast<std::int64_t>(status.st_mtim.tv_nsec) == expected.mtime_nanoseconds;
 }
 
-bool same_ctime(const struct stat& status, std::int64_t seconds, std::int64_t nanoseconds) {
-    return static_cast<std::int64_t>(status.st_ctim.tv_sec) == seconds &&
-           static_cast<std::int64_t>(status.st_ctim.tv_nsec) == nanoseconds;
+bool same_current_ctime(const struct stat& first, const struct stat& second) {
+    return first.st_ctim.tv_sec == second.st_ctim.tv_sec &&
+           first.st_ctim.tv_nsec == second.st_ctim.tv_nsec;
 }
 
-bool descriptor_flags(int descriptor, int& error_number) {
+bool descriptor_flags(int descriptor, bool require_cloexec, int& error_number) {
     errno = 0;
     const int descriptor_flags = fcntl(descriptor, F_GETFD);
     if (descriptor_flags < 0) {
@@ -66,7 +66,8 @@ bool descriptor_flags(int descriptor, int& error_number) {
         error_number = errno == 0 ? EIO : errno;
         return false;
     }
-    if ((descriptor_flags & FD_CLOEXEC) == 0 || (status_flags & O_PATH) != O_PATH) {
+    if ((require_cloexec && (descriptor_flags & FD_CLOEXEC) == 0) ||
+        (status_flags & O_PATH) != O_PATH) {
         error_number = EINVAL;
         return false;
     }
@@ -89,26 +90,15 @@ int ordinary_close(int descriptor, void*) {
     return ::close(descriptor);
 }
 
-bool effective_execute_access(int descriptor, int& error_number) {
+int ordinary_access(int descriptor, void*) {
 #ifdef SYS_faccessat2
-    errno = 0;
-    const int result =
-        static_cast<int>(syscall(SYS_faccessat2, descriptor, "", X_OK, AT_EMPTY_PATH | AT_EACCESS));
-    if (result == 0) {
-        error_number = 0;
-        return true;
-    }
-    if (errno != ENOSYS) {
-        error_number = errno == 0 ? EACCES : errno;
-        return false;
-    }
+    return static_cast<int>(
+        syscall(SYS_faccessat2, descriptor, "", X_OK, AT_EMPTY_PATH | AT_EACCESS));
 #else
     (void)descriptor;
+    errno = ENOSYS;
+    return -1;
 #endif
-    // Older Linux kernels have no FD-relative effective-ID access primitive.
-    // The owner-execute/effective-owner policy remains enforced from fstat.
-    error_number = 0;
-    return true;
 }
 
 }  // namespace
@@ -126,7 +116,8 @@ ExecutableLease::~ExecutableLease() {
                                          ? Diagnostic{FailurePhase::Cleanup, ECANCELED}
                                          : diagnostic;
     }
-    if (diagnostic.phase != FailurePhase::None && diagnostic.error_number != ECANCELED) {
+    if (diagnostic.phase != FailurePhase::None && diagnostic.error_number != ECANCELED &&
+        cleanup_state_.use_count() == 1) {
         std::fprintf(stderr,
                      "FAIL [#377 executable lease destructor]: phase=%u errno=%d\n",
                      static_cast<unsigned>(diagnostic.phase),
@@ -153,8 +144,8 @@ bool ExecutableLease::create_impl(const std::string& canonical_absolute_path,
                                   Diagnostic& diagnostic) {
     diagnostic = {};
     if (lease.active_ || lease.terminal_ || lease.observation_fd_ >= 0 ||
-        lease.authority_fd_ >= 0 || canonical_absolute_path.empty() ||
-        canonical_absolute_path.front() != '/' ||
+        lease.authority_one_fd_ >= 0 || lease.authority_two_fd_ >= 0 ||
+        canonical_absolute_path.empty() || canonical_absolute_path.front() != '/' ||
         canonical_absolute_path.find('\0') != std::string::npos ||
         canonical_absolute_path.size() >= PATH_MAX) {
         fail(diagnostic, FailurePhase::Argument, EINVAL);
@@ -162,9 +153,13 @@ bool ExecutableLease::create_impl(const std::string& canonical_absolute_path,
     }
     std::array<char, PATH_MAX> resolved{};
     errno = 0;
-    if (realpath(canonical_absolute_path.c_str(), resolved.data()) == nullptr ||
-        canonical_absolute_path != resolved.data()) {
-        fail(diagnostic, FailurePhase::Canonical, errno == 0 ? EINVAL : errno);
+    char* const canonical = realpath(canonical_absolute_path.c_str(), resolved.data());
+    if (canonical == nullptr) {
+        fail(diagnostic, FailurePhase::Canonical, errno == 0 ? EIO : errno);
+        return false;
+    }
+    if (canonical_absolute_path != canonical) {
+        fail(diagnostic, FailurePhase::Canonical, EINVAL);
         return false;
     }
 
@@ -186,32 +181,34 @@ bool ExecutableLease::create_impl(const std::string& canonical_absolute_path,
     lease.cleanup_state_ = std::make_shared<CleanupState>();
     lease.kcmp_for_testing_ = hooks == nullptr ? nullptr : hooks->kcmp;
     lease.close_for_testing_ = hooks == nullptr ? nullptr : hooks->close;
+    lease.access_for_testing_ = hooks == nullptr ? nullptr : hooks->access;
     lease.hook_context_ = hooks == nullptr ? nullptr : hooks->context;
     const CreationFailurePoint failure_point =
         hooks == nullptr ? CreationFailurePoint::None : hooks->creation_failure;
     if (failure_point == CreationFailurePoint::AfterOpen)
         return lease.fail_after_acquire({FailurePhase::Open, EIO}, diagnostic);
 
-    lease.authority_fd_ = fcntl(lease.observation_fd_, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-    if (lease.authority_fd_ < 0)
+    lease.authority_one_fd_ = fcntl(lease.observation_fd_, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (lease.authority_one_fd_ < 0)
+        return lease.fail_after_acquire({FailurePhase::Duplicate, errno == 0 ? EIO : errno},
+                                        diagnostic);
+    lease.authority_two_fd_ = fcntl(lease.observation_fd_, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (lease.authority_two_fd_ < 0)
         return lease.fail_after_acquire({FailurePhase::Duplicate, errno == 0 ? EIO : errno},
                                         diagnostic);
     if (failure_point == CreationFailurePoint::AfterDuplicate)
         return lease.fail_after_acquire({FailurePhase::Duplicate, EIO}, diagnostic);
 
     struct stat status{};
-    if (failure_point == CreationFailurePoint::IdentityValidation ||
-        fstat(lease.observation_fd_, &status) != 0 || !S_ISREG(status.st_mode) ||
-        status.st_dev == 0 || status.st_ino == 0 || status.st_size < 0) {
-        return lease.fail_after_acquire({FailurePhase::Identity,
-                                         failure_point == CreationFailurePoint::IdentityValidation
-                                             ? EIO
-                                             : (errno == 0 ? EINVAL : errno)},
+    if (failure_point == CreationFailurePoint::IdentityValidation)
+        return lease.fail_after_acquire({FailurePhase::Identity, EIO}, diagnostic);
+    errno = 0;
+    if (fstat(lease.observation_fd_, &status) != 0)
+        return lease.fail_after_acquire({FailurePhase::Identity, errno == 0 ? EIO : errno},
                                         diagnostic);
-    }
+    if (!S_ISREG(status.st_mode) || status.st_dev == 0 || status.st_ino == 0 || status.st_size < 0)
+        return lease.fail_after_acquire({FailurePhase::Identity, EINVAL}, diagnostic);
     lease.identity_ = make_identity(status);
-    lease.accepted_ctime_seconds_ = lease.identity_.ctime_seconds;
-    lease.accepted_ctime_nanoseconds_ = lease.identity_.ctime_nanoseconds;
 
     if (!lease.revalidate(diagnostic)) {
         const Diagnostic original = diagnostic;
@@ -222,6 +219,7 @@ bool ExecutableLease::create_impl(const std::string& canonical_absolute_path,
 
 bool ExecutableLease::validate_policy(int descriptor, Diagnostic& diagnostic) const {
     struct stat status{};
+    errno = 0;
     if (fstat(descriptor, &status) != 0) {
         fail(diagnostic, FailurePhase::Policy, errno == 0 ? EIO : errno);
         return false;
@@ -231,9 +229,11 @@ bool ExecutableLease::validate_policy(int descriptor, Diagnostic& diagnostic) co
         fail(diagnostic, FailurePhase::Policy, EACCES);
         return false;
     }
-    int access_error = 0;
-    if (!effective_execute_access(descriptor, access_error)) {
-        fail(diagnostic, FailurePhase::Policy, access_error);
+    const AccessForTesting operation =
+        access_for_testing_ == nullptr ? ordinary_access : access_for_testing_;
+    errno = 0;
+    if (operation(descriptor, hook_context_) != 0) {
+        fail(diagnostic, FailurePhase::Policy, errno == 0 ? EIO : errno);
         return false;
     }
     return true;
@@ -243,15 +243,20 @@ bool ExecutableLease::validate_descriptor(int descriptor,
                                           bool require_metadata,
                                           Diagnostic& diagnostic) const {
     int flag_error = 0;
-    if (descriptor < 0 || !descriptor_flags(descriptor, flag_error)) {
+    if (descriptor < 0 || !descriptor_flags(descriptor, true, flag_error)) {
         fail(diagnostic,
              FailurePhase::Identity,
              descriptor < 0 ? EBADF : (flag_error == 0 ? EINVAL : flag_error));
         return false;
     }
     struct stat status{};
-    if (fstat(descriptor, &status) != 0 || !same_object(status, identity_)) {
-        fail(diagnostic, FailurePhase::Identity, errno == 0 ? EINVAL : errno);
+    errno = 0;
+    if (fstat(descriptor, &status) != 0) {
+        fail(diagnostic, FailurePhase::Identity, errno == 0 ? EIO : errno);
+        return false;
+    }
+    if (!same_object(status, identity_)) {
+        fail(diagnostic, FailurePhase::Identity, EINVAL);
         return false;
     }
     if (require_metadata && !same_metadata_except_ctime(status, identity_)) {
@@ -273,77 +278,161 @@ bool ExecutableLease::same_open_file_description(int first,
     return false;
 }
 
-void ExecutableLease::record_validation(bool succeeded, const Diagnostic& diagnostic) const {
+void ExecutableLease::record_semantic_validation(bool succeeded,
+                                                 const Diagnostic& diagnostic) const {
     if (!cleanup_state_) return;
-    ++cleanup_state_->validation_attempts;
-    cleanup_state_->validation_succeeded = succeeded;
-    cleanup_state_->validation_diagnostic = diagnostic;
+    ++cleanup_state_->semantic_validation.attempts;
+    cleanup_state_->semantic_validation.succeeded = succeeded;
+    cleanup_state_->semantic_validation.diagnostic = diagnostic;
+}
+
+void ExecutableLease::record_custody_validation(bool succeeded,
+                                                const Diagnostic& diagnostic) const {
+    if (!cleanup_state_) return;
+    ++cleanup_state_->custody_validation.attempts;
+    cleanup_state_->custody_validation.succeeded = succeeded;
+    cleanup_state_->custody_validation.diagnostic = diagnostic;
 }
 
 bool ExecutableLease::validate_custody(Diagnostic& diagnostic) const {
     diagnostic = {};
-    if (!active_ || terminal_ || observation_fd_ < 0 || authority_fd_ < 0) {
+    if (!active_ || terminal_ || observation_fd_ < 0 || authority_one_fd_ < 0 ||
+        authority_two_fd_ < 0) {
         fail(diagnostic, FailurePhase::Argument, active_ ? EBADF : EALREADY);
         return false;
     }
     if (!validate_descriptor(observation_fd_, false, diagnostic) ||
-        !validate_descriptor(authority_fd_, false, diagnostic) ||
-        !same_open_file_description(observation_fd_, authority_fd_, diagnostic))
+        !validate_descriptor(authority_one_fd_, false, diagnostic) ||
+        !validate_descriptor(authority_two_fd_, false, diagnostic) ||
+        !same_open_file_description(observation_fd_, authority_one_fd_, diagnostic) ||
+        !same_open_file_description(observation_fd_, authority_two_fd_, diagnostic) ||
+        !same_open_file_description(authority_one_fd_, authority_two_fd_, diagnostic))
         return false;
+    return true;
+}
+
+bool ExecutableLease::authorize_cleanup(bool require_cloexec,
+                                        std::array<bool, 3>& original_members,
+                                        Diagnostic& diagnostic) const {
+    original_members = {};
+    diagnostic = {};
+    const std::array<int, 3> descriptors = {observation_fd_, authority_one_fd_, authority_two_fd_};
+    std::array<bool, 3> candidates{};
+    for (std::size_t index = 0; index < descriptors.size(); ++index) {
+        int flag_error = 0;
+        if (descriptors[index] < 0 ||
+            !descriptor_flags(descriptors[index], require_cloexec, flag_error)) {
+            if (require_cloexec) {
+                fail(diagnostic,
+                     FailurePhase::Identity,
+                     descriptors[index] < 0 ? EBADF : flag_error);
+                return false;
+            }
+            continue;
+        }
+        struct stat status{};
+        errno = 0;
+        if (fstat(descriptors[index], &status) != 0) continue;
+        candidates[index] = same_object(status, identity_);
+    }
+
+    enum class Relation : std::uint8_t { Unknown, Different, Same };
+    std::array<std::array<Relation, 3>, 3> relations{};
+    unsigned same_edges = 0u;
+    int comparison_error = 0;
+    bool any_different = false;
+    for (std::size_t first = 0; first < descriptors.size(); ++first) {
+        for (std::size_t second = first + 1u; second < descriptors.size(); ++second) {
+            if (!candidates[first] || !candidates[second]) {
+                relations[first][second] = Relation::Different;
+                any_different = true;
+                continue;
+            }
+            errno = 0;
+            const KcmpForTesting compare =
+                kcmp_for_testing_ == nullptr ? ordinary_kcmp : kcmp_for_testing_;
+            const int result = compare(descriptors[first], descriptors[second], hook_context_);
+            if (result == 0) {
+                relations[first][second] = Relation::Same;
+                ++same_edges;
+            } else if (result > 0) {
+                relations[first][second] = Relation::Different;
+                any_different = true;
+            } else {
+                relations[first][second] = Relation::Unknown;
+                if (comparison_error == 0) comparison_error = errno == 0 ? EIO : errno;
+            }
+        }
+    }
+    if (same_edges == 0u) {
+        fail(diagnostic,
+             FailurePhase::Kcmp,
+             comparison_error != 0 ? comparison_error : (any_different ? EXDEV : EIO));
+        return false;
+    }
+    for (std::size_t first = 0; first < descriptors.size(); ++first)
+        for (std::size_t second = first + 1u; second < descriptors.size(); ++second)
+            if (relations[first][second] == Relation::Same) {
+                original_members[first] = true;
+                original_members[second] = true;
+            }
+    const unsigned member_count = static_cast<unsigned>(original_members[0]) +
+                                  static_cast<unsigned>(original_members[1]) +
+                                  static_cast<unsigned>(original_members[2]);
+    if (member_count < 2u) {
+        fail(diagnostic, FailurePhase::Kcmp, EINVAL);
+        original_members = {};
+        return false;
+    }
     return true;
 }
 
 bool ExecutableLease::revalidate(Diagnostic& diagnostic) const {
     diagnostic = {};
     if (!validate_custody(diagnostic)) {
-        record_validation(false, diagnostic);
+        record_semantic_validation(false, diagnostic);
         return false;
     }
     struct stat observation{};
-    struct stat authority{};
+    struct stat authority_one{};
+    struct stat authority_two{};
     struct stat path_status{};
-    if (fstat(observation_fd_, &observation) != 0 || fstat(authority_fd_, &authority) != 0) {
+    errno = 0;
+    if (fstat(observation_fd_, &observation) != 0 ||
+        fstat(authority_one_fd_, &authority_one) != 0 ||
+        fstat(authority_two_fd_, &authority_two) != 0) {
         fail(diagnostic, FailurePhase::Identity, errno == 0 ? EIO : errno);
-        record_validation(false, diagnostic);
+        record_semantic_validation(false, diagnostic);
         return false;
     }
     if (!same_metadata_except_ctime(observation, identity_) ||
-        !same_metadata_except_ctime(authority, identity_) ||
-        observation.st_mode != authority.st_mode || observation.st_uid != authority.st_uid ||
-        observation.st_gid != authority.st_gid || observation.st_size != authority.st_size ||
-        observation.st_mtim.tv_sec != authority.st_mtim.tv_sec ||
-        observation.st_mtim.tv_nsec != authority.st_mtim.tv_nsec ||
-        observation.st_ctim.tv_sec != authority.st_ctim.tv_sec ||
-        observation.st_ctim.tv_nsec != authority.st_ctim.tv_nsec) {
+        !same_metadata_except_ctime(authority_one, identity_) ||
+        !same_metadata_except_ctime(authority_two, identity_) ||
+        !same_current_ctime(observation, authority_one) ||
+        !same_current_ctime(observation, authority_two)) {
         fail(diagnostic, FailurePhase::Identity, EINVAL);
-        record_validation(false, diagnostic);
+        record_semantic_validation(false, diagnostic);
         return false;
     }
     errno = 0;
     if (lstat(path_.c_str(), &path_status) != 0 || !same_object(path_status, identity_) ||
         !same_metadata_except_ctime(path_status, identity_) ||
-        path_status.st_ctim.tv_sec != observation.st_ctim.tv_sec ||
-        path_status.st_ctim.tv_nsec != observation.st_ctim.tv_nsec) {
+        !same_current_ctime(path_status, observation)) {
         fail(diagnostic, FailurePhase::Path, errno == 0 ? EINVAL : errno);
-        record_validation(false, diagnostic);
+        record_semantic_validation(false, diagnostic);
         return false;
     }
-    // Linux changes ctime for link-count and some pathname transitions. nlink
-    // is intentionally not an invariant, and a temporary different-inode
-    // pathname replacement must remain restore/retry capable. Once the exact
-    // path binding is back and all mode/owner/size/mtime fields are unchanged,
-    // advance the common ctime baseline shared by path and both pinned FDs.
-    // Content or other metadata drift remains independently fail-closed.
-    if (!same_ctime(observation, accepted_ctime_seconds_, accepted_ctime_nanoseconds_)) {
-        accepted_ctime_seconds_ = static_cast<std::int64_t>(observation.st_ctim.tv_sec);
-        accepted_ctime_nanoseconds_ = static_cast<std::int64_t>(observation.st_ctim.tv_nsec);
-    }
+    // Initial ctime remains diagnostic evidence only. nlink is deliberately
+    // not invariant, so revalidation requires merely that the current path and
+    // all three exact-OFD members agree on current ctime. This does not detect
+    // an excluded same-size/mtime-restored content or ACL mutation.
     if (!validate_policy(observation_fd_, diagnostic) ||
-        !validate_policy(authority_fd_, diagnostic)) {
-        record_validation(false, diagnostic);
+        !validate_policy(authority_one_fd_, diagnostic) ||
+        !validate_policy(authority_two_fd_, diagnostic)) {
+        record_semantic_validation(false, diagnostic);
         return false;
     }
-    record_validation(true, diagnostic);
+    record_semantic_validation(true, diagnostic);
     return true;
 }
 
@@ -375,42 +464,54 @@ bool ExecutableLease::close_active(bool destructor, Diagnostic& diagnostic) {
         return false;
     }
     Diagnostic custody;
-    const bool exact_pair = validate_custody(custody);
-    record_validation(exact_pair, custody);
-    if (!exact_pair && !destructor) {
+    std::array<bool, 3> original_members{};
+    bool authorized = authorize_cleanup(!destructor, original_members, custody);
+    const bool every_member = original_members[0] && original_members[1] && original_members[2];
+    if (authorized && !destructor && !every_member) {
+        authorized = false;
+        custody = {FailurePhase::Kcmp, EXDEV};
+    }
+    record_custody_validation(authorized, custody);
+    if (!authorized && !destructor) {
         diagnostic = custody;
         if (cleanup_state_) cleanup_state_->diagnostic = diagnostic;
         return false;
     }
 
     bool success = true;
-    if (exact_pair) {
-        // Detach both fields before the first close, then attempt independently.
-        int observation = observation_fd_;
-        int authority = authority_fd_;
+    if (authorized) {
+        // Detach every field before the first close. A destructor with a
+        // single-slot replacement closes only the exact-OFD majority and
+        // preserves the foreign numeric slot.
+        std::array<int, 3> descriptors = {observation_fd_, authority_one_fd_, authority_two_fd_};
         observation_fd_ = -1;
-        authority_fd_ = -1;
+        authority_one_fd_ = -1;
+        authority_two_fd_ = -1;
         active_ = false;
         terminal_ = true;
-        success = close_one(observation, cleanup_state_->observation, diagnostic);
-        if (!close_one(authority, cleanup_state_->authority, diagnostic)) success = false;
-    } else {
-        // Destruction cannot offer restore/retry. Never touch an unproven
-        // observation slot. The never-exposed private authority is settled only
-        // when its O_PATH/CLOEXEC/object custody remains independently valid.
-        cleanup_state_->observation.error_number = custody.error_number;
-        Diagnostic authority_diagnostic;
-        if (validate_descriptor(authority_fd_, false, authority_diagnostic)) {
-            if (!close_one(authority_fd_, cleanup_state_->authority, diagnostic)) success = false;
-        } else {
-            cleanup_state_->authority.error_number = authority_diagnostic.error_number;
-            success = false;
-            if (diagnostic.phase == FailurePhase::None) diagnostic = authority_diagnostic;
+        std::array<CloseOutcome*, 3> outcomes = {&cleanup_state_->observation,
+                                                 &cleanup_state_->authority_one,
+                                                 &cleanup_state_->authority_two};
+        for (std::size_t index = 0; index < descriptors.size(); ++index) {
+            if (original_members[index]) {
+                if (!close_one(descriptors[index], *outcomes[index], diagnostic)) success = false;
+            } else {
+                outcomes[index]->error_number = EXDEV;
+                success = false;
+            }
         }
-        observation_fd_ = -1;  // Foreign/unproven numeric slot is not owned.
+    } else {
+        // No exact majority: preserve every unproven numeric slot. Destruction
+        // cannot retry, but it must not guess based on flags or inode identity.
+        cleanup_state_->observation.error_number = custody.error_number;
+        cleanup_state_->authority_one.error_number = custody.error_number;
+        cleanup_state_->authority_two.error_number = custody.error_number;
+        observation_fd_ = -1;
+        authority_one_fd_ = -1;
+        authority_two_fd_ = -1;
         active_ = false;
         terminal_ = true;
-        if (diagnostic.phase == FailurePhase::None) diagnostic = custody;
+        diagnostic = custody;
         success = false;
     }
     cleanup_state_->destructor = destructor;
@@ -430,16 +531,21 @@ bool ExecutableLease::fail_after_acquire(const Diagnostic& original, Diagnostic&
     // every acquired field unconditionally and settles each one exactly once.
     Diagnostic close_diagnostic;
     int observation = observation_fd_;
-    int authority = authority_fd_;
+    int authority_one = authority_one_fd_;
+    int authority_two = authority_two_fd_;
     observation_fd_ = -1;
-    authority_fd_ = -1;
+    authority_one_fd_ = -1;
+    authority_two_fd_ = -1;
     active_ = false;
     terminal_ = true;
     if (observation >= 0)
         (void)close_one(observation, cleanup_state_->observation, close_diagnostic);
-    if (authority >= 0) (void)close_one(authority, cleanup_state_->authority, close_diagnostic);
-    cleanup_state_->validation_succeeded = false;
-    cleanup_state_->validation_diagnostic = original;
+    if (authority_one >= 0)
+        (void)close_one(authority_one, cleanup_state_->authority_one, close_diagnostic);
+    if (authority_two >= 0)
+        (void)close_one(authority_two, cleanup_state_->authority_two, close_diagnostic);
+    cleanup_state_->creation_cleanup = true;
+    cleanup_state_->creation_diagnostic = original;
     diagnostic = original;
     if (cleanup_state_) cleanup_state_->diagnostic = original;
     return false;

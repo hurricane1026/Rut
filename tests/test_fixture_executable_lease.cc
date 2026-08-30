@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -145,7 +146,7 @@ bool self_kcmp(int first, int second) {
 
 bool new_owned_fds(const std::vector<int>& baseline,
                    int observation,
-                   int& authority,
+                   std::array<int, 2>& authorities,
                    std::vector<int>& current) {
     if (!fd_snapshot(current)) return false;
     std::vector<int> added;
@@ -154,10 +155,12 @@ bool new_owned_fds(const std::vector<int>& baseline,
                         baseline.begin(),
                         baseline.end(),
                         std::back_inserter(added));
-    if (added.size() != 2u || std::find(added.begin(), added.end(), observation) == added.end())
+    if (added.size() != 3u || std::find(added.begin(), added.end(), observation) == added.end())
         return false;
-    authority = added[0] == observation ? added[1] : added[0];
-    return true;
+    std::size_t at = 0u;
+    for (const int descriptor : added)
+        if (descriptor != observation) authorities[at++] = descriptor;
+    return at == authorities.size();
 }
 
 bool canonical_custody_test() {
@@ -171,7 +174,7 @@ bool canonical_custody_test() {
     if (!check(executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
                "canonical create"))
         return false;
-    int authority = -1;
+    std::array<int, 2> authorities{-1, -1};
     std::vector<int> active;
     struct stat status{};
     const int observation_flags = fcntl(lease.observation_fd(), F_GETFD);
@@ -179,14 +182,20 @@ bool canonical_custody_test() {
     const bool identity = fstat(lease.observation_fd(), &status) == 0;
     const auto evidence = lease.cleanup_state();
     const bool okay =
-        check(lease.active() && new_owned_fds(baseline, lease.observation_fd(), authority, active),
-              "canonical exact two-FD custody") &&
+        check(
+            lease.active() && new_owned_fds(baseline, lease.observation_fd(), authorities, active),
+            "canonical exact three-FD custody") &&
         check(observation_flags >= 0 && (observation_flags & FD_CLOEXEC) != 0 &&
                   observation_status >= 0 && (observation_status & O_PATH) == O_PATH,
               "canonical observation flags") &&
-        check(fcntl(authority, F_GETFD) >= 0 && (fcntl(authority, F_GETFD) & FD_CLOEXEC) != 0 &&
-                  self_kcmp(lease.observation_fd(), authority),
-              "canonical private authority exact OFD") &&
+        check(fcntl(authorities[0], F_GETFD) >= 0 &&
+                  (fcntl(authorities[0], F_GETFD) & FD_CLOEXEC) != 0 &&
+                  fcntl(authorities[1], F_GETFD) >= 0 &&
+                  (fcntl(authorities[1], F_GETFD) & FD_CLOEXEC) != 0 &&
+                  self_kcmp(lease.observation_fd(), authorities[0]) &&
+                  self_kcmp(lease.observation_fd(), authorities[1]) &&
+                  self_kcmp(authorities[0], authorities[1]),
+              "canonical private authorities exact OFD") &&
         check(identity && lease.identity().device == static_cast<std::uint64_t>(status.st_dev) &&
                   lease.identity().inode == static_cast<std::uint64_t>(status.st_ino) &&
                   lease.identity().mode == static_cast<std::uint64_t>(status.st_mode) &&
@@ -195,10 +204,11 @@ bool canonical_custody_test() {
               "canonical stored identity") &&
         check(lease.revalidate(diagnostic), "canonical revalidate") &&
         check(lease.close(diagnostic), "canonical close") &&
-        check(!lease.active() && evidence->validation_succeeded &&
-                  evidence->observation.attempted && evidence->observation.succeeded &&
-                  evidence->authority.attempted && evidence->authority.succeeded &&
-                  evidence->reportable_success,
+        check(!lease.active() && evidence->semantic_validation.succeeded &&
+                  evidence->custody_validation.succeeded && evidence->observation.attempted &&
+                  evidence->observation.succeeded && evidence->authority_one.attempted &&
+                  evidence->authority_one.succeeded && evidence->authority_two.attempted &&
+                  evidence->authority_two.succeeded && evidence->reportable_success,
               "canonical cleanup evidence") &&
         same_snapshot(baseline, "canonical exact FD residue") &&
         check(!lease.close(diagnostic) && diagnostic.phase == executable::FailurePhase::Close &&
@@ -250,6 +260,31 @@ bool argument_and_policy_rejection_test() {
     okay = check(invalid_preopen && valid_after_argument &&
                      fresh_after_argument.close(fresh_diagnostic),
                  "pre-open argument rejection did not leave object fresh") &&
+           okay;
+    executable::ExecutableLease seeded_canonical;
+    executable::Diagnostic seeded_diagnostic;
+    errno = EBUSY;
+    okay = check(!executable::ExecutableLease::create(
+                     directory.child("./program"), seeded_canonical, seeded_diagnostic) &&
+                     seeded_diagnostic.phase == executable::FailurePhase::Canonical &&
+                     seeded_diagnostic.error_number == EINVAL,
+                 "canonical mismatch inherited ambient errno") &&
+           okay;
+    executable::ExecutableLease seeded_policy;
+    errno = EBUSY;
+    okay = check(!executable::ExecutableLease::create(
+                     directory.child("nonexec"), seeded_policy, seeded_diagnostic) &&
+                     seeded_diagnostic.phase == executable::FailurePhase::Policy &&
+                     seeded_diagnostic.error_number == EACCES,
+                 "policy mismatch inherited ambient errno") &&
+           okay;
+    executable::ExecutableLease seeded_identity;
+    errno = EBUSY;
+    okay = check(!executable::ExecutableLease::create(
+                     directory.child("subdir"), seeded_identity, seeded_diagnostic) &&
+                     seeded_diagnostic.phase == executable::FailurePhase::Identity &&
+                     seeded_diagnostic.error_number == EINVAL,
+                 "initial identity mismatch inherited ambient errno") &&
            okay;
     if (geteuid() == 0) {
         if (fchownat(directory.descriptor, "program", 1, static_cast<gid_t>(-1), 0) != 0)
@@ -305,8 +340,10 @@ bool pathname_replacement_test() {
                 directory.executable("program"),
             "pathname replacement setup"))
         return false;
-    const bool rejected =
-        !lease.revalidate(diagnostic) && diagnostic.phase == executable::FailurePhase::Path;
+    errno = EBUSY;
+    const bool rejected = !lease.revalidate(diagnostic) &&
+                          diagnostic.phase == executable::FailurePhase::Path &&
+                          diagnostic.error_number == EINVAL;
     if (unlinkat(directory.descriptor, "program", 0) != 0 ||
         renameat(directory.descriptor, "saved-program", directory.descriptor, "program") != 0)
         return check(false, "pathname restoration");
@@ -356,15 +393,15 @@ bool observation_mutation_test(bool same_inode_new_ofd) {
     if (!check(executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
                "observation create"))
         return false;
-    int authority = -1;
+    std::array<int, 2> authorities{-1, -1};
     std::vector<int> active;
-    if (!check(new_owned_fds(baseline, lease.observation_fd(), authority, active),
+    if (!check(new_owned_fds(baseline, lease.observation_fd(), authorities, active),
                "observation authority discovery"))
         return false;
     const int slot = lease.observation_fd();
     const int saved = fcntl(slot, F_DUPFD_CLOEXEC, 0);
     const std::string replacement_path = same_inode_new_ofd
-                                             ? "/proc/self/fd/" + std::to_string(authority)
+                                             ? "/proc/self/fd/" + std::to_string(authorities[0])
                                              : directory.child("other");
     const int replacement = open(replacement_path.c_str(), O_PATH | O_CLOEXEC);
     if (!check(saved >= 0 && replacement >= 0 && dup2(replacement, slot) == slot &&
@@ -413,10 +450,29 @@ bool cloexec_recovery_test() {
 
 struct KcmpInjection {
     int error_number = 0;
+    bool enabled = true;
 };
 
-int denied_kcmp(int, int, void* context) {
+int denied_kcmp(int first, int second, void* context) {
     const auto* injection = static_cast<const KcmpInjection*>(context);
+    if (injection != nullptr && !injection->enabled) {
+#ifdef SYS_kcmp
+        return static_cast<int>(syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, first, second));
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
+    }
+    errno = injection == nullptr ? EIO : injection->error_number;
+    return -1;
+}
+
+struct AccessInjection {
+    int error_number = 0;
+};
+
+int denied_access(int, void* context) {
+    const auto* injection = static_cast<const AccessInjection*>(context);
     errno = injection == nullptr ? EIO : injection->error_number;
     return -1;
 }
@@ -456,18 +512,28 @@ bool create_failure_cleanup_test() {
         executable::Diagnostic diagnostic;
         CloseInjection close_injection;
         const executable::HooksForTesting hooks{
-            nullptr, real_close_then_error, &close_injection, point};
+            nullptr, real_close_then_error, nullptr, &close_injection, point};
         const bool created = executable::ExecutableLease::create_with_hooks_for_testing(
             directory.child("program"), hooks, lease, diagnostic);
-        const unsigned expected = point == executable::CreationFailurePoint::AfterOpen ? 1u : 2u;
+        const executable::Diagnostic creation_diagnostic = diagnostic;
+        const unsigned expected = point == executable::CreationFailurePoint::AfterOpen ? 1u : 3u;
         const auto evidence = lease.cleanup_state();
         const bool terminal_reuse =
             !executable::ExecutableLease::create(directory.child("program"), lease, diagnostic) &&
             diagnostic.phase == executable::FailurePhase::Argument;
+        const executable::FailurePhase expected_phase =
+            point == executable::CreationFailurePoint::AfterOpen ? executable::FailurePhase::Open
+            : point == executable::CreationFailurePoint::AfterDuplicate
+                ? executable::FailurePhase::Duplicate
+                : executable::FailurePhase::Identity;
         okay =
-            check(!created && !lease.active() && close_injection.calls == expected &&
-                      evidence->observation.attempts == 1u &&
-                      evidence->authority.attempts == (expected == 2u ? 1u : 0u) && terminal_reuse,
+            check(!created && !lease.active() && creation_diagnostic.phase == expected_phase &&
+                      creation_diagnostic.error_number == EIO &&
+                      close_injection.calls == expected && evidence->observation.attempts == 1u &&
+                      evidence->authority_one.attempts == (expected == 3u ? 1u : 0u) &&
+                      evidence->authority_two.attempts == (expected == 3u ? 1u : 0u) &&
+                      evidence->creation_cleanup &&
+                      evidence->creation_diagnostic.phase == expected_phase && terminal_reuse,
                   "creation failure cleanup was not exact") &&
             okay;
         okay = same_snapshot(baseline, "creation failure FD residue") && okay;
@@ -477,18 +543,65 @@ bool create_failure_cleanup_test() {
         executable::Diagnostic diagnostic;
         KcmpInjection injection{denied};
         const executable::HooksForTesting hooks{
-            denied_kcmp, nullptr, &injection, executable::CreationFailurePoint::None};
+            denied_kcmp, nullptr, nullptr, &injection, executable::CreationFailurePoint::None};
         const bool created = executable::ExecutableLease::create_with_hooks_for_testing(
             directory.child("program"), hooks, lease, diagnostic);
         okay = check(!created && diagnostic.phase == executable::FailurePhase::Kcmp &&
                          diagnostic.error_number == denied && !lease.active() &&
                          lease.cleanup_state()->observation.attempts == 1u &&
-                         lease.cleanup_state()->authority.attempts == 1u,
+                         lease.cleanup_state()->authority_one.attempts == 1u &&
+                         lease.cleanup_state()->authority_two.attempts == 1u,
                      "kcmp denial did not fail closed with exact cleanup") &&
                okay;
         okay = same_snapshot(baseline, "kcmp denial FD residue") && okay;
     }
+    for (const int denied : {ENOSYS, ENOTSUP, EACCES}) {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        AccessInjection injection{denied};
+        const executable::HooksForTesting hooks{
+            nullptr, nullptr, denied_access, &injection, executable::CreationFailurePoint::None};
+        errno = EBUSY;
+        const bool created = executable::ExecutableLease::create_with_hooks_for_testing(
+            directory.child("program"), hooks, lease, diagnostic);
+        okay = check(!created && diagnostic.phase == executable::FailurePhase::Policy &&
+                         diagnostic.error_number == denied && !lease.active() &&
+                         lease.cleanup_state()->observation.attempts == 1u &&
+                         lease.cleanup_state()->authority_one.attempts == 1u &&
+                         lease.cleanup_state()->authority_two.attempts == 1u,
+                     "FD-relative access denial did not fail closed exactly") &&
+               okay;
+        okay = same_snapshot(baseline, "access denial FD residue") && okay;
+    }
     return okay;
+}
+
+bool creation_close_uncertainty_test() {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "creation uncertainty setup") ||
+        !check(fd_snapshot(baseline), "creation uncertainty baseline"))
+        return false;
+    executable::ExecutableLease lease;
+    executable::Diagnostic diagnostic;
+    CloseInjection injection{0u, 2u, EINTR};
+    const executable::HooksForTesting hooks{nullptr,
+                                            real_close_then_error,
+                                            nullptr,
+                                            &injection,
+                                            executable::CreationFailurePoint::AfterDuplicate};
+    const bool created = executable::ExecutableLease::create_with_hooks_for_testing(
+        directory.child("program"), hooks, lease, diagnostic);
+    const auto evidence = lease.cleanup_state();
+    return check(!created && diagnostic.phase == executable::FailurePhase::Duplicate &&
+                     diagnostic.error_number == EIO && injection.calls == 3u &&
+                     evidence->creation_cleanup && evidence->observation.attempts == 1u &&
+                     evidence->observation.succeeded && evidence->authority_one.attempts == 1u &&
+                     !evidence->authority_one.succeeded &&
+                     evidence->authority_one.error_number == EINTR &&
+                     evidence->authority_two.attempts == 1u && evidence->authority_two.succeeded,
+                 "creation close uncertainty was retried or obscured") &&
+           same_snapshot(baseline, "creation uncertainty residue");
 }
 
 bool metadata_and_link_test() {
@@ -519,11 +632,14 @@ bool metadata_and_link_test() {
         !lease.revalidate(diagnostic) && (diagnostic.phase == executable::FailurePhase::Identity ||
                                           diagnostic.phase == executable::FailurePhase::Policy);
     // Semantic drift does not remove ownership authority from cleanup.
+    const auto explicit_evidence = lease.cleanup_state();
     const bool closed = lease.close(diagnostic);
     if (!check(link_added && link_removed && initial_identity_retained,
                "hard-link transition rejected or rewrote initial identity") ||
         !check(drift_rejected, "metadata drift accepted") ||
-        !check(closed, "metadata drift prevented ownership cleanup"))
+        !check(closed && !explicit_evidence->semantic_validation.succeeded &&
+                   explicit_evidence->custody_validation.succeeded,
+               "metadata drift evidence was overwritten by ownership cleanup"))
         return false;
 
     if (!check(directory.executable("content-program"), "content drift setup")) return false;
@@ -539,14 +655,19 @@ bool metadata_and_link_test() {
         const bool truncated = writer >= 0 && ftruncate(writer, 1) == 0;
         const bool writer_closed = writer >= 0 && close(writer) == 0;
         if (!check(truncated && writer_closed, "content drift mutation")) return false;
+        errno = EBUSY;
         if (!check(!content.revalidate(diagnostic) &&
-                       diagnostic.phase == executable::FailurePhase::Identity,
+                       diagnostic.phase == executable::FailurePhase::Identity &&
+                       diagnostic.error_number == EINVAL,
                    "content drift accepted"))
             return false;
         // Destructor must use custody, not semantic metadata, for cleanup.
     }
     return check(destructor_evidence->destructor && destructor_evidence->observation.succeeded &&
-                     destructor_evidence->authority.succeeded &&
+                     destructor_evidence->authority_one.succeeded &&
+                     destructor_evidence->authority_two.succeeded &&
+                     !destructor_evidence->semantic_validation.succeeded &&
+                     destructor_evidence->custody_validation.succeeded &&
                      !destructor_evidence->reportable_success,
                  "content drift prevented destructor ownership cleanup") &&
            same_snapshot(baseline, "metadata residue");
@@ -561,40 +682,179 @@ bool uncertain_close_case(unsigned fail_call, int failure) {
     executable::ExecutableLease lease;
     executable::Diagnostic diagnostic;
     CloseInjection injection{0u, fail_call, failure};
-    const executable::HooksForTesting hooks{
-        nullptr, real_close_then_error, &injection, executable::CreationFailurePoint::None};
+    const executable::HooksForTesting hooks{nullptr,
+                                            real_close_then_error,
+                                            nullptr,
+                                            &injection,
+                                            executable::CreationFailurePoint::None};
     if (!check(executable::ExecutableLease::create_with_hooks_for_testing(
                    directory.child("program"), hooks, lease, diagnostic),
                "uncertain close create"))
         return false;
     const auto evidence = lease.cleanup_state();
     const bool closed = lease.close(diagnostic);
-    const bool observation_failed = fail_call == 1u;
+    const std::array<const executable::CloseOutcome*, 3> outcomes = {
+        &evidence->observation, &evidence->authority_one, &evidence->authority_two};
+    bool outcomes_exact = true;
+    for (std::size_t index = 0; index < outcomes.size(); ++index)
+        outcomes_exact =
+            outcomes_exact && outcomes[index]->attempts == 1u &&
+            (index + 1u == fail_call
+                 ? (!outcomes[index]->succeeded && outcomes[index]->error_number == failure)
+                 : (outcomes[index]->succeeded && outcomes[index]->error_number == 0));
     return check(!closed && !lease.active() &&
                      diagnostic.phase == executable::FailurePhase::Close &&
-                     diagnostic.error_number == failure && injection.calls == 2u,
-                 "uncertain close did not attempt both exactly once") &&
-           check(evidence->observation.attempts == 1u &&
-                     evidence->observation.succeeded != observation_failed &&
-                     evidence->observation.error_number == (observation_failed ? failure : 0) &&
-                     evidence->authority.attempts == 1u &&
-                     evidence->authority.succeeded == observation_failed &&
-                     evidence->authority.error_number == (observation_failed ? 0 : failure) &&
-                     !evidence->reportable_success,
+                     diagnostic.error_number == failure && injection.calls == 3u,
+                 "uncertain close did not attempt all three exactly once") &&
+           check(outcomes_exact && !evidence->reportable_success,
                  "uncertain close outcomes were not independent") &&
            same_snapshot(baseline, "uncertain close retried or leaked FD");
 }
 
 bool uncertain_close_test() {
-    return uncertain_close_case(1u, EINTR) && uncertain_close_case(2u, EIO);
+    return uncertain_close_case(1u, EINTR) && uncertain_close_case(2u, EIO) &&
+           uncertain_close_case(3u, EINTR);
 }
 
-bool destructor_test(bool foreign_observation) {
+bool destructor_close_uncertainty_test() {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "destructor uncertainty setup") ||
+        !check(fd_snapshot(baseline), "destructor uncertainty baseline"))
+        return false;
+    CloseInjection injection;
+    std::shared_ptr<const executable::CleanupState> evidence;
+    {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        const executable::HooksForTesting hooks{nullptr,
+                                                real_close_then_error,
+                                                nullptr,
+                                                &injection,
+                                                executable::CreationFailurePoint::None};
+        if (!check(executable::ExecutableLease::create_with_hooks_for_testing(
+                       directory.child("program"), hooks, lease, diagnostic),
+                   "destructor uncertainty create"))
+            return false;
+        evidence = lease.cleanup_state();
+        injection.fail_call = 2u;
+        injection.failure = EINTR;
+    }
+    return check(injection.calls == 3u && evidence->destructor && evidence->observation.succeeded &&
+                     evidence->authority_one.attempted && !evidence->authority_one.succeeded &&
+                     evidence->authority_one.error_number == EINTR &&
+                     evidence->authority_two.succeeded && !evidence->reportable_success,
+                 "destructor close uncertainty was retried or obscured") &&
+           same_snapshot(baseline, "destructor uncertainty residue");
+}
+
+enum class SlotMutation : std::uint8_t { DifferentInode, SameInodeNewOfd, ClearCloexec };
+
+const executable::CloseOutcome& close_outcome(const executable::CleanupState& state,
+                                              std::size_t index) {
+    if (index == 0u) return state.observation;
+    if (index == 1u) return state.authority_one;
+    return state.authority_two;
+}
+
+bool slot_mutation_test(std::size_t slot_index, SlotMutation mutation) {
     PrivateDirectory directory;
     std::vector<int> baseline;
     if (!check(directory.create() && directory.executable() && directory.executable("other"),
-               "destructor setup") ||
+               "slot mutation setup") ||
+        !check(fd_snapshot(baseline), "slot mutation baseline"))
+        return false;
+    executable::ExecutableLease lease;
+    executable::Diagnostic diagnostic;
+    if (!check(executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
+               "slot mutation create"))
+        return false;
+    std::array<int, 2> authorities{-1, -1};
+    std::vector<int> active;
+    if (!check(new_owned_fds(baseline, lease.observation_fd(), authorities, active),
+               "slot mutation authority discovery"))
+        return false;
+    const std::array<int, 3> slots = {lease.observation_fd(), authorities[0], authorities[1]};
+    const int slot = slots[slot_index];
+    if (mutation == SlotMutation::ClearCloexec) {
+        if (!check(fcntl(slot, F_SETFD, 0) == 0, "slot clear CLOEXEC")) return false;
+        errno = EBUSY;
+        const bool semantic_rejected = !lease.revalidate(diagnostic) &&
+                                       diagnostic.phase == executable::FailurePhase::Identity &&
+                                       diagnostic.error_number == EINVAL;
+        errno = EBUSY;
+        const bool close_rejected = !lease.close(diagnostic) && lease.active() &&
+                                    diagnostic.phase == executable::FailurePhase::Identity &&
+                                    diagnostic.error_number == EINVAL;
+        if (!check(fcntl(slot, F_SETFD, FD_CLOEXEC) == 0, "slot restore CLOEXEC")) return false;
+        return check(semantic_rejected && close_rejected,
+                     "slot CLOEXEC mismatch was not deterministic/retryable") &&
+               check(lease.revalidate(diagnostic), "slot CLOEXEC restoration rejected") &&
+               check(lease.close(diagnostic), "slot CLOEXEC restored close") &&
+               same_snapshot(baseline, "slot CLOEXEC residue");
+    }
+
+    const int saved = fcntl(slot, F_DUPFD_CLOEXEC, 0);
+    const std::string replacement_path =
+        mutation == SlotMutation::DifferentInode
+            ? directory.child("other")
+            : "/proc/self/fd/" + std::to_string(slots[(slot_index + 1u) % slots.size()]);
+    const int replacement = open(replacement_path.c_str(), O_PATH | O_CLOEXEC);
+    const int foreign_saved = replacement >= 0 ? fcntl(replacement, F_DUPFD_CLOEXEC, 0) : -1;
+    if (!check(saved >= 0 && replacement >= 0 && foreign_saved >= 0 &&
+                   dup2(replacement, slot) == slot && fcntl(slot, F_SETFD, FD_CLOEXEC) == 0 &&
+                   close(replacement) == 0,
+               "slot replacement"))
+        return false;
+    errno = EBUSY;
+    const bool semantic_rejected =
+        !lease.revalidate(diagnostic) &&
+        diagnostic.error_number == (mutation == SlotMutation::DifferentInode ? EINVAL : EXDEV);
+    errno = EBUSY;
+    const bool close_rejected = !lease.close(diagnostic) && lease.active() &&
+                                diagnostic.phase == executable::FailurePhase::Kcmp &&
+                                diagnostic.error_number == EXDEV;
+    const bool foreign_preserved = fcntl(slot, F_GETFD) >= 0 && self_kcmp(slot, foreign_saved);
+    if (!check(dup2(saved, slot) == slot && fcntl(slot, F_SETFD, FD_CLOEXEC) == 0,
+               "slot exact restoration"))
+        return false;
+    close(saved);
+    close(foreign_saved);
+    return check(semantic_rejected && close_rejected && foreign_preserved,
+                 "slot mutation was accepted or foreign descriptor closed") &&
+           check(lease.revalidate(diagnostic), "slot exact restoration rejected") &&
+           check(lease.close(diagnostic), "slot restored close") &&
+           same_snapshot(baseline, "slot mutation final residue");
+}
+
+bool canonical_destructor_test() {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "destructor setup") ||
         !check(fd_snapshot(baseline), "destructor baseline"))
+        return false;
+    std::shared_ptr<const executable::CleanupState> evidence;
+    {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        if (!check(
+                executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
+                "canonical destructor create"))
+            return false;
+        evidence = lease.cleanup_state();
+    }
+    return check(evidence->destructor && !evidence->reportable_success &&
+                     evidence->custody_validation.succeeded && evidence->observation.succeeded &&
+                     evidence->authority_one.succeeded && evidence->authority_two.succeeded,
+                 "canonical destructor evidence") &&
+           same_snapshot(baseline, "canonical destructor residue");
+}
+
+bool destructor_single_replacement_test(std::size_t slot_index) {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "majority destructor setup") ||
+        !check(fd_snapshot(baseline), "majority destructor baseline"))
         return false;
     std::shared_ptr<const executable::CleanupState> evidence;
     int foreign_slot = -1;
@@ -604,38 +864,124 @@ bool destructor_test(bool foreign_observation) {
         executable::Diagnostic diagnostic;
         if (!check(
                 executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
-                "destructor create"))
+                "majority destructor create"))
+            return false;
+        std::array<int, 2> authorities{-1, -1};
+        std::vector<int> active;
+        if (!check(new_owned_fds(baseline, lease.observation_fd(), authorities, active),
+                   "majority destructor discovery"))
+            return false;
+        const std::array<int, 3> slots = {lease.observation_fd(), authorities[0], authorities[1]};
+        foreign_slot = slots[slot_index];
+        const std::string path =
+            "/proc/self/fd/" + std::to_string(slots[(slot_index + 1u) % slots.size()]);
+        const int replacement = open(path.c_str(), O_PATH | O_CLOEXEC);
+        foreign_saved = replacement >= 0 ? fcntl(replacement, F_DUPFD_CLOEXEC, 0) : -1;
+        if (!check(replacement >= 0 && foreign_saved >= 0 &&
+                       dup2(replacement, foreign_slot) == foreign_slot &&
+                       fcntl(foreign_slot, F_SETFD, FD_CLOEXEC) == 0 && close(replacement) == 0,
+                   "majority destructor replacement"))
             return false;
         evidence = lease.cleanup_state();
-        if (foreign_observation) {
-            foreign_slot = lease.observation_fd();
-            const int replacement = open(directory.child("other").c_str(), O_PATH | O_CLOEXEC);
-            foreign_saved = fcntl(replacement, F_DUPFD_CLOEXEC, 0);
-            if (!check(replacement >= 0 && foreign_saved >= 0 &&
-                           dup2(replacement, foreign_slot) == foreign_slot &&
-                           fcntl(foreign_slot, F_SETFD, FD_CLOEXEC) == 0,
-                       "destructor foreign replacement"))
-                return false;
-            close(replacement);
-        }
     }
-    if (!check(evidence && evidence->destructor && !evidence->reportable_success,
-               "destructor claimed reportable success"))
-        return false;
-    if (!foreign_observation)
-        return check(evidence->observation.succeeded && evidence->authority.succeeded,
-                     "canonical destructor did not settle both owned FDs") &&
-               same_snapshot(baseline, "canonical destructor residue");
+    bool majority_closed = evidence->custody_validation.succeeded;
+    for (std::size_t index = 0; index < 3u; ++index) {
+        const auto& outcome = close_outcome(*evidence, index);
+        majority_closed =
+            majority_closed &&
+            (index == slot_index ? (!outcome.attempted && outcome.error_number == EXDEV)
+                                 : (outcome.attempted && outcome.succeeded));
+    }
     const bool foreign_preserved = fcntl(foreign_slot, F_GETFD) >= 0 &&
                                    fcntl(foreign_saved, F_GETFD) >= 0 &&
                                    self_kcmp(foreign_slot, foreign_saved);
-    const bool authority_settled = !evidence->observation.attempted &&
-                                   evidence->authority.attempted && evidence->authority.succeeded;
     close(foreign_slot);
     close(foreign_saved);
-    return check(foreign_preserved, "destructor closed foreign observation") &&
-           check(authority_settled, "destructor did not safely settle private authority") &&
-           same_snapshot(baseline, "foreign destructor final residue");
+    return check(evidence->destructor && !evidence->reportable_success && majority_closed,
+                 "destructor did not close only exact original majority") &&
+           check(foreign_preserved, "destructor closed same-inode foreign slot") &&
+           same_snapshot(baseline, "majority destructor final residue");
+}
+
+bool destructor_cleared_observation_test() {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "CLOEXEC destructor setup") ||
+        !check(fd_snapshot(baseline), "CLOEXEC destructor baseline"))
+        return false;
+    std::shared_ptr<const executable::CleanupState> evidence;
+    {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        if (!check(
+                executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
+                "CLOEXEC destructor create") ||
+            !check(fcntl(lease.observation_fd(), F_SETFD, 0) == 0, "CLOEXEC destructor mutation") ||
+            !check(!lease.revalidate(diagnostic) &&
+                       diagnostic.phase == executable::FailurePhase::Identity,
+                   "CLOEXEC destructor semantic rejection"))
+            return false;
+        evidence = lease.cleanup_state();
+    }
+    return check(!evidence->semantic_validation.succeeded &&
+                     evidence->custody_validation.succeeded && evidence->observation.succeeded &&
+                     evidence->authority_one.succeeded && evidence->authority_two.succeeded,
+                 "destructor overwrote semantics or refused exact CLOEXEC-drift custody") &&
+           same_snapshot(baseline, "CLOEXEC destructor residue");
+}
+
+bool destructor_no_proof_test(bool ambiguous) {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "no-proof destructor setup") ||
+        !check(fd_snapshot(baseline), "no-proof destructor baseline"))
+        return false;
+    std::shared_ptr<const executable::CleanupState> evidence;
+    std::array<int, 3> preserved{-1, -1, -1};
+    int anchor = -1;
+    KcmpInjection injection{EPERM, false};
+    {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        const executable::HooksForTesting hooks{
+            denied_kcmp, nullptr, nullptr, &injection, executable::CreationFailurePoint::None};
+        if (!check(executable::ExecutableLease::create_with_hooks_for_testing(
+                       directory.child("program"), hooks, lease, diagnostic),
+                   "no-proof destructor create"))
+            return false;
+        std::array<int, 2> authorities{-1, -1};
+        std::vector<int> active;
+        if (!check(new_owned_fds(baseline, lease.observation_fd(), authorities, active),
+                   "no-proof destructor discovery"))
+            return false;
+        preserved = {lease.observation_fd(), authorities[0], authorities[1]};
+        if (ambiguous) {
+            anchor = fcntl(preserved[0], F_DUPFD_CLOEXEC, 0);
+            if (!check(anchor >= 0, "ambiguous anchor")) return false;
+            for (const int slot : preserved) {
+                const std::string path = "/proc/self/fd/" + std::to_string(anchor);
+                const int replacement = open(path.c_str(), O_PATH | O_CLOEXEC);
+                if (!check(replacement >= 0 && dup2(replacement, slot) == slot &&
+                               fcntl(slot, F_SETFD, FD_CLOEXEC) == 0 && close(replacement) == 0,
+                           "ambiguous independent replacement"))
+                    return false;
+            }
+        } else {
+            injection.enabled = true;
+        }
+        evidence = lease.cleanup_state();
+    }
+    bool all_preserved = true;
+    for (const int descriptor : preserved)
+        all_preserved = all_preserved && fcntl(descriptor, F_GETFD) >= 0;
+    const bool none_closed =
+        !evidence->custody_validation.succeeded && !evidence->observation.attempted &&
+        !evidence->authority_one.attempted && !evidence->authority_two.attempted;
+    for (const int descriptor : preserved) close(descriptor);
+    if (anchor >= 0) close(anchor);
+    return check(evidence->destructor && none_closed && all_preserved,
+                 "no-proof destructor guessed custody or made false residue claim") &&
+           same_snapshot(baseline, "no-proof destructor final residue");
 }
 
 }  // namespace
@@ -649,10 +995,22 @@ int main() {
     okay = observation_mutation_test(true) && okay;
     okay = cloexec_recovery_test() && okay;
     okay = create_failure_cleanup_test() && okay;
+    okay = creation_close_uncertainty_test() && okay;
     okay = metadata_and_link_test() && okay;
     okay = uncertain_close_test() && okay;
-    okay = destructor_test(false) && okay;
-    okay = destructor_test(true) && okay;
+    okay = destructor_close_uncertainty_test() && okay;
+    for (std::size_t slot = 0u; slot < 3u; ++slot) {
+        okay = slot_mutation_test(slot, SlotMutation::DifferentInode) && okay;
+        okay = slot_mutation_test(slot, SlotMutation::SameInodeNewOfd) && okay;
+        okay = slot_mutation_test(slot, SlotMutation::ClearCloexec) && okay;
+    }
+    okay = canonical_destructor_test() && okay;
+    okay = destructor_single_replacement_test(0u) && okay;
+    okay = destructor_single_replacement_test(1u) && okay;
+    okay = destructor_single_replacement_test(2u) && okay;
+    okay = destructor_cleared_observation_test() && okay;
+    okay = destructor_no_proof_test(false) && okay;
+    okay = destructor_no_proof_test(true) && okay;
     if (okay) std::puts("PASS: executable lease custody and cleanup tests");
     return okay ? 0 : 1;
 }
