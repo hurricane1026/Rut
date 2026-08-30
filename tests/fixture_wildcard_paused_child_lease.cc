@@ -657,7 +657,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
             fail(diagnostic,
                  FailurePhase::Argument,
                  plan->child_use_receipt_->state_ == PreparedChildUseState::Abandoned ? ESTALE
-                                                                                       : EALREADY);
+                                                                                      : EALREADY);
             return false;
         }
         const int output_fd = plan->combined_output_fd;

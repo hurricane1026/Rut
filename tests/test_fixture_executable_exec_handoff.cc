@@ -1146,9 +1146,8 @@ bool destructor_majority_case(bool unique_majority) {
 }
 
 bool plan_is_reset(const child_fixture::ChildDescriptorPlan& plan) {
-    return plan.combined_output_fd == -1 && plan.null_input_fd == -1 &&
-           plan.executable_fd == -1 && plan.exec_status_fd == -1 &&
-           plan.exec_status_authority_fd == -1 &&
+    return plan.combined_output_fd == -1 && plan.null_input_fd == -1 && plan.executable_fd == -1 &&
+           plan.exec_status_fd == -1 && plan.exec_status_authority_fd == -1 &&
            plan.continuation.kind == child_fixture::ChildContinuationKind::Inert &&
            !plan.child_use_receipt_for_testing();
 }
@@ -1208,8 +1207,7 @@ bool rejected_prepared_child_destructor_residue_case(bool invalid_input) {
     executable::Diagnostic source_diagnostic;
     if (!executable::ExecutableLease::create(self, source, source_diagnostic)) return false;
     const int input = open(invalid_input ? "/dev/zero" : "/dev/null", O_RDONLY | O_CLOEXEC);
-    const int output = invalid_input ? create_capture()
-                                     : open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = invalid_input ? create_capture() : open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (input < 0 || output < 0) return false;
     const auto baseline = fd_snapshot();
     {
@@ -1221,8 +1219,7 @@ bool rejected_prepared_child_destructor_residue_case(bool invalid_input) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         if (!handoff::ExecutableExecHandoffLease::create(
                 source, handoff_lease, handoff_diagnostic) ||
-            !handoff_lease.make_child_plan(
-                input, output, false, plan, handoff_diagnostic) ||
+            !handoff_lease.make_child_plan(input, output, false, plan, handoff_diagnostic) ||
             child_fixture::PausedChildLease::create_prepared(
                 deadline, plan, child, child_diagnostic) ||
             child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
@@ -1255,10 +1252,8 @@ bool failed_prepared_create_can_retry_case() {
     child_fixture::Diagnostic child_diagnostic;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
     if (invalid_input < 0 || valid_input < 0 || output < 0 ||
-        !handoff_lease.make_child_plan(
-            invalid_input, output, false, plan, handoff_diagnostic) ||
-        child_fixture::PausedChildLease::create_prepared(
-            deadline, plan, child, child_diagnostic) ||
+        !handoff_lease.make_child_plan(invalid_input, output, false, plan, handoff_diagnostic) ||
+        child_fixture::PausedChildLease::create_prepared(deadline, plan, child, child_diagnostic) ||
         child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
         !plan.child_use_receipt_for_testing() ||
         plan.child_use_receipt_for_testing()->state() !=
@@ -1303,8 +1298,7 @@ bool copied_plan_rejected_after_owner_end_case(bool explicit_close) {
             if (input < 0 || output < 0 ||
                 !handoff::ExecutableExecHandoffLease::create(
                     source, handoff_lease, handoff_diagnostic) ||
-                !handoff_lease.make_child_plan(
-                    input, output, false, plan, handoff_diagnostic))
+                !handoff_lease.make_child_plan(input, output, false, plan, handoff_diagnostic))
                 _exit(3);
             copied_plan = plan;
             stale_slots = {plan.executable_fd, plan.exec_status_fd, plan.exec_status_authority_fd};
@@ -1369,8 +1363,7 @@ bool active_child_handoff_destructor_preserves_case() {
             if (input < 0 || output < 0 ||
                 !handoff::ExecutableExecHandoffLease::create(
                     source, handoff_lease, handoff_diagnostic) ||
-                !handoff_lease.make_child_plan(
-                    input, output, false, plan, handoff_diagnostic) ||
+                !handoff_lease.make_child_plan(input, output, false, plan, handoff_diagnostic) ||
                 !child_fixture::PausedChildLease::create_prepared(
                     deadline, plan, child, child_diagnostic))
                 _exit(3);
@@ -1436,8 +1429,7 @@ bool reverse_destruction_settlement_residue_case() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         if (!handoff::ExecutableExecHandoffLease::create(
                 source, handoff_lease, handoff_diagnostic) ||
-            !handoff_lease.make_child_plan(
-                input, output, false, plan, handoff_diagnostic) ||
+            !handoff_lease.make_child_plan(input, output, false, plan, handoff_diagnostic) ||
             !child_fixture::PausedChildLease::create_prepared(
                 deadline, plan, child, child_diagnostic))
             return false;

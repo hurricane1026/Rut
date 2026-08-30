@@ -313,8 +313,7 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
     status_writer_authority_one_fd_ = writer_authority_one;
     status_writer_authority_two_fd_ = writer_authority_two;
     struct stat status_identity{};
-    if (hooks_.fail_status_identity_fstat ||
-        fstat(status_reader_fd_, &status_identity) != 0) {
+    if (hooks_.fail_status_identity_fstat || fstat(status_reader_fd_, &status_identity) != 0) {
         if (hooks_.fail_status_identity_fstat) errno = EIO;
         fail(diagnostic, FailurePhase::Pipe, errno);
         Diagnostic ignored;
