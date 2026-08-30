@@ -603,6 +603,11 @@ void* mmap(void* address, size_t length, int protection, int flags, int fd, off_
             ring_view.sqes = (struct io_uring_sqe*)mapped;
             ring_view.sqes_length = length;
         } else {
+            const char* inject = getenv("RUT_IOURING_GATE_INJECT_DUPLICATE_SQ");
+            if ((uint64_t)offset == IORING_OFF_SQ_RING && length == expected_sq_length &&
+                ring_view.sq_ring != 0 && duplicate_sq_mapping_injected && inject != 0 &&
+                strcmp(inject, "1") == 0)
+                gate->duplicate_sq_injection_count++;
             fail_locked(RUT_IOURING_GATE_ERROR_RING);
             failed_now = 1;
         }
@@ -1090,8 +1095,14 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
             uint32_t* mask = (uint32_t*)(sq + ring_view.params.sq_off.ring_mask);
             const uint32_t original = __atomic_load_n(mask, __ATOMIC_ACQUIRE);
             __atomic_store_n(mask, original ^ 1U, __ATOMIC_RELEASE);
+            lock_identity();
+            gate->ready_mask_mutation_count++;
+            unlock_identity();
             if (!runtime_ring_complete()) fail(RUT_IOURING_GATE_ERROR_RING);
             __atomic_store_n(mask, original, __ATOMIC_RELEASE);
+            lock_identity();
+            gate->ready_mask_restoration_count++;
+            unlock_identity();
         }
         const int inspection = inspect_submission((uint32_t)arg2);
         if (inspection == 0) {
