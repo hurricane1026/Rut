@@ -1327,6 +1327,26 @@ static bool valid_wildcard_attempt_phase(WildcardAttemptPhase phase) {
     return false;
 }
 
+static bool valid_wildcard_attempt_mode_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptMode::Canonical) &&
+           value <= static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess);
+}
+
+static bool valid_wildcard_attempt_phase_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptPhase::GuardHeld) &&
+           value <= static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+}
+
+static bool valid_wildcard_attempt_decision_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec) &&
+           value <= static_cast<u64>(WildcardAttemptDecisionKind::Finish);
+}
+
+static bool valid_wildcard_attempt_settlement_value(u64 value) {
+    return value >= static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled) &&
+           value <= static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled);
+}
+
 static u64 wildcard_phase_sequence(WildcardAttemptPhase phase) {
     switch (phase) {
         case WildcardAttemptPhase::GuardHeld:
@@ -1343,6 +1363,42 @@ static u64 wildcard_phase_sequence(WildcardAttemptPhase phase) {
             return 9u;
         case WildcardAttemptPhase::WildcardLive:
             return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_phase_sequence_value(u64 phase) {
+    switch (phase) {
+        case static_cast<u64>(WildcardAttemptPhase::GuardHeld):
+            return 1u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactRutWitness):
+            return 2u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionPrepared):
+            return 3u;
+        case static_cast<u64>(WildcardAttemptPhase::CollisionRejected):
+            return 5u;
+        case static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld):
+            return 7u;
+        case static_cast<u64>(WildcardAttemptPhase::GuardReleased):
+            return 9u;
+        case static_cast<u64>(WildcardAttemptPhase::WildcardLive):
+            return 11u;
+    }
+    return 0u;
+}
+
+static u64 wildcard_rejection_checkpoint_value(u64 mode) {
+    switch (mode) {
+        case static_cast<u64>(WildcardAttemptMode::MissingCollision):
+        case static_cast<u64>(WildcardAttemptMode::PrematureGuardRelease):
+            return static_cast<u64>(WildcardAttemptPhase::CollisionRejected);
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerKind):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerAddress):
+        case static_cast<u64>(WildcardAttemptMode::WrongListenerInode):
+        case static_cast<u64>(WildcardAttemptMode::FalsePostReleaseSuccess):
+            return static_cast<u64>(WildcardAttemptPhase::WildcardLive);
+        case static_cast<u64>(WildcardAttemptMode::Canonical):
+            return 0u;
     }
     return 0u;
 }
@@ -1392,11 +1448,14 @@ static std::vector<unsigned char> encode_wildcard_command(const WildcardAttemptC
 
 static bool decode_wildcard_command(const std::vector<unsigned char>& payload,
                                     WildcardAttemptCommandV1& command) {
-    command = {};
     std::array<u64, 4u> fields{};
-    if (!decode_wildcard_fields(payload, fields)) return false;
-    command = {fields[0], fields[1], static_cast<WildcardAttemptMode>(fields[2]), fields[3]};
-    return valid_wildcard_command(command);
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) || fields[3] != 0u)
+        return false;
+    const WildcardAttemptCommandV1 decoded{
+        fields[0], fields[1], static_cast<WildcardAttemptMode>(fields[2]), fields[3]};
+    command = decoded;
+    return true;
 }
 
 static bool valid_wildcard_phase(const WildcardAttemptPhaseV1& witness) {
@@ -1416,15 +1475,19 @@ static std::vector<unsigned char> encode_wildcard_phase(const WildcardAttemptPha
 
 static bool decode_wildcard_phase(const std::vector<unsigned char>& payload,
                                   WildcardAttemptPhaseV1& witness) {
-    witness = {};
     std::array<u64, 5u> fields{};
-    if (!decode_wildcard_fields(payload, fields)) return false;
-    witness = {fields[0],
-               fields[1],
-               static_cast<WildcardAttemptMode>(fields[2]),
-               static_cast<WildcardAttemptPhase>(fields[3]),
-               fields[4]};
-    return valid_wildcard_phase(witness);
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_phase_value(fields[3]) ||
+        fields[4] != wildcard_phase_sequence_value(fields[3]))
+        return false;
+    const WildcardAttemptPhaseV1 decoded{fields[0],
+                                         fields[1],
+                                         static_cast<WildcardAttemptMode>(fields[2]),
+                                         static_cast<WildcardAttemptPhase>(fields[3]),
+                                         fields[4]};
+    witness = decoded;
+    return true;
 }
 
 static bool valid_wildcard_decision(const WildcardAttemptDecisionV1& decision) {
@@ -1472,16 +1535,55 @@ static std::vector<unsigned char> encode_wildcard_decision(
 
 static bool decode_wildcard_decision(const std::vector<unsigned char>& payload,
                                      WildcardAttemptDecisionV1& decision) {
-    decision = {};
     std::array<u64, 6u> fields{};
-    if (!decode_wildcard_fields(payload, fields)) return false;
-    decision = {fields[0],
-                fields[1],
-                static_cast<WildcardAttemptMode>(fields[2]),
-                static_cast<WildcardAttemptDecisionKind>(fields[3]),
-                static_cast<WildcardAttemptPhase>(fields[4]),
-                fields[5]};
-    return valid_wildcard_decision(decision);
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_decision_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    const u64 checkpoint = wildcard_rejection_checkpoint_value(fields[2]);
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionPrepared) &&
+                    fields[5] == 4u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeExactCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::CollisionRejected) &&
+                    fields[5] == 6u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeGuardRelease):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::ExactCleanedGuardHeld) &&
+                    fields[5] == 8u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardExec):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::GuardReleased) &&
+                    fields[5] == 10u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeWildcardCleanup):
+            valid = fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 12u;
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::RejectAndCleanup):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == checkpoint &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]);
+            break;
+        case static_cast<u64>(WildcardAttemptDecisionKind::Finish):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 14u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptDecisionV1 decoded{fields[0],
+                                            fields[1],
+                                            static_cast<WildcardAttemptMode>(fields[2]),
+                                            static_cast<WildcardAttemptDecisionKind>(fields[3]),
+                                            static_cast<WildcardAttemptPhase>(fields[4]),
+                                            fields[5]};
+    decision = decoded;
+    return true;
 }
 
 static bool valid_wildcard_settlement(const WildcardAttemptSettlementV1& settlement) {
@@ -1514,16 +1616,34 @@ static std::vector<unsigned char> encode_wildcard_settlement(
 
 static bool decode_wildcard_settlement(const std::vector<unsigned char>& payload,
                                        WildcardAttemptSettlementV1& settlement) {
-    settlement = {};
     std::array<u64, 6u> fields{};
-    if (!decode_wildcard_fields(payload, fields)) return false;
-    settlement = {fields[0],
-                  fields[1],
-                  static_cast<WildcardAttemptMode>(fields[2]),
-                  static_cast<WildcardAttemptSettlementKind>(fields[3]),
-                  static_cast<WildcardAttemptPhase>(fields[4]),
-                  fields[5]};
-    return valid_wildcard_settlement(settlement);
+    if (!decode_wildcard_fields(payload, fields) || fields[0] != kWildcardAttemptVersion ||
+        fields[1] == 0u || !valid_wildcard_attempt_mode_value(fields[2]) ||
+        !valid_wildcard_attempt_settlement_value(fields[3]) ||
+        !valid_wildcard_attempt_phase_value(fields[4]))
+        return false;
+    bool valid = false;
+    switch (fields[3]) {
+        case static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled):
+            valid = fields[2] == static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == static_cast<u64>(WildcardAttemptPhase::WildcardLive) &&
+                    fields[5] == 13u;
+            break;
+        case static_cast<u64>(WildcardAttemptSettlementKind::MutationSettled):
+            valid = fields[2] != static_cast<u64>(WildcardAttemptMode::Canonical) &&
+                    fields[4] == wildcard_rejection_checkpoint_value(fields[2]) &&
+                    fields[5] == wildcard_phase_sequence_value(fields[4]) + 1u;
+            break;
+    }
+    if (!valid) return false;
+    const WildcardAttemptSettlementV1 decoded{fields[0],
+                                              fields[1],
+                                              static_cast<WildcardAttemptMode>(fields[2]),
+                                              static_cast<WildcardAttemptSettlementKind>(fields[3]),
+                                              static_cast<WildcardAttemptPhase>(fields[4]),
+                                              fields[5]};
+    settlement = decoded;
+    return true;
 }
 
 class WildcardAttemptStateMachine {
@@ -1571,9 +1691,21 @@ public:
                 return accept_phase(witness,
                                     WildcardAttemptPhase::WildcardLive,
                                     State::AwaitWildcardCleanupAuthorization);
-            default:
+            case State::Empty:
+            case State::AwaitCollisionAuthorization:
+            case State::AwaitExactCleanupAuthorization:
+            case State::AwaitGuardReleaseAuthorization:
+            case State::AwaitWildcardAuthorization:
+            case State::AwaitWildcardCleanupAuthorization:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitFinish:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
                 return fail();
         }
+        return fail();
     }
 
     bool decide(const WildcardAttemptDecisionV1& decision) {
@@ -1612,9 +1744,20 @@ public:
             case State::AwaitFinish:
                 return accept_decision(
                     decision, WildcardAttemptDecisionKind::Finish, State::Complete);
-            default:
+            case State::Empty:
+            case State::AwaitGuardHeld:
+            case State::AwaitExactRutWitness:
+            case State::AwaitCollisionPrepared:
+            case State::AwaitExactCleanedGuardHeld:
+            case State::AwaitGuardReleased:
+            case State::AwaitAttemptSettlement:
+            case State::AwaitMutationSettlement:
+            case State::Complete:
+            case State::MutationRejected:
+            case State::Failed:
                 return fail();
         }
+        return fail();
     }
 
     bool settle(const WildcardAttemptSettlementV1& settlement) {
@@ -1684,7 +1827,7 @@ private:
     }
 
     bool fail() {
-        if (state_ != State::Complete && state_ != State::MutationRejected) state_ = State::Failed;
+        state_ = State::Failed;
         return false;
     }
 
@@ -9222,6 +9365,129 @@ static bool wildcard_existing_frame_golden_self_check() {
     return true;
 }
 
+static bool same_wildcard_command(const WildcardAttemptCommandV1& left,
+                                  const WildcardAttemptCommandV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_phase(const WildcardAttemptPhaseV1& left,
+                                const WildcardAttemptPhaseV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.phase == right.phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_decision(const WildcardAttemptDecisionV1& left,
+                                   const WildcardAttemptDecisionV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.decision == right.decision &&
+           left.for_phase == right.for_phase && left.sequence == right.sequence;
+}
+
+static bool same_wildcard_settlement(const WildcardAttemptSettlementV1& left,
+                                     const WildcardAttemptSettlementV1& right) {
+    return left.version == right.version && left.transaction_id == right.transaction_id &&
+           left.mode == right.mode && left.settlement == right.settlement &&
+           left.terminal_phase == right.terminal_phase && left.sequence == right.sequence;
+}
+
+static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
+    const WildcardAttemptCommandV1 command_sentinel{
+        91u, 92u, WildcardAttemptMode::WrongListenerInode, 93u};
+    const std::array<u64, 4u> command_fields{
+        kWildcardAttemptVersion, 0x377u, static_cast<u64>(WildcardAttemptMode::Canonical), 0u};
+    for (std::size_t field = 0u; field != command_fields.size(); ++field) {
+        std::array<u64, 4u> invalid = command_fields;
+        invalid[field] = field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : 1u));
+        WildcardAttemptCommandV1 output = command_sentinel;
+        if (decode_wildcard_command(encode_wildcard_fields(invalid), output) ||
+            !same_wildcard_command(output, command_sentinel)) {
+            error = "invalid raw wildcard command mutated decoder output";
+            return false;
+        }
+    }
+
+    const WildcardAttemptPhaseV1 phase_sentinel{91u,
+                                                92u,
+                                                WildcardAttemptMode::WrongListenerInode,
+                                                WildcardAttemptPhase::GuardReleased,
+                                                93u};
+    const std::array<u64, 5u> phase_fields{kWildcardAttemptVersion,
+                                           0x377u,
+                                           static_cast<u64>(WildcardAttemptMode::Canonical),
+                                           static_cast<u64>(WildcardAttemptPhase::GuardHeld),
+                                           1u};
+    for (std::size_t field = 0u; field != phase_fields.size(); ++field) {
+        std::array<u64, 5u> invalid = phase_fields;
+        invalid[field] =
+            field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : (field == 3u ? 8u : 0u)));
+        WildcardAttemptPhaseV1 output = phase_sentinel;
+        if (decode_wildcard_phase(encode_wildcard_fields(invalid), output) ||
+            !same_wildcard_phase(output, phase_sentinel)) {
+            error = "invalid raw wildcard phase mutated decoder output";
+            return false;
+        }
+    }
+
+    const WildcardAttemptDecisionV1 decision_sentinel{91u,
+                                                      92u,
+                                                      WildcardAttemptMode::WrongListenerInode,
+                                                      WildcardAttemptDecisionKind::Finish,
+                                                      WildcardAttemptPhase::GuardReleased,
+                                                      93u};
+    const std::array<u64, 6u> decision_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptDecisionKind::AuthorizeCollisionExec),
+        static_cast<u64>(WildcardAttemptPhase::CollisionPrepared),
+        4u};
+    for (std::size_t field = 0u; field != decision_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = decision_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 8u : (field == 4u ? 8u : 0u))));
+        WildcardAttemptDecisionV1 output = decision_sentinel;
+        if (decode_wildcard_decision(encode_wildcard_fields(invalid), output) ||
+            !same_wildcard_decision(output, decision_sentinel)) {
+            error = "invalid raw wildcard decision mutated decoder output";
+            return false;
+        }
+    }
+
+    const WildcardAttemptSettlementV1 settlement_sentinel{
+        91u,
+        92u,
+        WildcardAttemptMode::WrongListenerInode,
+        WildcardAttemptSettlementKind::MutationSettled,
+        WildcardAttemptPhase::GuardReleased,
+        93u};
+    const std::array<u64, 6u> settlement_fields{
+        kWildcardAttemptVersion,
+        0x377u,
+        static_cast<u64>(WildcardAttemptMode::Canonical),
+        static_cast<u64>(WildcardAttemptSettlementKind::AttemptSettled),
+        static_cast<u64>(WildcardAttemptPhase::WildcardLive),
+        13u};
+    for (std::size_t field = 0u; field != settlement_fields.size(); ++field) {
+        std::array<u64, 6u> invalid = settlement_fields;
+        invalid[field] =
+            field == 0u
+                ? 2u
+                : (field == 1u ? 0u
+                               : (field == 2u ? 8u : (field == 3u ? 3u : (field == 4u ? 8u : 0u))));
+        WildcardAttemptSettlementV1 output = settlement_sentinel;
+        if (decode_wildcard_settlement(encode_wildcard_fields(invalid), output) ||
+            !same_wildcard_settlement(output, settlement_sentinel)) {
+            error = "invalid raw wildcard settlement mutated decoder output";
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool wildcard_attempt_codec_self_check(std::string& error) {
     constexpr std::array<WildcardAttemptMode, 7u> modes{
         WildcardAttemptMode::Canonical,
@@ -9245,6 +9511,7 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
         error = "wildcard frame allocation changed an existing 35--50 wire header";
         return false;
     }
+    if (!wildcard_decoder_atomic_failure_self_check(error)) return false;
     for (WildcardAttemptMode mode : modes) {
         WildcardAttemptCommandV1 command{kWildcardAttemptVersion, 0x377u, mode, 0u};
         WildcardAttemptCommandV1 decoded;
@@ -9578,14 +9845,25 @@ static bool drive_wildcard_mutation(WildcardAttemptStateMachine& machine,
 }
 
 static bool wildcard_attempt_state_self_check(std::string& error) {
-    WildcardAttemptStateMachine canonical;
-    if (!drive_wildcard_canonical(canonical)) {
+    WildcardAttemptStateMachine canonical_replay;
+    if (!drive_wildcard_canonical(canonical_replay)) {
         error = "canonical wildcard state sequence was rejected";
         return false;
     }
-    if (canonical.observe(
-            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld))) {
-        error = "wildcard transition after canonical terminal state was accepted";
+    if (canonical_replay.observe(
+            wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld)) ||
+        !canonical_replay.failed() || canonical_replay.complete() ||
+        canonical_replay.mutation_rejected()) {
+        error = "valid replay after canonical completion did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine canonical_wrong_binding;
+    if (!drive_wildcard_canonical(canonical_wrong_binding) ||
+        canonical_wrong_binding.observe(wildcard_phase(
+            WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld, 0x378u)) ||
+        !canonical_wrong_binding.failed() || canonical_wrong_binding.complete() ||
+        canonical_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after canonical completion did not poison terminal state";
         return false;
     }
     for (WildcardAttemptMode mode : {WildcardAttemptMode::MissingCollision,
@@ -9599,14 +9877,38 @@ static bool wildcard_attempt_state_self_check(std::string& error) {
             error = "intended wildcard mutation rejection sequence failed";
             return false;
         }
-        const WildcardAttemptPhase checkpoint = wildcard_rejection_checkpoint(mode);
-        if (mutation.settle(wildcard_settlement(mode,
-                                                WildcardAttemptSettlementKind::MutationSettled,
-                                                checkpoint,
-                                                wildcard_phase_sequence(checkpoint) + 1u))) {
-            error = "wildcard transition after mutation terminal state was accepted";
+        if (!mutation.mutation_rejected() || mutation.complete() || mutation.failed()) {
+            error = "wildcard mutation did not retain its initial rejection terminal state";
             return false;
         }
+    }
+    constexpr WildcardAttemptMode terminal_mutation_mode = WildcardAttemptMode::MissingCollision;
+    constexpr WildcardAttemptPhase terminal_mutation_phase =
+        WildcardAttemptPhase::CollisionRejected;
+    WildcardAttemptStateMachine mutation_replay;
+    if (!drive_wildcard_mutation(mutation_replay, terminal_mutation_mode) ||
+        mutation_replay.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u)) ||
+        !mutation_replay.failed() || mutation_replay.complete() ||
+        mutation_replay.mutation_rejected()) {
+        error = "valid replay after mutation rejection did not poison terminal state";
+        return false;
+    }
+    WildcardAttemptStateMachine mutation_wrong_binding;
+    if (!drive_wildcard_mutation(mutation_wrong_binding, terminal_mutation_mode) ||
+        mutation_wrong_binding.settle(
+            wildcard_settlement(terminal_mutation_mode,
+                                WildcardAttemptSettlementKind::MutationSettled,
+                                terminal_mutation_phase,
+                                wildcard_phase_sequence(terminal_mutation_phase) + 1u,
+                                0x378u)) ||
+        !mutation_wrong_binding.failed() || mutation_wrong_binding.complete() ||
+        mutation_wrong_binding.mutation_rejected()) {
+        error = "wrong-bound input after mutation rejection did not poison terminal state";
+        return false;
     }
 
     const auto new_machine_at_collision = [] {
