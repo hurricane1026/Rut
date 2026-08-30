@@ -4556,7 +4556,6 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
         error = "probe Root/Launcher IDB1 peer, process, argv, credential, or netns binding failed";
         return false;
     }
-    std::vector<ProcIdentity> ancestry_processes;
     ProbeChainFacts facts;
     facts.peer_pid = root_peer.pid;
     facts.root_pid = root.pid;
@@ -4602,11 +4601,24 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
                           true});
         root_was_recorded =
             root_was_recorded || process.pid == root.pid || process.pid == launcher.pid;
-        ancestry_processes.push_back(std::move(process));
     }
     if (root_was_recorded || !validate_probe_chain_facts(facts, error)) return false;
+    const identity_bundle::ProcessIdentityEvidence& anchor_evidence = ancestry_evidence.back();
+    RetainedAnchorEvidence retained_anchor;
+    retained_anchor.pid = anchor_evidence.identity.pid;
+    retained_anchor.ppid = anchor_evidence.identity.ppid;
+    retained_anchor.pgid = anchor_evidence.identity.pgid;
+    retained_anchor.sid = anchor_evidence.identity.sid;
+    retained_anchor.start = anchor_evidence.identity.start;
+    retained_anchor.state = anchor_evidence.state;
+    retained_anchor.uid = anchor_evidence.identity.uid;
+    retained_anchor.gid = anchor_evidence.identity.gid;
+    retained_anchor.uid_values = anchor_evidence.status.uid_values;
+    retained_anchor.gid_values = anchor_evidence.status.gid_values;
+    retained_anchor.cmdline = anchor_evidence.cmdline;
+    retained_anchor.pidfd_live = anchor_evidence.pidfd_live;
     std::string ancestry_error;
-    if (!validate_launcher_ancestry(launch, launcher, ancestry_processes, ancestry_error) ||
+    if (!prove_retained_sudo_wrapper(launch, launcher, retained_anchor, ancestry_error) ||
         launch.mode != rut::test::fixture_direct_launch::LaunchMode::SudoWrapper) {
         error = "probe ancestry failed shared launch validation: " + ancestry_error;
         return false;
