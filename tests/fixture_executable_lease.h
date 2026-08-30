@@ -75,6 +75,7 @@ using AccessForTesting = int (*)(int descriptor, void* context);
 enum class CreationFailurePoint : std::uint8_t {
     None,
     AfterOpen,
+    AfterFirstDuplicate,
     AfterDuplicate,
     IdentityValidation,
 };
@@ -99,9 +100,11 @@ struct HooksForTesting {
 // two exact duplicate authorities are private. If an excluded caller mutation
 // replaces the observation slot, revalidation and close fail closed without
 // closing the foreign descriptor; restoring an exact duplicate permits retry.
-// Destructor cleanup can settle an original two-member exact-OFD majority
-// after any one numeric-slot replacement; without a unique majority, or when
-// kcmp cannot provide exact evidence, every unproven slot is preserved.
+// Under the explicit at-most-one-numeric-slot-replacement defensive boundary,
+// destructor cleanup can settle the original two-member exact-OFD majority.
+// Without a unique majority, or when kcmp cannot provide exact evidence, every
+// unproven slot is preserved. Two coordinated replacements that share one new
+// OFD can form a false majority and are explicitly outside this guarantee.
 // Initial ctime is retained as diagnostic evidence. Because nlink is not an
 // invariant, revalidation checks only current ctime agreement among the path
 // and all pinned members; it cannot attest against excluded restored metadata,

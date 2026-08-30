@@ -192,6 +192,8 @@ bool ExecutableLease::create_impl(const std::string& canonical_absolute_path,
     if (lease.authority_one_fd_ < 0)
         return lease.fail_after_acquire({FailurePhase::Duplicate, errno == 0 ? EIO : errno},
                                         diagnostic);
+    if (failure_point == CreationFailurePoint::AfterFirstDuplicate)
+        return lease.fail_after_acquire({FailurePhase::Duplicate, EIO}, diagnostic);
     lease.authority_two_fd_ = fcntl(lease.observation_fd_, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
     if (lease.authority_two_fd_ < 0)
         return lease.fail_after_acquire({FailurePhase::Duplicate, errno == 0 ? EIO : errno},
@@ -314,6 +316,9 @@ bool ExecutableLease::validate_custody(Diagnostic& diagnostic) const {
 bool ExecutableLease::authorize_cleanup(bool require_cloexec,
                                         std::array<bool, 3>& original_members,
                                         Diagnostic& diagnostic) const {
+    // This finite majority is defensive only under the documented at-most-one
+    // slot-replacement boundary. Two coordinated foreign slots sharing one new
+    // OFD are indistinguishable from an original majority and are out of scope.
     original_members = {};
     diagnostic = {};
     const std::array<int, 3> descriptors = {observation_fd_, authority_one_fd_, authority_two_fd_};
@@ -480,9 +485,9 @@ bool ExecutableLease::close_active(bool destructor, Diagnostic& diagnostic) {
 
     bool success = true;
     if (authorized) {
-        // Detach every field before the first close. A destructor with a
-        // single-slot replacement closes only the exact-OFD majority and
-        // preserves the foreign numeric slot.
+        // Detach every field before the first close. Under the documented
+        // at-most-one-slot-replacement boundary, a destructor closes only the
+        // original exact-OFD majority and preserves the foreign numeric slot.
         std::array<int, 3> descriptors = {observation_fd_, authority_one_fd_, authority_two_fd_};
         observation_fd_ = -1;
         authority_one_fd_ = -1;

@@ -68,15 +68,22 @@ bool write_all(int fd, const unsigned char* data, std::size_t size) {
 }
 
 struct PrivateDirectory {
+    using RmdirForTesting = int (*)(const char* path);
+
     std::array<char, 96> path{};
     int descriptor = -1;
+    bool directory_created = false;
+    RmdirForTesting rmdir_for_testing = rmdir;
 
-    bool create() {
-        std::snprintf(path.data(), path.size(), "/tmp/rut377-executable-XXXXXX");
+    bool create_with_pattern(const char* pattern) {
+        std::snprintf(path.data(), path.size(), "%s", pattern);
         if (mkdtemp(path.data()) == nullptr) return false;
+        directory_created = true;
         descriptor = open(path.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         return descriptor >= 0 && fchmod(descriptor, 0700) == 0;
     }
+
+    bool create() { return create_with_pattern("/tmp/rut377-executable-XXXXXX"); }
 
     std::string child(const char* name) const { return std::string(path.data()) + "/" + name; }
 
@@ -128,10 +135,32 @@ struct PrivateDirectory {
             }
             close(descriptor);
         }
-        if (path[0] != '\0' && rmdir(path.data()) != 0)
+        if (directory_created && rmdir_for_testing(path.data()) != 0)
             std::fprintf(stderr, "FAIL: temporary directory cleanup errno=%d\n", errno);
     }
 };
+
+unsigned rmdir_calls = 0u;
+
+int recording_rmdir(const char* path) {
+    ++rmdir_calls;
+    return rmdir(path);
+}
+
+bool failed_mkdtemp_cleanup_test() {
+    rmdir_calls = 0u;
+    {
+        PrivateDirectory directory;
+        directory.rmdir_for_testing = recording_rmdir;
+        errno = 0;
+        if (!check(
+                !directory.create_with_pattern("/proc/rut377-executable-no-parent/child-XXXXXX") &&
+                    errno == ENOENT && !directory.directory_created && directory.descriptor < 0,
+                "deterministic mkdtemp failure precondition"))
+            return false;
+    }
+    return check(rmdir_calls == 0u, "failed mkdtemp attempted rmdir cleanup");
+}
 
 bool self_kcmp(int first, int second) {
 #ifdef SYS_kcmp
@@ -505,6 +534,7 @@ bool create_failure_cleanup_test() {
     bool okay = true;
     for (const executable::CreationFailurePoint point : {
              executable::CreationFailurePoint::AfterOpen,
+             executable::CreationFailurePoint::AfterFirstDuplicate,
              executable::CreationFailurePoint::AfterDuplicate,
              executable::CreationFailurePoint::IdentityValidation,
          }) {
@@ -516,21 +546,25 @@ bool create_failure_cleanup_test() {
         const bool created = executable::ExecutableLease::create_with_hooks_for_testing(
             directory.child("program"), hooks, lease, diagnostic);
         const executable::Diagnostic creation_diagnostic = diagnostic;
-        const unsigned expected = point == executable::CreationFailurePoint::AfterOpen ? 1u : 3u;
+        const unsigned expected = point == executable::CreationFailurePoint::AfterOpen ? 1u
+                                  : point == executable::CreationFailurePoint::AfterFirstDuplicate
+                                      ? 2u
+                                      : 3u;
         const auto evidence = lease.cleanup_state();
         const bool terminal_reuse =
             !executable::ExecutableLease::create(directory.child("program"), lease, diagnostic) &&
             diagnostic.phase == executable::FailurePhase::Argument;
         const executable::FailurePhase expected_phase =
             point == executable::CreationFailurePoint::AfterOpen ? executable::FailurePhase::Open
-            : point == executable::CreationFailurePoint::AfterDuplicate
+            : point == executable::CreationFailurePoint::AfterFirstDuplicate ||
+                    point == executable::CreationFailurePoint::AfterDuplicate
                 ? executable::FailurePhase::Duplicate
                 : executable::FailurePhase::Identity;
         okay =
             check(!created && !lease.active() && creation_diagnostic.phase == expected_phase &&
                       creation_diagnostic.error_number == EIO &&
                       close_injection.calls == expected && evidence->observation.attempts == 1u &&
-                      evidence->authority_one.attempts == (expected == 3u ? 1u : 0u) &&
+                      evidence->authority_one.attempts == (expected >= 2u ? 1u : 0u) &&
                       evidence->authority_two.attempts == (expected == 3u ? 1u : 0u) &&
                       evidence->creation_cleanup &&
                       evidence->creation_diagnostic.phase == expected_phase && terminal_reuse,
@@ -930,7 +964,7 @@ bool destructor_cleared_observation_test() {
            same_snapshot(baseline, "CLOEXEC destructor residue");
 }
 
-bool destructor_no_proof_test(bool ambiguous) {
+bool destructor_no_proof_test(bool independent_no_majority) {
     PrivateDirectory directory;
     std::vector<int> baseline;
     if (!check(directory.create() && directory.executable(), "no-proof destructor setup") ||
@@ -955,15 +989,15 @@ bool destructor_no_proof_test(bool ambiguous) {
                    "no-proof destructor discovery"))
             return false;
         preserved = {lease.observation_fd(), authorities[0], authorities[1]};
-        if (ambiguous) {
+        if (independent_no_majority) {
             anchor = fcntl(preserved[0], F_DUPFD_CLOEXEC, 0);
-            if (!check(anchor >= 0, "ambiguous anchor")) return false;
+            if (!check(anchor >= 0, "independent no-majority anchor")) return false;
             for (const int slot : preserved) {
                 const std::string path = "/proc/self/fd/" + std::to_string(anchor);
                 const int replacement = open(path.c_str(), O_PATH | O_CLOEXEC);
                 if (!check(replacement >= 0 && dup2(replacement, slot) == slot &&
                                fcntl(slot, F_SETFD, FD_CLOEXEC) == 0 && close(replacement) == 0,
-                           "ambiguous independent replacement"))
+                           "independent no-majority replacement"))
                     return false;
             }
         } else {
@@ -984,10 +1018,71 @@ bool destructor_no_proof_test(bool ambiguous) {
            same_snapshot(baseline, "no-proof destructor final residue");
 }
 
+bool destructor_excluded_two_replacement_limit_test() {
+    PrivateDirectory directory;
+    std::vector<int> baseline;
+    if (!check(directory.create() && directory.executable(), "excluded majority setup") ||
+        !check(fd_snapshot(baseline), "excluded majority baseline"))
+        return false;
+    std::shared_ptr<const executable::CleanupState> evidence;
+    std::array<int, 3> slots{-1, -1, -1};
+    int original_anchor = -1;
+    int foreign_witness = -1;
+    {
+        executable::ExecutableLease lease;
+        executable::Diagnostic diagnostic;
+        if (!check(
+                executable::ExecutableLease::create(directory.child("program"), lease, diagnostic),
+                "excluded majority create"))
+            return false;
+        std::array<int, 2> authorities{-1, -1};
+        std::vector<int> active;
+        if (!check(new_owned_fds(baseline, lease.observation_fd(), authorities, active),
+                   "excluded majority discovery"))
+            return false;
+        slots = {lease.observation_fd(), authorities[0], authorities[1]};
+        original_anchor = fcntl(slots[2], F_DUPFD_CLOEXEC, 0);
+        const std::string path = "/proc/self/fd/" + std::to_string(original_anchor);
+        const int new_ofd = original_anchor >= 0 ? open(path.c_str(), O_PATH | O_CLOEXEC) : -1;
+        foreign_witness = new_ofd >= 0 ? fcntl(new_ofd, F_DUPFD_CLOEXEC, 0) : -1;
+        if (!check(original_anchor >= 0 && new_ofd >= 0 && foreign_witness >= 0 &&
+                       dup2(new_ofd, slots[0]) == slots[0] && dup2(new_ofd, slots[1]) == slots[1] &&
+                       fcntl(slots[0], F_SETFD, FD_CLOEXEC) == 0 &&
+                       fcntl(slots[1], F_SETFD, FD_CLOEXEC) == 0 && self_kcmp(slots[0], slots[1]) &&
+                       !self_kcmp(slots[0], slots[2]) && close(new_ofd) == 0,
+                   "excluded coordinated replacement"))
+            return false;
+        evidence = lease.cleanup_state();
+    }
+    errno = 0;
+    const int first_flags = fcntl(slots[0], F_GETFD);
+    const int first_error = errno;
+    errno = 0;
+    const int second_flags = fcntl(slots[1], F_GETFD);
+    const int second_error = errno;
+    const bool foreign_majority_closed =
+        first_flags < 0 && first_error == EBADF && second_flags < 0 && second_error == EBADF &&
+        evidence->observation.attempted && evidence->observation.succeeded &&
+        evidence->authority_one.attempted && evidence->authority_one.succeeded;
+    const bool original_minority_preserved =
+        fcntl(slots[2], F_GETFD) >= 0 && fcntl(original_anchor, F_GETFD) >= 0 &&
+        self_kcmp(slots[2], original_anchor) && !evidence->authority_two.attempted &&
+        evidence->authority_two.error_number == EXDEV;
+    const bool witness_preserved = fcntl(foreign_witness, F_GETFD) >= 0;
+    close(slots[2]);
+    close(original_anchor);
+    close(foreign_witness);
+    return check(evidence->destructor && evidence->custody_validation.succeeded &&
+                     foreign_majority_closed && original_minority_preserved && witness_preserved,
+                 "excluded two-slot false-majority limitation was not demonstrated exactly") &&
+           same_snapshot(baseline, "excluded majority final residue");
+}
+
 }  // namespace
 
 int main() {
     bool okay = true;
+    okay = failed_mkdtemp_cleanup_test() && okay;
     okay = canonical_custody_test() && okay;
     okay = argument_and_policy_rejection_test() && okay;
     okay = pathname_replacement_test() && okay;
@@ -1011,6 +1106,7 @@ int main() {
     okay = destructor_cleared_observation_test() && okay;
     okay = destructor_no_proof_test(false) && okay;
     okay = destructor_no_proof_test(true) && okay;
+    okay = destructor_excluded_two_replacement_limit_test() && okay;
     if (okay) std::puts("PASS: executable lease custody and cleanup tests");
     return okay ? 0 : 1;
 }
