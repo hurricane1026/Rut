@@ -53,16 +53,23 @@ struct SettlementReceipt {
     int error_number = 0;
 };
 
+enum class PreparedChildUseState : std::uint8_t { OwnerLive, Claimed, Abandoned };
+
 // Parent-only single-use evidence joining a prepared descriptor plan to the
 // PausedChildLease that successfully claimed it.  It is never consulted by the
-// post-fork child continuation.
+// post-fork child continuation. Under the exclusive single-thread parent
+// contract, its only transitions are OwnerLive->Claimed or
+// OwnerLive->Abandoned.
 class PreparedChildUseReceipt {
 public:
+    PreparedChildUseState state() const { return state_; }
     pid_t child_pid() const { return child_pid_; }
     std::shared_ptr<const SettlementReceipt> settlement() const { return settlement_; }
 
 private:
     friend class PausedChildLease;
+    friend class rut::test::fixture_executable_exec_handoff::ExecutableExecHandoffLease;
+    PreparedChildUseState state_ = PreparedChildUseState::OwnerLive;
     pid_t child_pid_ = -1;
     std::shared_ptr<const SettlementReceipt> settlement_;
 };
@@ -102,7 +109,8 @@ struct HooksForTesting {
 // A declaration-only descriptor plan. The output descriptor remains borrowed
 // from the caller; the lease deliberately retains no duplicate authority for
 // it and therefore requires exclusive ownership of the parent descriptor
-// table until settlement.
+// table until settlement. Copies share a single-use owner lifecycle and are
+// rejected after their originating owner abandons the plan.
 struct ChildDescriptorPlan {
     ChildDescriptorPlan() = default;
     ChildDescriptorPlan(int output_fd) : combined_output_fd(output_fd) {}

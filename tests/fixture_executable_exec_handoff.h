@@ -102,6 +102,8 @@ struct HooksForTesting {
 // Numeric accessors are observation-only causal-test seams; the exclusive
 // parent owner does not read them or mutate its FD table during an operation.
 // Deliberate test mutations are detected fail-closed before release or close.
+// Destroying an H with a claimed active/unreaped child is nonreportable misuse:
+// it deliberately preserves every owned slot and never signals or reaps.
 class ExecutableExecHandoffLease {
 public:
     ExecutableExecHandoffLease();
@@ -192,7 +194,7 @@ private:
     std::string canonical_path_;
     executable::ExecutableIdentity identity_;
     std::shared_ptr<const child_fixture::SettlementReceipt> settlement_;
-    std::shared_ptr<const child_fixture::PreparedChildUseReceipt> child_use_receipt_;
+    std::shared_ptr<child_fixture::PreparedChildUseReceipt> child_use_receipt_;
     std::shared_ptr<CleanupState> cleanup_;
     HooksForTesting hooks_{};
 };

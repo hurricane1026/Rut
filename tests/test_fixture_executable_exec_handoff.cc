@@ -1227,12 +1227,123 @@ bool rejected_prepared_child_destructor_residue_case(bool invalid_input) {
                 deadline, plan, child, child_diagnostic) ||
             child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
             !plan.child_use_receipt_for_testing() ||
+            plan.child_use_receipt_for_testing()->state() !=
+                child_fixture::PreparedChildUseState::OwnerLive ||
             plan.child_use_receipt_for_testing()->child_pid() != -1 ||
             plan.child_use_receipt_for_testing()->settlement())
             return false;
     }
     const bool clean = fd_snapshot() == baseline;
     return close(input) == 0 && close(output) == 0 && source.close(source_diagnostic) && clean;
+}
+
+bool failed_prepared_create_can_retry_case() {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    if (!executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, handoff_diagnostic))
+        return false;
+    const int invalid_input = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    const int valid_input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    child_fixture::ChildDescriptorPlan plan;
+    child_fixture::PausedChildLease child;
+    child_fixture::Diagnostic child_diagnostic;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    if (invalid_input < 0 || valid_input < 0 || output < 0 ||
+        !handoff_lease.make_child_plan(
+            invalid_input, output, false, plan, handoff_diagnostic) ||
+        child_fixture::PausedChildLease::create_prepared(
+            deadline, plan, child, child_diagnostic) ||
+        child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
+        !plan.child_use_receipt_for_testing() ||
+        plan.child_use_receipt_for_testing()->state() !=
+            child_fixture::PreparedChildUseState::OwnerLive)
+        return false;
+    plan.null_input_fd = valid_input;
+    if (!child_fixture::PausedChildLease::create_prepared(
+            deadline, plan, child, child_diagnostic) ||
+        plan.child_use_receipt_for_testing()->state() !=
+            child_fixture::PreparedChildUseState::Claimed)
+        return false;
+    child_fixture::PausedChildLease duplicate_child;
+    if (child_fixture::PausedChildLease::create_prepared(
+            deadline, plan, duplicate_child, child_diagnostic) ||
+        child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
+        child_diagnostic.error_number != EALREADY || duplicate_child.active() ||
+        !child.validate_prepared(deadline, child_diagnostic) ||
+        !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
+        !source.close(source_diagnostic))
+        return false;
+    return close(invalid_input) == 0 && close(valid_input) == 0 && close(output) == 0;
+}
+
+bool copied_plan_rejected_after_owner_end_case(bool explicit_close) {
+    const pid_t subprocess = fork();
+    if (subprocess < 0) return false;
+    if (subprocess == 0) {
+        std::string self;
+        executable::ExecutableLease source;
+        executable::Diagnostic source_diagnostic;
+        if (!canonical_self(self) ||
+            !executable::ExecutableLease::create(self, source, source_diagnostic))
+            _exit(2);
+        const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        const int output = create_capture();
+        child_fixture::ChildDescriptorPlan copied_plan;
+        std::array<int, 3> stale_slots{};
+        {
+            handoff::ExecutableExecHandoffLease handoff_lease;
+            handoff::Diagnostic handoff_diagnostic;
+            child_fixture::ChildDescriptorPlan plan;
+            if (input < 0 || output < 0 ||
+                !handoff::ExecutableExecHandoffLease::create(
+                    source, handoff_lease, handoff_diagnostic) ||
+                !handoff_lease.make_child_plan(
+                    input, output, false, plan, handoff_diagnostic))
+                _exit(3);
+            copied_plan = plan;
+            stale_slots = {plan.executable_fd, plan.exec_status_fd, plan.exec_status_authority_fd};
+            if (explicit_close && !handoff_lease.close(handoff_diagnostic)) _exit(4);
+        }
+        const auto receipt = copied_plan.child_use_receipt_for_testing();
+        if (!receipt || receipt->state() != child_fixture::PreparedChildUseState::Abandoned)
+            _exit(5);
+        for (const int slot : stale_slots) {
+            const int replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (replacement < 0) _exit(6);
+            if (replacement != slot) {
+                if (dup3(replacement, slot, O_CLOEXEC) != slot || close(replacement) != 0) _exit(7);
+            }
+        }
+        const auto repopulated = fd_snapshot();
+        int status = 0;
+        errno = 0;
+        if (waitpid(-1, &status, WNOHANG) != -1 || errno != ECHILD) _exit(8);
+        child_fixture::PausedChildLease child;
+        child_fixture::Diagnostic child_diagnostic;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        if (child_fixture::PausedChildLease::create_prepared(
+                deadline, copied_plan, child, child_diagnostic) ||
+            child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
+            child_diagnostic.error_number != ESTALE || child.active() ||
+            fd_snapshot() != repopulated)
+            _exit(9);
+        errno = 0;
+        if (waitpid(-1, &status, WNOHANG) != -1 || errno != ECHILD) _exit(10);
+        for (const int slot : stale_slots)
+            if (close(slot) != 0) _exit(11);
+        if (close(input) != 0 || close(output) != 0 || !source.close(source_diagnostic)) _exit(12);
+        _exit(0);
+    }
+    int status = 0;
+    while (waitpid(subprocess, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 bool active_child_handoff_destructor_preserves_case() {
@@ -1263,6 +1374,10 @@ bool active_child_handoff_destructor_preserves_case() {
                 !child_fixture::PausedChildLease::create_prepared(
                     deadline, plan, child, child_diagnostic))
                 _exit(3);
+            if (!plan.child_use_receipt_for_testing() ||
+                plan.child_use_receipt_for_testing()->state() !=
+                    child_fixture::PreparedChildUseState::Claimed)
+                _exit(8);
             const auto status = status_slots(handoff_lease);
             owned = {handoff_lease.observation_fd(),
                      handoff_lease.authority_one_fd_for_testing(),
@@ -1273,7 +1388,18 @@ bool active_child_handoff_destructor_preserves_case() {
                      status[3],
                      status[4],
                      status[5]};
+            if (handoff_lease.close(handoff_diagnostic) ||
+                handoff_diagnostic.phase != handoff::FailurePhase::Settlement ||
+                handoff_diagnostic.error_number != EPERM ||
+                plan.child_use_receipt_for_testing()->state() !=
+                    child_fixture::PreparedChildUseState::Claimed)
+                _exit(10);
+            for (const int fd : owned)
+                if (fcntl(fd, F_GETFD) < 0) _exit(11);
         }
+        if (plan.child_use_receipt_for_testing()->state() !=
+            child_fixture::PreparedChildUseState::Claimed)
+            _exit(9);
         for (const int fd : owned)
             if (fcntl(fd, F_GETFD) < 0) _exit(4);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -1341,6 +1467,15 @@ int main() {
     if (!rejected_prepared_child_destructor_residue_case(true) ||
         !rejected_prepared_child_destructor_residue_case(false)) {
         std::fprintf(stderr, "rejected prepared-child destructor residue case failed\n");
+        return 1;
+    }
+    if (!failed_prepared_create_can_retry_case()) {
+        std::fprintf(stderr, "failed prepared-child create retry case failed\n");
+        return 1;
+    }
+    if (!copied_plan_rejected_after_owner_end_case(false) ||
+        !copied_plan_rejected_after_owner_end_case(true)) {
+        std::fprintf(stderr, "copied stale plan owner-lifecycle case failed\n");
         return 1;
     }
     if (!active_child_handoff_destructor_preserves_case()) {

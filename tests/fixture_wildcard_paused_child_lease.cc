@@ -653,9 +653,11 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     const bool prepared = plan != nullptr;
     if (prepared) {
         if (plan->child_use_receipt_ &&
-            (plan->child_use_receipt_->child_pid_ != -1 ||
-             plan->child_use_receipt_->settlement_)) {
-            fail(diagnostic, FailurePhase::Argument, EALREADY);
+            plan->child_use_receipt_->state_ != PreparedChildUseState::OwnerLive) {
+            fail(diagnostic,
+                 FailurePhase::Argument,
+                 plan->child_use_receipt_->state_ == PreparedChildUseState::Abandoned ? ESTALE
+                                                                                       : EALREADY);
             return false;
         }
         const int output_fd = plan->combined_output_fd;
@@ -1019,6 +1021,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     lease.settlement_ = candidate.settlement_;
     lease.settlement_->identity = lease.identity_;
     if (prepared && plan->child_use_receipt_) {
+        plan->child_use_receipt_->state_ = PreparedChildUseState::Claimed;
         plan->child_use_receipt_->child_pid_ = child;
         plan->child_use_receipt_->settlement_ = lease.settlement_;
     }

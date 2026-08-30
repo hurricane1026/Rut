@@ -616,13 +616,33 @@ bool ExecutableExecHandoffLease::close(Diagnostic& diagnostic) {
     diagnostic = {};
     ++cleanup_->cleanup_attempts;
     cleanup_->cleanup_attempted = true;
-    if (!active_ || !settlement_ || settlement_->child_pid != child_pid_ ||
-        !settlement_->terminal || !settlement_->reaped) {
+    if (!active_) {
         fail(diagnostic, FailurePhase::Settlement, EPERM);
         cleanup_->cleanup_diagnostic = diagnostic;
         return false;
     }
-    if (!validate_custody(diagnostic) || !validate_status_custody(true, diagnostic)) {
+    if (plan_made_) {
+        if (!child_use_receipt_) {
+            fail(diagnostic, FailurePhase::Settlement, EPERM);
+            cleanup_->cleanup_diagnostic = diagnostic;
+            return false;
+        }
+        if (child_use_receipt_->state() == child_fixture::PreparedChildUseState::OwnerLive)
+            child_use_receipt_->state_ = child_fixture::PreparedChildUseState::Abandoned;
+        if (child_use_receipt_->state() == child_fixture::PreparedChildUseState::Claimed) {
+            auto settlement = settlement_;
+            if (!settlement) settlement = child_use_receipt_->settlement();
+            if (!settlement || settlement->child_pid != child_use_receipt_->child_pid() ||
+                !settlement->terminal || !settlement->reaped) {
+                fail(diagnostic, FailurePhase::Settlement, EPERM);
+                cleanup_->cleanup_diagnostic = diagnostic;
+                return false;
+            }
+            child_pid_ = child_use_receipt_->child_pid();
+        }
+    }
+    if (!validate_custody(diagnostic) ||
+        (plan_made_ && !validate_status_custody(true, diagnostic))) {
         cleanup_->cleanup_diagnostic = diagnostic;
         return false;
     }
@@ -705,7 +725,9 @@ void ExecutableExecHandoffLease::destructor_cleanup() {
     auto settlement = settlement_;
     if (plan_made_) {
         if (!child_use_receipt_) return;
-        if (child_use_receipt_->child_pid() > 0) {
+        if (child_use_receipt_->state() == child_fixture::PreparedChildUseState::OwnerLive)
+            child_use_receipt_->state_ = child_fixture::PreparedChildUseState::Abandoned;
+        if (child_use_receipt_->state() == child_fixture::PreparedChildUseState::Claimed) {
             if (!settlement) settlement = child_use_receipt_->settlement();
             if (!settlement || settlement->child_pid != child_use_receipt_->child_pid() ||
                 !settlement->terminal || !settlement->reaped)
