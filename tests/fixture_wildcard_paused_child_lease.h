@@ -9,6 +9,10 @@
 
 #include <sys/types.h>
 
+namespace rut::test::fixture_executable_exec_handoff {
+class ExecutableExecHandoffLease;
+}
+
 namespace rut::test::fixture_wildcard_paused_child_lease {
 
 using ProcIdentity = fixture_worker_protocol::ProcIdentity;
@@ -49,6 +53,20 @@ struct SettlementReceipt {
     int error_number = 0;
 };
 
+// Parent-only single-use evidence joining a prepared descriptor plan to the
+// PausedChildLease that successfully claimed it.  It is never consulted by the
+// post-fork child continuation.
+class PreparedChildUseReceipt {
+public:
+    pid_t child_pid() const { return child_pid_; }
+    std::shared_ptr<const SettlementReceipt> settlement() const { return settlement_; }
+
+private:
+    friend class PausedChildLease;
+    pid_t child_pid_ = -1;
+    std::shared_ptr<const SettlementReceipt> settlement_;
+};
+
 enum class ChildContinuationKind : std::uint8_t { Inert, Execveat };
 
 enum class ReleaseSendState : std::uint8_t { NotSent, Sent, SentCloseUncertain };
@@ -86,12 +104,23 @@ struct HooksForTesting {
 // it and therefore requires exclusive ownership of the parent descriptor
 // table until settlement.
 struct ChildDescriptorPlan {
+    ChildDescriptorPlan() = default;
+    ChildDescriptorPlan(int output_fd) : combined_output_fd(output_fd) {}
+
     int combined_output_fd = -1;
     int null_input_fd = -1;
     int executable_fd = -1;
     int exec_status_fd = -1;
     int exec_status_authority_fd = -1;
     ChildContinuation continuation{};
+    std::shared_ptr<const PreparedChildUseReceipt> child_use_receipt_for_testing() const {
+        return child_use_receipt_;
+    }
+
+private:
+    friend class PausedChildLease;
+    friend class rut::test::fixture_executable_exec_handoff::ExecutableExecHandoffLease;
+    std::shared_ptr<PreparedChildUseReceipt> child_use_receipt_;
 };
 
 // A single-use, non-movable paused direct-child lease. The caller owns the

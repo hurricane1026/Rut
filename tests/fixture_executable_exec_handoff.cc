@@ -246,6 +246,7 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
                                                  child_fixture::ChildDescriptorPlan& plan,
                                                  Diagnostic& diagnostic) {
     diagnostic = {};
+    plan = {};
     if (!active_ || plan_made_ || borrowed_null_input_fd <= 2 || borrowed_combined_output_fd <= 2 ||
         borrowed_null_input_fd == borrowed_combined_output_fd ||
         borrowed_null_input_fd == executable_fd_ || borrowed_combined_output_fd == executable_fd_ ||
@@ -298,13 +299,13 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
     }
     std::copy(canonical_path_.begin(), canonical_path_.end(), continuation.argv0.begin());
     continuation.argv0[canonical_path_.size()] = '\0';
-    plan = {};
-    plan.combined_output_fd = borrowed_combined_output_fd;
-    plan.null_input_fd = borrowed_null_input_fd;
-    plan.executable_fd = executable_fd_;
-    plan.exec_status_fd = status[1];
-    plan.exec_status_authority_fd = writer_authority_one;
-    plan.continuation = continuation;
+    child_fixture::ChildDescriptorPlan candidate_plan;
+    candidate_plan.combined_output_fd = borrowed_combined_output_fd;
+    candidate_plan.null_input_fd = borrowed_null_input_fd;
+    candidate_plan.executable_fd = executable_fd_;
+    candidate_plan.exec_status_fd = status[1];
+    candidate_plan.exec_status_authority_fd = writer_authority_one;
+    candidate_plan.continuation = continuation;
     status_reader_fd_ = status[0];
     status_reader_authority_one_fd_ = reader_authority_one;
     status_reader_authority_two_fd_ = reader_authority_two;
@@ -312,7 +313,9 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
     status_writer_authority_one_fd_ = writer_authority_one;
     status_writer_authority_two_fd_ = writer_authority_two;
     struct stat status_identity{};
-    if (fstat(status_reader_fd_, &status_identity) != 0) {
+    if (hooks_.fail_status_identity_fstat ||
+        fstat(status_reader_fd_, &status_identity) != 0) {
+        if (hooks_.fail_status_identity_fstat) errno = EIO;
         fail(diagnostic, FailurePhase::Pipe, errno);
         Diagnostic ignored;
         (void)close_one(status_reader_fd_, ignored);
@@ -334,9 +337,12 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
         ::close(status_writer_authority_two_fd_);
         status_reader_fd_ = status_reader_authority_one_fd_ = status_reader_authority_two_fd_ = -1;
         status_writer_fd_ = status_writer_authority_one_fd_ = status_writer_authority_two_fd_ = -1;
-        plan = {};
         return false;
     }
+    auto child_use_receipt = std::make_shared<child_fixture::PreparedChildUseReceipt>();
+    candidate_plan.child_use_receipt_ = child_use_receipt;
+    child_use_receipt_ = child_use_receipt;
+    plan = candidate_plan;
     plan_made_ = true;
     return true;
 }
@@ -348,8 +354,11 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
                                                      Diagnostic& diagnostic) {
     diagnostic = {};
     observation = {};
+    const auto child_settlement = child.settlement_receipt();
     if (!active_ || !plan_made_ || writer_retired_ || !child.active() ||
-        child.child_executable_fd() != executable_fd_) {
+        child.child_executable_fd() != executable_fd_ || !child_use_receipt_ ||
+        child_use_receipt_->child_pid() != child.child_pid() ||
+        child_use_receipt_->settlement() != child_settlement) {
         fail(diagnostic, FailurePhase::Argument, EINVAL);
         return false;
     }
@@ -369,7 +378,7 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
         return false;
     }
     child_pid_ = child.child_pid();
-    settlement_ = child.settlement_receipt();
+    settlement_ = child_settlement;
     if (!validate_custody(diagnostic) || !validate_status_custody(false, diagnostic) ||
         !same_ofd(getpid(), child.child_pid(), executable_fd_, child.child_executable_fd()) ||
         !same_ofd(getpid(),
@@ -693,9 +702,17 @@ void ExecutableExecHandoffLease::destructor_cleanup() {
     cleanup_->cleanup_attempted = true;
     cleanup_->cleanup_succeeded = false;
     cleanup_->cleanup_diagnostic = {FailurePhase::Settlement, EPERM};
-    if (!settlement_ || settlement_->child_pid != child_pid_ || !settlement_->terminal ||
-        !settlement_->reaped)
-        return;
+    auto settlement = settlement_;
+    if (plan_made_) {
+        if (!child_use_receipt_) return;
+        if (child_use_receipt_->child_pid() > 0) {
+            if (!settlement) settlement = child_use_receipt_->settlement();
+            if (!settlement || settlement->child_pid != child_use_receipt_->child_pid() ||
+                !settlement->terminal || !settlement->reaped)
+                return;
+            child_pid_ = child_use_receipt_->child_pid();
+        }
+    }
     destructor_close_status_triad(status_reader_fd_,
                                   status_reader_authority_one_fd_,
                                   status_reader_authority_two_fd_,

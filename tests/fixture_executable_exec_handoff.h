@@ -89,6 +89,7 @@ struct HooksForTesting {
     // 1 same-inode/new-OFD, 2 different object, 3 clear CLOEXEC.
     std::uint8_t child_executable_mutation = 0;
     bool (*proc_snapshot_allowed)(void*) = nullptr;
+    bool fail_status_identity_fstat = false;
 };
 
 // Tests-only, single-use custody bridge.  The source ExecutableLease remains
@@ -191,6 +192,7 @@ private:
     std::string canonical_path_;
     executable::ExecutableIdentity identity_;
     std::shared_ptr<const child_fixture::SettlementReceipt> settlement_;
+    std::shared_ptr<const child_fixture::PreparedChildUseReceipt> child_use_receipt_;
     std::shared_ptr<CleanupState> cleanup_;
     HooksForTesting hooks_{};
 };

@@ -1,8 +1,10 @@
 #include "fixture_executable_exec_handoff.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -51,6 +53,22 @@ int open_fd_count() {
     }
     if (closedir(directory) != 0) return -1;
     return count;
+}
+
+std::vector<int> fd_snapshot() {
+    std::vector<int> snapshot;
+    DIR* directory = opendir("/proc/self/fd");
+    if (directory == nullptr) return snapshot;
+    const int own_fd = dirfd(directory);
+    while (const dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        const long value = std::strtol(entry->d_name, &end, 10);
+        if (end != entry->d_name && *end == '\0' && value >= 0 && value != own_fd)
+            snapshot.push_back(static_cast<int>(value));
+    }
+    if (closedir(directory) != 0) return {};
+    std::sort(snapshot.begin(), snapshot.end());
+    return snapshot;
 }
 
 std::array<int, 6> status_slots(const handoff::ExecutableExecHandoffLease& lease);
@@ -1127,6 +1145,181 @@ bool destructor_majority_case(bool unique_majority) {
     return result;
 }
 
+bool plan_is_reset(const child_fixture::ChildDescriptorPlan& plan) {
+    return plan.combined_output_fd == -1 && plan.null_input_fd == -1 &&
+           plan.executable_fd == -1 && plan.exec_status_fd == -1 &&
+           plan.exec_status_authority_fd == -1 &&
+           plan.continuation.kind == child_fixture::ChildContinuationKind::Inert &&
+           !plan.child_use_receipt_for_testing();
+}
+
+bool create_only_destructor_residue_case() {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    if (!executable::ExecutableLease::create(self, source, source_diagnostic)) return false;
+    const auto baseline = fd_snapshot();
+    {
+        handoff::ExecutableExecHandoffLease handoff_lease;
+        handoff::Diagnostic diagnostic;
+        if (!handoff::ExecutableExecHandoffLease::create(source, handoff_lease, diagnostic))
+            return false;
+    }
+    return fd_snapshot() == baseline && source.close(source_diagnostic);
+}
+
+bool post_assignment_plan_failure_resets_case() {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    if (!executable::ExecutableLease::create(self, source, source_diagnostic)) return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    if (input < 0 || output < 0) return false;
+    const auto baseline = fd_snapshot();
+    child_fixture::ChildDescriptorPlan plan;
+    plan.combined_output_fd = 77;
+    plan.null_input_fd = 78;
+    plan.executable_fd = 79;
+    plan.exec_status_fd = 80;
+    plan.exec_status_authority_fd = 81;
+    {
+        handoff::ExecutableExecHandoffLease handoff_lease;
+        handoff::Diagnostic diagnostic;
+        handoff::HooksForTesting hooks;
+        hooks.fail_status_identity_fstat = true;
+        if (!handoff::ExecutableExecHandoffLease::create_with_hooks_for_testing(
+                source, hooks, handoff_lease, diagnostic) ||
+            handoff_lease.make_child_plan(input, output, false, plan, diagnostic) ||
+            diagnostic.phase != handoff::FailurePhase::Pipe || diagnostic.error_number != EIO ||
+            !plan_is_reset(plan))
+            return false;
+    }
+    const bool clean = fd_snapshot() == baseline;
+    return close(input) == 0 && close(output) == 0 && source.close(source_diagnostic) && clean;
+}
+
+bool rejected_prepared_child_destructor_residue_case(bool invalid_input) {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    if (!executable::ExecutableLease::create(self, source, source_diagnostic)) return false;
+    const int input = open(invalid_input ? "/dev/zero" : "/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = invalid_input ? create_capture()
+                                     : open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (input < 0 || output < 0) return false;
+    const auto baseline = fd_snapshot();
+    {
+        handoff::ExecutableExecHandoffLease handoff_lease;
+        handoff::Diagnostic handoff_diagnostic;
+        child_fixture::ChildDescriptorPlan plan;
+        child_fixture::PausedChildLease child;
+        child_fixture::Diagnostic child_diagnostic;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        if (!handoff::ExecutableExecHandoffLease::create(
+                source, handoff_lease, handoff_diagnostic) ||
+            !handoff_lease.make_child_plan(
+                input, output, false, plan, handoff_diagnostic) ||
+            child_fixture::PausedChildLease::create_prepared(
+                deadline, plan, child, child_diagnostic) ||
+            child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
+            !plan.child_use_receipt_for_testing() ||
+            plan.child_use_receipt_for_testing()->child_pid() != -1 ||
+            plan.child_use_receipt_for_testing()->settlement())
+            return false;
+    }
+    const bool clean = fd_snapshot() == baseline;
+    return close(input) == 0 && close(output) == 0 && source.close(source_diagnostic) && clean;
+}
+
+bool active_child_handoff_destructor_preserves_case() {
+    const pid_t subprocess = fork();
+    if (subprocess < 0) return false;
+    if (subprocess == 0) {
+        std::string self;
+        executable::ExecutableLease source;
+        executable::Diagnostic source_diagnostic;
+        child_fixture::PausedChildLease child;
+        child_fixture::Diagnostic child_diagnostic;
+        child_fixture::ChildDescriptorPlan plan;
+        if (!canonical_self(self) ||
+            !executable::ExecutableLease::create(self, source, source_diagnostic))
+            _exit(2);
+        const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        const int output = create_capture();
+        std::array<int, 9> owned{};
+        {
+            handoff::ExecutableExecHandoffLease handoff_lease;
+            handoff::Diagnostic handoff_diagnostic;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            if (input < 0 || output < 0 ||
+                !handoff::ExecutableExecHandoffLease::create(
+                    source, handoff_lease, handoff_diagnostic) ||
+                !handoff_lease.make_child_plan(
+                    input, output, false, plan, handoff_diagnostic) ||
+                !child_fixture::PausedChildLease::create_prepared(
+                    deadline, plan, child, child_diagnostic))
+                _exit(3);
+            const auto status = status_slots(handoff_lease);
+            owned = {handoff_lease.observation_fd(),
+                     handoff_lease.authority_one_fd_for_testing(),
+                     handoff_lease.authority_two_fd_for_testing(),
+                     status[0],
+                     status[1],
+                     status[2],
+                     status[3],
+                     status[4],
+                     status[5]};
+        }
+        for (const int fd : owned)
+            if (fcntl(fd, F_GETFD) < 0) _exit(4);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        if (!child.validate_prepared(deadline, child_diagnostic) ||
+            !child.cleanup(deadline, child_diagnostic))
+            _exit(5);
+        for (const int fd : owned)
+            if (close(fd) != 0) _exit(6);
+        if (!source.close(source_diagnostic) || close(input) != 0 || close(output) != 0) _exit(7);
+        _exit(0);
+    }
+    int status = 0;
+    while (waitpid(subprocess, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool reverse_destruction_settlement_residue_case() {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    if (!executable::ExecutableLease::create(self, source, source_diagnostic)) return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    if (input < 0 || output < 0) return false;
+    const auto baseline = fd_snapshot();
+    {
+        handoff::ExecutableExecHandoffLease handoff_lease;
+        child_fixture::ChildDescriptorPlan plan;
+        child_fixture::PausedChildLease child;
+        handoff::Diagnostic handoff_diagnostic;
+        child_fixture::Diagnostic child_diagnostic;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        if (!handoff::ExecutableExecHandoffLease::create(
+                source, handoff_lease, handoff_diagnostic) ||
+            !handoff_lease.make_child_plan(
+                input, output, false, plan, handoff_diagnostic) ||
+            !child_fixture::PausedChildLease::create_prepared(
+                deadline, plan, child, child_diagnostic))
+            return false;
+    }
+    const bool clean = fd_snapshot() == baseline;
+    return close(input) == 0 && close(output) == 0 && source.close(source_diagnostic) && clean;
+}
+
 }  // namespace
 
 int main() {
@@ -1135,6 +1328,27 @@ int main() {
     if (fd_baseline < 0) return 1;
     if (!legacy_inert_prepared_stdin_cloexec_case()) {
         std::fprintf(stderr, "legacy prepared stdin CLOEXEC regression failed\n");
+        return 1;
+    }
+    if (!create_only_destructor_residue_case()) {
+        std::fprintf(stderr, "create-only destructor residue case failed\n");
+        return 1;
+    }
+    if (!post_assignment_plan_failure_resets_case()) {
+        std::fprintf(stderr, "post-assignment plan failure reset case failed\n");
+        return 1;
+    }
+    if (!rejected_prepared_child_destructor_residue_case(true) ||
+        !rejected_prepared_child_destructor_residue_case(false)) {
+        std::fprintf(stderr, "rejected prepared-child destructor residue case failed\n");
+        return 1;
+    }
+    if (!active_child_handoff_destructor_preserves_case()) {
+        std::fprintf(stderr, "active-child handoff destructor preservation case failed\n");
+        return 1;
+    }
+    if (!reverse_destruction_settlement_residue_case()) {
+        std::fprintf(stderr, "reverse destruction settlement residue case failed\n");
         return 1;
     }
     if (!run_live_case()) {
