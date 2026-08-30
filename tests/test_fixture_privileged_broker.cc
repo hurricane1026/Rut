@@ -99,6 +99,10 @@ constexpr u16 kExactRutCleanup = 43;
 constexpr u16 kExactRutCleaned = 44;
 constexpr u16 kExactRutFailure = 45;
 constexpr u16 kExactEscrowSettled = 46;
+constexpr u16 kWildcardHandoffRun = 47;
+constexpr u16 kWildcardHandoffWitness = 48;
+constexpr u16 kWildcardHandoffFinish = 49;
+constexpr u16 kWildcardHandoffFinished = 50;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
 constexpr int kCredentialFd = 198;
@@ -175,7 +179,12 @@ static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
 
 static bool listener_scenario_name(const char* scenario) {
     return strcmp(scenario, "listener-guard-reservation") == 0 ||
-           strcmp(scenario, "listener-cleanup-observation-failure") == 0;
+           strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
+           strcmp(scenario, "listener-wildcard-release-handoff") == 0;
+}
+
+static bool listener_wildcard_handoff(const char* scenario) {
+    return strcmp(scenario, "listener-wildcard-release-handoff") == 0;
 }
 
 static bool listener_failure_integration(const char* scenario) {
@@ -185,10 +194,11 @@ static bool listener_failure_integration(const char* scenario) {
 static_assert(kListenerDeadlineMs <= std::numeric_limits<int>::max() / 4);
 constexpr int kListenerFailureLauncherWaitMs = kListenerDeadlineMs * 4;
 constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
+constexpr int kWildcardHandoffLauncherWaitMs = kListenerDeadlineMs * 4;
 
 static int launcher_broker_wait_ms(const char* scenario) {
-    return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
-                                                  : kBrokerDeadlineMs;
+    if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
+    return listener_wildcard_handoff(scenario) ? kWildcardHandoffLauncherWaitMs : kBrokerDeadlineMs;
 }
 
 static int cleanup_response_wait_ms(const char* scenario) {
@@ -203,6 +213,9 @@ static bool listener_failure_bound_self_check(std::string& error) {
             kListenerDeadlineMs * 2 ||
         launcher_broker_wait_ms("listener-guard-reservation") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("listener-wildcard-release-handoff") !=
+            kWildcardHandoffLauncherWaitMs ||
+        cleanup_response_wait_ms("listener-wildcard-release-handoff") != kListenerDeadlineMs ||
         launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("normal") != kListenerDeadlineMs) {
         error = "listener failure extended deadline selection failed";
@@ -1114,6 +1127,50 @@ struct ExactRutCleanedReport {
     u64 guard_connect_error = 0u;
 };
 
+constexpr u64 kWildcardHandoffVersion = 1u;
+constexpr std::size_t kWildcardHandoffFields = 39u;
+struct WildcardHandoffReport {
+    u64 version = kWildcardHandoffVersion;
+    u64 collision_pid = 0u;
+    u64 collision_start = 0u;
+    u64 collision_exit_one = 0u;
+    u64 collision_pidfd_invalidated = 0u;
+    u64 collision_log_eaddrinuse = 0u;
+    u64 collision_no_wildcard = 0u;
+    u64 collision_exact_live = 0u;
+    u64 collision_guard_live = 0u;
+    u64 collision_source_absent = 0u;
+    u64 collision_log_absent = 0u;
+    u64 collision_response_bytes = 0u;
+    u64 exact_reaped = 0u;
+    u64 exact_listener_absent = 0u;
+    u64 exact_temps_absent = 0u;
+    u64 guard_invalidated = 0u;
+    u64 port_absent_before_retry = 0u;
+    u64 same_source = 0u;
+    u64 wildcard_pid = 0u;
+    u64 wildcard_start = 0u;
+    u64 wildcard_listener_inode = 0u;
+    u64 wildcard_kind = 0u;
+    u64 positive_response_bytes = 0u;
+    u64 positive_response_exact = 0u;
+    u64 positive_prompt_eof = 0u;
+    u64 guard_response_bytes = 0u;
+    u64 guard_response_exact = 0u;
+    u64 guard_prompt_eof = 0u;
+    u64 wildcard_stable = 0u;
+    u64 wildcard_clean_exit = 0u;
+    u64 wildcard_pidfd_invalidated = 0u;
+    u64 wildcard_child_absent = 0u;
+    u64 wildcard_listener_absent = 0u;
+    u64 wildcard_source_absent = 0u;
+    u64 wildcard_log_absent = 0u;
+    u64 target_fd_count = 0u;
+    u64 positive_ipv4 = 0u;
+    u64 guard_ipv4 = 0u;
+    u64 port = 0u;
+};
+
 enum class ExactFailurePhase : u64 {
     LeaseReopen = 1u,
     Temp = 2u,
@@ -1338,6 +1395,71 @@ static bool decode_exact_cleaned(const std::vector<unsigned char>& payload,
               fields[9],
               fields[10]};
     return report.version == kExactProtocolVersion;
+}
+
+static std::vector<unsigned char> encode_wildcard_handoff(const WildcardHandoffReport& report) {
+    const std::array<u64, kWildcardHandoffFields> fields{
+        report.version,
+        report.collision_pid,
+        report.collision_start,
+        report.collision_exit_one,
+        report.collision_pidfd_invalidated,
+        report.collision_log_eaddrinuse,
+        report.collision_no_wildcard,
+        report.collision_exact_live,
+        report.collision_guard_live,
+        report.collision_source_absent,
+        report.collision_log_absent,
+        report.collision_response_bytes,
+        report.exact_reaped,
+        report.exact_listener_absent,
+        report.exact_temps_absent,
+        report.guard_invalidated,
+        report.port_absent_before_retry,
+        report.same_source,
+        report.wildcard_pid,
+        report.wildcard_start,
+        report.wildcard_listener_inode,
+        report.wildcard_kind,
+        report.positive_response_bytes,
+        report.positive_response_exact,
+        report.positive_prompt_eof,
+        report.guard_response_bytes,
+        report.guard_response_exact,
+        report.guard_prompt_eof,
+        report.wildcard_stable,
+        report.wildcard_clean_exit,
+        report.wildcard_pidfd_invalidated,
+        report.wildcard_child_absent,
+        report.wildcard_listener_absent,
+        report.wildcard_source_absent,
+        report.wildcard_log_absent,
+        report.target_fd_count,
+        report.positive_ipv4,
+        report.guard_ipv4,
+        report.port,
+    };
+    std::vector<unsigned char> payload;
+    payload.reserve(fields.size() * sizeof(u64));
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool decode_wildcard_handoff(const std::vector<unsigned char>& payload,
+                                    WildcardHandoffReport& report) {
+    report = {};
+    if (payload.size() != kWildcardHandoffFields * sizeof(u64)) return false;
+    std::array<u64, kWildcardHandoffFields> fields{};
+    for (std::size_t i = 0u; i < fields.size(); ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    if (fields[0] != kWildcardHandoffVersion) return false;
+    report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
+              fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
+              fields[14], fields[15], fields[16], fields[17], fields[18], fields[19], fields[20],
+              fields[21], fields[22], fields[23], fields[24], fields[25], fields[26], fields[27],
+              fields[28], fields[29], fields[30], fields[31], fields[32], fields[33], fields[34],
+              fields[35], fields[36], fields[37], fields[38]};
+    return report.version == kWildcardHandoffVersion;
 }
 
 static std::vector<unsigned char> exact_cleanup_payload() {
@@ -2377,6 +2499,8 @@ struct ExactChildState {
     struct stat executable_status{};
     std::string executable;
     std::string argv;
+    std::string source_name;
+    std::string log_name;
     std::string source_path;
     std::string log_path;
     std::string directory_path;
@@ -3241,10 +3365,10 @@ static bool cleanup_exact_child(ExactChildState& child,
                                  child.log_status.st_ino == 0u;
     const bool source_removed =
         reaped && (no_temp_custody ||
-                   remove_exact_temp(directory_fd, "exact-listener.rut", child.source_status));
+                   remove_exact_temp(directory_fd, child.source_name.c_str(), child.source_status));
     const bool log_removed =
         reaped && (no_temp_custody ||
-                   remove_exact_temp(directory_fd, "exact-listener.log", child.log_status));
+                   remove_exact_temp(directory_fd, child.log_name.c_str(), child.log_status));
     if (directory_fd >= 0) close(directory_fd);
     u64 fd_count = 0u;
     int guard_error = 0;
@@ -3341,8 +3465,10 @@ static bool start_exact_child(const Frame& command,
     }
     child.directory_path = directory_path;
     child.directory_status = directory_status;
-    child.source_path = directory_path + "/exact-listener.rut";
-    child.log_path = directory_path + "/exact-listener.log";
+    child.source_name = "exact-listener.rut";
+    child.log_name = "exact-listener.log";
+    child.source_path = directory_path + "/" + child.source_name;
+    child.log_path = directory_path + "/" + child.log_name;
     failure.phase = ExactFailurePhase::Temp;
     std::string source;
     privileged_listener::Diagnostic source_diagnostic;
@@ -3353,11 +3479,11 @@ static bool start_exact_child(const Frame& command,
         return false;
     }
     const int source_fd = openat(directory_fd,
-                                 "exact-listener.rut",
+                                 child.source_name.c_str(),
                                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                                  0600);
     const int log_fd = openat(directory_fd,
-                              "exact-listener.log",
+                              child.log_name.c_str(),
                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                               0600);
     const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
@@ -3369,8 +3495,8 @@ static bool start_exact_child(const Frame& command,
         if (source_fd >= 0) close(source_fd);
         if (log_fd >= 0) close(log_fd);
         (void)unlink_regular_at_if_identity(
-            directory_fd, "exact-listener.rut", child.source_status);
-        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+            directory_fd, child.source_name.c_str(), child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
         close(directory_fd);
         close(executable_fd);
         return false;
@@ -3419,8 +3545,8 @@ static bool start_exact_child(const Frame& command,
     close(log_fd);
     if (pid <= 1) {
         (void)unlink_regular_at_if_identity(
-            directory_fd, "exact-listener.rut", child.source_status);
-        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+            directory_fd, child.source_name.c_str(), child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
         close(directory_fd);
         close(executable_fd);
         return false;
@@ -3561,6 +3687,467 @@ static bool start_exact_child(const Frame& command,
     report.stable = 1u;
     report.backend = backend;
     return true;
+}
+
+static bool remove_listener_attempt_temps(ExactChildState& child) {
+    const int directory_fd = reopen_exact_directory(child);
+    if (directory_fd < 0) return false;
+    const bool source_removed =
+        remove_exact_temp(directory_fd, child.source_name.c_str(), child.source_status);
+    const bool log_removed =
+        remove_exact_temp(directory_fd, child.log_name.c_str(), child.log_status);
+    close(directory_fd);
+    return source_removed && log_removed;
+}
+
+static bool close_attempt_pidfd(ExactChildState& child) {
+    if (!child.pidfd_acquired || child.pidfd < 0) return false;
+    const int old = child.pidfd;
+    close(child.pidfd);
+    child.pidfd = -1;
+    errno = 0;
+    return fcntl(old, F_GETFD) < 0 && errno == EBADF;
+}
+
+static bool observe_selected_port_absent(const privileged_listener::ListenerPlan& plan,
+                                         std::chrono::steady_clock::time_point deadline) {
+    while (std::chrono::steady_clock::now() < deadline) {
+        privileged_listener::ProcTcpTable table;
+        privileged_listener::ListenerEvidence evidence;
+        privileged_listener::Diagnostic diagnostic;
+        if (read_process_tcp_table(getpid(), table) &&
+            privileged_listener::classify_listener_evidence(
+                table,
+                plan,
+                {},
+                privileged_listener::ListenerEvidenceKind::PortAbsent,
+                evidence,
+                diagnostic))
+            return true;
+        (void)poll(nullptr, 0, 10);
+    }
+    return false;
+}
+
+static bool prepare_wildcard_attempt(const ExactChildState& exact_owner,
+                                     const GuardReport& held,
+                                     const char* stem,
+                                     ExactChildState& child,
+                                     std::string& source_bytes) {
+    child = {};
+    source_bytes.clear();
+    if (stem == nullptr ||
+        (strcmp(stem, "wildcard-collision") != 0 && strcmp(stem, "wildcard-success") != 0))
+        return false;
+#ifdef O_PATH
+    const int executable_fd = open(exact_owner.executable.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
+#else
+    const int executable_fd = -1;
+#endif
+    struct stat executable_status{}, path_status{};
+    if (executable_fd < 0 || fstat(executable_fd, &executable_status) != 0 ||
+        lstat(exact_owner.executable.c_str(), &path_status) != 0 ||
+        executable_status.st_dev != exact_owner.executable_status.st_dev ||
+        executable_status.st_ino != exact_owner.executable_status.st_ino ||
+        executable_status.st_mode != exact_owner.executable_status.st_mode ||
+        executable_status.st_uid != exact_owner.executable_status.st_uid ||
+        executable_status.st_gid != exact_owner.executable_status.st_gid ||
+        path_status.st_dev != executable_status.st_dev ||
+        path_status.st_ino != executable_status.st_ino) {
+        if (executable_fd >= 0) close(executable_fd);
+        return false;
+    }
+    const int directory_fd = reopen_exact_directory(exact_owner);
+    if (directory_fd < 0) {
+        close(executable_fd);
+        return false;
+    }
+    child.directory_path = exact_owner.directory_path;
+    child.directory_status = exact_owner.directory_status;
+    child.source_name = std::string(stem) + ".rut";
+    child.log_name = std::string(stem) + ".log";
+    child.source_path = child.directory_path + "/" + child.source_name;
+    child.log_path = child.directory_path + "/" + child.log_name;
+    privileged_listener::Diagnostic diagnostic;
+    if (!privileged_listener::build_listener_source(
+            held.plan,
+            privileged_listener::ListenerSourceKind::Wildcard,
+            source_bytes,
+            diagnostic)) {
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    const int source_fd = openat(directory_fd,
+                                 child.source_name.c_str(),
+                                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                                 0600);
+    const int log_fd = openat(directory_fd,
+                              child.log_name.c_str(),
+                              O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                              0600);
+    const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
+    const bool log_identity = log_fd >= 0 && fstat(log_fd, &child.log_status) == 0;
+    if (!source_identity || !log_identity || !write_all_fd(source_fd, source_bytes) ||
+        fsync(source_fd) != 0 || !S_ISREG(child.source_status.st_mode) ||
+        !S_ISREG(child.log_status.st_mode) || (child.source_status.st_mode & 0777) != 0600 ||
+        (child.log_status.st_mode & 0777) != 0600) {
+        if (source_fd >= 0) close(source_fd);
+        if (log_fd >= 0) close(log_fd);
+        (void)unlink_regular_at_if_identity(
+            directory_fd, child.source_name.c_str(), child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, child.log_name.c_str(), child.log_status);
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    close(source_fd);
+    int release_pipe[2] = {-1, -1};
+    if (pipe2(release_pipe, O_CLOEXEC) != 0) {
+        close(log_fd);
+        (void)remove_listener_attempt_temps(child);
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(release_pipe[1]);
+        if (setpgid(0, 0) != 0 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent ||
+            dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+            _exit(125);
+        char release = 0;
+        ssize_t count;
+        do {
+            count = read(release_pipe[0], &release, 1);
+        } while (count < 0 && errno == EINTR);
+        if (count != 1 || release != 'R') _exit(125);
+        close(release_pipe[0]);
+        const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(125);
+#ifdef SYS_close_range
+        if ((executable_fd > 3 &&
+             syscall(SYS_close_range, 3u, static_cast<unsigned>(executable_fd - 1), 0u) != 0) ||
+            syscall(SYS_close_range,
+                    static_cast<unsigned>(executable_fd + 1),
+                    std::numeric_limits<unsigned>::max(),
+                    0u) != 0)
+            _exit(125);
+#else
+        const long limit = sysconf(_SC_OPEN_MAX);
+        if (limit <= 0 || limit > std::numeric_limits<int>::max()) _exit(125);
+        for (int fd = 3; fd < limit; ++fd)
+            if (fd != executable_fd) close(fd);
+#endif
+        std::array<char*, 10> argv{
+            const_cast<char*>(exact_owner.executable.c_str()),
+            const_cast<char*>(child.source_path.c_str()),
+            const_cast<char*>("--shards"),
+            const_cast<char*>("1"),
+            const_cast<char*>("--no-pin"),
+            const_cast<char*>("--drain"),
+            const_cast<char*>("0"),
+            const_cast<char*>("--opt"),
+            const_cast<char*>("2"),
+            nullptr,
+        };
+#ifdef SYS_execveat
+        syscall(SYS_execveat, executable_fd, "", argv.data(), environ, AT_EMPTY_PATH);
+#endif
+        _exit(126);
+    }
+    close(release_pipe[0]);
+    close(log_fd);
+    close(directory_fd);
+    if (pid <= 1) {
+        close(release_pipe[1]);
+        close(executable_fd);
+        (void)remove_listener_attempt_temps(child);
+        return false;
+    }
+    child.forked = true;
+    child.pid = pid;
+    child.executable = exact_owner.executable;
+    child.executable_status = executable_status;
+    child.argv = exact_argv({child.executable,
+                             child.source_path,
+                             "--shards",
+                             "1",
+                             "--no-pin",
+                             "--drain",
+                             "0",
+                             "--opt",
+                             "2"});
+    (void)setpgid(pid, pid);
+#ifdef SYS_pidfd_open
+    child.pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+#endif
+    child.pidfd_acquired = child.pidfd >= 0;
+    ProcIdentity pre_exec;
+    const bool identity_ok = child.pidfd >= 0 && (fcntl(child.pidfd, F_GETFD) & FD_CLOEXEC) != 0 &&
+                             exact_pidfd_binding(child.pidfd, pid) &&
+                             read_proc(pid, pre_exec, false) && pre_exec.pid == pid &&
+                             pre_exec.ppid == getpid() && pre_exec.pgid == pid &&
+                             pre_exec.uid == getuid() && pre_exec.gid == getgid() &&
+                             pre_exec.netns == held.netns && pre_exec.start != 0u;
+    child.identity = pre_exec;
+    const bool released = identity_ok && write(release_pipe[1], "R", 1) == 1;
+    close(release_pipe[1]);
+    close(executable_fd);
+    if (released) return true;
+    (void)reap_exact_owned_child(child, new_exact_cleanup_deadline());
+    if (child.reaped && child.pidfd >= 0) (void)close_attempt_pidfd(child);
+    if (child.reaped) (void)remove_listener_attempt_temps(child);
+    return false;
+}
+
+static bool run_wildcard_handoff(int guard_fd,
+                                 const GuardReport& held,
+                                 ExactChildState& exact_child,
+                                 WildcardHandoffReport& report) {
+    report = {};
+    report.positive_ipv4 = held.plan.positive_ipv4;
+    report.guard_ipv4 = held.plan.guard_ipv4;
+    report.port = held.plan.port;
+    ExactChildState collision;
+    std::string collision_source;
+    if (!prepare_wildcard_attempt(
+            exact_child, held, "wildcard-collision", collision, collision_source))
+        return false;
+    report.collision_pid = static_cast<u64>(collision.pid);
+    report.collision_start = collision.identity.start;
+    const auto collision_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
+    while (!collision.reaped && std::chrono::steady_clock::now() < collision_deadline) {
+        (void)exact_direct_wait(collision);
+        if (!collision.reaped) (void)poll(nullptr, 0, 10);
+    }
+    if (!collision.reaped) {
+        if (!reap_exact_owned_child(collision, new_exact_cleanup_deadline()))
+            for (;;) (void)poll(nullptr, 0, kCleanupMs);
+        (void)close_attempt_pidfd(collision);
+        (void)remove_listener_attempt_temps(collision);
+        return false;
+    }
+    report.collision_exit_one =
+        WIFEXITED(collision.wait_status) && WEXITSTATUS(collision.wait_status) == 1 ? 1u : 0u;
+    report.collision_pidfd_invalidated = close_attempt_pidfd(collision) ? 1u : 0u;
+    std::string collision_log;
+    privileged_listener::CollisionLogEvidence collision_evidence;
+    privileged_listener::Diagnostic diagnostic;
+    report.collision_log_eaddrinuse =
+        read_file(collision.log_path, collision_log, privileged_listener::kMaxCollisionLogBytes) &&
+                privileged_listener::classify_collision_log(
+                    collision_log, collision.source_path, 2u, collision_evidence, diagnostic)
+            ? 1u
+            : 0u;
+    ProcIdentity exact_live;
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> exact_inodes;
+    privileged_listener::ListenerEvidence exact_evidence;
+    const bool exact_identity =
+        exact_child_identity(exact_child, exact_child.executable_status, held.netns, exact_live);
+    const bool exact_only = exact_identity &&
+                            same_process_identity(exact_live, exact_child.identity) &&
+                            read_process_tcp_table(getpid(), table) &&
+                            process_socket_inodes(exact_child.pid, exact_inodes) &&
+                            privileged_listener::classify_listener_evidence(
+                                table,
+                                held.plan,
+                                exact_inodes,
+                                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                                exact_evidence,
+                                diagnostic) &&
+                            exact_evidence.child_owned_inode == exact_child.listener_inode;
+    report.collision_no_wildcard = exact_only ? 1u : 0u;
+    report.collision_exact_live = exact_identity ? 1u : 0u;
+    report.collision_guard_live =
+        target_socket_inode(getpid(), guard_fd, held.socket_inode) ? 1u : 0u;
+    const bool collision_temps = remove_listener_attempt_temps(collision);
+    errno = 0;
+    report.collision_source_absent =
+        collision_temps && access(collision.source_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
+                                                                                              : 0u;
+    errno = 0;
+    report.collision_log_absent =
+        collision_temps && access(collision.log_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
+                                                                                           : 0u;
+    if (report.collision_exit_one != 1u || report.collision_pidfd_invalidated != 1u ||
+        report.collision_log_eaddrinuse != 1u || report.collision_no_wildcard != 1u ||
+        report.collision_exact_live != 1u || report.collision_guard_live != 1u ||
+        report.collision_source_absent != 1u || report.collision_log_absent != 1u ||
+        report.collision_response_bytes != 0u)
+        return false;
+
+    ExactRutCleanedReport exact_cleaned;
+    ExactFailureReport exact_failure;
+    if (!cleanup_exact_child(exact_child,
+                             held,
+                             guard_fd,
+                             &exact_cleaned,
+                             true,
+                             new_exact_cleanup_deadline(),
+                             &exact_failure))
+        return false;
+    report.exact_reaped = exact_cleaned.clean_exit && exact_cleaned.child_absent;
+    report.exact_listener_absent = exact_cleaned.listener_absent;
+    report.exact_temps_absent = exact_cleaned.temps_absent;
+    if (report.exact_reaped != 1u || report.exact_listener_absent != 1u ||
+        report.exact_temps_absent != 1u || !exact_child.guard_release_safe ||
+        !target_socket_inode(getpid(), guard_fd, held.socket_inode))
+        return false;
+
+    const int old_guard = guard_fd;
+    close(guard_fd);
+    errno = 0;
+    report.guard_invalidated = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
+    report.port_absent_before_retry =
+        observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()) ? 1u : 0u;
+    if (report.guard_invalidated != 1u || report.port_absent_before_retry != 1u) return false;
+
+    ExactChildState wildcard;
+    std::string success_source;
+    if (!prepare_wildcard_attempt(exact_child, held, "wildcard-success", wildcard, success_source))
+        return false;
+    report.same_source = success_source == collision_source ? 1u : 0u;
+    report.wildcard_pid = static_cast<u64>(wildcard.pid);
+    report.wildcard_start = wildcard.identity.start;
+    const auto ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
+    u64 backend = 0u;
+    bool ready = false;
+    while (std::chrono::steady_clock::now() < ready_deadline) {
+        ProcIdentity identity;
+        privileged_listener::ProcTcpTable ready_table;
+        std::vector<u64> inodes;
+        privileged_listener::ListenerEvidence evidence;
+        std::string log;
+        if (exact_child_identity(wildcard, wildcard.executable_status, held.netns, identity)) {
+            wildcard.identity = identity;
+            wildcard.post_exec_identity = true;
+            if (read_process_tcp_table(getpid(), ready_table) &&
+                process_socket_inodes(wildcard.pid, inodes) &&
+                privileged_listener::classify_listener_evidence(
+                    ready_table,
+                    held.plan,
+                    inodes,
+                    privileged_listener::ListenerEvidenceKind::Wildcard,
+                    evidence,
+                    diagnostic) &&
+                read_file(wildcard.log_path, log, privileged_listener::kMaxCollisionLogBytes) &&
+                exact_log_ready(
+                    log, wildcard.source_path, static_cast<u16>(held.plan.port), backend)) {
+                wildcard.listener_inode = evidence.child_owned_inode;
+                ready = true;
+                break;
+            }
+        }
+        if (exact_direct_wait(wildcard)) break;
+        (void)poll(nullptr, 0, 10);
+    }
+    if (!ready || wildcard.listener_inode == 0u || report.same_source != 1u) {
+        if (!reap_exact_owned_child(wildcard, new_exact_cleanup_deadline()))
+            for (;;) (void)poll(nullptr, 0, kCleanupMs);
+        if (wildcard.pidfd >= 0) (void)close_attempt_pidfd(wildcard);
+        if (wildcard.reaped) (void)remove_listener_attempt_temps(wildcard);
+        return false;
+    }
+    const auto cleanup_failed_wildcard = [&]() {
+        if (!reap_exact_owned_child(wildcard, new_exact_cleanup_deadline()))
+            for (;;) (void)poll(nullptr, 0, kCleanupMs);
+        if (wildcard.pidfd >= 0 && !close_attempt_pidfd(wildcard))
+            for (;;) (void)poll(nullptr, 0, kCleanupMs);
+        if (!remove_listener_attempt_temps(wildcard) ||
+            !observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()))
+            for (;;) (void)poll(nullptr, 0, kCleanupMs);
+    };
+    report.wildcard_start = wildcard.identity.start;
+    report.wildcard_listener_inode = wildcard.listener_inode;
+    report.wildcard_kind = 1u;
+    ExactRutReport positive_response;
+    ExactRutReport guard_response;
+    if (!exact_http_exchange(held.plan.positive_ipv4,
+                             static_cast<u16>(held.plan.port),
+                             ready_deadline,
+                             positive_response) ||
+        !exact_http_exchange(held.plan.guard_ipv4,
+                             static_cast<u16>(held.plan.port),
+                             ready_deadline,
+                             guard_response)) {
+        cleanup_failed_wildcard();
+        return false;
+    }
+    report.positive_response_bytes = positive_response.response_bytes;
+    report.positive_response_exact = positive_response.response_exact;
+    report.positive_prompt_eof = positive_response.prompt_eof;
+    report.guard_response_bytes = guard_response.response_bytes;
+    report.guard_response_exact = guard_response.response_exact;
+    report.guard_prompt_eof = guard_response.prompt_eof;
+    if (std::chrono::steady_clock::now() + std::chrono::milliseconds(500) > ready_deadline) {
+        cleanup_failed_wildcard();
+        return false;
+    }
+    (void)poll(nullptr, 0, 500);
+    ProcIdentity stable;
+    privileged_listener::ProcTcpTable stable_table;
+    std::vector<u64> stable_inodes;
+    privileged_listener::ListenerEvidence stable_evidence;
+    u64 live_fd_count = 0u;
+    report.wildcard_stable =
+        exact_child_identity(wildcard, wildcard.executable_status, held.netns, stable) &&
+                same_process_identity(stable, wildcard.identity) &&
+                read_process_tcp_table(getpid(), stable_table) &&
+                process_socket_inodes(wildcard.pid, stable_inodes) &&
+                privileged_listener::classify_listener_evidence(
+                    stable_table,
+                    held.plan,
+                    stable_inodes,
+                    privileged_listener::ListenerEvidenceKind::Wildcard,
+                    stable_evidence,
+                    diagnostic) &&
+                stable_evidence.child_owned_inode == wildcard.listener_inode &&
+                count_open_fds(live_fd_count) && live_fd_count == held.current_fd_count
+            ? 1u
+            : 0u;
+    if (report.wildcard_stable != 1u) {
+        cleanup_failed_wildcard();
+        return false;
+    }
+    const bool reaped = reap_exact_owned_child(wildcard, new_exact_cleanup_deadline());
+    if (!reaped)
+        for (;;) (void)poll(nullptr, 0, kCleanupMs);
+    report.wildcard_clean_exit =
+        reaped && WIFEXITED(wildcard.wait_status) && WEXITSTATUS(wildcard.wait_status) == 0 ? 1u
+                                                                                            : 0u;
+    report.wildcard_pidfd_invalidated = reaped && close_attempt_pidfd(wildcard) ? 1u : 0u;
+    report.wildcard_child_absent =
+        reaped && observe_exact_liveness(wildcard.identity) == ExactLiveness::ExitedOrReused ? 1u
+                                                                                             : 0u;
+    const bool wildcard_temps = reaped && remove_listener_attempt_temps(wildcard);
+    errno = 0;
+    report.wildcard_source_absent =
+        wildcard_temps && access(wildcard.source_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u
+                                                                                            : 0u;
+    errno = 0;
+    report.wildcard_log_absent =
+        wildcard_temps && access(wildcard.log_path.c_str(), F_OK) < 0 && errno == ENOENT ? 1u : 0u;
+    report.wildcard_listener_absent =
+        reaped && observe_selected_port_absent(held.plan, new_exact_cleanup_deadline()) ? 1u : 0u;
+    (void)count_open_fds(report.target_fd_count);
+    if (report.wildcard_pidfd_invalidated != 1u || report.wildcard_child_absent != 1u ||
+        report.wildcard_listener_absent != 1u || report.wildcard_source_absent != 1u ||
+        report.wildcard_log_absent != 1u || report.target_fd_count != held.baseline_fd_count)
+        for (;;) (void)poll(nullptr, 0, kCleanupMs);
+    return report.version == kWildcardHandoffVersion && report.same_source == 1u &&
+           report.wildcard_kind == 1u && report.positive_response_bytes == 65u &&
+           report.positive_response_exact == 1u && report.positive_prompt_eof == 1u &&
+           report.guard_response_bytes == 65u && report.guard_response_exact == 1u &&
+           report.guard_prompt_eof == 1u && report.wildcard_stable == 1u &&
+           report.wildcard_clean_exit == 1u && report.wildcard_pidfd_invalidated == 1u &&
+           report.wildcard_child_absent == 1u && report.wildcard_listener_absent == 1u &&
+           report.wildcard_source_absent == 1u && report.wildcard_log_absent == 1u &&
+           report.target_fd_count == held.baseline_fd_count;
 }
 
 static int finish_exact_failure(int control,
@@ -3745,7 +4332,49 @@ static int secured_target_main(const char* control_path,
             ExactRutCleanedReport exact_cleaned;
             const bool cleanup_command =
                 receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
-                exact_cleanup_request(exact_cleanup, token);
+                (exact_cleanup_request(exact_cleanup, token) ||
+                 (listener_wildcard_handoff(scenario) &&
+                  exact_request(exact_cleanup, kWildcardHandoffRun, token)));
+            if (cleanup_command && listener_wildcard_handoff(scenario)) {
+                WildcardHandoffReport wildcard_report;
+                if (!run_wildcard_handoff(guard_fd, held, exact_child, wildcard_report) ||
+                    !send_frame(control,
+                                Frame{kWildcardHandoffWitness,
+                                      token,
+                                      encode_wildcard_handoff(wildcard_report)},
+                                kHandshakeMs)) {
+                    exact_failure.phase = ExactFailurePhase::Cleanup;
+                    exact_failure.error_number = EPROTO;
+                    if (!exact_child.cleanup_complete) {
+                        const bool cleanup_ok = cleanup_exact_child(exact_child,
+                                                                    held,
+                                                                    guard_fd,
+                                                                    nullptr,
+                                                                    false,
+                                                                    new_exact_cleanup_deadline(),
+                                                                    &exact_failure);
+                        if (!cleanup_ok)
+                            return finish_exact_failure(
+                                control, token, held, guard_fd, exact_child, exact_failure, 56);
+                    }
+                    (void)send_frame(
+                        control,
+                        Frame{kExactRutFailure, token, encode_exact_failure(exact_failure)},
+                        kHandshakeMs);
+                    close(control);
+                    return 56;
+                }
+                Frame finish;
+                if (!receive_frame(control, finish, kBrokerDeadlineMs) ||
+                    !exact_request(finish, kWildcardHandoffFinish, token) ||
+                    !send_frame(
+                        control, Frame{kWildcardHandoffFinished, token, {}}, kHandshakeMs)) {
+                    close(control);
+                    return 56;
+                }
+                close(control);
+                return 0;
+            }
             if (cleanup_command && listener_failure_integration(scenario)) {
                 ExactCleanupObservation injected;
                 const bool unexpectedly_absent =
@@ -8574,6 +9203,139 @@ static bool validate_exact_cleaned_report(const ExactRutCleanedReport& report,
     return true;
 }
 
+static bool validate_wildcard_handoff_report(const WildcardHandoffReport& report,
+                                             const ExactRutReport& exact_live,
+                                             const ProcIdentity& exact_child,
+                                             const ExecutableLease& lease,
+                                             const ParentEndpoint& endpoint,
+                                             const ProcIdentity& target,
+                                             const GuardReport& held,
+                                             std::string& error) {
+    const bool scalar =
+        report.version == kWildcardHandoffVersion && report.collision_pid > 1u &&
+        report.collision_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
+        report.collision_start != 0u && report.collision_exit_one == 1u &&
+        report.collision_pidfd_invalidated == 1u && report.collision_log_eaddrinuse == 1u &&
+        report.collision_no_wildcard == 1u && report.collision_exact_live == 1u &&
+        report.collision_guard_live == 1u && report.collision_source_absent == 1u &&
+        report.collision_log_absent == 1u && report.collision_response_bytes == 0u &&
+        report.exact_reaped == 1u && report.exact_listener_absent == 1u &&
+        report.exact_temps_absent == 1u && report.guard_invalidated == 1u &&
+        report.port_absent_before_retry == 1u && report.same_source == 1u &&
+        report.wildcard_pid > 1u &&
+        report.wildcard_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
+        report.wildcard_start != 0u && report.wildcard_listener_inode != 0u &&
+        report.wildcard_kind == 1u && report.positive_response_bytes == 65u &&
+        report.positive_response_exact == 1u && report.positive_prompt_eof == 1u &&
+        report.guard_response_bytes == 65u && report.guard_response_exact == 1u &&
+        report.guard_prompt_eof == 1u && report.wildcard_stable == 1u &&
+        report.wildcard_clean_exit == 1u && report.wildcard_pidfd_invalidated == 1u &&
+        report.wildcard_child_absent == 1u && report.wildcard_listener_absent == 1u &&
+        report.wildcard_source_absent == 1u && report.wildcard_log_absent == 1u &&
+        report.target_fd_count == held.baseline_fd_count &&
+        report.positive_ipv4 == held.plan.positive_ipv4 &&
+        report.guard_ipv4 == held.plan.guard_ipv4 && report.port == held.plan.port &&
+        report.collision_pid != report.wildcard_pid &&
+        report.collision_pid != exact_live.child_pid &&
+        report.wildcard_pid != exact_live.child_pid &&
+        report.collision_pid != static_cast<u64>(target.pid) &&
+        report.wildcard_pid != static_cast<u64>(target.pid) && executable_lease_unchanged(lease) &&
+        endpoint_unchanged(endpoint);
+    if (!scalar) {
+        error = "wildcard handoff scalar/collision/response evidence was invalid";
+        return false;
+    }
+    ProcIdentity collision_identity;
+    collision_identity.pid = static_cast<pid_t>(report.collision_pid);
+    collision_identity.start = report.collision_start;
+    ProcIdentity wildcard_identity;
+    wildcard_identity.pid = static_cast<pid_t>(report.wildcard_pid);
+    wildcard_identity.start = report.wildcard_start;
+    u64 target_fds = 0u;
+    if (!target_gone_or_reused(exact_child) ||
+        observe_exact_liveness(collision_identity) != ExactLiveness::ExitedOrReused ||
+        observe_exact_liveness(wildcard_identity) != ExactLiveness::ExitedOrReused ||
+        !target_fd_absent(target.pid, static_cast<int>(exact_live.pidfd)) ||
+        !target_fd_absent(target.pid, static_cast<int>(held.guard_fd)) ||
+        !count_target_fds(target.pid, target_fds) || target_fds != held.baseline_fd_count) {
+        error = "wildcard handoff exact/collision/retry process or FD cleanup was invalid";
+        return false;
+    }
+    struct stat ignored{};
+    const auto absent = [&](const std::string& name) {
+        errno = 0;
+        return lstat((endpoint.directory + "/" + name).c_str(), &ignored) < 0 && errno == ENOENT;
+    };
+    privileged_listener::ProcTcpTable table;
+    privileged_listener::ListenerEvidence evidence;
+    privileged_listener::Diagnostic diagnostic;
+    if (!absent("exact-listener.rut") || !absent("exact-listener.log") ||
+        !absent("wildcard-collision.rut") || !absent("wildcard-collision.log") ||
+        !absent("wildcard-success.rut") || !absent("wildcard-success.log") ||
+        !read_target_tcp_table(target.pid, table, error) ||
+        !privileged_listener::classify_listener_evidence(
+            table,
+            held.plan,
+            {},
+            privileged_listener::ListenerEvidenceKind::PortAbsent,
+            evidence,
+            diagnostic)) {
+        if (error.empty()) error = "wildcard handoff port/temp absence evidence was invalid";
+        return false;
+    }
+    return true;
+}
+
+static bool wildcard_handoff_mutation_self_check(const WildcardHandoffReport& canonical,
+                                                 const ExactRutReport& exact_live,
+                                                 const ProcIdentity& exact_child,
+                                                 const ExecutableLease& lease,
+                                                 const ParentEndpoint& endpoint,
+                                                 const ProcIdentity& target,
+                                                 const GuardReport& held) {
+    const auto rejects = [&](WildcardHandoffReport mutation) {
+        std::string ignored_error;
+        return !validate_wildcard_handoff_report(
+            mutation, exact_live, exact_child, lease, endpoint, target, held, ignored_error);
+    };
+    WildcardHandoffReport mutation = canonical;
+    mutation.collision_exit_one = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.collision_log_eaddrinuse = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.collision_no_wildcard = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.collision_guard_live = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.wildcard_kind = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.positive_ipv4 = canonical.guard_ipv4;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.guard_ipv4 = canonical.positive_ipv4;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.wildcard_listener_inode = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.port_absent_before_retry = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.same_source = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.positive_response_exact = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.guard_prompt_eof = 0u;
+    return rejects(mutation);
+}
+
 static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
                                               const ExecutableLease& lease,
                                               const ParentEndpoint& endpoint,
@@ -8678,6 +9440,8 @@ static bool guard_protocol_self_check(std::string& error) {
         kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
         kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
         kExactRutCleaned != 44u || kExactRutFailure != 45u || kExactEscrowSettled != 46u ||
+        kWildcardHandoffRun != 47u || kWildcardHandoffWitness != 48u ||
+        kWildcardHandoffFinish != 49u || kWildcardHandoffFinished != 50u ||
         !parse_guard_request(request, decoded_positive, decoded_guard) ||
         decoded_positive != positive || decoded_guard != guard) {
         error = "private guard frame/request codec self-check failed";
@@ -8837,6 +9601,40 @@ static bool guard_protocol_self_check(std::string& error) {
     cleaned_payload[0] = 2u;
     if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
         error = "unknown exact cleaned version was accepted";
+        return false;
+    }
+    WildcardHandoffReport wildcard;
+    wildcard.collision_pid = 401u;
+    wildcard.collision_start = 402u;
+    wildcard.collision_exit_one = 1u;
+    wildcard.collision_log_eaddrinuse = 1u;
+    wildcard.wildcard_pid = 501u;
+    wildcard.wildcard_start = 502u;
+    wildcard.wildcard_listener_inode = 503u;
+    wildcard.wildcard_kind = 1u;
+    wildcard.positive_response_bytes = 65u;
+    wildcard.guard_response_bytes = 65u;
+    wildcard.positive_ipv4 = positive;
+    wildcard.guard_ipv4 = guard;
+    wildcard.port = 8080u;
+    WildcardHandoffReport wildcard_decoded;
+    std::vector<unsigned char> wildcard_payload = encode_wildcard_handoff(wildcard);
+    if (!decode_wildcard_handoff(wildcard_payload, wildcard_decoded) ||
+        wildcard_decoded.collision_pid != wildcard.collision_pid ||
+        wildcard_decoded.wildcard_listener_inode != wildcard.wildcard_listener_inode ||
+        wildcard_decoded.positive_response_bytes != 65u || wildcard_decoded.port != 8080u) {
+        error = "canonical wildcard handoff codec failed";
+        return false;
+    }
+    wildcard_payload.pop_back();
+    if (decode_wildcard_handoff(wildcard_payload, wildcard_decoded)) {
+        error = "truncated wildcard handoff was accepted";
+        return false;
+    }
+    wildcard_payload = encode_wildcard_handoff(wildcard);
+    wildcard_payload[0] = 2u;
+    if (decode_wildcard_handoff(wildcard_payload, wildcard_decoded)) {
+        error = "unknown wildcard handoff version was accepted";
         return false;
     }
     Token exact_token{};
@@ -9646,123 +10444,178 @@ static bool run_session(const std::string& sudo_path,
                 if (error.empty()) error = "exact public-RUT run/witness evidence failed";
                 break;
             }
-            Frame exact_cleaned_frame;
-            ExactRutCleanedReport exact_cleaned;
-            if (!send_frame(target_fd,
-                            Frame{kExactRutCleanup, token, exact_cleanup_payload()},
-                            kHandshakeMs) ||
-                !receive_frame(
-                    target_fd, exact_cleaned_frame, cleanup_response_wait_ms(scenario))) {
-                error = "exact public-RUT cleanup transport failed";
-                break;
-            }
-            if (listener_failure_integration(scenario)) {
-                ExactFailureReport failure;
-                ExactFailureIntegrationStage integration_stage =
-                    ExactFailureIntegrationStage::Failure;
-                if (!advance_exact_failure_integration(integration_stage,
-                                                       exact_cleaned_frame.type) ||
-                    !token_equal(exact_cleaned_frame.token, token) ||
-                    !decode_exact_failure(exact_cleaned_frame.payload, failure) ||
-                    !exact_injected_cleanup_failure(failure, exact_report)) {
-                    error = "injected cleanup failure evidence was malformed or misbound";
+            if (listener_wildcard_handoff(scenario)) {
+                Frame wildcard_frame;
+                WildcardHandoffReport wildcard_report;
+                if (!send_frame(target_fd, Frame{kWildcardHandoffRun, token, {}}, kHandshakeMs) ||
+                    !receive_frame(target_fd, wildcard_frame, kListenerDeadlineMs * 2)) {
+                    error = "wildcard collision/release handoff transport failed";
                     break;
                 }
-                const auto target_eof_deadline = std::chrono::steady_clock::now() +
-                                                 std::chrono::milliseconds(kListenerDeadlineMs);
-                if (!wait_control_eof(target_fd, target_eof_deadline)) {
-                    error = "injected failure Target EOF was missing or out of order";
-                    break;
-                }
-                close(target_fd);
-                target_fd = -1;
-                if (observe_exact_liveness(root_proc) != ExactLiveness::Live) {
-                    error = "exact Root PID/start was not live before deliberate loss";
-                    break;
-                }
-                const auto pre_root_loss_deadline =
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-                if (!observe_quiet_broker_while_root_live(
-                        broker_fd, root_proc, pre_root_loss_deadline)) {
-                    error = "frame46/broker event preceded deliberate exact Root loss";
-                    break;
-                }
-                close(root_fd);
-                root_fd = -1;
-                const auto root_loss_deadline = std::chrono::steady_clock::now() +
-                                                std::chrono::milliseconds(kListenerDeadlineMs);
-                if (!wait_identity_gone_or_reused_until(root_proc, root_loss_deadline)) {
-                    error = "exact Root PID/start survived deliberate lease loss";
-                    break;
-                }
-                if (!receive_failed_target_lifecycle(broker_fd,
-                                                     token,
-                                                     target_proc.pid,
-                                                     failure,
-                                                     held.socket_inode,
-                                                     error,
-                                                     &integration_stage) ||
-                    integration_stage != ExactFailureIntegrationStage::Complete) {
-                    if (error.empty())
-                        error = "injected failure settlement/exit lifecycle was incomplete";
-                    break;
-                }
-                broker_lifecycle_complete = true;
-            } else {
-                if (exact_cleaned_frame.type == kExactRutFailure &&
-                    token_equal(exact_cleaned_frame.token, token)) {
+                if (wildcard_frame.type == kExactRutFailure &&
+                    token_equal(wildcard_frame.token, token)) {
                     ExactFailureReport failure;
-                    if (decode_exact_failure(exact_cleaned_frame.payload, failure))
-                        error = "exact public-RUT failed at phase " +
+                    if (decode_exact_failure(wildcard_frame.payload, failure))
+                        error = "wildcard handoff failed at exact phase " +
                                 std::string(exact_failure_phase_name(failure.phase)) +
-                                " errno=" + std::to_string(failure.error_number) +
-                                " count=" + std::to_string(failure.count);
+                                " errno=" + std::to_string(failure.error_number);
                     else
-                        error = "exact public-RUT returned malformed cleanup failure evidence";
-                    (void)receive_failed_target_lifecycle(
-                        broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
+                        error = "wildcard handoff returned malformed failure evidence";
                     break;
                 }
-                if (exact_cleaned_frame.type != kExactRutCleaned ||
-                    !token_equal(exact_cleaned_frame.token, token) ||
-                    !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
-                    !validate_exact_cleaned_report(exact_cleaned,
-                                                   exact_report,
-                                                   exact_child,
-                                                   endpoint,
-                                                   target_proc,
-                                                   held,
-                                                   error) ||
-                    !exact_cleaned_mutation_self_check(
-                        exact_cleaned, exact_report, exact_child, endpoint, target_proc, held) ||
-                    !observe_guard_held(target_proc, plan, held, error)) {
-                    if (error.empty())
-                        error = "exact public-RUT cleanup/guard-held evidence failed";
-                    break;
-                }
-                Frame released_frame;
-                GuardReport released;
-                if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
-                    !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
-                    released_frame.type != kGuardReleased ||
-                    !token_equal(released_frame.token, token) ||
-                    !decode_guard_report(released_frame.payload, released) ||
-                    !validate_guard_report(released, plan, target_proc, true) ||
-                    released.guard_fd != held.guard_fd ||
-                    released.socket_inode != held.socket_inode ||
-                    released.baseline_fd_count != held.baseline_fd_count ||
-                    released.owner_pid != held.owner_pid ||
-                    released.owner_start != held.owner_start || released.netns != held.netns ||
-                    !observe_guard_released(target_proc, plan, released, error)) {
-                    if (error.empty()) error = "released guard report/proc/FD evidence was invalid";
+                if (wildcard_frame.type != kWildcardHandoffWitness ||
+                    !token_equal(wildcard_frame.token, token) ||
+                    !decode_wildcard_handoff(wildcard_frame.payload, wildcard_report) ||
+                    !validate_wildcard_handoff_report(wildcard_report,
+                                                      exact_report,
+                                                      exact_child,
+                                                      rut_executable,
+                                                      endpoint,
+                                                      target_proc,
+                                                      held,
+                                                      error) ||
+                    !wildcard_handoff_mutation_self_check(wildcard_report,
+                                                          exact_report,
+                                                          exact_child,
+                                                          rut_executable,
+                                                          endpoint,
+                                                          target_proc,
+                                                          held)) {
+                    if (error.empty()) error = "wildcard collision/release handoff evidence failed";
                     break;
                 }
                 Frame finished;
-                if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
+                if (!send_frame(
+                        target_fd, Frame{kWildcardHandoffFinish, token, {}}, kHandshakeMs) ||
                     !receive_frame(target_fd, finished, kHandshakeMs) ||
-                    !exact_request(finished, kGuardFinished, token)) {
-                    error = "guard lifecycle final release handshake failed";
+                    !exact_request(finished, kWildcardHandoffFinished, token)) {
+                    error = "wildcard handoff final validated-release handshake failed";
                     break;
+                }
+            } else {
+                Frame exact_cleaned_frame;
+                ExactRutCleanedReport exact_cleaned;
+                if (!send_frame(target_fd,
+                                Frame{kExactRutCleanup, token, exact_cleanup_payload()},
+                                kHandshakeMs) ||
+                    !receive_frame(
+                        target_fd, exact_cleaned_frame, cleanup_response_wait_ms(scenario))) {
+                    error = "exact public-RUT cleanup transport failed";
+                    break;
+                }
+                if (listener_failure_integration(scenario)) {
+                    ExactFailureReport failure;
+                    ExactFailureIntegrationStage integration_stage =
+                        ExactFailureIntegrationStage::Failure;
+                    if (!advance_exact_failure_integration(integration_stage,
+                                                           exact_cleaned_frame.type) ||
+                        !token_equal(exact_cleaned_frame.token, token) ||
+                        !decode_exact_failure(exact_cleaned_frame.payload, failure) ||
+                        !exact_injected_cleanup_failure(failure, exact_report)) {
+                        error = "injected cleanup failure evidence was malformed or misbound";
+                        break;
+                    }
+                    const auto target_eof_deadline = std::chrono::steady_clock::now() +
+                                                     std::chrono::milliseconds(kListenerDeadlineMs);
+                    if (!wait_control_eof(target_fd, target_eof_deadline)) {
+                        error = "injected failure Target EOF was missing or out of order";
+                        break;
+                    }
+                    close(target_fd);
+                    target_fd = -1;
+                    if (observe_exact_liveness(root_proc) != ExactLiveness::Live) {
+                        error = "exact Root PID/start was not live before deliberate loss";
+                        break;
+                    }
+                    const auto pre_root_loss_deadline =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+                    if (!observe_quiet_broker_while_root_live(
+                            broker_fd, root_proc, pre_root_loss_deadline)) {
+                        error = "frame46/broker event preceded deliberate exact Root loss";
+                        break;
+                    }
+                    close(root_fd);
+                    root_fd = -1;
+                    const auto root_loss_deadline = std::chrono::steady_clock::now() +
+                                                    std::chrono::milliseconds(kListenerDeadlineMs);
+                    if (!wait_identity_gone_or_reused_until(root_proc, root_loss_deadline)) {
+                        error = "exact Root PID/start survived deliberate lease loss";
+                        break;
+                    }
+                    if (!receive_failed_target_lifecycle(broker_fd,
+                                                         token,
+                                                         target_proc.pid,
+                                                         failure,
+                                                         held.socket_inode,
+                                                         error,
+                                                         &integration_stage) ||
+                        integration_stage != ExactFailureIntegrationStage::Complete) {
+                        if (error.empty())
+                            error = "injected failure settlement/exit lifecycle was incomplete";
+                        break;
+                    }
+                    broker_lifecycle_complete = true;
+                } else {
+                    if (exact_cleaned_frame.type == kExactRutFailure &&
+                        token_equal(exact_cleaned_frame.token, token)) {
+                        ExactFailureReport failure;
+                        if (decode_exact_failure(exact_cleaned_frame.payload, failure))
+                            error = "exact public-RUT failed at phase " +
+                                    std::string(exact_failure_phase_name(failure.phase)) +
+                                    " errno=" + std::to_string(failure.error_number) +
+                                    " count=" + std::to_string(failure.count);
+                        else
+                            error = "exact public-RUT returned malformed cleanup failure evidence";
+                        (void)receive_failed_target_lifecycle(
+                            broker_fd, token, target_proc.pid, failure, held.socket_inode, error);
+                        break;
+                    }
+                    if (exact_cleaned_frame.type != kExactRutCleaned ||
+                        !token_equal(exact_cleaned_frame.token, token) ||
+                        !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
+                        !validate_exact_cleaned_report(exact_cleaned,
+                                                       exact_report,
+                                                       exact_child,
+                                                       endpoint,
+                                                       target_proc,
+                                                       held,
+                                                       error) ||
+                        !exact_cleaned_mutation_self_check(exact_cleaned,
+                                                           exact_report,
+                                                           exact_child,
+                                                           endpoint,
+                                                           target_proc,
+                                                           held) ||
+                        !observe_guard_held(target_proc, plan, held, error)) {
+                        if (error.empty())
+                            error = "exact public-RUT cleanup/guard-held evidence failed";
+                        break;
+                    }
+                    Frame released_frame;
+                    GuardReport released;
+                    if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
+                        !receive_frame(target_fd, released_frame, kBrokerDeadlineMs) ||
+                        released_frame.type != kGuardReleased ||
+                        !token_equal(released_frame.token, token) ||
+                        !decode_guard_report(released_frame.payload, released) ||
+                        !validate_guard_report(released, plan, target_proc, true) ||
+                        released.guard_fd != held.guard_fd ||
+                        released.socket_inode != held.socket_inode ||
+                        released.baseline_fd_count != held.baseline_fd_count ||
+                        released.owner_pid != held.owner_pid ||
+                        released.owner_start != held.owner_start || released.netns != held.netns ||
+                        !observe_guard_released(target_proc, plan, released, error)) {
+                        if (error.empty())
+                            error = "released guard report/proc/FD evidence was invalid";
+                        break;
+                    }
+                    Frame finished;
+                    if (!send_frame(target_fd, Frame{kGuardFinish, token, {}}, kHandshakeMs) ||
+                        !receive_frame(target_fd, finished, kHandshakeMs) ||
+                        !exact_request(finished, kGuardFinished, token)) {
+                        error = "guard lifecycle final release handshake failed";
+                        break;
+                    }
                 }
             }
         } else if (strcmp(scenario, "term-ignore") == 0) {
@@ -10097,6 +10950,16 @@ static bool run_positive(const std::string& sudo_path,
                      "listener-cleanup-observation-failure",
                      error)) {
         error = "listener-cleanup-observation-failure: " + error;
+        return false;
+    }
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
+                     "listener-wildcard-release-handoff",
+                     error)) {
+        error = "listener-wildcard-release-handoff: " + error;
         return false;
     }
     return true;
