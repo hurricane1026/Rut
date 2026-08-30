@@ -20,6 +20,82 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Tests-only fixed privileged identity bundle transport.  This is a pure
+# socketpair/SCM_RIGHTS self-check and is not connected to the broker runtime.
+add_library(fixture_identity_bundle STATIC fixture_identity_bundle.cc)
+target_include_directories(fixture_identity_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_identity_bundle test_fixture_identity_bundle.cc)
+target_link_libraries(test_fixture_identity_bundle PRIVATE fixture_identity_bundle)
+add_test(NAME test_fixture_identity_bundle COMMAND test_fixture_identity_bundle)
+set_tests_properties(test_fixture_identity_bundle PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+
+# Manifest-free bounded ancestry FD transport.  This remains a pure
+# socketpair/procfs self-check and is not connected to the privileged broker.
+add_library(fixture_ancestry_bundle STATIC fixture_ancestry_bundle.cc)
+target_include_directories(fixture_ancestry_bundle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_ancestry_bundle PUBLIC fixture_identity_bundle)
+
+add_executable(test_fixture_ancestry_bundle test_fixture_ancestry_bundle.cc)
+target_link_libraries(test_fixture_ancestry_bundle PRIVATE fixture_ancestry_bundle)
+add_test(NAME test_fixture_ancestry_bundle COMMAND test_fixture_ancestry_bundle)
+set_tests_properties(test_fixture_ancestry_bundle PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
+# Pure #358 Stage 2a3b sudo/nsenter/launcher causal state model.  This test
+# uses synthetic process identities and never invokes sudo or fakes a positive
+# privileged semantic run.
+add_library(fixture_direct_launch STATIC fixture_direct_launch.cc)
+target_include_directories(fixture_direct_launch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_fixture_direct_launch test_fixture_direct_launch.cc)
+target_link_libraries(test_fixture_direct_launch PRIVATE fixture_direct_launch)
+add_test(NAME test_fixture_direct_launch COMMAND test_fixture_direct_launch)
+set_tests_properties(test_fixture_direct_launch PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# Tests-only retained-sudo ancestry collector and exact one-record binder.
+add_library(fixture_privileged_ancestry STATIC fixture_privileged_ancestry.cc)
+target_include_directories(fixture_privileged_ancestry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_privileged_ancestry PUBLIC
+    fixture_ancestry_bundle fixture_direct_launch fixture_identity_bundle fixture_worker_protocol)
+
+add_executable(test_fixture_privileged_ancestry test_fixture_privileged_ancestry.cc)
+target_link_libraries(test_fixture_privileged_ancestry PRIVATE fixture_privileged_ancestry)
+add_test(NAME test_fixture_privileged_ancestry COMMAND test_fixture_privileged_ancestry)
+set_tests_properties(test_fixture_privileged_ancestry PROPERTIES LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
+# Pure #358 listener plan/source/proc-table/collision-log evidence. The library
+# is shared with the privileged broker; this focused unit creates no sockets or
+# processes.
+add_library(fixture_privileged_listener STATIC fixture_privileged_listener.cc)
+target_include_directories(fixture_privileged_listener PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(test_fixture_privileged_listener test_fixture_privileged_listener.cc)
+target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privileged_listener)
+add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
+set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
+
+if(RUT_ENABLE_JIT)
+    add_executable(test_fixture_privileged_listener_loader
+        test_fixture_privileged_listener_loader.cc)
+    target_link_libraries(test_fixture_privileged_listener_loader PRIVATE
+        fixture_privileged_listener rut_loader)
+    target_include_directories(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+    add_test(NAME test_fixture_privileged_listener_loader
+        COMMAND test_fixture_privileged_listener_loader)
+    set_tests_properties(test_fixture_privileged_listener_loader PROPERTIES
+        LABELS "unit;jit" TIMEOUT 30)
+endif()
+
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -492,6 +568,34 @@ if(RUT_ENABLE_JIT)
     )
     add_test(NAME test_ipv4_fixture_topology COMMAND test_ipv4_fixture_topology)
     set_tests_properties(test_ipv4_fixture_topology PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+    add_executable(test_fixture_privileged_broker
+        test_fixture_privileged_broker.cc
+        fixture_ipv4_topology.cc
+    )
+    target_link_libraries(test_fixture_privileged_broker PRIVATE
+        fixture_ancestry_bundle
+        fixture_direct_launch
+        fixture_identity_bundle
+        fixture_privileged_ancestry
+        fixture_privileged_listener
+        fixture_worker_protocol
+    )
+    target_include_directories(test_fixture_privileged_broker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(test_fixture_privileged_broker PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_dependencies(test_fixture_privileged_broker rut)
+    add_test(NAME test_fixture_privileged_broker
+             COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+    set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential

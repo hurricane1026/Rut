@@ -1,0 +1,347 @@
+name: "#358 Stage2a3b positive (WIP only)"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue358-stage2a3b-positive-wip-only
+  cancel-in-progress: false
+
+jobs:
+  privileged-broker:
+    name: Required privileged broker
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.number == 375 &&
+       github.event.pull_request.head.ref == 'wip/issue358-stage2a3b' &&
+       github.event.pull_request.base.ref == 'agent/nginx-to-rut-converter' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/wip/issue358-stage2a3b')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Initialize logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/issue358-stage2a3b-logs"
+          mkdir -p "$log_dir"
+          touch "$log_dir/topology-direct.log" "$log_dir/topology-ctest.log" \
+            "$log_dir/direct.log" "$log_dir/ctest.log"
+          : > "$log_dir/audit.log"
+
+      - name: Check out exact WIP head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install JIT dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            /usr/bin/sudo -n /usr/bin/tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
+            /usr/bin/sudo -n /usr/bin/tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          /usr/bin/sudo -n /usr/bin/apt-get update
+          /usr/bin/sudo -n /usr/bin/apt-get install -y \
+            cmake ninja-build llvm-21-dev libboost-dev ragel
+
+      - name: Strict privileged runner preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker=/usr/bin/docker
+          sudo=/usr/bin/sudo
+          nsenter=/usr/bin/nsenter
+          ip=/usr/sbin/ip
+
+          for executable in "$docker" "$sudo" "$nsenter" "$ip"; do
+            if [[ ! -x "$executable" ]]; then
+              echo "required absolute executable is unavailable: $executable" >&2
+              exit 1
+            fi
+          done
+
+          "$sudo" -n -- /bin/true
+          "$sudo" -n -- "$nsenter" --net=/proc/self/ns/net -- /bin/true
+          "$docker" info
+          "$docker" network inspect bridge
+
+          bridge_driver=$("$docker" network inspect --format '{{.Driver}}' bridge)
+          bridge_name=$("$docker" network inspect \
+            --format '{{index .Options "com.docker.network.bridge.name"}}' bridge)
+          [[ "$bridge_driver" == bridge ]]
+          if [[ -z "$bridge_name" ]]; then
+            bridge_name=docker0
+          fi
+          if [[ ! "$bridge_name" =~ ^[[:alnum:]_.:-]+$ ]]; then
+            echo "docker bridge exposed an unsafe host interface name" >&2
+            exit 1
+          fi
+          "$ip" -details link show dev "$bridge_name"
+          if [[ ! -d "/sys/class/net/${bridge_name}/bridge" ]]; then
+            echo "docker bridge lacks host bridge evidence: $bridge_name" >&2
+            exit 1
+          fi
+          printf 'verified host bridge: driver=%s interface=%s\n' \
+            "$bridge_driver" "$bridge_name"
+
+      - name: Provision exact repository-pinned nginx image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker=/usr/bin/docker
+          pinned_file="$GITHUB_WORKSPACE/tests/pinned-nginx-image.txt"
+          if [[ ! -f "$pinned_file" || -L "$pinned_file" ]]; then
+            echo "repository pinned image source must be a regular non-symlink file" >&2
+            exit 1
+          fi
+          mapfile -t pinned_images < "$pinned_file"
+          if (( ${#pinned_images[@]} != 1 )); then
+            echo "tests/pinned-nginx-image.txt must contain exactly one image reference" >&2
+            exit 1
+          fi
+          image=${pinned_images[0]}
+          if [[ ! "$image" =~ ^nginx@sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid pinned nginx image reference" >&2
+            exit 1
+          fi
+          printf 'repository-pinned image: %s\n' "$image"
+
+          for attempt in 1 2 3; do
+            if "$docker" pull "$image"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "failed to pull the pinned nginx image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+          "$docker" image inspect "$image" > /dev/null
+          repo_digests=$("$docker" image inspect \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image")
+          printf '%s\n' "$repo_digests"
+          if ! grep -Fqx -- "$image" <<< "$repo_digests"; then
+            echo "pulled image does not expose the exact required RepoDigest" >&2
+            exit 1
+          fi
+
+      - name: Configure Release JIT with LLVM 21
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUT_ENABLE_JIT=ON \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+
+      - name: Build topology and privileged broker fixtures only
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build rut test_ipv4_fixture_topology test_fixture_privileged_broker
+
+      - name: Run required topology fixture directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            timeout --signal=TERM --kill-after=10s 180s \
+              ./build/tests/test_ipv4_fixture_topology 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-direct.log"
+
+      - name: Run required focused topology CTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            ctest --test-dir build --output-on-failure --no-tests=error \
+              -j 1 --timeout 180 -R '^test_ipv4_fixture_topology$' 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/topology-ctest.log"
+
+      - name: Run required broker fixture directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            timeout --signal=TERM --kill-after=10s 180s \
+              ./build/tests/test_fixture_privileged_broker "$(realpath ./build/src/rut)" 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/direct.log"
+
+      - name: Run required focused CTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+            ctest --test-dir build --output-on-failure --no-tests=error \
+              -j 1 --timeout 180 -R '^test_fixture_privileged_broker$' 2>&1 | \
+            tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/ctest.log"
+
+      - name: Audit residual Stage2a2 resources
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/issue358-stage2a3b-logs"
+          mkdir -p "$log_dir"
+          touch "$log_dir/topology-direct.log" "$log_dir/topology-ctest.log" \
+            "$log_dir/direct.log" "$log_dir/ctest.log"
+
+          audit() {
+            local residue=0
+            local audit_error=0
+            local id path pid cmdline proc_dir recheck_rc
+            local containers_file="$log_dir/audit-containers.txt"
+            local networks_file="$log_dir/audit-networks.txt"
+            local proc_paths_file="$log_dir/audit-proc-paths.bin"
+            local proc_find_error="$log_dir/audit-proc-find.stderr"
+            local proc_read_error="$log_dir/audit-proc-read.stderr"
+            local tmp_paths_file="$log_dir/audit-tmp-paths.bin"
+            local tmp_find_error="$log_dir/audit-tmp-find.stderr"
+            local sudo=/usr/bin/sudo
+
+            echo "read-only residual audit for rut.stage=358-stage2a2"
+
+            if /usr/bin/docker ps -aq \
+                --filter 'label=rut.stage=358-stage2a2' > "$containers_file"; then
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                /usr/bin/docker inspect --format \
+                  'container id={{.Id}} name={{.Name}} stage={{index .Config.Labels "rut.stage"}} token={{index .Config.Labels "rut.token"}} labels={{json .Config.Labels}}' \
+                  "$id" || audit_error=1
+                residue=$((residue + 1))
+              done < "$containers_file"
+            else
+              echo "unable to enumerate labeled containers" >&2
+              audit_error=1
+            fi
+
+            if /usr/bin/docker network ls -q \
+                --filter 'label=rut.stage=358-stage2a2' > "$networks_file"; then
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                /usr/bin/docker network inspect --format \
+                  'network id={{.Id}} name={{.Name}} stage={{index .Labels "rut.stage"}} token={{index .Labels "rut.token"}} labels={{json .Labels}}' \
+                  "$id" || audit_error=1
+                residue=$((residue + 1))
+              done < "$networks_file"
+            else
+              echo "unable to enumerate labeled networks" >&2
+              audit_error=1
+            fi
+
+            : > "$proc_find_error"
+            if ! "$sudo" -n /usr/bin/find /proc -ignore_readdir_race \
+                -mindepth 2 -maxdepth 2 -type f -name cmdline -print0 \
+                > "$proc_paths_file" 2> "$proc_find_error"; then
+              echo "unable to complete /proc cmdline traversal" >&2
+              audit_error=1
+            fi
+            if [[ -s "$proc_find_error" ]]; then
+              echo "/proc cmdline traversal reported errors:" >&2
+              /usr/bin/cat "$proc_find_error" >&2
+              audit_error=1
+            fi
+
+            while IFS= read -r -d '' path; do
+              pid=${path#/proc/}
+              pid=${pid%/cmdline}
+              : > "$proc_read_error"
+              if ! cmdline=$("$sudo" -n /usr/bin/cat -- "$path" 2> "$proc_read_error" | \
+                  /usr/bin/tr '\0' ' '); then
+                proc_dir=${path%/cmdline}
+                if "$sudo" -n /usr/bin/test -e "$proc_dir"; then
+                  printf 'existing proc cmdline is unreadable: path=%q pid=%q\n' \
+                    "$path" "$pid" >&2
+                  if [[ -s "$proc_read_error" ]]; then
+                    /usr/bin/cat "$proc_read_error" >&2
+                  fi
+                  audit_error=1
+                else
+                  recheck_rc=$?
+                  if (( recheck_rc == 1 )); then
+                    printf 'snapshotted process disappeared before cmdline read: pid=%q\n' "$pid"
+                  else
+                    printf 'unable to recheck proc identity after cmdline read failure: pid=%q rc=%d\n' \
+                      "$pid" "$recheck_rc" >&2
+                    if [[ -s "$proc_read_error" ]]; then
+                      /usr/bin/cat "$proc_read_error" >&2
+                    fi
+                    audit_error=1
+                  fi
+                fi
+                continue
+              fi
+              if [[ -s "$proc_read_error" ]]; then
+                printf 'proc cmdline read reported errors: path=%q pid=%q\n' \
+                  "$path" "$pid" >&2
+                /usr/bin/cat "$proc_read_error" >&2
+                audit_error=1
+              fi
+              case "$cmdline" in
+                *test_fixture_privileged_broker*|*--fixture-broker-launcher*|\
+                *--fixture-privileged-broker*|*--fixture-privileged-dropped-broker*|\
+                *--fixture-privileged-target*|*rut358-broker-*)
+                  printf 'process pid=%s cmdline=%q\n' "$pid" "$cmdline"
+                  residue=$((residue + 1))
+                  ;;
+              esac
+            done < "$proc_paths_file"
+
+            : > "$tmp_find_error"
+            if ! "$sudo" -n /usr/bin/find /tmp -xdev -mindepth 1 -maxdepth 1 \
+                \( -name 'rut358-topology-*' -o -name 'rut358-broker-*' -o \
+                   -name 'rut358-proto-*' \) \
+                -print0 > "$tmp_paths_file" 2> "$tmp_find_error"; then
+              echo "unable to complete /tmp rut358 residue traversal" >&2
+              audit_error=1
+            fi
+            if [[ -s "$tmp_find_error" ]]; then
+              echo "/tmp rut358 residue traversal reported errors:" >&2
+              /usr/bin/cat "$tmp_find_error" >&2
+              audit_error=1
+            fi
+            while IFS= read -r -d '' path; do
+              if ! "$sudo" -n /usr/bin/stat \
+                  --printf='temporary path=%n type=%F owner=%u:%g mode=%a\n' "$path"; then
+                printf 'unable to read exact temporary residue: path=%q\n' "$path" >&2
+                audit_error=1
+              fi
+              residue=$((residue + 1))
+            done < "$tmp_paths_file"
+
+            printf 'residual-count=%d audit-error=%d\n' "$residue" "$audit_error"
+            if (( audit_error != 0 || residue != 0 )); then
+              echo "residual audit failed; workflow intentionally performs no deletion or signaling" >&2
+              return 1
+            fi
+            echo "residual audit passed"
+          }
+
+          audit 2>&1 | tee "$log_dir/audit.log"
+
+      - name: Upload broker fixture logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue358-stage2a3b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue358-stage2a3b-logs/topology-direct.log
+            ${{ runner.temp }}/issue358-stage2a3b-logs/topology-ctest.log
+            ${{ runner.temp }}/issue358-stage2a3b-logs/direct.log
+            ${{ runner.temp }}/issue358-stage2a3b-logs/ctest.log
+            ${{ runner.temp }}/issue358-stage2a3b-logs/audit.log
+          if-no-files-found: error

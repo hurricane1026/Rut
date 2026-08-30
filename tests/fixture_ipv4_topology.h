@@ -1,6 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+
+#include <sys/types.h>
 
 namespace rut::test::ipv4_topology {
 
@@ -28,7 +32,52 @@ struct RunResult {
     std::string error;
 };
 
+// Controls only the host-parent verification performed after Docker topology
+// setup. Docker/IPAM setup and read-only holder /proc validation are unchanged.
+enum class HeldTopologyProbePolicy {
+    RequireHostRefusalProbes,
+    SocketlessHostParent,
+};
+
+struct HeldTopologyProbeEvidence {
+    HeldTopologyProbePolicy policy = HeldTopologyProbePolicy::RequireHostRefusalProbes;
+    std::uint32_t selected_port_absence_checks = 0;
+    std::uint32_t host_parent_af_inet_socket_calls = 0;
+    std::uint32_t successful_refusal_probes = 0;
+};
+
+// Immutable evidence exposed only while the topology fixture remains alive.
+// The fixture retains exclusive ownership of every Docker resource.
+struct HeldTopologySnapshot {
+    std::string token;
+    std::string network_a_name;
+    std::string network_a_id;
+    std::string network_a_subnet;
+    std::string network_a_gateway;
+    std::string network_b_name;
+    std::string network_b_id;
+    std::string network_b_subnet;
+    std::string network_b_gateway;
+    std::string holder_name;
+    std::string holder_id;
+    std::string positive_ip;
+    std::string guard_ip;
+    pid_t holder_pid = -1;
+    std::uint64_t holder_start = 0;
+    ino_t holder_netns = 0;
+    HeldTopologyProbeEvidence probe_evidence;
+};
+
+using HeldTopologyCallback =
+    std::function<bool(const HeldTopologySnapshot& snapshot, std::string& error)>;
+
 RunResult run(FailurePoint failure_point);
+RunResult run_with_held_topology(const HeldTopologyCallback& callback);
+RunResult run_with_held_topology(HeldTopologyProbePolicy policy,
+                                 const HeldTopologyCallback& callback);
+bool validate_held_topology_probe_evidence(const HeldTopologyProbeEvidence& evidence,
+                                           HeldTopologyProbePolicy expected_policy,
+                                           std::string& error);
 bool audit_zero_residue(const std::string& token,
                         const std::string& network_a_name,
                         const std::string& network_b_name,

@@ -70,7 +70,7 @@ bool write_exact(int fd, const unsigned char* data, size_t size, int timeout_ms)
     size_t done = 0;
     while (done != size) {
         if (!wait_fd(fd, POLLOUT, deadline)) return false;
-        const ssize_t n = write(fd, data + done, size - done);
+        const ssize_t n = send(fd, data + done, size - done, MSG_NOSIGNAL);
         if (n > 0) {
             done += static_cast<size_t>(n);
         } else if (n < 0 && errno == EINTR) {
@@ -82,8 +82,10 @@ bool write_exact(int fd, const unsigned char* data, size_t size, int timeout_ms)
     return true;
 }
 
-bool read_exact(int fd, unsigned char* data, size_t size, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+static bool read_exact_until(int fd,
+                             unsigned char* data,
+                             size_t size,
+                             std::chrono::steady_clock::time_point deadline) {
     size_t done = 0;
     while (done != size) {
         if (!wait_fd(fd, POLLIN, deadline)) return false;
@@ -97,6 +99,11 @@ bool read_exact(int fd, unsigned char* data, size_t size, int timeout_ms) {
         }
     }
     return true;
+}
+
+bool read_exact(int fd, unsigned char* data, size_t size, int timeout_ms) {
+    return read_exact_until(
+        fd, data, size, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
 static void put16(std::vector<unsigned char>& out, u16 value) {
@@ -156,23 +163,28 @@ bool valid_frame_header(const unsigned char* header, const Token& expected) {
            std::equal(header + 12, header + kHeaderBytes, expected.bytes.begin());
 }
 
-bool receive_frame(int fd, Frame& frame, int timeout_ms) {
+bool receive_frame_until(int fd, Frame& frame, std::chrono::steady_clock::time_point deadline) {
     std::array<unsigned char, kHeaderBytes> header{};
-    if (!read_exact(fd, header.data(), header.size(), timeout_ms)) return false;
+    if (!read_exact_until(fd, header.data(), header.size(), deadline)) return false;
     frame.type = static_cast<u16>(header[6]) | static_cast<u16>(header[7] << 8);
     const u32 length = static_cast<u32>(header[8]) | (static_cast<u32>(header[9]) << 8) |
                        (static_cast<u32>(header[10]) << 16) | (static_cast<u32>(header[11]) << 24);
     std::copy(header.begin() + 12, header.end(), frame.token.bytes.begin());
     if (length > kMaxPayload || !valid_frame_header(header.data(), frame.token)) return false;
     frame.payload.assign(length, 0);
-    return length == 0 || read_exact(fd, frame.payload.data(), length, timeout_ms);
+    return length == 0 || read_exact_until(fd, frame.payload.data(), length, deadline);
+}
+
+bool receive_frame(int fd, Frame& frame, int timeout_ms) {
+    return receive_frame_until(
+        fd, frame, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
 bool token_equal(const Token& a, const Token& b) {
     return a.bytes == b.bytes;
 }
 
-bool read_proc(pid_t pid, ProcIdentity& result) {
+bool read_proc(pid_t pid, ProcIdentity& result, bool require_capabilities_clear) {
     if (pid <= 0) return false;
     std::string stat_text;
     if (!read_file("/proc/" + std::to_string(pid) + "/stat", stat_text, 8192)) return false;
@@ -185,17 +197,23 @@ bool read_proc(pid_t pid, ProcIdentity& result) {
     if (!(fields >> state >> ppid >> pgrp)) return false;
     long ignored = 0;
     u64 start = 0;
+    pid_t sid = -1;
     for (int field = 6; field <= 22; ++field) {
         if (field == 22) {
             unsigned long long value = 0;
             if (!(fields >> value)) return false;
             start = static_cast<u64>(value);
+        } else if (field == 6) {
+            long value = 0;
+            if (!(fields >> value)) return false;
+            sid = static_cast<pid_t>(value);
         } else if (!(fields >> ignored)) {
             return false;
         }
     }
     result.pid = pid;
     result.ppid = static_cast<pid_t>(ppid);
+    result.sid = sid;
     result.start = start;
     result.pgid = static_cast<pid_t>(pgrp);
 
@@ -260,7 +278,8 @@ bool read_proc(pid_t pid, ProcIdentity& result) {
     if (length <= 0) return false;
     result.exe.assign(exe.data(), static_cast<size_t>(length));
     if (!read_file("/proc/" + std::to_string(pid) + "/cmdline", result.cmdline, 8192)) return false;
-    return result.netns != 0 && result.start != 0 && result.pgid > 0 && result.capabilities_clear;
+    return result.netns != 0 && result.start != 0 && result.pgid > 0 &&
+           (!require_capabilities_clear || result.capabilities_clear);
 }
 
 bool get_peer(int fd, Peer& peer) {
@@ -482,11 +501,11 @@ bool process_alive(pid_t pid) {
 }
 
 bool same_process_identity(const ProcIdentity& a, const ProcIdentity& b) {
-    return a.pid == b.pid && a.ppid == b.ppid && a.start == b.start && a.pgid == b.pgid &&
-           a.uid == b.uid && a.uid != static_cast<uid_t>(-1) && a.gid == b.gid &&
-           a.netns == b.netns && a.exe_dev == b.exe_dev && a.exe_ino == b.exe_ino &&
-           a.exe == b.exe && a.cmdline == b.cmdline && a.no_new_privs == b.no_new_privs &&
-           a.capabilities_clear == b.capabilities_clear &&
+    return a.pid == b.pid && a.ppid == b.ppid && a.sid == b.sid && a.start == b.start &&
+           a.pgid == b.pgid && a.uid == b.uid && a.uid != static_cast<uid_t>(-1) &&
+           a.gid == b.gid && a.netns == b.netns && a.exe_dev == b.exe_dev &&
+           a.exe_ino == b.exe_ino && a.exe == b.exe && a.cmdline == b.cmdline &&
+           a.no_new_privs == b.no_new_privs && a.capabilities_clear == b.capabilities_clear &&
            a.supplementary_groups == b.supplementary_groups;
 }
 
@@ -606,10 +625,15 @@ bool create_listener(const std::string& path, int& fd) {
         return false;
     }
     memcpy(address.sun_path, path.data(), path.size() + 1);
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        chmod(path.c_str(), 0600) != 0 || listen(fd, 1) != 0) {
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         close(fd);
         fd = -1;
+        return false;
+    }
+    if (chmod(path.c_str(), 0600) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        fd = -1;
+        (void)unlink(path.c_str());
         return false;
     }
     return true;
