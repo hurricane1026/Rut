@@ -69,6 +69,7 @@ using rut::test::fixture_direct_launch::LaunchStage;
 using rut::test::fixture_direct_launch::observe_direct;
 using rut::test::fixture_direct_launch::StageDescriptor;
 using rut::test::fixture_direct_launch::validate_launcher_ancestry;
+using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
 
 constexpr u16 kBrokerRootHello = 20;
@@ -6215,7 +6216,13 @@ int main(int argc, char** argv) {
         return required ? 1 : 77;
     }
     const auto result = rut::test::ipv4_topology::run_with_held_topology(
+        HeldTopologyProbePolicy::SocketlessHostParent,
         [&](const HeldTopologySnapshot& topology, std::string& callback_error) {
+            if (!rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+                    topology.probe_evidence,
+                    HeldTopologyProbePolicy::SocketlessHostParent,
+                    callback_error))
+                return false;
             return run_positive(
                 sudo_path, nsenter_path, self.data(), topology, required, callback_error);
         });

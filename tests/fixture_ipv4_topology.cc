@@ -1712,6 +1712,34 @@ bool runner_descendant_self_check(std::string& error) {
     return true;
 }
 
+bool validate_held_topology_probe_evidence(const HeldTopologyProbeEvidence& evidence,
+                                           HeldTopologyProbePolicy expected_policy,
+                                           std::string& error) {
+    if (expected_policy != HeldTopologyProbePolicy::RequireHostRefusalProbes &&
+        expected_policy != HeldTopologyProbePolicy::SocketlessHostParent) {
+        error = "unknown held-topology probe policy";
+        return false;
+    }
+    if (evidence.policy != expected_policy || evidence.selected_port_absence_checks != 1u) {
+        error = "held-topology probe policy or read-only absence evidence was not exact";
+        return false;
+    }
+    if (expected_policy == HeldTopologyProbePolicy::RequireHostRefusalProbes) {
+        if (evidence.host_parent_af_inet_socket_calls != 2u ||
+            evidence.successful_refusal_probes != 2u) {
+            error = "held-topology host refusal-probe evidence was not exact";
+            return false;
+        }
+        return true;
+    }
+    if (evidence.host_parent_af_inet_socket_calls != 0u ||
+        evidence.successful_refusal_probes != 0u) {
+        error = "socketless held-topology policy reported a host AF_INET probe";
+        return false;
+    }
+    return true;
+}
+
 RunResult run(FailurePoint failure_point) {
     RunResult result;
     std::string token;
@@ -1842,6 +1870,11 @@ RunResult run(FailurePoint failure_point) {
 }
 
 RunResult run_with_held_topology(const HeldTopologyCallback& callback) {
+    return run_with_held_topology(HeldTopologyProbePolicy::RequireHostRefusalProbes, callback);
+}
+
+RunResult run_with_held_topology(HeldTopologyProbePolicy policy,
+                                 const HeldTopologyCallback& callback) {
     RunResult result;
     std::string token;
     if (!callback || !high_entropy_token(token)) {
@@ -1888,10 +1921,25 @@ RunResult run_with_held_topology(const HeldTopologyCallback& callback) {
         return fail_after_cleanup();
 
     static constexpr u16 kProbePort = 41857;
-    if (!fixture.probe_port_absent(kProbePort, result.error) ||
-        !fixture.probe_refused(fixture.positive_ip(), kProbePort, result.error) ||
-        !fixture.probe_refused(fixture.guard_ip(), kProbePort, result.error))
+    HeldTopologyProbeEvidence probe_evidence;
+    probe_evidence.policy = policy;
+    if (!fixture.probe_port_absent(kProbePort, result.error)) return fail_after_cleanup();
+    ++probe_evidence.selected_port_absence_checks;
+    if (policy == HeldTopologyProbePolicy::RequireHostRefusalProbes) {
+        const auto probe_refused = [&](const std::string& address) {
+            ++probe_evidence.host_parent_af_inet_socket_calls;
+            if (!fixture.probe_refused(address, kProbePort, result.error)) return false;
+            ++probe_evidence.successful_refusal_probes;
+            return true;
+        };
+        if (!probe_refused(fixture.positive_ip()) || !probe_refused(fixture.guard_ip()))
+            return fail_after_cleanup();
+    }
+    std::string probe_evidence_error;
+    if (!validate_held_topology_probe_evidence(probe_evidence, policy, probe_evidence_error)) {
+        result.error = probe_evidence_error;
         return fail_after_cleanup();
+    }
 
     ProcIdentity holder_identity{};
     if (!proc_identity(fixture.holder_pid(), holder_identity, false) ||
@@ -1917,6 +1965,7 @@ RunResult run_with_held_topology(const HeldTopologyCallback& callback) {
     snapshot.holder_pid = fixture.holder_pid();
     snapshot.holder_start = fixture.holder_start();
     snapshot.holder_netns = holder_identity.netns;
+    snapshot.probe_evidence = probe_evidence;
     if (!callback(snapshot, result.error)) return fail_after_cleanup();
     if (!fixture.cleanup(result.error)) return fail_after_cleanup();
     std::string residue_error;

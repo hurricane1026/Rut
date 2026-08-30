@@ -3,6 +3,8 @@
 #include <iostream>
 
 using rut::test::ipv4_topology::FailurePoint;
+using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
+using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::RunResult;
 
 int main() {
@@ -15,6 +17,57 @@ int main() {
     }
     if (!rut::test::ipv4_topology::runner_descendant_self_check(validation_error)) {
         std::cerr << "FAIL [#358 Stage 2a2 runner PGID validation]: " << validation_error << "\n";
+        return 1;
+    }
+    HeldTopologyProbeEvidence default_probe_evidence{
+        HeldTopologyProbePolicy::RequireHostRefusalProbes, 1u, 2u, 2u};
+    if (!rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            default_probe_evidence,
+            HeldTopologyProbePolicy::RequireHostRefusalProbes,
+            validation_error)) {
+        std::cerr << "FAIL [#358 Stage 2a3b held topology probe policy]: " << validation_error
+                  << "\n";
+        return 1;
+    }
+    HeldTopologyProbeEvidence mutated_probe_evidence = default_probe_evidence;
+    mutated_probe_evidence.host_parent_af_inet_socket_calls = 0u;
+    validation_error.clear();
+    if (rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            mutated_probe_evidence,
+            HeldTopologyProbePolicy::RequireHostRefusalProbes,
+            validation_error)) {
+        std::cerr << "FAIL [#358 Stage 2a3b held topology probe policy]: mutated default probe "
+                     "evidence was accepted\n";
+        return 1;
+    }
+    HeldTopologyProbeEvidence socketless_probe_evidence{
+        HeldTopologyProbePolicy::SocketlessHostParent, 1u, 0u, 0u};
+    validation_error.clear();
+    if (!rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            socketless_probe_evidence,
+            HeldTopologyProbePolicy::SocketlessHostParent,
+            validation_error)) {
+        std::cerr << "FAIL [#358 Stage 2a3b socketless topology probe policy]: " << validation_error
+                  << "\n";
+        return 1;
+    }
+    mutated_probe_evidence = socketless_probe_evidence;
+    mutated_probe_evidence.host_parent_af_inet_socket_calls = 1u;
+    validation_error.clear();
+    if (rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            mutated_probe_evidence,
+            HeldTopologyProbePolicy::SocketlessHostParent,
+            validation_error) ||
+        rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            socketless_probe_evidence,
+            HeldTopologyProbePolicy::RequireHostRefusalProbes,
+            validation_error) ||
+        rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+            default_probe_evidence,
+            HeldTopologyProbePolicy::SocketlessHostParent,
+            validation_error)) {
+        std::cerr << "FAIL [#358 Stage 2a3b socketless topology probe policy]: mutated/swapped "
+                     "socket policy evidence was accepted\n";
         return 1;
     }
     const RunResult preflight = rut::test::ipv4_topology::run(FailurePoint::AfterNetworkACreated);
@@ -71,7 +124,13 @@ int main() {
                     error = std::string("held topology snapshot invalid field: ") + field;
                 return condition;
             };
-            return require(!snapshot.token.empty(), "token") &&
+            std::string probe_error;
+            return require(rut::test::ipv4_topology::validate_held_topology_probe_evidence(
+                               snapshot.probe_evidence,
+                               HeldTopologyProbePolicy::RequireHostRefusalProbes,
+                               probe_error),
+                           probe_error.c_str()) &&
+                   require(!snapshot.token.empty(), "token") &&
                    require(!snapshot.network_a_name.empty(), "network_a_name") &&
                    require(!snapshot.network_a_id.empty(), "network_a_id") &&
                    require(!snapshot.network_a_subnet.empty(), "network_a_subnet") &&
