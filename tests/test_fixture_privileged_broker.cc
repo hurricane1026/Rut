@@ -98,11 +98,13 @@ constexpr u16 kExactRutWitness = 42;
 constexpr u16 kExactRutCleanup = 43;
 constexpr u16 kExactRutCleaned = 44;
 constexpr u16 kExactRutFailure = 45;
+constexpr u16 kExactEscrowSettled = 46;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
 constexpr int kCredentialFd = 198;
+constexpr int kExactCustodyFd = 199;
 constexpr int kLauncherBundleFdBase = 220;
-static_assert(kLauncherBundleFdBase > kCredentialFd);
+static_assert(kLauncherBundleFdBase > kExactCustodyFd && kExactCustodyFd != kCredentialFd);
 
 struct EndpointIdentity {
     dev_t directory_dev = 0;
@@ -169,6 +171,7 @@ enum class ExactLiveness { Live, ExitedOrReused, Unknown };
 static ExactLiveness observe_exact_liveness(const ProcIdentity& expected);
 static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
+static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
 
 static bool exact_request(const Frame& request, u16 expected_type, const Token& token) {
     return request.type == expected_type && token_equal(request.token, token) &&
@@ -1040,6 +1043,57 @@ struct ExactFailureReport {
     u64 count = 0u;
 };
 
+constexpr u64 kExactCustodyVersion = 1u;
+constexpr std::size_t kExactCustodyFields = 20u;
+struct ExactCustodyRecord {
+    u64 version = kExactCustodyVersion;
+    u64 child_pid = 0u;
+    u64 child_start = 0u;
+    u64 child_exe_dev = 0u;
+    u64 child_exe_ino = 0u;
+    u64 listener_inode = 0u;
+    u64 positive_ipv4 = 0u;
+    u64 guard_ipv4 = 0u;
+    u64 port = 0u;
+    u64 guard_inode = 0u;
+    u64 netns = 0u;
+    u64 directory_dev = 0u;
+    u64 directory_ino = 0u;
+    u64 source_dev = 0u;
+    u64 source_ino = 0u;
+    u64 log_dev = 0u;
+    u64 log_ino = 0u;
+    u64 target_pid = 0u;
+    u64 target_start = 0u;
+    u64 has_pidfd = 0u;
+};
+
+struct ExactEscrowRights {
+    int guard = -1;
+    int pidfd = -1;
+    int directory = -1;
+
+    void close_all() {
+        for (int* fd : {&guard, &pidfd, &directory}) {
+            if (*fd >= 0) close(*fd);
+            *fd = -1;
+        }
+    }
+};
+
+constexpr std::size_t kExactSettledFields = 9u;
+struct ExactSettledRecord {
+    u64 version = kExactCustodyVersion;
+    u64 target_pid = 0u;
+    u64 child_pid = 0u;
+    u64 guard_inode = 0u;
+    u64 adopted = 0u;
+    u64 reaped = 0u;
+    u64 listener_absent = 0u;
+    u64 temps_absent = 0u;
+    u64 guard_closed = 0u;
+};
+
 static bool executable_lease_unchanged(const ExecutableLease& lease);
 
 static void append_u64(std::vector<unsigned char>& payload, u64 value) {
@@ -1255,6 +1309,291 @@ static bool decode_exact_failure(const std::vector<unsigned char>& payload,
         return false;
     report = {version, phase, error_number, count};
     return true;
+}
+
+static std::vector<unsigned char> encode_exact_custody(const ExactCustodyRecord& record,
+                                                       const Token& token) {
+    std::vector<unsigned char> wire;
+    wire.reserve(kTokenBytes + kExactCustodyFields * sizeof(u64));
+    wire.insert(wire.end(), token.bytes.begin(), token.bytes.end());
+    for (u64 field :
+         {record.version,       record.child_pid,      record.child_start,   record.child_exe_dev,
+          record.child_exe_ino, record.listener_inode, record.positive_ipv4, record.guard_ipv4,
+          record.port,          record.guard_inode,    record.netns,         record.directory_dev,
+          record.directory_ino, record.source_dev,     record.source_ino,    record.log_dev,
+          record.log_ino,       record.target_pid,     record.target_start,  record.has_pidfd})
+        append_u64(wire, field);
+    return wire;
+}
+
+static bool decode_exact_custody(const std::vector<unsigned char>& wire,
+                                 const Token& token,
+                                 ExactCustodyRecord& record) {
+    record = {};
+    if (wire.size() != kTokenBytes + kExactCustodyFields * sizeof(u64) ||
+        !std::equal(token.bytes.begin(), token.bytes.end(), wire.begin()))
+        return false;
+    std::array<u64, kExactCustodyFields> fields{};
+    for (std::size_t i = 0; i != fields.size(); ++i)
+        fields[i] = read_u64(wire.data() + kTokenBytes + i * sizeof(u64));
+    if (fields[0] != kExactCustodyVersion || fields[1] <= 1u || fields[2] == 0u ||
+        fields[6] > std::numeric_limits<u32>::max() ||
+        fields[7] > std::numeric_limits<u32>::max() || fields[8] == 0u ||
+        fields[8] > std::numeric_limits<u16>::max() || fields[9] == 0u || fields[10] == 0u ||
+        fields[11] == 0u || fields[12] == 0u || fields[14] == 0u || fields[16] == 0u ||
+        fields[17] <= 1u || fields[18] == 0u || fields[19] > 1u)
+        return false;
+    record = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
+              fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
+              fields[14], fields[15], fields[16], fields[17], fields[18], fields[19]};
+    return true;
+}
+
+static std::vector<unsigned char> encode_exact_settled(const ExactSettledRecord& settled) {
+    std::vector<unsigned char> payload;
+    payload.reserve(kExactSettledFields * sizeof(u64));
+    for (u64 field : {settled.version,
+                      settled.target_pid,
+                      settled.child_pid,
+                      settled.guard_inode,
+                      settled.adopted,
+                      settled.reaped,
+                      settled.listener_absent,
+                      settled.temps_absent,
+                      settled.guard_closed})
+        append_u64(payload, field);
+    return payload;
+}
+
+static bool decode_exact_settled(const std::vector<unsigned char>& payload,
+                                 ExactSettledRecord& settled) {
+    settled = {};
+    if (payload.size() != kExactSettledFields * sizeof(u64)) return false;
+    std::array<u64, kExactSettledFields> fields{};
+    for (std::size_t i = 0; i != fields.size(); ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    if (fields[0] != kExactCustodyVersion || fields[1] <= 1u || fields[2] <= 1u ||
+        fields[3] == 0u || fields[4] > 1u || fields[5] > 1u || fields[6] > 1u || fields[7] > 1u ||
+        fields[8] > 1u)
+        return false;
+    settled = {fields[0],
+               fields[1],
+               fields[2],
+               fields[3],
+               fields[4],
+               fields[5],
+               fields[6],
+               fields[7],
+               fields[8]};
+    return true;
+}
+
+static bool receive_failed_target_lifecycle(int broker_fd,
+                                            const Token& token,
+                                            pid_t expected_target,
+                                            u64 expected_child,
+                                            u64 expected_guard_inode,
+                                            std::string& error) {
+    Frame record;
+    if (!receive_frame(broker_fd, record, kListenerDeadlineMs)) {
+        error += "; dropped failure lifecycle timed out";
+        return false;
+    }
+    if (record.type == kExactEscrowSettled) {
+        ExactSettledRecord settled;
+        if (!token_equal(record.token, token) || !decode_exact_settled(record.payload, settled) ||
+            settled.target_pid != static_cast<u64>(expected_target) ||
+            (expected_child != 0u && settled.child_pid != expected_child) ||
+            settled.guard_inode != expected_guard_inode || settled.adopted != 1u ||
+            settled.reaped != 1u || settled.listener_absent != 1u || settled.temps_absent != 1u ||
+            settled.guard_closed != 1u || !receive_frame(broker_fd, record, kHandshakeMs)) {
+            error += "; malformed or incomplete failure-settled evidence";
+            return false;
+        }
+    }
+    if (record.type != kTargetExited || !token_equal(record.token, token) ||
+        record.payload.size() != 4u) {
+        error += "; missing failed Target exit evidence";
+        return false;
+    }
+    const int status =
+        static_cast<int>(record.payload[0]) | (static_cast<int>(record.payload[1]) << 8) |
+        (static_cast<int>(record.payload[2]) << 16) | (static_cast<int>(record.payload[3]) << 24);
+    Frame released;
+    if ((!WIFEXITED(status) || WEXITSTATUS(status) == 0) && !WIFSIGNALED(status)) {
+        error += "; failed Target reported success";
+        return false;
+    }
+    if (!send_frame(broker_fd, Frame{kRelease, token, {}}, kHandshakeMs) ||
+        !receive_frame(broker_fd, released, kHandshakeMs) || released.type != kReleased ||
+        !token_equal(released.token, token) || !released.payload.empty()) {
+        error += "; dropped failure release handshake failed";
+        return false;
+    }
+    return true;
+}
+
+static void close_rights_in_message(msghdr& message) {
+    for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len < CMSG_LEN(0) || header->cmsg_len > message.msg_controllen)
+            continue;
+        const std::size_t bytes = header->cmsg_len - CMSG_LEN(0);
+        const int* fds = reinterpret_cast<const int*>(CMSG_DATA(header));
+        for (std::size_t i = 0; i != bytes / sizeof(int); ++i)
+            if (fds[i] >= 0) close(fds[i]);
+    }
+}
+
+static bool send_exact_custody(int fd,
+                               const Token& token,
+                               const ExactCustodyRecord& record,
+                               const ExactEscrowRights& rights,
+                               std::chrono::steady_clock::time_point deadline) {
+    const std::vector<unsigned char> wire = encode_exact_custody(record, token);
+    std::array<int, 3> fds{rights.guard, rights.pidfd, rights.directory};
+    const std::size_t count = record.has_pidfd != 0u ? 3u : 2u;
+    if (record.has_pidfd == 0u) fds[1] = rights.directory;
+    if (fd < 0 || rights.guard < 0 || rights.directory < 0 ||
+        (record.has_pidfd != 0u && rights.pidfd < 0) || !wait_fd(fd, POLLOUT, deadline))
+        return false;
+    alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(3 * sizeof(int))> control{};
+    iovec vector{const_cast<unsigned char*>(wire.data()), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = CMSG_SPACE(count * sizeof(int));
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(count * sizeof(int));
+    memcpy(CMSG_DATA(header), fds.data(), count * sizeof(int));
+    ssize_t sent;
+    do {
+        sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    return sent == static_cast<ssize_t>(wire.size());
+}
+
+static bool receive_exact_custody(int fd,
+                                  const Token& token,
+                                  pid_t expected_target,
+                                  uid_t expected_uid,
+                                  gid_t expected_gid,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  ExactCustodyRecord& record,
+                                  ExactEscrowRights& rights) {
+    rights.close_all();
+    if (fd < 0 || !wait_fd(fd, POLLIN, deadline)) return false;
+    std::vector<unsigned char> wire(kTokenBytes + kExactCustodyFields * sizeof(u64));
+    alignas(cmsghdr)
+        std::array<unsigned char, CMSG_SPACE(3 * sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))>
+            control{};
+    iovec vector{wire.data(), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    ssize_t received;
+    do {
+        received = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+    } while (received < 0 && errno == EINTR);
+    if (received != static_cast<ssize_t>(wire.size()) ||
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
+        !decode_exact_custody(wire, token, record)) {
+        close_rights_in_message(message);
+        return false;
+    }
+    const cmsghdr* rights_header = nullptr;
+    const cmsghdr* credentials_header = nullptr;
+    std::size_t header_count = 0u;
+    for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        ++header_count;
+        if (header->cmsg_level != SOL_SOCKET) continue;
+        if (header->cmsg_type == SCM_RIGHTS && rights_header == nullptr)
+            rights_header = header;
+        else if (header->cmsg_type == SCM_CREDENTIALS && credentials_header == nullptr)
+            credentials_header = header;
+    }
+    const std::size_t expected_count = record.has_pidfd != 0u ? 3u : 2u;
+    if (header_count != 2u || rights_header == nullptr || credentials_header == nullptr ||
+        rights_header->cmsg_len != CMSG_LEN(expected_count * sizeof(int)) ||
+        credentials_header->cmsg_len != CMSG_LEN(sizeof(struct ucred))) {
+        close_rights_in_message(message);
+        return false;
+    }
+    struct ucred credentials{};
+    memcpy(&credentials, CMSG_DATA(credentials_header), sizeof(credentials));
+    if (credentials.pid != expected_target || credentials.uid != expected_uid ||
+        credentials.gid != expected_gid || record.target_pid != static_cast<u64>(expected_target)) {
+        close_rights_in_message(message);
+        return false;
+    }
+    std::array<int, 3> fds{-1, -1, -1};
+    memcpy(fds.data(), CMSG_DATA(rights_header), expected_count * sizeof(int));
+    rights.guard = fds[0];
+    rights.pidfd = record.has_pidfd != 0u ? fds[1] : -1;
+    rights.directory = record.has_pidfd != 0u ? fds[2] : fds[1];
+    return rights.guard >= 0 && rights.directory >= 0 &&
+           (record.has_pidfd == 0u || rights.pidfd >= 0);
+}
+
+static std::vector<unsigned char> exact_custody_ack(const Token& token) {
+    std::vector<unsigned char> wire;
+    wire.reserve(kTokenBytes + sizeof(u64));
+    wire.insert(wire.end(), token.bytes.begin(), token.bytes.end());
+    append_u64(wire, kExactCustodyVersion);
+    return wire;
+}
+
+static bool send_exact_custody_ack(int fd,
+                                   const Token& token,
+                                   std::chrono::steady_clock::time_point deadline) {
+    const std::vector<unsigned char> wire = exact_custody_ack(token);
+    if (!wait_fd(fd, POLLOUT, deadline)) return false;
+    ssize_t sent;
+    do {
+        sent = send(fd, wire.data(), wire.size(), MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    return sent == static_cast<ssize_t>(wire.size());
+}
+
+static bool receive_exact_custody_ack(int fd,
+                                      const Token& token,
+                                      pid_t expected_dropped,
+                                      uid_t expected_uid,
+                                      gid_t expected_gid,
+                                      std::chrono::steady_clock::time_point deadline) {
+    const std::vector<unsigned char> expected = exact_custody_ack(token);
+    std::vector<unsigned char> wire(expected.size());
+    alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(struct ucred))> control{};
+    iovec vector{wire.data(), wire.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    if (!wait_fd(fd, POLLIN, deadline)) return false;
+    ssize_t received;
+    do {
+        received = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+    } while (received < 0 && errno == EINTR);
+    cmsghdr* only = CMSG_FIRSTHDR(&message);
+    if (received != static_cast<ssize_t>(wire.size()) || wire != expected ||
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 || only == nullptr ||
+        CMSG_NXTHDR(&message, only) != nullptr || only->cmsg_level != SOL_SOCKET ||
+        only->cmsg_type != SCM_CREDENTIALS || only->cmsg_len != CMSG_LEN(sizeof(struct ucred))) {
+        close_rights_in_message(message);
+        return false;
+    }
+    struct ucred credentials{};
+    memcpy(&credentials, CMSG_DATA(only), sizeof(credentials));
+    return credentials.pid == expected_dropped && credentials.uid == expected_uid &&
+           credentials.gid == expected_gid;
 }
 
 static std::vector<unsigned char> guard_request_payload(u32 positive_ipv4, u32 guard_ipv4) {
@@ -1849,6 +2188,20 @@ struct ExactChildState {
     bool guard_release_safe = false;
 };
 
+static bool validate_exact_custody_endpoint(int fd, pid_t expected_dropped) {
+    int type = 0;
+    socklen_t type_size = sizeof(type);
+    Peer peer;
+    const int enabled = 1;
+    const int flags = fcntl(fd, F_GETFD);
+    return fd == kExactCustodyFd && expected_dropped > 1 && flags >= 0 &&
+           getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_size) == 0 &&
+           type_size == sizeof(type) && type == SOCK_SEQPACKET && get_peer(fd, peer) &&
+           peer.pid == expected_dropped && peer.uid == getuid() && peer.gid == getgid() &&
+           setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) == 0 &&
+           fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
 static bool write_all_fd(int fd, const std::string& contents) {
     std::size_t offset = 0u;
     while (offset < contents.size()) {
@@ -2152,6 +2505,55 @@ static int reopen_exact_directory(const ExactChildState& child) {
         return -1;
     }
     return fd;
+}
+
+static bool handoff_unreaped_exact_child(const Token& token,
+                                         const GuardReport& held,
+                                         int guard_fd,
+                                         const ExactChildState& child) {
+    if (!child.forked || child.reaped || child.pid <= 1 || guard_fd < 0) return false;
+    ProcIdentity target_identity;
+    ProcIdentity child_identity;
+    if (!read_proc(getpid(), target_identity) || target_identity.pid != getpid() ||
+        target_identity.ppid <= 1 || !read_proc(child.pid, child_identity, false) ||
+        child_identity.pid != child.pid || child_identity.ppid != getpid() ||
+        child_identity.start == 0u || child_identity.netns != held.netns)
+        return false;
+    const int directory_fd = reopen_exact_directory(child);
+    if (directory_fd < 0) return false;
+    ExactCustodyRecord record;
+    record.child_pid = static_cast<u64>(child.pid);
+    record.child_start = child_identity.start;
+    record.child_exe_dev = child_identity.exe_dev;
+    record.child_exe_ino = child_identity.exe_ino;
+    record.listener_inode = child.listener_inode;
+    record.positive_ipv4 = held.plan.positive_ipv4;
+    record.guard_ipv4 = held.plan.guard_ipv4;
+    record.port = held.plan.port;
+    record.guard_inode = held.socket_inode;
+    record.netns = held.netns;
+    record.directory_dev = child.directory_status.st_dev;
+    record.directory_ino = child.directory_status.st_ino;
+    record.source_dev = child.source_status.st_dev;
+    record.source_ino = child.source_status.st_ino;
+    record.log_dev = child.log_status.st_dev;
+    record.log_ino = child.log_status.st_ino;
+    record.target_pid = static_cast<u64>(getpid());
+    record.target_start = target_identity.start;
+    record.has_pidfd = child.pidfd >= 0 ? 1u : 0u;
+    ExactEscrowRights rights;
+    rights.guard = guard_fd;
+    rights.pidfd = child.pidfd;
+    rights.directory = directory_fd;
+    const auto deadline = new_exact_cleanup_deadline();
+    const bool sent = send_exact_custody(kExactCustodyFd, token, record, rights, deadline);
+    close(directory_fd);
+    return sent && receive_exact_custody_ack(kExactCustodyFd,
+                                             token,
+                                             target_identity.ppid,
+                                             target_identity.uid,
+                                             target_identity.gid,
+                                             deadline);
 }
 
 static bool remove_exact_temp(int directory_fd, const char* name, const struct stat& expected) {
@@ -2679,9 +3081,16 @@ static bool start_exact_child(const Frame& command,
 
 static int finish_exact_failure(int control,
                                 const Token& token,
+                                const GuardReport& held,
+                                int guard_fd,
                                 const ExactChildState& child,
                                 const ExactFailureReport& failure,
                                 int exit_code) {
+    if (child.forked && !child.reaped &&
+        !handoff_unreaped_exact_child(token, held, guard_fd, child)) {
+        close(control);
+        return exit_code;
+    }
     (void)send_frame(
         control, Frame{kExactRutFailure, token, encode_exact_failure(failure)}, kHandshakeMs);
     close(control);
@@ -2702,6 +3111,9 @@ static int secured_target_main(const char* control_path,
     u64 broker = 0;
     if (!token_from_hex(token_string, token) || !parse_u64(broker_text, broker) || broker <= 1)
         return 40;
+    if (strcmp(scenario, "listener-guard-reservation") == 0 &&
+        !validate_exact_custody_endpoint(kExactCustodyFd, static_cast<pid_t>(broker)))
+        return 39;
     const int control = connect_control(control_path);
     if (control < 0) return 41;
     if (strcmp(scenario, "no-ready") == 0) {
@@ -2790,7 +3202,8 @@ static int secured_target_main(const char* control_path,
                                          new_exact_cleanup_deadline(),
                                          &exact_failure))
                     exact_failure.phase = ExactFailurePhase::Cleanup;
-                return finish_exact_failure(control, token, exact_child, exact_failure, 53);
+                return finish_exact_failure(
+                    control, token, held, guard_fd, exact_child, exact_failure, 53);
             }
             if (!send_frame(control,
                             Frame{kExactRutWitness, token, encode_exact_report(exact_report)},
@@ -2805,7 +3218,8 @@ static int secured_target_main(const char* control_path,
                                                             new_exact_cleanup_deadline(),
                                                             &exact_failure);
                 (void)cleanup_ok;
-                return finish_exact_failure(control, token, exact_child, exact_failure, 53);
+                return finish_exact_failure(
+                    control, token, held, guard_fd, exact_child, exact_failure, 53);
             }
             Frame exact_cleanup;
             ExactRutCleanedReport exact_cleaned;
@@ -2824,13 +3238,15 @@ static int secured_target_main(const char* control_path,
                             Frame{kExactRutCleaned, token, encode_exact_cleaned(exact_cleaned)},
                             kHandshakeMs)) {
                 exact_failure.phase = ExactFailurePhase::Cleanup;
-                return finish_exact_failure(control, token, exact_child, exact_failure, 54);
+                return finish_exact_failure(
+                    control, token, held, guard_fd, exact_child, exact_failure, 54);
             }
             Frame release;
             if (!receive_frame(control, release, kBrokerDeadlineMs) ||
                 !exact_request(release, kGuardRelease, token)) {
                 if (!exact_child.guard_release_safe)
-                    return finish_exact_failure(control, token, exact_child, exact_failure, 49);
+                    return finish_exact_failure(
+                        control, token, held, guard_fd, exact_child, exact_failure, 49);
                 close(guard_fd);
                 close(control);
                 return 49;
@@ -2845,7 +3261,8 @@ static int secured_target_main(const char* control_path,
                                           new_exact_cleanup_deadline(),
                                           &exact_failure);
                 if (!exact_child.guard_release_safe)
-                    return finish_exact_failure(control, token, exact_child, exact_failure, 49);
+                    return finish_exact_failure(
+                        control, token, held, guard_fd, exact_child, exact_failure, 49);
             }
             close(guard_fd);
             errno = 0;
@@ -2894,6 +3311,276 @@ static int secured_target_main(const char* control_path,
     }
 }
 
+static bool validate_exact_escrow(const ExactCustodyRecord& record,
+                                  const ExactEscrowRights& rights,
+                                  const ProcIdentity& target,
+                                  ino_t expected_netns,
+                                  uid_t expected_uid,
+                                  gid_t expected_gid) {
+    if (record.target_pid != static_cast<u64>(target.pid) || record.target_start != target.start ||
+        record.netns != static_cast<u64>(expected_netns) || target.uid != expected_uid ||
+        target.gid != expected_gid || rights.guard < 0 || rights.directory < 0)
+        return false;
+    struct stat guard_status{}, directory_status{}, source_status{}, log_status{};
+    sockaddr_in endpoint{};
+    socklen_t endpoint_size = sizeof(endpoint);
+    int socket_type = 0;
+    int accept_connection = 0;
+    socklen_t option_size = sizeof(int);
+    if (fstat(rights.guard, &guard_status) != 0 || !S_ISSOCK(guard_status.st_mode) ||
+        guard_status.st_ino != record.guard_inode ||
+        getsockname(rights.guard, reinterpret_cast<sockaddr*>(&endpoint), &endpoint_size) != 0 ||
+        endpoint_size != sizeof(endpoint) || endpoint.sin_family != AF_INET ||
+        ntohl(endpoint.sin_addr.s_addr) != record.guard_ipv4 ||
+        ntohs(endpoint.sin_port) != record.port ||
+        getsockopt(rights.guard, SOL_SOCKET, SO_TYPE, &socket_type, &option_size) != 0 ||
+        socket_type != SOCK_STREAM ||
+        getsockopt(rights.guard, SOL_SOCKET, SO_ACCEPTCONN, &accept_connection, &option_size) !=
+            0 ||
+        accept_connection != 0 || fstat(rights.directory, &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode) || directory_status.st_dev != record.directory_dev ||
+        directory_status.st_ino != record.directory_ino ||
+        directory_status.st_uid != expected_uid || directory_status.st_gid != expected_gid ||
+        (directory_status.st_mode & 0777) != 0700 ||
+        fstatat(rights.directory, "exact-listener.rut", &source_status, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(source_status.st_mode) || source_status.st_dev != record.source_dev ||
+        source_status.st_ino != record.source_ino ||
+        fstatat(rights.directory, "exact-listener.log", &log_status, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(log_status.st_mode) || log_status.st_dev != record.log_dev ||
+        log_status.st_ino != record.log_ino)
+        return false;
+    ProcIdentity child;
+    if (!read_proc(static_cast<pid_t>(record.child_pid), child, false) ||
+        child.pid != static_cast<pid_t>(record.child_pid) || child.ppid != target.pid ||
+        child.start != record.child_start || child.exe_dev != record.child_exe_dev ||
+        child.exe_ino != record.child_exe_ino || child.netns != expected_netns ||
+        child.uid != expected_uid || child.gid != expected_gid)
+        return false;
+    if (record.has_pidfd != 0u && (rights.pidfd < 0 || !pidfd_link_matches(getpid(), rights.pidfd)))
+        return false;
+    if (record.listener_inode != 0u) {
+        privileged_listener::ProcTcpTable table;
+        std::vector<u64> inodes;
+        privileged_listener::ListenerEvidence evidence;
+        privileged_listener::Diagnostic diagnostic;
+        const privileged_listener::ListenerPlan plan{static_cast<u32>(record.positive_ipv4),
+                                                     static_cast<u32>(record.guard_ipv4),
+                                                     record.port};
+        if (!read_process_tcp_table(child.pid, table) ||
+            !process_socket_inodes(child.pid, inodes) ||
+            !privileged_listener::classify_listener_evidence(
+                table,
+                plan,
+                inodes,
+                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                evidence,
+                diagnostic) ||
+            evidence.child_owned_inode != record.listener_inode)
+            return false;
+    }
+    return true;
+}
+
+static bool wait_reap_adopted_exact(const ExactCustodyRecord& record,
+                                    ExactEscrowRights& rights,
+                                    std::chrono::steady_clock::time_point deadline,
+                                    bool& adopted) {
+    adopted = false;
+    bool term_sent = false;
+    bool kill_sent = false;
+    const auto kill_deadline =
+        std::chrono::steady_clock::now() + (deadline - std::chrono::steady_clock::now()) / 2;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int status = 0;
+        const pid_t waited = waitpid(static_cast<pid_t>(record.child_pid), &status, WNOHANG);
+        if (waited == static_cast<pid_t>(record.child_pid)) {
+            adopted = true;
+            return true;
+        }
+        if (waited < 0 && errno != EINTR && errno != ECHILD) return false;
+        ProcIdentity child;
+        const bool identity = read_proc(static_cast<pid_t>(record.child_pid), child, false) &&
+                              child.pid == static_cast<pid_t>(record.child_pid) &&
+                              child.ppid == getpid() && child.start == record.child_start &&
+                              child.exe_dev == record.child_exe_dev &&
+                              child.exe_ino == record.child_exe_ino;
+        if (identity) {
+            adopted = true;
+            if (!term_sent) {
+#ifdef SYS_pidfd_send_signal
+                const bool signalled =
+                    rights.pidfd >= 0
+                        ? syscall(SYS_pidfd_send_signal, rights.pidfd, SIGTERM, nullptr, 0) == 0
+                        : kill(child.pid, SIGTERM) == 0;
+#else
+                const bool signalled = kill(child.pid, SIGTERM) == 0;
+#endif
+                if (!signalled && errno != ESRCH) return false;
+                term_sent = true;
+            } else if (!kill_sent && std::chrono::steady_clock::now() >= kill_deadline) {
+#ifdef SYS_pidfd_send_signal
+                const bool signalled =
+                    rights.pidfd >= 0
+                        ? syscall(SYS_pidfd_send_signal, rights.pidfd, SIGKILL, nullptr, 0) == 0
+                        : kill(child.pid, SIGKILL) == 0;
+#else
+                const bool signalled = kill(child.pid, SIGKILL) == 0;
+#endif
+                if (!signalled && errno != ESRCH) return false;
+                kill_sent = true;
+            }
+        }
+        (void)poll(nullptr, 0, 10);
+    }
+    return false;
+}
+
+static bool settle_exact_escrow(int control,
+                                const Token& token,
+                                const ExactCustodyRecord& record,
+                                ExactEscrowRights& rights,
+                                ExactSettledRecord& settled) {
+    settled.version = kExactCustodyVersion;
+    settled.target_pid = record.target_pid;
+    settled.child_pid = record.child_pid;
+    settled.guard_inode = record.guard_inode;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
+    bool adopted = false;
+    const bool reaped = wait_reap_adopted_exact(record, rights, deadline, adopted);
+    privileged_listener::ProcTcpTable table;
+    bool listener_absent = false;
+    while (reaped && std::chrono::steady_clock::now() < deadline) {
+        if (read_process_tcp_table(getpid(), table) &&
+            exact_listener_absent(table,
+                                  {static_cast<u32>(record.positive_ipv4),
+                                   static_cast<u32>(record.guard_ipv4),
+                                   record.port},
+                                  record.listener_inode)) {
+            listener_absent = true;
+            break;
+        }
+        (void)poll(nullptr, 0, 10);
+    }
+    struct stat source{}, log{};
+    source.st_dev = record.source_dev;
+    source.st_ino = record.source_ino;
+    log.st_dev = record.log_dev;
+    log.st_ino = record.log_ino;
+    const bool temps_absent = reaped &&
+                              remove_exact_temp(rights.directory, "exact-listener.rut", source) &&
+                              remove_exact_temp(rights.directory, "exact-listener.log", log);
+    settled.adopted = adopted ? 1u : 0u;
+    settled.reaped = reaped ? 1u : 0u;
+    settled.listener_absent = listener_absent ? 1u : 0u;
+    settled.temps_absent = temps_absent ? 1u : 0u;
+    if (reaped && listener_absent && temps_absent) {
+        const int old_guard = rights.guard;
+        close(rights.guard);
+        rights.guard = -1;
+        errno = 0;
+        settled.guard_closed = fcntl(old_guard, F_GETFD) < 0 && errno == EBADF ? 1u : 0u;
+    }
+    const bool sent = send_frame(
+        control, Frame{kExactEscrowSettled, token, encode_exact_settled(settled)}, kHandshakeMs);
+    return sent && settled.adopted != 0u && settled.reaped != 0u && settled.listener_absent != 0u &&
+           settled.temps_absent != 0u && settled.guard_closed != 0u;
+}
+
+static OwnedWaitResult wait_listener_target_bounded(pid_t target,
+                                                    const ProcIdentity& target_identity,
+                                                    pid_t root_broker,
+                                                    int root_lease,
+                                                    int custody_fd,
+                                                    int control,
+                                                    const Token& token,
+                                                    ino_t expected_netns,
+                                                    uid_t expected_uid,
+                                                    gid_t expected_gid,
+                                                    int& target_status) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs * 2);
+    bool custody_received = false;
+    ExactCustodyRecord custody;
+    ExactEscrowRights rights;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const bool root_lost = control_lease_lost(root_lease) || getppid() != root_broker;
+        if (root_lost && !custody_received) return OwnedWaitResult::LeaseLost;
+        int status = 0;
+        const pid_t waited = waitpid(target, &status, WNOHANG);
+        if (waited == target) {
+            target_status = status;
+            if (custody_received) {
+                ExactSettledRecord settled;
+                const bool settled_ok =
+                    settle_exact_escrow(control, token, custody, rights, settled);
+                rights.close_all();
+                return settled_ok ? OwnedWaitResult::Exited : OwnedWaitResult::Error;
+            }
+            return OwnedWaitResult::Exited;
+        }
+        if (waited < 0 && errno != EINTR) {
+            rights.close_all();
+            return OwnedWaitResult::Error;
+        }
+        pollfd descriptor{custody_fd, POLLIN, 0};
+        int polled;
+        do {
+            polled = poll(&descriptor, 1, 10);
+        } while (polled < 0 && errno == EINTR);
+        if (polled < 0) {
+            rights.close_all();
+            return OwnedWaitResult::Error;
+        }
+        if ((descriptor.revents & POLLIN) != 0) {
+            if (custody_received ||
+                !receive_exact_custody(custody_fd,
+                                       token,
+                                       target,
+                                       expected_uid,
+                                       expected_gid,
+                                       deadline,
+                                       custody,
+                                       rights) ||
+                !validate_exact_escrow(
+                    custody, rights, target_identity, expected_netns, expected_uid, expected_gid) ||
+                control_lease_lost(root_lease) || getppid() != root_broker ||
+                prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker ||
+                !send_exact_custody_ack(custody_fd, token, deadline)) {
+                rights.close_all();
+                return OwnedWaitResult::Error;
+            }
+            custody_received = true;
+        }
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            rights.close_all();
+            return OwnedWaitResult::Error;
+        }
+    }
+    if (!custody_received) return OwnedWaitResult::Error;
+    // ACK transferred guard custody.  A Target that does not exit by the
+    // outer deadline is still our direct child and may now be killed without
+    // releasing the escrowed guard.
+    if (kill(target, SIGKILL) != 0 && errno != ESRCH) {
+        rights.close_all();
+        return OwnedWaitResult::Error;
+    }
+    const auto target_deadline = new_exact_cleanup_deadline();
+    while (std::chrono::steady_clock::now() < target_deadline) {
+        const pid_t waited = waitpid(target, &target_status, WNOHANG);
+        if (waited == target) {
+            ExactSettledRecord settled;
+            const bool settled_ok = settle_exact_escrow(control, token, custody, rights, settled);
+            rights.close_all();
+            return settled_ok ? OwnedWaitResult::Exited : OwnedWaitResult::Error;
+        }
+        if (waited < 0 && errno != EINTR) break;
+        (void)poll(nullptr, 0, 10);
+    }
+    rights.close_all();
+    return OwnedWaitResult::Error;
+}
+
 static int dropped_broker_main(const char* executable,
                                const char* control_path,
                                const char* token_string,
@@ -2935,12 +3622,35 @@ static int dropped_broker_main(const char* executable,
     int launch_pipe[2] = {-1, -1};
     int trace_pipe[2] = {-1, -1};
     if (pipe2(launch_pipe, O_CLOEXEC) != 0 || pipe2(trace_pipe, O_CLOEXEC) != 0) return 27;
+    const bool listener_scenario = strcmp(scenario, "listener-guard-reservation") == 0;
+    int custody_pair[2] = {-1, -1};
+    const int pass_credentials = 1;
+    if (listener_scenario &&
+        (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0 ||
+         socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, custody_pair) != 0 ||
+         setsockopt(custody_pair[0],
+                    SOL_SOCKET,
+                    SO_PASSCRED,
+                    &pass_credentials,
+                    sizeof(pass_credentials)) != 0))
+        return 27;
     const pid_t target = fork();
     if (target < 0) return 28;
     if (target == 0) {
         const pid_t broker_parent = getppid();
         close(launch_pipe[1]);
         close(trace_pipe[0]);
+        if (listener_scenario) {
+            close(custody_pair[0]);
+            if (custody_pair[1] == kExactCustodyFd) {
+                const int flags = fcntl(kExactCustodyFd, F_GETFD);
+                if (flags < 0 || fcntl(kExactCustodyFd, F_SETFD, flags & ~FD_CLOEXEC) != 0)
+                    _exit(49);
+            } else {
+                if (dup3(custody_pair[1], kExactCustodyFd, 0) != kExactCustodyFd) _exit(49);
+                close(custody_pair[1]);
+            }
+        }
         if (!arm_parent_death(broker_parent)) _exit(50);
         char authorization = 0;
         ssize_t count;
@@ -2973,6 +3683,10 @@ static int dropped_broker_main(const char* executable,
     }
     close(launch_pipe[0]);
     close(trace_pipe[1]);
+    if (listener_scenario) {
+        close(custody_pair[1]);
+        custody_pair[1] = -1;
+    }
     int control = -1;
     OwnedChildCleanup target_cleanup(target, &control);
     // These are all downstream leases owned by this dropped broker.  Close
@@ -2980,6 +3694,7 @@ static int dropped_broker_main(const char* executable,
     // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
     target_cleanup.add_downstream_fd(&launch_pipe[1]);
     target_cleanup.add_downstream_fd(&trace_pipe[0]);
+    if (listener_scenario) target_cleanup.add_downstream_fd(&custody_pair[0]);
     if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker)) return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
@@ -3043,25 +3758,49 @@ static int dropped_broker_main(const char* executable,
                                                 scenario});
     const int target_wait_ms =
         strcmp(scenario, "owned-wait-term-ignore") == 0 ? kCleanupMs : kBrokerDeadlineMs;
+    ProcIdentity listener_target_identity;
+    const bool listener_target_valid =
+        !listener_scenario ||
+        (read_proc(target, listener_target_identity) && listener_target_identity.pid == target &&
+         listener_target_identity.ppid == getpid() && listener_target_identity.start != 0u &&
+         listener_target_identity.exe == executable &&
+         listener_target_identity.cmdline == target_argv);
     const OwnedWaitResult target_wait_result =
-        wait_owned_child_bounded(target,
-                                 executable,
-                                 target_argv,
-                                 caller_uid,
-                                 caller_gid,
-                                 static_cast<ino_t>(expected_netns),
-                                 target,
-                                 true,
-                                 target_wait_ms,
-                                 target_status,
-                                 kCredentialFd,
-                                 &control);
+        !listener_target_valid
+            ? OwnedWaitResult::Error
+            : (listener_scenario ? wait_listener_target_bounded(target,
+                                                                listener_target_identity,
+                                                                root_broker,
+                                                                kCredentialFd,
+                                                                custody_pair[0],
+                                                                control,
+                                                                token,
+                                                                static_cast<ino_t>(expected_netns),
+                                                                caller_uid,
+                                                                caller_gid,
+                                                                target_status)
+                                 : wait_owned_child_bounded(target,
+                                                            executable,
+                                                            target_argv,
+                                                            caller_uid,
+                                                            caller_gid,
+                                                            static_cast<ino_t>(expected_netns),
+                                                            target,
+                                                            true,
+                                                            target_wait_ms,
+                                                            target_status,
+                                                            kCredentialFd,
+                                                            &control));
     if (target_wait_result != OwnedWaitResult::Exited) {
         if (target_wait_result == OwnedWaitResult::LeaseLost) target_cleanup.disarm();
         close(kCredentialFd);
         return 34;
     }
     target_cleanup.disarm();
+    if (custody_pair[0] >= 0) {
+        close(custody_pair[0]);
+        custody_pair[0] = -1;
+    }
     const std::vector<unsigned char> status_payload{
         static_cast<unsigned char>(target_status),
         static_cast<unsigned char>(target_status >> 8),
@@ -3299,6 +4038,9 @@ static int root_broker_main(const char* executable,
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
     int status = 0;
+    const int dropped_wait_ms = strcmp(scenario, "listener-guard-reservation") == 0
+                                    ? kListenerDeadlineMs * 3
+                                    : kBrokerDeadlineMs;
     const OwnedWaitResult dropped_wait_result =
         wait_owned_child_bounded(dropped,
                                  executable,
@@ -3308,7 +4050,7 @@ static int root_broker_main(const char* executable,
                                  static_cast<ino_t>(expected_netns),
                                  dropped,
                                  true,
-                                 kBrokerDeadlineMs,
+                                 dropped_wait_ms,
                                  status,
                                  root_control,
                                  &credential_pair[0]);
@@ -7540,6 +8282,8 @@ static bool run_session(const std::string& sudo_path,
                             " errno=" + std::to_string(failure.error_number) +
                             " count=" + std::to_string(failure.count);
                 }
+                (void)receive_failed_target_lifecycle(
+                    broker_fd, token, target_proc.pid, 0u, held.socket_inode, error);
                 break;
             }
             if (exact_frame.type != kExactRutWitness || !token_equal(exact_frame.token, token) ||
@@ -7575,6 +8319,12 @@ static bool run_session(const std::string& sudo_path,
                             " count=" + std::to_string(failure.count);
                 else
                     error = "exact public-RUT returned malformed cleanup failure evidence";
+                (void)receive_failed_target_lifecycle(broker_fd,
+                                                      token,
+                                                      target_proc.pid,
+                                                      exact_report.child_pid,
+                                                      held.socket_inode,
+                                                      error);
                 break;
             }
             if (exact_cleaned_frame.type != kExactRutCleaned ||
