@@ -401,7 +401,42 @@ static ExactLiveness observe_exact_liveness(const ProcIdentity& expected) {
     }
 }
 
+static bool exact_pre_root_loss_causal_state(ExactLiveness root_liveness, short broker_events) {
+    return root_liveness == ExactLiveness::Live && broker_events == 0;
+}
+
+static bool observe_quiet_broker_while_root_live(int broker_fd,
+                                                 const ProcIdentity& root,
+                                                 std::chrono::steady_clock::time_point deadline) {
+    if (broker_fd < 0 || !exact_pre_root_loss_causal_state(observe_exact_liveness(root), 0))
+        return false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        pollfd descriptor{broker_fd, static_cast<short>(POLLIN | POLLHUP | POLLERR), 0};
+        int polled;
+        do {
+            polled = poll(
+                &descriptor, 1, static_cast<int>(std::min<std::int64_t>(10, remaining.count())));
+        } while (polled < 0 && errno == EINTR);
+        if (polled < 0 ||
+            !exact_pre_root_loss_causal_state(observe_exact_liveness(root), descriptor.revents))
+            return false;
+    }
+    return exact_pre_root_loss_causal_state(observe_exact_liveness(root), 0);
+}
+
 static bool exact_liveness_self_check(std::string& error) {
+    if (!exact_pre_root_loss_causal_state(ExactLiveness::Live, 0) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::Unknown, 0) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::ExitedOrReused, 0) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::Live, POLLIN) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::Live, POLLHUP) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::Live, POLLERR) ||
+        exact_pre_root_loss_causal_state(ExactLiveness::Live, POLLNVAL)) {
+        error = "pre-Root-loss broker quiet/live causal decision failed";
+        return false;
+    }
     int arm_pipe[2] = {-1, -1};
     if (pipe2(arm_pipe, O_CLOEXEC) != 0) {
         error = "PDEATHSIG self-check pipe failed";
@@ -9611,6 +9646,17 @@ static bool run_session(const std::string& sudo_path,
                 }
                 close(target_fd);
                 target_fd = -1;
+                if (observe_exact_liveness(root_proc) != ExactLiveness::Live) {
+                    error = "exact Root PID/start was not live before deliberate loss";
+                    break;
+                }
+                const auto pre_root_loss_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+                if (!observe_quiet_broker_while_root_live(
+                        broker_fd, root_proc, pre_root_loss_deadline)) {
+                    error = "frame46/broker event preceded deliberate exact Root loss";
+                    break;
+                }
                 close(root_fd);
                 root_fd = -1;
                 const auto root_loss_deadline = std::chrono::steady_clock::now() +
