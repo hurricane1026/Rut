@@ -3597,29 +3597,16 @@ static ExactEscrowValidation classify_exact_child_observation(bool read_succeede
                                            : ExactEscrowValidation::Invalid;
 }
 
-static ExactEscrowValidation classify_exact_listener_observation(bool table_read,
-                                                                 bool inodes_read,
-                                                                 bool evidence_matches,
-                                                                 bool mismatch_confirmed) {
+static ExactEscrowValidation classify_exact_listener_observation(
+    bool table_read,
+    bool inodes_read,
+    bool positive_exact_evidence,
+    bool inode_matches,
+    ExactEscrowValidation identity_revalidation) {
     if (!table_read || !inodes_read) return ExactEscrowValidation::ObservationTransient;
-    if (evidence_matches) return ExactEscrowValidation::Valid;
-    return mismatch_confirmed ? ExactEscrowValidation::Invalid
-                              : ExactEscrowValidation::ObservationTransient;
-}
-
-static bool exact_listener_observations_equal(const privileged_listener::ProcTcpTable& first_table,
-                                              const std::vector<u64>& first_inodes,
-                                              const privileged_listener::ProcTcpTable& second_table,
-                                              const std::vector<u64>& second_inodes) {
-    if (first_table.count != second_table.count || first_inodes != second_inodes) return false;
-    for (std::size_t index = 0u; index != first_table.count; ++index) {
-        const auto& first = first_table.rows[index];
-        const auto& second = second_table.rows[index];
-        if (first.local_ipv4 != second.local_ipv4 || first.local_port != second.local_port ||
-            first.state != second.state || first.inode != second.inode)
-            return false;
-    }
-    return true;
+    if (!positive_exact_evidence) return ExactEscrowValidation::ObservationTransient;
+    if (identity_revalidation != ExactEscrowValidation::Valid) return identity_revalidation;
+    return inode_matches ? ExactEscrowValidation::Valid : ExactEscrowValidation::Invalid;
 }
 
 static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& record,
@@ -3707,41 +3694,36 @@ static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& rec
                                                      record.port};
         const bool table_read = read_process_tcp_table(child.pid, table);
         const bool inodes_read = process_socket_inodes(child.pid, inodes);
-        const bool evidence_matches = table_read && inodes_read &&
-                                      privileged_listener::classify_listener_evidence(
-                                          table,
-                                          plan,
-                                          inodes,
-                                          privileged_listener::ListenerEvidenceKind::ExactPositive,
-                                          evidence,
-                                          diagnostic) &&
-                                      evidence.child_owned_inode == record.listener_inode;
-        ExactEscrowValidation listener_validation =
-            classify_exact_listener_observation(table_read, inodes_read, evidence_matches, false);
-        if (listener_validation == ExactEscrowValidation::ObservationTransient && table_read &&
-            inodes_read) {
-            privileged_listener::ProcTcpTable second_table;
-            std::vector<u64> second_inodes;
-            privileged_listener::ListenerEvidence second_evidence;
-            privileged_listener::Diagnostic second_diagnostic;
-            const bool second_table_read = read_process_tcp_table(child.pid, second_table);
-            const bool second_inodes_read = process_socket_inodes(child.pid, second_inodes);
-            const bool second_matches =
-                second_table_read && second_inodes_read &&
-                privileged_listener::classify_listener_evidence(
-                    second_table,
-                    plan,
-                    second_inodes,
-                    privileged_listener::ListenerEvidenceKind::ExactPositive,
-                    second_evidence,
-                    second_diagnostic) &&
-                second_evidence.child_owned_inode == record.listener_inode;
-            const bool mismatch_confirmed =
-                second_table_read && second_inodes_read && !second_matches &&
-                exact_listener_observations_equal(table, inodes, second_table, second_inodes);
-            listener_validation = classify_exact_listener_observation(
-                second_table_read, second_inodes_read, second_matches, mismatch_confirmed);
+        const bool positive_exact_evidence =
+            table_read && inodes_read &&
+            privileged_listener::classify_listener_evidence(
+                table,
+                plan,
+                inodes,
+                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                evidence,
+                diagnostic);
+        ExactEscrowValidation identity_revalidation = ExactEscrowValidation::ObservationTransient;
+        if (positive_exact_evidence) {
+            ProcIdentity child_after;
+            const bool child_after_read = read_proc(child.pid, child_after, false);
+            const pid_t transition_parent =
+                expected_child_parent == expected_target ? getpid() : expected_target;
+            identity_revalidation = classify_exact_child_observation(child_after_read,
+                                                                     child_after,
+                                                                     record,
+                                                                     expected_child_parent,
+                                                                     transition_parent,
+                                                                     expected_netns,
+                                                                     expected_uid,
+                                                                     expected_gid);
         }
+        const ExactEscrowValidation listener_validation = classify_exact_listener_observation(
+            table_read,
+            inodes_read,
+            positive_exact_evidence,
+            positive_exact_evidence && evidence.child_owned_inode == record.listener_inode,
+            identity_revalidation);
         if (listener_validation != ExactEscrowValidation::Valid) return listener_validation;
     }
     return ExactEscrowValidation::Valid;
@@ -4159,17 +4141,24 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
 }
 
 static bool exact_adoption_fault_self_check(std::string& error) {
-    if (classify_exact_listener_observation(false, true, false, false) !=
+    if (classify_exact_listener_observation(
+            false, true, false, false, ExactEscrowValidation::Valid) !=
             ExactEscrowValidation::ObservationTransient ||
-        classify_exact_listener_observation(true, false, false, false) !=
+        classify_exact_listener_observation(
+            true, false, false, false, ExactEscrowValidation::Valid) !=
             ExactEscrowValidation::ObservationTransient ||
-        classify_exact_listener_observation(true, true, false, false) !=
+        classify_exact_listener_observation(
+            true, true, false, false, ExactEscrowValidation::Valid) !=
             ExactEscrowValidation::ObservationTransient ||
-        classify_exact_listener_observation(true, true, false, true) !=
+        classify_exact_listener_observation(
+            true, true, true, false, ExactEscrowValidation::ObservationTransient) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_listener_observation(
+            true, true, true, false, ExactEscrowValidation::Valid) !=
             ExactEscrowValidation::Invalid ||
-        classify_exact_listener_observation(true, true, true, false) !=
+        classify_exact_listener_observation(true, true, true, true, ExactEscrowValidation::Valid) !=
             ExactEscrowValidation::Valid) {
-        error = "exact listener read/mismatch classification failed";
+        error = "exact listener absence/conflict identity classification failed";
         return false;
     }
     if (exact_peer_closed_action(false, false) != ExactPeerClosedAction::WaitDirect ||
