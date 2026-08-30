@@ -9391,27 +9391,61 @@ static bool same_wildcard_settlement(const WildcardAttemptSettlementV1& left,
            left.terminal_phase == right.terminal_phase && left.sequence == right.sequence;
 }
 
+template <typename Value, typename Decoder, typename Equal>
+static bool rejects_without_mutating(const std::vector<unsigned char>& payload,
+                                     const Value& sentinel,
+                                     Decoder decoder,
+                                     Equal equal) {
+    Value output = sentinel;
+    return !decoder(payload, output) && equal(output, sentinel);
+}
+
+constexpr WildcardAttemptCommandV1 kWildcardCommandDecodeSentinel{
+    kWildcardAttemptVersion, 0x3771u, WildcardAttemptMode::WrongListenerInode, 0u};
+constexpr WildcardAttemptPhaseV1 kWildcardPhaseDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3772u,
+    WildcardAttemptMode::WrongListenerAddress,
+    WildcardAttemptPhase::GuardReleased,
+    9u};
+constexpr WildcardAttemptDecisionV1 kWildcardDecisionDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3773u,
+    WildcardAttemptMode::WrongListenerInode,
+    WildcardAttemptDecisionKind::RejectAndCleanup,
+    WildcardAttemptPhase::WildcardLive,
+    11u};
+constexpr WildcardAttemptSettlementV1 kWildcardSettlementDecodeSentinel{
+    kWildcardAttemptVersion,
+    0x3774u,
+    WildcardAttemptMode::FalsePostReleaseSuccess,
+    WildcardAttemptSettlementKind::MutationSettled,
+    WildcardAttemptPhase::WildcardLive,
+    12u};
+
 static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
-    const WildcardAttemptCommandV1 command_sentinel{
-        91u, 92u, WildcardAttemptMode::WrongListenerInode, 93u};
+    if (!valid_wildcard_command(kWildcardCommandDecodeSentinel) ||
+        !valid_wildcard_phase(kWildcardPhaseDecodeSentinel) ||
+        !valid_wildcard_decision(kWildcardDecisionDecodeSentinel) ||
+        !valid_wildcard_settlement(kWildcardSettlementDecodeSentinel)) {
+        error = "wildcard decoder atomic-failure sentinel is not valid";
+        return false;
+    }
+
     const std::array<u64, 4u> command_fields{
         kWildcardAttemptVersion, 0x377u, static_cast<u64>(WildcardAttemptMode::Canonical), 0u};
     for (std::size_t field = 0u; field != command_fields.size(); ++field) {
         std::array<u64, 4u> invalid = command_fields;
         invalid[field] = field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : 1u));
-        WildcardAttemptCommandV1 output = command_sentinel;
-        if (decode_wildcard_command(encode_wildcard_fields(invalid), output) ||
-            !same_wildcard_command(output, command_sentinel)) {
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
             error = "invalid raw wildcard command mutated decoder output";
             return false;
         }
     }
 
-    const WildcardAttemptPhaseV1 phase_sentinel{91u,
-                                                92u,
-                                                WildcardAttemptMode::WrongListenerInode,
-                                                WildcardAttemptPhase::GuardReleased,
-                                                93u};
     const std::array<u64, 5u> phase_fields{kWildcardAttemptVersion,
                                            0x377u,
                                            static_cast<u64>(WildcardAttemptMode::Canonical),
@@ -9421,20 +9455,15 @@ static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
         std::array<u64, 5u> invalid = phase_fields;
         invalid[field] =
             field == 0u ? 2u : (field == 1u ? 0u : (field == 2u ? 8u : (field == 3u ? 8u : 0u)));
-        WildcardAttemptPhaseV1 output = phase_sentinel;
-        if (decode_wildcard_phase(encode_wildcard_fields(invalid), output) ||
-            !same_wildcard_phase(output, phase_sentinel)) {
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
             error = "invalid raw wildcard phase mutated decoder output";
             return false;
         }
     }
 
-    const WildcardAttemptDecisionV1 decision_sentinel{91u,
-                                                      92u,
-                                                      WildcardAttemptMode::WrongListenerInode,
-                                                      WildcardAttemptDecisionKind::Finish,
-                                                      WildcardAttemptPhase::GuardReleased,
-                                                      93u};
     const std::array<u64, 6u> decision_fields{
         kWildcardAttemptVersion,
         0x377u,
@@ -9449,21 +9478,15 @@ static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
                 ? 2u
                 : (field == 1u ? 0u
                                : (field == 2u ? 8u : (field == 3u ? 8u : (field == 4u ? 8u : 0u))));
-        WildcardAttemptDecisionV1 output = decision_sentinel;
-        if (decode_wildcard_decision(encode_wildcard_fields(invalid), output) ||
-            !same_wildcard_decision(output, decision_sentinel)) {
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
             error = "invalid raw wildcard decision mutated decoder output";
             return false;
         }
     }
 
-    const WildcardAttemptSettlementV1 settlement_sentinel{
-        91u,
-        92u,
-        WildcardAttemptMode::WrongListenerInode,
-        WildcardAttemptSettlementKind::MutationSettled,
-        WildcardAttemptPhase::GuardReleased,
-        93u};
     const std::array<u64, 6u> settlement_fields{
         kWildcardAttemptVersion,
         0x377u,
@@ -9478,9 +9501,10 @@ static bool wildcard_decoder_atomic_failure_self_check(std::string& error) {
                 ? 2u
                 : (field == 1u ? 0u
                                : (field == 2u ? 8u : (field == 3u ? 3u : (field == 4u ? 8u : 0u))));
-        WildcardAttemptSettlementV1 output = settlement_sentinel;
-        if (decode_wildcard_settlement(encode_wildcard_fields(invalid), output) ||
-            !same_wildcard_settlement(output, settlement_sentinel)) {
+        if (!rejects_without_mutating(encode_wildcard_fields(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
             error = "invalid raw wildcard settlement mutated decoder output";
             return false;
         }
@@ -9602,17 +9626,22 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
 
     WildcardAttemptCommandV1 command{
         kWildcardAttemptVersion, 0x377u, WildcardAttemptMode::Canonical, 0u};
-    WildcardAttemptCommandV1 decoded_command;
     std::vector<unsigned char> payload = encode_wildcard_command(command);
     payload.pop_back();
-    if (decode_wildcard_command(payload, decoded_command)) {
-        error = "truncated wildcard command was accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "truncated wildcard command was accepted or mutated decoder output";
         return false;
     }
     payload = encode_wildcard_command(command);
     payload.push_back(0u);
-    if (decode_wildcard_command(payload, decoded_command)) {
-        error = "trailing wildcard command bytes were accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardCommandDecodeSentinel,
+                                  decode_wildcard_command,
+                                  same_wildcard_command)) {
+        error = "trailing wildcard command bytes were accepted or mutated decoder output";
         return false;
     }
     for (unsigned mutation = 0u; mutation != 4u; ++mutation) {
@@ -9625,25 +9654,29 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
             invalid.mode = static_cast<WildcardAttemptMode>(8u);
         else
             invalid.sequence = 1u;
-        if (decode_wildcard_command(encode_wildcard_command(invalid), decoded_command)) {
-            error = "invalid wildcard command range was accepted";
+        if (!rejects_without_mutating(encode_wildcard_command(invalid),
+                                      kWildcardCommandDecodeSentinel,
+                                      decode_wildcard_command,
+                                      same_wildcard_command)) {
+            error = "invalid wildcard command was accepted or mutated decoder output";
             return false;
         }
     }
 
     WildcardAttemptPhaseV1 witness =
         wildcard_phase(WildcardAttemptMode::Canonical, WildcardAttemptPhase::GuardHeld);
-    WildcardAttemptPhaseV1 decoded_witness;
     payload = encode_wildcard_phase(witness);
     payload.pop_back();
-    if (decode_wildcard_phase(payload, decoded_witness)) {
-        error = "truncated wildcard phase was accepted";
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "truncated wildcard phase was accepted or mutated decoder output";
         return false;
     }
     payload = encode_wildcard_phase(witness);
     payload.push_back(0u);
-    if (decode_wildcard_phase(payload, decoded_witness)) {
-        error = "trailing wildcard phase bytes were accepted";
+    if (!rejects_without_mutating(
+            payload, kWildcardPhaseDecodeSentinel, decode_wildcard_phase, same_wildcard_phase)) {
+        error = "trailing wildcard phase bytes were accepted or mutated decoder output";
         return false;
     }
     for (unsigned mutation = 0u; mutation != 5u; ++mutation) {
@@ -9658,24 +9691,32 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
             invalid.phase = static_cast<WildcardAttemptPhase>(8u);
         else
             invalid.sequence++;
-        if (decode_wildcard_phase(encode_wildcard_phase(invalid), decoded_witness)) {
-            error = "invalid wildcard phase range was accepted";
+        if (!rejects_without_mutating(encode_wildcard_phase(invalid),
+                                      kWildcardPhaseDecodeSentinel,
+                                      decode_wildcard_phase,
+                                      same_wildcard_phase)) {
+            error = "invalid wildcard phase was accepted or mutated decoder output";
             return false;
         }
     }
 
     WildcardAttemptDecisionV1 decision = canonical_decisions.front();
-    WildcardAttemptDecisionV1 decoded_decision;
     payload = encode_wildcard_decision(decision);
     payload.pop_back();
-    if (decode_wildcard_decision(payload, decoded_decision)) {
-        error = "truncated wildcard decision was accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "truncated wildcard decision was accepted or mutated decoder output";
         return false;
     }
     payload = encode_wildcard_decision(decision);
     payload.push_back(0u);
-    if (decode_wildcard_decision(payload, decoded_decision)) {
-        error = "trailing wildcard decision bytes were accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardDecisionDecodeSentinel,
+                                  decode_wildcard_decision,
+                                  same_wildcard_decision)) {
+        error = "trailing wildcard decision bytes were accepted or mutated decoder output";
         return false;
     }
     for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
@@ -9694,22 +9735,31 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
             invalid.for_phase = WildcardAttemptPhase::GuardHeld;
         else
             invalid.sequence++;
-        if (decode_wildcard_decision(encode_wildcard_decision(invalid), decoded_decision)) {
-            error = "invalid wildcard decision range was accepted";
+        if (!rejects_without_mutating(encode_wildcard_decision(invalid),
+                                      kWildcardDecisionDecodeSentinel,
+                                      decode_wildcard_decision,
+                                      same_wildcard_decision)) {
+            error = "invalid wildcard decision was accepted or mutated decoder output";
             return false;
         }
     }
 
     payload = encode_wildcard_settlement(canonical_settlement);
     payload.pop_back();
-    if (decode_wildcard_settlement(payload, decoded_settlement)) {
-        error = "truncated wildcard settlement was accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "truncated wildcard settlement was accepted or mutated decoder output";
         return false;
     }
     payload = encode_wildcard_settlement(canonical_settlement);
     payload.push_back(0u);
-    if (decode_wildcard_settlement(payload, decoded_settlement)) {
-        error = "trailing wildcard settlement bytes were accepted";
+    if (!rejects_without_mutating(payload,
+                                  kWildcardSettlementDecodeSentinel,
+                                  decode_wildcard_settlement,
+                                  same_wildcard_settlement)) {
+        error = "trailing wildcard settlement bytes were accepted or mutated decoder output";
         return false;
     }
     for (unsigned mutation = 0u; mutation != 7u; ++mutation) {
@@ -9728,8 +9778,11 @@ static bool wildcard_attempt_codec_self_check(std::string& error) {
             invalid.terminal_phase = WildcardAttemptPhase::GuardReleased;
         else
             invalid.sequence++;
-        if (decode_wildcard_settlement(encode_wildcard_settlement(invalid), decoded_settlement)) {
-            error = "invalid wildcard settlement range was accepted";
+        if (!rejects_without_mutating(encode_wildcard_settlement(invalid),
+                                      kWildcardSettlementDecodeSentinel,
+                                      decode_wildcard_settlement,
+                                      same_wildcard_settlement)) {
+            error = "invalid wildcard settlement was accepted or mutated decoder output";
             return false;
         }
     }
