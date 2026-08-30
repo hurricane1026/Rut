@@ -1475,6 +1475,33 @@ static void close_rights_in_message(msghdr& message) {
     }
 }
 
+enum class ExactCustodyPeek { Record, Eof, Retry, Error };
+
+static ExactCustodyPeek peek_exact_custody(int fd, bool peer_hup) {
+    unsigned char byte = 0u;
+    alignas(cmsghdr)
+        std::array<unsigned char, CMSG_SPACE(3 * sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))>
+            control{};
+    iovec vector{&byte, 1u};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1u;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    ssize_t received;
+    do {
+        received = recvmsg(fd, &message, MSG_PEEK | MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+    } while (received < 0 && errno == EINTR);
+    if (received < 0)
+        return errno == EAGAIN || errno == EWOULDBLOCK ? ExactCustodyPeek::Retry
+                                                       : ExactCustodyPeek::Error;
+    const bool ancillary_present = CMSG_FIRSTHDR(&message) != nullptr;
+    close_rights_in_message(message);
+    if (received > 0 || ancillary_present || (message.msg_flags & MSG_CTRUNC) != 0)
+        return ExactCustodyPeek::Record;
+    return peer_hup ? ExactCustodyPeek::Eof : ExactCustodyPeek::Record;
+}
+
 static bool send_exact_custody(int fd,
                                const Token& token,
                                const ExactCustodyRecord& record,
@@ -2794,7 +2821,103 @@ static bool exact_transaction_self_check(std::string& error) {
 
 enum class ExactCustodyMutation { Canonical, MissingRights, ExtraRights, Truncated, WrongCreds };
 
+static bool exact_custody_peek_self_check(std::string& error) {
+    for (bool queued_record : {true, false}) {
+        u64 baseline = 0u;
+        int sockets[2] = {-1, -1};
+        const int pass_credentials = 1;
+        if (!count_open_fds(baseline) ||
+            socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0) {
+            error = "exact custody EOF peek self-check setup failed";
+            return false;
+        }
+        if (setsockopt(
+                sockets[0], SOL_SOCKET, SO_PASSCRED, &pass_credentials, sizeof(pass_credentials)) !=
+            0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            error = "exact custody EOF peek self-check credential setup failed";
+            return false;
+        }
+        if (queued_record) {
+            const int transferred = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            unsigned char byte = 0xa5u;
+            alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> control{};
+            iovec vector{&byte, 1u};
+            msghdr message{};
+            message.msg_iov = &vector;
+            message.msg_iovlen = 1u;
+            message.msg_control = control.data();
+            message.msg_controllen = control.size();
+            cmsghdr* header = CMSG_FIRSTHDR(&message);
+            if (transferred < 0 || header == nullptr) {
+                if (transferred >= 0) close(transferred);
+                close(sockets[0]);
+                close(sockets[1]);
+                error = "exact custody EOF peek self-check right setup failed";
+                return false;
+            }
+            header->cmsg_level = SOL_SOCKET;
+            header->cmsg_type = SCM_RIGHTS;
+            header->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(header), &transferred, sizeof(transferred));
+            const bool sent = sendmsg(sockets[1], &message, MSG_NOSIGNAL) == 1;
+            close(transferred);
+            if (!sent) {
+                close(sockets[0]);
+                close(sockets[1]);
+                error = "exact custody EOF peek self-check send failed";
+                return false;
+            }
+        }
+        close(sockets[1]);
+        sockets[1] = -1;
+        pollfd descriptor{sockets[0], POLLIN | POLLHUP, 0};
+        if (poll(&descriptor, 1, kCleanupMs) <= 0 || (descriptor.revents & POLLHUP) == 0 ||
+            peek_exact_custody(sockets[0], true) !=
+                (queued_record ? ExactCustodyPeek::Record : ExactCustodyPeek::Eof)) {
+            close(sockets[0]);
+            error = "exact custody record/EOF peek classification failed";
+            return false;
+        }
+        if (queued_record) {
+            unsigned char byte = 0u;
+            alignas(cmsghdr) std::array<unsigned char,
+                                        CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))>
+                control{};
+            iovec vector{&byte, 1u};
+            msghdr message{};
+            message.msg_iov = &vector;
+            message.msg_iovlen = 1u;
+            message.msg_control = control.data();
+            message.msg_controllen = control.size();
+            const ssize_t received = recvmsg(sockets[0], &message, MSG_CMSG_CLOEXEC);
+            bool right_preserved = false;
+            for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr;
+                 header = CMSG_NXTHDR(&message, header))
+                if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
+                    header->cmsg_len == CMSG_LEN(sizeof(int)))
+                    right_preserved = true;
+            close_rights_in_message(message);
+            if (received != 1 || byte != 0xa5u || !right_preserved ||
+                peek_exact_custody(sockets[0], true) != ExactCustodyPeek::Eof) {
+                close(sockets[0]);
+                error = "exact custody peek consumed or lost queued rights";
+                return false;
+            }
+        }
+        close(sockets[0]);
+        u64 after = 0u;
+        if (!count_open_fds(after) || after != baseline) {
+            error = "exact custody EOF peek self-check leaked a descriptor";
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool exact_custody_ancillary_self_check(std::string& error) {
+    if (!exact_custody_peek_self_check(error)) return false;
     for (ExactCustodyMutation mutation : {ExactCustodyMutation::Canonical,
                                           ExactCustodyMutation::MissingRights,
                                           ExactCustodyMutation::ExtraRights,
@@ -4089,7 +4212,17 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
             if (custody_received)
                 return finish_post_ack_escrow(
                     target, control, token, custody, rights, false, true, target_status);
-            if (const auto result = accept_custody(false)) return *result;
+            const ExactCustodyPeek peek =
+                peek_exact_custody(custody_fd, (descriptor.revents & POLLHUP) != 0);
+            if (peek == ExactCustodyPeek::Record) {
+                if (const auto result = accept_custody(false)) return *result;
+            } else if (peek == ExactCustodyPeek::Eof) {
+                custody_peer_closed = true;
+            } else if (peek == ExactCustodyPeek::Error) {
+                if (exact_listener_target_reaped(target, expected_target_start, target_status))
+                    return OwnedWaitResult::Exited;
+                hold_listener_failure(root_lease, custody_fd);
+            }
         }
         if ((descriptor.revents & POLLHUP) != 0 && !custody_received) custody_peer_closed = true;
         if ((descriptor.revents & POLLNVAL) != 0 ||
