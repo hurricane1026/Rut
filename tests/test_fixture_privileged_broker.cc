@@ -4602,7 +4602,11 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
         root_was_recorded =
             root_was_recorded || process.pid == root.pid || process.pid == launcher.pid;
     }
-    if (root_was_recorded || !validate_probe_chain_facts(facts, error)) return false;
+    if (root_was_recorded) {
+        error = "probe ancestry unexpectedly included Root or Launcher";
+        return false;
+    }
+    if (!validate_probe_chain_facts(facts, error)) return false;
     const identity_bundle::ProcessIdentityEvidence& anchor_evidence = ancestry_evidence.back();
     RetainedAnchorEvidence retained_anchor;
     retained_anchor.pid = anchor_evidence.identity.pid;
@@ -4719,9 +4723,16 @@ static bool run_ancestry_probe_session(const std::string& sudo_path,
                                               launcher_argv,
                                               launch,
                                               lease,
-                                              error) ||
-            !endpoint_unchanged(endpoint) || !lease.revalidate()) {
-            if (error.empty()) error = "ancestry probe semantic/endpoint/lease validation failed";
+                                              error)) {
+            if (error.empty()) error = "ancestry probe semantic validation failed";
+            break;
+        }
+        if (!endpoint_unchanged(endpoint)) {
+            error = "ancestry probe endpoint identity changed";
+            break;
+        }
+        if (!lease.revalidate()) {
+            error = "ancestry probe launch GroupLease revalidation failed";
             break;
         }
         Peer final_root_peer;
