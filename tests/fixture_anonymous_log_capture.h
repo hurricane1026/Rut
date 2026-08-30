@@ -49,10 +49,12 @@ struct Identity {
 
 using PreadForTesting = ssize_t (*)(int fd, void* buffer, std::size_t count, off_t offset);
 using CloseForTesting = int (*)(int fd);
+using AfterFinalSealForTesting = void (*)(int fd);
 
 struct HooksForTesting {
     PreadForTesting pread = nullptr;
     CloseForTesting close = nullptr;
+    AfterFinalSealForTesting after_final_seal = nullptr;
 };
 
 // A move-only, anonymous bounded stdout/stderr sink. The descriptor returned
@@ -120,6 +122,7 @@ private:
     std::shared_ptr<CleanupState> cleanup_state_;
     PreadForTesting pread_for_testing_ = nullptr;
     CloseForTesting close_for_testing_ = nullptr;
+    AfterFinalSealForTesting after_final_seal_for_testing_ = nullptr;
     bool settled_ = false;
 };
 

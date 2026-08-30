@@ -37,14 +37,55 @@ bool same_identity(const struct stat& status, const Identity& expected) {
            (status.st_mode & 07777) == 0600 && status.st_nlink == 0;
 }
 
-bool valid_fd_flags(int fd) {
+bool valid_fd_flags(int fd, int& error_number) {
+    errno = 0;
     const int flags = fcntl(fd, F_GETFD);
-    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+    if (flags < 0) {
+        error_number = errno;
+        return false;
+    }
+    if ((flags & FD_CLOEXEC) == 0) {
+        error_number = EINVAL;
+        return false;
+    }
+    error_number = 0;
+    return true;
 }
 
-bool valid_seals(int fd, int expected) {
+bool valid_seals(int fd, int expected, int& error_number) {
+    errno = 0;
     const int seals = fcntl(fd, F_GET_SEALS);
-    return seals == expected;
+    if (seals < 0) {
+        error_number = errno;
+        return false;
+    }
+    if (seals != expected) {
+        error_number = EINVAL;
+        return false;
+    }
+    error_number = 0;
+    return true;
+}
+
+bool fd_matches_object(int fd, const Identity& expected, int& error_number) {
+    errno = 0;
+    struct stat status{};
+    if (fstat(fd, &status) != 0) {
+        error_number = errno;
+        return false;
+    }
+    // Metadata (mode/uid/gid) is deliberately not part of this close guard:
+    // those fields are mutable and are independently revalidated by the lease.
+    // Refuse only a missing/replaced numeric descriptor; matching dev/inode of
+    // the regular, unlinked memfd is the stable object identity.
+    if (!S_ISREG(status.st_mode) || status.st_nlink != 0 || status.st_dev == 0 ||
+        status.st_ino == 0 || static_cast<std::uint64_t>(status.st_dev) != expected.device ||
+        static_cast<std::uint64_t>(status.st_ino) != expected.inode) {
+        error_number = EINVAL;
+        return false;
+    }
+    error_number = 0;
+    return true;
 }
 
 }  // namespace
@@ -58,12 +99,14 @@ AnonymousLogCapture::AnonymousLogCapture(AnonymousLogCapture&& other) noexcept
       cleanup_state_(other.cleanup_state_),
       pread_for_testing_(other.pread_for_testing_),
       close_for_testing_(other.close_for_testing_),
+      after_final_seal_for_testing_(other.after_final_seal_for_testing_),
       settled_(other.settled_) {
     other.fd_ = -1;
     other.max_bytes_ = 0u;
     other.identity_ = {};
     other.pread_for_testing_ = nullptr;
     other.close_for_testing_ = nullptr;
+    other.after_final_seal_for_testing_ = nullptr;
     other.settled_ = false;
 }
 
@@ -120,6 +163,7 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
     capture.max_bytes_ = max_bytes;
     capture.pread_for_testing_ = hooks == nullptr ? nullptr : hooks->pread;
     capture.close_for_testing_ = hooks == nullptr ? nullptr : hooks->close;
+    capture.after_final_seal_for_testing_ = hooks == nullptr ? nullptr : hooks->after_final_seal;
     capture.cleanup_state_ = std::make_shared<CleanupState>();
     capture.settled_ = false;
 
@@ -132,7 +176,9 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
     };
 
     if (fchmod(capture.fd_, 0600) != 0) return fail_created(FailurePhase::Identity, errno);
-    if (!valid_fd_flags(capture.fd_)) return fail_created(FailurePhase::Identity, errno);
+    int validation_error = 0;
+    if (!valid_fd_flags(capture.fd_, validation_error))
+        return fail_created(FailurePhase::Identity, validation_error);
 
     struct stat status{};
     if (fstat(capture.fd_, &status) != 0) return fail_created(FailurePhase::Identity, errno);
@@ -147,8 +193,8 @@ bool AnonymousLogCapture::create_impl(std::size_t max_bytes,
         return fail_created(FailurePhase::Capacity, errno);
     if (fcntl(capture.fd_, F_ADD_SEALS, kInitialSeals) != 0)
         return fail_created(FailurePhase::Seal, errno);
-    if (!valid_seals(capture.fd_, kInitialSeals))
-        return fail_created(FailurePhase::Seal, errno == 0 ? EINVAL : errno);
+    if (!valid_seals(capture.fd_, kInitialSeals, validation_error))
+        return fail_created(FailurePhase::Seal, validation_error);
     if (!capture.validate_identity_and_capacity(diagnostic)) {
         const Diagnostic original = diagnostic;
         return fail_created(original.phase, original.error_number);
@@ -172,13 +218,14 @@ bool AnonymousLogCapture::validate_identity_and_capacity(Diagnostic& diagnostic)
         fail(diagnostic, FailurePhase::Identity, EINVAL);
         return false;
     }
-    if (!valid_fd_flags(fd_)) {
-        fail(diagnostic, FailurePhase::Identity, errno == 0 ? EINVAL : errno);
+    int validation_error = 0;
+    if (!valid_fd_flags(fd_, validation_error)) {
+        fail(diagnostic, FailurePhase::Identity, validation_error);
         return false;
     }
     const int expected_seals = settled_ ? kFinalSeals : kInitialSeals;
-    if (!valid_seals(fd_, expected_seals)) {
-        fail(diagnostic, FailurePhase::Seal, errno == 0 ? EINVAL : errno);
+    if (!valid_seals(fd_, expected_seals, validation_error)) {
+        fail(diagnostic, FailurePhase::Seal, validation_error);
         return false;
     }
     return true;
@@ -259,11 +306,23 @@ bool AnonymousLogCapture::settle(Diagnostic& diagnostic) {
         fail(diagnostic, FailurePhase::Seal, errno);
         return false;
     }
-    if (!valid_seals(fd_, kFinalSeals)) {
-        fail(diagnostic, FailurePhase::Seal, errno == 0 ? EINVAL : errno);
+    int validation_error = 0;
+    if (!valid_seals(fd_, kFinalSeals, validation_error)) {
+        fail(diagnostic, FailurePhase::Seal, validation_error);
         return false;
     }
     settled_ = true;
+    if (after_final_seal_for_testing_ != nullptr) after_final_seal_for_testing_(fd_);
+    // Keep the physical final state even if this last independent check sees
+    // a concurrent/replacement mutation; callers must treat the false return
+    // as terminal and may still inspect the settled descriptor state.
+    if (!validate_identity_and_capacity(diagnostic)) return false;
+    const off_t final_offset = lseek(fd_, 0, SEEK_CUR);
+    if (final_offset < 0) {
+        fail(diagnostic, FailurePhase::Offset, errno);
+        return false;
+    }
+    if (!validate_offset(final_offset, diagnostic)) return false;
     return true;
 }
 
@@ -284,6 +343,13 @@ bool AnonymousLogCapture::close_owned(CloseForTesting operation, Diagnostic& dia
         return true;
     }
     const int owned = fd_;
+    int identity_error = 0;
+    if (!fd_matches_object(owned, identity_, identity_error)) {
+        fd_ = -1;
+        fail(diagnostic, FailurePhase::Close, identity_error);
+        record_cleanup(false, diagnostic);
+        return false;
+    }
     fd_ = -1;
     errno = 0;
     const int result = operation == nullptr ? ::close(owned) : operation(owned);

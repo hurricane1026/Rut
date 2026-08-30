@@ -67,13 +67,18 @@ bool reap_bounded(pid_t child, int& status) {
 struct PrivateDirectory {
     std::array<char, 64> path{};
     int fd = -1;
+    bool directory_created = false;
     bool ordinary_created = false;
     dev_t ordinary_device = 0;
     ino_t ordinary_inode = 0;
 
     bool create() {
-        std::snprintf(path.data(), path.size(), "/tmp/rut377-anonymous-XXXXXX");
-        if (mkdtemp(path.data()) == nullptr) return false;
+        std::array<char, 64> pattern{};
+        std::snprintf(pattern.data(), pattern.size(), "/tmp/rut377-anonymous-XXXXXX");
+        char* const created = mkdtemp(pattern.data());
+        if (created == nullptr) return false;
+        std::snprintf(path.data(), path.size(), "%s", created);
+        directory_created = true;
         fd = open(path.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         return fd >= 0 && fchmod(fd, 0700) == 0;
     }
@@ -111,7 +116,7 @@ struct PrivateDirectory {
                 std::fprintf(stderr, "FAIL: private ordinary cleanup errno=%d\n", errno);
             close(fd);
         }
-        if (path[0] != '\0' && rmdir(path.data()) != 0)
+        if (directory_created && rmdir(path.data()) != 0)
             std::fprintf(stderr, "FAIL: private directory cleanup errno=%d\n", errno);
     }
 };
@@ -161,6 +166,10 @@ int uncertain_close(int fd) {
     (void)fd;
     errno = EINTR;
     return -1;
+}
+
+void mutate_after_final_seal(int fd) {
+    (void)fchmod(fd, 0640);
 }
 
 bool identity_and_initial_seals_test() {
@@ -356,20 +365,26 @@ bool mutation_and_duplicate_settlement_test() {
     capture::AnonymousLogCapture mode;
     if (!capture::AnonymousLogCapture::create(16u, mode, diagnostic)) return false;
     const bool mode_changed = fchmod(mode.descriptor(), 0640) == 0;
+    errno = EAGAIN;
     const bool mode_rejected = mode_changed && !mode.snapshot(bytes, diagnostic) &&
-                               diagnostic.phase == capture::FailurePhase::Identity;
+                               diagnostic.phase == capture::FailurePhase::Identity &&
+                               diagnostic.error_number == EINVAL;
 
     capture::AnonymousLogCapture cloexec;
     if (!capture::AnonymousLogCapture::create(16u, cloexec, diagnostic)) return false;
     const bool cloexec_changed = fcntl(cloexec.descriptor(), F_SETFD, 0) == 0;
+    errno = EAGAIN;
     const bool cloexec_rejected = cloexec_changed && !cloexec.snapshot(bytes, diagnostic) &&
-                                  diagnostic.phase == capture::FailurePhase::Identity;
+                                  diagnostic.phase == capture::FailurePhase::Identity &&
+                                  diagnostic.error_number == EINVAL;
 
     capture::AnonymousLogCapture seals;
     if (!capture::AnonymousLogCapture::create(16u, seals, diagnostic)) return false;
     const bool unexpected_seal = fcntl(seals.descriptor(), F_ADD_SEALS, F_SEAL_SEAL) == 0;
+    errno = EAGAIN;
     const bool seal_rejected = unexpected_seal && !seals.settle(diagnostic) &&
-                               diagnostic.phase == capture::FailurePhase::Seal;
+                               diagnostic.phase == capture::FailurePhase::Seal &&
+                               diagnostic.error_number == EINVAL;
     const int unchanged_seals = fcntl(seals.descriptor(), F_GET_SEALS);
 
     capture::AnonymousLogCapture offset;
@@ -394,11 +409,27 @@ bool mutation_and_duplicate_settlement_test() {
     const bool settled_snapshot =
         settled.snapshot(bytes, diagnostic) && bytes == std::string(payload, sizeof(payload));
 
+    capture::AnonymousLogCapture final_mutation;
+    const capture::HooksForTesting final_mutation_hooks{nullptr, nullptr, mutate_after_final_seal};
+    if (!capture::AnonymousLogCapture::create_with_hooks_for_testing(
+            16u, final_mutation_hooks, final_mutation, diagnostic))
+        return false;
+    const char final_byte = 'f';
+    const bool final_write = write(final_mutation.descriptor(), &final_byte, 1u) == 1;
+    const bool final_mutation_rejected = final_write && !final_mutation.settle(diagnostic) &&
+                                         diagnostic.phase == capture::FailurePhase::Identity &&
+                                         diagnostic.error_number == EINVAL &&
+                                         final_mutation.settled();
+    const bool final_restored =
+        fchmod(final_mutation.descriptor(), 0600) == 0 && final_mutation.close(diagnostic);
+
     return check(mode_rejected && cloexec_rejected && seal_rejected && offset_rejected &&
                      unchanged_seals == (F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL),
                  "metadata, CLOEXEC, seal, or shared-offset mutation was accepted") &&
            check(settled_ok && settled_write_rejected && settled_snapshot,
-                 "settlement with a duplicate writer was not immutable");
+                 "settlement with a duplicate writer was not immutable") &&
+           check(final_mutation_rejected && final_restored,
+                 "post-seal final identity validation was not causal");
 }
 
 bool close_move_and_no_path_test() {
@@ -466,8 +497,22 @@ bool close_move_and_no_path_test() {
     bool ordinary_ok = ordinary >= 0;
     if (ordinary_ok) {
         ordinary_ok = write_all(ordinary, "ordinary", 8u);
-        if (close(ordinary) != 0) ordinary_ok = false;
     }
+    capture::AnonymousLogCapture victim;
+    capture::Diagnostic replacement_diagnostic;
+    const bool victim_created =
+        capture::AnonymousLogCapture::create(16u, victim, replacement_diagnostic);
+    const int victim_fd = victim_created ? victim.descriptor() : -1;
+    const bool replaced = ordinary_ok && victim_created && victim_fd != ordinary &&
+                          dup2(ordinary, victim_fd) == victim_fd;
+    const bool replacement_close_rejected =
+        replaced && !victim.close(replacement_diagnostic) &&
+        replacement_diagnostic.phase == capture::FailurePhase::Close &&
+        replacement_diagnostic.error_number == EINVAL;
+    const bool replacement_remains_open =
+        replaced && fcntl(victim_fd, F_GETFD) >= 0 && fcntl(ordinary, F_GETFD) >= 0;
+    if (victim_fd >= 0 && replaced) close(victim_fd);
+    if (ordinary >= 0) close(ordinary);
     capture::AnonymousLogCapture unrelated;
     const bool capture_created = capture::AnonymousLogCapture::create(16u, unrelated, diagnostic);
     std::array<char, 128> fd_target{};
@@ -488,7 +533,8 @@ bool close_move_and_no_path_test() {
         ordinary_read >= 0 ? read(ordinary_read, ordinary_bytes.data(), ordinary_bytes.size()) : -1;
     if (ordinary_read >= 0) close(ordinary_read);
     const bool no_path =
-        reuse_rejected && directory_created && capture_created && fd_target_size > 0 &&
+        reuse_rejected && directory_created && capture_created && replacement_close_rejected &&
+        replacement_remains_open && fd_target_size > 0 &&
         std::string(fd_target.data(), static_cast<std::size_t>(fd_target_size))
                 .find("memfd:rut377-anonymous-log") != std::string::npos &&
         ordinary_ok && ordinary_count == 8 && std::string(ordinary_bytes.data(), 8u) == "ordinary";
