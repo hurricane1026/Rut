@@ -82,7 +82,7 @@ int close_after_real_close(int fd, void* opaque) {
 
 volatile sig_atomic_t signal_count = 0;
 void count_signal(int) {
-    ++signal_count;
+    signal_count = static_cast<sig_atomic_t>(signal_count + 1);
 }
 
 void check(bool value, const char* message) {
