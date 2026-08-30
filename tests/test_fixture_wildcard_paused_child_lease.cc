@@ -108,6 +108,13 @@ void canonical() {
     check(lease.release(deadline(), diagnostic), "canonical release");
     check(!lease.active() && lease.released(), "canonical settled");
     check(fd_snapshot() == baseline && child_snapshot() == children, "canonical residue");
+    const auto settled_fds = fd_snapshot();
+    const auto settled_children = child_snapshot();
+    check(!lease.release(deadline(), diagnostic), "canonical double release accepted");
+    check(diagnostic.phase == FailurePhase::Argument && diagnostic.error_number == EALREADY,
+          "canonical double release diagnostic");
+    check(fd_snapshot() == settled_fds && child_snapshot() == settled_children,
+          "canonical double release residue");
 }
 
 void sibling_rejection() {
@@ -182,13 +189,16 @@ void cloexec_and_independent_pidfd() {
 
 void destructor_preserves_replacement() {
     Diagnostic diagnostic;
+    const auto baseline_children = child_snapshot();
     std::shared_ptr<const rut::test::fixture_wildcard_paused_child_lease::CleanupState> evidence;
     int replacement = -1;
     int slot = -1;
+    pid_t leased_pid = -1;
     {
         PausedChildLease lease;
         check(PausedChildLease::create(deadline(), lease, diagnostic),
               "destructor replacement create");
+        leased_pid = lease.child_pid();
         evidence = lease.cleanup_state();
         slot = lease.observation_pidfd();
         const int independent = static_cast<int>(syscall(SYS_pidfd_open, lease.child_pid(), 0u));
@@ -201,8 +211,82 @@ void destructor_preserves_replacement() {
     check(evidence->attempted && !evidence->succeeded, "destructor replacement evidence");
     check(fcntl(slot, F_GETFD) >= 0 && fcntl(replacement, F_GETFD) >= 0,
           "destructor closed replacement");
+    check(child_snapshot() == baseline_children, "destructor replacement child residue");
+    errno = 0;
+    check(waitpid(leased_pid, nullptr, WNOHANG) == -1 && errno == ECHILD,
+          "destructor replacement child not reaped");
     close(slot);
     close(replacement);
+}
+
+void wait_for_pidfd_exit(int pidfd, const char* message) {
+    pollfd dead{pidfd, POLLIN | POLLERR | POLLHUP, 0};
+    check(poll(&dead, 1, 2000) == 1, message);
+}
+
+void release_retry_observation_mutation(bool replace_observation) {
+    Diagnostic diagnostic;
+    HooksForTesting hooks;
+    hooks.post_release_delay_ms = 100;
+    PausedChildLease lease;
+    check(PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
+          "release retry mutation create");
+    const int slot = lease.observation_pidfd();
+    const int saved = fcntl(slot, F_DUPFD_CLOEXEC, 0);
+    check(saved >= 0, "release retry mutation save");
+    check(!lease.release(deadline(5), diagnostic), "release retry mutation initial accepted");
+    check(diagnostic.phase == FailurePhase::Wait && diagnostic.error_number == ETIMEDOUT,
+          "release retry mutation initial diagnostic");
+    wait_for_pidfd_exit(saved, "release retry mutation child exit");
+
+    int replacement = -1;
+    if (replace_observation) {
+        replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        check(replacement >= 0 && dup2(replacement, slot) == slot &&
+                  fcntl(slot, F_SETFD, FD_CLOEXEC) == 0,
+              "release retry wrong observation");
+    } else {
+        const int flags = fcntl(slot, F_GETFD);
+        check(flags >= 0 && fcntl(slot, F_SETFD, flags & ~FD_CLOEXEC) == 0,
+              "release retry clear cloexec");
+    }
+    const auto mutated_fds = fd_snapshot();
+    check(!lease.release(deadline(), diagnostic), "release retry mutation accepted");
+    check(diagnostic.phase == FailurePhase::Pidfd && diagnostic.error_number == EINVAL,
+          "release retry mutation diagnostic");
+    check(lease.active() && !lease.released(), "release retry mutation mis-settled");
+    check(fcntl(slot, F_GETFD) >= 0 && fd_snapshot() == mutated_fds,
+          "release retry mutation closed descriptor");
+
+    check(dup2(saved, slot) == slot && fcntl(slot, F_SETFD, FD_CLOEXEC) == 0,
+          "release retry mutation restore");
+    close(saved);
+    if (replacement >= 0) close(replacement);
+    check(lease.release(deadline(), diagnostic), "release retry mutation recovery");
+}
+
+void release_retry_expired_deadline() {
+    Diagnostic diagnostic;
+    HooksForTesting hooks;
+    hooks.post_release_delay_ms = 100;
+    PausedChildLease lease;
+    check(PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
+          "release retry expired create");
+    const int pidfd = fcntl(lease.observation_pidfd(), F_DUPFD_CLOEXEC, 0);
+    check(pidfd >= 0, "release retry expired pidfd");
+    check(!lease.release(deadline(5), diagnostic), "release retry expired initial accepted");
+    check(diagnostic.phase == FailurePhase::Wait && diagnostic.error_number == ETIMEDOUT,
+          "release retry expired initial diagnostic");
+    wait_for_pidfd_exit(pidfd, "release retry expired child exit");
+    const auto before_retry_fds = fd_snapshot();
+    check(!lease.release(Clock::now() - std::chrono::milliseconds(1), diagnostic),
+          "release retry expired accepted");
+    check(diagnostic.phase == FailurePhase::Pidfd && diagnostic.error_number == ETIMEDOUT,
+          "release retry expired diagnostic");
+    check(lease.active() && !lease.released() && fd_snapshot() == before_retry_fds,
+          "release retry expired mis-settled");
+    close(pidfd);
+    check(lease.release(deadline(), diagnostic), "release retry expired recovery");
 }
 
 void wrong_observation_recovery() {
@@ -257,13 +341,20 @@ void expired_and_destructor() {
           "expired cleanup accepted");
     check(expired_cleanup.cleanup(deadline(), diagnostic), "expired cleanup recovery");
     std::shared_ptr<const rut::test::fixture_wildcard_paused_child_lease::CleanupState> evidence;
+    const auto baseline_children = child_snapshot();
+    pid_t leased_pid = -1;
     {
         PausedChildLease scoped;
         check(PausedChildLease::create(deadline(), scoped, diagnostic), "destructor create");
+        leased_pid = scoped.child_pid();
         evidence = scoped.cleanup_state();
         check(!evidence->attempted && scoped.active(), "destructor pre-evidence");
     }
     check(evidence->attempted && !evidence->succeeded, "destructor evidence");
+    check(child_snapshot() == baseline_children, "destructor child residue");
+    errno = 0;
+    check(waitpid(leased_pid, nullptr, WNOHANG) == -1 && errno == ECHILD,
+          "destructor child not reaped");
 }
 
 int failing_pidfd(pid_t, unsigned int) {
@@ -380,6 +471,9 @@ int main() {
         wrong_observation_recovery();
         cloexec_and_independent_pidfd();
         destructor_preserves_replacement();
+        release_retry_observation_mutation(false);
+        release_retry_observation_mutation(true);
+        release_retry_expired_deadline();
         dead_child_reap();
         expired_and_destructor();
         creation_failures();

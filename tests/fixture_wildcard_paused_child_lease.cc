@@ -698,8 +698,10 @@ bool PausedChildLease::release(std::chrono::steady_clock::time_point deadline,
         fail(diagnostic, FailurePhase::Release, EPROTO);
         return false;
     }
-    if (!observation_valid)
+    if (!observation_valid) {
         observation_valid = validate_pidfd(observation_pidfd_, false, deadline, diagnostic);
+        if (!observation_valid) return false;
+    }
     const bool closed = close_after_reap(diagnostic, observation_valid);
     if (release_close_uncertain_) {
         active_ = false;
