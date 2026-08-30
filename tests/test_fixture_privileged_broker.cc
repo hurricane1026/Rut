@@ -397,11 +397,17 @@ static bool exact_liveness_self_check(std::string& error) {
     close(arm_pipe[0]);
     int arm_status = 0;
     bool arm_reaped = false;
-    for (;;) {
-        const pid_t waited = waitpid(arm_child, &arm_status, 0);
+    const auto arm_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < arm_deadline) {
+        const pid_t waited = waitpid(arm_child, &arm_status, WNOHANG);
         if (waited == arm_child) {
             arm_reaped = true;
             break;
+        }
+        if (waited == 0) {
+            (void)poll(nullptr, 0, 10);
+            continue;
         }
         if (waited < 0 && errno == EINTR) continue;
         break;
@@ -427,11 +433,19 @@ static bool exact_liveness_self_check(std::string& error) {
     siginfo_t info{};
     bool wnowait_zombie = false;
     if (killed) {
-        for (;;) {
-            const int waited = waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOWAIT);
-            if (waited == 0) {
+        const auto zombie_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+        while (std::chrono::steady_clock::now() < zombie_deadline) {
+            memset(&info, 0, sizeof(info));
+            const int waited =
+                waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT);
+            if (waited == 0 && info.si_pid == child) {
                 wnowait_zombie = info.si_pid == child;
                 break;
+            }
+            if (waited == 0) {
+                (void)poll(nullptr, 0, 10);
+                continue;
             }
             if (errno == EINTR) continue;
             break;
@@ -441,11 +455,17 @@ static bool exact_liveness_self_check(std::string& error) {
                                  observe_exact_liveness(expected) == ExactLiveness::ExitedOrReused;
     int status = 0;
     bool reaped = false;
-    for (;;) {
-        const pid_t waited = waitpid(child, &status, 0);
+    const auto reap_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < reap_deadline) {
+        const pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) {
             reaped = true;
             break;
+        }
+        if (waited == 0) {
+            (void)poll(nullptr, 0, 10);
+            continue;
         }
         if (waited < 0 && errno == EINTR) continue;
         break;
@@ -2203,8 +2223,24 @@ static bool exact_transaction_self_check(std::string& error) {
     if (early.pid == 0) _exit(7);
     early.forked = true;
     siginfo_t early_info{};
-    while (waitid(P_PID, static_cast<id_t>(early.pid), &early_info, WEXITED | WNOWAIT) != 0) {
-        if (errno == EINTR) continue;
+    bool early_waitable = false;
+    const auto early_deadline = new_exact_cleanup_deadline();
+    while (std::chrono::steady_clock::now() < early_deadline) {
+        memset(&early_info, 0, sizeof(early_info));
+        const int waited =
+            waitid(P_PID, static_cast<id_t>(early.pid), &early_info, WEXITED | WNOHANG | WNOWAIT);
+        if (waited == 0 && early_info.si_pid == early.pid) {
+            early_waitable = true;
+            break;
+        }
+        if (waited == 0) {
+            (void)poll(nullptr, 0, 10);
+            continue;
+        }
+        if (errno != EINTR) break;
+    }
+    if (!early_waitable) {
+        (void)reap_exact_owned_child(early, new_exact_cleanup_deadline());
         error = "exact ownership early-exit WNOWAIT self-check failed";
         return false;
     }
@@ -2333,9 +2369,12 @@ static bool cleanup_exact_child(ExactChildState& child,
     const bool proc_observed = absence_observed && observation.proc_observed;
     const bool listener_absent = absence_observed && observation.listener_absent;
     const bool child_absent = !child.forked || (reaped && !process_alive(child.pid));
-    const bool guard_ok = target_socket_inode(getpid(), guard_fd, held.socket_inode) &&
-                          bounded_connect_refused(
-                              held.plan.guard_ipv4, static_cast<u16>(held.plan.port), guard_error);
+    const bool guard_deadline_live = std::chrono::steady_clock::now() < deadline;
+    if (!guard_deadline_live) guard_error = ETIMEDOUT;
+    const bool guard_ok =
+        target_socket_inode(getpid(), guard_fd, held.socket_inode) && guard_deadline_live &&
+        connect_refused_until(
+            held.plan.guard_ipv4, static_cast<u16>(held.plan.port), deadline, guard_error);
     const bool fd_ok = count_open_fds(fd_count) && fd_count == held.current_fd_count;
     child.guard_release_safe = exact_guard_release_gate(child, proc_observed, listener_absent);
     if (!child.guard_release_safe && failure != nullptr) {
