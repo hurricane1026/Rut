@@ -189,6 +189,7 @@ void cloexec_and_independent_pidfd() {
 
 void destructor_preserves_replacement() {
     Diagnostic diagnostic;
+    const auto baseline_fds = fd_snapshot();
     const auto baseline_children = child_snapshot();
     std::shared_ptr<const rut::test::fixture_wildcard_paused_child_lease::CleanupState> evidence;
     int replacement = -1;
@@ -211,12 +212,18 @@ void destructor_preserves_replacement() {
     check(evidence->attempted && !evidence->succeeded, "destructor replacement evidence");
     check(fcntl(slot, F_GETFD) >= 0 && fcntl(replacement, F_GETFD) >= 0,
           "destructor closed replacement");
+    auto expected_fds = baseline_fds;
+    expected_fds.push_back(slot);
+    expected_fds.push_back(replacement);
+    std::sort(expected_fds.begin(), expected_fds.end());
+    check(fd_snapshot() == expected_fds, "destructor replacement fd residue");
     check(child_snapshot() == baseline_children, "destructor replacement child residue");
     errno = 0;
     check(waitpid(leased_pid, nullptr, WNOHANG) == -1 && errno == ECHILD,
           "destructor replacement child not reaped");
     close(slot);
     close(replacement);
+    check(fd_snapshot() == baseline_fds, "destructor replacement cleanup residue");
 }
 
 void wait_for_pidfd_exit(int pidfd, const char* message) {
@@ -341,6 +348,7 @@ void expired_and_destructor() {
           "expired cleanup accepted");
     check(expired_cleanup.cleanup(deadline(), diagnostic), "expired cleanup recovery");
     std::shared_ptr<const rut::test::fixture_wildcard_paused_child_lease::CleanupState> evidence;
+    const auto baseline_fds = fd_snapshot();
     const auto baseline_children = child_snapshot();
     pid_t leased_pid = -1;
     {
@@ -351,6 +359,7 @@ void expired_and_destructor() {
         check(!evidence->attempted && scoped.active(), "destructor pre-evidence");
     }
     check(evidence->attempted && !evidence->succeeded, "destructor evidence");
+    check(fd_snapshot() == baseline_fds, "destructor fd residue");
     check(child_snapshot() == baseline_children, "destructor child residue");
     errno = 0;
     check(waitpid(leased_pid, nullptr, WNOHANG) == -1 && errno == ECHILD,
