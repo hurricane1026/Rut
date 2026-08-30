@@ -141,6 +141,8 @@ void sibling_after_ready() {
     check(waitpid(sibling, nullptr, WNOHANG) == 0, "sibling died on creation");
     check(!lease.validate_paused(deadline(), diagnostic), "post sibling accepted");
     check(diagnostic.phase == FailurePhase::Children, "post sibling phase");
+    check(waitpid(lease.child_pid(), nullptr, WNOHANG) == 0, "leased child died on rejection");
+    check(waitpid(sibling, nullptr, WNOHANG) == 0, "sibling died on rejection");
     kill_by_pidfd(sibling, "post sibling kill");
     check(waitpid(sibling, nullptr, 0) == sibling, "post sibling reap");
     check(lease.validate_paused(deadline(), diagnostic), "post sibling recovery");
