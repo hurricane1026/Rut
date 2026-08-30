@@ -36,7 +36,8 @@ struct ListenerPlan {
     // Canonical host-order IPv4 values (for example 10.1.2.3 is 0x0a010203).
     std::uint32_t positive_ipv4 = 0u;
     std::uint32_t guard_ipv4 = 0u;
-    std::uint16_t port = 0u;
+    // Kept wide until validation rejects values outside 1..65535.
+    std::uint64_t port = 0u;
 };
 
 struct ListenerPlanText {
@@ -81,9 +82,10 @@ enum class ListenerEvidenceKind : std::uint8_t {
 
 struct ListenerEvidence {
     ListenerEvidenceKind kind = ListenerEvidenceKind::PortAbsent;
-    // True means no TCP LISTEN row exists at guard_ipv4:port. A separately
-    // authenticated guard FD proves that its non-listening reservation is held.
-    bool guard_listener_absent = false;
+    // Wildcard LISTEN covers guard_ipv4:port; exact-positive and complete-port-
+    // absence evidence do not. A separate authenticated guard FD proves that
+    // its non-listening reservation is held during the exact phase.
+    bool guard_covered_by_listener = false;
     std::uint64_t child_owned_inode = 0u;
 };
 

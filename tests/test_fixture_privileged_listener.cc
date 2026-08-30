@@ -1,6 +1,7 @@
 #include "fixture_privileged_listener.h"
 #include <cerrno>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,15 @@ bool plan_and_source_tests() {
     mutation = kPlan;
     mutation.port = 0u;
     rejected(mutation, "zero selected port was accepted");
+    mutation = kPlan;
+    mutation.port = 65536u;
+    rejected(mutation, "one-past-maximum selected port was accepted");
+    mutation = kPlan;
+    mutation.port = 0xffffffffu;
+    rejected(mutation, "large selected port was narrowed and accepted");
+    mutation = kPlan;
+    mutation.port = std::numeric_limits<std::uint64_t>::max();
+    rejected(mutation, "maximum-width selected port was narrowed and accepted");
 
     mutation = kPlan;
     mutation.port = 65535u;
@@ -157,6 +167,9 @@ bool proc_parser_tests() {
     rejects(std::string(kHeader) + row("0302010A:1F90", "0A", "111") +
                 row("0302010A:1F90", "0A", "111", 1u),
             "duplicate proc record was accepted");
+    rejects(std::string(kHeader) + row("0302010A:1F90", "0A", "111") +
+                row("00000000:1F91", "0A", "111", 1u),
+            "same socket inode reused by another proc record was accepted");
     std::string over_rows = kHeader;
     for (std::size_t i = 0u; i <= listener::kMaxProcRows; ++i)
         over_rows += row("0302010A:1F90", "07", std::to_string(1000u + i), i);
@@ -168,18 +181,19 @@ bool evidence_tests() {
     listener::Diagnostic diagnostic;
     listener::ProcTcpTable exact;
     const std::string exact_text = std::string(kHeader) + row("0302010A:1F90", "0A", "111") +
-                                   row("0402010A:1F90", "07", "222", 1u);
+                                   row("0402010A:1F90", "07", "222", 1u) +
+                                   row("00000000:1F91", "0A", "333", 2u);
     bool ok = check(listener::parse_proc_net_tcp(exact_text, exact, diagnostic),
                     "exact evidence table setup failed");
     listener::ListenerEvidence evidence;
     ok = check(listener::classify_listener_evidence(exact,
                                                     kPlan,
-                                                    {111u, 222u},
+                                                    {111u},
                                                     listener::ListenerEvidenceKind::ExactPositive,
                                                     evidence,
                                                     diagnostic) &&
                    evidence.kind == listener::ListenerEvidenceKind::ExactPositive &&
-                   evidence.guard_listener_absent && evidence.child_owned_inode == 111u &&
+                   !evidence.guard_covered_by_listener && evidence.child_owned_inode == 111u &&
                    diagnostic.match_count == 1u && diagnostic.owned_count == 1u,
                "exact positive child-owned listener was not classified") &&
          ok;
@@ -196,6 +210,26 @@ bool evidence_tests() {
                    message) &&
              ok;
     };
+    rejects(exact,
+            {},
+            listener::ListenerEvidenceKind::ExactPositive,
+            listener::DiagnosticPhase::Ownership,
+            "missing child-owned exact-listener inode was accepted");
+    rejects(exact,
+            {111u, 999u},
+            listener::ListenerEvidenceKind::ExactPositive,
+            listener::DiagnosticPhase::Ownership,
+            "extra absent-from-table child-owned inode was accepted");
+    rejects(exact,
+            {111u, 222u},
+            listener::ListenerEvidenceKind::ExactPositive,
+            listener::DiagnosticPhase::Ownership,
+            "target-owned non-listening guard inode was accepted as RUT-child-owned");
+    rejects(exact,
+            {333u},
+            listener::ListenerEvidenceKind::ExactPositive,
+            listener::DiagnosticPhase::Evidence,
+            "unrelated-port child-owned inode was accepted for exact listener");
     rejects(exact,
             {999u},
             listener::ListenerEvidenceKind::ExactPositive,
@@ -227,7 +261,7 @@ bool evidence_tests() {
                                                        listener::ListenerEvidenceKind::Wildcard,
                                                        evidence,
                                                        diagnostic) &&
-                  evidence.child_owned_inode == 444u && evidence.guard_listener_absent,
+                  evidence.child_owned_inode == 444u && evidence.guard_covered_by_listener,
               "child-owned wildcard listener was not classified") &&
         ok;
     rejects(wildcard,
@@ -247,9 +281,19 @@ bool evidence_tests() {
                                                      listener::ListenerEvidenceKind::PortAbsent,
                                                      evidence,
                                                      diagnostic) &&
-                evidence.child_owned_inode == 0u && evidence.guard_listener_absent,
+                evidence.child_owned_inode == 0u && !evidence.guard_covered_by_listener,
             "complete selected-port absence was not classified") &&
         ok;
+    rejects(absent,
+            {666u},
+            listener::ListenerEvidenceKind::PortAbsent,
+            listener::DiagnosticPhase::Ownership,
+            "unrelated-port child-owned inode was accepted for complete port absence");
+    rejects(absent,
+            {999u},
+            listener::ListenerEvidenceKind::PortAbsent,
+            listener::DiagnosticPhase::Ownership,
+            "absent-from-table child-owned inode was accepted for complete port absence");
 
     listener::ProcTcpTable guard_reserved;
     ok =
@@ -272,7 +316,7 @@ bool evidence_tests() {
               "guard listener mutation table setup failed") &&
         ok;
     rejects(guard_listening,
-            {777u},
+            {},
             listener::ListenerEvidenceKind::PortAbsent,
             listener::DiagnosticPhase::Evidence,
             "guard LISTEN record was accepted as complete port absence");
@@ -280,7 +324,7 @@ bool evidence_tests() {
     listener::ProcTcpTable ambiguous = exact;
     ambiguous.rows[ambiguous.count++] = {0u, kPlan.port, 0x0au, 888u};
     rejects(ambiguous,
-            {111u, 888u},
+            {111u},
             listener::ListenerEvidenceKind::ExactPositive,
             listener::DiagnosticPhase::Evidence,
             "conflicting exact and wildcard listeners were accepted");

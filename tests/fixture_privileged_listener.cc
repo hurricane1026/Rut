@@ -104,7 +104,8 @@ bool validate_listener_plan(const ListenerPlan& plan,
                             Diagnostic& diagnostic) {
     text = {};
     diagnostic = {};
-    if (plan.port == 0u || plan.positive_ipv4 == 0u || plan.guard_ipv4 == 0u ||
+    if (plan.port == 0u || plan.port > std::numeric_limits<std::uint16_t>::max() ||
+        plan.positive_ipv4 == 0u || plan.guard_ipv4 == 0u ||
         plan.positive_ipv4 == plan.guard_ipv4 || is_loopback(plan.positive_ipv4) ||
         is_loopback(plan.guard_ipv4)) {
         fail(diagnostic, DiagnosticPhase::Plan);
@@ -227,8 +228,11 @@ bool parse_proc_net_tcp(const std::string& contents, ProcTcpTable& table, Diagno
         record.state = static_cast<std::uint8_t>(state);
         for (std::size_t i = 0u; i < table.count; ++i) {
             const ProcTcpRecord& prior = table.rows[i];
-            if (prior.local_ipv4 == record.local_ipv4 && prior.local_port == record.local_port &&
-                prior.state == record.state && prior.inode == record.inode) {
+            const bool duplicate_record =
+                prior.local_ipv4 == record.local_ipv4 && prior.local_port == record.local_port &&
+                prior.state == record.state && prior.inode == record.inode;
+            const bool reused_inode = record.inode != 0u && prior.inode == record.inode;
+            if (duplicate_record || reused_inode) {
                 fail(diagnostic, DiagnosticPhase::ProcRow, table.count);
                 return false;
             }
@@ -253,6 +257,22 @@ bool classify_listener_evidence(const ProcTcpTable& table,
         fail(diagnostic, DiagnosticPhase::Ownership, table.count);
         return false;
     }
+    const bool listener_expected = expected == ListenerEvidenceKind::ExactPositive ||
+                                   expected == ListenerEvidenceKind::Wildcard;
+    if ((listener_expected && child_owned_socket_inodes.size() != 1u) ||
+        (expected == ListenerEvidenceKind::PortAbsent && !child_owned_socket_inodes.empty())) {
+        fail(diagnostic,
+             DiagnosticPhase::Ownership,
+             table.count,
+             0u,
+             child_owned_socket_inodes.size());
+        return false;
+    }
+    if (!listener_expected && expected != ListenerEvidenceKind::PortAbsent) {
+        fail(diagnostic, DiagnosticPhase::Evidence, table.count);
+        return false;
+    }
+    const std::uint16_t selected_port = static_cast<std::uint16_t>(plan.port);
 
     std::size_t listeners = 0u;
     std::size_t port_records = 0u;
@@ -263,7 +283,7 @@ bool classify_listener_evidence(const ProcTcpTable& table,
     std::uint64_t selected_inode = 0u;
     for (std::size_t i = 0u; i < table.count; ++i) {
         const ProcTcpRecord& row = table.rows[i];
-        if (row.local_port != plan.port) continue;
+        if (row.local_port != selected_port) continue;
         port_records++;
         if (row.state != kTcpListen) continue;
         listeners++;
@@ -292,7 +312,7 @@ bool classify_listener_evidence(const ProcTcpTable& table,
         return false;
     }
     evidence.kind = expected;
-    evidence.guard_listener_absent = true;
+    evidence.guard_covered_by_listener = expected == ListenerEvidenceKind::Wildcard;
     evidence.child_owned_inode = expected == ListenerEvidenceKind::PortAbsent ? 0u : selected_inode;
     diagnostic = {DiagnosticPhase::None,
                   table.count,
