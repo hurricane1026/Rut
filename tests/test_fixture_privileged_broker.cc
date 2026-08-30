@@ -2197,7 +2197,7 @@ static bool validate_exact_custody_endpoint(int fd, pid_t expected_dropped) {
     return fd == kExactCustodyFd && expected_dropped > 1 && flags >= 0 &&
            getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_size) == 0 &&
            type_size == sizeof(type) && type == SOCK_SEQPACKET && get_peer(fd, peer) &&
-           peer.pid == expected_dropped && peer.uid == getuid() && peer.gid == getgid() &&
+           peer.pid == expected_dropped && peer.uid == 0u && peer.gid == 0u &&
            setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) == 0 &&
            fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
 }
@@ -2273,6 +2273,25 @@ static bool pidfd_link_matches(pid_t owner, int fd) {
     const ssize_t length = readlink(path.c_str(), link.data(), link.size() - 1u);
     if (length <= 0 || static_cast<std::size_t>(length) >= link.size()) return false;
     return std::string(link.data(), static_cast<std::size_t>(length)) == "anon_inode:[pidfd]";
+}
+
+static bool exact_pidfd_binding(int fd, pid_t expected_pid) {
+    if (fd < 0 || expected_pid <= 1) return false;
+    std::string text;
+    if (!read_file("/proc/self/fdinfo/" + std::to_string(fd), text, 4096)) return false;
+    std::istringstream lines(text);
+    std::string key;
+    bool found = false;
+    while (lines >> key) {
+        if (key == "Pid:") {
+            long pid = 0;
+            if (found || !(lines >> pid) || pid != expected_pid) return false;
+            found = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return found;
 }
 
 static bool exact_log_ready(const std::string& log,
@@ -2729,6 +2748,153 @@ static bool exact_transaction_self_check(std::string& error) {
         std::chrono::steady_clock::now() - listener_start > std::chrono::milliseconds(200)) {
         error = "persistent listener evidence did not return boundedly fail-closed";
         return false;
+    }
+    return true;
+}
+
+enum class ExactCustodyMutation { Canonical, MissingRights, ExtraRights, Truncated, WrongCreds };
+
+static bool exact_custody_ancillary_self_check(std::string& error) {
+    for (ExactCustodyMutation mutation : {ExactCustodyMutation::Canonical,
+                                          ExactCustodyMutation::MissingRights,
+                                          ExactCustodyMutation::ExtraRights,
+                                          ExactCustodyMutation::Truncated,
+                                          ExactCustodyMutation::WrongCreds}) {
+        int sockets[2] = {-1, -1};
+        const int enabled = 1;
+        u64 baseline = 0u;
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0 ||
+            setsockopt(sockets[0], SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) != 0 ||
+            !count_open_fds(baseline)) {
+            error = "exact custody ancillary self-check setup failed";
+            return false;
+        }
+        const pid_t sender = fork();
+        if (sender < 0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            error = "exact custody ancillary self-check fork failed";
+            return false;
+        }
+        if (sender == 0) {
+            close(sockets[0]);
+            Token token{};
+            token.bytes[0] = 0xa5u;
+            ExactCustodyRecord record;
+            record.child_pid = 101u;
+            record.child_start = 102u;
+            record.child_exe_dev = 103u;
+            record.child_exe_ino = 104u;
+            record.listener_inode = 105u;
+            record.positive_ipv4 = 0x7f000002u;
+            record.guard_ipv4 = 0x7f000003u;
+            record.port = 8080u;
+            record.guard_inode = 106u;
+            record.netns = 107u;
+            record.directory_dev = 108u;
+            record.directory_ino = 109u;
+            record.source_dev = 110u;
+            record.source_ino = 111u;
+            record.log_dev = 112u;
+            record.log_ino = 113u;
+            record.target_pid = static_cast<u64>(getpid());
+            record.target_start = 115u;
+            record.has_pidfd = mutation == ExactCustodyMutation::ExtraRights ? 0u : 1u;
+            ExactEscrowRights rights;
+            rights.guard = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            rights.pidfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            rights.directory = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            const std::vector<unsigned char> canonical = encode_exact_custody(record, token);
+            std::vector<unsigned char> wire = canonical;
+            if (mutation == ExactCustodyMutation::Truncated) wire.push_back(0u);
+            bool sent = false;
+            if (mutation == ExactCustodyMutation::Canonical ||
+                mutation == ExactCustodyMutation::WrongCreds) {
+                sent = send_exact_custody(
+                    sockets[1],
+                    token,
+                    record,
+                    rights,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs));
+            } else if (mutation == ExactCustodyMutation::MissingRights ||
+                       mutation == ExactCustodyMutation::Truncated) {
+                sent = send(sockets[1], wire.data(), wire.size(), MSG_NOSIGNAL) ==
+                       static_cast<ssize_t>(wire.size());
+            } else {
+                alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(3 * sizeof(int))> control{};
+                const std::array<int, 3> fds{rights.guard, rights.pidfd, rights.directory};
+                iovec vector{wire.data(), wire.size()};
+                msghdr message{};
+                message.msg_iov = &vector;
+                message.msg_iovlen = 1;
+                message.msg_control = control.data();
+                message.msg_controllen = control.size();
+                cmsghdr* header = CMSG_FIRSTHDR(&message);
+                header->cmsg_level = SOL_SOCKET;
+                header->cmsg_type = SCM_RIGHTS;
+                header->cmsg_len = CMSG_LEN(fds.size() * sizeof(int));
+                memcpy(CMSG_DATA(header), fds.data(), fds.size() * sizeof(int));
+                sent = sendmsg(sockets[1], &message, MSG_NOSIGNAL) ==
+                       static_cast<ssize_t>(wire.size());
+            }
+            if (sent && mutation == ExactCustodyMutation::Canonical) {
+                const int pass_credentials = 1;
+                sent = setsockopt(sockets[1],
+                                  SOL_SOCKET,
+                                  SO_PASSCRED,
+                                  &pass_credentials,
+                                  sizeof(pass_credentials)) == 0 &&
+                       receive_exact_custody_ack(sockets[1],
+                                                 token,
+                                                 getppid(),
+                                                 getuid(),
+                                                 getgid(),
+                                                 std::chrono::steady_clock::now() +
+                                                     std::chrono::milliseconds(kCleanupMs));
+            }
+            rights.close_all();
+            close(sockets[1]);
+            _exit(sent ? 0 : 1);
+        }
+        close(sockets[1]);
+        Token token{};
+        token.bytes[0] = 0xa5u;
+        ExactCustodyRecord record;
+        ExactEscrowRights rights;
+        const pid_t expected = mutation == ExactCustodyMutation::WrongCreds ? sender + 1 : sender;
+        const bool received = receive_exact_custody(sockets[0],
+                                                    token,
+                                                    expected,
+                                                    getuid(),
+                                                    getgid(),
+                                                    new_exact_cleanup_deadline(),
+                                                    record,
+                                                    rights);
+        const bool canonical = mutation == ExactCustodyMutation::Canonical;
+        const bool acked =
+            !canonical || send_exact_custody_ack(sockets[0], token, new_exact_cleanup_deadline());
+        const bool wrong_types =
+            received && (fcntl(rights.guard, F_GETFD) < 0 || fcntl(rights.directory, F_GETFD) < 0);
+        rights.close_all();
+        close(sockets[0]);
+        int status = 0;
+        bool reaped = false;
+        const auto deadline = new_exact_cleanup_deadline();
+        while (std::chrono::steady_clock::now() < deadline) {
+            const pid_t waited = waitpid(sender, &status, WNOHANG);
+            if (waited == sender) {
+                reaped = true;
+                break;
+            }
+            if (waited < 0 && errno != EINTR) break;
+            (void)poll(nullptr, 0, 10);
+        }
+        u64 after = 0u;
+        if (received != canonical || !acked || wrong_types || !reaped || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0 || !count_open_fds(after) || after + 2u != baseline) {
+            error = "exact custody ancillary inventory/credential mutation self-check failed";
+            return false;
+        }
     }
     return true;
 }
@@ -3344,10 +3510,12 @@ static bool validate_exact_escrow(const ExactCustodyRecord& record,
         (directory_status.st_mode & 0777) != 0700 ||
         fstatat(rights.directory, "exact-listener.rut", &source_status, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISREG(source_status.st_mode) || source_status.st_dev != record.source_dev ||
-        source_status.st_ino != record.source_ino ||
+        source_status.st_ino != record.source_ino || source_status.st_uid != expected_uid ||
+        source_status.st_gid != expected_gid || (source_status.st_mode & 0777) != 0600 ||
         fstatat(rights.directory, "exact-listener.log", &log_status, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISREG(log_status.st_mode) || log_status.st_dev != record.log_dev ||
-        log_status.st_ino != record.log_ino)
+        log_status.st_ino != record.log_ino || log_status.st_uid != expected_uid ||
+        log_status.st_gid != expected_gid || (log_status.st_mode & 0777) != 0600)
         return false;
     ProcIdentity child;
     if (!read_proc(static_cast<pid_t>(record.child_pid), child, false) ||
@@ -3356,7 +3524,9 @@ static bool validate_exact_escrow(const ExactCustodyRecord& record,
         child.exe_ino != record.child_exe_ino || child.netns != expected_netns ||
         child.uid != expected_uid || child.gid != expected_gid)
         return false;
-    if (record.has_pidfd != 0u && (rights.pidfd < 0 || !pidfd_link_matches(getpid(), rights.pidfd)))
+    if (record.has_pidfd != 0u &&
+        (rights.pidfd < 0 || !pidfd_link_matches(getpid(), rights.pidfd) ||
+         !exact_pidfd_binding(rights.pidfd, static_cast<pid_t>(record.child_pid))))
         return false;
     if (record.listener_inode != 0u) {
         privileged_listener::ProcTcpTable table;
@@ -3579,6 +3749,46 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
     }
     rights.close_all();
     return OwnedWaitResult::Error;
+}
+
+static bool exact_adoption_fault_self_check(std::string& error) {
+    const pid_t child = fork();
+    if (child < 0) {
+        error = "exact adoption PID-start self-check fork failed";
+        return false;
+    }
+    if (child == 0) {
+        for (;;) pause();
+    }
+    ProcIdentity identity;
+    if (!read_proc(child, identity, false)) {
+        (void)kill(child, SIGKILL);
+        error = "exact adoption PID-start self-check identity failed";
+        return false;
+    }
+    ExactCustodyRecord wrong;
+    wrong.child_pid = static_cast<u64>(child);
+    wrong.child_start = identity.start + 1u;
+    wrong.child_exe_dev = identity.exe_dev;
+    wrong.child_exe_ino = identity.exe_ino;
+    ExactEscrowRights rights;
+    bool adopted = false;
+    const auto start = std::chrono::steady_clock::now();
+    if (wait_reap_adopted_exact(wrong, rights, start + std::chrono::milliseconds(30), adopted) ||
+        adopted || std::chrono::steady_clock::now() - start > std::chrono::milliseconds(250)) {
+        (void)kill(child, SIGKILL);
+        error = "wrong exact adopted PID-start was not rejected boundedly";
+        return false;
+    }
+    ExactCustodyRecord correct = wrong;
+    correct.child_start = identity.start;
+    if (!wait_reap_adopted_exact(correct, rights, new_exact_cleanup_deadline(), adopted) ||
+        !adopted) {
+        (void)kill(child, SIGKILL);
+        error = "exact adopted child direct authority did not reap";
+        return false;
+    }
+    return true;
 }
 
 static int dropped_broker_main(const char* executable,
@@ -7784,6 +7994,88 @@ static bool guard_protocol_self_check(std::string& error) {
         error = "overflow exact failure count was accepted";
         return false;
     }
+    ExactCustodyRecord custody;
+    custody.child_pid = 101u;
+    custody.child_start = 102u;
+    custody.child_exe_dev = 103u;
+    custody.child_exe_ino = 104u;
+    custody.listener_inode = 105u;
+    custody.positive_ipv4 = 0x7f000002u;
+    custody.guard_ipv4 = 0x7f000003u;
+    custody.port = 8080u;
+    custody.guard_inode = 106u;
+    custody.netns = 107u;
+    custody.directory_dev = 108u;
+    custody.directory_ino = 109u;
+    custody.source_dev = 110u;
+    custody.source_ino = 111u;
+    custody.log_dev = 112u;
+    custody.log_ino = 113u;
+    custody.target_pid = 114u;
+    custody.target_start = 115u;
+    custody.has_pidfd = 1u;
+    ExactCustodyRecord decoded_custody;
+    std::vector<unsigned char> custody_wire = encode_exact_custody(custody, exact_token);
+    if (!decode_exact_custody(custody_wire, exact_token, decoded_custody) ||
+        decoded_custody.child_pid != custody.child_pid ||
+        decoded_custody.guard_inode != custody.guard_inode || decoded_custody.has_pidfd != 1u) {
+        error = "canonical exact custody codec failed";
+        return false;
+    }
+    custody_wire.pop_back();
+    if (decode_exact_custody(custody_wire, exact_token, decoded_custody)) {
+        error = "truncated exact custody was accepted";
+        return false;
+    }
+    custody_wire = encode_exact_custody(custody, exact_token);
+    custody_wire[kTokenBytes] = 2u;
+    if (decode_exact_custody(custody_wire, exact_token, decoded_custody)) {
+        error = "unknown exact custody version was accepted";
+        return false;
+    }
+    Token wrong_custody_token = exact_token;
+    wrong_custody_token.bytes[0] ^= 1u;
+    if (decode_exact_custody(
+            encode_exact_custody(custody, wrong_custody_token), exact_token, decoded_custody)) {
+        error = "wrong exact custody token was accepted";
+        return false;
+    }
+    custody.has_pidfd = 2u;
+    if (decode_exact_custody(
+            encode_exact_custody(custody, exact_token), exact_token, decoded_custody)) {
+        error = "overflow exact custody rights inventory was accepted";
+        return false;
+    }
+    ExactSettledRecord settled;
+    settled.target_pid = 114u;
+    settled.child_pid = 101u;
+    settled.guard_inode = 106u;
+    settled.adopted = settled.reaped = settled.listener_absent = settled.temps_absent =
+        settled.guard_closed = 1u;
+    ExactSettledRecord decoded_settled;
+    std::vector<unsigned char> settled_payload = encode_exact_settled(settled);
+    if (!decode_exact_settled(settled_payload, decoded_settled) ||
+        decoded_settled.target_pid != settled.target_pid || decoded_settled.adopted != 1u ||
+        decoded_settled.guard_closed != 1u) {
+        error = "canonical exact failure-settled codec failed";
+        return false;
+    }
+    settled_payload.pop_back();
+    if (decode_exact_settled(settled_payload, decoded_settled)) {
+        error = "truncated exact failure-settled record was accepted";
+        return false;
+    }
+    settled_payload = encode_exact_settled(settled);
+    settled_payload[0] = 2u;
+    if (decode_exact_settled(settled_payload, decoded_settled)) {
+        error = "unknown exact failure-settled version was accepted";
+        return false;
+    }
+    settled.guard_closed = 2u;
+    if (decode_exact_settled(encode_exact_settled(settled), decoded_settled)) {
+        error = "overflow exact failure-settled state was accepted";
+        return false;
+    }
     return true;
 }
 
@@ -8718,7 +9010,8 @@ int main(int argc, char** argv) {
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error) ||
         !ancestry_probe_validation_self_check(error) ||
         !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error) ||
-        !exact_transaction_self_check(error)) {
+        !exact_transaction_self_check(error) || !exact_custody_ancillary_self_check(error) ||
+        !exact_adoption_fault_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
