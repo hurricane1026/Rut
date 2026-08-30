@@ -97,6 +97,7 @@ constexpr u16 kExactRutRun = 41;
 constexpr u16 kExactRutWitness = 42;
 constexpr u16 kExactRutCleanup = 43;
 constexpr u16 kExactRutCleaned = 44;
+constexpr u16 kExactRutFailure = 45;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
 constexpr int kCredentialFd = 198;
@@ -954,8 +955,10 @@ struct ExecutableLease {
     }
 };
 
-constexpr std::size_t kExactReportFields = 24u;
+constexpr u64 kExactProtocolVersion = 1u;
+constexpr std::size_t kExactReportFields = 25u;
 struct ExactRutReport {
+    u64 version = kExactProtocolVersion;
     u64 child_pid = 0u;
     u64 child_start = 0u;
     u64 child_ppid = 0u;
@@ -982,8 +985,9 @@ struct ExactRutReport {
     u64 backend = 0u;
 };
 
-constexpr std::size_t kExactCleanedFields = 10u;
+constexpr std::size_t kExactCleanedFields = 11u;
 struct ExactRutCleanedReport {
+    u64 version = kExactProtocolVersion;
     u64 child_pid = 0u;
     u64 child_start = 0u;
     u64 listener_inode = 0u;
@@ -994,6 +998,26 @@ struct ExactRutCleanedReport {
     u64 temps_absent = 0u;
     u64 target_fd_count = 0u;
     u64 guard_connect_error = 0u;
+};
+
+enum class ExactFailurePhase : u64 {
+    LeaseReopen = 1u,
+    Temp = 2u,
+    ForkPreExec = 3u,
+    Exec = 4u,
+    PidfdIdentity = 5u,
+    ListenerLog = 6u,
+    HttpEof = 7u,
+    GuardRefusal = 8u,
+    StabilityFd = 9u,
+    Cleanup = 10u,
+};
+
+struct ExactFailureReport {
+    u64 version = kExactProtocolVersion;
+    ExactFailurePhase phase = ExactFailurePhase::LeaseReopen;
+    u64 error_number = 0u;
+    u64 count = 0u;
 };
 
 static bool executable_lease_unchanged(const ExecutableLease& lease);
@@ -1056,18 +1080,31 @@ static bool parse_executable_lease(const std::vector<unsigned char>& payload,
 
 static std::vector<unsigned char> encode_exact_report(const ExactRutReport& report) {
     const std::array<u64, kExactReportFields> fields{
-        report.child_pid,      report.child_start,
-        report.child_ppid,     report.child_pgid,
-        report.child_sid,      report.child_uid,
-        report.child_gid,      report.child_netns,
-        report.child_exe_dev,  report.child_exe_ino,
-        report.pidfd,          report.pidfd_cloexec,
-        report.listener_inode, report.source_dev,
-        report.source_ino,     report.log_dev,
-        report.log_ino,        report.target_fd_count,
-        report.response_bytes, report.response_exact,
-        report.prompt_eof,     report.guard_connect_error,
-        report.stable,         report.backend,
+        report.version,
+        report.child_pid,
+        report.child_start,
+        report.child_ppid,
+        report.child_pgid,
+        report.child_sid,
+        report.child_uid,
+        report.child_gid,
+        report.child_netns,
+        report.child_exe_dev,
+        report.child_exe_ino,
+        report.pidfd,
+        report.pidfd_cloexec,
+        report.listener_inode,
+        report.source_dev,
+        report.source_ino,
+        report.log_dev,
+        report.log_ino,
+        report.target_fd_count,
+        report.response_bytes,
+        report.response_exact,
+        report.prompt_eof,
+        report.guard_connect_error,
+        report.stable,
+        report.backend,
     };
     std::vector<unsigned char> payload;
     payload.reserve(fields.size() * sizeof(u64));
@@ -1081,15 +1118,17 @@ static bool decode_exact_report(const std::vector<unsigned char>& payload, Exact
     std::array<u64, kExactReportFields> fields{};
     for (std::size_t i = 0u; i < kExactReportFields; ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
-    report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],
-              fields[6],  fields[7],  fields[8],  fields[9],  fields[10], fields[11],
-              fields[12], fields[13], fields[14], fields[15], fields[16], fields[17],
-              fields[18], fields[19], fields[20], fields[21], fields[22], fields[23]};
-    return true;
+    if (fields[0] != kExactProtocolVersion) return false;
+    report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
+              fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
+              fields[14], fields[15], fields[16], fields[17], fields[18], fields[19], fields[20],
+              fields[21], fields[22], fields[23], fields[24]};
+    return report.version == kExactProtocolVersion;
 }
 
 static std::vector<unsigned char> encode_exact_cleaned(const ExactRutCleanedReport& report) {
     const std::array<u64, kExactCleanedFields> fields{
+        report.version,
         report.child_pid,
         report.child_start,
         report.listener_inode,
@@ -1114,6 +1153,7 @@ static bool decode_exact_cleaned(const std::vector<unsigned char>& payload,
     std::array<u64, kExactCleanedFields> fields{};
     for (std::size_t i = 0u; i < kExactCleanedFields; ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    if (fields[0] != kExactProtocolVersion) return false;
     report = {fields[0],
               fields[1],
               fields[2],
@@ -1123,7 +1163,77 @@ static bool decode_exact_cleaned(const std::vector<unsigned char>& payload,
               fields[6],
               fields[7],
               fields[8],
-              fields[9]};
+              fields[9],
+              fields[10]};
+    return report.version == kExactProtocolVersion;
+}
+
+static std::vector<unsigned char> exact_cleanup_payload() {
+    std::vector<unsigned char> payload;
+    append_u64(payload, kExactProtocolVersion);
+    return payload;
+}
+
+static bool exact_cleanup_request(const Frame& request, const Token& token) {
+    return request.type == kExactRutCleanup && token_equal(request.token, token) &&
+           request.payload.size() == sizeof(u64) &&
+           read_u64(request.payload.data()) == kExactProtocolVersion;
+}
+
+static bool valid_exact_failure_phase(ExactFailurePhase phase) {
+    const u64 value = static_cast<u64>(phase);
+    return value >= static_cast<u64>(ExactFailurePhase::LeaseReopen) &&
+           value <= static_cast<u64>(ExactFailurePhase::Cleanup);
+}
+
+static const char* exact_failure_phase_name(ExactFailurePhase phase) {
+    switch (phase) {
+        case ExactFailurePhase::LeaseReopen:
+            return "lease/reopen";
+        case ExactFailurePhase::Temp:
+            return "temp";
+        case ExactFailurePhase::ForkPreExec:
+            return "fork/pre-exec";
+        case ExactFailurePhase::Exec:
+            return "exec";
+        case ExactFailurePhase::PidfdIdentity:
+            return "pidfd/identity";
+        case ExactFailurePhase::ListenerLog:
+            return "listener/log";
+        case ExactFailurePhase::HttpEof:
+            return "HTTP/EOF";
+        case ExactFailurePhase::GuardRefusal:
+            return "guard-refusal";
+        case ExactFailurePhase::StabilityFd:
+            return "stability/FD";
+        case ExactFailurePhase::Cleanup:
+            return "cleanup";
+    }
+    return "invalid";
+}
+
+static std::vector<unsigned char> encode_exact_failure(const ExactFailureReport& report) {
+    std::vector<unsigned char> payload;
+    payload.reserve(4u * sizeof(u64));
+    append_u64(payload, report.version);
+    append_u64(payload, static_cast<u64>(report.phase));
+    append_u64(payload, report.error_number);
+    append_u64(payload, report.count);
+    return payload;
+}
+
+static bool decode_exact_failure(const std::vector<unsigned char>& payload,
+                                 ExactFailureReport& report) {
+    report = {};
+    if (payload.size() != 4u * sizeof(u64)) return false;
+    const u64 version = read_u64(payload.data());
+    const auto phase = static_cast<ExactFailurePhase>(read_u64(payload.data() + sizeof(u64)));
+    const u64 error_number = read_u64(payload.data() + 2u * sizeof(u64));
+    const u64 count = read_u64(payload.data() + 3u * sizeof(u64));
+    if (version != kExactProtocolVersion || !valid_exact_failure_phase(phase) ||
+        error_number > static_cast<u64>(std::numeric_limits<int>::max()) || count > 1024u)
+        return false;
+    report = {version, phase, error_number, count};
     return true;
 }
 
@@ -1700,15 +1810,23 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
 struct ExactChildState {
     pid_t pid = -1;
     int pidfd = -1;
+    bool pidfd_acquired = false;
+    bool forked = false;
+    bool reaped = false;
+    bool post_exec_identity = false;
+    int wait_status = 0;
     ProcIdentity identity;
     struct stat executable_status{};
     std::string executable;
     std::string argv;
     std::string source_path;
     std::string log_path;
+    std::string directory_path;
+    struct stat directory_status{};
     struct stat source_status{};
     struct stat log_status{};
     u64 listener_inode = 0u;
+    bool guard_release_safe = false;
 };
 
 static bool write_all_fd(int fd, const std::string& contents) {
@@ -1947,58 +2065,154 @@ static bool unlink_regular_at_if_identity(int directory_fd,
            S_ISREG(current.st_mode) && unlinkat(directory_fd, name, 0) == 0;
 }
 
+static bool exact_direct_wait(ExactChildState& child, bool blocking) {
+    if (!child.forked || child.pid <= 1 || child.reaped) return !child.forked || child.reaped;
+    for (;;) {
+        const pid_t waited = waitpid(child.pid, &child.wait_status, blocking ? 0 : WNOHANG);
+        if (waited == child.pid) {
+            child.reaped = true;
+            return true;
+        }
+        if (waited == 0) return false;
+        if (waited < 0 && errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool signal_exact_owned_child(ExactChildState& child, int signal_number) {
+    if (exact_direct_wait(child, false)) return true;
+#ifdef SYS_pidfd_send_signal
+    if (child.pidfd >= 0 &&
+        syscall(SYS_pidfd_send_signal, child.pidfd, signal_number, nullptr, 0) == 0)
+        return true;
+#endif
+    // An unreaped direct child still owns its PID, so the fork ownership itself
+    // is safe authority even before the public executable identity is visible.
+    return kill(child.pid, signal_number) == 0 || errno == ESRCH;
+}
+
+static bool reap_exact_owned_child(ExactChildState& child) {
+    if (!child.forked) return true;
+    if (exact_direct_wait(child, false)) return true;
+    if (!signal_exact_owned_child(child, SIGTERM)) return false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (exact_direct_wait(child, false)) return true;
+        (void)poll(nullptr, 0, 10);
+    }
+    if (!signal_exact_owned_child(child, SIGKILL)) return false;
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (exact_direct_wait(child, false)) return true;
+        (void)poll(nullptr, 0, 10);
+    }
+    // Do not release the guard or exit while a fork-owned child is unresolved.
+    return exact_direct_wait(child, true);
+}
+
+static int reopen_exact_directory(const ExactChildState& child) {
+    if (child.directory_path.empty() || child.directory_status.st_ino == 0u) return -1;
+    const int fd =
+        open(child.directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat current{};
+    if (fd < 0 || fstat(fd, &current) != 0 || current.st_dev != child.directory_status.st_dev ||
+        current.st_ino != child.directory_status.st_ino || !S_ISDIR(current.st_mode) ||
+        current.st_uid != getuid() || current.st_gid != getgid() ||
+        (current.st_mode & 0777) != 0700) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool remove_exact_temp(int directory_fd, const char* name, const struct stat& expected) {
+    if (expected.st_ino != 0u) return unlink_regular_at_if_identity(directory_fd, name, expected);
+    struct stat ignored{};
+    errno = 0;
+    return directory_fd >= 0 && fstatat(directory_fd, name, &ignored, AT_SYMLINK_NOFOLLOW) < 0 &&
+           errno == ENOENT;
+}
+
+static bool exact_guard_release_gate(const ExactChildState& child,
+                                     bool proc_observed,
+                                     bool listener_absent) {
+    return (!child.forked || child.reaped) && proc_observed && listener_absent;
+}
+
+static bool exact_live_fd_count(u64 observed, const GuardReport& held) {
+    return observed == held.current_fd_count + 1u;
+}
+
+static void ensure_exact_guard_release_safe(ExactChildState& child, const GuardReport& held) {
+    while (!child.guard_release_safe) {
+        const bool reaped = reap_exact_owned_child(child);
+        privileged_listener::ProcTcpTable table;
+        const bool proc_observed = read_process_tcp_table(getpid(), table);
+        const bool listener_absent =
+            proc_observed && exact_listener_absent(table, held.plan, child.listener_inode);
+        child.guard_release_safe =
+            reaped && exact_guard_release_gate(child, proc_observed, listener_absent);
+        if (!child.guard_release_safe) (void)poll(nullptr, 0, 10);
+    }
+}
+
+static bool exact_transaction_self_check(std::string& error) {
+    ExactChildState early;
+    early.pid = fork();
+    if (early.pid < 0) {
+        error = "exact ownership early-exit fork self-check failed";
+        return false;
+    }
+    if (early.pid == 0) _exit(7);
+    early.forked = true;
+    siginfo_t early_info{};
+    while (waitid(P_PID, static_cast<id_t>(early.pid), &early_info, WEXITED | WNOWAIT) != 0) {
+        if (errno == EINTR) continue;
+        error = "exact ownership early-exit WNOWAIT self-check failed";
+        return false;
+    }
+    if (!reap_exact_owned_child(early) || !early.reaped || early.pid <= 1 ||
+        !WIFEXITED(early.wait_status) || WEXITSTATUS(early.wait_status) != 7) {
+        error = "early-reaped exact child ownership was lost";
+        return false;
+    }
+    ExactChildState no_pidfd;
+    no_pidfd.pid = fork();
+    if (no_pidfd.pid < 0) {
+        error = "exact ownership pidfd-failure model fork failed";
+        return false;
+    }
+    if (no_pidfd.pid == 0) {
+        for (;;) pause();
+    }
+    no_pidfd.forked = true;
+    if (!reap_exact_owned_child(no_pidfd) || !no_pidfd.reaped || no_pidfd.pidfd != -1) {
+        error = "pidfd-open failure model did not retain direct child reap authority";
+        return false;
+    }
+    ExactChildState live;
+    live.forked = true;
+    GuardReport held;
+    held.current_fd_count = 5u;
+    if (exact_guard_release_gate(live, true, true) ||
+        exact_guard_release_gate(early, false, true) ||
+        exact_guard_release_gate(early, true, false) ||
+        !exact_guard_release_gate(early, true, true) || exact_live_fd_count(7u, held) ||
+        !exact_live_fd_count(6u, held)) {
+        error = "cleanup-before-witness/proc-failure/transient-FD gate self-check failed";
+        return false;
+    }
+    return true;
+}
+
 static bool cleanup_exact_child(ExactChildState& child,
-                                int directory_fd,
                                 const GuardReport& held,
                                 int guard_fd,
                                 ExactRutCleanedReport* cleaned,
                                 bool require_clean_exit) {
-    bool identity_ok = false;
-    ProcIdentity current;
-    const struct stat& executable = child.executable_status;
-    if (executable.st_ino != 0u)
-        identity_ok = exact_child_identity(child, executable, held.netns, current) &&
-                      same_process_identity(current, child.identity);
-    int status = 0;
-    bool reaped = false;
-    if (identity_ok && child.pidfd >= 0) {
-#ifdef SYS_pidfd_send_signal
-        if (syscall(SYS_pidfd_send_signal, child.pidfd, SIGTERM, nullptr, 0) == 0) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
-            while (std::chrono::steady_clock::now() < deadline) {
-                const pid_t waited = waitpid(child.pid, &status, WNOHANG);
-                if (waited == child.pid) {
-                    reaped = true;
-                    break;
-                }
-                if (waited < 0 && errno != EINTR) break;
-                (void)poll(nullptr, 0, 10);
-            }
-        }
-#endif
-    }
-    const bool clean_exit = reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!reaped && identity_ok) {
-        ProcIdentity revalidated;
-        if (exact_child_identity(child, executable, held.netns, revalidated) &&
-            same_process_identity(revalidated, child.identity)) {
-#ifdef SYS_pidfd_send_signal
-            (void)syscall(SYS_pidfd_send_signal, child.pidfd, SIGKILL, nullptr, 0);
-#endif
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-            while (std::chrono::steady_clock::now() < deadline) {
-                const pid_t waited = waitpid(child.pid, &status, WNOHANG);
-                if (waited == child.pid) {
-                    reaped = true;
-                    break;
-                }
-                if (waited < 0 && errno != EINTR) break;
-                (void)poll(nullptr, 0, 10);
-            }
-        }
-    }
+    const bool reaped = reap_exact_owned_child(child);
+    const bool clean_exit = reaped && child.forked && WIFEXITED(child.wait_status) &&
+                            WEXITSTATUS(child.wait_status) == 0;
     bool pidfd_invalidated = false;
     if (child.pidfd >= 0) {
         const int old = child.pidfd;
@@ -2007,24 +2221,38 @@ static bool cleanup_exact_child(ExactChildState& child,
         errno = 0;
         pidfd_invalidated = fcntl(old, F_GETFD) < 0 && errno == EBADF;
     }
+    const int directory_fd = reopen_exact_directory(child);
+    const bool no_temp_custody = child.directory_path.empty() && child.source_status.st_ino == 0u &&
+                                 child.log_status.st_ino == 0u;
     const bool source_removed =
-        unlink_regular_at_if_identity(directory_fd, "exact-listener.rut", child.source_status);
+        no_temp_custody ||
+        remove_exact_temp(directory_fd, "exact-listener.rut", child.source_status);
     const bool log_removed =
-        unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+        no_temp_custody || remove_exact_temp(directory_fd, "exact-listener.log", child.log_status);
     if (directory_fd >= 0) close(directory_fd);
     privileged_listener::ProcTcpTable table;
     u64 fd_count = 0u;
     int guard_error = 0;
-    bool listener_absent = true;
-    if (held.plan.port != 0u && read_process_tcp_table(getpid(), table)) {
-        listener_absent = exact_listener_absent(table, held.plan, child.listener_inode);
+    bool listener_absent = false;
+    bool proc_observed = false;
+    const auto absence_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    while (held.plan.port != 0u && std::chrono::steady_clock::now() < absence_deadline) {
+        if (read_process_tcp_table(getpid(), table)) {
+            proc_observed = true;
+            listener_absent = exact_listener_absent(table, held.plan, child.listener_inode);
+            if (listener_absent) break;
+        }
+        (void)poll(nullptr, 0, 10);
     }
-    const bool child_absent = !process_alive(child.pid);
+    const bool child_absent = !child.forked || (reaped && !process_alive(child.pid));
     const bool guard_ok = target_socket_inode(getpid(), guard_fd, held.socket_inode) &&
                           bounded_connect_refused(
                               held.plan.guard_ipv4, static_cast<u16>(held.plan.port), guard_error);
     const bool fd_ok = count_open_fds(fd_count) && fd_count == held.current_fd_count;
+    child.guard_release_safe = exact_guard_release_gate(child, proc_observed, listener_absent);
     if (cleaned != nullptr) {
+        cleaned->version = kExactProtocolVersion;
         cleaned->child_pid = child.pid;
         cleaned->child_start = child.identity.start;
         cleaned->listener_inode = child.listener_inode;
@@ -2036,8 +2264,9 @@ static bool cleanup_exact_child(ExactChildState& child,
         cleaned->target_fd_count = fd_count;
         cleaned->guard_connect_error = guard_error;
     }
-    return reaped && (!require_clean_exit || clean_exit) && pidfd_invalidated && child_absent &&
-           listener_absent && source_removed && log_removed && guard_ok && fd_ok;
+    return child.guard_release_safe && (!require_clean_exit || clean_exit) && child.pidfd < 0 &&
+           (!child.pidfd_acquired || pidfd_invalidated) && child_absent && source_removed &&
+           log_removed && guard_ok && fd_ok;
 }
 
 static bool start_exact_child(const Frame& command,
@@ -2045,8 +2274,11 @@ static bool start_exact_child(const Frame& command,
                               int guard_fd,
                               const GuardReport& held,
                               ExactChildState& child,
-                              ExactRutReport& report) {
+                              ExactRutReport& report,
+                              ExactFailureReport& failure) {
     report = {};
+    failure = {};
+    failure.phase = ExactFailurePhase::LeaseReopen;
     std::string executable;
     struct stat expected_executable{};
     if (!parse_executable_lease(command.payload, executable, expected_executable) ||
@@ -2090,6 +2322,11 @@ static bool start_exact_child(const Frame& command,
         close(executable_fd);
         return false;
     }
+    child.directory_path = directory_path;
+    child.directory_status = directory_status;
+    child.source_path = directory_path + "/exact-listener.rut";
+    child.log_path = directory_path + "/exact-listener.log";
+    failure.phase = ExactFailurePhase::Temp;
     std::string source;
     privileged_listener::Diagnostic source_diagnostic;
     if (!privileged_listener::build_listener_source(
@@ -2106,8 +2343,6 @@ static bool start_exact_child(const Frame& command,
                               "exact-listener.log",
                               O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                               0600);
-    child.source_path = directory_path + "/exact-listener.rut";
-    child.log_path = directory_path + "/exact-listener.log";
     const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
     const bool log_identity = log_fd >= 0 && fstat(log_fd, &child.log_status) == 0;
     if (!source_identity || !log_identity || !write_all_fd(source_fd, source) ||
@@ -2124,6 +2359,7 @@ static bool start_exact_child(const Frame& command,
         return false;
     }
     close(source_fd);
+    failure.phase = ExactFailurePhase::ForkPreExec;
     const pid_t parent = getpid();
     const pid_t pid = fork();
     if (pid == 0) {
@@ -2172,6 +2408,7 @@ static bool start_exact_child(const Frame& command,
         close(executable_fd);
         return false;
     }
+    child.forked = true;
     (void)setpgid(pid, pid);
     child.pid = pid;
     child.executable = executable;
@@ -2181,6 +2418,9 @@ static bool start_exact_child(const Frame& command,
 #ifdef SYS_pidfd_open
     child.pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
 #endif
+    child.pidfd_acquired = child.pidfd >= 0;
+    close(directory_fd);
+    failure.phase = ExactFailurePhase::PidfdIdentity;
     bool ready = child.pidfd >= 0 && (fcntl(child.pidfd, F_GETFD) & FD_CLOEXEC) != 0;
     u64 backend = 0u;
     const auto deadline =
@@ -2193,7 +2433,10 @@ static bool start_exact_child(const Frame& command,
         privileged_listener::Diagnostic diagnostic;
         std::string log;
         const bool identity_ready = exact_child_identity(child, pinned, held.netns, identity);
-        if (identity_ready) child.identity = identity;
+        if (identity_ready) {
+            child.identity = identity;
+            child.post_exec_identity = true;
+        }
         if (identity_ready && read_process_tcp_table(pid, table) &&
             process_socket_inodes(pid, inodes) &&
             privileged_listener::classify_listener_evidence(
@@ -2210,27 +2453,50 @@ static bool start_exact_child(const Frame& command,
         }
         int status = 0;
         if (waitpid(pid, &status, WNOHANG) == pid) {
-            child.pid = -1;
+            child.reaped = true;
+            child.wait_status = status;
             ready = false;
             break;
         }
         (void)poll(nullptr, 0, 10);
     }
     close(executable_fd);
-    if (!ready || child.identity.pid != pid || child.listener_inode == 0u ||
-        !exact_http_exchange(
-            held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
-        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+    if (!ready || child.identity.pid != pid) {
+        failure.phase = child.reaped && !child.post_exec_identity
+                            ? ExactFailurePhase::Exec
+                            : ExactFailurePhase::PidfdIdentity;
+        failure.error_number = errno > 0 ? static_cast<u64>(errno) : 0u;
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    if (child.listener_inode == 0u) {
+        failure.phase = ExactFailurePhase::ListenerLog;
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
+        return false;
+    }
+    failure.phase = ExactFailurePhase::HttpEof;
+    if (!exact_http_exchange(
+            held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
+        failure.count = report.response_bytes;
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
+        return false;
+    }
+    failure.phase = ExactFailurePhase::GuardRefusal;
     int guard_error = 0;
     if (!connect_refused_until(
             held.plan.guard_ipv4, static_cast<u16>(held.plan.port), deadline, guard_error)) {
-        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        failure.error_number = guard_error > 0 ? static_cast<u64>(guard_error) : 0u;
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    failure.phase = ExactFailurePhase::StabilityFd;
     if (std::chrono::steady_clock::now() + std::chrono::milliseconds(500) > deadline) {
-        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     (void)poll(nullptr, 0, 500);
@@ -2252,8 +2518,10 @@ static bool start_exact_child(const Frame& command,
             diagnostic) ||
         evidence.child_owned_inode != child.listener_inode ||
         !target_socket_inode(getpid(), guard_fd, held.socket_inode) || !count_open_fds(fd_count) ||
-        fd_count != held.current_fd_count + 1u || !pidfd_link_matches(getpid(), child.pidfd)) {
-        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        !exact_live_fd_count(fd_count, held) || !pidfd_link_matches(getpid(), child.pidfd)) {
+        failure.count = fd_count;
+        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
+            failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     report.child_pid = pid;
@@ -2277,7 +2545,6 @@ static bool start_exact_child(const Frame& command,
     report.guard_connect_error = guard_error;
     report.stable = 1u;
     report.backend = backend;
-    close(directory_fd);
     return true;
 }
 
@@ -2355,10 +2622,27 @@ static int secured_target_main(const char* control_path,
             Frame exact_run;
             ExactChildState exact_child;
             ExactRutReport exact_report;
-            if (!receive_frame(control, exact_run, kListenerDeadlineMs) ||
-                exact_run.type != kExactRutRun || !token_equal(exact_run.token, token) ||
-                !start_exact_child(
-                    exact_run, control_path, guard_fd, held, exact_child, exact_report)) {
+            ExactFailureReport exact_failure;
+            const bool run_request = receive_frame(control, exact_run, kListenerDeadlineMs) &&
+                                     exact_run.type == kExactRutRun &&
+                                     token_equal(exact_run.token, token);
+            const bool started = run_request && start_exact_child(exact_run,
+                                                                  control_path,
+                                                                  guard_fd,
+                                                                  held,
+                                                                  exact_child,
+                                                                  exact_report,
+                                                                  exact_failure);
+            if (!started) {
+                if (!run_request) exact_failure.phase = ExactFailurePhase::LeaseReopen;
+                if (!exact_child.guard_release_safe &&
+                    !cleanup_exact_child(exact_child, held, guard_fd, nullptr, false))
+                    exact_failure.phase = ExactFailurePhase::Cleanup;
+                ensure_exact_guard_release_safe(exact_child, held);
+                (void)send_frame(
+                    control,
+                    Frame{kExactRutFailure, token, encode_exact_failure(exact_failure)},
+                    kHandshakeMs);
                 close(guard_fd);
                 close(control);
                 return 53;
@@ -2366,36 +2650,33 @@ static int secured_target_main(const char* control_path,
             if (!send_frame(control,
                             Frame{kExactRutWitness, token, encode_exact_report(exact_report)},
                             kHandshakeMs)) {
-                const std::string control_string(control_path);
-                const std::string directory_path =
-                    control_string.substr(0u, control_string.rfind('/'));
-                const int directory_fd =
-                    open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-                (void)cleanup_exact_child(
-                    exact_child, directory_fd, held, guard_fd, nullptr, false);
-                close(guard_fd);
+                const bool cleanup_ok =
+                    cleanup_exact_child(exact_child, held, guard_fd, nullptr, false);
+                if (!exact_child.guard_release_safe)
+                    ensure_exact_guard_release_safe(exact_child, held);
+                if (cleanup_ok || exact_child.guard_release_safe) close(guard_fd);
                 close(control);
                 return 53;
             }
             Frame exact_cleanup;
-            const std::string control_string(control_path);
-            const std::size_t slash = control_string.rfind('/');
-            const std::string directory_path =
-                slash == std::string::npos ? std::string() : control_string.substr(0u, slash);
-            const int directory_fd =
-                directory_path.empty()
-                    ? -1
-                    : open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
             ExactRutCleanedReport exact_cleaned;
             const bool cleanup_command =
                 receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
-                exact_request(exact_cleanup, kExactRutCleanup, token);
-            const bool cleanup_ok = cleanup_exact_child(
-                exact_child, directory_fd, held, guard_fd, &exact_cleaned, cleanup_command);
+                exact_cleanup_request(exact_cleanup, token);
+            const bool cleanup_ok =
+                cleanup_exact_child(exact_child, held, guard_fd, &exact_cleaned, cleanup_command);
             if (!cleanup_command || !cleanup_ok ||
                 !send_frame(control,
                             Frame{kExactRutCleaned, token, encode_exact_cleaned(exact_cleaned)},
                             kHandshakeMs)) {
+                ExactFailureReport cleanup_failure;
+                cleanup_failure.phase = ExactFailurePhase::Cleanup;
+                (void)send_frame(
+                    control,
+                    Frame{kExactRutFailure, token, encode_exact_failure(cleanup_failure)},
+                    kHandshakeMs);
+                if (!exact_child.guard_release_safe)
+                    ensure_exact_guard_release_safe(exact_child, held);
                 close(guard_fd);
                 close(control);
                 return 54;
@@ -2403,9 +2684,14 @@ static int secured_target_main(const char* control_path,
             Frame release;
             if (!receive_frame(control, release, kBrokerDeadlineMs) ||
                 !exact_request(release, kGuardRelease, token)) {
+                if (!exact_child.guard_release_safe)
+                    ensure_exact_guard_release_safe(exact_child, held);
                 close(guard_fd);
                 close(control);
                 return 49;
+            }
+            if (!exact_child.guard_release_safe) {
+                ensure_exact_guard_release_safe(exact_child, held);
             }
             close(guard_fd);
             errno = 0;
@@ -6166,7 +6452,7 @@ static bool validate_exact_witness(const ExactRutReport& report,
     const std::string log_path = endpoint.directory + "/exact-listener.log";
     const std::string expected_argv = exact_argv(
         {lease.path, source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"});
-    if (report.child_pid <= 1u ||
+    if (report.version != kExactProtocolVersion || report.child_pid <= 1u ||
         report.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
         report.child_ppid != static_cast<u64>(target.pid) ||
         report.child_pgid != report.child_pid || report.child_sid != static_cast<u64>(target.sid) ||
@@ -6242,9 +6528,9 @@ static bool validate_exact_cleaned_report(const ExactRutCleanedReport& report,
                                           const ProcIdentity& target,
                                           const GuardReport& held,
                                           std::string& error) {
-    if (report.child_pid != live.child_pid || report.child_start != live.child_start ||
-        report.listener_inode != live.listener_inode || report.clean_exit != 1u ||
-        report.pidfd_invalidated != 1u || report.child_absent != 1u ||
+    if (report.version != kExactProtocolVersion || report.child_pid != live.child_pid ||
+        report.child_start != live.child_start || report.listener_inode != live.listener_inode ||
+        report.clean_exit != 1u || report.pidfd_invalidated != 1u || report.child_absent != 1u ||
         report.listener_absent != 1u || report.temps_absent != 1u ||
         report.target_fd_count != held.current_fd_count ||
         report.guard_connect_error != ECONNREFUSED || !target_gone_or_reused(child) ||
@@ -6285,6 +6571,9 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
             mutation, lease, endpoint, target, held, ignored_identity, ignored_error);
     };
     ExactRutReport mutation = canonical;
+    mutation.version++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
     mutation.child_start++;
     if (!rejects(mutation)) return false;
     mutation = canonical;
@@ -6340,6 +6629,9 @@ static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canon
             mutation, live, child, endpoint, target, held, ignored_error);
     };
     ExactRutCleanedReport mutation = canonical;
+    mutation.version++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
     mutation.clean_exit = 0u;
     if (!rejects(mutation)) return false;
     mutation = canonical;
@@ -6370,7 +6662,8 @@ static bool guard_protocol_self_check(std::string& error) {
     if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
         kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
         kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
-        kExactRutCleaned != 44u || !parse_guard_request(request, decoded_positive, decoded_guard) ||
+        kExactRutCleaned != 44u || kExactRutFailure != 45u ||
+        !parse_guard_request(request, decoded_positive, decoded_guard) ||
         decoded_positive != positive || decoded_guard != guard) {
         error = "private guard frame/request codec self-check failed";
         return false;
@@ -6498,6 +6791,12 @@ static bool guard_protocol_self_check(std::string& error) {
         error = "oversized exact witness was accepted";
         return false;
     }
+    live_payload = encode_exact_report(live);
+    live_payload[0] = 2u;
+    if (decode_exact_report(live_payload, live_decoded)) {
+        error = "unknown exact witness version was accepted";
+        return false;
+    }
     ExactRutCleanedReport cleaned;
     cleaned.child_pid = 101u;
     cleaned.child_start = 202u;
@@ -6517,6 +6816,76 @@ static bool guard_protocol_self_check(std::string& error) {
     cleaned_payload.pop_back();
     if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
         error = "truncated exact cleanup was accepted";
+        return false;
+    }
+    cleaned_payload = encode_exact_cleaned(cleaned);
+    cleaned_payload[0] = 2u;
+    if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
+        error = "unknown exact cleaned version was accepted";
+        return false;
+    }
+    Token exact_token{};
+    Frame cleanup{kExactRutCleanup, exact_token, exact_cleanup_payload()};
+    if (!exact_cleanup_request(cleanup, exact_token)) {
+        error = "canonical exact cleanup request was rejected";
+        return false;
+    }
+    cleanup.payload.clear();
+    if (exact_cleanup_request(cleanup, exact_token)) {
+        error = "empty exact cleanup request was accepted";
+        return false;
+    }
+    cleanup.payload = exact_cleanup_payload();
+    cleanup.payload[0] = 2u;
+    if (exact_cleanup_request(cleanup, exact_token)) {
+        error = "unknown exact cleanup version was accepted";
+        return false;
+    }
+    cleanup.payload = exact_cleanup_payload();
+    cleanup.payload.push_back(0u);
+    if (exact_cleanup_request(cleanup, exact_token)) {
+        error = "oversized exact cleanup request was accepted";
+        return false;
+    }
+    ExactFailureReport canonical_failure;
+    canonical_failure.phase = ExactFailurePhase::ListenerLog;
+    canonical_failure.error_number = EPROTO;
+    canonical_failure.count = 3u;
+    ExactFailureReport decoded_failure;
+    std::vector<unsigned char> failure_payload = encode_exact_failure(canonical_failure);
+    if (!decode_exact_failure(failure_payload, decoded_failure) ||
+        decoded_failure.phase != ExactFailurePhase::ListenerLog ||
+        decoded_failure.error_number != EPROTO || decoded_failure.count != 3u) {
+        error = "canonical bounded exact failure codec failed";
+        return false;
+    }
+    failure_payload[0] = 2u;
+    if (decode_exact_failure(failure_payload, decoded_failure)) {
+        error = "unknown exact failure version was accepted";
+        return false;
+    }
+    failure_payload = encode_exact_failure(canonical_failure);
+    std::fill(
+        failure_payload.begin() + sizeof(u64), failure_payload.begin() + 2u * sizeof(u64), 0xffu);
+    if (decode_exact_failure(failure_payload, decoded_failure)) {
+        error = "unknown exact failure phase was accepted";
+        return false;
+    }
+    failure_payload = encode_exact_failure(canonical_failure);
+    failure_payload.pop_back();
+    if (decode_exact_failure(failure_payload, decoded_failure)) {
+        error = "truncated exact failure was accepted";
+        return false;
+    }
+    failure_payload = encode_exact_failure(canonical_failure);
+    failure_payload.push_back(0u);
+    if (decode_exact_failure(failure_payload, decoded_failure)) {
+        error = "oversized exact failure was accepted";
+        return false;
+    }
+    canonical_failure.count = 1025u;
+    if (decode_exact_failure(encode_exact_failure(canonical_failure), decoded_failure)) {
+        error = "overflow exact failure count was accepted";
         return false;
     }
     return true;
@@ -7003,8 +7372,23 @@ static bool run_session(const std::string& sudo_path,
                 !send_frame(target_fd,
                             Frame{kExactRutRun, token, executable_lease_payload(rut_executable)},
                             kHandshakeMs) ||
-                !receive_frame(target_fd, exact_frame, kListenerDeadlineMs) ||
-                exact_frame.type != kExactRutWitness || !token_equal(exact_frame.token, token) ||
+                !receive_frame(target_fd, exact_frame, kListenerDeadlineMs)) {
+                error = "exact public-RUT run/witness transport failed";
+                break;
+            }
+            if (exact_frame.type == kExactRutFailure && token_equal(exact_frame.token, token)) {
+                ExactFailureReport failure;
+                if (!decode_exact_failure(exact_frame.payload, failure)) {
+                    error = "exact public-RUT returned malformed bounded failure evidence";
+                } else {
+                    error = "exact public-RUT failed at phase " +
+                            std::string(exact_failure_phase_name(failure.phase)) +
+                            " errno=" + std::to_string(failure.error_number) +
+                            " count=" + std::to_string(failure.count);
+                }
+                break;
+            }
+            if (exact_frame.type != kExactRutWitness || !token_equal(exact_frame.token, token) ||
                 !decode_exact_report(exact_frame.payload, exact_report) ||
                 !validate_exact_witness(exact_report,
                                         rut_executable,
@@ -7020,9 +7404,26 @@ static bool run_session(const std::string& sudo_path,
             }
             Frame exact_cleaned_frame;
             ExactRutCleanedReport exact_cleaned;
-            if (!send_frame(target_fd, Frame{kExactRutCleanup, token, {}}, kHandshakeMs) ||
-                !receive_frame(target_fd, exact_cleaned_frame, kListenerDeadlineMs) ||
-                exact_cleaned_frame.type != kExactRutCleaned ||
+            if (!send_frame(target_fd,
+                            Frame{kExactRutCleanup, token, exact_cleanup_payload()},
+                            kHandshakeMs) ||
+                !receive_frame(target_fd, exact_cleaned_frame, kListenerDeadlineMs)) {
+                error = "exact public-RUT cleanup transport failed";
+                break;
+            }
+            if (exact_cleaned_frame.type == kExactRutFailure &&
+                token_equal(exact_cleaned_frame.token, token)) {
+                ExactFailureReport failure;
+                if (decode_exact_failure(exact_cleaned_frame.payload, failure))
+                    error = "exact public-RUT failed at phase " +
+                            std::string(exact_failure_phase_name(failure.phase)) +
+                            " errno=" + std::to_string(failure.error_number) +
+                            " count=" + std::to_string(failure.count);
+                else
+                    error = "exact public-RUT returned malformed cleanup failure evidence";
+                break;
+            }
+            if (exact_cleaned_frame.type != kExactRutCleaned ||
                 !token_equal(exact_cleaned_frame.token, token) ||
                 !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
                 !validate_exact_cleaned_report(
@@ -7412,7 +7813,8 @@ int main(int argc, char** argv) {
         !prelaunch_close_first_self_check(error) ||
         !identity_bundle_integration_self_check(error) || !retained_anchor_self_check(error) ||
         !ancestry_probe_validation_self_check(error) ||
-        !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error)) {
+        !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error) ||
+        !exact_transaction_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }

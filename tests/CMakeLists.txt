@@ -78,11 +78,23 @@ target_include_directories(fixture_privileged_listener PRIVATE
 
 add_executable(test_fixture_privileged_listener test_fixture_privileged_listener.cc)
 target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privileged_listener)
-if(RUT_ENABLE_JIT)
-    target_link_libraries(test_fixture_privileged_listener PRIVATE rut_loader)
-endif()
 add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
 set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
+
+if(RUT_ENABLE_JIT)
+    add_executable(test_fixture_privileged_listener_loader
+        test_fixture_privileged_listener_loader.cc)
+    target_link_libraries(test_fixture_privileged_listener_loader PRIVATE
+        fixture_privileged_listener rut_loader)
+    target_include_directories(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(test_fixture_privileged_listener_loader PRIVATE
+        ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+    add_test(NAME test_fixture_privileged_listener_loader
+        COMMAND test_fixture_privileged_listener_loader)
+    set_tests_properties(test_fixture_privileged_listener_loader PROPERTIES
+        LABELS "unit;jit" TIMEOUT 30)
+endif()
 
 add_executable(test_exact_path_view test_exact_path_view.cc)
 target_include_directories(test_exact_path_view PRIVATE
