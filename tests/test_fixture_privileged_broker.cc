@@ -2065,10 +2065,10 @@ static bool unlink_regular_at_if_identity(int directory_fd,
            S_ISREG(current.st_mode) && unlinkat(directory_fd, name, 0) == 0;
 }
 
-static bool exact_direct_wait(ExactChildState& child, bool blocking) {
+static bool exact_direct_wait(ExactChildState& child) {
     if (!child.forked || child.pid <= 1 || child.reaped) return !child.forked || child.reaped;
     for (;;) {
-        const pid_t waited = waitpid(child.pid, &child.wait_status, blocking ? 0 : WNOHANG);
+        const pid_t waited = waitpid(child.pid, &child.wait_status, WNOHANG);
         if (waited == child.pid) {
             child.reaped = true;
             return true;
@@ -2080,7 +2080,7 @@ static bool exact_direct_wait(ExactChildState& child, bool blocking) {
 }
 
 static bool signal_exact_owned_child(ExactChildState& child, int signal_number) {
-    if (exact_direct_wait(child, false)) return true;
+    if (exact_direct_wait(child)) return true;
 #ifdef SYS_pidfd_send_signal
     if (child.pidfd >= 0 &&
         syscall(SYS_pidfd_send_signal, child.pidfd, signal_number, nullptr, 0) == 0)
@@ -2091,23 +2091,32 @@ static bool signal_exact_owned_child(ExactChildState& child, int signal_number) 
     return kill(child.pid, signal_number) == 0 || errno == ESRCH;
 }
 
-static bool reap_exact_owned_child(ExactChildState& child) {
+static bool reap_exact_owned_child(ExactChildState& child,
+                                   std::chrono::steady_clock::time_point deadline) {
     if (!child.forked) return true;
-    if (exact_direct_wait(child, false)) return true;
+    if (exact_direct_wait(child)) return true;
+    if (std::chrono::steady_clock::now() >= deadline) {
+        errno = ETIMEDOUT;
+        return false;
+    }
     if (!signal_exact_owned_child(child, SIGTERM)) return false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+    const auto kill_deadline =
+        std::chrono::steady_clock::now() + (deadline - std::chrono::steady_clock::now()) / 2;
+    bool killed = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (exact_direct_wait(child, false)) return true;
-        (void)poll(nullptr, 0, 10);
+        if (exact_direct_wait(child)) return true;
+        if (!killed && std::chrono::steady_clock::now() >= kill_deadline) {
+            if (!signal_exact_owned_child(child, SIGKILL)) return false;
+            killed = true;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() > 0)
+            (void)poll(nullptr, 0, static_cast<int>(std::min<std::int64_t>(10, remaining.count())));
     }
-    if (!signal_exact_owned_child(child, SIGKILL)) return false;
-    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (exact_direct_wait(child, false)) return true;
-        (void)poll(nullptr, 0, 10);
-    }
-    // Do not release the guard or exit while a fork-owned child is unresolved.
-    return exact_direct_wait(child, true);
+    if (exact_direct_wait(child)) return true;
+    errno = ETIMEDOUT;
+    return false;
 }
 
 static int reopen_exact_directory(const ExactChildState& child) {
@@ -2143,17 +2152,45 @@ static bool exact_live_fd_count(u64 observed, const GuardReport& held) {
     return observed == held.current_fd_count + 1u;
 }
 
-static void ensure_exact_guard_release_safe(ExactChildState& child, const GuardReport& held) {
-    while (!child.guard_release_safe) {
-        const bool reaped = reap_exact_owned_child(child);
+static std::chrono::steady_clock::time_point new_exact_cleanup_deadline() {
+    return std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs * 2);
+}
+
+enum class ExactCleanupFault { None, ProcFailure, ListenerPresent };
+
+struct ExactCleanupObservation {
+    bool proc_observed = false;
+    bool listener_absent = false;
+    int error_number = 0;
+    u64 attempts = 0u;
+};
+
+static bool observe_exact_listener_absence(const ExactChildState& child,
+                                           const GuardReport& held,
+                                           std::chrono::steady_clock::time_point deadline,
+                                           ExactCleanupFault fault,
+                                           ExactCleanupObservation& observation) {
+    observation = {};
+    while (held.plan.port != 0u && std::chrono::steady_clock::now() < deadline) {
+        if (observation.attempts < 1024u) ++observation.attempts;
         privileged_listener::ProcTcpTable table;
-        const bool proc_observed = read_process_tcp_table(getpid(), table);
-        const bool listener_absent =
-            proc_observed && exact_listener_absent(table, held.plan, child.listener_inode);
-        child.guard_release_safe =
-            reaped && exact_guard_release_gate(child, proc_observed, listener_absent);
-        if (!child.guard_release_safe) (void)poll(nullptr, 0, 10);
+        const bool observed =
+            fault == ExactCleanupFault::ListenerPresent ||
+            (fault != ExactCleanupFault::ProcFailure && read_process_tcp_table(getpid(), table));
+        if (observed) {
+            observation.proc_observed = true;
+            observation.listener_absent =
+                fault != ExactCleanupFault::ListenerPresent &&
+                exact_listener_absent(table, held.plan, child.listener_inode);
+            if (observation.listener_absent) return true;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() > 0)
+            (void)poll(nullptr, 0, static_cast<int>(std::min<std::int64_t>(10, remaining.count())));
     }
+    observation.error_number = ETIMEDOUT;
+    return false;
 }
 
 static bool exact_transaction_self_check(std::string& error) {
@@ -2171,8 +2208,8 @@ static bool exact_transaction_self_check(std::string& error) {
         error = "exact ownership early-exit WNOWAIT self-check failed";
         return false;
     }
-    if (!reap_exact_owned_child(early) || !early.reaped || early.pid <= 1 ||
-        !WIFEXITED(early.wait_status) || WEXITSTATUS(early.wait_status) != 7) {
+    if (!reap_exact_owned_child(early, new_exact_cleanup_deadline()) || !early.reaped ||
+        early.pid <= 1 || !WIFEXITED(early.wait_status) || WEXITSTATUS(early.wait_status) != 7) {
         error = "early-reaped exact child ownership was lost";
         return false;
     }
@@ -2186,8 +2223,33 @@ static bool exact_transaction_self_check(std::string& error) {
         for (;;) pause();
     }
     no_pidfd.forked = true;
-    if (!reap_exact_owned_child(no_pidfd) || !no_pidfd.reaped || no_pidfd.pidfd != -1) {
+    if (!reap_exact_owned_child(no_pidfd, new_exact_cleanup_deadline()) || !no_pidfd.reaped ||
+        no_pidfd.pidfd != -1) {
         error = "pidfd-open failure model did not retain direct child reap authority";
+        return false;
+    }
+    ExactChildState deadline_child;
+    deadline_child.pid = fork();
+    if (deadline_child.pid < 0) {
+        error = "exact bounded-reap fault model fork failed";
+        return false;
+    }
+    if (deadline_child.pid == 0) {
+        for (;;) pause();
+    }
+    deadline_child.forked = true;
+    const auto expired = std::chrono::steady_clock::now();
+    const bool expired_reaped = reap_exact_owned_child(deadline_child, expired);
+    const bool expired_bounded =
+        std::chrono::steady_clock::now() - expired <= std::chrono::milliseconds(100);
+    if (expired_reaped || deadline_child.reaped || !expired_bounded) {
+        (void)reap_exact_owned_child(deadline_child, new_exact_cleanup_deadline());
+        error = "expired exact child reap did not return boundedly fail-closed";
+        return false;
+    }
+    if (!reap_exact_owned_child(deadline_child, new_exact_cleanup_deadline()) ||
+        !deadline_child.reaped) {
+        error = "bounded-reap fault model child was not subsequently reclaimed";
         return false;
     }
     ExactChildState live;
@@ -2202,6 +2264,34 @@ static bool exact_transaction_self_check(std::string& error) {
         error = "cleanup-before-witness/proc-failure/transient-FD gate self-check failed";
         return false;
     }
+    held.plan.port = 1u;
+    ExactCleanupObservation observation;
+    const auto proc_start = std::chrono::steady_clock::now();
+    if (observe_exact_listener_absence(early,
+                                       held,
+                                       proc_start + std::chrono::milliseconds(30),
+                                       ExactCleanupFault::ProcFailure,
+                                       observation) ||
+        observation.proc_observed || observation.listener_absent ||
+        exact_guard_release_gate(early, observation.proc_observed, observation.listener_absent) ||
+        observation.error_number != ETIMEDOUT || observation.attempts == 0u ||
+        std::chrono::steady_clock::now() - proc_start > std::chrono::milliseconds(200)) {
+        error = "persistent proc-observation failure did not return boundedly fail-closed";
+        return false;
+    }
+    const auto listener_start = std::chrono::steady_clock::now();
+    if (observe_exact_listener_absence(early,
+                                       held,
+                                       listener_start + std::chrono::milliseconds(30),
+                                       ExactCleanupFault::ListenerPresent,
+                                       observation) ||
+        !observation.proc_observed || observation.listener_absent ||
+        exact_guard_release_gate(early, observation.proc_observed, observation.listener_absent) ||
+        observation.error_number != ETIMEDOUT || observation.attempts == 0u ||
+        std::chrono::steady_clock::now() - listener_start > std::chrono::milliseconds(200)) {
+        error = "persistent listener evidence did not return boundedly fail-closed";
+        return false;
+    }
     return true;
 }
 
@@ -2209,48 +2299,50 @@ static bool cleanup_exact_child(ExactChildState& child,
                                 const GuardReport& held,
                                 int guard_fd,
                                 ExactRutCleanedReport* cleaned,
-                                bool require_clean_exit) {
-    const bool reaped = reap_exact_owned_child(child);
+                                bool require_clean_exit,
+                                std::chrono::steady_clock::time_point deadline,
+                                ExactFailureReport* failure = nullptr,
+                                ExactCleanupFault fault = ExactCleanupFault::None) {
+    const bool reaped = reap_exact_owned_child(child, deadline);
+    const int reap_error = reaped ? 0 : (errno != 0 ? errno : ETIMEDOUT);
     const bool clean_exit = reaped && child.forked && WIFEXITED(child.wait_status) &&
                             WEXITSTATUS(child.wait_status) == 0;
     bool pidfd_invalidated = false;
-    if (child.pidfd >= 0) {
+    if (reaped && child.pidfd >= 0) {
         const int old = child.pidfd;
         close(child.pidfd);
         child.pidfd = -1;
         errno = 0;
         pidfd_invalidated = fcntl(old, F_GETFD) < 0 && errno == EBADF;
     }
-    const int directory_fd = reopen_exact_directory(child);
+    const int directory_fd = reaped ? reopen_exact_directory(child) : -1;
     const bool no_temp_custody = child.directory_path.empty() && child.source_status.st_ino == 0u &&
                                  child.log_status.st_ino == 0u;
     const bool source_removed =
-        no_temp_custody ||
-        remove_exact_temp(directory_fd, "exact-listener.rut", child.source_status);
+        reaped && (no_temp_custody ||
+                   remove_exact_temp(directory_fd, "exact-listener.rut", child.source_status));
     const bool log_removed =
-        no_temp_custody || remove_exact_temp(directory_fd, "exact-listener.log", child.log_status);
+        reaped && (no_temp_custody ||
+                   remove_exact_temp(directory_fd, "exact-listener.log", child.log_status));
     if (directory_fd >= 0) close(directory_fd);
-    privileged_listener::ProcTcpTable table;
     u64 fd_count = 0u;
     int guard_error = 0;
-    bool listener_absent = false;
-    bool proc_observed = false;
-    const auto absence_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
-    while (held.plan.port != 0u && std::chrono::steady_clock::now() < absence_deadline) {
-        if (read_process_tcp_table(getpid(), table)) {
-            proc_observed = true;
-            listener_absent = exact_listener_absent(table, held.plan, child.listener_inode);
-            if (listener_absent) break;
-        }
-        (void)poll(nullptr, 0, 10);
-    }
+    ExactCleanupObservation observation;
+    const bool absence_observed =
+        reaped && observe_exact_listener_absence(child, held, deadline, fault, observation);
+    const bool proc_observed = absence_observed && observation.proc_observed;
+    const bool listener_absent = absence_observed && observation.listener_absent;
     const bool child_absent = !child.forked || (reaped && !process_alive(child.pid));
     const bool guard_ok = target_socket_inode(getpid(), guard_fd, held.socket_inode) &&
                           bounded_connect_refused(
                               held.plan.guard_ipv4, static_cast<u16>(held.plan.port), guard_error);
     const bool fd_ok = count_open_fds(fd_count) && fd_count == held.current_fd_count;
     child.guard_release_safe = exact_guard_release_gate(child, proc_observed, listener_absent);
+    if (!child.guard_release_safe && failure != nullptr) {
+        failure->phase = ExactFailurePhase::Cleanup;
+        failure->error_number = static_cast<u64>(reaped ? observation.error_number : reap_error);
+        failure->count = std::min<u64>(observation.attempts, 1024u);
+    }
     if (cleaned != nullptr) {
         cleaned->version = kExactProtocolVersion;
         cleaned->child_pid = child.pid;
@@ -2461,27 +2553,28 @@ static bool start_exact_child(const Frame& command,
         (void)poll(nullptr, 0, 10);
     }
     close(executable_fd);
+    const auto cleanup_after_failure = [&]() {
+        return cleanup_exact_child(
+            child, held, guard_fd, nullptr, false, new_exact_cleanup_deadline(), &failure);
+    };
     if (!ready || child.identity.pid != pid) {
         failure.phase = child.reaped && !child.post_exec_identity
                             ? ExactFailurePhase::Exec
                             : ExactFailurePhase::PidfdIdentity;
         failure.error_number = errno > 0 ? static_cast<u64>(errno) : 0u;
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     if (child.listener_inode == 0u) {
         failure.phase = ExactFailurePhase::ListenerLog;
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     failure.phase = ExactFailurePhase::HttpEof;
     if (!exact_http_exchange(
             held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
         failure.count = report.response_bytes;
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     failure.phase = ExactFailurePhase::GuardRefusal;
@@ -2489,14 +2582,12 @@ static bool start_exact_child(const Frame& command,
     if (!connect_refused_until(
             held.plan.guard_ipv4, static_cast<u16>(held.plan.port), deadline, guard_error)) {
         failure.error_number = guard_error > 0 ? static_cast<u64>(guard_error) : 0u;
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     failure.phase = ExactFailurePhase::StabilityFd;
     if (std::chrono::steady_clock::now() + std::chrono::milliseconds(500) > deadline) {
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     (void)poll(nullptr, 0, 500);
@@ -2520,8 +2611,7 @@ static bool start_exact_child(const Frame& command,
         !target_socket_inode(getpid(), guard_fd, held.socket_inode) || !count_open_fds(fd_count) ||
         !exact_live_fd_count(fd_count, held) || !pidfd_link_matches(getpid(), child.pidfd)) {
         failure.count = fd_count;
-        if (!cleanup_exact_child(child, held, guard_fd, nullptr, false))
-            failure.phase = ExactFailurePhase::Cleanup;
+        if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
     report.child_pid = pid;
@@ -2546,6 +2636,23 @@ static bool start_exact_child(const Frame& command,
     report.stable = 1u;
     report.backend = backend;
     return true;
+}
+
+static int finish_exact_failure(int control,
+                                const Token& token,
+                                const ExactChildState& child,
+                                const ExactFailureReport& failure,
+                                int exit_code) {
+    (void)send_frame(
+        control, Frame{kExactRutFailure, token, encode_exact_failure(failure)}, kHandshakeMs);
+    close(control);
+    // The guard is deliberately not closed here.  When the owned child has
+    // been definitively reaped, nonzero Target exit is a safe terminal action:
+    // kernel process teardown closes the still-owned guard without publishing
+    // frame 44 or frame 37 success.  An unreaped deadline failure is likewise
+    // reported without further PID signalling or a false cleanup claim.
+    (void)child;
+    return exit_code;
 }
 
 static int secured_target_main(const char* control_path,
@@ -2636,62 +2743,70 @@ static int secured_target_main(const char* control_path,
             if (!started) {
                 if (!run_request) exact_failure.phase = ExactFailurePhase::LeaseReopen;
                 if (!exact_child.guard_release_safe &&
-                    !cleanup_exact_child(exact_child, held, guard_fd, nullptr, false))
+                    !cleanup_exact_child(exact_child,
+                                         held,
+                                         guard_fd,
+                                         nullptr,
+                                         false,
+                                         new_exact_cleanup_deadline(),
+                                         &exact_failure))
                     exact_failure.phase = ExactFailurePhase::Cleanup;
-                ensure_exact_guard_release_safe(exact_child, held);
-                (void)send_frame(
-                    control,
-                    Frame{kExactRutFailure, token, encode_exact_failure(exact_failure)},
-                    kHandshakeMs);
-                close(guard_fd);
-                close(control);
-                return 53;
+                return finish_exact_failure(control, token, exact_child, exact_failure, 53);
             }
             if (!send_frame(control,
                             Frame{kExactRutWitness, token, encode_exact_report(exact_report)},
                             kHandshakeMs)) {
-                const bool cleanup_ok =
-                    cleanup_exact_child(exact_child, held, guard_fd, nullptr, false);
-                if (!exact_child.guard_release_safe)
-                    ensure_exact_guard_release_safe(exact_child, held);
-                if (cleanup_ok || exact_child.guard_release_safe) close(guard_fd);
-                close(control);
-                return 53;
+                exact_failure.phase = ExactFailurePhase::HttpEof;
+                exact_failure.error_number = errno > 0 ? static_cast<u64>(errno) : 0u;
+                const bool cleanup_ok = cleanup_exact_child(exact_child,
+                                                            held,
+                                                            guard_fd,
+                                                            nullptr,
+                                                            false,
+                                                            new_exact_cleanup_deadline(),
+                                                            &exact_failure);
+                (void)cleanup_ok;
+                return finish_exact_failure(control, token, exact_child, exact_failure, 53);
             }
             Frame exact_cleanup;
             ExactRutCleanedReport exact_cleaned;
             const bool cleanup_command =
                 receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
                 exact_cleanup_request(exact_cleanup, token);
-            const bool cleanup_ok =
-                cleanup_exact_child(exact_child, held, guard_fd, &exact_cleaned, cleanup_command);
+            const bool cleanup_ok = cleanup_exact_child(exact_child,
+                                                        held,
+                                                        guard_fd,
+                                                        &exact_cleaned,
+                                                        cleanup_command,
+                                                        new_exact_cleanup_deadline(),
+                                                        &exact_failure);
             if (!cleanup_command || !cleanup_ok ||
                 !send_frame(control,
                             Frame{kExactRutCleaned, token, encode_exact_cleaned(exact_cleaned)},
                             kHandshakeMs)) {
-                ExactFailureReport cleanup_failure;
-                cleanup_failure.phase = ExactFailurePhase::Cleanup;
-                (void)send_frame(
-                    control,
-                    Frame{kExactRutFailure, token, encode_exact_failure(cleanup_failure)},
-                    kHandshakeMs);
-                if (!exact_child.guard_release_safe)
-                    ensure_exact_guard_release_safe(exact_child, held);
-                close(guard_fd);
-                close(control);
-                return 54;
+                exact_failure.phase = ExactFailurePhase::Cleanup;
+                return finish_exact_failure(control, token, exact_child, exact_failure, 54);
             }
             Frame release;
             if (!receive_frame(control, release, kBrokerDeadlineMs) ||
                 !exact_request(release, kGuardRelease, token)) {
                 if (!exact_child.guard_release_safe)
-                    ensure_exact_guard_release_safe(exact_child, held);
+                    return finish_exact_failure(control, token, exact_child, exact_failure, 49);
                 close(guard_fd);
                 close(control);
                 return 49;
             }
             if (!exact_child.guard_release_safe) {
-                ensure_exact_guard_release_safe(exact_child, held);
+                exact_failure.phase = ExactFailurePhase::Cleanup;
+                (void)cleanup_exact_child(exact_child,
+                                          held,
+                                          guard_fd,
+                                          nullptr,
+                                          false,
+                                          new_exact_cleanup_deadline(),
+                                          &exact_failure);
+                if (!exact_child.guard_release_safe)
+                    return finish_exact_failure(control, token, exact_child, exact_failure, 49);
             }
             close(guard_fd);
             errno = 0;
