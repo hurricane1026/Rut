@@ -1,9 +1,15 @@
 #include "fixture_privileged_listener.h"
+#ifdef RUT_ENABLE_JIT
+#include "rut/serve_loader.h"
+#endif
 #include <cerrno>
 #include <cstdio>
 #include <limits>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace listener = rut::test::fixture_privileged_listener;
 
@@ -84,10 +90,10 @@ bool plan_and_source_tests() {
     std::string source;
     static constexpr char kExact[] =
         "listen 10.1.2.3:8080\n"
-        "route exact slash_normalized GET \"/\" { return local_response({ status: 204 }) }\n";
+        "route GET \"/\" { return 204 }\n";
     static constexpr char kWildcard[] =
         "listen :8080\n"
-        "route exact slash_normalized GET \"/\" { return local_response({ status: 204 }) }\n";
+        "route GET \"/\" { return 204 }\n";
     ok = check(listener::build_listener_source(
                    kPlan, listener::ListenerSourceKind::Exact, source, diagnostic) &&
                    source == kExact,
@@ -113,6 +119,41 @@ bool plan_and_source_tests() {
                "invalid plan source construction did not fail before output") &&
          ok;
     return ok;
+}
+
+bool public_loader_test() {
+#ifdef RUT_ENABLE_JIT
+    char path[] = "/tmp/rut-listener-source-XXXXXX";
+    const int fd = mkstemp(path);
+    if (!check(fd >= 0, "public-loader source tempfile creation failed")) return false;
+    std::string source;
+    listener::Diagnostic diagnostic;
+    bool ok = listener::build_listener_source(
+        kPlan, listener::ListenerSourceKind::Exact, source, diagnostic);
+    std::size_t offset = 0u;
+    while (ok && offset < source.size()) {
+        const ssize_t count = write(fd, source.data() + offset, source.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            ok = false;
+            break;
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    if (close(fd) != 0) ok = false;
+    rut::LoadedProgram program;
+    rut::LoadError error;
+    if (ok) ok = rut::load_rut_program(path, program, error, rut::jit::OptLevel::O2);
+    if (ok)
+        ok = program.has_listener && program.listener.address == rut::ListenerAddress::IPv4Exact &&
+             program.listener.ipv4_host == kPlan.positive_ipv4 &&
+             program.listener.port == kPlan.port;
+    program.destroy();
+    if (unlink(path) != 0) ok = false;
+    return check(ok, "ordinary listener source did not compile through the public loader");
+#else
+    return true;
+#endif
 }
 
 bool proc_parser_tests() {
@@ -452,8 +493,8 @@ bool collision_log_tests() {
 }  // namespace
 
 int main() {
-    const bool ok = plan_and_source_tests() && proc_parser_tests() && guard_reservation_tests() &&
-                    evidence_tests() && collision_log_tests();
+    const bool ok = plan_and_source_tests() && public_loader_test() && proc_parser_tests() &&
+                    guard_reservation_tests() && evidence_tests() && collision_log_tests();
     if (!ok) return 1;
     std::puts("PASS: #358 pure listener evidence helper");
     return 0;

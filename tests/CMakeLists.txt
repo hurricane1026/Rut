@@ -78,6 +78,9 @@ target_include_directories(fixture_privileged_listener PRIVATE
 
 add_executable(test_fixture_privileged_listener test_fixture_privileged_listener.cc)
 target_link_libraries(test_fixture_privileged_listener PRIVATE fixture_privileged_listener)
+if(RUT_ENABLE_JIT)
+    target_link_libraries(test_fixture_privileged_listener PRIVATE rut_loader)
+endif()
 add_test(NAME test_fixture_privileged_listener COMMAND test_fixture_privileged_listener)
 set_tests_properties(test_fixture_privileged_listener PROPERTIES LABELS "unit" TIMEOUT 30)
 
@@ -577,7 +580,9 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_fixture_privileged_broker PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
-    add_test(NAME test_fixture_privileged_broker COMMAND test_fixture_privileged_broker)
+    add_dependencies(test_fixture_privileged_broker rut)
+    add_test(NAME test_fixture_privileged_broker
+             COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE

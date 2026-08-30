@@ -133,9 +133,7 @@ bool build_listener_source(const ListenerPlan& plan,
     }
     const std::string endpoint =
         kind == ListenerSourceKind::Exact ? text.positive_endpoint : text.wildcard_endpoint;
-    source = "listen " + endpoint + "\n" +
-             "route exact slash_normalized GET \"/\" { return local_response({ status: 204 }) "
-             "}\n";
+    source = "listen " + endpoint + "\n" + "route GET \"/\" { return 204 }\n";
     if (source.size() > kMaxSourceBytes) {
         fail(diagnostic, DiagnosticPhase::Source);
         return false;

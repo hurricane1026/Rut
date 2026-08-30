@@ -152,7 +152,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ninja -C build test_ipv4_fixture_topology test_fixture_privileged_broker
+          ninja -C build rut test_ipv4_fixture_topology test_fixture_privileged_broker
 
       - name: Run required topology fixture directly
         shell: bash
@@ -178,7 +178,7 @@ jobs:
           set -euo pipefail
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
             timeout --signal=TERM --kill-after=10s 180s \
-              ./build/tests/test_fixture_privileged_broker 2>&1 | \
+              ./build/tests/test_fixture_privileged_broker "$(realpath ./build/src/rut)" 2>&1 | \
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/direct.log"
 
       - name: Run required focused CTest

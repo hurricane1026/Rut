@@ -1,7 +1,7 @@
 // #358 Stage 2a3b: authenticated sudo/nsenter broker lifecycle only.
 // The listener-guard-reservation scenario lets only the secured ordinary Target
-// create a non-listening AF_INET guard and bounded probe clients. No HTTP
-// listener, nginx process, or RUT process is created here.
+// own the non-listening AF_INET guard, exact public-RUT child, and bounded HTTP/
+// refusal clients. The host parent retains read-only identity evidence only.
 
 #include "fixture_ancestry_bundle.h"
 #include "fixture_direct_launch.h"
@@ -93,7 +93,12 @@ constexpr u16 kGuardRelease = 37;
 constexpr u16 kGuardReleased = 38;
 constexpr u16 kGuardFinish = 39;
 constexpr u16 kGuardFinished = 40;
+constexpr u16 kExactRutRun = 41;
+constexpr u16 kExactRutWitness = 42;
+constexpr u16 kExactRutCleanup = 43;
+constexpr u16 kExactRutCleaned = 44;
 constexpr int kBrokerDeadlineMs = 5000;
+constexpr int kListenerDeadlineMs = 15000;
 constexpr int kCredentialFd = 198;
 constexpr int kLauncherBundleFdBase = 220;
 static_assert(kLauncherBundleFdBase > kCredentialFd);
@@ -137,6 +142,10 @@ static bool safe_signal_target(const Report& report,
                                const Peer& peer,
                                const ProcIdentity& expected,
                                int signal_number);
+static bool target_socket_inode(pid_t target, int fd, u64 expected_inode);
+static bool exact_listener_absent(const privileged_listener::ProcTcpTable& table,
+                                  const privileged_listener::ListenerPlan& plan,
+                                  u64 listener_inode);
 static bool write_pipe_exact(int fd, const unsigned char* data, size_t size, int timeout_ms);
 static bool stable_proc_identity(pid_t pid, ProcIdentity& identity);
 static bool child_exited_wnowait(pid_t pid);
@@ -935,6 +944,60 @@ struct GuardReport {
     u64 fd_invalidated = 0u;
 };
 
+struct ExecutableLease {
+    std::string path;
+    int fd = -1;
+    struct stat status{};
+
+    ~ExecutableLease() {
+        if (fd >= 0) close(fd);
+    }
+};
+
+constexpr std::size_t kExactReportFields = 24u;
+struct ExactRutReport {
+    u64 child_pid = 0u;
+    u64 child_start = 0u;
+    u64 child_ppid = 0u;
+    u64 child_pgid = 0u;
+    u64 child_sid = 0u;
+    u64 child_uid = 0u;
+    u64 child_gid = 0u;
+    u64 child_netns = 0u;
+    u64 child_exe_dev = 0u;
+    u64 child_exe_ino = 0u;
+    u64 pidfd = 0u;
+    u64 pidfd_cloexec = 0u;
+    u64 listener_inode = 0u;
+    u64 source_dev = 0u;
+    u64 source_ino = 0u;
+    u64 log_dev = 0u;
+    u64 log_ino = 0u;
+    u64 target_fd_count = 0u;
+    u64 response_bytes = 0u;
+    u64 response_exact = 0u;
+    u64 prompt_eof = 0u;
+    u64 guard_connect_error = 0u;
+    u64 stable = 0u;
+    u64 backend = 0u;
+};
+
+constexpr std::size_t kExactCleanedFields = 10u;
+struct ExactRutCleanedReport {
+    u64 child_pid = 0u;
+    u64 child_start = 0u;
+    u64 listener_inode = 0u;
+    u64 clean_exit = 0u;
+    u64 pidfd_invalidated = 0u;
+    u64 child_absent = 0u;
+    u64 listener_absent = 0u;
+    u64 temps_absent = 0u;
+    u64 target_fd_count = 0u;
+    u64 guard_connect_error = 0u;
+};
+
+static bool executable_lease_unchanged(const ExecutableLease& lease);
+
 static void append_u64(std::vector<unsigned char>& payload, u64 value) {
     for (unsigned shift = 0u; shift != 64u; shift += 8u)
         payload.push_back(static_cast<unsigned char>(value >> shift));
@@ -945,6 +1008,123 @@ static u64 read_u64(const unsigned char* value) {
     for (unsigned shift = 0u; shift != 64u; shift += 8u)
         result |= static_cast<u64>(value[shift / 8u]) << shift;
     return result;
+}
+
+static std::vector<unsigned char> executable_lease_payload(const ExecutableLease& lease) {
+    std::vector<unsigned char> payload;
+    payload.reserve(7u * sizeof(u64) + lease.path.size());
+    append_u64(payload, 1u);
+    append_u64(payload, static_cast<u64>(lease.status.st_dev));
+    append_u64(payload, static_cast<u64>(lease.status.st_ino));
+    append_u64(payload, static_cast<u64>(lease.status.st_mode));
+    append_u64(payload, static_cast<u64>(lease.status.st_uid));
+    append_u64(payload, static_cast<u64>(lease.status.st_gid));
+    append_u64(payload, lease.path.size());
+    payload.insert(payload.end(), lease.path.begin(), lease.path.end());
+    return payload;
+}
+
+static bool parse_executable_lease(const std::vector<unsigned char>& payload,
+                                   std::string& path,
+                                   struct stat& expected) {
+    path.clear();
+    expected = {};
+    if (payload.size() < 7u * sizeof(u64)) return false;
+    const u64 version = read_u64(payload.data());
+    const u64 dev = read_u64(payload.data() + sizeof(u64));
+    const u64 ino = read_u64(payload.data() + 2u * sizeof(u64));
+    const u64 mode = read_u64(payload.data() + 3u * sizeof(u64));
+    const u64 uid = read_u64(payload.data() + 4u * sizeof(u64));
+    const u64 gid = read_u64(payload.data() + 5u * sizeof(u64));
+    const u64 length = read_u64(payload.data() + 6u * sizeof(u64));
+    if (version != 1u || length == 0u || length > PATH_MAX ||
+        length != payload.size() - 7u * sizeof(u64) || dev > std::numeric_limits<dev_t>::max() ||
+        ino > std::numeric_limits<ino_t>::max() || mode > std::numeric_limits<mode_t>::max() ||
+        uid > std::numeric_limits<uid_t>::max() || gid > std::numeric_limits<gid_t>::max())
+        return false;
+    path.assign(reinterpret_cast<const char*>(payload.data() + 7u * sizeof(u64)),
+                static_cast<std::size_t>(length));
+    if (path.front() != '/' || path.find('\0') != std::string::npos) return false;
+    expected.st_dev = static_cast<dev_t>(dev);
+    expected.st_ino = static_cast<ino_t>(ino);
+    expected.st_mode = static_cast<mode_t>(mode);
+    expected.st_uid = static_cast<uid_t>(uid);
+    expected.st_gid = static_cast<gid_t>(gid);
+    return S_ISREG(expected.st_mode) && (expected.st_mode & 0111) != 0 &&
+           (expected.st_mode & 0022) == 0;
+}
+
+static std::vector<unsigned char> encode_exact_report(const ExactRutReport& report) {
+    const std::array<u64, kExactReportFields> fields{
+        report.child_pid,      report.child_start,
+        report.child_ppid,     report.child_pgid,
+        report.child_sid,      report.child_uid,
+        report.child_gid,      report.child_netns,
+        report.child_exe_dev,  report.child_exe_ino,
+        report.pidfd,          report.pidfd_cloexec,
+        report.listener_inode, report.source_dev,
+        report.source_ino,     report.log_dev,
+        report.log_ino,        report.target_fd_count,
+        report.response_bytes, report.response_exact,
+        report.prompt_eof,     report.guard_connect_error,
+        report.stable,         report.backend,
+    };
+    std::vector<unsigned char> payload;
+    payload.reserve(fields.size() * sizeof(u64));
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool decode_exact_report(const std::vector<unsigned char>& payload, ExactRutReport& report) {
+    report = {};
+    if (payload.size() != kExactReportFields * sizeof(u64)) return false;
+    std::array<u64, kExactReportFields> fields{};
+    for (std::size_t i = 0u; i < kExactReportFields; ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],
+              fields[6],  fields[7],  fields[8],  fields[9],  fields[10], fields[11],
+              fields[12], fields[13], fields[14], fields[15], fields[16], fields[17],
+              fields[18], fields[19], fields[20], fields[21], fields[22], fields[23]};
+    return true;
+}
+
+static std::vector<unsigned char> encode_exact_cleaned(const ExactRutCleanedReport& report) {
+    const std::array<u64, kExactCleanedFields> fields{
+        report.child_pid,
+        report.child_start,
+        report.listener_inode,
+        report.clean_exit,
+        report.pidfd_invalidated,
+        report.child_absent,
+        report.listener_absent,
+        report.temps_absent,
+        report.target_fd_count,
+        report.guard_connect_error,
+    };
+    std::vector<unsigned char> payload;
+    payload.reserve(fields.size() * sizeof(u64));
+    for (u64 field : fields) append_u64(payload, field);
+    return payload;
+}
+
+static bool decode_exact_cleaned(const std::vector<unsigned char>& payload,
+                                 ExactRutCleanedReport& report) {
+    report = {};
+    if (payload.size() != kExactCleanedFields * sizeof(u64)) return false;
+    std::array<u64, kExactCleanedFields> fields{};
+    for (std::size_t i = 0u; i < kExactCleanedFields; ++i)
+        fields[i] = read_u64(payload.data() + i * sizeof(u64));
+    report = {fields[0],
+              fields[1],
+              fields[2],
+              fields[3],
+              fields[4],
+              fields[5],
+              fields[6],
+              fields[7],
+              fields[8],
+              fields[9]};
+    return true;
 }
 
 static std::vector<unsigned char> guard_request_payload(u32 positive_ipv4, u32 guard_ipv4) {
@@ -1517,6 +1697,590 @@ static OwnedWaitResult wait_owned_child_bounded(pid_t child,
     return lease_revoked ? OwnedWaitResult::LeaseLost : OwnedWaitResult::Exited;
 }
 
+struct ExactChildState {
+    pid_t pid = -1;
+    int pidfd = -1;
+    ProcIdentity identity;
+    struct stat executable_status{};
+    std::string executable;
+    std::string argv;
+    std::string source_path;
+    std::string log_path;
+    struct stat source_status{};
+    struct stat log_status{};
+    u64 listener_inode = 0u;
+};
+
+static bool write_all_fd(int fd, const std::string& contents) {
+    std::size_t offset = 0u;
+    while (offset < contents.size()) {
+        const ssize_t count = write(fd, contents.data() + offset, contents.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<std::size_t>(count);
+    }
+    return true;
+}
+
+static bool read_process_tcp_table(pid_t pid, privileged_listener::ProcTcpTable& table) {
+    std::string contents;
+    privileged_listener::Diagnostic diagnostic;
+    return pid > 1 &&
+           read_file("/proc/" + std::to_string(pid) + "/net/tcp",
+                     contents,
+                     privileged_listener::kMaxProcBytes) &&
+           privileged_listener::parse_proc_net_tcp(contents, table, diagnostic);
+}
+
+static bool process_socket_inodes(pid_t pid, std::vector<u64>& inodes) {
+    inodes.clear();
+    if (pid <= 1) return false;
+    const std::string directory_path = "/proc/" + std::to_string(pid) + "/fd";
+    const int directory_fd = open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) return false;
+    DIR* directory = fdopendir(directory_fd);
+    if (directory == nullptr) {
+        close(directory_fd);
+        return false;
+    }
+    bool ok = true;
+    while (dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        errno = 0;
+        const long fd = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0') continue;
+        if (errno != 0 || fd < 0 || fd > std::numeric_limits<int>::max()) {
+            ok = false;
+            break;
+        }
+        std::array<char, 64> link{};
+        const ssize_t length =
+            readlinkat(directory_fd, entry->d_name, link.data(), link.size() - 1u);
+        if (length <= 9 || static_cast<std::size_t>(length) >= link.size()) continue;
+        link[static_cast<std::size_t>(length)] = '\0';
+        const std::string value(link.data(), static_cast<std::size_t>(length));
+        if (value.rfind("socket:[", 0u) != 0u || value.back() != ']') continue;
+        u64 inode = 0u;
+        const std::string inode_text = value.substr(8u, value.size() - 9u);
+        if (!parse_u64(inode_text.c_str(), inode) || inode == 0u ||
+            inodes.size() >= privileged_listener::kMaxOwnedSocketInodes) {
+            ok = false;
+            break;
+        }
+        inodes.push_back(inode);
+    }
+    if (closedir(directory) != 0) ok = false;
+    std::sort(inodes.begin(), inodes.end());
+    if (std::adjacent_find(inodes.begin(), inodes.end()) != inodes.end()) ok = false;
+    return ok;
+}
+
+static bool pidfd_link_matches(pid_t owner, int fd) {
+    if (owner <= 1 || fd < 0) return false;
+    const std::string path = "/proc/" + std::to_string(owner) + "/fd/" + std::to_string(fd);
+    std::array<char, 64> link{};
+    const ssize_t length = readlink(path.c_str(), link.data(), link.size() - 1u);
+    if (length <= 0 || static_cast<std::size_t>(length) >= link.size()) return false;
+    return std::string(link.data(), static_cast<std::size_t>(length)) == "anon_inode:[pidfd]";
+}
+
+static bool exact_log_ready(const std::string& log,
+                            const std::string& source_path,
+                            u16 port,
+                            u64& backend) {
+    backend = 0u;
+    if (log.empty() || log.size() > privileged_listener::kMaxCollisionLogBytes ||
+        log.find('\0') != std::string::npos)
+        return false;
+    const std::string loaded = "Loaded program: " + source_path + " (opt O2)\n";
+    const std::string listening =
+        "Listening on port " + std::to_string(port) + " with 1 shard(s)\n";
+    const auto occurrences = [&](const std::string& needle) {
+        std::size_t count = 0u, offset = 0u;
+        while ((offset = log.find(needle, offset)) != std::string::npos) {
+            count++;
+            offset += needle.size();
+        }
+        return count;
+    };
+    const std::size_t epoll = occurrences("Backend: epoll\n");
+    const std::size_t io_uring = occurrences("Backend: io_uring\n");
+    if (epoll + io_uring != 1u || occurrences(loaded) != 1u || occurrences(listening) != 1u ||
+        log.find("Backend: io_uring TLS") != std::string::npos ||
+        log.find("Failed") != std::string::npos)
+        return false;
+    const std::size_t loaded_at = log.find(loaded);
+    const std::size_t backend_at =
+        log.find(epoll == 1u ? "Backend: epoll\n" : "Backend: io_uring\n");
+    const std::size_t listening_at = log.find(listening);
+    if (!(loaded_at < backend_at && backend_at < listening_at)) return false;
+    backend = epoll == 1u ? 1u : 2u;
+    return true;
+}
+
+static bool exact_http_exchange(u32 ipv4,
+                                u16 port,
+                                std::chrono::steady_clock::time_point deadline,
+                                ExactRutReport& report) {
+    static constexpr char request[] =
+        "GET / HTTP/1.1\r\nHost: exact-listener.invalid\r\nConnection: close\r\n\r\n";
+    static constexpr char expected[] =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    static_assert(sizeof(expected) - 1u == 65u);
+    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (client < 0) return false;
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    endpoint.sin_addr.s_addr = htonl(ipv4);
+    int rc = connect(client, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint));
+    if (rc < 0 && errno == EINPROGRESS) {
+        if (!wait_fd(client, POLLOUT, deadline)) {
+            close(client);
+            return false;
+        }
+        int socket_error = 0;
+        socklen_t size = sizeof(socket_error);
+        if (getsockopt(client, SOL_SOCKET, SO_ERROR, &socket_error, &size) != 0 ||
+            socket_error != 0) {
+            close(client);
+            return false;
+        }
+    } else if (rc < 0) {
+        close(client);
+        return false;
+    }
+    std::size_t sent = 0u;
+    while (sent < sizeof(request) - 1u) {
+        if (!wait_fd(client, POLLOUT, deadline)) {
+            close(client);
+            return false;
+        }
+        const ssize_t count =
+            send(client, request + sent, sizeof(request) - 1u - sent, MSG_NOSIGNAL);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count <= 0) {
+            close(client);
+            return false;
+        }
+        sent += static_cast<std::size_t>(count);
+    }
+    std::string response;
+    response.reserve(sizeof(expected));
+    bool eof = false;
+    while (response.size() <= sizeof(expected) - 1u) {
+        if (!wait_fd(client, POLLIN | POLLHUP, deadline)) break;
+        std::array<char, 128> bytes{};
+        const ssize_t count = recv(client, bytes.data(), bytes.size(), 0);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count < 0) break;
+        if (count == 0) {
+            eof = true;
+            break;
+        }
+        response.append(bytes.data(), static_cast<std::size_t>(count));
+    }
+    linger reset_after_eof{1, 0};
+    const bool reset_configured =
+        eof &&
+        setsockopt(client, SOL_SOCKET, SO_LINGER, &reset_after_eof, sizeof(reset_after_eof)) == 0;
+    close(client);
+    report.response_bytes = response.size();
+    report.response_exact = response == std::string(expected, sizeof(expected) - 1u) ? 1u : 0u;
+    report.prompt_eof = eof ? 1u : 0u;
+    return report.response_exact == 1u && report.prompt_eof == 1u && reset_configured;
+}
+
+static bool connect_refused_until(u32 ipv4,
+                                  u16 port,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  int& connect_error) {
+    connect_error = 0;
+    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (client < 0) return false;
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    endpoint.sin_addr.s_addr = htonl(ipv4);
+    int result = connect(client, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint));
+    if (result == 0) {
+        close(client);
+        return false;
+    }
+    connect_error = errno;
+    if (connect_error == EINPROGRESS) {
+        if (!wait_fd(client, POLLOUT, deadline)) {
+            close(client);
+            return false;
+        }
+        socklen_t size = sizeof(connect_error);
+        if (getsockopt(client, SOL_SOCKET, SO_ERROR, &connect_error, &size) != 0 ||
+            size != sizeof(connect_error)) {
+            close(client);
+            return false;
+        }
+    }
+    close(client);
+    return connect_error == ECONNREFUSED;
+}
+
+static bool exact_child_identity(const ExactChildState& child,
+                                 const struct stat& executable,
+                                 ino_t netns,
+                                 ProcIdentity& current) {
+    return child.pid > 1 && read_proc(child.pid, current) && current.pid == child.pid &&
+           current.ppid == getpid() && current.pgid == child.pid && current.sid == getsid(0) &&
+           current.uid == getuid() && current.gid == getgid() &&
+           current.supplementary_groups == 0 && current.no_new_privs &&
+           current.capabilities_clear && current.netns == netns &&
+           current.exe_dev == executable.st_dev && current.exe_ino == executable.st_ino &&
+           current.exe == child.executable && current.cmdline == child.argv;
+}
+
+static bool unlink_regular_at_if_identity(int directory_fd,
+                                          const char* name,
+                                          const struct stat& expected) {
+    struct stat current{};
+    return directory_fd >= 0 && expected.st_ino != 0u &&
+           fstatat(directory_fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+           current.st_dev == expected.st_dev && current.st_ino == expected.st_ino &&
+           S_ISREG(current.st_mode) && unlinkat(directory_fd, name, 0) == 0;
+}
+
+static bool cleanup_exact_child(ExactChildState& child,
+                                int directory_fd,
+                                const GuardReport& held,
+                                int guard_fd,
+                                ExactRutCleanedReport* cleaned,
+                                bool require_clean_exit) {
+    bool identity_ok = false;
+    ProcIdentity current;
+    const struct stat& executable = child.executable_status;
+    if (executable.st_ino != 0u)
+        identity_ok = exact_child_identity(child, executable, held.netns, current) &&
+                      same_process_identity(current, child.identity);
+    int status = 0;
+    bool reaped = false;
+    if (identity_ok && child.pidfd >= 0) {
+#ifdef SYS_pidfd_send_signal
+        if (syscall(SYS_pidfd_send_signal, child.pidfd, SIGTERM, nullptr, 0) == 0) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t waited = waitpid(child.pid, &status, WNOHANG);
+                if (waited == child.pid) {
+                    reaped = true;
+                    break;
+                }
+                if (waited < 0 && errno != EINTR) break;
+                (void)poll(nullptr, 0, 10);
+            }
+        }
+#endif
+    }
+    const bool clean_exit = reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!reaped && identity_ok) {
+        ProcIdentity revalidated;
+        if (exact_child_identity(child, executable, held.netns, revalidated) &&
+            same_process_identity(revalidated, child.identity)) {
+#ifdef SYS_pidfd_send_signal
+            (void)syscall(SYS_pidfd_send_signal, child.pidfd, SIGKILL, nullptr, 0);
+#endif
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t waited = waitpid(child.pid, &status, WNOHANG);
+                if (waited == child.pid) {
+                    reaped = true;
+                    break;
+                }
+                if (waited < 0 && errno != EINTR) break;
+                (void)poll(nullptr, 0, 10);
+            }
+        }
+    }
+    bool pidfd_invalidated = false;
+    if (child.pidfd >= 0) {
+        const int old = child.pidfd;
+        close(child.pidfd);
+        child.pidfd = -1;
+        errno = 0;
+        pidfd_invalidated = fcntl(old, F_GETFD) < 0 && errno == EBADF;
+    }
+    const bool source_removed =
+        unlink_regular_at_if_identity(directory_fd, "exact-listener.rut", child.source_status);
+    const bool log_removed =
+        unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+    if (directory_fd >= 0) close(directory_fd);
+    privileged_listener::ProcTcpTable table;
+    u64 fd_count = 0u;
+    int guard_error = 0;
+    bool listener_absent = true;
+    if (held.plan.port != 0u && read_process_tcp_table(getpid(), table)) {
+        listener_absent = exact_listener_absent(table, held.plan, child.listener_inode);
+    }
+    const bool child_absent = !process_alive(child.pid);
+    const bool guard_ok = target_socket_inode(getpid(), guard_fd, held.socket_inode) &&
+                          bounded_connect_refused(
+                              held.plan.guard_ipv4, static_cast<u16>(held.plan.port), guard_error);
+    const bool fd_ok = count_open_fds(fd_count) && fd_count == held.current_fd_count;
+    if (cleaned != nullptr) {
+        cleaned->child_pid = child.pid;
+        cleaned->child_start = child.identity.start;
+        cleaned->listener_inode = child.listener_inode;
+        cleaned->clean_exit = clean_exit ? 1u : 0u;
+        cleaned->pidfd_invalidated = pidfd_invalidated ? 1u : 0u;
+        cleaned->child_absent = child_absent ? 1u : 0u;
+        cleaned->listener_absent = listener_absent ? 1u : 0u;
+        cleaned->temps_absent = source_removed && log_removed ? 1u : 0u;
+        cleaned->target_fd_count = fd_count;
+        cleaned->guard_connect_error = guard_error;
+    }
+    return reaped && (!require_clean_exit || clean_exit) && pidfd_invalidated && child_absent &&
+           listener_absent && source_removed && log_removed && guard_ok && fd_ok;
+}
+
+static bool start_exact_child(const Frame& command,
+                              const char* control_path,
+                              int guard_fd,
+                              const GuardReport& held,
+                              ExactChildState& child,
+                              ExactRutReport& report) {
+    report = {};
+    std::string executable;
+    struct stat expected_executable{};
+    if (!parse_executable_lease(command.payload, executable, expected_executable) ||
+        expected_executable.st_uid != getuid() || expected_executable.st_gid != getgid())
+        return false;
+    std::array<char, PATH_MAX> canonical_executable{};
+    if (realpath(executable.c_str(), canonical_executable.data()) == nullptr ||
+        executable != canonical_executable.data())
+        return false;
+#ifdef O_PATH
+    const int executable_fd = open(executable.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
+#else
+    const int executable_fd = -1;
+#endif
+    struct stat pinned{}, path_status{};
+    if (executable_fd < 0 || fstat(executable_fd, &pinned) != 0 ||
+        lstat(executable.c_str(), &path_status) != 0 ||
+        pinned.st_dev != expected_executable.st_dev ||
+        pinned.st_ino != expected_executable.st_ino ||
+        pinned.st_mode != expected_executable.st_mode ||
+        pinned.st_uid != expected_executable.st_uid ||
+        pinned.st_gid != expected_executable.st_gid || path_status.st_dev != pinned.st_dev ||
+        path_status.st_ino != pinned.st_ino) {
+        if (executable_fd >= 0) close(executable_fd);
+        return false;
+    }
+    const std::string control(control_path);
+    const std::size_t slash = control.rfind('/');
+    if (slash == std::string::npos || slash == 0u) {
+        close(executable_fd);
+        return false;
+    }
+    const std::string directory_path = control.substr(0u, slash);
+    const int directory_fd =
+        open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat directory_status{};
+    if (directory_fd < 0 || fstat(directory_fd, &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode) || directory_status.st_uid != getuid() ||
+        directory_status.st_gid != getgid() || (directory_status.st_mode & 0777) != 0700) {
+        if (directory_fd >= 0) close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    std::string source;
+    privileged_listener::Diagnostic source_diagnostic;
+    if (!privileged_listener::build_listener_source(
+            held.plan, privileged_listener::ListenerSourceKind::Exact, source, source_diagnostic)) {
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    const int source_fd = openat(directory_fd,
+                                 "exact-listener.rut",
+                                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                                 0600);
+    const int log_fd = openat(directory_fd,
+                              "exact-listener.log",
+                              O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                              0600);
+    child.source_path = directory_path + "/exact-listener.rut";
+    child.log_path = directory_path + "/exact-listener.log";
+    const bool source_identity = source_fd >= 0 && fstat(source_fd, &child.source_status) == 0;
+    const bool log_identity = log_fd >= 0 && fstat(log_fd, &child.log_status) == 0;
+    if (!source_identity || !log_identity || !write_all_fd(source_fd, source) ||
+        fsync(source_fd) != 0 || !S_ISREG(child.source_status.st_mode) ||
+        !S_ISREG(child.log_status.st_mode) || (child.source_status.st_mode & 0777) != 0600 ||
+        (child.log_status.st_mode & 0777) != 0600) {
+        if (source_fd >= 0) close(source_fd);
+        if (log_fd >= 0) close(log_fd);
+        (void)unlink_regular_at_if_identity(
+            directory_fd, "exact-listener.rut", child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    close(source_fd);
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (setpgid(0, 0) != 0 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent ||
+            dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+            _exit(125);
+        const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(125);
+#ifdef SYS_close_range
+        if ((executable_fd > 3 &&
+             syscall(SYS_close_range, 3u, static_cast<unsigned>(executable_fd - 1), 0u) != 0) ||
+            syscall(SYS_close_range,
+                    static_cast<unsigned>(executable_fd + 1),
+                    std::numeric_limits<unsigned>::max(),
+                    0u) != 0)
+            _exit(125);
+#else
+        const long limit = sysconf(_SC_OPEN_MAX);
+        if (limit <= 0 || limit > std::numeric_limits<int>::max()) _exit(125);
+        for (int fd = 3; fd < limit; ++fd)
+            if (fd != executable_fd) close(fd);
+#endif
+        std::array<char*, 10> argv{
+            const_cast<char*>(executable.c_str()),
+            const_cast<char*>(child.source_path.c_str()),
+            const_cast<char*>("--shards"),
+            const_cast<char*>("1"),
+            const_cast<char*>("--no-pin"),
+            const_cast<char*>("--drain"),
+            const_cast<char*>("0"),
+            const_cast<char*>("--opt"),
+            const_cast<char*>("2"),
+            nullptr,
+        };
+#ifdef SYS_execveat
+        syscall(SYS_execveat, executable_fd, "", argv.data(), environ, AT_EMPTY_PATH);
+#endif
+        _exit(126);
+    }
+    close(log_fd);
+    if (pid <= 1) {
+        (void)unlink_regular_at_if_identity(
+            directory_fd, "exact-listener.rut", child.source_status);
+        (void)unlink_regular_at_if_identity(directory_fd, "exact-listener.log", child.log_status);
+        close(directory_fd);
+        close(executable_fd);
+        return false;
+    }
+    (void)setpgid(pid, pid);
+    child.pid = pid;
+    child.executable = executable;
+    child.executable_status = pinned;
+    child.argv = exact_argv(
+        {executable, child.source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"});
+#ifdef SYS_pidfd_open
+    child.pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+#endif
+    bool ready = child.pidfd >= 0 && (fcntl(child.pidfd, F_GETFD) & FD_CLOEXEC) != 0;
+    u64 backend = 0u;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs);
+    while (ready && std::chrono::steady_clock::now() < deadline) {
+        ProcIdentity identity;
+        privileged_listener::ProcTcpTable table;
+        std::vector<u64> inodes;
+        privileged_listener::ListenerEvidence evidence;
+        privileged_listener::Diagnostic diagnostic;
+        std::string log;
+        const bool identity_ready = exact_child_identity(child, pinned, held.netns, identity);
+        if (identity_ready) child.identity = identity;
+        if (identity_ready && read_process_tcp_table(pid, table) &&
+            process_socket_inodes(pid, inodes) &&
+            privileged_listener::classify_listener_evidence(
+                table,
+                held.plan,
+                inodes,
+                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                evidence,
+                diagnostic) &&
+            read_file(child.log_path, log, privileged_listener::kMaxCollisionLogBytes) &&
+            exact_log_ready(log, child.source_path, static_cast<u16>(held.plan.port), backend)) {
+            child.listener_inode = evidence.child_owned_inode;
+            break;
+        }
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            child.pid = -1;
+            ready = false;
+            break;
+        }
+        (void)poll(nullptr, 0, 10);
+    }
+    close(executable_fd);
+    if (!ready || child.identity.pid != pid || child.listener_inode == 0u ||
+        !exact_http_exchange(
+            held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
+        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        return false;
+    }
+    int guard_error = 0;
+    if (!connect_refused_until(
+            held.plan.guard_ipv4, static_cast<u16>(held.plan.port), deadline, guard_error)) {
+        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        return false;
+    }
+    if (std::chrono::steady_clock::now() + std::chrono::milliseconds(500) > deadline) {
+        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        return false;
+    }
+    (void)poll(nullptr, 0, 500);
+    ProcIdentity stable;
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> inodes;
+    privileged_listener::ListenerEvidence evidence;
+    privileged_listener::Diagnostic diagnostic;
+    u64 fd_count = 0u;
+    if (!exact_child_identity(child, pinned, held.netns, stable) ||
+        !same_process_identity(stable, child.identity) || !read_process_tcp_table(pid, table) ||
+        !process_socket_inodes(pid, inodes) ||
+        !privileged_listener::classify_listener_evidence(
+            table,
+            held.plan,
+            inodes,
+            privileged_listener::ListenerEvidenceKind::ExactPositive,
+            evidence,
+            diagnostic) ||
+        evidence.child_owned_inode != child.listener_inode ||
+        !target_socket_inode(getpid(), guard_fd, held.socket_inode) || !count_open_fds(fd_count) ||
+        fd_count != held.current_fd_count + 1u || !pidfd_link_matches(getpid(), child.pidfd)) {
+        (void)cleanup_exact_child(child, directory_fd, held, guard_fd, nullptr, false);
+        return false;
+    }
+    report.child_pid = pid;
+    report.child_start = child.identity.start;
+    report.child_ppid = child.identity.ppid;
+    report.child_pgid = child.identity.pgid;
+    report.child_sid = child.identity.sid;
+    report.child_uid = child.identity.uid;
+    report.child_gid = child.identity.gid;
+    report.child_netns = child.identity.netns;
+    report.child_exe_dev = child.identity.exe_dev;
+    report.child_exe_ino = child.identity.exe_ino;
+    report.pidfd = child.pidfd;
+    report.pidfd_cloexec = 1u;
+    report.listener_inode = child.listener_inode;
+    report.source_dev = child.source_status.st_dev;
+    report.source_ino = child.source_status.st_ino;
+    report.log_dev = child.log_status.st_dev;
+    report.log_ino = child.log_status.st_ino;
+    report.target_fd_count = fd_count;
+    report.guard_connect_error = guard_error;
+    report.stable = 1u;
+    report.backend = backend;
+    close(directory_fd);
+    return true;
+}
+
 static int secured_target_main(const char* control_path,
                                const char* token_string,
                                const char* broker_text,
@@ -1587,6 +2351,54 @@ static int secured_target_main(const char* control_path,
                 close(guard_fd);
                 close(control);
                 return 48;
+            }
+            Frame exact_run;
+            ExactChildState exact_child;
+            ExactRutReport exact_report;
+            if (!receive_frame(control, exact_run, kListenerDeadlineMs) ||
+                exact_run.type != kExactRutRun || !token_equal(exact_run.token, token) ||
+                !start_exact_child(
+                    exact_run, control_path, guard_fd, held, exact_child, exact_report)) {
+                close(guard_fd);
+                close(control);
+                return 53;
+            }
+            if (!send_frame(control,
+                            Frame{kExactRutWitness, token, encode_exact_report(exact_report)},
+                            kHandshakeMs)) {
+                const std::string control_string(control_path);
+                const std::string directory_path =
+                    control_string.substr(0u, control_string.rfind('/'));
+                const int directory_fd =
+                    open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+                (void)cleanup_exact_child(
+                    exact_child, directory_fd, held, guard_fd, nullptr, false);
+                close(guard_fd);
+                close(control);
+                return 53;
+            }
+            Frame exact_cleanup;
+            const std::string control_string(control_path);
+            const std::size_t slash = control_string.rfind('/');
+            const std::string directory_path =
+                slash == std::string::npos ? std::string() : control_string.substr(0u, slash);
+            const int directory_fd =
+                directory_path.empty()
+                    ? -1
+                    : open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            ExactRutCleanedReport exact_cleaned;
+            const bool cleanup_command =
+                receive_frame(control, exact_cleanup, kListenerDeadlineMs) &&
+                exact_request(exact_cleanup, kExactRutCleanup, token);
+            const bool cleanup_ok = cleanup_exact_child(
+                exact_child, directory_fd, held, guard_fd, &exact_cleaned, cleanup_command);
+            if (!cleanup_command || !cleanup_ok ||
+                !send_frame(control,
+                            Frame{kExactRutCleaned, token, encode_exact_cleaned(exact_cleaned)},
+                            kHandshakeMs)) {
+                close(guard_fd);
+                close(control);
+                return 54;
             }
             Frame release;
             if (!receive_frame(control, release, kBrokerDeadlineMs) ||
@@ -5322,6 +6134,234 @@ static bool observe_guard_released(const ProcIdentity& target,
     }
 }
 
+static bool exact_listener_absent(const privileged_listener::ProcTcpTable& table,
+                                  const privileged_listener::ListenerPlan& plan,
+                                  u64 listener_inode) {
+    for (std::size_t i = 0u; i < table.count; ++i) {
+        const auto& row = table.rows[i];
+        if (row.state == 0x0au && row.local_ipv4 == plan.positive_ipv4 &&
+            row.local_port == plan.port)
+            return false;
+        if (listener_inode != 0u && row.inode == listener_inode) return false;
+    }
+    return true;
+}
+
+static bool regular_temp_identity(const std::string& path, u64 dev, u64 ino) {
+    struct stat status{};
+    return dev != 0u && ino != 0u && lstat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) &&
+           (status.st_mode & 0777) == 0600 && status.st_uid == getuid() &&
+           status.st_gid == getgid() && static_cast<u64>(status.st_dev) == dev &&
+           static_cast<u64>(status.st_ino) == ino;
+}
+
+static bool validate_exact_witness(const ExactRutReport& report,
+                                   const ExecutableLease& lease,
+                                   const ParentEndpoint& endpoint,
+                                   const ProcIdentity& target,
+                                   const GuardReport& held,
+                                   ProcIdentity& child_identity,
+                                   std::string& error) {
+    const std::string source_path = endpoint.directory + "/exact-listener.rut";
+    const std::string log_path = endpoint.directory + "/exact-listener.log";
+    const std::string expected_argv = exact_argv(
+        {lease.path, source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"});
+    if (report.child_pid <= 1u ||
+        report.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
+        report.child_ppid != static_cast<u64>(target.pid) ||
+        report.child_pgid != report.child_pid || report.child_sid != static_cast<u64>(target.sid) ||
+        report.child_uid != getuid() || report.child_gid != getgid() ||
+        report.child_netns != target.netns || report.child_exe_dev != lease.status.st_dev ||
+        report.child_exe_ino != lease.status.st_ino ||
+        report.pidfd > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        report.pidfd_cloexec != 1u || report.listener_inode == 0u ||
+        report.target_fd_count != held.current_fd_count + 1u || report.response_bytes != 65u ||
+        report.response_exact != 1u || report.prompt_eof != 1u ||
+        report.guard_connect_error != ECONNREFUSED || report.stable != 1u ||
+        (report.backend != 1u && report.backend != 2u) || !executable_lease_unchanged(lease)) {
+        error = "exact RUT witness scalar/executable evidence was invalid";
+        return false;
+    }
+    const pid_t child = static_cast<pid_t>(report.child_pid);
+    if (!read_proc(child, child_identity) || child_identity.start != report.child_start ||
+        child_identity.ppid != target.pid || child_identity.pgid != child ||
+        child_identity.sid != target.sid || child_identity.uid != getuid() ||
+        child_identity.gid != getgid() || child_identity.supplementary_groups != 0 ||
+        !child_identity.no_new_privs || !child_identity.capabilities_clear ||
+        child_identity.netns != target.netns || child_identity.exe_dev != lease.status.st_dev ||
+        child_identity.exe_ino != lease.status.st_ino || child_identity.exe != lease.path ||
+        child_identity.cmdline != expected_argv ||
+        !pidfd_link_matches(target.pid, static_cast<int>(report.pidfd)) ||
+        !target_socket_inode(target.pid, static_cast<int>(held.guard_fd), held.socket_inode)) {
+        error = "parent exact RUT child/pidfd/guard identity proof failed";
+        return false;
+    }
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> inodes;
+    privileged_listener::ListenerEvidence evidence;
+    privileged_listener::Diagnostic diagnostic;
+    if (!read_process_tcp_table(child, table) || !process_socket_inodes(child, inodes) ||
+        !privileged_listener::classify_listener_evidence(
+            table,
+            held.plan,
+            inodes,
+            privileged_listener::ListenerEvidenceKind::ExactPositive,
+            evidence,
+            diagnostic) ||
+        evidence.child_owned_inode != report.listener_inode) {
+        error = "parent exact positive listener inode/table ownership proof failed";
+        return false;
+    }
+    std::string source, log;
+    u64 backend = 0u;
+    privileged_listener::Diagnostic source_diagnostic;
+    std::string expected_source;
+    u64 target_fds = 0u;
+    if (!regular_temp_identity(source_path, report.source_dev, report.source_ino) ||
+        !regular_temp_identity(log_path, report.log_dev, report.log_ino) ||
+        !read_file(source_path, source, 4096u) ||
+        !privileged_listener::build_listener_source(held.plan,
+                                                    privileged_listener::ListenerSourceKind::Exact,
+                                                    expected_source,
+                                                    source_diagnostic) ||
+        source != expected_source ||
+        !read_file(log_path, log, privileged_listener::kMaxCollisionLogBytes) ||
+        !exact_log_ready(log, source_path, static_cast<u16>(held.plan.port), backend) ||
+        backend != report.backend || !count_target_fds(target.pid, target_fds) ||
+        target_fds != report.target_fd_count) {
+        error = "parent exact source/log/backend/temp/FD evidence failed";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_exact_cleaned_report(const ExactRutCleanedReport& report,
+                                          const ExactRutReport& live,
+                                          const ProcIdentity& child,
+                                          const ParentEndpoint& endpoint,
+                                          const ProcIdentity& target,
+                                          const GuardReport& held,
+                                          std::string& error) {
+    if (report.child_pid != live.child_pid || report.child_start != live.child_start ||
+        report.listener_inode != live.listener_inode || report.clean_exit != 1u ||
+        report.pidfd_invalidated != 1u || report.child_absent != 1u ||
+        report.listener_absent != 1u || report.temps_absent != 1u ||
+        report.target_fd_count != held.current_fd_count ||
+        report.guard_connect_error != ECONNREFUSED || !target_gone_or_reused(child) ||
+        !target_fd_absent(target.pid, static_cast<int>(live.pidfd)) ||
+        !target_socket_inode(target.pid, static_cast<int>(held.guard_fd), held.socket_inode)) {
+        error = "parent exact cleanup scalar/process/pidfd/guard evidence failed";
+        return false;
+    }
+    struct stat ignored{};
+    errno = 0;
+    const bool source_absent =
+        lstat((endpoint.directory + "/exact-listener.rut").c_str(), &ignored) < 0 &&
+        errno == ENOENT;
+    errno = 0;
+    const bool log_absent =
+        lstat((endpoint.directory + "/exact-listener.log").c_str(), &ignored) < 0 &&
+        errno == ENOENT;
+    privileged_listener::ProcTcpTable table;
+    u64 target_fds = 0u;
+    if (!source_absent || !log_absent || !read_process_tcp_table(target.pid, table) ||
+        !exact_listener_absent(table, held.plan, live.listener_inode) ||
+        !count_target_fds(target.pid, target_fds) || target_fds != held.current_fd_count) {
+        error = "parent exact listener/temp/FD cleanup evidence failed";
+        return false;
+    }
+    return true;
+}
+
+static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
+                                              const ExecutableLease& lease,
+                                              const ParentEndpoint& endpoint,
+                                              const ProcIdentity& target,
+                                              const GuardReport& held) {
+    const auto rejects = [&](ExactRutReport mutation) {
+        ProcIdentity ignored_identity;
+        std::string ignored_error;
+        return !validate_exact_witness(
+            mutation, lease, endpoint, target, held, ignored_identity, ignored_error);
+    };
+    ExactRutReport mutation = canonical;
+    mutation.child_start++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.child_ppid++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.child_pgid++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.child_exe_ino++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.pidfd++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.listener_inode++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.source_ino++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.log_ino++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.response_bytes--;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.response_exact = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.prompt_eof = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.guard_connect_error = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.stable = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.backend = 0u;
+    return rejects(mutation);
+}
+
+static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canonical,
+                                              const ExactRutReport& live,
+                                              const ProcIdentity& child,
+                                              const ParentEndpoint& endpoint,
+                                              const ProcIdentity& target,
+                                              const GuardReport& held) {
+    const auto rejects = [&](ExactRutCleanedReport mutation) {
+        std::string ignored_error;
+        return !validate_exact_cleaned_report(
+            mutation, live, child, endpoint, target, held, ignored_error);
+    };
+    ExactRutCleanedReport mutation = canonical;
+    mutation.clean_exit = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.pidfd_invalidated = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.child_absent = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.listener_absent = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.temps_absent = 0u;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.target_fd_count++;
+    if (!rejects(mutation)) return false;
+    mutation = canonical;
+    mutation.guard_connect_error = 0u;
+    return rejects(mutation);
+}
+
 static bool guard_protocol_self_check(std::string& error) {
     constexpr u32 positive = 0x0a010203u;
     constexpr u32 guard = 0x0a010204u;
@@ -5329,7 +6369,8 @@ static bool guard_protocol_self_check(std::string& error) {
     std::vector<unsigned char> request = guard_request_payload(positive, guard);
     if (kGuardReserve != 35u || kGuardHeld != 36u || kGuardRelease != 37u ||
         kGuardReleased != 38u || kGuardFinish != 39u || kGuardFinished != 40u ||
-        !parse_guard_request(request, decoded_positive, decoded_guard) ||
+        kExactRutRun != 41u || kExactRutWitness != 42u || kExactRutCleanup != 43u ||
+        kExactRutCleaned != 44u || !parse_guard_request(request, decoded_positive, decoded_guard) ||
         decoded_positive != positive || decoded_guard != guard) {
         error = "private guard frame/request codec self-check failed";
         return false;
@@ -5405,12 +6446,86 @@ static bool guard_protocol_self_check(std::string& error) {
         error = "unknown guard report version was accepted";
         return false;
     }
+    ExecutableLease lease;
+    lease.path = "/tmp/build/rut";
+    lease.status.st_dev = 11;
+    lease.status.st_ino = 12;
+    lease.status.st_mode = S_IFREG | 0755;
+    lease.status.st_uid = 1000;
+    lease.status.st_gid = 1000;
+    std::string decoded_path;
+    struct stat decoded_status{};
+    std::vector<unsigned char> lease_payload = executable_lease_payload(lease);
+    if (!parse_executable_lease(lease_payload, decoded_path, decoded_status) ||
+        decoded_path != lease.path || decoded_status.st_dev != lease.status.st_dev ||
+        decoded_status.st_ino != lease.status.st_ino ||
+        decoded_status.st_mode != lease.status.st_mode || decoded_status.st_uid != 1000u ||
+        decoded_status.st_gid != 1000u) {
+        error = "canonical exact executable lease codec failed";
+        return false;
+    }
+    lease_payload.pop_back();
+    if (parse_executable_lease(lease_payload, decoded_path, decoded_status)) {
+        error = "truncated exact executable lease was accepted";
+        return false;
+    }
+    lease.status.st_mode = S_IFREG | 0775;
+    if (parse_executable_lease(executable_lease_payload(lease), decoded_path, decoded_status)) {
+        error = "group-writable exact executable lease was accepted";
+        return false;
+    }
+    ExactRutReport live;
+    live.child_pid = 101u;
+    live.child_start = 202u;
+    live.listener_inode = 303u;
+    live.response_bytes = 65u;
+    live.response_exact = 1u;
+    live.prompt_eof = 1u;
+    live.guard_connect_error = ECONNREFUSED;
+    live.stable = 1u;
+    live.backend = 2u;
+    ExactRutReport live_decoded;
+    std::vector<unsigned char> live_payload = encode_exact_report(live);
+    if (!decode_exact_report(live_payload, live_decoded) ||
+        live_decoded.child_pid != live.child_pid ||
+        live_decoded.listener_inode != live.listener_inode || live_decoded.response_bytes != 65u ||
+        live_decoded.backend != 2u) {
+        error = "canonical exact witness codec failed";
+        return false;
+    }
+    live_payload.push_back(0u);
+    if (decode_exact_report(live_payload, live_decoded)) {
+        error = "oversized exact witness was accepted";
+        return false;
+    }
+    ExactRutCleanedReport cleaned;
+    cleaned.child_pid = 101u;
+    cleaned.child_start = 202u;
+    cleaned.listener_inode = 303u;
+    cleaned.clean_exit = cleaned.pidfd_invalidated = cleaned.child_absent = 1u;
+    cleaned.listener_absent = cleaned.temps_absent = 1u;
+    cleaned.target_fd_count = 5u;
+    cleaned.guard_connect_error = ECONNREFUSED;
+    ExactRutCleanedReport cleaned_decoded;
+    std::vector<unsigned char> cleaned_payload = encode_exact_cleaned(cleaned);
+    if (!decode_exact_cleaned(cleaned_payload, cleaned_decoded) ||
+        cleaned_decoded.child_pid != cleaned.child_pid || cleaned_decoded.clean_exit != 1u ||
+        cleaned_decoded.temps_absent != 1u) {
+        error = "canonical exact cleanup codec failed";
+        return false;
+    }
+    cleaned_payload.pop_back();
+    if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
+        error = "truncated exact cleanup was accepted";
+        return false;
+    }
     return true;
 }
 
 static bool run_session(const std::string& sudo_path,
                         const std::string& nsenter_path,
                         const std::string& executable,
+                        const ExecutableLease& rut_executable,
                         const HeldTopologySnapshot& topology,
                         const char* scenario,
                         std::string& error) {
@@ -5881,6 +6996,43 @@ static bool run_session(const std::string& sudo_path,
                 if (error.empty()) error = "held guard report/proc evidence was invalid";
                 break;
             }
+            Frame exact_frame;
+            ExactRutReport exact_report;
+            ProcIdentity exact_child;
+            if (!executable_lease_unchanged(rut_executable) ||
+                !send_frame(target_fd,
+                            Frame{kExactRutRun, token, executable_lease_payload(rut_executable)},
+                            kHandshakeMs) ||
+                !receive_frame(target_fd, exact_frame, kListenerDeadlineMs) ||
+                exact_frame.type != kExactRutWitness || !token_equal(exact_frame.token, token) ||
+                !decode_exact_report(exact_frame.payload, exact_report) ||
+                !validate_exact_witness(exact_report,
+                                        rut_executable,
+                                        endpoint,
+                                        target_proc,
+                                        held,
+                                        exact_child,
+                                        error) ||
+                !exact_witness_mutation_self_check(
+                    exact_report, rut_executable, endpoint, target_proc, held)) {
+                if (error.empty()) error = "exact public-RUT run/witness evidence failed";
+                break;
+            }
+            Frame exact_cleaned_frame;
+            ExactRutCleanedReport exact_cleaned;
+            if (!send_frame(target_fd, Frame{kExactRutCleanup, token, {}}, kHandshakeMs) ||
+                !receive_frame(target_fd, exact_cleaned_frame, kListenerDeadlineMs) ||
+                exact_cleaned_frame.type != kExactRutCleaned ||
+                !token_equal(exact_cleaned_frame.token, token) ||
+                !decode_exact_cleaned(exact_cleaned_frame.payload, exact_cleaned) ||
+                !validate_exact_cleaned_report(
+                    exact_cleaned, exact_report, exact_child, endpoint, target_proc, held, error) ||
+                !exact_cleaned_mutation_self_check(
+                    exact_cleaned, exact_report, exact_child, endpoint, target_proc, held) ||
+                !observe_guard_held(target_proc, plan, held, error)) {
+                if (error.empty()) error = "exact public-RUT cleanup/guard-held evidence failed";
+                break;
+            }
             Frame released_frame;
             GuardReport released;
             if (!send_frame(target_fd, Frame{kGuardRelease, token, {}}, kHandshakeMs) ||
@@ -6063,6 +7215,51 @@ static bool regular_root_owned_executable(const char* path) {
            access(path, X_OK) == 0;
 }
 
+static bool open_canonical_caller_executable(const char* path,
+                                             ExecutableLease& lease,
+                                             std::string& error) {
+    lease.path.clear();
+    lease.status = {};
+    if (lease.fd >= 0) {
+        close(lease.fd);
+        lease.fd = -1;
+    }
+    std::array<char, PATH_MAX> canonical{};
+    if (path == nullptr || path[0] != '/' || realpath(path, canonical.data()) == nullptr ||
+        path != std::string(canonical.data())) {
+        error = "RUT executable path was not canonical absolute";
+        return false;
+    }
+#ifdef O_PATH
+    lease.fd = open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+#else
+    lease.fd = -1;
+    errno = ENOTSUP;
+#endif
+    struct stat path_status{};
+    if (lease.fd < 0 || fstat(lease.fd, &lease.status) != 0 || lstat(path, &path_status) != 0 ||
+        !S_ISREG(lease.status.st_mode) || lease.status.st_uid != getuid() ||
+        lease.status.st_gid != getgid() || (lease.status.st_mode & 0111) == 0 ||
+        (lease.status.st_mode & 0022) != 0 || access(path, X_OK) != 0 ||
+        lease.status.st_dev != path_status.st_dev || lease.status.st_ino != path_status.st_ino) {
+        error = "RUT executable custody or caller-owned mode validation failed";
+        if (lease.fd >= 0) close(lease.fd);
+        lease.fd = -1;
+        return false;
+    }
+    lease.path = canonical.data();
+    return true;
+}
+
+static bool executable_lease_unchanged(const ExecutableLease& lease) {
+    struct stat pinned{}, path{};
+    return lease.fd >= 0 && !lease.path.empty() && fstat(lease.fd, &pinned) == 0 &&
+           lstat(lease.path.c_str(), &path) == 0 && pinned.st_dev == lease.status.st_dev &&
+           pinned.st_ino == lease.status.st_ino && pinned.st_mode == lease.status.st_mode &&
+           pinned.st_uid == lease.status.st_uid && pinned.st_gid == lease.status.st_gid &&
+           path.st_dev == pinned.st_dev && path.st_ino == pinned.st_ino;
+}
+
 static bool run_preflight_command(const std::vector<std::string>& argv) {
     const pid_t child = fork();
     if (child < 0) return false;
@@ -6143,6 +7340,7 @@ static bool preflight(std::string& sudo_path, std::string& nsenter_path, std::st
 static bool run_positive(const std::string& sudo_path,
                          const std::string& nsenter_path,
                          const std::string& executable,
+                         const ExecutableLease& rut_executable,
                          const HeldTopologySnapshot& topology,
                          bool required,
                          std::string& error) {
@@ -6165,12 +7363,18 @@ static bool run_positive(const std::string& sudo_path,
                                  "owned-wait-term-ignore",
                                  "broker-early",
                                  "broker-lease-loss"})
-        if (!run_session(sudo_path, nsenter_path, executable, topology, scenario, error)) {
+        if (!run_session(
+                sudo_path, nsenter_path, executable, rut_executable, topology, scenario, error)) {
             error = std::string(scenario) + ": " + error;
             return false;
         }
-    if (!run_session(
-            sudo_path, nsenter_path, executable, topology, "listener-guard-reservation", error)) {
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
+                     "listener-guard-reservation",
+                     error)) {
         error = "listener-guard-reservation: " + error;
         return false;
     }
@@ -6188,8 +7392,8 @@ int main(int argc, char** argv) {
         return dropped_broker_main(argv[0], argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 6 && strcmp(argv[1], "--fixture-privileged-target") == 0)
         return secured_target_main(argv[2], argv[3], argv[4], argv[5]);
-    if (argc != 1) {
-        std::cerr << "usage: test_fixture_privileged_broker\n";
+    if (argc != 2) {
+        std::cerr << "usage: test_fixture_privileged_broker /canonical/path/to/rut\n";
         return 2;
     }
     std::array<char, PATH_MAX> self{};
@@ -6197,9 +7401,11 @@ int main(int argc, char** argv) {
     if (length <= 0) return 1;
     self[static_cast<size_t>(length)] = '\0';
     std::string sudo_path, nsenter_path, error;
+    ExecutableLease rut_executable;
     const bool required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED") != nullptr &&
                           strcmp(getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED"), "1") == 0;
-    if (!pure_protocol_self_checks(error) || !launch_argv_refactor_self_check(error) ||
+    if (!open_canonical_caller_executable(argv[1], rut_executable, error) ||
+        !pure_protocol_self_checks(error) || !launch_argv_refactor_self_check(error) ||
         !exact_liveness_self_check(error) || !endpoint_replacement_self_check(error) ||
         !bounded_wait_and_signal_self_check(error) || !group_lease_self_check(error) ||
         !lease_loss_owner_cascade_self_check(error) || !launcher_error_order_self_check(error) ||
@@ -6223,8 +7429,13 @@ int main(int argc, char** argv) {
                     HeldTopologyProbePolicy::SocketlessHostParent,
                     callback_error))
                 return false;
-            return run_positive(
-                sudo_path, nsenter_path, self.data(), topology, required, callback_error);
+            return run_positive(sudo_path,
+                                nsenter_path,
+                                self.data(),
+                                rut_executable,
+                                topology,
+                                required,
+                                callback_error);
         });
     if (result.prerequisite_failure) {
         std::cerr << (required ? "FAIL" : "SKIP") << " [#358 Stage 2a3b topology]: " << result.error
