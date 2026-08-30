@@ -3577,7 +3577,50 @@ static bool exact_custody_child_identity_matches(const ProcIdentity& child,
            child.uid == expected_uid && child.gid == expected_gid;
 }
 
-enum class ExactEscrowValidation { Invalid, ChildStateTransient, Valid };
+enum class ExactEscrowValidation { Invalid, ObservationTransient, Valid };
+
+static ExactEscrowValidation classify_exact_child_observation(bool read_succeeded,
+                                                              const ProcIdentity& child,
+                                                              const ExactCustodyRecord& record,
+                                                              pid_t expected_parent,
+                                                              pid_t transition_parent,
+                                                              ino_t expected_netns,
+                                                              uid_t expected_uid,
+                                                              gid_t expected_gid) {
+    if (!read_succeeded) return ExactEscrowValidation::ObservationTransient;
+    if (child.pid != static_cast<pid_t>(record.child_pid) || child.start != record.child_start ||
+        child.exe_dev != record.child_exe_dev || child.exe_ino != record.child_exe_ino ||
+        child.netns != expected_netns || child.uid != expected_uid || child.gid != expected_gid)
+        return ExactEscrowValidation::Invalid;
+    if (child.ppid == expected_parent) return ExactEscrowValidation::Valid;
+    return child.ppid == transition_parent ? ExactEscrowValidation::ObservationTransient
+                                           : ExactEscrowValidation::Invalid;
+}
+
+static ExactEscrowValidation classify_exact_listener_observation(bool table_read,
+                                                                 bool inodes_read,
+                                                                 bool evidence_matches,
+                                                                 bool mismatch_confirmed) {
+    if (!table_read || !inodes_read) return ExactEscrowValidation::ObservationTransient;
+    if (evidence_matches) return ExactEscrowValidation::Valid;
+    return mismatch_confirmed ? ExactEscrowValidation::Invalid
+                              : ExactEscrowValidation::ObservationTransient;
+}
+
+static bool exact_listener_observations_equal(const privileged_listener::ProcTcpTable& first_table,
+                                              const std::vector<u64>& first_inodes,
+                                              const privileged_listener::ProcTcpTable& second_table,
+                                              const std::vector<u64>& second_inodes) {
+    if (first_table.count != second_table.count || first_inodes != second_inodes) return false;
+    for (std::size_t index = 0u; index != first_table.count; ++index) {
+        const auto& first = first_table.rows[index];
+        const auto& second = second_table.rows[index];
+        if (first.local_ipv4 != second.local_ipv4 || first.local_port != second.local_port ||
+            first.state != second.state || first.inode != second.inode)
+            return false;
+    }
+    return true;
+}
 
 static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& record,
                                                    const ExactEscrowRights& rights,
@@ -3635,14 +3678,20 @@ static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& rec
         if (record.has_pidfd != 0u ||
             observe_exact_liveness(child) != ExactLiveness::ExitedOrReused)
             return ExactEscrowValidation::Invalid;
-    } else if (!read_proc(static_cast<pid_t>(record.child_pid), child, false) ||
-               !exact_custody_child_identity_matches(child,
-                                                     record,
-                                                     expected_child_parent,
-                                                     expected_netns,
-                                                     expected_uid,
-                                                     expected_gid)) {
-        return ExactEscrowValidation::ChildStateTransient;
+    } else {
+        const bool child_read = read_proc(static_cast<pid_t>(record.child_pid), child, false);
+        const pid_t transition_parent =
+            expected_child_parent == expected_target ? getpid() : expected_target;
+        const ExactEscrowValidation child_validation =
+            classify_exact_child_observation(child_read,
+                                             child,
+                                             record,
+                                             expected_child_parent,
+                                             transition_parent,
+                                             expected_netns,
+                                             expected_uid,
+                                             expected_gid);
+        if (child_validation != ExactEscrowValidation::Valid) return child_validation;
     }
     if (record.has_pidfd != 0u &&
         (rights.pidfd < 0 || !pidfd_link_matches(getpid(), rights.pidfd) ||
@@ -3656,17 +3705,44 @@ static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& rec
         const privileged_listener::ListenerPlan plan{static_cast<u32>(record.positive_ipv4),
                                                      static_cast<u32>(record.guard_ipv4),
                                                      record.port};
-        if (!read_process_tcp_table(child.pid, table) ||
-            !process_socket_inodes(child.pid, inodes) ||
-            !privileged_listener::classify_listener_evidence(
-                table,
-                plan,
-                inodes,
-                privileged_listener::ListenerEvidenceKind::ExactPositive,
-                evidence,
-                diagnostic) ||
-            evidence.child_owned_inode != record.listener_inode)
-            return ExactEscrowValidation::Invalid;
+        const bool table_read = read_process_tcp_table(child.pid, table);
+        const bool inodes_read = process_socket_inodes(child.pid, inodes);
+        const bool evidence_matches = table_read && inodes_read &&
+                                      privileged_listener::classify_listener_evidence(
+                                          table,
+                                          plan,
+                                          inodes,
+                                          privileged_listener::ListenerEvidenceKind::ExactPositive,
+                                          evidence,
+                                          diagnostic) &&
+                                      evidence.child_owned_inode == record.listener_inode;
+        ExactEscrowValidation listener_validation =
+            classify_exact_listener_observation(table_read, inodes_read, evidence_matches, false);
+        if (listener_validation == ExactEscrowValidation::ObservationTransient && table_read &&
+            inodes_read) {
+            privileged_listener::ProcTcpTable second_table;
+            std::vector<u64> second_inodes;
+            privileged_listener::ListenerEvidence second_evidence;
+            privileged_listener::Diagnostic second_diagnostic;
+            const bool second_table_read = read_process_tcp_table(child.pid, second_table);
+            const bool second_inodes_read = process_socket_inodes(child.pid, second_inodes);
+            const bool second_matches =
+                second_table_read && second_inodes_read &&
+                privileged_listener::classify_listener_evidence(
+                    second_table,
+                    plan,
+                    second_inodes,
+                    privileged_listener::ListenerEvidenceKind::ExactPositive,
+                    second_evidence,
+                    second_diagnostic) &&
+                second_evidence.child_owned_inode == record.listener_inode;
+            const bool mismatch_confirmed =
+                second_table_read && second_inodes_read && !second_matches &&
+                exact_listener_observations_equal(table, inodes, second_table, second_inodes);
+            listener_validation = classify_exact_listener_observation(
+                second_table_read, second_inodes_read, second_matches, mismatch_confirmed);
+        }
+        if (listener_validation != ExactEscrowValidation::Valid) return listener_validation;
     }
     return ExactEscrowValidation::Valid;
 }
@@ -3724,7 +3800,7 @@ static ExactCustodyTargetState validate_received_exact_custody(const ExactCustod
                                                                            expected_gid);
     if (adopted_validation == ExactEscrowValidation::Invalid)
         return ExactCustodyTargetState::Invalid;
-    if (adopted_validation == ExactEscrowValidation::ChildStateTransient)
+    if (adopted_validation == ExactEscrowValidation::ObservationTransient)
         return ExactCustodyTargetState::Transient;
     return ExactCustodyTargetState::ExitedAndAdopted;
 }
@@ -4083,6 +4159,19 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
 }
 
 static bool exact_adoption_fault_self_check(std::string& error) {
+    if (classify_exact_listener_observation(false, true, false, false) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_listener_observation(true, false, false, false) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_listener_observation(true, true, false, false) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_listener_observation(true, true, false, true) !=
+            ExactEscrowValidation::Invalid ||
+        classify_exact_listener_observation(true, true, true, false) !=
+            ExactEscrowValidation::Valid) {
+        error = "exact listener read/mismatch classification failed";
+        return false;
+    }
     if (exact_peer_closed_action(false, false) != ExactPeerClosedAction::WaitDirect ||
         exact_peer_closed_action(true, false) != ExactPeerClosedAction::ReturnExited ||
         exact_peer_closed_action(false, true) != ExactPeerClosedAction::Hold) {
@@ -4131,6 +4220,40 @@ static bool exact_adoption_fault_self_check(std::string& error) {
     }
     ExactCustodyRecord correct = wrong;
     correct.child_start = identity.start;
+    ProcIdentity transitioned = identity;
+    transitioned.ppid = getpid() + 1;
+    ProcIdentity wrong_identity = identity;
+    ++wrong_identity.start;
+    if (classify_exact_child_observation(false,
+                                         identity,
+                                         correct,
+                                         getpid(),
+                                         transitioned.ppid,
+                                         identity.netns,
+                                         identity.uid,
+                                         identity.gid) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_child_observation(true,
+                                         transitioned,
+                                         correct,
+                                         getpid(),
+                                         transitioned.ppid,
+                                         identity.netns,
+                                         identity.uid,
+                                         identity.gid) !=
+            ExactEscrowValidation::ObservationTransient ||
+        classify_exact_child_observation(true,
+                                         wrong_identity,
+                                         correct,
+                                         getpid(),
+                                         transitioned.ppid,
+                                         identity.netns,
+                                         identity.uid,
+                                         identity.gid) != ExactEscrowValidation::Invalid) {
+        (void)kill(child, SIGKILL);
+        error = "exact child read/transition/stable mismatch classification failed";
+        return false;
+    }
     if (!exact_custody_child_identity_matches(
             identity, correct, getpid(), identity.netns, identity.uid, identity.gid) ||
         exact_custody_child_identity_matches(
