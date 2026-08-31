@@ -3700,12 +3700,12 @@ static bool canonical_parent_retry_identity(const collision_evidence::RetryLive&
         !canonical_parent_pidfd_info(target.pid, static_cast<int>(report.pidfd.pidfd_fd), child) ||
         [&]() {
             u64 socket_inode = 0u;
-            return canonical_target_socket_evidence(child,
-                                                    positive_ipv4,
-                                                    guard_ipv4,
-                                                    static_cast<u16>(report.port),
-                                                    socket_inode) &&
-                   socket_inode != 0u;
+            return !canonical_target_socket_evidence(child,
+                                                     positive_ipv4,
+                                                     guard_ipv4,
+                                                     static_cast<u16>(report.port),
+                                                     socket_inode) ||
+                   socket_inode == 0u;
         }()) {
         error = "retry child/pidfd/socket identity was not independently observed";
         return false;
