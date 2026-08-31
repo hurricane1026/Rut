@@ -618,12 +618,33 @@ PausedChildLease::~PausedChildLease() {
                 settlement_->wait_status = child_status_;
                 settlement_->error_number = result < 0 ? errno : 0;
             }
+        } else if (result == 0 && owned_sigkill_sent_) {
+            do {
+                result = waitpid(child_pid_, &child_status_, 0);
+            } while (result < 0 && errno == EINTR);
+            reaped = result == child_pid_;
+            child_reaped_ = reaped;
+            if (settlement_) {
+                settlement_->terminal = reaped || (result < 0 && errno == ECHILD);
+                settlement_->reaped = reaped;
+                settlement_->wait_status = child_status_;
+                settlement_->error_number = result < 0 ? errno : 0;
+            }
         } else if (result == 0) {
             const bool authority_valid =
                 valid_pidfd_unbounded(
                     authority_pidfd_, child_pid_, true, authority_dev_, authority_ino_) &&
                 read_proc(child_pid_, current) && matches_current_owned_identity(current);
-            if (authority_valid && pidfd_signal(authority_pidfd_, SIGKILL)) {
+            if (authority_valid) {
+                if (settlement_) ++settlement_->sigkill_attempts;
+                const bool sent = pidfd_signal(authority_pidfd_, SIGKILL);
+                if (sent) {
+                    owned_sigkill_sent_ = true;
+                    if (settlement_) settlement_->sigkill_sent = true;
+                }
+                if (!sent) {
+                    (void)close_once(release_fd_, diagnostic);  // EOF is the safe fallback.
+                }
                 do {
                     result = waitpid(child_pid_, &child_status_, 0);
                 } while (result < 0 && errno == EINTR);
@@ -648,6 +669,12 @@ PausedChildLease::~PausedChildLease() {
                 }
             }
         }
+    }
+    if (reaped && owned_sigkill_sent_) {
+        observation_valid =
+            valid_pidfd_unbounded(
+                observation_pidfd_, child_pid_, false, observation_dev_, observation_ino_) &&
+            same_open_file_description(observation_pidfd_, authority_pidfd_);
     }
     bool success = reaped;
     if (reaped) {
@@ -992,6 +1019,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
         hooks == nullptr ? nullptr : hooks->prepared_procfs_allowed;
     candidate.prepared_validation_context_ =
         hooks == nullptr ? nullptr : hooks->prepared_validation_context;
+    candidate.post_sigkill_delay_ms_ = hooks == nullptr ? 0u : hooks->post_sigkill_delay_ms;
     candidate.active_ = true;
     candidate.settlement_ = std::make_shared<SettlementReceipt>();
     candidate.settlement_->child_pid = child;
@@ -1100,6 +1128,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     lease.kcmp_file_hook_ = candidate.kcmp_file_hook_;
     lease.prepared_procfs_allowed_hook_ = candidate.prepared_procfs_allowed_hook_;
     lease.prepared_validation_context_ = candidate.prepared_validation_context_;
+    lease.post_sigkill_delay_ms_ = candidate.post_sigkill_delay_ms_;
     lease.active_ = true;
     lease.settlement_ = candidate.settlement_;
     lease.settlement_->identity = lease.identity_;
@@ -1550,7 +1579,12 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
         settlement_->error_number = ECHILD;
     }
     bool observation_valid = false;
-    if (!child_reaped_ && result == 0) {
+    if (!child_reaped_ && result == 0 && owned_sigkill_sent_) {
+        if (!wait_reap(deadline, diagnostic)) {
+            record_cleanup(false, diagnostic);
+            return false;
+        }
+    } else if (!child_reaped_ && result == 0) {
         ProcIdentity current;
         if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
             !validate_pidfd(authority_pidfd_, true, deadline, diagnostic)) {
@@ -1568,8 +1602,22 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
             return false;
         }
         observation_valid = true;
+        if (settlement_) ++settlement_->sigkill_attempts;
         if (!pidfd_signal(authority_pidfd_, SIGKILL)) {
             fail(diagnostic, FailurePhase::Cleanup, errno == 0 ? EIO : errno);
+            record_cleanup(false, diagnostic);
+            return false;
+        }
+        owned_sigkill_sent_ = true;
+        if (settlement_) settlement_->sigkill_sent = true;
+        if (post_sigkill_delay_ms_ != 0) {
+            timespec delay{static_cast<time_t>(post_sigkill_delay_ms_ / 1000u),
+                           static_cast<long>((post_sigkill_delay_ms_ % 1000u) * 1000000u)};
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+            }
+        }
+        if (!before_deadline(deadline)) {
+            fail(diagnostic, FailurePhase::Wait, ETIMEDOUT);
             record_cleanup(false, diagnostic);
             return false;
         }
