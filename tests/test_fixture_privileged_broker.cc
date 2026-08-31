@@ -3568,6 +3568,7 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         source.ipv4 != guard_ipv4 || source.port == 0u || source.port > 65535u ||
         source.g_fd <= 2u || source.g_f_getfd != static_cast<u64>(FD_CLOEXEC) ||
         (source.g_f_getfl & static_cast<u64>(O_ACCMODE)) != static_cast<u64>(O_RDWR) ||
+        (source.g_f_getfl & static_cast<u64>(O_NONBLOCK | O_APPEND | O_ASYNC)) != 0u ||
         source.dev == 0u || source.ino == 0u || source.mode == 0u ||
         (source.mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFSOCK) ||
         source.rdev != 0u || source.socket_domain != static_cast<u64>(AF_INET) ||
@@ -3608,8 +3609,11 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         static_cast<u64>(source_status.st_dev) != source.source_dev ||
         static_cast<u64>(source_status.st_ino) != source.source_ino ||
         static_cast<u64>(source_status.st_size) != source.source_size ||
+        static_cast<u64>(source_status.st_mode) != source.source_mode ||
         source_status.st_nlink != 1u || source_status.st_uid != getuid() ||
-        source_status.st_gid != getgid()) {
+        source_status.st_gid != getgid() ||
+        static_cast<u64>(directory_status.st_mode) != source.directory_mode ||
+        directory_status.st_uid != getuid() || directory_status.st_gid != getgid()) {
         error = "random source path/stat identity was not independently observed";
         return false;
     }
@@ -3667,9 +3671,11 @@ static bool canonical_parent_retry_identity(const collision_evidence::RetryLive&
     const std::string expected_cmdline = report.cmdline;
     if (!read_proc(child, first) || !read_proc(child, second) ||
         !same_process_identity(first, second) || first.start != report.header.child_start ||
-        first.ppid != target.pid || first.uid != getuid() || first.gid != getgid() ||
-        first.netns != target.netns || first.exe != executable ||
-        first.cmdline != expected_cmdline || !canonical_empty_environment(child) ||
+        canonical_proc13(first) != report.procs.first ||
+        canonical_proc13(second) != report.procs.second || first.ppid != target.pid ||
+        first.uid != getuid() || first.gid != getgid() || first.netns != target.netns ||
+        first.exe != executable || first.cmdline != expected_cmdline ||
+        !canonical_empty_environment(child) ||
         !pidfd_link_matches(target.pid, static_cast<int>(report.pidfd.pidfd_fd)) ||
         !canonical_parent_pidfd_info(target.pid, static_cast<int>(report.pidfd.pidfd_fd), child) ||
         [&]() {
