@@ -3582,8 +3582,9 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         source.dev == 0u || source.ino == 0u || source.mode == 0u ||
         (source.mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFSOCK) ||
         source.rdev != 0u || source.socket_domain != static_cast<u64>(AF_INET) ||
-        source.socket_type != static_cast<u64>(SOCK_STREAM) || source.socket_protocol != 0u ||
-        source.reuseaddr != 0u || source.reuseport != 0u || source.acceptconn != 0u ||
+        source.socket_type != static_cast<u64>(SOCK_STREAM) ||
+        source.socket_protocol != static_cast<u64>(IPPROTO_TCP) || source.reuseaddr != 0u ||
+        source.reuseport != 0u || source.acceptconn != 0u ||
         source.proc_link != "socket:[" + std::to_string(source.ino) + "]" ||
         source.proc_link_len != source.proc_link.size() || source.proc_link.size() > 29u ||
         source.directory_dev == 0u || source.directory_ino == 0u ||
