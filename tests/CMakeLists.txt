@@ -173,6 +173,33 @@ set_tests_properties(test_fixture_executable_exec_handoff PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30)
 
+# Reusable tests-only ownership of exactly one public-RUT process attempt. It
+# composes lifecycle evidence only; listener/collision/HTTP behavior remains
+# outside this fixture.
+add_library(fixture_public_rut_session_attempt STATIC
+    fixture_public_rut_session_attempt.cc)
+target_include_directories(fixture_public_rut_session_attempt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_public_rut_session_attempt PUBLIC
+    fixture_anonymous_log_capture
+    fixture_executable_exec_handoff
+    fixture_executable_lease
+    fixture_wildcard_paused_child_lease
+    fixture_wildcard_source_lease
+    fixture_worker_protocol)
+
+add_executable(test_fixture_public_rut_session_attempt
+    test_fixture_public_rut_session_attempt.cc)
+target_link_libraries(test_fixture_public_rut_session_attempt PRIVATE
+    fixture_private_directory_lease
+    fixture_public_rut_session_attempt)
+add_test(NAME test_fixture_public_rut_session_attempt
+    COMMAND test_fixture_public_rut_session_attempt)
+set_tests_properties(test_fixture_public_rut_session_attempt PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # #377 declaration-only paused-child descriptor preparation. This composes the
 # independently owned source, capture and child leases only for child dup2/FD
 # closure; release remains inert and no runtime/session is launched.
@@ -199,11 +226,9 @@ if(RUT_ENABLE_JIT)
     add_executable(test_fixture_wildcard_canonical_session
         test_fixture_wildcard_canonical_session.cc)
     target_link_libraries(test_fixture_wildcard_canonical_session PRIVATE
-        fixture_anonymous_log_capture
-        fixture_executable_exec_handoff
         fixture_executable_lease
         fixture_private_directory_lease
-        fixture_wildcard_paused_child_lease
+        fixture_public_rut_session_attempt
         fixture_wildcard_source_lease
         fixture_worker_protocol)
     target_compile_definitions(test_fixture_wildcard_canonical_session PRIVATE
