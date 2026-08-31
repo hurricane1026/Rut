@@ -1,8 +1,7 @@
 #include "fixture_anonymous_log_capture.h"
-#include "fixture_executable_exec_handoff.h"
 #include "fixture_executable_lease.h"
 #include "fixture_private_directory_lease.h"
-#include "fixture_wildcard_paused_child_lease.h"
+#include "fixture_public_rut_session_attempt.h"
 #include "fixture_wildcard_source_lease.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
@@ -21,7 +20,6 @@
 #include <vector>
 
 #include <dirent.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -30,9 +28,8 @@
 #include <unistd.h>
 
 namespace capture = rut::test::fixture_anonymous_log_capture;
-namespace child = rut::test::fixture_wildcard_paused_child_lease;
+namespace attempt = rut::test::fixture_public_rut_session_attempt;
 namespace executable = rut::test::fixture_executable_lease;
-namespace handoff = rut::test::fixture_executable_exec_handoff;
 namespace private_directory = rut::test::fixture_private_directory_lease;
 namespace protocol = rut::test::fixture_worker_protocol;
 namespace source = rut::test::fixture_wildcard_source_lease;
@@ -51,21 +48,6 @@ bool check(bool condition, const char* message) {
 Clock::time_point deadline(int milliseconds = 7000) {
     return Clock::now() + std::chrono::milliseconds(milliseconds);
 }
-
-struct OwnedFd {
-    int value = -1;
-
-    bool close_owned() {
-        if (value < 0) return true;
-        const int detached = value;
-        value = -1;
-        return close(detached) == 0;
-    }
-
-    ~OwnedFd() {
-        if (value >= 0) (void)close(value);
-    }
-};
 
 bool fd_snapshot(std::vector<int>& descriptors) {
     descriptors.clear();
@@ -195,20 +177,6 @@ bool parse_startup_bytes(const std::string& bytes,
     return true;
 }
 
-bool wait_for_strict_startup(capture::AnonymousLogCapture& output,
-                             const std::string& source_path,
-                             Clock::time_point until,
-                             std::string& bytes,
-                             StartupEvidence& evidence) {
-    capture::Diagnostic diagnostic;
-    for (;;) {
-        if (!output.snapshot(bytes, diagnostic)) return false;
-        if (parse_startup_bytes(bytes, source_path, evidence)) return true;
-        if (bytes.size() >= output.max_bytes() || Clock::now() >= until) return false;
-        (void)poll(nullptr, 0, 5);
-    }
-}
-
 bool evidence_mutations_rejected(const std::string& canonical,
                                  const std::string& source_path,
                                  const StartupEvidence& evidence) {
@@ -273,23 +241,17 @@ bool run_one_canonical_session() {
     bool launched_identity_known = false;
     bool ok = true;
     {
-        // Declaration order is the reverse of defensive destruction order:
-        // child -> handoff -> null -> capture -> executable -> source -> directory.
+        // Reverse destruction: attempt -> executable -> source -> directory.
         private_directory::PrivateDirectoryLease directory;
         source::WildcardAttemptSourceLease source_lease;
         executable::ExecutableLease executable_lease;
-        capture::AnonymousLogCapture output;
-        OwnedFd null_input;
-        handoff::ExecutableExecHandoffLease handoff_lease;
-        child::PausedChildLease child_lease;
+        attempt::PublicRutAttemptLease public_attempt;
         directory_receipt = directory.settlement_receipt();
 
         private_directory::Diagnostic directory_diagnostic;
         source::Diagnostic source_diagnostic;
         executable::Diagnostic executable_diagnostic;
-        capture::Diagnostic capture_diagnostic;
-        handoff::Diagnostic handoff_diagnostic;
-        child::Diagnostic child_diagnostic;
+        attempt::Diagnostic attempt_diagnostic;
         std::string executable_path;
         const auto until = deadline();
         const auto record = [&](bool result, const char* message) {
@@ -301,44 +263,24 @@ bool run_one_canonical_session() {
             private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic),
             "private directory creation");
         directory_path = directory.path();
-        bool source_created = false;
-        if (directory_created) {
-            source_created = record(
-                source::WildcardAttemptSourceLease::create_exact_bytes(directory.descriptor(),
-                                                                       directory.path(),
-                                                                       kSourceBasename,
-                                                                       kSourceBytes,
-                                                                       source_lease,
-                                                                       source_diagnostic),
-                "exact ordinary-RUT source lease");
-            if (source_created) source_path = source_lease.path();
-        }
-
+        const bool source_created =
+            directory_created &&
+            record(source::WildcardAttemptSourceLease::create_exact_bytes(directory.descriptor(),
+                                                                          directory.path(),
+                                                                          kSourceBasename,
+                                                                          kSourceBytes,
+                                                                          source_lease,
+                                                                          source_diagnostic),
+                   "exact ordinary-RUT source lease");
+        if (source_created) source_path = source_lease.path();
         const bool executable_path_known =
             source_created &&
             record(canonical_executable(executable_path), "canonical public rut path");
-        bool executable_created = false;
-        if (executable_path_known)
-            executable_created =
-                record(executable::ExecutableLease::create(
-                           executable_path, executable_lease, executable_diagnostic),
-                       "public rut executable lease");
-
-        bool capture_created = false;
-        if (executable_created)
-            capture_created = record(capture::AnonymousLogCapture::create(
-                                         capture::kMaxCaptureBytes, output, capture_diagnostic),
-                                     "bounded startup capture");
-
-        if (capture_created) {
-            null_input.value = open("/dev/null", O_RDONLY | O_CLOEXEC);
-            (void)record(null_input.value >= 0, "borrowed /dev/null");
-        }
-        bool handoff_created = false;
-        if (null_input.value >= 0)
-            handoff_created = record(handoff::ExecutableExecHandoffLease::create(
-                                         executable_lease, handoff_lease, handoff_diagnostic),
-                                     "executable handoff");
+        const bool executable_created =
+            executable_path_known &&
+            record(executable::ExecutableLease::create(
+                       executable_path, executable_lease, executable_diagnostic),
+                   "public rut executable lease");
 
         const std::array<std::string_view, 9> arguments = {executable_path,
                                                            source_path,
@@ -355,95 +297,82 @@ bool run_one_canonical_session() {
             std::none_of(arguments.begin(), arguments.end(), [](std::string_view argument) {
                 return argument.find("access-log") != std::string_view::npos;
             });
-        if (handoff_created)
-            (void)record(no_access_log_configuration,
-                         "source/argv unexpectedly configure an access log");
+        (void)record(no_access_log_configuration,
+                     "source/argv unexpectedly configure an access log");
+        attempt::HooksForTesting hooks;
+        const bool prepared =
+            executable_created && no_access_log_configuration &&
+            record(public_attempt.prepare(
+                       source_lease, executable_lease, arguments, until, hooks, attempt_diagnostic),
+                   "reusable exact public-RUT attempt prepare");
+        const pid_t launched_pid = prepared ? public_attempt.child_pid() : -1;
+        const auto settlement = prepared ? public_attempt.settlement_receipt() : nullptr;
 
-        child::ChildDescriptorPlan plan;
-        bool plan_made = false;
-        if (handoff_created && no_access_log_configuration)
-            plan_made = record(handoff_lease.make_child_plan_with_arguments(null_input.value,
-                                                                            output.descriptor(),
-                                                                            false,
-                                                                            arguments,
-                                                                            plan,
-                                                                            handoff_diagnostic),
-                               "exact nine-argument child plan");
-
-        bool child_created = false;
-        if (plan_made)
-            child_created = record(child::PausedChildLease::create_prepared(
-                                       until, plan, child_lease, child_diagnostic),
-                                   "prepared public rut child");
-
-        pid_t launched_pid = -1;
-        std::shared_ptr<const child::SettlementReceipt> settlement;
-        if (child_created) {
-            launched_pid = child_lease.child_pid();
-            settlement = child_lease.settlement_receipt();
-            launched_identity = child_lease.identity();
-            launched_identity_known = true;
-        }
-
-        handoff::ExecObservation observation;
         bool exec_observed = false;
-        if (child_created) {
-            exec_observed =
-                handoff_lease.release_and_observe(
-                    executable_lease, child_lease, until, observation, handoff_diagnostic) &&
-                observation.outcome == handoff::ExecOutcome::ExecObservedLive &&
-                observation.first.cmdline == expected_cmdline &&
-                observation.second.cmdline == expected_cmdline;
+        if (prepared) {
+            exec_observed = public_attempt.exec_and_observe(
+                                source_lease, executable_lease, until, attempt_diagnostic) &&
+                            public_attempt.state() == attempt::State::ExecObservedLive &&
+                            public_attempt.exec_observation().first.cmdline == expected_cmdline &&
+                            public_attempt.exec_observation().second.cmdline == expected_cmdline;
             (void)record(exec_observed, "public rut exec observation");
-            if (exec_observed) launched_identity = observation.second;
+            if (exec_observed) {
+                launched_identity = public_attempt.exec_observation().second;
+                launched_identity_known = true;
+            }
         }
 
         std::string readiness_bytes;
         StartupEvidence readiness_evidence;
         bool readiness = false;
         if (exec_observed) {
-            std::string candidate;
-            StartupEvidence candidate_evidence;
-            if (wait_for_strict_startup(
-                    output, source_path, until, candidate, candidate_evidence)) {
-                protocol::ProcIdentity first_proc;
-                protocol::ProcIdentity second_proc;
-                protocol::ProcIdentity third_proc;
-                capture::Diagnostic first_snapshot_diagnostic;
-                capture::Diagnostic second_snapshot_diagnostic;
-                std::string first_snapshot;
-                std::string second_snapshot;
-                StartupEvidence first_evidence;
-                StartupEvidence second_evidence;
-                readiness = pidfd_live(child_lease.observation_pidfd()) &&
-                            protocol::read_proc(launched_pid, first_proc) &&
-                            protocol::same_process_identity(observation.second, first_proc) &&
-                            source_lease.revalidate(source_diagnostic) &&
-                            executable_lease.revalidate(executable_diagnostic) &&
-                            exact_empty_environment(launched_pid) &&
-                            output.snapshot(first_snapshot, first_snapshot_diagnostic) &&
-                            parse_startup_bytes(first_snapshot, source_path, first_evidence) &&
-                            protocol::read_proc(launched_pid, second_proc) &&
-                            protocol::same_process_identity(first_proc, second_proc) &&
-                            pidfd_live(child_lease.observation_pidfd()) &&
-                            exact_empty_environment(launched_pid) &&
-                            executable_lease.revalidate(executable_diagnostic) &&
-                            source_lease.revalidate(source_diagnostic) &&
-                            output.snapshot(second_snapshot, second_snapshot_diagnostic) &&
-                            parse_startup_bytes(second_snapshot, source_path, second_evidence) &&
-                            first_snapshot == second_snapshot && first_snapshot == candidate &&
-                            first_evidence.backend == second_evidence.backend &&
-                            first_evidence.port == second_evidence.port &&
-                            source_lease.revalidate(source_diagnostic) &&
-                            executable_lease.revalidate(executable_diagnostic) &&
-                            exact_empty_environment(launched_pid) &&
-                            protocol::read_proc(launched_pid, third_proc) &&
-                            protocol::same_process_identity(second_proc, third_proc) &&
-                            pidfd_live(child_lease.observation_pidfd());
-                if (readiness) {
-                    readiness_bytes = first_snapshot;
-                    readiness_evidence = first_evidence;
+            for (;;) {
+                std::string candidate;
+                StartupEvidence candidate_evidence;
+                if (!public_attempt.snapshot_capture(candidate, attempt_diagnostic)) break;
+                if (parse_startup_bytes(candidate, source_path, candidate_evidence)) {
+                    protocol::ProcIdentity first_proc;
+                    protocol::ProcIdentity second_proc;
+                    protocol::ProcIdentity third_proc;
+                    std::string first_snapshot;
+                    std::string second_snapshot;
+                    StartupEvidence first_evidence;
+                    StartupEvidence second_evidence;
+                    readiness =
+                        pidfd_live(public_attempt.observation_pidfd()) &&
+                        protocol::read_proc(launched_pid, first_proc) &&
+                        protocol::same_process_identity(public_attempt.exec_observation().second,
+                                                        first_proc) &&
+                        source_lease.revalidate(source_diagnostic) &&
+                        executable_lease.revalidate(executable_diagnostic) &&
+                        exact_empty_environment(launched_pid) &&
+                        public_attempt.snapshot_capture(first_snapshot, attempt_diagnostic) &&
+                        parse_startup_bytes(first_snapshot, source_path, first_evidence) &&
+                        protocol::read_proc(launched_pid, second_proc) &&
+                        protocol::same_process_identity(first_proc, second_proc) &&
+                        pidfd_live(public_attempt.observation_pidfd()) &&
+                        exact_empty_environment(launched_pid) &&
+                        executable_lease.revalidate(executable_diagnostic) &&
+                        source_lease.revalidate(source_diagnostic) &&
+                        public_attempt.snapshot_capture(second_snapshot, attempt_diagnostic) &&
+                        parse_startup_bytes(second_snapshot, source_path, second_evidence) &&
+                        first_snapshot == second_snapshot && first_snapshot == candidate &&
+                        first_evidence.backend == second_evidence.backend &&
+                        first_evidence.port == second_evidence.port &&
+                        source_lease.revalidate(source_diagnostic) &&
+                        executable_lease.revalidate(executable_diagnostic) &&
+                        exact_empty_environment(launched_pid) &&
+                        protocol::read_proc(launched_pid, third_proc) &&
+                        protocol::same_process_identity(second_proc, third_proc) &&
+                        pidfd_live(public_attempt.observation_pidfd());
+                    if (readiness) {
+                        readiness_bytes = first_snapshot;
+                        readiness_evidence = first_evidence;
+                    }
+                    break;
                 }
+                if (candidate.size() >= capture::kMaxCaptureBytes || Clock::now() >= until) break;
+                (void)poll(nullptr, 0, 5);
             }
             (void)record(readiness, "strict post-bracketed startup readiness");
             if (readiness)
@@ -452,48 +381,24 @@ bool run_one_canonical_session() {
                     "copied startup evidence mutation rejection");
         }
 
-        // Stop authority is exclusively PausedChildLease::cleanup(). Once
-        // exact reap is known, every following owner is attempted in order;
-        // one failure never suppresses an independent later settlement.
-        bool exact_settlement = false;
-        if (child_created) {
-            const bool child_cleaned =
-                child_lease.active() && child_lease.cleanup(until, child_diagnostic);
-            exact_settlement = child_cleaned && settlement &&
-                               settlement->child_pid == launched_pid && settlement->terminal &&
-                               settlement->reaped && settlement->error_number == 0 &&
-                               WIFSIGNALED(settlement->wait_status) &&
-                               WTERMSIG(settlement->wait_status) == SIGKILL;
-            (void)record(exact_settlement, "SIGKILL terminal+reaped child settlement");
-        }
-
-        const bool safe_to_settle_writers = !child_created || exact_settlement;
-        if (safe_to_settle_writers) {
-            if (handoff_created)
-                (void)record(handoff_lease.close(handoff_diagnostic),
-                             "post-child handoff settlement");
-            if (null_input.value >= 0)
-                (void)record(null_input.close_owned(), "borrowed /dev/null parent close");
-            if (capture_created) {
-                std::string final_bytes;
-                capture::Diagnostic settle_diagnostic;
-                capture::Diagnostic snapshot_diagnostic;
-                capture::Diagnostic close_diagnostic;
-                const bool settled = output.settle(settle_diagnostic);
-                (void)record(settled, "startup capture settlement");
-                const bool snapshotted = output.snapshot(final_bytes, snapshot_diagnostic);
-                (void)record(snapshotted, "final startup capture snapshot");
-                if (readiness) {
-                    StartupEvidence final_evidence;
-                    (void)record(
-                        snapshotted && final_bytes == readiness_bytes &&
-                            parse_startup_bytes(final_bytes, source_path, final_evidence) &&
-                            final_evidence.backend == readiness_evidence.backend &&
-                            final_evidence.port == readiness_evidence.port,
-                        "sealed final startup evidence");
-                }
-                (void)record(output.close(close_diagnostic), "startup capture close");
-            }
+        const bool exact_settlement =
+            prepared &&
+            record(public_attempt.settle_killed(SIGKILL, until, attempt_diagnostic),
+                   "SIGKILL terminal+reaped attempt settlement") &&
+            settlement && settlement->child_pid == launched_pid && settlement->terminal &&
+            settlement->reaped && settlement->error_number == 0 &&
+            WIFSIGNALED(settlement->wait_status) && WTERMSIG(settlement->wait_status) == SIGKILL;
+        if (exact_settlement) {
+            StartupEvidence final_evidence;
+            (void)record(
+                public_attempt.sealed_capture_bytes() == readiness_bytes &&
+                    parse_startup_bytes(
+                        public_attempt.sealed_capture_bytes(), source_path, final_evidence) &&
+                    final_evidence.backend == readiness_evidence.backend &&
+                    final_evidence.port == readiness_evidence.port,
+                "sealed final startup evidence");
+            (void)record(public_attempt.close_evidence(attempt_diagnostic),
+                         "startup capture evidence close");
             if (executable_created)
                 (void)record(executable_lease.close(executable_diagnostic),
                              "public rut executable settlement");
@@ -503,7 +408,7 @@ bool run_one_canonical_session() {
                 (void)record(directory.settle(directory_diagnostic),
                              "private directory settlement");
         } else {
-            (void)record(false, "settlement retained after uncertain child cleanup");
+            (void)record(false, "settlement retained after uncertain attempt cleanup");
         }
     }
 
