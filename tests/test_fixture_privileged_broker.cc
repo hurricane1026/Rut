@@ -124,6 +124,30 @@ constexpr u16 kWildcardAttemptDecision = 53;
 constexpr u16 kWildcardAttemptSettlement = 54;
 constexpr int kBrokerDeadlineMs = 5000;
 constexpr int kListenerDeadlineMs = 15000;
+constexpr int kCanonicalTargetOperationMs = 90000;
+constexpr int kCanonicalTargetCleanupSlackMs = 10000;
+constexpr int kCanonicalTargetCleanupMs =
+    kCanonicalTargetOperationMs + kCanonicalTargetCleanupSlackMs;
+constexpr int kCanonicalParentProtocolMs = 110000;
+constexpr int kCanonicalParentDispatchSlackMs = 5000;
+constexpr int kCanonicalDroppedTargetWaitMs = 120000;
+constexpr int kCanonicalDroppedDispatchSlackMs = 10000;
+constexpr int kCanonicalRootDroppedWaitMs = 150000;
+constexpr int kCanonicalRootSetupSlackMs = 25000;
+constexpr int kCanonicalLauncherRootWaitMs = 165000;
+constexpr int kCanonicalLauncherAuthorizationSlackMs = 10000;
+constexpr int kPrivilegedBrokerCTestTimeoutMs = 360000;
+static_assert(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs);
+static_assert(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
+              kCanonicalParentProtocolMs);
+static_assert(kCanonicalParentProtocolMs + kCanonicalDroppedDispatchSlackMs <=
+              kCanonicalDroppedTargetWaitMs);
+static_assert(kCanonicalDroppedTargetWaitMs + kCanonicalRootSetupSlackMs + 3 * kCleanupMs <
+              kCanonicalRootDroppedWaitMs);
+static_assert(kCanonicalRootDroppedWaitMs + kCanonicalLauncherAuthorizationSlackMs +
+                  3 * kCleanupMs <
+              kCanonicalLauncherRootWaitMs);
+static_assert(kCanonicalLauncherRootWaitMs < kPrivilegedBrokerCTestTimeoutMs);
 constexpr int kCredentialFd = 198;
 constexpr int kExactCustodyFd = 199;
 constexpr int kLauncherBundleFdBase = 220;
@@ -215,6 +239,19 @@ static bool canonical_collision_scenario(const char* scenario) {
     return strcmp(scenario, "listener-canonical-collision-release") == 0;
 }
 
+enum class TargetWaitStrategy { OwnedWait, ListenerCustody };
+
+static TargetWaitStrategy target_wait_strategy(const char* scenario) {
+    if (strcmp(scenario, "listener-guard-reservation") == 0 ||
+        strcmp(scenario, "listener-cleanup-observation-failure") == 0)
+        return TargetWaitStrategy::ListenerCustody;
+    return TargetWaitStrategy::OwnedWait;
+}
+
+static bool target_wait_requires_custody(const char* scenario) {
+    return target_wait_strategy(scenario) == TargetWaitStrategy::ListenerCustody;
+}
+
 static bool listener_failure_integration(const char* scenario) {
     return strcmp(scenario, "listener-cleanup-observation-failure") == 0;
 }
@@ -225,7 +262,7 @@ constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
 constexpr int kWildcardAttemptAggregateWaitMs = kListenerDeadlineMs * 6;
 
 static int launcher_broker_wait_ms(const char* scenario) {
-    if (canonical_collision_scenario(scenario)) return kWildcardAttemptAggregateWaitMs;
+    if (canonical_collision_scenario(scenario)) return kCanonicalLauncherRootWaitMs;
     return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
                                                   : kBrokerDeadlineMs;
 }
@@ -236,9 +273,8 @@ static int cleanup_response_wait_ms(const char* scenario) {
 }
 
 static int scenario_aggregate_wait_ms(const char* scenario) {
-    if (strcmp(scenario, "listener-wildcard-attempt") == 0 ||
-        canonical_collision_scenario(scenario))
-        return kWildcardAttemptAggregateWaitMs;
+    if (canonical_collision_scenario(scenario)) return kCanonicalParentProtocolMs;
+    if (strcmp(scenario, "listener-wildcard-attempt") == 0) return kWildcardAttemptAggregateWaitMs;
     if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
     if (listener_scenario_name(scenario)) return kListenerDeadlineMs;
     return kBrokerDeadlineMs;
@@ -260,11 +296,44 @@ static bool listener_failure_bound_self_check(std::string& error) {
         scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
             kWildcardAttemptAggregateWaitMs ||
         scenario_aggregate_wait_ms("listener-canonical-collision-release") !=
-            kWildcardAttemptAggregateWaitMs ||
+            kCanonicalParentProtocolMs ||
+        launcher_broker_wait_ms("listener-canonical-collision-release") !=
+            kCanonicalLauncherRootWaitMs ||
+        target_wait_strategy("listener-canonical-collision-release") !=
+            TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("normal") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("ready-loss") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("no-ready") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("term-ignore") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("owned-wait-term-ignore") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("broker-early") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("broker-lease-loss") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("listener-wildcard-attempt") != TargetWaitStrategy::OwnedWait ||
+        target_wait_strategy("listener-guard-reservation") != TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-cleanup-observation-failure") !=
+            TargetWaitStrategy::ListenerCustody ||
+        target_wait_requires_custody("listener-canonical-collision-release") ||
+        target_wait_requires_custody("normal") ||
+        !target_wait_requires_custody("listener-guard-reservation") ||
+        !target_wait_requires_custody("listener-cleanup-observation-failure") ||
+        !(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs) ||
+        !(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
+          kCanonicalParentProtocolMs) ||
+        !(kCanonicalParentProtocolMs + kCanonicalDroppedDispatchSlackMs <=
+          kCanonicalDroppedTargetWaitMs) ||
+        !(kCanonicalDroppedTargetWaitMs + kCanonicalRootSetupSlackMs + 3 * kCleanupMs <
+          kCanonicalRootDroppedWaitMs) ||
+        !(kCanonicalRootDroppedWaitMs + kCanonicalLauncherAuthorizationSlackMs + 3 * kCleanupMs <
+          kCanonicalLauncherRootWaitMs) ||
+        !(kCanonicalLauncherRootWaitMs < kPrivilegedBrokerCTestTimeoutMs) ||
+        kCanonicalTargetOperationMs != 90000 || kCanonicalTargetCleanupSlackMs != 10000 ||
+        kCanonicalTargetCleanupMs != 100000 || kCanonicalParentProtocolMs != 110000 ||
+        kCanonicalDroppedTargetWaitMs != 120000 || kCanonicalRootDroppedWaitMs != 150000 ||
+        kCanonicalLauncherRootWaitMs != 165000 || kPrivilegedBrokerCTestTimeoutMs != 360000 ||
         kBrokerDeadlineMs != 5000 || kListenerDeadlineMs != 15000 ||
         kListenerFailureFrame45WaitMs != 30000 || kListenerFailureLauncherWaitMs != 60000 ||
         kWildcardAttemptAggregateWaitMs != 90000) {
-        error = "listener failure extended deadline selection failed";
+        error = "listener/canonical wait strategy or deadline selection failed";
         return false;
     }
     return true;
@@ -3306,8 +3375,11 @@ static int canonical_target_flow(int control,
     u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
     std::string executable_path;
     if (!parse_canonical_request(request, positive_ipv4, guard_ipv4, executable_path)) return 60;
-    const auto transaction_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
-    const auto cleanup_deadline = transaction_deadline + std::chrono::seconds(10);
+    const auto transaction_start = std::chrono::steady_clock::now();
+    const auto transaction_deadline =
+        transaction_start + std::chrono::milliseconds(kCanonicalTargetOperationMs);
+    const auto cleanup_deadline =
+        transaction_start + std::chrono::milliseconds(kCanonicalTargetCleanupMs);
     u64 transaction = 0u;
     ProcIdentity target_identity;
     if (!canonical_random_transaction(transaction) || !read_proc(getpid(), target_identity) ||
@@ -4389,7 +4461,8 @@ static bool run_canonical_collision_release_parent(int target_fd,
         error = "held topology addresses were not canonical IPv4";
         return false;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kCanonicalParentProtocolMs);
     const std::vector<unsigned char> request =
         canonical_request_payload(positive_ipv4, guard_ipv4, executable);
     if (!send_frame(
@@ -6440,7 +6513,7 @@ static int secured_target_main(const char* control_path,
     u64 broker = 0;
     if (!token_from_hex(token_string, token) || !parse_u64(broker_text, broker) || broker <= 1)
         return 40;
-    if (listener_scenario_name(scenario) &&
+    if (target_wait_requires_custody(scenario) &&
         !validate_exact_custody_endpoint(kExactCustodyFd, static_cast<pid_t>(broker)))
         return 39;
     const int control = connect_control(control_path);
@@ -7541,10 +7614,11 @@ static int dropped_broker_main(const char* executable,
     int launch_pipe[2] = {-1, -1};
     int trace_pipe[2] = {-1, -1};
     if (pipe2(launch_pipe, O_CLOEXEC) != 0 || pipe2(trace_pipe, O_CLOEXEC) != 0) return 27;
-    const bool listener_scenario = listener_scenario_name(scenario);
+    const TargetWaitStrategy wait_strategy = target_wait_strategy(scenario);
+    const bool listener_custody = wait_strategy == TargetWaitStrategy::ListenerCustody;
     int custody_pair[2] = {-1, -1};
     const int pass_credentials = 1;
-    if (listener_scenario &&
+    if (listener_custody &&
         (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0 ||
          socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, custody_pair) != 0 ||
          setsockopt(custody_pair[0],
@@ -7559,7 +7633,7 @@ static int dropped_broker_main(const char* executable,
         const pid_t broker_parent = getppid();
         close(launch_pipe[1]);
         close(trace_pipe[0]);
-        if (listener_scenario) {
+        if (listener_custody) {
             close(custody_pair[0]);
             if (custody_pair[1] == kExactCustodyFd) {
                 const int flags = fcntl(kExactCustodyFd, F_GETFD);
@@ -7602,7 +7676,7 @@ static int dropped_broker_main(const char* executable,
     }
     close(launch_pipe[0]);
     close(trace_pipe[1]);
-    if (listener_scenario) {
+    if (listener_custody) {
         close(custody_pair[1]);
         custody_pair[1] = -1;
     }
@@ -7614,8 +7688,8 @@ static int dropped_broker_main(const char* executable,
     // EOF/PDEATHSIG and can exit without an unsafe signal from its parent.
     target_cleanup.add_downstream_fd(&launch_pipe[1]);
     target_cleanup.add_downstream_fd(&trace_pipe[0]);
-    if (listener_scenario) target_cleanup.add_downstream_fd(&custody_pair[0]);
-    if (listener_scenario) {
+    if (listener_custody) target_cleanup.add_downstream_fd(&custody_pair[0]);
+    if (listener_custody) {
         ProcIdentity spawned_target;
         if (!read_proc(target, spawned_target, false) || spawned_target.pid != target ||
             spawned_target.ppid != getpid() || spawned_target.start == 0u)
@@ -7623,7 +7697,7 @@ static int dropped_broker_main(const char* executable,
         listener_target_start = spawned_target.start;
     }
     if (!secure_as(caller_uid, caller_gid) || !arm_parent_death(root_broker) ||
-        (listener_scenario && (prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker)))
+        (listener_custody && (prctl(PR_SET_PDEATHSIG, 0) != 0 || getppid() != root_broker)))
         return 29;
     control = connect_control(control_path);
     if (control < 0) return 30;
@@ -7687,37 +7761,44 @@ static int dropped_broker_main(const char* executable,
                                                 scenario});
     const int target_wait_ms =
         strcmp(scenario, "owned-wait-term-ignore") == 0 ? kCleanupMs : kBrokerDeadlineMs;
-    const OwnedWaitResult target_wait_result =
-        listener_scenario ? wait_listener_target_bounded(target,
-                                                         listener_target_start,
-                                                         executable,
-                                                         target_argv,
-                                                         root_broker,
-                                                         root_identity.start,
-                                                         kCredentialFd,
-                                                         custody_pair[0],
-                                                         listener_failure_integration(scenario),
-                                                         control,
-                                                         token,
-                                                         static_cast<ino_t>(expected_netns),
-                                                         caller_uid,
-                                                         caller_gid,
-                                                         canonical_collision_scenario(scenario)
-                                                             ? kWildcardAttemptAggregateWaitMs
-                                                             : kListenerDeadlineMs * 2,
-                                                         target_status)
-                          : wait_owned_child_bounded(target,
-                                                     executable,
-                                                     target_argv,
-                                                     caller_uid,
-                                                     caller_gid,
-                                                     static_cast<ino_t>(expected_netns),
-                                                     target,
-                                                     true,
-                                                     target_wait_ms,
-                                                     target_status,
-                                                     kCredentialFd,
-                                                     &control);
+    OwnedWaitResult target_wait_result = OwnedWaitResult::Error;
+    switch (wait_strategy) {
+        case TargetWaitStrategy::ListenerCustody:
+            target_wait_result =
+                wait_listener_target_bounded(target,
+                                             listener_target_start,
+                                             executable,
+                                             target_argv,
+                                             root_broker,
+                                             root_identity.start,
+                                             kCredentialFd,
+                                             custody_pair[0],
+                                             listener_failure_integration(scenario),
+                                             control,
+                                             token,
+                                             static_cast<ino_t>(expected_netns),
+                                             caller_uid,
+                                             caller_gid,
+                                             kListenerDeadlineMs * 2,
+                                             target_status);
+            break;
+        case TargetWaitStrategy::OwnedWait:
+            target_wait_result = wait_owned_child_bounded(target,
+                                                          executable,
+                                                          target_argv,
+                                                          caller_uid,
+                                                          caller_gid,
+                                                          static_cast<ino_t>(expected_netns),
+                                                          target,
+                                                          true,
+                                                          canonical_collision_scenario(scenario)
+                                                              ? kCanonicalDroppedTargetWaitMs
+                                                              : target_wait_ms,
+                                                          target_status,
+                                                          kCredentialFd,
+                                                          &control);
+            break;
+    }
     if (target_wait_result != OwnedWaitResult::Exited) {
         if (target_wait_result == OwnedWaitResult::LeaseLost) target_cleanup.disarm();
         close(kCredentialFd);
@@ -7965,10 +8046,9 @@ static int root_broker_main(const char* executable,
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
     int status = 0;
-    const int dropped_wait_ms = canonical_collision_scenario(scenario)
-                                    ? kWildcardAttemptAggregateWaitMs
-                                : listener_scenario_name(scenario) ? kListenerDeadlineMs * 3
-                                                                   : kBrokerDeadlineMs;
+    const int dropped_wait_ms = canonical_collision_scenario(scenario) ? kCanonicalRootDroppedWaitMs
+                                : listener_scenario_name(scenario)     ? kListenerDeadlineMs * 3
+                                                                       : kBrokerDeadlineMs;
     const OwnedWaitResult dropped_wait_result =
         wait_owned_child_bounded(dropped,
                                  executable,
@@ -13701,6 +13781,15 @@ static bool run_positive(const std::string& sudo_path,
 int main(int argc, char** argv) {
     if (argc == 3 && strcmp(argv[2], "--canonical-cleanup-live-self-check") == 0) {
         for (;;) pause();
+    }
+    if (argc == 2 && strcmp(argv[1], "--canonical-wait-strategy-self-check") == 0) {
+        std::string error;
+        if (!listener_failure_bound_self_check(error)) {
+            std::cerr << "FAIL [#377 canonical wait strategy self-check]: " << error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #377 canonical wait strategy self-check\n";
+        return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--canonical-target-cleanup-self-check") == 0) {
         std::string error;

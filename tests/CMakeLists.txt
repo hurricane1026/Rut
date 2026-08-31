@@ -865,11 +865,12 @@ if(RUT_ENABLE_JIT)
     add_dependencies(test_fixture_privileged_broker rut)
     add_test(NAME test_fixture_privileged_broker
              COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+    set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 120
+        TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}
         SKIP_RETURN_CODE 77
     )
     add_test(NAME test_fixture_wildcard_attempt_protocol
@@ -877,6 +878,13 @@ if(RUT_ENABLE_JIT)
                      --wildcard-attempt-protocol-self-check)
     set_tests_properties(test_fixture_wildcard_attempt_protocol PROPERTIES
         LABELS "unit"
+    )
+    add_test(NAME test_fixture_canonical_wait_strategy
+             COMMAND test_fixture_privileged_broker
+                     --canonical-wait-strategy-self-check)
+    set_tests_properties(test_fixture_canonical_wait_strategy PROPERTIES
+        LABELS "unit"
+        TIMEOUT 30
     )
     add_test(NAME test_fixture_canonical_target_cleanup
              COMMAND test_fixture_privileged_broker
