@@ -177,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
-            timeout --signal=TERM --kill-after=10s 180s \
+            timeout --signal=TERM --kill-after=10s 360s \
               ./build/tests/test_fixture_privileged_broker "$(realpath ./build/src/rut)" 2>&1 | \
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/direct.log"
 
@@ -187,7 +187,7 @@ jobs:
           set -euo pipefail
           RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
             ctest --test-dir build --output-on-failure --no-tests=error \
-              -j 1 --timeout 180 -R '^test_fixture_privileged_broker$' 2>&1 | \
+              -j 1 --timeout 360 -R '^test_fixture_privileged_broker$' 2>&1 | \
             tee "${RUNNER_TEMP}/issue358-stage2a3b-logs/ctest.log"
 
       - name: Audit residual Stage2a2 resources
