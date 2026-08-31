@@ -95,8 +95,12 @@ bool wait_ready(int fd,
             return fail(
                 diagnostic, DiagnosticCode::PollError, stage, error_number, bytes_transferred);
         }
-        if (result == 0)
-            return fail(diagnostic, DiagnosticCode::Deadline, stage, ETIMEDOUT, bytes_transferred);
+        if (result == 0) {
+            if (Clock::now() >= deadline)
+                return fail(
+                    diagnostic, DiagnosticCode::Deadline, stage, ETIMEDOUT, bytes_transferred);
+            continue;
+        }
         if (Clock::now() >= deadline)
             return fail(diagnostic, DiagnosticCode::Deadline, stage, ETIMEDOUT, bytes_transferred);
         if ((descriptor.revents & POLLNVAL) != 0)
@@ -133,7 +137,8 @@ bool read_exact(int fd,
             return fail(diagnostic, code, stage, 0, total);
         }
         const int error_number = errno;
-        if (error_number == EINTR) continue;
+        if (error_number == EINTR || error_number == EAGAIN || error_number == EWOULDBLOCK)
+            continue;
         return fail(diagnostic, DiagnosticCode::SyscallError, stage, error_number, total);
     }
     return true;
@@ -162,7 +167,8 @@ bool write_exact(int fd,
         }
         if (count == 0) return fail(diagnostic, DiagnosticCode::SyscallError, stage, EPIPE, total);
         const int error_number = errno;
-        if (error_number == EINTR) continue;
+        if (error_number == EINTR || error_number == EAGAIN || error_number == EWOULDBLOCK)
+            continue;
         return fail(diagnostic, DiagnosticCode::SyscallError, stage, error_number, total);
     }
     return true;

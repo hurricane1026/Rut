@@ -118,21 +118,33 @@ struct HookState {
     unsigned poll_eintr = 0u;
     unsigned recv_eintr = 0u;
     unsigned send_eintr = 0u;
+    unsigned recv_eagain_on_call = std::numeric_limits<unsigned>::max();
+    unsigned send_eagain_on_call = std::numeric_limits<unsigned>::max();
     unsigned poll_calls = 0u;
     unsigned recv_calls = 0u;
     unsigned send_calls = 0u;
+    int first_poll_timeout = -1;
+    int second_poll_timeout = -1;
     unsigned recv_fail_after = std::numeric_limits<unsigned>::max();
     unsigned send_fail_after = std::numeric_limits<unsigned>::max();
     unsigned poll_zero_after = std::numeric_limits<unsigned>::max();
+    unsigned recv_zero_after = std::numeric_limits<unsigned>::max();
+    unsigned poll_hup_after = std::numeric_limits<unsigned>::max();
+    unsigned poll_error_after = std::numeric_limits<unsigned>::max();
+    bool poll_zero_once = false;
     int failure_errno = EIO;
     bool poll_failure = false;
     bool recv_failure = false;
     bool send_failure = false;
 };
 
-int ready_poll(pollfd* descriptors, nfds_t count, int, void* opaque) {
+int ready_poll(pollfd* descriptors, nfds_t count, int timeout, void* opaque) {
     auto& state = *static_cast<HookState*>(opaque);
     ++state.poll_calls;
+    if (state.poll_calls == 1u)
+        state.first_poll_timeout = timeout;
+    else if (state.poll_calls == 2u)
+        state.second_poll_timeout = timeout;
     if (state.poll_eintr != 0u) {
         --state.poll_eintr;
         errno = EINTR;
@@ -142,12 +154,15 @@ int ready_poll(pollfd* descriptors, nfds_t count, int, void* opaque) {
         errno = state.failure_errno;
         return -1;
     }
-    if (state.poll_calls > state.poll_zero_after) {
+    if ((state.poll_zero_once && state.poll_calls == 1u) ||
+        state.poll_calls > state.poll_zero_after) {
         descriptors[0].revents = 0;
         return 0;
     }
     for (nfds_t index = 0u; index != count; ++index)
         descriptors[index].revents = descriptors[index].events;
+    if (state.poll_calls > state.poll_hup_after) descriptors[0].revents |= POLLHUP;
+    if (state.poll_calls > state.poll_error_after) descriptors[0].revents |= POLLERR;
     return 1;
 }
 
@@ -159,6 +174,11 @@ ssize_t fragmented_recv(int fd, void* data, std::size_t size, int flags, void* o
         errno = EINTR;
         return -1;
     }
+    if (state.recv_calls == state.recv_eagain_on_call) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (state.recv_calls > state.recv_zero_after) return 0;
     if (state.recv_failure || state.recv_calls > state.recv_fail_after) {
         errno = state.failure_errno;
         return -1;
@@ -173,6 +193,10 @@ ssize_t fragmented_send(int fd, const void* data, std::size_t size, int flags, v
     if (state.send_eintr != 0u) {
         --state.send_eintr;
         errno = EINTR;
+        return -1;
+    }
+    if (state.send_calls == state.send_eagain_on_call) {
+        errno = EAGAIN;
         return -1;
     }
     if (state.send_failure || state.send_calls > state.send_fail_after) {
@@ -285,6 +309,101 @@ bool test_fragmented_eintr() {
     return ok;
 }
 
+bool test_zero_poll_is_retried() {
+    int descriptors[2] = {-1, -1};
+    if (!check(open_pair(descriptors), "zero-poll socketpair")) return false;
+    const worker::Token expected = token();
+    const worker::Frame sent = frame(expected);
+    const Bytes header =
+        wire_header(sent.type, expected, static_cast<worker::u32>(sent.payload.size()));
+    Bytes wire = header;
+    wire.insert(wire.end(), sent.payload.begin(), sent.payload.end());
+    bool ok = check(write_all(descriptors[0], wire.data(), wire.size()), "zero-poll wire");
+
+    HookState state;
+    state.poll_zero_once = true;
+    worker::Frame received = frame(token(0x90u), 91u);
+    const worker::Frame original = received;
+    transport::Diagnostic diagnostic;
+    ok &= check(transport::receive_frame(descriptors[1],
+                                         expected,
+                                         worker::kMaxPayload,
+                                         Clock::now() + std::chrono::hours(24 * 30),
+                                         received,
+                                         diagnostic,
+                                         hooks(state)),
+                "zero-poll retry succeeds");
+    ok &= check(same_frame(received, sent), "zero-poll retry frame");
+    ok &= check(diagnostic == transport::Diagnostic{}, "zero-poll retry diagnostic");
+    ok &= check(state.poll_calls >= 2u, "zero-poll retry called poll again");
+    ok &= check(state.first_poll_timeout == std::numeric_limits<int>::max() &&
+                    state.second_poll_timeout == std::numeric_limits<int>::max(),
+                "zero-poll retry keeps distant absolute deadline");
+    ok &= check(!same_frame(received, original), "zero-poll retry output committed");
+    close_pair(descriptors);
+    return ok;
+}
+
+bool test_eagain_after_partial_transfer() {
+    const worker::Token expected = token();
+    const worker::Frame sent = frame(expected, evidence::kEnvelopeBytes + 13u);
+    const Bytes header =
+        wire_header(sent.type, expected, static_cast<worker::u32>(sent.payload.size()));
+    Bytes wire = header;
+    wire.insert(wire.end(), sent.payload.begin(), sent.payload.end());
+    bool ok = true;
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "receive EAGAIN socketpair");
+        ok &= check(write_all(descriptors[0], wire.data(), wire.size()), "receive EAGAIN wire");
+        HookState state;
+        state.chunk = 7u;
+        state.recv_eagain_on_call = 2u;
+        worker::Frame received = frame(token(0x90u), 91u);
+        transport::Diagnostic diagnostic;
+        ok &= check(transport::receive_frame(descriptors[1],
+                                             expected,
+                                             worker::kMaxPayload,
+                                             Clock::now() + std::chrono::seconds(2),
+                                             received,
+                                             diagnostic,
+                                             hooks(state)),
+                    "receive EAGAIN after partial transfer");
+        ok &= check(same_frame(received, sent), "receive EAGAIN frame");
+        ok &= check(state.recv_calls > 2u && state.poll_calls == state.recv_calls,
+                    "receive EAGAIN uses wait loop");
+        close_pair(descriptors);
+    }
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "send EAGAIN socketpair");
+        HookState state;
+        state.chunk = 5u;
+        state.send_eagain_on_call = 2u;
+        transport::Diagnostic diagnostic;
+        ok &= check(transport::send_frame(descriptors[0],
+                                          expected,
+                                          worker::kMaxPayload,
+                                          Clock::now() + std::chrono::seconds(2),
+                                          sent,
+                                          diagnostic,
+                                          hooks(state)),
+                    "send EAGAIN after partial transfer");
+        ok &= check(diagnostic == transport::Diagnostic{}, "send EAGAIN diagnostic");
+        ok &= check(state.send_calls > 2u && state.poll_calls == state.send_calls,
+                    "send EAGAIN uses wait loop");
+        std::vector<unsigned char> peer_wire(wire.size());
+        ok &= check(::recv(descriptors[1], peer_wire.data(), peer_wire.size(), MSG_WAITALL) ==
+                        static_cast<ssize_t>(peer_wire.size()),
+                    "send EAGAIN wire size");
+        ok &= check(peer_wire == wire, "send EAGAIN wire unchanged");
+        close_pair(descriptors);
+    }
+    return ok;
+}
+
 bool test_deadlines_and_eof() {
     bool ok = true;
     const worker::Token expected = token();
@@ -328,7 +447,7 @@ bool test_deadlines_and_eof() {
         ok &= check(!transport::receive_frame(descriptors[1],
                                               expected,
                                               worker::kMaxPayload,
-                                              Clock::now() + std::chrono::seconds(1),
+                                              Clock::now() + std::chrono::milliseconds(5),
                                               output,
                                               diagnostic,
                                               hooks(state)),
@@ -765,6 +884,162 @@ bool test_poll_and_syscall_errors() {
     return ok;
 }
 
+bool test_poll_hup_and_error_causality() {
+    const worker::Token expected = token();
+    const worker::Frame value = frame(expected, evidence::kEnvelopeBytes + 20u);
+    bool ok = true;
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "HUP clean EOF socketpair");
+        HookState state;
+        state.poll_hup_after = 0u;
+        state.recv_zero_after = 0u;
+        worker::Frame output = frame(token(0x90u), 91u);
+        const worker::Frame original = output;
+        transport::Diagnostic diagnostic;
+        ok &= check(!transport::receive_frame(descriptors[1],
+                                              expected,
+                                              worker::kMaxPayload,
+                                              Clock::now() + std::chrono::seconds(2),
+                                              output,
+                                              diagnostic,
+                                              hooks(state)),
+                    "HUP then zero is clean EOF");
+        ok &= expect_diagnostic(diagnostic,
+                                transport::DiagnosticCode::CleanEofBeforeHeader,
+                                transport::Stage::ReadHeader,
+                                0,
+                                0u,
+                                "HUP clean EOF diagnostic");
+        ok &= check(same_frame(output, original), "HUP clean EOF output untouched");
+        close_pair(descriptors);
+    }
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "HUP truncated header socketpair");
+        const Bytes header =
+            wire_header(value.type, expected, static_cast<worker::u32>(value.payload.size()));
+        ok &= check(write_all(descriptors[0], header.data(), 7u), "HUP truncated header bytes");
+        HookState state;
+        state.chunk = 7u;
+        state.poll_hup_after = 1u;
+        state.recv_zero_after = 1u;
+        worker::Frame output = frame(token(0x90u), 91u);
+        const worker::Frame original = output;
+        transport::Diagnostic diagnostic;
+        ok &= check(!transport::receive_frame(descriptors[1],
+                                              expected,
+                                              worker::kMaxPayload,
+                                              Clock::now() + std::chrono::seconds(2),
+                                              output,
+                                              diagnostic,
+                                              hooks(state)),
+                    "HUP then zero truncates header");
+        ok &= expect_diagnostic(diagnostic,
+                                transport::DiagnosticCode::TruncatedHeader,
+                                transport::Stage::ReadHeader,
+                                0,
+                                7u,
+                                "HUP truncated header diagnostic");
+        ok &= check(same_frame(output, original), "HUP truncated header output untouched");
+        close_pair(descriptors);
+    }
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "HUP truncated payload socketpair");
+        const Bytes header =
+            wire_header(value.type, expected, static_cast<worker::u32>(value.payload.size()));
+        ok &= check(write_all(descriptors[0], header.data(), header.size()),
+                    "HUP truncated payload header");
+        ok &= check(write_all(descriptors[0], value.payload.data(), 4u),
+                    "HUP truncated payload bytes");
+        HookState state;
+        state.poll_hup_after = 2u;
+        state.recv_zero_after = 2u;
+        worker::Frame output = frame(token(0x90u), 91u);
+        const worker::Frame original = output;
+        transport::Diagnostic diagnostic;
+        ok &= check(!transport::receive_frame(descriptors[1],
+                                              expected,
+                                              worker::kMaxPayload,
+                                              Clock::now() + std::chrono::seconds(2),
+                                              output,
+                                              diagnostic,
+                                              hooks(state)),
+                    "HUP then zero truncates payload");
+        ok &= expect_diagnostic(diagnostic,
+                                transport::DiagnosticCode::TruncatedPayload,
+                                transport::Stage::ReadPayload,
+                                0,
+                                worker::kHeaderBytes + 4u,
+                                "HUP truncated payload diagnostic");
+        ok &= check(same_frame(output, original), "HUP truncated payload output untouched");
+        close_pair(descriptors);
+    }
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "ERR receive socketpair");
+        const Bytes header =
+            wire_header(value.type, expected, static_cast<worker::u32>(value.payload.size()));
+        ok &= check(write_all(descriptors[0], header.data(), header.size()), "ERR receive bytes");
+        HookState state;
+        state.chunk = 7u;
+        state.poll_error_after = 1u;
+        state.recv_fail_after = 1u;
+        state.failure_errno = EPROTO;
+        worker::Frame output = frame(token(0x90u), 91u);
+        const worker::Frame original = output;
+        transport::Diagnostic diagnostic;
+        ok &= check(!transport::receive_frame(descriptors[1],
+                                              expected,
+                                              worker::kMaxPayload,
+                                              Clock::now() + std::chrono::seconds(2),
+                                              output,
+                                              diagnostic,
+                                              hooks(state)),
+                    "ERR then recv fixed errno");
+        ok &= expect_diagnostic(diagnostic,
+                                transport::DiagnosticCode::SyscallError,
+                                transport::Stage::ReadHeader,
+                                EPROTO,
+                                7u,
+                                "ERR receive causal diagnostic");
+        ok &= check(same_frame(output, original), "ERR receive output untouched");
+        close_pair(descriptors);
+    }
+
+    {
+        int descriptors[2] = {-1, -1};
+        ok &= check(open_pair(descriptors), "ERR send socketpair");
+        HookState state;
+        state.chunk = 5u;
+        state.poll_error_after = 1u;
+        state.send_fail_after = 1u;
+        state.failure_errno = ENOSPC;
+        transport::Diagnostic diagnostic;
+        ok &= check(!transport::send_frame(descriptors[0],
+                                           expected,
+                                           worker::kMaxPayload,
+                                           Clock::now() + std::chrono::seconds(2),
+                                           value,
+                                           diagnostic,
+                                           hooks(state)),
+                    "ERR then send fixed errno");
+        ok &= expect_diagnostic(diagnostic,
+                                transport::DiagnosticCode::SyscallError,
+                                transport::Stage::WriteHeader,
+                                ENOSPC,
+                                5u,
+                                "ERR send causal diagnostic");
+        close_pair(descriptors);
+    }
+    return ok;
+}
+
 bool test_partial_terminal_errors() {
     const worker::Token expected = token();
     const worker::Frame value = frame(expected);
@@ -918,10 +1193,13 @@ int main() {
     bool ok = true;
     ok &= test_canonical_and_exact_wire();
     ok &= test_fragmented_eintr();
+    ok &= test_zero_poll_is_retried();
+    ok &= test_eagain_after_partial_transfer();
     ok &= test_deadlines_and_eof();
     ok &= test_protocol_rejections();
     ok &= test_argument_and_send_validation();
     ok &= test_poll_and_syscall_errors();
+    ok &= test_poll_hup_and_error_causality();
     ok &= test_partial_terminal_errors();
     ok &= test_peer_close_and_decoder_rejection();
     if (!ok) return 1;
