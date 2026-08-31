@@ -1,9 +1,11 @@
 #include "fixture_private_directory_lease.h"
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -19,9 +21,6 @@ std::string seed(unsigned tag) {
     std::array<char, 33> bytes{};
     std::snprintf(bytes.data(), bytes.size(), "%032x", getpid() * 16u + tag);
     return bytes.data();
-}
-std::string quarantine(const std::string& value) {
-    return ".rut377-directory-quarantine-" + value;
 }
 struct ObjectIdentity {
     std::uint64_t device = 0, inode = 0;
@@ -44,14 +43,21 @@ bool absent_at(int parent, const std::string& name) {
     errno = 0;
     return !identity_at(parent, name, unused) && errno == ENOENT;
 }
-bool fd_count(unsigned& count) {
+bool fd_snapshot(std::vector<int>& values) {
+    values.clear();
     DIR* stream = opendir("/proc/self/fd");
     if (!stream) return false;
-    count = 0;
-    while (dirent* entry = readdir(stream))
-        if (entry->d_name[0] != '.') ++count;
-    --count;
-    return closedir(stream) == 0;
+    const int own = dirfd(stream);
+    errno = 0;
+    while (dirent* entry = readdir(stream)) {
+        int value = -1;
+        if (std::sscanf(entry->d_name, "%d", &value) == 1 && value != own) values.push_back(value);
+        errno = 0;
+    }
+    const int error = errno;
+    if (closedir(stream) != 0 || error != 0) return false;
+    std::sort(values.begin(), values.end());
+    return true;
 }
 directory::HooksForTesting hooks(unsigned tag) {
     directory::HooksForTesting value;
@@ -83,12 +89,10 @@ std::shared_ptr<const directory::SettlementReceipt> normal(unsigned tag, bool ex
     return receipt;
 }
 bool normal_lifecycle_tests() {
-    unsigned before = 0, after = 0;
-    const bool baseline = fd_count(before);
-    const auto explicit_receipt = normal(1, true);
-    const auto destructor_receipt = normal(2, false);
-    return check(baseline && complete(explicit_receipt) && complete(destructor_receipt) &&
-                     fd_count(after) && before == after,
+    std::vector<int> before, after;
+    const bool baseline = fd_snapshot(before);
+    return check(baseline && complete(normal(1, true)) && complete(normal(2, false)) &&
+                     fd_snapshot(after) && before == after,
                  "explicit/destructor settlement and FD baseline");
 }
 bool creation_abort_test() {
@@ -167,7 +171,7 @@ bool collision_retry_test() {
     directory::Diagnostic diagnostic;
     if (!create(config, lease, diagnostic)) return false;
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    const std::string collision = quarantine(config.quarantine_seeds[0]);
+    const std::string collision = ".rut377-directory-quarantine-" + config.quarantine_seeds[0];
     ObjectIdentity collision_id, observed_collision, candidate;
     const bool prepared = mkdirat(parent, collision.c_str(), 0700) == 0 &&
                           identity_at(parent, collision, collision_id) &&
@@ -278,6 +282,8 @@ bool original_residue_test() {
         !receipt->settlement_complete && !receipt->descriptor_closed && receipt->namespace_synced &&
         receipt->original_residue == directory::Residue::Present &&
         receipt->candidate_residue == directory::Residue::Absent &&
+        failed(diagnostic, directory::FailurePhase::Revalidate, EEXIST) &&
+        !lease.settle(diagnostic) &&
         failed(diagnostic, directory::FailurePhase::Revalidate, EEXIST) &&
         same(mutation.candidate_id, lease.identity()) &&
         identity_at(parent, mutation.original, observed) && same(observed, mutation.original_id) &&

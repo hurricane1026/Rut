@@ -298,7 +298,7 @@ bool PrivateDirectoryLease::finalize_removed(Diagnostic& diagnostic) {
             return reject(diagnostic, FailurePhase::Close, errno);
         }
     }
-    if (parent_fd_ < 0 || close_failed_) return receipt_->settlement_complete;
+    if (parent_fd_ < 0 || close_failed_) return diagnostic = receipt_->diagnostic, false;
     if (fsync(parent_fd_) != 0) return reject(diagnostic, FailurePhase::Sync, errno);
     receipt_->namespace_synced = true;
     if (receipt_->original_residue != Residue::Absent ||
