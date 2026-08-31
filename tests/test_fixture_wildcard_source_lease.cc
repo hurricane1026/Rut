@@ -268,7 +268,31 @@ bool exact_bytes_creation_and_bounds_test() {
                    boundary.revalidate(diagnostic),
                "255-byte exact source boundary was rejected") &&
          ok;
-    return check(canonical.remove(diagnostic) && boundary.remove(diagnostic),
+
+    source_lease::WildcardAttemptSourceLease poisoned_owner;
+    std::string caller_owned = "owned exact source bytes\n";
+    const std::string expected_caller_bytes = caller_owned;
+    const bool poison_created =
+        source_lease::WildcardAttemptSourceLease::create_exact_bytes(directory.fd,
+                                                                     directory.path,
+                                                                     "poisoned-owner.rut",
+                                                                     caller_owned,
+                                                                     poisoned_owner,
+                                                                     diagnostic);
+    caller_owned.assign(caller_owned.size(), 'z');
+    std::array<char, 64> leased_bytes{};
+    const ssize_t leased_count =
+        poison_created
+            ? pread(poisoned_owner.descriptor(), leased_bytes.data(), leased_bytes.size(), 0)
+            : -1;
+    ok = check(poison_created && caller_owned != expected_caller_bytes &&
+                   poisoned_owner.revalidate(diagnostic) && leased_count >= 0 &&
+                   std::string(leased_bytes.data(), static_cast<std::size_t>(leased_count)) ==
+                       expected_caller_bytes,
+               "caller exact-byte poisoning changed leased source") &&
+         ok;
+    return check(canonical.remove(diagnostic) && boundary.remove(diagnostic) &&
+                     poisoned_owner.remove(diagnostic),
                  "exact source cleanup failed") &&
            ok;
 }

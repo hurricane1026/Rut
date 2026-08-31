@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,9 +21,11 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/fs.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -49,38 +52,135 @@ Clock::time_point deadline(int milliseconds = 7000) {
 }
 
 struct PrivateDirectory {
+    struct Identity {
+        dev_t device = 0;
+        ino_t inode = 0;
+        mode_t mode = 0;
+        uid_t uid = static_cast<uid_t>(-1);
+        gid_t gid = static_cast<gid_t>(-1);
+    };
+
     std::string path;
+    std::string basename;
+    int parent_fd = -1;
     int fd = -1;
+    Identity identity;
+    bool active = false;
+
+    static Identity make_identity(const struct stat& status) {
+        return {status.st_dev, status.st_ino, status.st_mode, status.st_uid, status.st_gid};
+    }
+
+    static bool same_identity(const struct stat& status, const Identity& expected) {
+        return S_ISDIR(status.st_mode) && status.st_dev == expected.device &&
+               status.st_ino == expected.inode && status.st_mode == expected.mode &&
+               status.st_uid == expected.uid && status.st_gid == expected.gid &&
+               (status.st_mode & 0777) == 0700;
+    }
+
+    static int rename_noreplace(int directory, const char* old_name, const char* new_name) {
+#ifdef SYS_renameat2
+        return static_cast<int>(
+            syscall(SYS_renameat2, directory, old_name, directory, new_name, RENAME_NOREPLACE));
+#else
+        (void)directory;
+        (void)old_name;
+        (void)new_name;
+        errno = ENOSYS;
+        return -1;
+#endif
+    }
+
+    bool validate_named(const std::string& name, const Identity& expected) const {
+        struct stat held{};
+        struct stat named{};
+        return parent_fd >= 0 && fd >= 0 && fstat(fd, &held) == 0 &&
+               fstatat(parent_fd, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+               same_identity(held, identity) && same_identity(named, expected);
+    }
 
     bool create() {
+        parent_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (parent_fd < 0) return false;
         std::array<char, 64> pattern{};
         std::snprintf(pattern.data(), pattern.size(), "/tmp/rut377-canonical-XXXXXX");
         char* const created = mkdtemp(pattern.data());
         if (created == nullptr) return false;
         path = created;
-        if (chmod(path.c_str(), 0700) != 0) return false;
-        fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        return fd >= 0;
+        basename = path.substr(std::string_view{"/tmp/"}.size());
+        fd = openat(parent_fd, basename.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 || fchmod(fd, 0700) != 0) return false;
+        struct stat status{};
+        if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != getuid() ||
+            status.st_gid != getgid() || (status.st_mode & 0777) != 0700)
+            return false;
+        identity = make_identity(status);
+        active = true;
+        return validate_named(basename, identity);
     }
 
     bool settle() {
-        bool ok = true;
-        if (fd >= 0) {
-            ok = close(fd) == 0;
-            fd = -1;
+        if (!active || !validate_named(basename, identity)) return false;
+        const std::string quarantine = basename + ".quarantine";
+        if (rename_noreplace(parent_fd, basename.c_str(), quarantine.c_str()) != 0) return false;
+        if (!validate_named(quarantine, identity)) {
+            (void)rename_noreplace(parent_fd, quarantine.c_str(), basename.c_str());
+            return false;
         }
-        if (!path.empty()) {
-            if (rmdir(path.c_str()) == 0)
-                path.clear();
-            else
-                ok = false;
+        if (unlinkat(parent_fd, quarantine.c_str(), AT_REMOVEDIR) != 0) {
+            (void)rename_noreplace(parent_fd, quarantine.c_str(), basename.c_str());
+            return false;
         }
-        return ok;
+        active = false;
+        const bool synced = fsync(parent_fd) == 0;
+        const int directory_slot = fd;
+        fd = -1;
+        const bool directory_closed = close(directory_slot) == 0;
+        const int parent_slot = parent_fd;
+        parent_fd = -1;
+        const bool parent_closed = close(parent_slot) == 0;
+        if (synced && directory_closed && parent_closed) {
+            path.clear();
+            basename.clear();
+            return true;
+        }
+        return false;
+    }
+
+    bool replace_entry_for_testing(Identity& replacement) {
+        if (!active || !validate_named(basename, identity)) return false;
+        const std::string saved = basename + ".saved";
+        if (rename_noreplace(parent_fd, basename.c_str(), saved.c_str()) != 0) return false;
+        if (mkdirat(parent_fd, basename.c_str(), 0700) != 0) {
+            (void)rename_noreplace(parent_fd, saved.c_str(), basename.c_str());
+            return false;
+        }
+        struct stat status{};
+        if (fstatat(parent_fd, basename.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) return false;
+        replacement = make_identity(status);
+        return !same_identity(status, identity);
+    }
+
+    bool replacement_intact_for_testing(const Identity& replacement) const {
+        struct stat status{};
+        return parent_fd >= 0 &&
+               fstatat(parent_fd, basename.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 &&
+               same_identity(status, replacement);
+    }
+
+    bool restore_after_replacement_for_testing(const Identity& replacement) {
+        const std::string saved = basename + ".saved";
+        if (!replacement_intact_for_testing(replacement) ||
+            unlinkat(parent_fd, basename.c_str(), AT_REMOVEDIR) != 0 ||
+            rename_noreplace(parent_fd, saved.c_str(), basename.c_str()) != 0)
+            return false;
+        return fsync(parent_fd) == 0 && validate_named(basename, identity);
     }
 
     ~PrivateDirectory() {
+        if (active) (void)settle();
         if (fd >= 0) (void)close(fd);
-        if (!path.empty()) (void)rmdir(path.c_str());
+        if (parent_fd >= 0) (void)close(parent_fd);
     }
 };
 
@@ -98,6 +198,20 @@ struct OwnedFd {
         if (value >= 0) (void)close(value);
     }
 };
+
+bool directory_replacement_refusal_test() {
+    PrivateDirectory directory;
+    PrivateDirectory::Identity replacement;
+    if (!check(directory.create(), "directory replacement setup") ||
+        !check(directory.replace_entry_for_testing(replacement), "directory replacement injection"))
+        return false;
+    const bool refused = !directory.settle();
+    const bool replacement_preserved = directory.replacement_intact_for_testing(replacement);
+    const bool restored = directory.restore_after_replacement_for_testing(replacement);
+    const bool removed = restored && directory.settle();
+    return check(refused && replacement_preserved && restored && removed,
+                 "directory replacement was removed or prevented exact retry");
+}
 
 bool fd_snapshot(std::vector<int>& descriptors) {
     descriptors.clear();
@@ -156,6 +270,13 @@ bool pidfd_live(int descriptor) {
         if (result < 0 && errno == EINTR) continue;
         return result == 0 && observed.revents == 0;
     }
+}
+
+bool exact_empty_environment(pid_t pid) {
+    std::string environment;
+    return pid > 0 &&
+           protocol::read_file("/proc/" + std::to_string(pid) + "/environ", environment, 1u) &&
+           environment.empty();
 }
 
 std::string encode_arguments(std::span<const std::string_view> arguments) {
@@ -285,180 +406,254 @@ bool run_one_canonical_session() {
         !check(child_snapshot(baseline_children), "baseline direct-child snapshot"))
         return false;
 
-    // Declaration order is the reverse of defensive destruction order:
-    // child -> handoff -> null -> capture -> executable -> source -> directory.
-    PrivateDirectory directory;
-    source::WildcardAttemptSourceLease source_lease;
-    executable::ExecutableLease executable_lease;
-    capture::AnonymousLogCapture output;
-    OwnedFd null_input;
-    handoff::ExecutableExecHandoffLease handoff_lease;
-    child::PausedChildLease child_lease;
-
-    source::Diagnostic source_diagnostic;
-    executable::Diagnostic executable_diagnostic;
-    capture::Diagnostic capture_diagnostic;
-    handoff::Diagnostic handoff_diagnostic;
-    child::Diagnostic child_diagnostic;
-    std::string executable_path;
     std::string source_path;
     std::string directory_path;
-    const auto until = deadline();
+    protocol::ProcIdentity launched_identity;
+    bool launched_identity_known = false;
     bool ok = true;
+    {
+        // Declaration order is the reverse of defensive destruction order:
+        // child -> handoff -> null -> capture -> executable -> source -> directory.
+        PrivateDirectory directory;
+        source::WildcardAttemptSourceLease source_lease;
+        executable::ExecutableLease executable_lease;
+        capture::AnonymousLogCapture output;
+        OwnedFd null_input;
+        handoff::ExecutableExecHandoffLease handoff_lease;
+        child::PausedChildLease child_lease;
 
-    if (!check(directory.create(), "private directory creation") ||
-        !check(source::WildcardAttemptSourceLease::create_exact_bytes(directory.fd,
-                                                                      directory.path,
-                                                                      kSourceBasename,
-                                                                      kSourceBytes,
-                                                                      source_lease,
-                                                                      source_diagnostic),
-               "exact ordinary-RUT source lease") ||
-        !check(canonical_executable(executable_path), "canonical public rut path") ||
-        !check(executable::ExecutableLease::create(
-                   executable_path, executable_lease, executable_diagnostic),
-               "public rut executable lease") ||
-        !check(capture::AnonymousLogCapture::create(
-                   capture::kMaxCaptureBytes, output, capture_diagnostic),
-               "bounded startup capture"))
-        return false;
-    source_path = source_lease.path();
-    directory_path = directory.path;
-    null_input.value = open("/dev/null", O_RDONLY | O_CLOEXEC);
-    if (!check(null_input.value >= 0, "borrowed /dev/null") ||
-        !check(handoff::ExecutableExecHandoffLease::create(
-                   executable_lease, handoff_lease, handoff_diagnostic),
-               "executable handoff"))
-        return false;
+        source::Diagnostic source_diagnostic;
+        executable::Diagnostic executable_diagnostic;
+        capture::Diagnostic capture_diagnostic;
+        handoff::Diagnostic handoff_diagnostic;
+        child::Diagnostic child_diagnostic;
+        std::string executable_path;
+        const auto until = deadline();
+        const auto record = [&](bool result, const char* message) {
+            ok = check(result, message) && ok;
+            return result;
+        };
 
-    const std::array<std::string_view, 9> arguments = {
-        executable_path, source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"};
-    const std::string expected_cmdline = encode_arguments(arguments);
-    const bool no_access_log_configuration =
-        std::string_view{kSourceBytes}.find("access_log") == std::string_view::npos &&
-        std::none_of(arguments.begin(), arguments.end(), [](std::string_view argument) {
-            return argument.find("access-log") != std::string_view::npos;
-        });
-    child::ChildDescriptorPlan plan;
-    if (!check(no_access_log_configuration, "source/argv unexpectedly configure an access log") ||
-        !check(
-            handoff_lease.make_child_plan_with_arguments(
-                null_input.value, output.descriptor(), false, arguments, plan, handoff_diagnostic),
-            "exact nine-argument child plan") ||
-        !check(child::PausedChildLease::create_prepared(until, plan, child_lease, child_diagnostic),
-               "prepared public rut child"))
-        return false;
+        const bool directory_created = record(directory.create(), "private directory creation");
+        directory_path = directory.path;
+        bool source_created = false;
+        if (directory_created) {
+            source_created =
+                record(source::WildcardAttemptSourceLease::create_exact_bytes(directory.fd,
+                                                                              directory.path,
+                                                                              kSourceBasename,
+                                                                              kSourceBytes,
+                                                                              source_lease,
+                                                                              source_diagnostic),
+                       "exact ordinary-RUT source lease");
+            if (source_created) source_path = source_lease.path();
+        }
 
-    const pid_t launched_pid = child_lease.child_pid();
-    const auto settlement = child_lease.settlement_receipt();
-    handoff::ExecObservation observation;
-    const bool exec_observed =
-        handoff_lease.release_and_observe(
-            executable_lease, child_lease, until, observation, handoff_diagnostic) &&
-        observation.outcome == handoff::ExecOutcome::ExecObservedLive &&
-        observation.first.cmdline == expected_cmdline &&
-        observation.second.cmdline == expected_cmdline;
-    ok = check(exec_observed, "public rut exec observation") && ok;
+        const bool executable_path_known =
+            source_created &&
+            record(canonical_executable(executable_path), "canonical public rut path");
+        bool executable_created = false;
+        if (executable_path_known)
+            executable_created =
+                record(executable::ExecutableLease::create(
+                           executable_path, executable_lease, executable_diagnostic),
+                       "public rut executable lease");
 
-    std::string readiness_bytes;
-    StartupEvidence readiness_evidence;
-    bool readiness = false;
-    if (exec_observed) {
-        std::string candidate;
-        StartupEvidence candidate_evidence;
-        if (wait_for_strict_startup(output, source_path, until, candidate, candidate_evidence)) {
-            protocol::ProcIdentity first_proc;
-            protocol::ProcIdentity second_proc;
-            capture::Diagnostic first_snapshot_diagnostic;
-            capture::Diagnostic second_snapshot_diagnostic;
-            std::string first_snapshot;
-            std::string second_snapshot;
-            StartupEvidence first_evidence;
-            StartupEvidence second_evidence;
-            readiness = pidfd_live(child_lease.observation_pidfd()) &&
-                        protocol::read_proc(launched_pid, first_proc) &&
-                        protocol::same_process_identity(observation.second, first_proc) &&
-                        executable_lease.revalidate(executable_diagnostic) &&
-                        source_lease.revalidate(source_diagnostic) &&
-                        output.snapshot(first_snapshot, first_snapshot_diagnostic) &&
-                        parse_startup_bytes(first_snapshot, source_path, first_evidence) &&
-                        protocol::read_proc(launched_pid, second_proc) &&
-                        protocol::same_process_identity(first_proc, second_proc) &&
-                        pidfd_live(child_lease.observation_pidfd()) &&
-                        executable_lease.revalidate(executable_diagnostic) &&
-                        source_lease.revalidate(source_diagnostic) &&
-                        output.snapshot(second_snapshot, second_snapshot_diagnostic) &&
-                        parse_startup_bytes(second_snapshot, source_path, second_evidence) &&
-                        first_snapshot == second_snapshot && first_snapshot == candidate &&
-                        first_evidence.backend == second_evidence.backend &&
-                        first_evidence.port == second_evidence.port;
-            if (readiness) {
-                readiness_bytes = first_snapshot;
-                readiness_evidence = first_evidence;
+        bool capture_created = false;
+        if (executable_created)
+            capture_created = record(capture::AnonymousLogCapture::create(
+                                         capture::kMaxCaptureBytes, output, capture_diagnostic),
+                                     "bounded startup capture");
+
+        if (capture_created) {
+            null_input.value = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            (void)record(null_input.value >= 0, "borrowed /dev/null");
+        }
+        bool handoff_created = false;
+        if (null_input.value >= 0)
+            handoff_created = record(handoff::ExecutableExecHandoffLease::create(
+                                         executable_lease, handoff_lease, handoff_diagnostic),
+                                     "executable handoff");
+
+        const std::array<std::string_view, 9> arguments = {executable_path,
+                                                           source_path,
+                                                           "--shards",
+                                                           "1",
+                                                           "--no-pin",
+                                                           "--drain",
+                                                           "0",
+                                                           "--opt",
+                                                           "2"};
+        const std::string expected_cmdline = encode_arguments(arguments);
+        const bool no_access_log_configuration =
+            std::string_view{kSourceBytes}.find("accessLog") == std::string_view::npos &&
+            std::none_of(arguments.begin(), arguments.end(), [](std::string_view argument) {
+                return argument.find("access-log") != std::string_view::npos;
+            });
+        if (handoff_created)
+            (void)record(no_access_log_configuration,
+                         "source/argv unexpectedly configure an access log");
+
+        child::ChildDescriptorPlan plan;
+        bool plan_made = false;
+        if (handoff_created && no_access_log_configuration)
+            plan_made = record(handoff_lease.make_child_plan_with_arguments(null_input.value,
+                                                                            output.descriptor(),
+                                                                            false,
+                                                                            arguments,
+                                                                            plan,
+                                                                            handoff_diagnostic),
+                               "exact nine-argument child plan");
+
+        bool child_created = false;
+        if (plan_made)
+            child_created = record(child::PausedChildLease::create_prepared(
+                                       until, plan, child_lease, child_diagnostic),
+                                   "prepared public rut child");
+
+        pid_t launched_pid = -1;
+        std::shared_ptr<const child::SettlementReceipt> settlement;
+        if (child_created) {
+            launched_pid = child_lease.child_pid();
+            settlement = child_lease.settlement_receipt();
+            launched_identity = child_lease.identity();
+            launched_identity_known = true;
+        }
+
+        handoff::ExecObservation observation;
+        bool exec_observed = false;
+        if (child_created) {
+            exec_observed =
+                handoff_lease.release_and_observe(
+                    executable_lease, child_lease, until, observation, handoff_diagnostic) &&
+                observation.outcome == handoff::ExecOutcome::ExecObservedLive &&
+                observation.first.cmdline == expected_cmdline &&
+                observation.second.cmdline == expected_cmdline;
+            (void)record(exec_observed, "public rut exec observation");
+            if (exec_observed) launched_identity = observation.second;
+        }
+
+        std::string readiness_bytes;
+        StartupEvidence readiness_evidence;
+        bool readiness = false;
+        if (exec_observed) {
+            std::string candidate;
+            StartupEvidence candidate_evidence;
+            if (wait_for_strict_startup(
+                    output, source_path, until, candidate, candidate_evidence)) {
+                protocol::ProcIdentity first_proc;
+                protocol::ProcIdentity second_proc;
+                protocol::ProcIdentity third_proc;
+                capture::Diagnostic first_snapshot_diagnostic;
+                capture::Diagnostic second_snapshot_diagnostic;
+                std::string first_snapshot;
+                std::string second_snapshot;
+                StartupEvidence first_evidence;
+                StartupEvidence second_evidence;
+                readiness = pidfd_live(child_lease.observation_pidfd()) &&
+                            protocol::read_proc(launched_pid, first_proc) &&
+                            protocol::same_process_identity(observation.second, first_proc) &&
+                            exact_empty_environment(launched_pid) &&
+                            executable_lease.revalidate(executable_diagnostic) &&
+                            source_lease.revalidate(source_diagnostic) &&
+                            output.snapshot(first_snapshot, first_snapshot_diagnostic) &&
+                            parse_startup_bytes(first_snapshot, source_path, first_evidence) &&
+                            protocol::read_proc(launched_pid, second_proc) &&
+                            protocol::same_process_identity(first_proc, second_proc) &&
+                            pidfd_live(child_lease.observation_pidfd()) &&
+                            exact_empty_environment(launched_pid) &&
+                            executable_lease.revalidate(executable_diagnostic) &&
+                            source_lease.revalidate(source_diagnostic) &&
+                            output.snapshot(second_snapshot, second_snapshot_diagnostic) &&
+                            parse_startup_bytes(second_snapshot, source_path, second_evidence) &&
+                            first_snapshot == second_snapshot && first_snapshot == candidate &&
+                            first_evidence.backend == second_evidence.backend &&
+                            first_evidence.port == second_evidence.port &&
+                            protocol::read_proc(launched_pid, third_proc) &&
+                            protocol::same_process_identity(second_proc, third_proc) &&
+                            pidfd_live(child_lease.observation_pidfd()) &&
+                            exact_empty_environment(launched_pid) &&
+                            executable_lease.revalidate(executable_diagnostic) &&
+                            source_lease.revalidate(source_diagnostic);
+                if (readiness) {
+                    readiness_bytes = first_snapshot;
+                    readiness_evidence = first_evidence;
+                }
             }
+            (void)record(readiness, "strict post-bracketed startup readiness");
+            if (readiness)
+                (void)record(
+                    evidence_mutations_rejected(readiness_bytes, source_path, readiness_evidence),
+                    "copied startup evidence mutation rejection");
+        }
+
+        // Stop authority is exclusively PausedChildLease::cleanup(). Once
+        // exact reap is known, every following owner is attempted in order;
+        // one failure never suppresses an independent later settlement.
+        bool exact_settlement = false;
+        if (child_created) {
+            const bool child_cleaned =
+                child_lease.active() && child_lease.cleanup(until, child_diagnostic);
+            exact_settlement = child_cleaned && settlement &&
+                               settlement->child_pid == launched_pid && settlement->terminal &&
+                               settlement->reaped && settlement->error_number == 0 &&
+                               WIFSIGNALED(settlement->wait_status) &&
+                               WTERMSIG(settlement->wait_status) == SIGKILL;
+            (void)record(exact_settlement, "SIGKILL terminal+reaped child settlement");
+        }
+
+        const bool safe_to_settle_writers = !child_created || exact_settlement;
+        if (safe_to_settle_writers) {
+            if (handoff_created)
+                (void)record(handoff_lease.close(handoff_diagnostic),
+                             "post-child handoff settlement");
+            if (null_input.value >= 0)
+                (void)record(null_input.close_owned(), "borrowed /dev/null parent close");
+            if (capture_created) {
+                std::string final_bytes;
+                capture::Diagnostic settle_diagnostic;
+                capture::Diagnostic snapshot_diagnostic;
+                capture::Diagnostic close_diagnostic;
+                const bool settled = output.settle(settle_diagnostic);
+                (void)record(settled, "startup capture settlement");
+                const bool snapshotted = output.snapshot(final_bytes, snapshot_diagnostic);
+                (void)record(snapshotted, "final startup capture snapshot");
+                if (readiness) {
+                    StartupEvidence final_evidence;
+                    (void)record(
+                        snapshotted && final_bytes == readiness_bytes &&
+                            parse_startup_bytes(final_bytes, source_path, final_evidence) &&
+                            final_evidence.backend == readiness_evidence.backend &&
+                            final_evidence.port == readiness_evidence.port,
+                        "sealed final startup evidence");
+                }
+                (void)record(output.close(close_diagnostic), "startup capture close");
+            }
+            if (executable_created)
+                (void)record(executable_lease.close(executable_diagnostic),
+                             "public rut executable settlement");
+            if (source_created)
+                (void)record(source_lease.remove(source_diagnostic), "ordinary-RUT source removal");
+            if (directory_created) (void)record(directory.settle(), "private directory settlement");
+        } else {
+            (void)record(false, "settlement retained after uncertain child cleanup");
         }
     }
-    ok = check(readiness, "strict bracketed startup readiness") && ok;
-    if (readiness)
-        ok = check(evidence_mutations_rejected(readiness_bytes, source_path, readiness_evidence),
-                   "copied startup evidence mutation rejection") &&
-             ok;
-
-    // Stop authority is exclusively PausedChildLease::cleanup(). Capture is
-    // never sealed until the retained settlement proves terminal+reaped.
-    const bool child_cleaned = child_lease.active() && child_lease.cleanup(until, child_diagnostic);
-    const bool exact_settlement =
-        child_cleaned && settlement && settlement->child_pid == launched_pid &&
-        settlement->terminal && settlement->reaped && settlement->error_number == 0 &&
-        WIFSIGNALED(settlement->wait_status) && WTERMSIG(settlement->wait_status) == SIGKILL;
-    ok = check(exact_settlement, "SIGKILL terminal+reaped child settlement") && ok;
-
-    const bool handoff_closed = exact_settlement && handoff_lease.close(handoff_diagnostic);
-    ok = check(handoff_closed, "post-reap handoff settlement") && ok;
-    const bool null_closed = handoff_closed && null_input.close_owned();
-    ok = check(null_closed, "borrowed /dev/null parent close") && ok;
-
-    bool capture_closed = false;
-    if (exact_settlement) {
-        std::string final_bytes;
-        capture::Diagnostic settle_diagnostic;
-        capture::Diagnostic snapshot_diagnostic;
-        capture::Diagnostic close_diagnostic;
-        const bool settled = output.settle(settle_diagnostic);
-        const bool final_snapshot = settled && output.snapshot(final_bytes, snapshot_diagnostic);
-        const bool final_exact = final_snapshot && readiness && final_bytes == readiness_bytes &&
-                                 parse_startup_bytes(final_bytes, source_path, readiness_evidence);
-        capture_closed = output.close(close_diagnostic);
-        ok = check(settled && final_snapshot && final_exact && capture_closed,
-                   "sealed final startup capture") &&
-             ok;
-    } else {
-        ok = check(false, "capture settlement withheld after uncertain child cleanup") && ok;
-    }
-
-    const bool executable_closed = capture_closed && executable_lease.close(executable_diagnostic);
-    ok = check(executable_closed, "public rut executable settlement") && ok;
-    const bool source_removed = executable_closed && source_lease.remove(source_diagnostic);
-    ok = check(source_removed, "ordinary-RUT source removal") && ok;
-    if (source_removed)
-        ok = check(access(source_path.c_str(), F_OK) != 0 && errno == ENOENT,
-                   "source path residue") &&
-             ok;
-    const bool directory_removed = source_removed && directory.settle();
-    ok = check(directory_removed, "private directory settlement") && ok;
-    if (directory_removed)
-        ok = check(access(directory_path.c_str(), F_OK) != 0 && errno == ENOENT,
-                   "private directory residue") &&
-             ok;
 
     std::vector<int> final_fds;
     std::vector<pid_t> final_children;
-    int wait_status = 0;
-    errno = 0;
-    const bool no_waitable_child = waitpid(-1, &wait_status, WNOHANG) == -1 && errno == ECHILD;
-    ok = check(protocol::target_gone_or_reused(observation.second), "public rut process residue") &&
-         ok;
-    ok = check(no_waitable_child, "waitable direct-child residue") && ok;
+    if (launched_identity_known)
+        ok = check(protocol::target_gone_or_reused(launched_identity),
+                   "exact public rut process residue") &&
+             ok;
+    if (!source_path.empty())
+        ok = check(access(source_path.c_str(), F_OK) != 0 && errno == ENOENT,
+                   "source path residue after fallback cleanup") &&
+             ok;
+    if (!directory_path.empty())
+        ok = check(access(directory_path.c_str(), F_OK) != 0 && errno == ENOENT,
+                   "private directory residue after fallback cleanup") &&
+             ok;
     ok = check(fd_snapshot(final_fds) && final_fds == baseline_fds, "owned FD residue") && ok;
     ok = check(child_snapshot(final_children) && final_children == baseline_children,
                "direct-child residue") &&
@@ -469,7 +664,7 @@ bool run_one_canonical_session() {
 }  // namespace
 
 int main() {
-    if (!run_one_canonical_session()) return 1;
+    if (!directory_replacement_refusal_test() || !run_one_canonical_session()) return 1;
     std::puts("PASS: #377 one fresh canonical public RUT session");
     return 0;
 }
