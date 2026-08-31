@@ -3066,6 +3066,12 @@ struct CanonicalCleanupResult {
     bool success() const { return first_failure == CanonicalCleanupPhase::None; }
 };
 
+struct CanonicalCleanupOnce {
+    bool done = false;
+    std::size_t coordinator_calls = 0u;
+    CanonicalCleanupResult result;
+};
+
 static void canonical_record_cleanup_step(CanonicalCleanupResult& result,
                                           CanonicalCleanupPhase phase) {
     if (result.order_size < result.order.size()) result.order[result.order_size++] = phase;
@@ -3244,6 +3250,28 @@ static CanonicalCleanupResult canonical_target_cleanup(
     return result;
 }
 
+static const CanonicalCleanupResult& canonical_target_cleanup_once(
+    CanonicalCleanupOnce& once,
+    public_attempt::PublicRutAttemptLease& retry_attempt,
+    public_attempt::PublicRutAttemptLease& collision_attempt,
+    exact_reservation::ExactTcpReservationLease& reservation,
+    source_lease::WildcardAttemptSourceLease& source,
+    private_directory::PrivateDirectoryLease& directory,
+    executable_lease::ExecutableLease& executable,
+    std::chrono::steady_clock::time_point cleanup_deadline) {
+    if (once.done) return once.result;
+    once.done = true;
+    ++once.coordinator_calls;
+    once.result = canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline);
+    return once.result;
+}
+
 static bool canonical_success_owners_settled(
     const public_attempt::PublicRutAttemptLease& retry_attempt,
     const public_attempt::PublicRutAttemptLease& collision_attempt,
@@ -3299,14 +3327,16 @@ static int canonical_target_flow(int control,
     executable_lease::Diagnostic executable_diagnostic;
     exact_reservation::Diagnostic reservation_diagnostic;
     public_attempt::Diagnostic attempt_diagnostic;
+    CanonicalCleanupOnce cleanup_once;
     auto fail = [&](int exit_code) {
-        const CanonicalCleanupResult cleanup = canonical_target_cleanup(retry_attempt,
-                                                                        collision_attempt,
-                                                                        reservation,
-                                                                        source,
-                                                                        directory,
-                                                                        executable,
-                                                                        cleanup_deadline);
+        const CanonicalCleanupResult& cleanup = canonical_target_cleanup_once(cleanup_once,
+                                                                              retry_attempt,
+                                                                              collision_attempt,
+                                                                              reservation,
+                                                                              source,
+                                                                              directory,
+                                                                              executable,
+                                                                              cleanup_deadline);
         if (!cleanup.success())
             std::fprintf(stderr,
                          "FAIL [#377 canonical Target cleanup]: exit=%d phase=%u errno=%d\n",
@@ -3668,17 +3698,24 @@ static int canonical_target_flow(int control,
             transaction_deadline))
         return fail(83);
     if (!retry_attempt.close_evidence(attempt_diagnostic)) return fail(83);
-    const CanonicalCleanupResult normal_cleanup = canonical_target_cleanup(retry_attempt,
-                                                                           collision_attempt,
-                                                                           reservation,
-                                                                           source,
-                                                                           directory,
-                                                                           executable,
-                                                                           cleanup_deadline);
-    if (!normal_cleanup.success() ||
-        !canonical_success_owners_settled(
+    const CanonicalCleanupResult& normal_cleanup = canonical_target_cleanup_once(cleanup_once,
+                                                                                 retry_attempt,
+                                                                                 collision_attempt,
+                                                                                 reservation,
+                                                                                 source,
+                                                                                 directory,
+                                                                                 executable,
+                                                                                 cleanup_deadline);
+    if (!normal_cleanup.success()) {
+        std::fprintf(stderr,
+                     "FAIL [#377 canonical Target cleanup]: exit=83 phase=%u errno=%d\n",
+                     static_cast<unsigned>(normal_cleanup.first_failure),
+                     normal_cleanup.error_number);
+        return 83;
+    }
+    if (!canonical_success_owners_settled(
             retry_attempt, collision_attempt, reservation, source, directory, executable))
-        return fail(83);
+        return 83;
     const collision_evidence::RetryFinalCapture final_report{static_cast<u64>(final_capture.size()),
                                                              final_capture};
     const collision_evidence::Envelope final_envelope =
@@ -3900,14 +3937,28 @@ static CanonicalCleanupSelfCheckResult canonical_target_cleanup_self_check(
                           retry_attempt.exec_and_observe(
                               source, executable, cleanup_deadline(), attempt_diagnostic) &&
                           retry_attempt.state() == public_attempt::State::ExecObservedLive;
-        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
-                                                                       collision_attempt,
-                                                                       reservation,
-                                                                       source,
-                                                                       directory,
-                                                                       executable,
-                                                                       cleanup_deadline());
-        if (!live || !result.success() || !result.children_terminal ||
+        CanonicalCleanupOnce cleanup_once;
+        const CanonicalCleanupResult& result = canonical_target_cleanup_once(cleanup_once,
+                                                                             retry_attempt,
+                                                                             collision_attempt,
+                                                                             reservation,
+                                                                             source,
+                                                                             directory,
+                                                                             executable,
+                                                                             cleanup_deadline());
+        // Model a later report/control failure taking the same Target exit path.
+        // The real cleanup result must be returned without touching any owner again.
+        const CanonicalCleanupResult& after_transport_failure =
+            canonical_target_cleanup_once(cleanup_once,
+                                          retry_attempt,
+                                          collision_attempt,
+                                          reservation,
+                                          source,
+                                          directory,
+                                          executable,
+                                          cleanup_deadline());
+        if (!live || !cleanup_once.done || cleanup_once.coordinator_calls != 1u ||
+            &result != &after_transport_failure || !result.success() || !result.children_terminal ||
             result.reservation_attempted ||
             !canonical_cleanup_order(result,
                                      {CanonicalCleanupPhase::RetryAttempt,
@@ -3967,7 +4018,9 @@ static CanonicalCleanupSelfCheckResult canonical_target_cleanup_self_check(
                                                                          directory,
                                                                          executable,
                                                                          cleanup_deadline());
-        if (!prepared || first.success() || first.children_terminal || !outer_preserved ||
+        if (!prepared || first.success() ||
+            first.first_failure != CanonicalCleanupPhase::RetryAttempt ||
+            first.error_number != ETIMEDOUT || first.children_terminal || !outer_preserved ||
             first.order_size != 2u || first.order[0] != CanonicalCleanupPhase::RetryAttempt ||
             first.order[1] != CanonicalCleanupPhase::CollisionAttempt || !recovery.success() ||
             !canonical_success_owners_settled(
