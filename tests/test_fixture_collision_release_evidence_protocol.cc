@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+
 namespace p = rut::test::fixture_collision_release_evidence_protocol;
 namespace w = rut::test::fixture_worker_protocol;
 using u64 = w::u64;
@@ -610,8 +612,11 @@ static void expect_source_failure(const p::ReceiverContext& receiver_context,
     p::Receiver receiver(receiver_context);
     auto frames =
         transcript_frames(receiver_context.token, receiver_context.expected_source, false);
+    const auto valid_first = frames[0];
     mutate(frames[0]);
     assert(!receiver.observe(frames[0]) && receiver.state() == p::State::Failed);
+    assert(receiver.source() == p::ReservationSource{});
+    assert(!receiver.observe(valid_first) && receiver.state() == p::State::Failed);
     assert(receiver.source() == p::ReservationSource{});
 }
 
@@ -626,6 +631,10 @@ static void expect_stage_failure(const p::ReceiverContext& receiver_context,
     assert(!receiver.observe(frames[stage]) && receiver.state() == p::State::Failed);
     assert(receiver.source() == receiver_context.expected_source);
     if (stage > 5u) assert(receiver.retry_live() == retry_live(receiver_context.expected_source));
+    const auto source_before = receiver.source();
+    const auto retry_before = receiver.retry_live();
+    assert(!receiver.observe(frames[0]) && receiver.state() == p::State::Failed);
+    assert(receiver.source() == source_before && receiver.retry_live() == retry_before);
 }
 
 static void rejection_matrix() {
@@ -642,6 +651,12 @@ static void rejection_matrix() {
 
     // Source scalar, malformed variable-length, and all collision cross/branch evidence.
     expect_source_failure(c, [](w::Frame& frame) { set_word(frame, 0u, 2u); });
+    expect_source_failure(c, [](w::Frame& frame) { set_word(frame, 2u, 0u); });
+    expect_source_failure(c, [](w::Frame& frame) { set_word(frame, 3u, O_RDONLY); });
+    for (const int forbidden : {O_NONBLOCK, O_APPEND, O_ASYNC})
+        expect_source_failure(c, [forbidden](w::Frame& frame) {
+            set_word(frame, 3u, static_cast<u64>(O_RDWR | forbidden));
+        });
     for (const std::size_t field : {0u, 1u, 2u, 3u})
         expect_stage_failure(c, 1u, [field](w::Frame& frame) { set_word(frame, field, 999999u); });
     expect_stage_failure(c, 1u, [](w::Frame& frame) { set_word(frame, 4u, 2u); });

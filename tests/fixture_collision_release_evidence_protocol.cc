@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+
 namespace rut::test::fixture_collision_release_evidence_protocol {
 namespace {
 
@@ -595,6 +597,9 @@ bool decode_reservation_source(const worker::Frame& frame,
         if (!get(frame.payload, position, *field)) return false;
     const std::size_t remaining = frame.payload.size() - position;
     if (value.reservation_state != static_cast<u64>(ReservationState::Held) ||
+        value.g_f_getfd != static_cast<u64>(FD_CLOEXEC) ||
+        (value.g_f_getfl & static_cast<u64>(O_ACCMODE)) != static_cast<u64>(O_RDWR) ||
+        (value.g_f_getfl & static_cast<u64>(O_NONBLOCK | O_APPEND | O_ASYNC)) != 0u ||
         value.source_state != static_cast<u64>(SourceState::Active) ||
         !canonical_bool(value.reuseaddr) || !canonical_bool(value.reuseport) ||
         !canonical_bool(value.acceptconn) || value.proc_link_len > kMaxProcLink ||
