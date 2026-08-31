@@ -1059,6 +1059,9 @@ bool Receiver::observe(const worker::Frame& frame) {
             state_ = State::AwaitFinish;
             return true;
         }
+        case State::AwaitFinish:
+        case State::Complete:
+        case State::Failed:
         default:
             return fail();
     }
