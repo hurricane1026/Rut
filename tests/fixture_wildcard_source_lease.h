@@ -70,6 +70,7 @@ using PwriteForTesting =
     ssize_t (*)(int fd, const void* buffer, std::size_t count, off_t offset, void* context);
 using FsyncForTesting = int (*)(int fd, void* context);
 using CloseForTesting = int (*)(int fd, void* context);
+enum class StageFaultForTesting : std::uint8_t { None, InitialIdentity, InitialFlags };
 
 struct SourceLeaseHooksForTesting {
     BoundaryHookForTesting before_reopen = nullptr;
@@ -82,7 +83,9 @@ struct StagedSourceHooksForTesting {
     FtruncateForTesting ftruncate_operation = nullptr;
     PwriteForTesting pwrite_operation = nullptr;
     FsyncForTesting fsync_operation = nullptr;
+    FsyncForTesting cleanup_fsync_operation = nullptr;
     CloseForTesting close_operation = nullptr;
+    StageFaultForTesting stage_fault = StageFaultForTesting::None;
     void* context = nullptr;
 };
 
@@ -191,6 +194,7 @@ private:
     bool validate_open_source(bool require_link, Diagnostic& diagnostic) const;
     bool validate_staged_sources(bool require_link,
                                  bool require_empty,
+                                 const SourceIdentity& expected,
                                  Diagnostic& diagnostic) const;
     bool validate_staged_detached(Diagnostic& diagnostic) const;
     bool read_exact_bytes(Diagnostic& diagnostic) const;
@@ -207,6 +211,7 @@ private:
     bool owned_entry_known_ = false;
     bool source_identity_known_ = false;
     bool source_fd_is_created_ = false;
+    bool unlink_evidence_complete_ = false;
     std::string directory_path_;
     std::string basename_;
     std::string path_;

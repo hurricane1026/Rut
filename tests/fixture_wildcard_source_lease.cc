@@ -17,6 +17,7 @@ namespace rut::test::fixture_wildcard_source_lease {
 namespace {
 
 constexpr unsigned kQuarantineAttempts = 32u;
+constexpr unsigned kFinalizeWriteAttempts = 512u;
 
 void fail(Diagnostic& diagnostic, FailurePhase phase, int error_number = 0) {
     diagnostic = {phase, error_number};
@@ -368,15 +369,28 @@ bool WildcardAttemptSourceLease::stage_impl(int identity_bound_directory_fd,
     lease.staged_hooks_ = hooks == nullptr ? StagedSourceHooksForTesting{} : *hooks;
 
     struct stat writer_status{};
-    if (fstat(writer, &writer_status) != 0 || !S_ISREG(writer_status.st_mode) ||
-        writer_status.st_uid != getuid() || writer_status.st_gid != getgid() ||
-        (writer_status.st_mode & 0777) != 0600 || writer_status.st_nlink != 1u ||
-        writer_status.st_size != 0 || !descriptor_flags(writer, O_WRONLY, false)) {
+    if (lease.staged_hooks_.stage_fault == StageFaultForTesting::InitialIdentity) {
+        const Diagnostic original{FailurePhase::Create, EIO};
+        return lease.fail_created(original, diagnostic);
+    }
+    if (fstat(writer, &writer_status) != 0) {
         const Diagnostic original{FailurePhase::Create, errno == 0 ? ESTALE : errno};
         return lease.fail_created(original, diagnostic);
     }
     lease.source_identity_ = make_source_identity(writer_status);
     lease.source_identity_known_ = true;
+    if (!S_ISREG(writer_status.st_mode) || writer_status.st_uid != getuid() ||
+        writer_status.st_gid != getgid() || (writer_status.st_mode & 0777) != 0600 ||
+        writer_status.st_nlink != 1u || writer_status.st_size != 0 ||
+        !descriptor_flags(writer, O_WRONLY, false) ||
+        lease.staged_hooks_.stage_fault == StageFaultForTesting::InitialFlags) {
+        const Diagnostic original{
+            FailurePhase::Create,
+            lease.staged_hooks_.stage_fault == StageFaultForTesting::InitialFlags
+                ? ECANCELED
+                : (errno == 0 ? ESTALE : errno)};
+        return lease.fail_created(original, diagnostic);
+    }
 
     lease.source_fd_ = openat(
         retained_directory, basename.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
@@ -558,7 +572,8 @@ bool WildcardAttemptSourceLease::finalize_exact_bytes(const std::string& exact_b
     if (staged_hooks_.before_finalize_identity != nullptr)
         staged_hooks_.before_finalize_identity(
             directory_fd_, basename_.c_str(), writer_fd_, source_fd_, staged_hooks_.context);
-    if (!validate_directory(diagnostic) || !validate_staged_sources(true, true, diagnostic)) {
+    if (!validate_directory(diagnostic) ||
+        !validate_staged_sources(true, true, source_identity_, diagnostic)) {
         state_ = State::FinalizeFailed;
         return false;
     }
@@ -581,7 +596,10 @@ bool WildcardAttemptSourceLease::finalize_exact_bytes(const std::string& exact_b
     if (truncate_operation(writer_fd_, 0, staged_hooks_.context) != 0)
         return terminal(FailurePhase::Finalize, errno);
     std::size_t offset = 0u;
+    unsigned write_attempts = 0u;
     while (offset < exact_bytes.size()) {
+        if (write_attempts == kFinalizeWriteAttempts) return terminal(FailurePhase::Write, EAGAIN);
+        ++write_attempts;
         errno = 0;
         const ssize_t count = write_operation(writer_fd_,
                                               exact_bytes.data() + offset,
@@ -605,8 +623,10 @@ bool WildcardAttemptSourceLease::finalize_exact_bytes(const std::string& exact_b
         staged_hooks_.after_finalize_sync(
             directory_fd_, basename_.c_str(), writer_fd_, source_fd_, staged_hooks_.context);
 
-    source_identity_.size = exact_bytes.size();
-    if (!validate_directory(diagnostic) || !validate_staged_sources(true, false, diagnostic)) {
+    SourceIdentity candidate = source_identity_;
+    candidate.size = exact_bytes.size();
+    if (!validate_directory(diagnostic) ||
+        !validate_staged_sources(true, false, candidate, diagnostic)) {
         state_ = State::FinalizeFailed;
         return false;
     }
@@ -616,6 +636,7 @@ bool WildcardAttemptSourceLease::finalize_exact_bytes(const std::string& exact_b
     }
     std::memcpy(staged_expected_bytes_.data(), exact_bytes.data(), exact_bytes.size());
     staged_expected_size_ = exact_bytes.size();
+    source_identity_ = candidate;
     active_ = true;
     state_ = State::Active;
     return true;
@@ -657,6 +678,7 @@ bool WildcardAttemptSourceLease::validate_open_source(bool require_link,
 
 bool WildcardAttemptSourceLease::validate_staged_sources(bool require_link,
                                                          bool require_empty,
+                                                         const SourceIdentity& expected,
                                                          Diagnostic& diagnostic) const {
     struct stat writer{};
     struct stat reader{};
@@ -668,13 +690,13 @@ bool WildcardAttemptSourceLease::validate_staged_sources(bool require_link,
         return false;
     }
     const bool expected_size =
-        require_empty ? (writer.st_size == 0 && reader.st_size == 0 && entry.st_size == 0)
-                      : (writer.st_size >= 0 &&
-                         static_cast<std::uint64_t>(writer.st_size) == source_identity_.size);
-    if (!same_source_object(writer, source_identity_, require_link) ||
-        !same_source_object(reader, source_identity_, require_link) ||
-        !same_source_object(entry, source_identity_, require_link) ||
-        writer.st_size != reader.st_size || writer.st_size != entry.st_size || !expected_size ||
+        require_empty
+            ? (writer.st_size == 0 && reader.st_size == 0 && entry.st_size == 0)
+            : (writer.st_size >= 0 && static_cast<std::uint64_t>(writer.st_size) == expected.size);
+    if (!same_source_object(writer, expected, require_link) ||
+        !same_source_object(reader, expected, require_link) ||
+        !same_source_object(entry, expected, require_link) || writer.st_size != reader.st_size ||
+        writer.st_size != entry.st_size || !expected_size ||
         !descriptor_flags(writer_fd_, O_WRONLY, false) ||
         !descriptor_flags(source_fd_, O_RDONLY, true)) {
         fail(diagnostic, FailurePhase::Lease, ESTALE);
@@ -720,7 +742,7 @@ bool WildcardAttemptSourceLease::read_exact_bytes(Diagnostic& diagnostic) const 
 bool WildcardAttemptSourceLease::revalidate(Diagnostic& diagnostic) const {
     diagnostic = {};
     if (!active_ || state_ != State::Active || !validate_directory(diagnostic) ||
-        (writer_fd_ >= 0 ? !validate_staged_sources(true, false, diagnostic)
+        (writer_fd_ >= 0 ? !validate_staged_sources(true, false, source_identity_, diagnostic)
                          : !validate_open_source(true, diagnostic)))
         return false;
     struct stat entry{};
@@ -764,10 +786,11 @@ bool WildcardAttemptSourceLease::quarantine_and_remove(BoundaryHookForTesting ho
     SourceIdentity expected = source_identity_;
     if (!source_identity_known_) {
         struct stat held{};
-        if (!source_fd_is_created_ || source_fd_ < 0 || fstat(source_fd_, &held) != 0 ||
-            !S_ISREG(held.st_mode) || held.st_uid != getuid() || held.st_gid != getgid() ||
-            held.st_size < 0) {
-            fail(diagnostic, FailurePhase::Quarantine, source_fd_ < 0 ? EBADF : errno);
+        const int authority = writer_fd_ >= 0 ? writer_fd_ : source_fd_;
+        if (authority < 0 || fstat(authority, &held) != 0 || !S_ISREG(held.st_mode) ||
+            held.st_uid != getuid() || held.st_gid != getgid() || (held.st_mode & 0777) != 0600 ||
+            held.st_nlink != 1u || held.st_size < 0) {
+            fail(diagnostic, FailurePhase::Quarantine, authority < 0 ? EBADF : errno);
             return false;
         }
         expected = make_source_identity(held);
@@ -787,15 +810,11 @@ bool WildcardAttemptSourceLease::quarantine_and_remove(BoundaryHookForTesting ho
     struct stat reader{};
     struct stat writer{};
     struct stat entry{};
-    const bool reader_owned =
-        source_fd_ < 0
-            ? writer_fd_ >= 0
-            : (fstat(source_fd_, &reader) == 0 && same_source_object(reader, expected, true) &&
-               (source_fd_is_created_ ? descriptor_flags(source_fd_, O_WRONLY, false)
-                                      : descriptor_flags(source_fd_, O_RDONLY, true)));
+    const bool reader_owned = source_fd_ < 0 ? writer_fd_ >= 0
+                                             : (fstat(source_fd_, &reader) == 0 &&
+                                                same_source_object(reader, expected, true));
     const bool writer_owned = writer_fd_ < 0 || (fstat(writer_fd_, &writer) == 0 &&
-                                                 same_source_object(writer, expected, true) &&
-                                                 descriptor_flags(writer_fd_, O_WRONLY, false));
+                                                 same_source_object(writer, expected, true));
     const bool entry_owned =
         fstatat(directory_fd_, owned_basename_.c_str(), &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
         same_source_object(entry, expected, true);
@@ -858,10 +877,12 @@ bool WildcardAttemptSourceLease::quarantine_and_remove(BoundaryHookForTesting ho
     }
     cleanup_required_ = false;
     owned_entry_known_ = false;
-    if (fsync(directory_fd_) != 0) {
-        fail(diagnostic, FailurePhase::Remove, errno);
-        return false;
-    }
+    const auto cleanup_sync = staged_hooks_.cleanup_fsync_operation == nullptr
+                                  ? real_fsync
+                                  : staged_hooks_.cleanup_fsync_operation;
+    errno = 0;
+    const bool directory_synced = cleanup_sync(directory_fd_, staged_hooks_.context) == 0;
+    const int sync_error = errno == 0 ? EIO : errno;
     struct stat residue{};
     errno = 0;
     const bool original_absent =
@@ -878,6 +899,11 @@ bool WildcardAttemptSourceLease::quarantine_and_remove(BoundaryHookForTesting ho
                                                     same_source_object(writer, expected, false));
     if (!original_absent || !quarantine_absent || !reader_detached || !writer_detached) {
         fail(diagnostic, FailurePhase::Remove, ESTALE);
+        return false;
+    }
+    unlink_evidence_complete_ = true;
+    if (!directory_synced) {
+        fail(diagnostic, FailurePhase::Remove, sync_error);
         return false;
     }
     return true;
@@ -902,20 +928,26 @@ bool WildcardAttemptSourceLease::remove_with_hook_for_testing(BoundaryHookForTes
     }
     owned_basename_ = basename_;
     owned_entry_known_ = true;
-    if (!quarantine_and_remove(hook, context, diagnostic)) {
+    const bool namespace_settled = quarantine_and_remove(hook, context, diagnostic);
+    const Diagnostic namespace_diagnostic = diagnostic;
+    if (!namespace_settled && cleanup_required_) {
         record_cleanup(false, diagnostic);
         return false;
     }
 
     const bool detached = state_ != State::Active
-                              ? true
+                              ? unlink_evidence_complete_
                               : (writer_fd_ >= 0 ? validate_staged_detached(diagnostic)
                                                  : validate_detached_after_unlink(diagnostic));
     active_ = false;
     Diagnostic close_diagnostic;
     close_descriptors(close_diagnostic);
-    if (detached && close_diagnostic.phase != FailurePhase::None) diagnostic = close_diagnostic;
-    const bool succeeded = detached && close_diagnostic.phase == FailurePhase::None;
+    if (!namespace_settled)
+        diagnostic = namespace_diagnostic;
+    else if (detached && close_diagnostic.phase != FailurePhase::None)
+        diagnostic = close_diagnostic;
+    const bool succeeded =
+        namespace_settled && detached && close_diagnostic.phase == FailurePhase::None;
     state_ = State::Removed;
     record_cleanup(succeeded, diagnostic);
     return succeeded;
@@ -951,7 +983,7 @@ void WildcardAttemptSourceLease::record_cleanup(bool succeeded, const Diagnostic
         cleanup_state_->attempted = true;
         cleanup_state_->succeeded = succeeded;
         cleanup_state_->diagnostic = diagnostic;
-    } else if (!succeeded) {
+    } else if (!succeeded && cleanup_state_->succeeded) {
         cleanup_state_->succeeded = false;
         cleanup_state_->diagnostic = diagnostic;
     }
@@ -961,23 +993,20 @@ void WildcardAttemptSourceLease::close_descriptors(Diagnostic& diagnostic) {
     diagnostic = {};
     const auto close_operation =
         staged_hooks_.close_operation == nullptr ? real_close : staged_hooks_.close_operation;
-    auto close_owned_source = [&](int& fd, int access_mode, bool nonblocking) {
+    auto close_owned_source = [&](int& fd) {
         if (fd < 0) return true;
         struct stat status{};
         if (!source_identity_known_ || fstat(fd, &status) != 0 ||
-            !same_owned_source_descriptor(status, source_identity_) ||
-            !descriptor_flags(fd, access_mode, nonblocking))
+            !same_owned_source_descriptor(status, source_identity_))
             return false;
         const int detached = fd;
         fd = -1;
         errno = 0;
         return close_operation(detached, staged_hooks_.context) == 0;
     };
-    const bool writer_closed = close_owned_source(writer_fd_, O_WRONLY, false);
+    const bool writer_closed = close_owned_source(writer_fd_);
     const int writer_error = errno == 0 ? EIO : errno;
-    const int source_access = source_fd_is_created_ ? O_WRONLY : O_RDONLY;
-    const bool source_nonblocking = !source_fd_is_created_;
-    const bool source_closed = close_owned_source(source_fd_, source_access, source_nonblocking);
+    const bool source_closed = close_owned_source(source_fd_);
     const int source_error = errno == 0 ? EIO : errno;
     source_fd_is_created_ = false;
     bool directory_closed = true;

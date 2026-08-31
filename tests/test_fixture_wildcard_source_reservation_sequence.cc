@@ -84,6 +84,11 @@ bool source_failed(const source::Diagnostic& diagnostic,
     return diagnostic.phase == phase && diagnostic.error_number == error_number;
 }
 
+bool same_identity(const source::SourceIdentity& left, const source::SourceIdentity& right) {
+    return left.device == right.device && left.inode == right.inode && left.mode == right.mode &&
+           left.uid == right.uid && left.gid == right.gid && left.size == right.size;
+}
+
 bool make_directory(directory::PrivateDirectoryLease& lease, directory::Diagnostic& diagnostic) {
     return directory::PrivateDirectoryLease::create(lease, diagnostic);
 }
@@ -166,11 +171,45 @@ bool argument_retry() {
     return check(ok, "pure argument retry and duplicate finalization rejection");
 }
 
+bool post_create_boundary_cleanup() {
+    Snapshot before;
+    Snapshot after;
+    bool ok = snapshot(before);
+    for (const auto fault : {source::StageFaultForTesting::InitialIdentity,
+                             source::StageFaultForTesting::InitialFlags}) {
+        source::WildcardAttemptSourceLease source_lease;
+        directory::PrivateDirectoryLease directory_lease;
+        directory::Diagnostic directory_diagnostic;
+        source::Diagnostic diagnostic;
+        source::StagedSourceHooksForTesting hooks;
+        hooks.stage_fault = fault;
+        ok = ok && make_directory(directory_lease, directory_diagnostic) &&
+             !source::WildcardAttemptSourceLease::stage_with_hooks_for_testing(
+                 directory_lease.descriptor(),
+                 directory_lease.path(),
+                 kBasename,
+                 hooks,
+                 source_lease,
+                 diagnostic) &&
+             source_failed(
+                 diagnostic,
+                 source::FailurePhase::Create,
+                 fault == source::StageFaultForTesting::InitialIdentity ? EIO : ECANCELED) &&
+             source_lease.state() == source::State::Removed && source_lease.descriptor() == -1 &&
+             source_lease.cleanup_state()->attempted && source_lease.cleanup_state()->succeeded &&
+             absent(directory_lease.descriptor(), kBasename) &&
+             directory_lease.settle(directory_diagnostic);
+    }
+    return check(ok && snapshot(after) && before == after,
+                 "post-O_EXCL identity/flag boundaries clean owned inode");
+}
+
 enum class Fault {
     None,
     InitialTruncate,
     FinalTruncate,
     PartialHardWrite,
+    EintrExhaustion,
     ZeroWrite,
     HardWrite,
     Sync
@@ -207,6 +246,10 @@ int fault_truncate(int fd, off_t length, void* opaque) {
 ssize_t fault_pwrite(int fd, const void* buffer, std::size_t count, off_t offset, void* opaque) {
     auto& context = *static_cast<OperationContext*>(opaque);
     ++context.write_calls;
+    if (context.fault == Fault::EintrExhaustion) {
+        errno = EINTR;
+        return -1;
+    }
     if (context.fault == Fault::ZeroWrite) return 0;
     if (context.fault == Fault::HardWrite ||
         (context.fault == Fault::PartialHardWrite && context.write_calls == 3u)) {
@@ -256,6 +299,7 @@ bool operation_case(Fault fault, bool expect_success) {
          source_lease.state() ==
              (expect_success ? source::State::Active : source::State::FinalizeFailed) &&
          (expect_success ? context.offset_unchanged : true) &&
+         (fault != Fault::EintrExhaustion || context.write_calls == 512u) &&
          (expect_success ? source_lease.revalidate(diagnostic)
                          : (!source_lease.finalize_exact_bytes("listen :9\n", diagnostic) &&
                             source_failed(diagnostic, source::FailurePhase::State, EALREADY))) &&
@@ -268,7 +312,8 @@ bool operation_failures() {
         operation_case(Fault::None, true) && operation_case(Fault::InitialTruncate, false) &&
         operation_case(Fault::FinalTruncate, false) &&
         operation_case(Fault::PartialHardWrite, false) && operation_case(Fault::ZeroWrite, false) &&
-        operation_case(Fault::HardWrite, false) && operation_case(Fault::Sync, false);
+        operation_case(Fault::HardWrite, false) && operation_case(Fault::EintrExhaustion, false) &&
+        operation_case(Fault::Sync, false);
     return check(ok, "EINTR/partial completion and terminal syscall failures");
 }
 
@@ -328,13 +373,15 @@ bool mutation_case(Mutation mutation) {
                    hooks,
                    source_lease,
                    diagnostic);
+    const auto published_staged_identity = source_lease.source_identity();
     if (ok && (mutation == Mutation::ReaderAfter || mutation == Mutation::WriterAfter)) {
         const int access = mutation == Mutation::ReaderAfter ? O_RDONLY : O_WRONLY;
         context.foreign = open("/dev/null", access | O_CLOEXEC);
     }
     const bool finalized = ok && source_lease.finalize_exact_bytes("listen :7\n", diagnostic);
     ok = ok && !finalized && context.changed &&
-         source_lease.state() == source::State::FinalizeFailed;
+         source_lease.state() == source::State::FinalizeFailed &&
+         same_identity(source_lease.source_identity(), published_staged_identity);
     if (mutation == Mutation::ModeBefore)
         ok = ok && fchmodat(directory_lease.descriptor(), kBasename, 0600, 0) == 0;
     else if (mutation == Mutation::SizeAfter)
@@ -447,6 +494,11 @@ int close_with_eio(int descriptor, void* opaque) {
     return -1;
 }
 
+int cleanup_sync_with_eio(int, void*) {
+    errno = EIO;
+    return -1;
+}
+
 bool cleanup_and_legacy() {
     Snapshot process_baseline;
     Snapshot before;
@@ -483,6 +535,32 @@ bool cleanup_and_legacy() {
         directory::PrivateDirectoryLease directory_lease;
         directory::Diagnostic directory_diagnostic;
         source::Diagnostic diagnostic;
+        source::StagedSourceHooksForTesting hooks;
+        hooks.cleanup_fsync_operation = cleanup_sync_with_eio;
+        ok = ok && make_directory(directory_lease, directory_diagnostic) &&
+             source::WildcardAttemptSourceLease::stage_with_hooks_for_testing(
+                 directory_lease.descriptor(),
+                 directory_lease.path(),
+                 kBasename,
+                 hooks,
+                 source_lease,
+                 diagnostic) &&
+             source_lease.finalize_exact_bytes("listen :4\n", diagnostic) &&
+             !source_lease.remove(diagnostic) &&
+             source_failed(diagnostic, source::FailurePhase::Remove, EIO) &&
+             source_lease.state() == source::State::Removed && source_lease.descriptor() == -1 &&
+             source_lease.cleanup_state()->attempted && !source_lease.cleanup_state()->succeeded &&
+             source_failed(
+                 source_lease.cleanup_state()->diagnostic, source::FailurePhase::Remove, EIO) &&
+             absent(directory_lease.descriptor(), kBasename) &&
+             directory_lease.settle(directory_diagnostic);
+    }
+    ok = ok && snapshot(after) && process_baseline == after;
+    {
+        source::WildcardAttemptSourceLease source_lease;
+        directory::PrivateDirectoryLease directory_lease;
+        directory::Diagnostic directory_diagnostic;
+        source::Diagnostic diagnostic;
         ok = ok && make_directory(directory_lease, directory_diagnostic) && snapshot(before) &&
              source::WildcardAttemptSourceLease::create_exact_bytes(directory_lease.descriptor(),
                                                                     directory_lease.path(),
@@ -503,9 +581,10 @@ bool cleanup_and_legacy() {
 int main() {
     std::vector<std::uint32_t> addresses;
     reservation::Diagnostic diagnostic;
-    if (!reservation::discover_eligible_ipv4(addresses, diagnostic) || addresses.empty()) return 77;
+    if (!reservation::discover_eligible_ipv4(addresses, diagnostic)) return 1;
+    if (addresses.empty()) return 77;
     const bool ok = canonical_sequence(addresses.front()) && argument_retry() &&
-                    operation_failures() && mutation_failures() &&
+                    post_create_boundary_cleanup() && operation_failures() && mutation_failures() &&
                     active_mutation_and_destructors() && cleanup_and_legacy();
     if (ok) std::puts("PASS: staged wildcard source/reservation sequence");
     return ok ? 0 : 1;
