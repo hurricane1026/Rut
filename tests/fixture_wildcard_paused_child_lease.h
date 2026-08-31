@@ -197,6 +197,13 @@ public:
                                   Diagnostic& diagnostic);
     bool authorize_exec_release(std::chrono::steady_clock::time_point deadline,
                                 Diagnostic& diagnostic);
+    // Accepts ownership of one exact post-exec identity only after an
+    // authorized Execveat release. The lease independently revalidates its
+    // pidfds, retained executable/argv and a fresh proc snapshot.
+    bool attest_post_exec_identity(const ProcIdentity& first,
+                                   const ProcIdentity& second,
+                                   std::chrono::steady_clock::time_point deadline,
+                                   Diagnostic& diagnostic);
     bool cleanup(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
 
     bool active() const { return active_; }
@@ -222,6 +229,8 @@ private:
                         Diagnostic& diagnostic) const;
     bool validate_identity(std::chrono::steady_clock::time_point deadline,
                            Diagnostic& diagnostic) const;
+    bool matches_current_owned_identity(const ProcIdentity& current) const;
+    bool matches_owned_post_exec_identity(const ProcIdentity& current) const;
     bool validate_bound_child(std::chrono::steady_clock::time_point deadline,
                               Diagnostic& diagnostic) const;
     bool validate_prepared_descriptors(std::chrono::steady_clock::time_point deadline,
@@ -238,6 +247,8 @@ private:
     pid_t parent_pid_ = -1;
     pid_t child_pid_ = -1;
     ProcIdentity identity_;
+    ProcIdentity post_exec_identity_;
+    bool post_exec_identity_attested_ = false;
     bool active_ = false;
     bool released_ = false;
     bool release_sent_ = false;

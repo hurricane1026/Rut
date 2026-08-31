@@ -81,6 +81,22 @@ bool same_bounded_exec_arguments(const BoundedExecArguments& first,
            std::memcmp(first.arena.data(), second.arena.data(), first.encoded_bytes) == 0;
 }
 
+bool same_stable_process_fields(const ProcIdentity& first, const ProcIdentity& second) {
+    return first.pid == second.pid && first.ppid == second.ppid && first.sid == second.sid &&
+           first.start == second.start && first.pgid == second.pgid && first.uid == second.uid &&
+           first.uid != static_cast<uid_t>(-1) && first.gid == second.gid &&
+           first.gid != static_cast<gid_t>(-1) && first.netns == second.netns &&
+           first.no_new_privs == second.no_new_privs &&
+           first.capabilities_clear == second.capabilities_clear &&
+           first.supplementary_groups == second.supplementary_groups;
+}
+
+bool exact_encoded_cmdline(const BoundedExecArguments& arguments, const std::string& cmdline) {
+    return cmdline.size() == arguments.encoded_bytes &&
+           (cmdline.empty() ||
+            std::memcmp(cmdline.data(), arguments.arena.data(), cmdline.size()) == 0);
+}
+
 int remaining_ms(std::chrono::steady_clock::time_point deadline) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
@@ -606,7 +622,7 @@ PausedChildLease::~PausedChildLease() {
             const bool authority_valid =
                 valid_pidfd_unbounded(
                     authority_pidfd_, child_pid_, true, authority_dev_, authority_ino_) &&
-                read_proc(child_pid_, current) && same_process_identity(identity_, current);
+                read_proc(child_pid_, current) && matches_current_owned_identity(current);
             if (authority_valid && pidfd_signal(authority_pidfd_, SIGKILL)) {
                 do {
                     result = waitpid(child_pid_, &child_status_, 0);
@@ -1139,12 +1155,31 @@ bool PausedChildLease::validate_identity(std::chrono::steady_clock::time_point d
         return false;
     }
     ProcIdentity current;
-    if (!read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
-        current.ppid != parent_pid_) {
+    if (!read_proc(child_pid_, current) || !matches_current_owned_identity(current)) {
         fail(diagnostic, FailurePhase::Identity, ESTALE);
         return false;
     }
     return true;
+}
+
+bool PausedChildLease::matches_owned_post_exec_identity(const ProcIdentity& current) const {
+    if (continuation_.arguments.argc == 0 || continuation_.arguments.offsets[1] == 0) return false;
+    struct stat executable_status{};
+    if (fstat(child_executable_fd_, &executable_status) != 0) return false;
+    const std::size_t argv0_size = continuation_.arguments.offsets[1] - 1;
+    const std::string_view argv0(continuation_.arguments.arena.data(), argv0_size);
+    return same_stable_process_fields(identity_, current) && current.ppid == parent_pid_ &&
+           current.exe_dev == executable_status.st_dev &&
+           current.exe_ino == executable_status.st_ino && current.exe.size() == argv0.size() &&
+           (argv0.empty() || std::memcmp(current.exe.data(), argv0.data(), argv0.size()) == 0) &&
+           exact_encoded_cmdline(continuation_.arguments, current.cmdline);
+}
+
+bool PausedChildLease::matches_current_owned_identity(const ProcIdentity& current) const {
+    if (post_exec_identity_attested_)
+        return same_process_identity(post_exec_identity_, current) &&
+               matches_owned_post_exec_identity(current);
+    return same_process_identity(identity_, current) && current.ppid == parent_pid_;
 }
 
 bool PausedChildLease::validate_bound_child(std::chrono::steady_clock::time_point deadline,
@@ -1434,6 +1469,53 @@ bool PausedChildLease::authorize_exec_release(std::chrono::steady_clock::time_po
     return true;
 }
 
+bool PausedChildLease::attest_post_exec_identity(const ProcIdentity& first,
+                                                 const ProcIdentity& second,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (!active_ || released_ || !release_sent_ || mode_ != Mode::Prepared ||
+        continuation_.kind != ChildContinuationKind::Execveat || !prepared_release_authorized_ ||
+        post_exec_identity_attested_) {
+        fail(diagnostic, FailurePhase::Argument, EALREADY);
+        return false;
+    }
+    if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
+        !validate_pidfd(authority_pidfd_, true, deadline, diagnostic))
+        return false;
+    if (!same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+        return false;
+    }
+    if (!same_process_identity(first, second) || !matches_owned_post_exec_identity(first) ||
+        !matches_owned_post_exec_identity(second)) {
+        fail(diagnostic, FailurePhase::Identity, ESTALE);
+        return false;
+    }
+    ProcIdentity current;
+    if (!read_proc(child_pid_, current) || !same_process_identity(second, current) ||
+        !matches_owned_post_exec_identity(current)) {
+        fail(diagnostic, FailurePhase::Identity, ESTALE);
+        return false;
+    }
+    std::vector<pid_t> children;
+    if (!direct_children(deadline, children, diagnostic)) return false;
+    if (children.size() != 1 || children.front() != child_pid_) {
+        fail(diagnostic, FailurePhase::Children, ECHILD);
+        return false;
+    }
+    if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
+        !validate_pidfd(authority_pidfd_, true, deadline, diagnostic) ||
+        !same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        if (diagnostic.phase == FailurePhase::None)
+            fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+        return false;
+    }
+    post_exec_identity_ = current;
+    post_exec_identity_attested_ = true;
+    return true;
+}
+
 bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
                                Diagnostic& diagnostic) {
     diagnostic = {};
@@ -1480,8 +1562,7 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
             record_cleanup(false, diagnostic);
             return false;
         }
-        if (!read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
-            current.ppid != parent_pid_) {
+        if (!read_proc(child_pid_, current) || !matches_current_owned_identity(current)) {
             fail(diagnostic, FailurePhase::Cleanup, ESTALE);
             record_cleanup(false, diagnostic);
             return false;

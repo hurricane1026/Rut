@@ -640,6 +640,20 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
         publish_status(observation.outcome, proc_diagnostic);
         return reportable_success;
     }
+    if (hooks_.post_exec_observation_mutation != nullptr)
+        hooks_.post_exec_observation_mutation(
+            observation.first, observation.second, hooks_.context);
+    if (!child.attest_post_exec_identity(
+            observation.first, observation.second, deadline, child_diagnostic)) {
+        observation.outcome = ExecOutcome::ProtocolFailure;
+        Diagnostic child_identity_diagnostic;
+        fail(child_identity_diagnostic,
+             FailurePhase::Child,
+             child_diagnostic.error_number == 0 ? ESTALE : child_diagnostic.error_number);
+        diagnostic = child_identity_diagnostic;
+        publish_status(observation.outcome, child_identity_diagnostic);
+        return reportable_success;
+    }
     observation.outcome = ExecOutcome::ExecObservedLive;
     publish_status(observation.outcome, {});
     return reportable_success;

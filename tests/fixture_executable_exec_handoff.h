@@ -91,6 +91,9 @@ struct HooksForTesting {
     // 1 same-inode/new-OFD, 2 different object, 3 clear CLOEXEC.
     std::uint8_t child_executable_mutation = 0;
     bool (*proc_snapshot_allowed)(void*) = nullptr;
+    void (*post_exec_observation_mutation)(child_fixture::ProcIdentity&,
+                                           child_fixture::ProcIdentity&,
+                                           void*) = nullptr;
     bool fail_status_identity_fstat = false;
 };
 

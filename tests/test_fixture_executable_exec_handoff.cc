@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1393,6 +1394,7 @@ bool argument_mutation_rejected_and_retry_case(ArgumentMutation mutation, bool t
 
 bool run_live_arguments_case(const std::vector<std::string_view>& arguments) {
     std::string self;
+    const auto baseline = fd_snapshot();
     executable::ExecutableLease source;
     executable::Diagnostic source_diagnostic;
     handoff::ExecutableExecHandoffLease handoff_lease;
@@ -1421,7 +1423,125 @@ bool run_live_arguments_case(const std::vector<std::string_view>& arguments) {
         !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
         !source.close(source_diagnostic))
         return false;
-    return close(input) == 0 && close(output) == 0;
+    if (close(input) != 0 || close(output) != 0 || fd_snapshot() != baseline) return false;
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+void forge_first_post_exec_cmdline(child_fixture::ProcIdentity& first,
+                                   child_fixture::ProcIdentity&,
+                                   void*) {
+    first.cmdline.push_back('x');
+}
+
+bool forged_post_exec_identity_rejected_case() {
+    std::string self;
+    const auto baseline = fd_snapshot();
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    handoff::HooksForTesting hooks;
+    hooks.post_exec_observation_mutation = forge_first_post_exec_cmdline;
+    if (!canonical_self(self) ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create_with_hooks_for_testing(
+            source, hooks, handoff_lease, handoff_diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    const std::array arguments = {
+        std::string_view{self}, std::string_view{""}, std::string_view{"after-empty"}};
+    child_fixture::ChildDescriptorPlan plan;
+    child_fixture::PausedChildLease child;
+    child_fixture::Diagnostic child_diagnostic;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    if (input < 0 || output < 0 ||
+        !handoff_lease.make_child_plan_with_arguments(
+            input, output, false, arguments, plan, handoff_diagnostic) ||
+        !child_fixture::PausedChildLease::create_prepared(deadline, plan, child, child_diagnostic))
+        return false;
+    handoff::ExecObservation observation;
+    if (!handoff_lease.release_and_observe(
+            source, child, deadline, observation, handoff_diagnostic) ||
+        observation.outcome != handoff::ExecOutcome::ProtocolFailure ||
+        handoff_diagnostic.phase != handoff::FailurePhase::Child ||
+        handoff_diagnostic.error_number != ESTALE ||
+        observation.first.cmdline == observation.second.cmdline ||
+        !child.attest_post_exec_identity(
+            observation.second, observation.second, deadline, child_diagnostic) ||
+        !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
+        !source.close(source_diagnostic) || close(input) != 0 || close(output) != 0 ||
+        fd_snapshot() != baseline)
+        return false;
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+bool post_exec_destructor_containment_case() {
+    const pid_t subprocess = fork();
+    if (subprocess < 0) return false;
+    if (subprocess == 0) {
+        const auto baseline = fd_snapshot();
+        std::string self;
+        executable::ExecutableLease source;
+        executable::Diagnostic source_diagnostic;
+        if (!canonical_self(self) ||
+            !executable::ExecutableLease::create(self, source, source_diagnostic))
+            _exit(2);
+        const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        const int output = create_capture();
+        const auto owned_baseline = fd_snapshot();
+        {
+            handoff::ExecutableExecHandoffLease handoff_lease;
+            handoff::Diagnostic handoff_diagnostic;
+            child_fixture::ChildDescriptorPlan plan;
+            child_fixture::PausedChildLease child;
+            child_fixture::Diagnostic child_diagnostic;
+            const std::array arguments = {
+                std::string_view{self}, std::string_view{""}, std::string_view{"after-empty"}};
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            if (input < 0 || output < 0 ||
+                !handoff::ExecutableExecHandoffLease::create(
+                    source, handoff_lease, handoff_diagnostic) ||
+                !handoff_lease.make_child_plan_with_arguments(
+                    input, output, false, arguments, plan, handoff_diagnostic) ||
+                !child_fixture::PausedChildLease::create_prepared(
+                    deadline, plan, child, child_diagnostic))
+                _exit(3);
+            handoff::ExecObservation observation;
+            if (!handoff_lease.release_and_observe(
+                    source, child, deadline, observation, handoff_diagnostic) ||
+                observation.outcome != handoff::ExecOutcome::ExecObservedLive)
+                _exit(4);
+            // Reverse destruction is deliberate: child contains and reaps the
+            // attested exec process before H settles its claimed descriptors.
+        }
+        if (fd_snapshot() != owned_baseline || !source.close(source_diagnostic) ||
+            close(input) != 0 || close(output) != 0 || fd_snapshot() != baseline)
+            _exit(5);
+        int status = 0;
+        errno = 0;
+        if (waitpid(-1, &status, WNOHANG) != -1 || errno != ECHILD) _exit(6);
+        _exit(0);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    int status = 0;
+    for (;;) {
+        const pid_t result = waitpid(subprocess, &status, WNOHANG);
+        if (result == subprocess) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void)kill(subprocess, SIGKILL);
+            while (waitpid(subprocess, &status, 0) < 0 && errno == EINTR) {
+            }
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
 }
 
 bool bounded_argument_transport_case() {
@@ -1454,7 +1574,7 @@ bool bounded_argument_transport_case() {
                                   "--opt",
                                   "2"}))
         return false;
-    return true;
+    return forged_post_exec_identity_rejected_case() && post_exec_destructor_containment_case();
 }
 
 bool plan_is_reset(const child_fixture::ChildDescriptorPlan& plan) {
