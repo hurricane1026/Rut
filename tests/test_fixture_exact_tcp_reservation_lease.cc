@@ -86,6 +86,24 @@ bool complete_release(const std::shared_ptr<const reservation::ReleaseReceipt>& 
            receipt->diagnostic.phase == reservation::FailurePhase::None;
 }
 
+bool same_receipt(const reservation::ReleaseReceipt& left,
+                  const reservation::ReleaseReceipt& right) {
+    return left.attempted == right.attempted && left.destructor == right.destructor &&
+           left.real_close_attempts == right.real_close_attempts &&
+           left.real_close_result == right.real_close_result &&
+           left.real_close_error == right.real_close_error &&
+           left.reported_close_error == right.reported_close_error &&
+           left.immediate_fgetfd_result == right.immediate_fgetfd_result &&
+           left.immediate_fgetfd_error == right.immediate_fgetfd_error &&
+           left.immediate_ebadf == right.immediate_ebadf &&
+           left.post_inventory_checked == right.post_inventory_checked &&
+           left.baseline_restored == right.baseline_restored &&
+           left.socket_inode_absent == right.socket_inode_absent &&
+           left.reportable_success == right.reportable_success && left.state == right.state &&
+           left.diagnostic.phase == right.diagnostic.phase &&
+           left.diagnostic.error_number == right.diagnostic.error_number;
+}
+
 bool run_case(const char* name, const std::function<bool()>& body) {
     Snapshot before;
     Snapshot after;
@@ -178,10 +196,7 @@ bool normal_and_probe(std::uint32_t address) {
     const reservation::ReleaseReceipt retained = *receipt;
     const bool doubled = !lease.release(diagnostic) &&
                          failed(diagnostic, reservation::FailurePhase::State, EALREADY) &&
-                         receipt->real_close_attempts == retained.real_close_attempts &&
-                         receipt->reportable_success == retained.reportable_success &&
-                         receipt->diagnostic.phase == retained.diagnostic.phase &&
-                         receipt->state == retained.state;
+                         same_receipt(*receipt, retained);
     return check(released && doubled, "normal explicit release, raw probes, and double release");
 }
 
@@ -234,6 +249,7 @@ bool replacement_recovery(std::uint32_t address) {
 
 bool destructor_foreign_preservation(std::uint32_t address) {
     std::shared_ptr<const reservation::ReleaseReceipt> receipt;
+    reservation::Diagnostic binding_loss;
     int owned_slot = -1;
     int saved = -1;
     {
@@ -246,15 +262,44 @@ bool destructor_foreign_preservation(std::uint32_t address) {
         if (saved < 0 || foreign < 0 || dup3(foreign, owned_slot, O_CLOEXEC) != owned_slot ||
             close(foreign) != 0 || lease.revalidate(diagnostic))
             return false;
+        binding_loss = diagnostic;
         receipt = lease.release_receipt();
     }
-    const bool preserved =
-        fcntl(owned_slot, F_GETFD) >= 0 && receipt && receipt->attempted && receipt->destructor &&
-        receipt->real_close_attempts == 0u && !receipt->reportable_success &&
-        receipt->state == reservation::State::BindingLost &&
-        failed(receipt->diagnostic, reservation::FailurePhase::Inventory, ESTALE);
+    const bool preserved = fcntl(owned_slot, F_GETFD) >= 0 && receipt && receipt->attempted &&
+                           receipt->destructor && receipt->real_close_attempts == 0u &&
+                           !receipt->reportable_success &&
+                           receipt->state == reservation::State::BindingLost &&
+                           receipt->diagnostic.phase == binding_loss.phase &&
+                           receipt->diagnostic.error_number == binding_loss.error_number;
     const bool cleaned = close(owned_slot) == 0 && close(saved) == 0;
     return check(preserved && cleaned, "BindingLost destructor preserves foreign replacement");
+}
+
+bool destructor_option_diagnostic(std::uint32_t address) {
+    std::shared_ptr<const reservation::ReleaseReceipt> receipt;
+    reservation::Diagnostic binding_loss;
+    int descriptor = -1;
+    {
+        reservation::ExactTcpReservationLease lease;
+        reservation::Diagnostic diagnostic;
+        if (!reserve(address, lease, diagnostic)) return false;
+        descriptor = lease.descriptor();
+        constexpr int one = 1;
+        if (setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+            lease.revalidate(diagnostic) ||
+            !failed(diagnostic, reservation::FailurePhase::Option, EINVAL))
+            return false;
+        binding_loss = diagnostic;
+        receipt = lease.release_receipt();
+    }
+    const bool retained = descriptor >= 0 && fcntl(descriptor, F_GETFD) >= 0 && receipt &&
+                          receipt->attempted && receipt->destructor &&
+                          receipt->real_close_attempts == 0u &&
+                          receipt->state == reservation::State::BindingLost &&
+                          receipt->diagnostic.phase == binding_loss.phase &&
+                          receipt->diagnostic.error_number == binding_loss.error_number;
+    const bool cleaned = descriptor >= 0 && close(descriptor) == 0;
+    return check(retained && cleaned, "BindingLost destructor retains exact option diagnostic");
 }
 
 bool destructor_release(std::uint32_t address) {
@@ -350,6 +395,9 @@ int main() {
     ok = run_case("duplicate-recovery", [&] { return duplicate_recovery(address); }) && ok;
     ok = run_case("replacement-recovery", [&] { return replacement_recovery(address); }) && ok;
     ok = run_case("destructor-foreign", [&] { return destructor_foreign_preservation(address); }) &&
+         ok;
+    ok = run_case("destructor-option-diagnostic",
+                  [&] { return destructor_option_diagnostic(address); }) &&
          ok;
     ok = run_case("destructor-release", [&] { return destructor_release(address); }) && ok;
     ok = run_case("synthesized-eintr",

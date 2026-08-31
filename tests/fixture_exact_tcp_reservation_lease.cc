@@ -169,11 +169,9 @@ ExactTcpReservationLease::~ExactTcpReservationLease() {
     if (state_ == State::Held) {
         Diagnostic diagnostic;
         if (!release_impl(true, diagnostic) && state_ == State::BindingLost)
-            record_unresolved_destructor(diagnostic);
+            record_unresolved_destructor(binding_loss_diagnostic_);
     } else if (state_ == State::BindingLost) {
-        Diagnostic diagnostic;
-        fail(diagnostic, FailurePhase::Inventory, ESTALE);
-        record_unresolved_destructor(diagnostic);
+        record_unresolved_destructor(binding_loss_diagnostic_);
     }
 }
 
@@ -364,11 +362,14 @@ bool ExactTcpReservationLease::revalidate(Diagnostic& diagnostic) {
         fail(diagnostic, FailurePhase::State, EALREADY);
         return false;
     }
+    const State prior_state = state_;
     if (!validate_socket(diagnostic) || !validate_held_inventory(diagnostic)) {
+        if (prior_state == State::Held) binding_loss_diagnostic_ = diagnostic;
         state_ = State::BindingLost;
         return false;
     }
     state_ = State::Held;
+    binding_loss_diagnostic_ = {};
     return true;
 }
 

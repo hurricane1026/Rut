@@ -132,6 +132,7 @@ private:
     FdIdentity socket_identity_;
     FdSnapshot baseline_;
     State state_ = State::Fresh;
+    Diagnostic binding_loss_diagnostic_;
     HooksForTesting hooks_;
     std::shared_ptr<ReleaseReceipt> receipt_;
 };
