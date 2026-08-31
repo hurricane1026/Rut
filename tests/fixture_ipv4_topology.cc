@@ -36,6 +36,8 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
 constexpr const char* kStageLabel = "rut.stage=358-stage2a2";
+constexpr const char* kSidecarStage = "358-held-namespace-sidecar";
+constexpr const char* kSidecarRole = "held-namespace-sidecar";
 
 struct CommandResult {
     bool started = false;
@@ -446,6 +448,38 @@ static bool no_published_ports(const std::string& port_bindings, const std::stri
     // image-declared container ports without a publication are null.
     return network_ports.find('[') == std::string::npos &&
            network_ports.find(":null") != std::string::npos;
+}
+
+static bool lowercase_hex(const std::string& text, size_t expected_length) {
+    if (text.size() != expected_length) return false;
+    for (const char character : text)
+        if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')))
+            return false;
+    return true;
+}
+
+static bool full_container_id(const std::string& id) {
+    return lowercase_hex(id, 64);
+}
+
+static bool sha256_identity(const std::string& identity) {
+    return identity.size() == 71 && identity.compare(0, 7, "sha256:") == 0 &&
+           lowercase_hex(identity.substr(7), 64);
+}
+
+static bool sidecar_snapshot_equal(const HeldNamespaceSidecarSnapshot& left,
+                                   const HeldNamespaceSidecarSnapshot& right) {
+    return left.token == right.token && left.stage == right.stage && left.role == right.role &&
+           left.name == right.name && left.id == right.id &&
+           left.pinned_image_reference == right.pinned_image_reference &&
+           left.image_id == right.image_id && left.network_mode == right.network_mode &&
+           left.path == right.path && left.arguments_json == right.arguments_json &&
+           left.pid == right.pid && left.start == right.start && left.netns == right.netns &&
+           left.host_netns == right.host_netns && left.running == right.running &&
+           left.read_only_root == right.read_only_root &&
+           left.capability_drop_all == right.capability_drop_all &&
+           left.no_new_privileges == right.no_new_privileges &&
+           left.no_published_ports == right.no_published_ports;
 }
 
 static std::string proc_hex(u32 value) {
@@ -864,6 +898,7 @@ public:
         network_a_.name = "rut358-a-" + token_;
         network_b_.name = "rut358-b-" + token_;
         holder_name_ = "rut358-holder-" + token_;
+        sidecar_name_ = "rut358-sidecar-" + token_;
     }
     ~Fixture() {
         std::string ignored;
@@ -872,6 +907,7 @@ public:
 
     const std::string& token() const { return token_; }
     const std::string& holder_name() const { return holder_name_; }
+    const std::string& sidecar_name() const { return sidecar_name_; }
     const Network& network_a() const { return network_a_; }
     const Network& network_b() const { return network_b_; }
     const std::string& positive_ip() const { return positive_ip_; }
@@ -879,6 +915,7 @@ public:
     pid_t holder_pid() const { return holder_pid_; }
     u64 holder_start() const { return holder_start_; }
     const std::string& holder_id() const { return holder_id_; }
+    const HeldNamespaceSidecarSnapshot& sidecar_snapshot() const { return sidecar_snapshot_; }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -1184,8 +1221,113 @@ public:
         return true;
     }
 
+    bool create_sidecar(HeldNamespaceSidecarFailurePoint point, std::string& error) {
+        CommandResult result;
+        const bool reported_timeout =
+            point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout;
+        if (!run_command({"docker",
+                          "run",
+                          "--pull=never",
+                          "--detach",
+                          "--name",
+                          sidecar_name_,
+                          "--network",
+                          "container:" + holder_id_,
+                          "--cap-drop",
+                          "ALL",
+                          "--security-opt",
+                          "no-new-privileges",
+                          "--read-only",
+                          "--tmpfs",
+                          "/tmp:rw,noexec,nosuid,size=1m",
+                          "--entrypoint",
+                          "/bin/sleep",
+                          "--label",
+                          std::string("rut.stage=") + kSidecarStage,
+                          "--label",
+                          "rut.token=" + token_,
+                          "--label",
+                          std::string("rut.role=") + kSidecarRole,
+                          RUT_PINNED_NGINX_IMAGE,
+                          "infinity"},
+                         result,
+                         15000,
+                         reported_timeout) ||
+            !exited_zero(result)) {
+            if (reported_timeout && result.timed_out && WIFEXITED(result.status) &&
+                WEXITSTATUS(result.status) == 0) {
+                HeldNamespaceSidecarSnapshot recovered;
+                std::string recovery_error;
+                if (inspect_sidecar(sidecar_name_, recovered, recovery_error)) {
+                    sidecar_exists_ = true;
+                    sidecar_id_ = recovered.id;
+                    sidecar_snapshot_ = recovered;
+                    error =
+                        "injected sidecar actual-success/reported-timeout; recovered exact "
+                        "identity";
+                } else {
+                    error = "sidecar creation reported timeout and exact recovery failed: " +
+                            recovery_error;
+                }
+            } else {
+                error = "held-namespace sidecar creation failed: " + trim(result.output);
+                discover_sidecar_after_failed_create();
+            }
+            return false;
+        }
+        sidecar_exists_ = true;
+        sidecar_id_ = trim(result.output);
+        if (!full_container_id(sidecar_id_)) {
+            error = "sidecar creation did not return one full container ID";
+            return false;
+        }
+        if (point == HeldNamespaceSidecarFailurePoint::AfterCreate)
+            return injected_sidecar("after create", error);
+        HeldNamespaceSidecarSnapshot discovered;
+        if (!inspect_sidecar(sidecar_id_, discovered, error)) return false;
+        sidecar_snapshot_ = discovered;
+        if (point == HeldNamespaceSidecarFailurePoint::AfterDiscovery)
+            return injected_sidecar("after discovery", error);
+        HeldTopologySnapshot topology = topology_snapshot();
+        if (!validate_held_namespace_sidecar_snapshot(topology, sidecar_snapshot_, error))
+            return false;
+        if (!verify_sidecar_uniqueness(error)) return false;
+        if (point == HeldNamespaceSidecarFailurePoint::AfterVerification)
+            return injected_sidecar("after verification", error);
+        cleanup_reported_timeout_ =
+            point == HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout;
+        return true;
+    }
+
+    bool terminate_sidecar_unexpectedly(std::string& error) {
+        if (!sidecar_exists_ || sidecar_id_.empty()) {
+            error = "cannot inject unexpected sidecar death without exact identity";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command({"docker", "kill", sidecar_id_}, result) || !exited_zero(result)) {
+            error = "unexpected sidecar death injection failed: " + trim(result.output);
+            return false;
+        }
+        error = "injected unexpected held-namespace sidecar death";
+        return true;
+    }
+
     bool cleanup(std::string& error) {
         bool success = true;
+        if (sidecar_exists_) {
+            std::string sidecar_error;
+            if (!cleanup_sidecar(sidecar_error)) {
+                success = false;
+                if (!sidecar_error.empty()) {
+                    if (!error.empty()) error += "; ";
+                    error += sidecar_error;
+                }
+                // A holder must never be released while a sibling container
+                // might still be attached to its network namespace.
+                if (sidecar_exists_) return false;
+            }
+        }
         if (holder_exists_) {
             if (!validate_holder(error))
                 success = false;
@@ -1231,6 +1373,210 @@ private:
     bool injected(std::string& error) {
         error = "injected boundary failure";
         return false;
+    }
+
+    bool injected_sidecar(const char* boundary, std::string& error) {
+        error = std::string("injected held-namespace sidecar failure ") + boundary;
+        return false;
+    }
+
+    HeldTopologySnapshot topology_snapshot() const {
+        HeldTopologySnapshot snapshot;
+        snapshot.token = token_;
+        snapshot.network_a_name = network_a_.name;
+        snapshot.network_a_id = network_a_.id;
+        snapshot.network_a_subnet = network_a_.subnet;
+        snapshot.network_a_gateway = network_a_.gateway;
+        snapshot.network_b_name = network_b_.name;
+        snapshot.network_b_id = network_b_.id;
+        snapshot.network_b_subnet = network_b_.subnet;
+        snapshot.network_b_gateway = network_b_.gateway;
+        snapshot.holder_name = holder_name_;
+        snapshot.holder_id = holder_id_;
+        snapshot.positive_ip = positive_ip_;
+        snapshot.guard_ip = guard_ip_;
+        snapshot.holder_pid = holder_pid_;
+        snapshot.holder_start = holder_start_;
+        ProcIdentity holder_identity{};
+        if (proc_identity(holder_pid_, holder_identity, false) &&
+            holder_identity.start == holder_start_ &&
+            container_netns_inode(holder_name_, holder_identity.netns))
+            snapshot.holder_netns = holder_identity.netns;
+        return snapshot;
+    }
+
+    bool inspect_sidecar(const std::string& reference,
+                         HeldNamespaceSidecarSnapshot& snapshot,
+                         std::string& error) {
+        CommandResult result;
+        if (!run_command({"docker",
+                          "inspect",
+                          "-f",
+                          "{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.Image}}|{{index "
+                          ".Config.Labels \"rut.stage\"}}|{{index .Config.Labels "
+                          "\"rut.token\"}}|{{index .Config.Labels \"rut.role\"}}|{{"
+                          ".HostConfig.NetworkMode}}|{{.State.Running}}|{{.State.Pid}}|{{"
+                          ".Path}}|{{json .Args}}|{{.HostConfig.ReadonlyRootfs}}|{{json "
+                          ".HostConfig.PortBindings}}|{{json .NetworkSettings.Ports}}|{{json "
+                          ".HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}",
+                          reference},
+                         result) ||
+            !exited_zero(result)) {
+            error = "sidecar inspection failed: " + trim(result.output);
+            return false;
+        }
+        std::vector<std::string> fields;
+        if (!split_exact(trim(result.output), '|', 17, fields)) {
+            error = "sidecar inspection record was malformed";
+            return false;
+        }
+        char* end = nullptr;
+        const long parsed_pid = strtol(fields[9].c_str(), &end, 10);
+        if (end == fields[9].c_str() || *end != '\0' || parsed_pid < 0) {
+            error = "sidecar inspection PID was malformed";
+            return false;
+        }
+        snapshot = {};
+        snapshot.id = fields[0];
+        snapshot.name =
+            fields[1].size() > 1 && fields[1][0] == '/' ? fields[1].substr(1) : fields[1];
+        snapshot.pinned_image_reference = fields[2];
+        snapshot.image_id = fields[3];
+        snapshot.stage = fields[4];
+        snapshot.token = fields[5];
+        snapshot.role = fields[6];
+        snapshot.network_mode = fields[7];
+        snapshot.running = fields[8] == "true";
+        snapshot.pid = static_cast<pid_t>(parsed_pid);
+        snapshot.path = fields[10];
+        snapshot.arguments_json = fields[11];
+        snapshot.read_only_root = fields[12] == "true";
+        snapshot.no_published_ports = no_published_ports(fields[13], fields[14]);
+        snapshot.capability_drop_all = fields[15] == "[\"ALL\"]";
+        snapshot.no_new_privileges = fields[16] == "[\"no-new-privileges\"]";
+        if (snapshot.running && snapshot.pid > 1) {
+            ProcIdentity identity{};
+            ProcIdentity host_identity{};
+            if (!proc_identity(snapshot.pid, identity, false) ||
+                !container_netns_inode(snapshot.name, identity.netns) ||
+                !proc_identity(getpid(), host_identity)) {
+                error = "sidecar PID/start/netns discovery failed";
+                return false;
+            }
+            snapshot.start = identity.start;
+            snapshot.netns = identity.netns;
+            snapshot.host_netns = host_identity.netns;
+        }
+        return true;
+    }
+
+    void discover_sidecar_after_failed_create() {
+        HeldNamespaceSidecarSnapshot discovered;
+        std::string ignored;
+        if (!inspect_sidecar(sidecar_name_, discovered, ignored)) return;
+        sidecar_exists_ = true;
+        sidecar_id_ = discovered.id;
+        sidecar_snapshot_ = discovered;
+    }
+
+    bool verify_sidecar_uniqueness(std::string& error) {
+        CommandResult result;
+        if (!run_command({"docker",
+                          "ps",
+                          "-aq",
+                          "--no-trunc",
+                          "--filter",
+                          "label=rut.token=" + token_,
+                          "--filter",
+                          std::string("label=rut.role=") + kSidecarRole},
+                         result) ||
+            !exited_zero(result) || trim(result.output) != sidecar_id_) {
+            error = "token/role-labelled sidecar cardinality or exact ID was not one";
+            return false;
+        }
+        return true;
+    }
+
+    bool prove_sidecar_absent(std::string& error) {
+        CommandResult result;
+        if (!run_command({"docker", "inspect", sidecar_id_}, result) || exited_zero(result)) {
+            error = "exact sidecar ID did not provably disappear";
+            return false;
+        }
+        if (!run_command({"docker", "inspect", sidecar_name_}, result) || exited_zero(result)) {
+            error = "exact sidecar name did not provably disappear";
+            return false;
+        }
+        if (!run_command({"docker",
+                          "ps",
+                          "-aq",
+                          "--filter",
+                          "label=rut.token=" + token_,
+                          "--filter",
+                          std::string("label=rut.role=") + kSidecarRole},
+                         result) ||
+            !exited_zero(result) || !trim(result.output).empty()) {
+            error = "token/role-labelled sidecar residue remains";
+            return false;
+        }
+        return true;
+    }
+
+    bool cleanup_sidecar(std::string& error) {
+        HeldNamespaceSidecarSnapshot current;
+        std::string inspect_error;
+        if (!inspect_sidecar(
+                sidecar_id_.empty() ? sidecar_name_ : sidecar_id_, current, inspect_error)) {
+            std::string absent_error;
+            if (sidecar_id_.empty() || !prove_sidecar_absent(absent_error)) {
+                error = inspect_error;
+                if (!absent_error.empty()) error += "; " + absent_error;
+                return false;
+            }
+            sidecar_exists_ = false;
+            error = "sidecar disappeared before identity-safe cleanup";
+            return false;
+        }
+        const bool had_discovered_snapshot = !sidecar_snapshot_.image_id.empty();
+        const std::string recorded_image_id =
+            had_discovered_snapshot ? sidecar_snapshot_.image_id : current.image_id;
+        const bool ownership_exact = !sidecar_id_.empty() && current.id == sidecar_id_ &&
+                                     current.name == sidecar_name_ && current.token == token_ &&
+                                     current.stage == kSidecarStage &&
+                                     current.role == kSidecarRole &&
+                                     current.pinned_image_reference == RUT_PINNED_NGINX_IMAGE &&
+                                     current.image_id == recorded_image_id;
+        if (!ownership_exact) {
+            error = "refusing sidecar deletion because immutable identity/ownership changed";
+            return false;
+        }
+        std::string semantic_error;
+        const HeldTopologySnapshot topology = topology_snapshot();
+        const bool semantic_exact =
+            validate_held_namespace_sidecar_snapshot(topology, current, semantic_error) &&
+            (!had_discovered_snapshot || sidecar_snapshot_equal(current, sidecar_snapshot_));
+        if (!semantic_exact && semantic_error.empty())
+            semantic_error = "sidecar PID/start/netns/security evidence changed before cleanup";
+
+        CommandResult result;
+        const bool command_ok = run_command(
+            {"docker", "rm", "-f", sidecar_id_}, result, 15000, cleanup_reported_timeout_);
+        std::string absent_error;
+        if ((!command_ok || !exited_zero(result)) && !result.timed_out) {
+            error = "sidecar cleanup command failed: " + trim(result.output);
+            return false;
+        }
+        if (!prove_sidecar_absent(absent_error)) {
+            error = "sidecar cleanup disappearance proof failed: " + absent_error;
+            return false;
+        }
+        sidecar_exists_ = false;
+        cleanup_reported_timeout_ = false;
+        if (!semantic_exact) {
+            error = semantic_error;
+            return false;
+        }
+        return true;
     }
 
     bool create_network(Network& network, FailurePoint point, std::string& error) {
@@ -1416,6 +1762,7 @@ private:
 
     std::string token_;
     std::string holder_name_;
+    std::string sidecar_name_;
     Network network_a_;
     Network network_b_;
     std::string positive_ip_;
@@ -1425,6 +1772,10 @@ private:
     u64 holder_start_ = 0;
     bool holder_exists_ = false;
     bool timeout_recovery_ = false;
+    std::string sidecar_id_;
+    HeldNamespaceSidecarSnapshot sidecar_snapshot_;
+    bool sidecar_exists_ = false;
+    bool cleanup_reported_timeout_ = false;
 };
 
 static bool write_manifest(const TempDir& temp, const Fixture& fixture) {
@@ -1432,7 +1783,8 @@ static bool write_manifest(const TempDir& temp, const Fixture& fixture) {
     if (fd < 0) return false;
     const std::string contents =
         "token=" + fixture.token() + "\nnetwork_a=" + fixture.network_a().name +
-        "\nnetwork_b=" + fixture.network_b().name + "\nholder=" + fixture.holder_name() + "\n";
+        "\nnetwork_b=" + fixture.network_b().name + "\nholder=" + fixture.holder_name() +
+        "\nsidecar=" + fixture.sidecar_name() + "\n";
     size_t offset = 0;
     while (offset < contents.size()) {
         const ssize_t count = write(fd, contents.data() + offset, contents.size() - offset);
@@ -1473,8 +1825,10 @@ static bool preflight(Fixture& fixture, std::string& error) {
         error = "host ip capability is unavailable";
         return false;
     }
-    for (const std::string& name :
-         {fixture.network_a().name, fixture.network_b().name, fixture.holder_name()}) {
+    for (const std::string& name : {fixture.network_a().name,
+                                    fixture.network_b().name,
+                                    fixture.holder_name(),
+                                    fixture.sidecar_name()}) {
         if (run_command({"docker", "inspect", name}, result) && exited_zero(result)) {
             error = "exact target name already exists: " + name;
             return false;
@@ -1496,6 +1850,43 @@ static bool preflight(Fixture& fixture, std::string& error) {
 }
 
 }  // namespace
+
+bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topology,
+                                              const HeldNamespaceSidecarSnapshot& sidecar,
+                                              std::string& error) {
+    const auto require = [&](bool condition, const char* field) {
+        if (!condition) error = std::string("held-namespace sidecar evidence mismatch: ") + field;
+        return condition;
+    };
+    if (!require(!topology.token.empty(), "topology token") ||
+        !require(!topology.holder_id.empty(), "holder ID") ||
+        !require(topology.holder_pid > 1, "holder PID") ||
+        !require(topology.holder_start != 0, "holder start") ||
+        !require(topology.holder_netns != 0, "holder netns") ||
+        !require(sidecar.token == topology.token, "token label") ||
+        !require(sidecar.stage == kSidecarStage, "stage label") ||
+        !require(sidecar.role == kSidecarRole, "role label") ||
+        !require(sidecar.name == "rut358-sidecar-" + topology.token, "name") ||
+        !require(full_container_id(sidecar.id), "full ID") ||
+        !require(sidecar.pinned_image_reference == RUT_PINNED_NGINX_IMAGE,
+                 "pinned image reference") ||
+        !require(sha256_identity(sidecar.image_id), "image ID") ||
+        !require(sidecar.network_mode == "container:" + topology.holder_id, "network mode") ||
+        !require(sidecar.path == "/bin/sleep", "entrypoint") ||
+        !require(sidecar.arguments_json == "[\"infinity\"]", "arguments") ||
+        !require(sidecar.running, "running state") || !require(sidecar.pid > 1, "PID") ||
+        !require(sidecar.pid != topology.holder_pid, "distinct PID") ||
+        !require(sidecar.start != 0, "start time") ||
+        !require(sidecar.netns == topology.holder_netns, "holder netns equality") ||
+        !require(sidecar.host_netns != 0, "host netns") ||
+        !require(sidecar.netns != sidecar.host_netns, "non-host netns") ||
+        !require(sidecar.read_only_root, "read-only root") ||
+        !require(sidecar.capability_drop_all, "cap-drop ALL") ||
+        !require(sidecar.no_new_privileges, "no-new-privileges") ||
+        !require(sidecar.no_published_ports, "no published ports"))
+        return false;
+    return true;
+}
 
 bool audit_zero_residue(const std::string& token,
                         const std::string& network_a_name,
@@ -1686,6 +2077,87 @@ bool pure_validation_self_checks(std::string& error) {
         !no_published_ports("{}", "{\"80/tcp\":null}")) {
         error = "published-port mutation validation was not causal";
         return false;
+    }
+    HeldTopologySnapshot topology;
+    topology.token = "0123456789abcdef";
+    topology.holder_id = std::string(64, 'a');
+    topology.holder_pid = 100;
+    topology.holder_start = 1000;
+    topology.holder_netns = 2000;
+    HeldNamespaceSidecarSnapshot sidecar;
+    sidecar.token = topology.token;
+    sidecar.stage = kSidecarStage;
+    sidecar.role = kSidecarRole;
+    sidecar.name = "rut358-sidecar-" + topology.token;
+    sidecar.id = std::string(64, 'b');
+    sidecar.pinned_image_reference = RUT_PINNED_NGINX_IMAGE;
+    sidecar.image_id = "sha256:" + std::string(64, 'c');
+    sidecar.network_mode = "container:" + topology.holder_id;
+    sidecar.path = "/bin/sleep";
+    sidecar.arguments_json = "[\"infinity\"]";
+    sidecar.pid = 101;
+    sidecar.start = 1001;
+    sidecar.netns = topology.holder_netns;
+    sidecar.host_netns = 2001;
+    sidecar.running = true;
+    sidecar.read_only_root = true;
+    sidecar.capability_drop_all = true;
+    sidecar.no_new_privileges = true;
+    sidecar.no_published_ports = true;
+    std::string sidecar_error;
+    if (!validate_held_namespace_sidecar_snapshot(topology, sidecar, sidecar_error)) {
+        error = "valid pure sidecar identity/security evidence was rejected: " + sidecar_error;
+        return false;
+    }
+    std::vector<HeldNamespaceSidecarSnapshot> sidecar_mutations;
+    const auto mutate = [&](const std::function<void(HeldNamespaceSidecarSnapshot&)>& change) {
+        HeldNamespaceSidecarSnapshot changed = sidecar;
+        change(changed);
+        sidecar_mutations.push_back(std::move(changed));
+    };
+    mutate([](auto& value) { value.token = "wrong"; });
+    mutate([](auto& value) { value.stage = "wrong"; });
+    mutate([](auto& value) { value.role = "wrong"; });
+    mutate([](auto& value) { value.name = "wrong"; });
+    mutate([](auto& value) { value.id = std::string(63, 'b'); });
+    mutate([](auto& value) { value.pinned_image_reference = "nginx:latest"; });
+    mutate([](auto& value) { value.image_id = "sha256:" + std::string(64, 'g'); });
+    mutate([](auto& value) { value.network_mode = "bridge"; });
+    mutate([](auto& value) { value.path = "/bin/sh"; });
+    mutate([](auto& value) { value.arguments_json = "[\"1\"]"; });
+    mutate([&](auto& value) { value.pid = topology.holder_pid; });
+    mutate([](auto& value) { value.start = 0; });
+    mutate([](auto& value) { value.netns = 2002; });
+    mutate([](auto& value) { value.host_netns = 0; });
+    mutate([](auto& value) { value.running = false; });
+    mutate([](auto& value) { value.read_only_root = false; });
+    mutate([](auto& value) { value.capability_drop_all = false; });
+    mutate([](auto& value) { value.no_new_privileges = false; });
+    mutate([](auto& value) { value.no_published_ports = false; });
+    for (const HeldNamespaceSidecarSnapshot& mutation : sidecar_mutations) {
+        sidecar_error.clear();
+        if (sidecar_snapshot_equal(sidecar, mutation) ||
+            validate_held_namespace_sidecar_snapshot(topology, mutation, sidecar_error)) {
+            error = "invalid/mutated pure sidecar identity/security evidence was accepted";
+            return false;
+        }
+    }
+    for (const auto& change :
+         {std::function<void(HeldNamespaceSidecarSnapshot&)>(
+              [](auto& value) { value.id = std::string(64, 'd'); }),
+          std::function<void(HeldNamespaceSidecarSnapshot&)>(
+              [](auto& value) { value.image_id = "sha256:" + std::string(64, 'd'); }),
+          std::function<void(HeldNamespaceSidecarSnapshot&)>([](auto& value) { value.pid += 1; }),
+          std::function<void(HeldNamespaceSidecarSnapshot&)>(
+              [](auto& value) { value.start += 1; })}) {
+        HeldNamespaceSidecarSnapshot changed = sidecar;
+        change(changed);
+        sidecar_error.clear();
+        if (!validate_held_namespace_sidecar_snapshot(topology, changed, sidecar_error) ||
+            sidecar_snapshot_equal(sidecar, changed)) {
+            error = "exact sidecar identity comparator did not distinguish valid-shaped mutation";
+            return false;
+        }
     }
     const Endpoint a{"a", "id-a", "10.0.0.2", "10.0.0.2/24", "10.0.0.1"};
     const Endpoint b{"b", "id-b", "10.0.1.2", "10.0.1.2/24", "10.0.1.1"};
@@ -1968,6 +2440,148 @@ RunResult run_with_held_topology(HeldTopologyProbePolicy policy,
     snapshot.probe_evidence = probe_evidence;
     if (!callback(snapshot, result.error)) return fail_after_cleanup();
     if (!fixture.cleanup(result.error)) return fail_after_cleanup();
+    std::string residue_error;
+    if (!audit(residue_error)) {
+        result.error = residue_error;
+        return result;
+    }
+    result.success = true;
+    return result;
+}
+
+RunResult run_with_held_topology_and_sidecar(const HeldTopologyAndSidecarCallback& callback,
+                                             HeldNamespaceSidecarFailurePoint failure_point) {
+    return run_with_held_topology_and_sidecar(
+        HeldTopologyProbePolicy::RequireHostRefusalProbes, callback, failure_point);
+}
+
+RunResult run_with_held_topology_and_sidecar(HeldTopologyProbePolicy policy,
+                                             const HeldTopologyAndSidecarCallback& callback,
+                                             HeldNamespaceSidecarFailurePoint failure_point) {
+    RunResult result;
+    std::string token;
+    if (!callback || !high_entropy_token(token)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        result.error = callback ? "high-entropy token generation unavailable"
+                                : "held-topology sidecar callback was empty";
+        return result;
+    }
+    Fixture fixture(token);
+    const auto audit = [&](std::string& error) {
+        if (!audit_zero_residue(token,
+                                fixture.network_a().name,
+                                fixture.network_b().name,
+                                fixture.holder_name(),
+                                error))
+            return false;
+        CommandResult inspect;
+        if (!run_command({"docker", "inspect", fixture.sidecar_name()}, inspect) ||
+            exited_zero(inspect)) {
+            error = "exact held-namespace sidecar name remains after cleanup";
+            return false;
+        }
+        return true;
+    };
+    TempDir temp;
+    if (!temp.create() || !write_manifest(temp, fixture) || !preflight(fixture, result.error)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe =
+            result.error.find("exact target name already exists") == std::string::npos;
+        if (result.error.empty()) result.error = "held-topology sidecar preflight failed";
+        return result;
+    }
+    const auto finish_after_cleanup = [&](bool expected_injection,
+                                          bool expected_semantic_cleanup_failure) {
+        std::string cleanup_error;
+        const bool cleanup_ok = fixture.cleanup(cleanup_error);
+        if (!cleanup_ok && !cleanup_error.empty()) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += cleanup_error;
+        }
+        std::string residue_error;
+        const bool residue_free = audit(residue_error);
+        if (!residue_free) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += residue_error;
+        }
+        result.success =
+            expected_injection && residue_free && (cleanup_ok || expected_semantic_cleanup_failure);
+        return result;
+    };
+    if (!fixture.create_networks(FailurePoint::None, result.error) ||
+        !fixture.create_holder(FailurePoint::None, result.error) ||
+        !fixture.attach_holder(FailurePoint::None, result.error) ||
+        !fixture.verify_topology(FailurePoint::None, result.error))
+        return finish_after_cleanup(false, false);
+
+    static constexpr u16 kProbePort = 41857;
+    HeldTopologyProbeEvidence probe_evidence;
+    probe_evidence.policy = policy;
+    if (!fixture.probe_port_absent(kProbePort, result.error))
+        return finish_after_cleanup(false, false);
+    ++probe_evidence.selected_port_absence_checks;
+    if (policy == HeldTopologyProbePolicy::RequireHostRefusalProbes) {
+        const auto probe_refused = [&](const std::string& address) {
+            ++probe_evidence.host_parent_af_inet_socket_calls;
+            if (!fixture.probe_refused(address, kProbePort, result.error)) return false;
+            ++probe_evidence.successful_refusal_probes;
+            return true;
+        };
+        if (!probe_refused(fixture.positive_ip()) || !probe_refused(fixture.guard_ip()))
+            return finish_after_cleanup(false, false);
+    }
+    std::string probe_error;
+    if (!validate_held_topology_probe_evidence(probe_evidence, policy, probe_error)) {
+        result.error = probe_error;
+        return finish_after_cleanup(false, false);
+    }
+    ProcIdentity holder_identity{};
+    if (!proc_identity(fixture.holder_pid(), holder_identity, false) ||
+        !container_netns_inode(fixture.holder_name(), holder_identity.netns) ||
+        holder_identity.start != fixture.holder_start()) {
+        result.error = "sidecar topology lost exact holder process identity";
+        return finish_after_cleanup(false, false);
+    }
+    HeldTopologySnapshot topology;
+    topology.token = fixture.token();
+    topology.network_a_name = fixture.network_a().name;
+    topology.network_a_id = fixture.network_a().id;
+    topology.network_a_subnet = fixture.network_a().subnet;
+    topology.network_a_gateway = fixture.network_a().gateway;
+    topology.network_b_name = fixture.network_b().name;
+    topology.network_b_id = fixture.network_b().id;
+    topology.network_b_subnet = fixture.network_b().subnet;
+    topology.network_b_gateway = fixture.network_b().gateway;
+    topology.holder_name = fixture.holder_name();
+    topology.holder_id = fixture.holder_id();
+    topology.positive_ip = fixture.positive_ip();
+    topology.guard_ip = fixture.guard_ip();
+    topology.holder_pid = fixture.holder_pid();
+    topology.holder_start = fixture.holder_start();
+    topology.holder_netns = holder_identity.netns;
+    topology.probe_evidence = probe_evidence;
+
+    if (!fixture.create_sidecar(failure_point, result.error)) {
+        const bool expected =
+            failure_point == HeldNamespaceSidecarFailurePoint::AfterCreate ||
+            failure_point == HeldNamespaceSidecarFailurePoint::AfterDiscovery ||
+            failure_point == HeldNamespaceSidecarFailurePoint::AfterVerification ||
+            failure_point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout;
+        return finish_after_cleanup(expected, false);
+    }
+    if (failure_point == HeldNamespaceSidecarFailurePoint::UnexpectedDeath) {
+        if (!fixture.terminate_sidecar_unexpectedly(result.error))
+            return finish_after_cleanup(false, false);
+        return finish_after_cleanup(true, true);
+    }
+    if (!callback(topology, fixture.sidecar_snapshot(), result.error))
+        return finish_after_cleanup(false, false);
+    if (failure_point == HeldNamespaceSidecarFailurePoint::AfterCallbackEntry) {
+        result.error = "injected held-namespace sidecar failure after callback entry";
+        return finish_after_cleanup(true, false);
+    }
+    if (!fixture.cleanup(result.error)) return finish_after_cleanup(false, false);
     std::string residue_error;
     if (!audit(residue_error)) {
         result.error = residue_error;

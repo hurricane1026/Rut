@@ -3,6 +3,7 @@
 #include <iostream>
 
 using rut::test::ipv4_topology::FailurePoint;
+using rut::test::ipv4_topology::HeldNamespaceSidecarFailurePoint;
 using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::RunResult;
@@ -154,6 +155,54 @@ int main() {
         std::cerr << "FAIL [#358 Stage 2a3b held topology callback]: " << held.error << "\n";
         return 1;
     }
+    const auto sidecar_callback =
+        [&](const rut::test::ipv4_topology::HeldTopologySnapshot& topology,
+            const rut::test::ipv4_topology::HeldNamespaceSidecarSnapshot& sidecar,
+            std::string& error) {
+            return rut::test::ipv4_topology::validate_held_namespace_sidecar_snapshot(
+                topology, sidecar, error);
+        };
+    const RunResult sidecar_normal =
+        rut::test::ipv4_topology::run_with_held_topology_and_sidecar(sidecar_callback);
+    if (sidecar_normal.prerequisite_failure || !sidecar_normal.success) {
+        std::cerr << "FAIL [#358 held-namespace sidecar normal lifecycle]: " << sidecar_normal.error
+                  << "\n";
+        return 1;
+    }
+    for (HeldNamespaceSidecarFailurePoint point : {
+             HeldNamespaceSidecarFailurePoint::AfterCreate,
+             HeldNamespaceSidecarFailurePoint::AfterDiscovery,
+             HeldNamespaceSidecarFailurePoint::AfterVerification,
+             HeldNamespaceSidecarFailurePoint::AfterCallbackEntry,
+             HeldNamespaceSidecarFailurePoint::CreateReportedTimeout,
+             HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout,
+             HeldNamespaceSidecarFailurePoint::UnexpectedDeath,
+         }) {
+        const RunResult injected =
+            rut::test::ipv4_topology::run_with_held_topology_and_sidecar(sidecar_callback, point);
+        if (injected.prerequisite_failure || !injected.success) {
+            std::cerr << "FAIL [#358 held-namespace sidecar failure-atomic matrix]: "
+                      << injected.error << "\n";
+            return 1;
+        }
+    }
+    bool failing_callback_ran = false;
+    const RunResult callback_failure = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
+        [&](const rut::test::ipv4_topology::HeldTopologySnapshot&,
+            const rut::test::ipv4_topology::HeldNamespaceSidecarSnapshot&,
+            std::string& error) {
+            failing_callback_ran = true;
+            error = "injected sidecar callback failure";
+            return false;
+        });
+    if (callback_failure.prerequisite_failure || callback_failure.success ||
+        !failing_callback_ran ||
+        callback_failure.error.find("injected sidecar callback failure") == std::string::npos) {
+        std::cerr << "FAIL [#358 held-namespace sidecar callback cleanup]: "
+                  << callback_failure.error << "\n";
+        return 1;
+    }
     std::cerr << "PASS: #358 Stage 2a2 Docker topology/IPAM and failure-atomic cleanup\n";
+    std::cerr << "PASS: #358 held-namespace sibling-container lease and zero-residue cleanup\n";
     return 0;
 }
