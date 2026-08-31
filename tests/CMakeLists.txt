@@ -60,6 +60,29 @@ set_tests_properties(test_fixture_collision_release_evidence_protocol PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30)
 
+# Tests-only authenticated absolute-deadline type-59 evidence transport. It
+# returns raw frames to the pure evidence codec and owns no broker, process,
+# listener, nginx, converter or runtime behavior.
+add_library(fixture_collision_release_evidence_transport STATIC
+    fixture_collision_release_evidence_transport.cc)
+target_include_directories(fixture_collision_release_evidence_transport PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_evidence_transport PUBLIC
+    fixture_collision_release_evidence_protocol)
+
+add_executable(test_fixture_collision_release_evidence_transport
+    test_fixture_collision_release_evidence_transport.cc)
+target_include_directories(test_fixture_collision_release_evidence_transport PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fixture_collision_release_evidence_transport PRIVATE
+    fixture_collision_release_evidence_transport)
+add_test(NAME test_fixture_collision_release_evidence_transport
+    COMMAND test_fixture_collision_release_evidence_transport)
+set_tests_properties(test_fixture_collision_release_evidence_transport PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # Linux-only, tests-only exact raw TCP reservation custody for #377. This owns
 # one bound non-listening socket and performs no broker, runtime or RUT work.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
