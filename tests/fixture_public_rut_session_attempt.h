@@ -71,6 +71,10 @@ struct HooksForTesting {
 };
 
 struct CleanupState {
+    unsigned int explicit_cleanup_calls = 0;
+    bool explicit_cleanup_attempted = false, explicit_cleanup_complete = false;
+    bool explicit_cleanup_reportable_success = false;
+    Diagnostic explicit_cleanup_diagnostic;
     bool destructor_attempted = false, destructor_reportable_success = false;
     bool child_attempted = false, child_settled = false;
     bool handoff_attempted = false, handoff_closed = false;
@@ -107,6 +111,10 @@ public:
                        std::chrono::steady_clock::time_point deadline,
                        Diagnostic& diagnostic);
     bool close_evidence(Diagnostic& diagnostic);
+    // Best-effort cleanup under one caller-owned absolute deadline. Child
+    // settlement always precedes closure of descriptors inherited by it.
+    // Completed calls are idempotent and replay their reportable result.
+    bool cleanup(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
 
     State state() const { return state_; }
     pid_t child_pid() const { return child_.child_pid(); }
