@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -477,13 +478,294 @@ static bool endpoint_set_equal(const std::vector<Endpoint>& expected,
     return true;
 }
 
+enum class JsonType { Null, Boolean, Number, String, Array, Object };
+
+struct JsonValue {
+    JsonType type = JsonType::Null;
+    // Object members retain only their values: none of the five Docker fields
+    // needs key lookup, while retaining values is sufficient to distinguish
+    // an exposed-but-unpublished port (null) from a host binding (array).
+    std::vector<JsonValue> children;
+};
+
+class BoundedJsonParser {
+public:
+    explicit BoundedJsonParser(const std::string& input) : input_(input) {}
+
+    bool parse(JsonValue& value) {
+        if (input_.empty() || input_.size() > kMaximumLength) return false;
+        skip_whitespace();
+        if (!parse_value(value, 0)) return false;
+        skip_whitespace();
+        return position_ == input_.size();
+    }
+
+private:
+    static constexpr size_t kMaximumLength = 16384;
+    static constexpr size_t kMaximumDepth = 32;
+    static constexpr size_t kMaximumNodes = 4096;
+
+    bool consume(char expected) {
+        if (position_ == input_.size() || input_[position_] != expected) return false;
+        ++position_;
+        return true;
+    }
+
+    void skip_whitespace() {
+        while (position_ < input_.size() &&
+               (input_[position_] == ' ' || input_[position_] == '\t' ||
+                input_[position_] == '\n' || input_[position_] == '\r'))
+            ++position_;
+    }
+
+    static bool hex_digit(char value) {
+        return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
+               (value >= 'A' && value <= 'F');
+    }
+
+    static unsigned hex_value(char value) {
+        if (value >= '0' && value <= '9') return static_cast<unsigned>(value - '0');
+        if (value >= 'a' && value <= 'f') return static_cast<unsigned>(value - 'a' + 10);
+        return static_cast<unsigned>(value - 'A' + 10);
+    }
+
+    bool unicode_escape(unsigned& code_unit) {
+        if (position_ + 4 > input_.size()) return false;
+        code_unit = 0;
+        for (size_t count = 0; count < 4; ++count) {
+            const char digit = input_[position_++];
+            if (!hex_digit(digit)) return false;
+            code_unit = code_unit * 16 + hex_value(digit);
+        }
+        return true;
+    }
+
+    bool raw_utf8() {
+        const unsigned char first = static_cast<unsigned char>(input_[position_]);
+        size_t continuation_count = 0;
+        unsigned code_point = 0;
+        unsigned minimum = 0;
+        if (first >= 0xc2 && first <= 0xdf) {
+            continuation_count = 1;
+            code_point = first & 0x1f;
+            minimum = 0x80;
+        } else if (first >= 0xe0 && first <= 0xef) {
+            continuation_count = 2;
+            code_point = first & 0x0f;
+            minimum = 0x800;
+        } else if (first >= 0xf0 && first <= 0xf4) {
+            continuation_count = 3;
+            code_point = first & 0x07;
+            minimum = 0x10000;
+        } else {
+            return false;
+        }
+        if (position_ + continuation_count >= input_.size()) return false;
+        ++position_;
+        for (size_t count = 0; count < continuation_count; ++count) {
+            const unsigned char next = static_cast<unsigned char>(input_[position_++]);
+            if ((next & 0xc0) != 0x80) return false;
+            code_point = (code_point << 6) | (next & 0x3f);
+        }
+        return code_point >= minimum && code_point <= 0x10ffff &&
+               !(code_point >= 0xd800 && code_point <= 0xdfff);
+    }
+
+    bool parse_string() {
+        if (!consume('"')) return false;
+        while (position_ < input_.size()) {
+            const unsigned char character = static_cast<unsigned char>(input_[position_++]);
+            if (character == '"') return true;
+            if (character < 0x20) return false;
+            if (character == '\\') {
+                if (position_ == input_.size()) return false;
+                const char escape = input_[position_++];
+                if (escape == '"' || escape == '\\' || escape == '/' || escape == 'b' ||
+                    escape == 'f' || escape == 'n' || escape == 'r' || escape == 't')
+                    continue;
+                if (escape != 'u') return false;
+                unsigned code_unit = 0;
+                if (!unicode_escape(code_unit)) return false;
+                if (code_unit >= 0xd800 && code_unit <= 0xdbff) {
+                    if (position_ + 2 > input_.size() || input_[position_] != '\\' ||
+                        input_[position_ + 1] != 'u')
+                        return false;
+                    position_ += 2;
+                    unsigned low_surrogate = 0;
+                    if (!unicode_escape(low_surrogate) || low_surrogate < 0xdc00 ||
+                        low_surrogate > 0xdfff)
+                        return false;
+                } else if (code_unit >= 0xdc00 && code_unit <= 0xdfff) {
+                    return false;
+                }
+                continue;
+            }
+            if (character >= 0x80) {
+                --position_;
+                if (!raw_utf8()) return false;
+            }
+        }
+        return false;
+    }
+
+    bool literal(const char* expected) {
+        const size_t length = std::strlen(expected);
+        if (input_.compare(position_, length, expected) != 0) return false;
+        position_ += length;
+        return true;
+    }
+
+    bool number() {
+        const size_t start = position_;
+        if (position_ < input_.size() && input_[position_] == '-') ++position_;
+        if (position_ == input_.size()) return false;
+        if (input_[position_] == '0') {
+            ++position_;
+            if (position_ < input_.size() && input_[position_] >= '0' && input_[position_] <= '9')
+                return false;
+        } else {
+            if (input_[position_] < '1' || input_[position_] > '9') return false;
+            while (position_ < input_.size() && input_[position_] >= '0' &&
+                   input_[position_] <= '9')
+                ++position_;
+        }
+        if (position_ < input_.size() && input_[position_] == '.') {
+            ++position_;
+            const size_t fraction = position_;
+            while (position_ < input_.size() && input_[position_] >= '0' &&
+                   input_[position_] <= '9')
+                ++position_;
+            if (fraction == position_) return false;
+        }
+        if (position_ < input_.size() && (input_[position_] == 'e' || input_[position_] == 'E')) {
+            ++position_;
+            if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-'))
+                ++position_;
+            const size_t exponent = position_;
+            while (position_ < input_.size() && input_[position_] >= '0' &&
+                   input_[position_] <= '9')
+                ++position_;
+            if (exponent == position_) return false;
+        }
+        return position_ != start;
+    }
+
+    bool parse_array(JsonValue& value, size_t depth) {
+        value.type = JsonType::Array;
+        if (!consume('[')) return false;
+        skip_whitespace();
+        if (consume(']')) return true;
+        for (;;) {
+            JsonValue element;
+            if (!parse_value(element, depth + 1)) return false;
+            value.children.push_back(std::move(element));
+            skip_whitespace();
+            if (consume(']')) return true;
+            if (!consume(',')) return false;
+            skip_whitespace();
+        }
+    }
+
+    bool parse_object(JsonValue& value, size_t depth) {
+        value.type = JsonType::Object;
+        if (!consume('{')) return false;
+        skip_whitespace();
+        if (consume('}')) return true;
+        for (;;) {
+            if (!parse_string()) return false;
+            skip_whitespace();
+            if (!consume(':')) return false;
+            skip_whitespace();
+            JsonValue member;
+            if (!parse_value(member, depth + 1)) return false;
+            value.children.push_back(std::move(member));
+            skip_whitespace();
+            if (consume('}')) return true;
+            if (!consume(',')) return false;
+            skip_whitespace();
+        }
+    }
+
+    bool parse_value(JsonValue& value, size_t depth) {
+        if (depth > kMaximumDepth || ++nodes_ > kMaximumNodes || position_ == input_.size())
+            return false;
+        const char first = input_[position_];
+        if (first == '[') return parse_array(value, depth);
+        if (first == '{') return parse_object(value, depth);
+        if (first == '"') {
+            value.type = JsonType::String;
+            return parse_string();
+        }
+        if (first == 'n') {
+            value.type = JsonType::Null;
+            return literal("null");
+        }
+        if (first == 't') {
+            value.type = JsonType::Boolean;
+            return literal("true");
+        }
+        if (first == 'f') {
+            value.type = JsonType::Boolean;
+            return literal("false");
+        }
+        if (first == '-' || (first >= '0' && first <= '9')) {
+            value.type = JsonType::Number;
+            return number();
+        }
+        return false;
+    }
+
+    const std::string& input_;
+    size_t position_ = 0;
+    size_t nodes_ = 0;
+};
+
+static bool parse_json(const std::string& text, JsonValue& value) {
+    return BoundedJsonParser(text).parse(value);
+}
+
+static bool string_array(const JsonValue& value, bool allow_null) {
+    if (allow_null && value.type == JsonType::Null) return true;
+    if (value.type != JsonType::Array) return false;
+    return std::all_of(value.children.begin(), value.children.end(), [](const JsonValue& child) {
+        return child.type == JsonType::String;
+    });
+}
+
+static bool port_map(const JsonValue& value) {
+    if (value.type == JsonType::Null) return true;
+    if (value.type != JsonType::Object) return false;
+    for (const JsonValue& binding : value.children) {
+        if (binding.type == JsonType::Null) continue;
+        if (binding.type != JsonType::Array) return false;
+        for (const JsonValue& endpoint : binding.children) {
+            if (endpoint.type != JsonType::Object ||
+                !std::all_of(endpoint.children.begin(),
+                             endpoint.children.end(),
+                             [](const JsonValue& field) { return field.type == JsonType::String; }))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool no_published_ports(const JsonValue& port_bindings, const JsonValue& network_ports) {
+    if (!port_map(port_bindings) || !port_map(network_ports)) return false;
+    if (port_bindings.type == JsonType::Object && !port_bindings.children.empty()) return false;
+    if (network_ports.type == JsonType::Null) return true;
+    // Docker represents an image-declared but unpublished container port as a
+    // null object member.  Any array, even an empty one, is not accepted as
+    // affirmative proof that no host publication exists.
+    return std::all_of(network_ports.children.begin(),
+                       network_ports.children.end(),
+                       [](const JsonValue& binding) { return binding.type == JsonType::Null; });
+}
+
 static bool no_published_ports(const std::string& port_bindings, const std::string& network_ports) {
-    if (port_bindings != "{}" && port_bindings != "null") return false;
-    if (network_ports == "null" || network_ports == "{}") return true;
-    // Docker represents a host publication as an array of host bindings;
-    // image-declared container ports without a publication are null.
-    return network_ports.find('[') == std::string::npos &&
-           network_ports.find(":null") != std::string::npos;
+    JsonValue parsed_bindings;
+    JsonValue parsed_ports;
+    return parse_json(port_bindings, parsed_bindings) && parse_json(network_ports, parsed_ports) &&
+           no_published_ports(parsed_bindings, parsed_ports);
 }
 
 static bool lowercase_hex(const std::string& text, size_t expected_length) {
@@ -501,42 +783,6 @@ static bool full_container_id(const std::string& id) {
 static bool sha256_identity(const std::string& identity) {
     return identity.size() == 71 && identity.compare(0, 7, "sha256:") == 0 &&
            lowercase_hex(identity.substr(7), 64);
-}
-
-static bool exact_json_shape(const std::string& text) {
-    if (text == "null") return true;
-    if (text.size() < 2) return false;
-    const char opening = text.front();
-    const char closing = text.back();
-    if (!((opening == '[' && closing == ']') || (opening == '{' && closing == '}'))) return false;
-    bool quoted = false;
-    bool escaped = false;
-    int square_depth = 0;
-    int brace_depth = 0;
-    for (char character : text) {
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (quoted && character == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (character == '"') {
-            quoted = !quoted;
-            continue;
-        }
-        if (quoted) continue;
-        if (character == '[')
-            ++square_depth;
-        else if (character == ']' && --square_depth < 0)
-            return false;
-        else if (character == '{')
-            ++brace_depth;
-        else if (character == '}' && --brace_depth < 0)
-            return false;
-    }
-    return !quoted && !escaped && square_depth == 0 && brace_depth == 0;
 }
 
 static bool parse_exact_bool(const std::string& text, bool& value) {
@@ -560,8 +806,21 @@ static bool parse_sidecar_inspect_record(const std::string& record,
         return false;
     }
     char* end = nullptr;
+    errno = 0;
     const long parsed_pid = strtol(fields[9].c_str(), &end, 10);
-    if (end == fields[9].c_str() || *end != '\0' || parsed_pid < 0) {
+    const bool decimal_pid =
+        !fields[9].empty() && std::all_of(fields[9].begin(), fields[9].end(), [](char character) {
+            return character >= '0' && character <= '9';
+        });
+    if (!decimal_pid || errno == ERANGE || end == fields[9].c_str() || *end != '\0' ||
+        parsed_pid < 0 ||
+        static_cast<std::uintmax_t>(parsed_pid) >
+            static_cast<std::uintmax_t>(std::numeric_limits<pid_t>::max())) {
+        error = "sidecar inspection PID was malformed";
+        return false;
+    }
+    const pid_t pid = static_cast<pid_t>(parsed_pid);
+    if (static_cast<long>(pid) != parsed_pid) {
         error = "sidecar inspection PID was malformed";
         return false;
     }
@@ -571,11 +830,20 @@ static bool parse_sidecar_inspect_record(const std::string& record,
         error = "sidecar inspection boolean was malformed";
         return false;
     }
-    for (size_t index : {size_t{11}, size_t{13}, size_t{14}, size_t{15}, size_t{16}}) {
-        if (!exact_json_shape(fields[index])) {
+    std::array<JsonValue, 5> json_fields;
+    const std::array<size_t, 5> json_indices{11, 13, 14, 15, 16};
+    for (size_t offset = 0; offset < json_indices.size(); ++offset) {
+        const size_t index = json_indices[offset];
+        if (!parse_json(fields[index], json_fields[offset])) {
             error = "sidecar inspection JSON was malformed at field " + std::to_string(index);
             return false;
         }
+    }
+    if (!string_array(json_fields[0], false) || !port_map(json_fields[1]) ||
+        !port_map(json_fields[2]) || !string_array(json_fields[3], true) ||
+        !string_array(json_fields[4], true)) {
+        error = "sidecar inspection JSON had an invalid Docker field type";
+        return false;
     }
     snapshot = {};
     snapshot.id = fields[0];
@@ -587,11 +855,11 @@ static bool parse_sidecar_inspect_record(const std::string& record,
     snapshot.role = fields[6];
     snapshot.network_mode = fields[7];
     snapshot.running = running;
-    snapshot.pid = static_cast<pid_t>(parsed_pid);
+    snapshot.pid = pid;
     snapshot.path = fields[10];
     snapshot.arguments_json = fields[11];
     snapshot.read_only_root = read_only;
-    snapshot.no_published_ports = no_published_ports(fields[13], fields[14]);
+    snapshot.no_published_ports = no_published_ports(json_fields[1], json_fields[2]);
     snapshot.capability_drop_all = fields[15] == "[\"ALL\"]";
     snapshot.no_new_privileges = fields[16] == "[\"no-new-privileges\"]";
     return true;
@@ -2306,6 +2574,8 @@ bool pure_validation_self_checks(std::string& error) {
     }
     if (no_published_ports("{\"80/tcp\":[]}", "null") ||
         no_published_ports("{}", "{\"80/tcp\":[{\"HostPort\":\"80\"}]}") ||
+        no_published_ports("{}", "{\"80/tcp\":\"malformed:null\"}") ||
+        no_published_ports("{}", "{\"80/tcp\":null") ||
         !no_published_ports("{}", "{\"80/tcp\":null}")) {
         error = "published-port mutation validation was not causal";
         return false;
@@ -2374,28 +2644,58 @@ bool pure_validation_self_checks(std::string& error) {
             return false;
         }
     }
-    std::vector<std::vector<std::string>> malformed_records;
+    std::vector<std::pair<std::string, std::vector<std::string>>> malformed_records;
     std::vector<std::string> short_record = raw_sidecar_fields;
     short_record.pop_back();
-    malformed_records.push_back(std::move(short_record));
-    for (const auto& mutation : {std::pair<size_t, const char*>{9, "not-a-pid"},
-                                 {8, "maybe"},
-                                 {12, "maybe"},
-                                 {11, "[\"unterminated"},
-                                 {13, "{"},
-                                 {14, "["},
-                                 {15, "[\"ALL\""},
-                                 {16, "not-json"}}) {
-        std::vector<std::string> malformed = raw_sidecar_fields;
-        malformed[mutation.first] = mutation.second;
-        malformed_records.push_back(std::move(malformed));
-    }
+    malformed_records.emplace_back("short record", std::move(short_record));
+    const auto add_malformed =
+        [&](const std::string& name, size_t index, const std::string& replacement) {
+            std::vector<std::string> malformed = raw_sidecar_fields;
+            malformed[index] = replacement;
+            malformed_records.emplace_back(name, std::move(malformed));
+        };
+    add_malformed("PID long overflow", 9, std::to_string(std::numeric_limits<long>::max()) + "0");
+    add_malformed(
+        "PID pid_t max plus one",
+        9,
+        std::to_string(static_cast<unsigned long long>(std::numeric_limits<pid_t>::max()) + 1ULL));
+    add_malformed("negative PID", 9, "-1");
+    add_malformed("signed positive PID", 9, "+101");
+    add_malformed("leading-space PID", 9, " 101");
+    add_malformed("PID trailing bytes", 9, "101x");
+    add_malformed("empty PID", 9, "");
+    add_malformed("non-numeric PID", 9, "not-a-pid");
+    add_malformed("running boolean", 8, "maybe");
+    add_malformed("read-only boolean", 12, "maybe");
+    add_malformed("unterminated arguments", 11, "[\"unterminated");
+    add_malformed("unterminated object", 13, "{");
+    add_malformed("unterminated array", 14, "[");
+    add_malformed("unterminated capability array", 15, "[\"ALL\"");
+    add_malformed("bare token", 16, "not-json");
+    add_malformed("crossed delimiters", 14, "[{\"80/tcp\":null]}");
+    add_malformed("trailing comma", 11, "[\"infinity\",]");
+    add_malformed("trailing junk", 11, "[\"infinity\"]junk");
+    add_malformed("invalid escape", 11, "[\"\\q\"]");
+    add_malformed("incomplete unicode escape", 11, "[\"\\u12\"]");
+    std::string unescaped_control = "[\"bad";
+    unescaped_control.push_back('\x01');
+    unescaped_control += "\"]";
+    add_malformed("unescaped control byte", 11, unescaped_control);
+    add_malformed("malformed null", 14, "{\"80/tcp\":nul}");
+    std::string excessive_nesting(34, '[');
+    excessive_nesting += "null";
+    excessive_nesting.append(34, ']');
+    add_malformed("excessive nesting", 14, excessive_nesting);
+    add_malformed("oversized JSON", 11, "[\"" + std::string(16385, 'x') + "\"]");
+    add_malformed("wrong arguments type", 11, "{\"infinity\":true}");
+    add_malformed("wrong port map type", 14, "[null]");
+    add_malformed("wrong capability type", 15, "\"ALL\"");
     for (const auto& malformed : malformed_records) {
         HeldNamespaceSidecarSnapshot ignored;
         raw_error.clear();
-        if (parse_sidecar_inspect_record(raw_record(malformed), ignored, raw_error) ||
+        if (parse_sidecar_inspect_record(raw_record(malformed.second), ignored, raw_error) ||
             raw_error.empty()) {
-            error = "malformed sidecar inspect record was accepted";
+            error = "malformed sidecar inspect record was accepted: " + malformed.first;
             return false;
         }
     }
