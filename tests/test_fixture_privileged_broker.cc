@@ -3590,12 +3590,19 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         source.path_len > collision_evidence::kMaxSourcePath ||
         source.bytes_len > collision_evidence::kMaxSourceBytes ||
         source.source_path.rfind(prefix, 0u) != 0u ||
-        source.source_path.size() <= prefix.size() + suffix.size() ||
+        source.source_path.size() != prefix.size() + 32u + suffix.size() ||
         source.source_path.compare(
             source.source_path.size() - suffix.size(), suffix.size(), suffix) != 0 ||
         source.source_path.find('\0') != std::string::npos || executable.empty() ||
         !canonical_parent_g_evidence(source, target)) {
         error = "reservation/source bootstrap projection was not exact";
+        return false;
+    }
+    const std::string random_name = source.source_path.substr(prefix.size(), 32u);
+    if (!std::all_of(random_name.begin(), random_name.end(), [](char value) {
+            return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+        })) {
+        error = "random source path name was not canonical";
         return false;
     }
     const std::string directory_path = source.source_path.substr(
