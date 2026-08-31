@@ -382,7 +382,7 @@ bool PublicRutAttemptLease::cleanup(Clock::time_point deadline, Diagnostic& diag
         while (!settled && child_.active() &&
                child_diagnostic.phase == child::FailurePhase::Pidfd &&
                child_diagnostic.error_number == EIO && settlement_ && !settlement_->terminal &&
-               !settlement_->reaped && Clock::now() < deadline) {
+               !settlement_->reaped && !settlement_->sigkill_sent && Clock::now() < deadline) {
             const int timeout = remaining_ms(deadline);
             if (timeout <= 0) break;
             (void)poll(nullptr, 0, timeout > 1 ? 1 : timeout);
@@ -440,7 +440,7 @@ bool PublicRutAttemptLease::cleanup(Clock::time_point deadline, Diagnostic& diag
     cleanup_->explicit_cleanup_diagnostic = first_failure;
     diagnostic = first_failure;
     if (cleanup_->explicit_cleanup_reportable_success) {
-        if (state_ != State::Empty) state_ = State::EvidenceClosed;
+        state_ = State::EvidenceClosed;
         return true;
     }
     state_ = State::Failed;
