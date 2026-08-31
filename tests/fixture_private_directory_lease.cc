@@ -69,6 +69,9 @@ int rename_noreplace(int fd, const char* from, const char* to) {
     return -1;
 #endif
 }
+int close_descriptor(int fd, const HooksForTesting& hooks) {
+    return hooks.close_descriptor ? hooks.close_descriptor(fd, hooks.context) : close(fd);
+}
 }  // namespace
 
 PrivateDirectoryLease::PrivateDirectoryLease() : receipt_(std::make_shared<SettlementReceipt>()) {}
@@ -293,7 +296,7 @@ bool PrivateDirectoryLease::finalize_removed(Diagnostic& diagnostic) {
     if (directory_fd_ >= 0) {
         const int descriptor = directory_fd_;
         directory_fd_ = -1;
-        if (close(descriptor) != 0) {
+        if (close_descriptor(descriptor, hooks_) != 0) {
             close_failed_ = true;
             return reject(diagnostic, FailurePhase::Close, errno);
         }
@@ -321,18 +324,16 @@ void PrivateDirectoryLease::observe_residues() {
     errno = saved;
 }
 void PrivateDirectoryLease::close_descriptors(Diagnostic& diagnostic) {
-    bool ok = true;
     for (int* slot : {&directory_fd_, &parent_fd_}) {
         if (*slot < 0) continue;
         const int descriptor = *slot;
         *slot = -1;
-        if (close(descriptor) != 0) {
-            ok = false;
+        if (close_descriptor(descriptor, hooks_) != 0) {
             close_failed_ = true;
             diagnostic = {FailurePhase::Close, errno};
         }
     }
-    receipt_->descriptor_closed = ok && !close_failed_;
-    if (!ok) receipt_->diagnostic = diagnostic;
+    receipt_->descriptor_closed = !close_failed_;
+    if (diagnostic.phase != FailurePhase::None) receipt_->diagnostic = diagnostic;
 }
 }  // namespace rut::test::fixture_private_directory_lease

@@ -37,11 +37,7 @@ struct Diagnostic {
     int error_number = 0;
 };
 struct Identity {
-    std::uint64_t device = 0;
-    std::uint64_t inode = 0;
-    std::uint64_t mode = 0;
-    std::uint64_t uid = 0;
-    std::uint64_t gid = 0;
+    std::uint64_t device = 0, inode = 0, mode = 0, uid = 0, gid = 0;
 };
 struct SettlementReceipt {
     bool attempted = false, object_removed = false, namespace_synced = false;
@@ -50,17 +46,16 @@ struct SettlementReceipt {
     Residue candidate_residue = Residue::Unknown;
     State state = State::Empty;
     Diagnostic diagnostic;
-    std::string path;
-    std::string original_basename;
-    std::string last_candidate;
+    std::string path, original_basename, last_candidate;
 };
 using RenameHookForTesting = void (*)(int parent_fd, const char* candidate, void* context);
 struct HooksForTesting {
     std::string creation_seed;
-    std::array<std::string, 2> quarantine_seeds;
+    std::array<std::string, 2> quarantine_seeds{};
     std::size_t quarantine_seed_count = 0;
     AbortPoint abort = AbortPoint::None;
     RenameHookForTesting after_quarantine_rename = nullptr;
+    int (*close_descriptor)(int descriptor, void* context) = nullptr;
     void* context = nullptr;
 };
 // Fixed-/tmp tests-only lease; only validation points/hooks are race-safe.

@@ -22,25 +22,17 @@ std::string seed(unsigned tag) {
     std::snprintf(bytes.data(), bytes.size(), "%032x", getpid() * 16u + tag);
     return bytes.data();
 }
-struct ObjectIdentity {
-    std::uint64_t device = 0, inode = 0;
-};
-bool identity_at(int parent, const std::string& name, ObjectIdentity& identity) {
+bool identity_at(int parent, const std::string& name, directory::Identity& identity) {
     struct stat status{};
     if (fstatat(parent, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) return false;
-    identity = {static_cast<std::uint64_t>(status.st_dev),
-                static_cast<std::uint64_t>(status.st_ino)};
+    identity = {std::uint64_t(status.st_dev), std::uint64_t(status.st_ino)};
     return true;
 }
-bool same(const ObjectIdentity& left, const ObjectIdentity& right) {
+bool same(const directory::Identity& left, const directory::Identity& right) {
     return left.device == right.device && left.inode == right.inode;
 }
-bool same(const ObjectIdentity& value, const directory::Identity& lease) {
-    return value.device == lease.device && value.inode == lease.inode;
-}
 bool absent_at(int parent, const std::string& name) {
-    ObjectIdentity unused;
-    errno = 0;
+    directory::Identity unused;
     return !identity_at(parent, name, unused) && errno == ENOENT;
 }
 bool fd_snapshot(std::vector<int>& values) {
@@ -60,9 +52,7 @@ bool fd_snapshot(std::vector<int>& values) {
     return true;
 }
 directory::HooksForTesting hooks(unsigned tag) {
-    directory::HooksForTesting value;
-    value.creation_seed = seed(tag);
-    return value;
+    return {.creation_seed = seed(tag)};
 }
 bool create(const directory::HooksForTesting& config,
             directory::PrivateDirectoryLease& lease,
@@ -88,10 +78,36 @@ std::shared_ptr<const directory::SettlementReceipt> normal(unsigned tag, bool ex
     if (explicit_settle && (!lease.revalidate(diagnostic) || !lease.settle(diagnostic))) return {};
     return receipt;
 }
+int close_with_eio(int descriptor, void* opaque) {
+    auto& injected = *static_cast<bool*>(opaque);
+    const int result = close(descriptor);
+    if (result != 0 || injected) return result;
+    injected = true;
+    return errno = EIO, -1;
+}
 bool normal_lifecycle_tests() {
     std::vector<int> before, after;
     const bool baseline = fd_snapshot(before);
-    return check(baseline && complete(normal(1, true)) && complete(normal(2, false)) &&
+    bool injected = false;
+    auto config = hooks(14);
+    config.close_descriptor = close_with_eio;
+    config.context = &injected;
+    std::shared_ptr<const directory::SettlementReceipt> receipt;
+    bool causal = false;
+    {
+        directory::PrivateDirectoryLease lease;
+        directory::Diagnostic diagnostic;
+        causal = create(config, lease, diagnostic);
+        receipt = lease.settlement_receipt();
+        causal =
+            causal && !lease.settle(diagnostic) && lease.state() == directory::State::Removed &&
+            failed(diagnostic, directory::FailurePhase::Close, EIO) &&
+            failed(receipt->diagnostic, directory::FailurePhase::Close, EIO) &&
+            !lease.settle(diagnostic) && failed(diagnostic, directory::FailurePhase::Close, EIO);
+    }
+    return check(baseline && complete(normal(1, true)) && complete(normal(2, false)) && causal &&
+                     injected && receipt->object_removed && !receipt->settlement_complete &&
+                     failed(receipt->diagnostic, directory::FailurePhase::Close, EIO) &&
                      fd_snapshot(after) && before == after,
                  "explicit/destructor settlement and FD baseline");
 }
@@ -99,7 +115,7 @@ bool creation_abort_test() {
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     auto config = hooks(3);
     config.abort = directory::AbortPoint::AfterMkdir;
-    ObjectIdentity before, after;
+    directory::Identity before, after;
     std::string name;
     std::shared_ptr<const directory::SettlementReceipt> receipt;
     bool pending = false;
@@ -131,14 +147,20 @@ bool replacement_restore_test() {
     directory::PrivateDirectoryLease lease;
     directory::Diagnostic diagnostic;
     if (!create(hooks(5), lease, diagnostic)) return false;
+    const bool mode_restored =
+        fchmod(lease.descriptor(), 0777) == 0 && !lease.revalidate(diagnostic) &&
+        lease.state() == directory::State::BindingLost &&
+        failed(diagnostic, directory::FailurePhase::Revalidate, ESTALE) &&
+        fchmod(lease.descriptor(), 0700) == 0 && lease.revalidate(diagnostic) &&
+        lease.state() == directory::State::Owned;
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     const std::string original = lease.basename(), saved = original + ".saved";
-    ObjectIdentity owned, foreign, observed_owned, observed_foreign;
-    const bool injected = renameat(parent, original.c_str(), parent, saved.c_str()) == 0 &&
-                          mkdirat(parent, original.c_str(), 0700) == 0 &&
-                          identity_at(parent, saved, owned) &&
-                          identity_at(parent, original, foreign) && same(owned, lease.identity()) &&
-                          !same(owned, foreign);
+    directory::Identity owned, foreign, observed_owned, observed_foreign;
+    const bool injected =
+        mode_restored && renameat(parent, original.c_str(), parent, saved.c_str()) == 0 &&
+        mkdirat(parent, original.c_str(), 0700) == 0 && identity_at(parent, saved, owned) &&
+        identity_at(parent, original, foreign) && same(owned, lease.identity()) &&
+        !same(owned, foreign);
     const bool refused = injected && !lease.settle(diagnostic) &&
                          lease.state() == directory::State::BindingLost &&
                          failed(diagnostic, directory::FailurePhase::Revalidate, ESTALE) &&
@@ -150,18 +172,7 @@ bool replacement_restore_test() {
                           lease.revalidate(diagnostic) &&
                           lease.state() == directory::State::Owned && lease.settle(diagnostic);
     if (parent >= 0) close(parent);
-    return check(restored, "replacement refused, exact restoration retried");
-}
-bool mode_restore_test() {
-    directory::PrivateDirectoryLease lease;
-    directory::Diagnostic diagnostic;
-    bool ok = create(hooks(6), lease, diagnostic);
-    ok = ok && fchmod(lease.descriptor(), 0777) == 0 && !lease.revalidate(diagnostic) &&
-         lease.state() == directory::State::BindingLost &&
-         failed(diagnostic, directory::FailurePhase::Revalidate, ESTALE) &&
-         fchmod(lease.descriptor(), 0700) == 0 && lease.revalidate(diagnostic) &&
-         lease.state() == directory::State::Owned && lease.settle(diagnostic);
-    return check(ok, "non-private mode refused and exact mode restored");
+    return check(restored, "mode/replacement refused and exact restorations retried");
 }
 bool collision_retry_test() {
     auto config = hooks(7);
@@ -172,7 +183,7 @@ bool collision_retry_test() {
     if (!create(config, lease, diagnostic)) return false;
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     const std::string collision = ".rut377-directory-quarantine-" + config.quarantine_seeds[0];
-    ObjectIdentity collision_id, observed_collision, candidate;
+    directory::Identity collision_id, observed_collision, candidate;
     const bool prepared = mkdirat(parent, collision.c_str(), 0700) == 0 &&
                           identity_at(parent, collision, collision_id) &&
                           mkdirat(lease.descriptor(), "kept", 0700) == 0;
@@ -192,16 +203,23 @@ bool collision_retry_test() {
     return check(retried, "collision and ENOTEMPTY same-name retry");
 }
 struct RenameMutation {
-    std::string saved;
-    ObjectIdentity saved_id, foreign_id, child_id;
-    bool complete = false;
+    std::string original, saved;
+    directory::Identity object_id, foreign_id, child_id;
+    bool replace_candidate = false, complete = false;
 };
-void replace_after_rename(int parent, const char* candidate, void* opaque) {
+void mutate_after_rename(int parent, const char* candidate, void* opaque) {
     auto& value = *static_cast<RenameMutation*>(opaque);
+    if (!value.replace_candidate) {
+        value.complete = mkdirat(parent, value.original.c_str(), 0700) == 0 &&
+                         identity_at(parent, value.original, value.foreign_id) &&
+                         identity_at(parent, candidate, value.object_id) &&
+                         !same(value.foreign_id, value.object_id);
+        return;
+    }
     value.saved = std::string(candidate) + ".saved";
     value.complete = renameat(parent, candidate, parent, value.saved.c_str()) == 0 &&
                      mkdirat(parent, candidate, 0700) == 0 &&
-                     identity_at(parent, value.saved, value.saved_id) &&
+                     identity_at(parent, value.saved, value.object_id) &&
                      identity_at(parent, candidate, value.foreign_id);
     const int foreign = openat(parent, candidate, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     value.complete = value.complete && foreign >= 0 && mkdirat(foreign, "foreign", 0700) == 0 &&
@@ -210,10 +228,11 @@ void replace_after_rename(int parent, const char* candidate, void* opaque) {
 }
 bool post_rename_mismatch_test() {
     RenameMutation mutation;
+    mutation.replace_candidate = true;
     auto config = hooks(10);
     config.quarantine_seeds = {seed(11), {}};
     config.quarantine_seed_count = 1;
-    config.after_quarantine_rename = replace_after_rename;
+    config.after_quarantine_rename = mutate_after_rename;
     config.context = &mutation;
     std::shared_ptr<const directory::SettlementReceipt> receipt;
     std::string candidate;
@@ -233,14 +252,14 @@ bool post_rename_mismatch_test() {
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     const int foreign =
         openat(parent, candidate.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    ObjectIdentity saved, replacement, child;
+    directory::Identity saved, replacement, child;
     const bool preserved =
         unresolved && receipt && !receipt->object_removed && receipt->descriptor_closed &&
         !receipt->current_basename_known &&
         receipt->candidate_residue == directory::Residue::Present &&
         failed(receipt->diagnostic, directory::FailurePhase::Quarantine, ESTALE) &&
         identity_at(parent, mutation.saved, saved) && identity_at(parent, candidate, replacement) &&
-        foreign >= 0 && identity_at(foreign, "foreign", child) && same(saved, mutation.saved_id) &&
+        foreign >= 0 && identity_at(foreign, "foreign", child) && same(saved, mutation.object_id) &&
         same(saved, owned) && same(replacement, mutation.foreign_id) &&
         same(child, mutation.child_id);
     const bool cleaned = preserved && unlinkat(foreign, "foreign", AT_REMOVEDIR) == 0 &&
@@ -250,24 +269,12 @@ bool post_rename_mismatch_test() {
     if (parent >= 0) close(parent);
     return check(cleaned, "post-rename mismatch preserves exact foreign entries");
 }
-struct OriginalMutation {
-    std::string original;
-    ObjectIdentity original_id, candidate_id;
-    bool complete = false;
-};
-void replace_original(int parent, const char* candidate, void* opaque) {
-    auto& value = *static_cast<OriginalMutation*>(opaque);
-    value.complete = mkdirat(parent, value.original.c_str(), 0700) == 0 &&
-                     identity_at(parent, value.original, value.original_id) &&
-                     identity_at(parent, candidate, value.candidate_id) &&
-                     !same(value.original_id, value.candidate_id);
-}
 bool original_residue_test() {
-    OriginalMutation mutation;
+    RenameMutation mutation;
     auto config = hooks(12);
     config.quarantine_seeds = {seed(13), {}};
     config.quarantine_seed_count = 1;
-    config.after_quarantine_rename = replace_original;
+    config.after_quarantine_rename = mutate_after_rename;
     config.context = &mutation;
     directory::PrivateDirectoryLease lease;
     directory::Diagnostic diagnostic;
@@ -275,7 +282,7 @@ bool original_residue_test() {
     mutation.original = lease.basename();
     const auto receipt = lease.settlement_receipt();
     const int parent = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    ObjectIdentity observed;
+    directory::Identity observed;
     const bool incomplete =
         !lease.settle(diagnostic) && mutation.complete &&
         lease.state() == directory::State::Removed && receipt->object_removed &&
@@ -283,10 +290,8 @@ bool original_residue_test() {
         receipt->original_residue == directory::Residue::Present &&
         receipt->candidate_residue == directory::Residue::Absent &&
         failed(diagnostic, directory::FailurePhase::Revalidate, EEXIST) &&
-        !lease.settle(diagnostic) &&
-        failed(diagnostic, directory::FailurePhase::Revalidate, EEXIST) &&
-        same(mutation.candidate_id, lease.identity()) &&
-        identity_at(parent, mutation.original, observed) && same(observed, mutation.original_id) &&
+        same(mutation.object_id, lease.identity()) &&
+        identity_at(parent, mutation.original, observed) && same(observed, mutation.foreign_id) &&
         absent_at(parent, receipt->last_candidate);
     const bool completed = incomplete &&
                            unlinkat(parent, mutation.original.c_str(), AT_REMOVEDIR) == 0 &&
@@ -297,8 +302,7 @@ bool original_residue_test() {
 }  // namespace
 int main() {
     if (!normal_lifecycle_tests() || !creation_abort_test() || !replacement_restore_test() ||
-        !mode_restore_test() || !collision_retry_test() || !post_rename_mismatch_test() ||
-        !original_residue_test())
+        !collision_retry_test() || !post_rename_mismatch_test() || !original_residue_test())
         return 1;
     std::puts("PASS: #377 private directory lease");
 }
