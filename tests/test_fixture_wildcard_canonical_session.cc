@@ -522,13 +522,17 @@ bool run_one_canonical_session() {
                    "private directory residue after fallback cleanup") &&
              ok;
     if (directory_receipt)
-        ok = check(directory_receipt->object_removed && directory_receipt->descriptor_closed &&
-                       directory_receipt->path == directory_path &&
-                       !directory_receipt->original_basename.empty() &&
-                       directory_receipt->residue == private_directory::Residue::Absent &&
-                       directory_receipt->state == private_directory::State::Removed,
-                   "private directory retained settlement receipt") &&
-             ok;
+        ok =
+            check(directory_receipt->attempted && directory_receipt->object_removed &&
+                      directory_receipt->namespace_synced && directory_receipt->descriptor_closed &&
+                      directory_receipt->settlement_complete &&
+                      directory_receipt->path == directory_path &&
+                      !directory_receipt->original_basename.empty() &&
+                      directory_receipt->original_residue == private_directory::Residue::Absent &&
+                      directory_receipt->candidate_residue == private_directory::Residue::Absent &&
+                      directory_receipt->state == private_directory::State::Removed,
+                  "private directory retained settlement receipt") &&
+            ok;
     ok = check(fd_snapshot(final_fds) && final_fds == baseline_fds, "owned FD residue") && ok;
     ok = check(child_snapshot(final_children) && final_children == baseline_children,
                "direct-child residue") &&
