@@ -840,11 +840,21 @@ if(RUT_ENABLE_JIT)
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
         fixture_ancestry_bundle
+        fixture_collision_release_evidence_protocol
+        fixture_collision_release_evidence_transport
+        fixture_collision_release_protocol
         fixture_direct_launch
+        fixture_exact_tcp_reservation_lease
+        fixture_executable_exec_handoff
+        fixture_executable_lease
         fixture_identity_bundle
+        fixture_private_directory_lease
         fixture_privileged_ancestry
         fixture_privileged_listener
+        fixture_public_rut_session_attempt
         fixture_worker_protocol
+        fixture_wildcard_paused_child_lease
+        fixture_wildcard_source_lease
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

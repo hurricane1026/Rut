@@ -4,15 +4,24 @@
 // refusal clients. The host parent retains read-only identity evidence only.
 
 #include "fixture_ancestry_bundle.h"
+#include "fixture_collision_release_evidence_protocol.h"
+#include "fixture_collision_release_evidence_transport.h"
+#include "fixture_collision_release_protocol.h"
 #include "fixture_direct_launch.h"
+#include "fixture_exact_tcp_reservation_lease.h"
+#include "fixture_executable_lease.h"
 #include "fixture_identity_bundle.h"
 #include "fixture_ipv4_topology.h"
+#include "fixture_private_directory_lease.h"
 #include "fixture_privileged_ancestry.h"
 #include "fixture_privileged_listener.h"
+#include "fixture_public_rut_session_attempt.h"
+#include "fixture_wildcard_source_lease.h"
 #include "fixture_worker_protocol.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -52,6 +61,14 @@ namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
 namespace privileged_ancestry = rut::test::fixture_privileged_ancestry;
 namespace privileged_listener = rut::test::fixture_privileged_listener;
+namespace collision_control = rut::test::fixture_collision_release_protocol;
+namespace collision_evidence = rut::test::fixture_collision_release_evidence_protocol;
+namespace evidence_transport = rut::test::fixture_collision_release_evidence_transport;
+namespace exact_reservation = rut::test::fixture_exact_tcp_reservation_lease;
+namespace executable_lease = rut::test::fixture_executable_lease;
+namespace private_directory = rut::test::fixture_private_directory_lease;
+namespace public_attempt = rut::test::fixture_public_rut_session_attempt;
+namespace source_lease = rut::test::fixture_wildcard_source_lease;
 using privileged_ancestry::parse_retained_anchor_stat;
 using privileged_ancestry::parse_retained_anchor_status;
 using privileged_ancestry::prove_retained_sudo_wrapper;
@@ -152,6 +169,15 @@ static bool safe_signal_target(const Report& report,
                                const ProcIdentity& expected,
                                int signal_number);
 static bool target_socket_inode(pid_t target, int fd, u64 expected_inode);
+static bool read_process_tcp_table(pid_t pid, privileged_listener::ProcTcpTable& table);
+static bool process_socket_inodes(pid_t pid, std::vector<u64>& inodes);
+static bool pidfd_link_matches(pid_t owner, int fd);
+static bool exact_pidfd_binding(int fd, pid_t expected_pid);
+static bool exact_log_ready(const std::string& log,
+                            const std::string& source_path,
+                            u16 port,
+                            u64& backend);
+static bool parse_canonical_ipv4(const std::string& text, u32& ipv4);
 static bool exact_listener_absent(const privileged_listener::ProcTcpTable& table,
                                   const privileged_listener::ListenerPlan& plan,
                                   u64 listener_inode);
@@ -181,7 +207,12 @@ static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
 
 static bool listener_scenario_name(const char* scenario) {
     return strcmp(scenario, "listener-guard-reservation") == 0 ||
-           strcmp(scenario, "listener-cleanup-observation-failure") == 0;
+           strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
+           strcmp(scenario, "listener-canonical-collision-release") == 0;
+}
+
+static bool canonical_collision_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-canonical-collision-release") == 0;
 }
 
 static bool listener_failure_integration(const char* scenario) {
@@ -194,6 +225,7 @@ constexpr int kListenerFailureFrame45WaitMs = kListenerDeadlineMs * 2;
 constexpr int kWildcardAttemptAggregateWaitMs = kListenerDeadlineMs * 6;
 
 static int launcher_broker_wait_ms(const char* scenario) {
+    if (canonical_collision_scenario(scenario)) return kWildcardAttemptAggregateWaitMs;
     return listener_failure_integration(scenario) ? kListenerFailureLauncherWaitMs
                                                   : kBrokerDeadlineMs;
 }
@@ -204,7 +236,9 @@ static int cleanup_response_wait_ms(const char* scenario) {
 }
 
 static int scenario_aggregate_wait_ms(const char* scenario) {
-    if (strcmp(scenario, "listener-wildcard-attempt") == 0) return kWildcardAttemptAggregateWaitMs;
+    if (strcmp(scenario, "listener-wildcard-attempt") == 0 ||
+        canonical_collision_scenario(scenario))
+        return kWildcardAttemptAggregateWaitMs;
     if (listener_failure_integration(scenario)) return kListenerFailureLauncherWaitMs;
     if (listener_scenario_name(scenario)) return kListenerDeadlineMs;
     return kBrokerDeadlineMs;
@@ -224,6 +258,8 @@ static bool listener_failure_bound_self_check(std::string& error) {
         scenario_aggregate_wait_ms("listener-cleanup-observation-failure") !=
             kListenerFailureLauncherWaitMs ||
         scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
+            kWildcardAttemptAggregateWaitMs ||
+        scenario_aggregate_wait_ms("listener-canonical-collision-release") !=
             kWildcardAttemptAggregateWaitMs ||
         kBrokerDeadlineMs != 5000 || kListenerDeadlineMs != 15000 ||
         kListenerFailureFrame45WaitMs != 30000 || kListenerFailureLauncherWaitMs != 60000 ||
@@ -2448,6 +2484,1451 @@ static bool parse_guard_request(const std::vector<unsigned char>& payload,
     return privileged_listener::validate_listener_plan(plan, text, diagnostic);
 }
 
+// Canonical collision/release keeps the existing two-address guard request but
+// carries the already pinned RUT pathname in a bounded, length-delimited tail.
+// The Target reopens and pins this name itself; the parent never passes an FD.
+static std::vector<unsigned char> canonical_request_payload(u32 positive_ipv4,
+                                                            u32 guard_ipv4,
+                                                            const std::string& executable) {
+    std::vector<unsigned char> payload = guard_request_payload(positive_ipv4, guard_ipv4);
+    append_u64(payload, executable.size());
+    payload.insert(payload.end(), executable.begin(), executable.end());
+    return payload;
+}
+
+static bool parse_canonical_request(const std::vector<unsigned char>& payload,
+                                    u32& positive_ipv4,
+                                    u32& guard_ipv4,
+                                    std::string& executable) {
+    executable.clear();
+    if (payload.size() < 3u * sizeof(u64)) return false;
+    std::vector<unsigned char> guard_payload(payload.begin(), payload.begin() + 2u * sizeof(u64));
+    if (!parse_guard_request(guard_payload, positive_ipv4, guard_ipv4)) return false;
+    const u64 length = read_u64(payload.data() + 2u * sizeof(u64));
+    if (length == 0u || length > PATH_MAX || length != payload.size() - 3u * sizeof(u64) ||
+        length > collision_evidence::kMaxSourcePath)
+        return false;
+    executable.assign(reinterpret_cast<const char*>(payload.data() + 3u * sizeof(u64)),
+                      static_cast<std::size_t>(length));
+    return executable.front() == '/' && executable.find('\0') == std::string::npos;
+}
+
+static ssize_t canonical_source_pread(int fd, void* buffer, std::size_t size, off_t offset) {
+    return pread(fd, buffer, size, offset);
+}
+
+static collision_evidence::Proc13 canonical_proc13(const ProcIdentity& value) {
+    return {static_cast<u64>(value.pid),
+            static_cast<u64>(value.ppid),
+            static_cast<u64>(value.sid),
+            value.start,
+            static_cast<u64>(value.pgid),
+            static_cast<u64>(value.uid),
+            static_cast<u64>(value.gid),
+            static_cast<u64>(value.netns),
+            static_cast<u64>(value.exe_dev),
+            static_cast<u64>(value.exe_ino),
+            value.no_new_privs ? 1u : 0u,
+            value.capabilities_clear ? 1u : 0u,
+            static_cast<u64>(value.supplementary_groups)};
+}
+
+static collision_evidence::ProcPair canonical_proc_pair(
+    const public_attempt::PublicRutAttemptLease& attempt_lease, bool live) {
+    collision_evidence::ProcPair value;
+    if (!live) return value;
+    value.first_tag = 1u;
+    value.second_tag = 1u;
+    value.first = canonical_proc13(attempt_lease.exec_observation().first);
+    value.second = canonical_proc13(attempt_lease.exec_observation().second);
+    return value;
+}
+
+static collision_evidence::Settlement9 canonical_settlement(
+    const std::shared_ptr<const public_attempt::child::SettlementReceipt>& receipt) {
+    if (!receipt) return {};
+    return {static_cast<u64>(receipt->child_pid),
+            static_cast<u64>(receipt->identity.pid),
+            static_cast<u64>(receipt->identity.ppid),
+            receipt->identity.start,
+            static_cast<u64>(receipt->identity.netns),
+            receipt->terminal ? 1u : 0u,
+            receipt->reaped ? 1u : 0u,
+            static_cast<u64>(receipt->wait_status),
+            static_cast<u64>(receipt->error_number)};
+}
+
+static collision_evidence::Cleanup14 canonical_cleanup(
+    const std::shared_ptr<const public_attempt::CleanupState>& value) {
+    if (!value) return {};
+    return {value->destructor_attempted ? 1u : 0u,
+            value->destructor_reportable_success ? 1u : 0u,
+            value->child_attempted ? 1u : 0u,
+            value->child_settled ? 1u : 0u,
+            value->handoff_attempted ? 1u : 0u,
+            value->handoff_closed ? 1u : 0u,
+            value->null_attempted ? 1u : 0u,
+            value->null_closed ? 1u : 0u,
+            value->capture_settle_attempted ? 1u : 0u,
+            value->capture_settled ? 1u : 0u,
+            value->capture_close_attempted ? 1u : 0u,
+            value->capture_closed ? 1u : 0u,
+            static_cast<u64>(value->diagnostic.phase),
+            static_cast<u64>(value->diagnostic.error_number)};
+}
+
+static bool canonical_proc_link(int fd, std::string& link) {
+    link.clear();
+    if (fd < 0) return false;
+    std::array<char, collision_evidence::kMaxProcLink + 1u> buffer{};
+    const ssize_t length = readlink((std::string("/proc/self/fd/") + std::to_string(fd)).c_str(),
+                                    buffer.data(),
+                                    buffer.size() - 1u);
+    if (length <= 0 || static_cast<std::size_t>(length) >= buffer.size()) return false;
+    link.assign(buffer.data(), static_cast<std::size_t>(length));
+    return link.starts_with("socket:[") && link.back() == ']';
+}
+
+static bool canonical_socket_fields(int fd,
+                                    u64& g_fgetfd,
+                                    u64& g_fgetfl,
+                                    u64& mode,
+                                    u64& device,
+                                    u64& rdevice,
+                                    u64& domain,
+                                    u64& type,
+                                    u64& protocol,
+                                    u64& reuseaddr,
+                                    u64& reuseport,
+                                    u64& acceptconn,
+                                    u64& inode,
+                                    std::string& proc_link) {
+    struct stat status{};
+    const int fgetfd = fcntl(fd, F_GETFD);
+    const int fgetfl = fcntl(fd, F_GETFL);
+    int socket_domain = 0, socket_type = 0, socket_protocol = 0;
+    int socket_reuseaddr = 0, socket_reuseport = 0, socket_acceptconn = 0;
+    socklen_t size = sizeof(int);
+    if (fd < 0 || fgetfd < 0 || fgetfl < 0 || fstat(fd, &status) != 0 ||
+        getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &socket_domain, &size) != 0)
+        return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socket_type, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &socket_protocol, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &socket_reuseaddr, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &socket_reuseport, &size) != 0) return false;
+    size = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &socket_acceptconn, &size) != 0) return false;
+    if (!canonical_proc_link(fd, proc_link)) return false;
+    g_fgetfd = static_cast<u64>(fgetfd);
+    g_fgetfl = static_cast<u64>(fgetfl);
+    mode = static_cast<u64>(status.st_mode);
+    device = static_cast<u64>(status.st_dev);
+    rdevice = static_cast<u64>(status.st_rdev);
+    domain = static_cast<u64>(socket_domain);
+    type = static_cast<u64>(socket_type);
+    protocol = static_cast<u64>(socket_protocol);
+    reuseaddr = static_cast<u64>(socket_reuseaddr);
+    reuseport = static_cast<u64>(socket_reuseport);
+    acceptconn = static_cast<u64>(socket_acceptconn);
+    inode = static_cast<u64>(status.st_ino);
+    return S_ISSOCK(status.st_mode) && inode != 0u &&
+           proc_link == "socket:[" + std::to_string(inode) + "]";
+}
+
+static bool canonical_reservation_source(
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const private_directory::PrivateDirectoryLease& directory,
+    const std::string& source_bytes,
+    const ProcIdentity& target,
+    collision_evidence::ReservationSource& report) {
+    report = {};
+    struct stat source_status{};
+    if (!source.active() || source.state() != source_lease::State::Active ||
+        reservation.state() != exact_reservation::State::Held ||
+        fstat(source.descriptor(), &source_status) != 0 || !S_ISREG(source_status.st_mode) ||
+        source_status.st_nlink != 1 || source_status.st_size < 0 ||
+        static_cast<u64>(source_status.st_size) != source_bytes.size())
+        return false;
+    u64 g_fgetfd = 0u, g_fgetfl = 0u, mode = 0u, device = 0u, rdevice = 0u, domain = 0u, type = 0u;
+    u64 protocol = 0u, reuseaddr = 0u, reuseport = 0u, acceptconn = 0u, inode = 0u;
+    std::string proc_link;
+    source_lease::Diagnostic source_diagnostic;
+    if (!canonical_socket_fields(reservation.descriptor(),
+                                 g_fgetfd,
+                                 g_fgetfl,
+                                 mode,
+                                 device,
+                                 rdevice,
+                                 domain,
+                                 type,
+                                 protocol,
+                                 reuseaddr,
+                                 reuseport,
+                                 acceptconn,
+                                 inode,
+                                 proc_link))
+        return false;
+    if (!source_lease::read_exact_bytes_for_testing(
+            source.descriptor(), source_bytes, canonical_source_pread, source_diagnostic))
+        return false;
+    report.reservation_state = static_cast<u64>(collision_evidence::ReservationState::Held);
+    report.g_fd = static_cast<u64>(reservation.descriptor());
+    report.g_f_getfd = g_fgetfd;
+    report.g_f_getfl = g_fgetfl;
+    report.ipv4 = reservation.ipv4();
+    report.port = reservation.port();
+    report.dev = device;
+    report.ino = inode;
+    report.mode = mode;
+    report.rdev = rdevice;
+    report.socket_domain = domain;
+    report.socket_type = type;
+    report.socket_protocol = protocol;
+    report.reuseaddr = reuseaddr;
+    report.reuseport = reuseport;
+    report.acceptconn = acceptconn;
+    report.proc_link_len = proc_link.size();
+    report.proc_link = proc_link;
+    report.directory_dev = directory.identity().device;
+    report.directory_ino = directory.identity().inode;
+    report.directory_mode = directory.identity().mode;
+    report.directory_uid = directory.identity().uid;
+    report.directory_gid = directory.identity().gid;
+    report.source_state = static_cast<u64>(collision_evidence::SourceState::Active);
+    report.source_dev = static_cast<u64>(source_status.st_dev);
+    report.source_ino = static_cast<u64>(source_status.st_ino);
+    report.source_mode = static_cast<u64>(source_status.st_mode);
+    report.source_uid = static_cast<u64>(source_status.st_uid);
+    report.source_gid = static_cast<u64>(source_status.st_gid);
+    report.source_size = static_cast<u64>(source_status.st_size);
+    report.source_nlink = static_cast<u64>(source_status.st_nlink);
+    report.path_len = source.path().size();
+    report.bytes_len = source_bytes.size();
+    report.source_path = source.path();
+    report.source_bytes = source_bytes;
+    return report.g_fd != 0u && report.ino == inode && target.pid > 1 &&
+           report.path_len <= collision_evidence::kMaxSourcePath &&
+           report.bytes_len <= collision_evidence::kMaxSourceBytes &&
+           report.source_path.front() == '/';
+}
+
+static collision_evidence::Envelope canonical_envelope_from_frame(
+    const Frame& frame, collision_evidence::ReportKind expected_kind) {
+    collision_evidence::Envelope value;
+    if (frame.type != collision_evidence::kEvidenceFrameType ||
+        frame.payload.size() < collision_evidence::kEnvelopeBytes)
+        return value;
+    std::array<u64, 11u> fields{};
+    for (std::size_t index = 0u; index != fields.size(); ++index)
+        fields[index] = read_u64(frame.payload.data() + index * sizeof(u64));
+    value.version = fields[0];
+    value.transaction = fields[1];
+    value.domain = fields[2];
+    value.kind = static_cast<collision_evidence::ReportKind>(fields[3]);
+    value.binding = static_cast<collision_evidence::Binding>(fields[4]);
+    value.phase = static_cast<collision_evidence::Phase>(fields[5]);
+    value.sequence = fields[6];
+    value.target = {fields[7], fields[8], fields[9]};
+    if (value.kind != expected_kind ||
+        fields[10] != frame.payload.size() - collision_evidence::kEnvelopeBytes)
+        return {};
+    return value;
+}
+
+static collision_evidence::Envelope canonical_expected_envelope(
+    u64 transaction,
+    const collision_evidence::Target& target,
+    collision_evidence::ReportKind kind,
+    collision_evidence::Binding binding,
+    collision_evidence::Phase phase,
+    u64 sequence) {
+    collision_evidence::Envelope value;
+    value.transaction = transaction;
+    value.kind = kind;
+    value.binding = binding;
+    value.phase = phase;
+    value.sequence = sequence;
+    value.target = target;
+    return value;
+}
+
+static bool canonical_send_evidence(int fd,
+                                    const Token& token,
+                                    const Frame& frame,
+                                    std::size_t maximum,
+                                    std::chrono::steady_clock::time_point deadline) {
+    evidence_transport::Diagnostic diagnostic;
+    return evidence_transport::send_frame(fd, token, maximum, deadline, frame, diagnostic);
+}
+
+static bool canonical_receive_evidence(int fd,
+                                       const Token& token,
+                                       std::size_t maximum,
+                                       std::chrono::steady_clock::time_point deadline,
+                                       Frame& frame) {
+    evidence_transport::Diagnostic diagnostic;
+    return evidence_transport::receive_frame(fd, token, maximum, deadline, frame, diagnostic);
+}
+
+static bool canonical_random_transaction(u64& transaction) {
+    transaction = 0u;
+    for (;;) {
+        const ssize_t count = getrandom(&transaction, sizeof(transaction), GRND_NONBLOCK);
+        if (count == static_cast<ssize_t>(sizeof(transaction))) return transaction != 0u;
+        if (count < 0 && errno == EINTR) continue;
+        return false;
+    }
+}
+
+static bool canonical_empty_environment(pid_t pid) {
+    std::string environment;
+    return pid > 1 && read_file("/proc/" + std::to_string(pid) + "/environ", environment, 8192u) &&
+           environment.empty();
+}
+
+static bool canonical_pidfd_live(int pidfd) {
+    if (pidfd < 0) return false;
+    pollfd descriptor{pidfd, POLLIN | POLLERR | POLLHUP, 0};
+    int result;
+    do {
+        result = poll(&descriptor, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 && descriptor.revents == 0;
+}
+
+static bool canonical_target_socket_evidence(
+    pid_t child, u32 positive_ipv4, u32 guard_ipv4, u16 port, u64& socket_inode) {
+    socket_inode = 0u;
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> inodes;
+    privileged_listener::Diagnostic diagnostic;
+    if (!read_process_tcp_table(child, table) || !process_socket_inodes(child, inodes))
+        return false;
+    const privileged_listener::ListenerPlan classified{positive_ipv4, guard_ipv4, port};
+    privileged_listener::ListenerEvidence evidence;
+    if (!privileged_listener::classify_listener_evidence(
+            table,
+            classified,
+            inodes,
+            privileged_listener::ListenerEvidenceKind::ExactPositive,
+            evidence,
+            diagnostic))
+        return false;
+    socket_inode = evidence.child_owned_inode;
+    return socket_inode != 0u;
+}
+
+static bool canonical_attempt_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const ProcIdentity& target,
+    const std::string& expected_cmdline,
+    const privileged_listener::CollisionLogEvidence& classifier,
+    bool live,
+    collision_evidence::CollisionAttempt& report) {
+    report = {};
+    const auto settlement = attempt_lease.settlement_receipt();
+    const auto cleanup = attempt_lease.cleanup_state();
+    if (!settlement || !cleanup || settlement->child_pid <= 1 || settlement->identity.start == 0u)
+        return false;
+    report.cross = {static_cast<u64>(reservation.descriptor()),
+                    reservation.socket_inode(),
+                    source.source_identity().device,
+                    source.source_identity().inode};
+    report.header = {live ? static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive)
+                          : static_cast<u64>(collision_evidence::AttemptState::EarlyDeath),
+                     static_cast<u64>(collision_evidence::CollisionOutcome::NaturallyRejected),
+                     static_cast<u64>(EADDRINUSE),
+                     static_cast<u64>(settlement->child_pid),
+                     settlement->identity.start,
+                     live ? static_cast<u64>(collision_evidence::CmdlineProvenance::BracketedProc)
+                          : static_cast<u64>(collision_evidence::CmdlineProvenance::OwnedExpected),
+                     expected_cmdline.size()};
+    report.procs = canonical_proc_pair(attempt_lease, live);
+    report.settlement = canonical_settlement(settlement);
+    report.cleanup = canonical_cleanup(cleanup);
+    report.classifier = {classifier.backend == privileged_listener::CollisionBackend::Epoll
+                             ? static_cast<u64>(collision_evidence::ClassifierBackend::Epoll)
+                             : static_cast<u64>(collision_evidence::ClassifierBackend::IoUring),
+                         2u,
+                         static_cast<u64>(EADDRINUSE),
+                         4u,
+                         attempt_lease.sealed_capture_bytes().size()};
+    report.cmdline = expected_cmdline;
+    return target.pid > 1 && report.cross.g_inode == reservation.socket_inode() &&
+           report.header.child_pid == report.settlement.child_pid &&
+           report.classifier.capture_len <= collision_evidence::kMaxCapture;
+}
+
+static bool canonical_evidence_closed_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    bool collision_live,
+    collision_evidence::EvidenceClosed& report) {
+    const auto settlement = attempt_lease.settlement_receipt();
+    if (!settlement || !attempt_lease.sealed_capture_bytes().size()) return false;
+    report = {static_cast<u64>(reservation.descriptor()),
+              reservation.socket_inode(),
+              source.source_identity().device,
+              source.source_identity().inode,
+              static_cast<u64>(settlement->child_pid),
+              settlement->identity.start,
+              collision_live ? static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive)
+                             : static_cast<u64>(collision_evidence::AttemptState::EarlyDeath),
+              static_cast<u64>(collision_evidence::ReservationState::Held),
+              static_cast<u64>(collision_evidence::SourceState::Active),
+              attempt_lease.sealed_capture_bytes().size(),
+              canonical_cleanup(attempt_lease.cleanup_state())};
+    return report.g_fd != 0u && report.g_inode == reservation.socket_inode() &&
+           report.source_dev == source.source_identity().device &&
+           report.source_inode == source.source_identity().inode && report.attempt_state != 0u;
+}
+
+static bool canonical_release_projection(
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    collision_evidence::Release& report) {
+    const auto receipt = reservation.release_receipt();
+    if (!receipt) return false;
+    const u64 invalid_fgetfd = std::numeric_limits<u64>::max();
+    report.g_fd = static_cast<u64>(reservation.descriptor());
+    report.ipv4 = reservation.ipv4();
+    report.port = reservation.port();
+    report.g_inode = reservation.socket_inode();
+    report.receipt = {receipt->attempted ? 1u : 0u,
+                      receipt->destructor ? 1u : 0u,
+                      receipt->real_close_attempts,
+                      static_cast<u64>(receipt->real_close_result),
+                      static_cast<u64>(receipt->real_close_error),
+                      static_cast<u64>(receipt->reported_close_error),
+                      receipt->immediate_ebadf ? invalid_fgetfd : 0u,
+                      static_cast<u64>(receipt->immediate_fgetfd_error),
+                      receipt->immediate_ebadf ? 1u : 0u,
+                      receipt->post_inventory_checked ? 1u : 0u,
+                      receipt->baseline_restored ? 1u : 0u,
+                      receipt->socket_inode_absent ? 1u : 0u,
+                      receipt->reportable_success ? 1u : 0u,
+                      static_cast<u64>(collision_evidence::ReleaseState::Released),
+                      static_cast<u64>(receipt->diagnostic.phase),
+                      static_cast<u64>(receipt->diagnostic.error_number)};
+    return report.receipt.attempted == 1u && report.receipt.destructor == 0u &&
+           report.receipt.real_close_attempts == 1u && report.receipt.real_close_result == 0u &&
+           report.receipt.immediate_ebadf == 1u && report.receipt.reportable_success == 1u;
+}
+
+static bool canonical_retry_live_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const std::string& expected_cmdline,
+    u64 backend,
+    const std::string& startup,
+    collision_evidence::RetryLive& report) {
+    const auto observation = attempt_lease.exec_observation();
+    report = {};
+    report.source_dev = source.source_identity().device;
+    report.source_inode = source.source_identity().inode;
+    report.source_size = source.source_identity().size;
+    report.source_path_len = source.path().size();
+    report.g_inode = reservation.socket_inode();
+    report.port = reservation.port();
+    report.header = {static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive),
+                     static_cast<u64>(collision_evidence::CollisionOutcome::NaturallyRejected),
+                     static_cast<u64>(EADDRINUSE),
+                     static_cast<u64>(attempt_lease.child_pid()),
+                     observation.second.start,
+                     static_cast<u64>(collision_evidence::CmdlineProvenance::BracketedProc),
+                     expected_cmdline.size()};
+    report.procs = canonical_proc_pair(attempt_lease, true);
+    report.pidfd.pidfd_fd = static_cast<u64>(attempt_lease.observation_pidfd());
+    report.pidfd.poll_result = 0u;
+    report.pidfd.revents = 0u;
+    report.pidfd.fdinfo_pid = static_cast<u64>(attempt_lease.child_pid());
+    report.startup = {backend, 2u, reservation.port(), startup.size()};
+    report.source_path = source.path();
+    report.cmdline = expected_cmdline;
+    return report.source_path_len <= collision_evidence::kMaxSourcePath &&
+           report.startup.capture_len <= collision_evidence::kMaxCapture &&
+           canonical_pidfd_live(attempt_lease.observation_pidfd()) &&
+           exact_pidfd_binding(attempt_lease.observation_pidfd(), attempt_lease.child_pid());
+}
+
+static bool canonical_retry_settlement_projection(
+    const public_attempt::PublicRutAttemptLease& attempt_lease,
+    const source_lease::WildcardAttemptSourceLease& source,
+    collision_evidence::RetrySettlement& report) {
+    const auto receipt = attempt_lease.settlement_receipt();
+    if (!receipt) return false;
+    report = {source.source_identity().device,
+              source.source_identity().inode,
+              static_cast<u64>(attempt_lease.child_pid()),
+              receipt->identity.start,
+              static_cast<u64>(collision_evidence::AttemptState::ExecObservedLive),
+              canonical_settlement(receipt),
+              canonical_cleanup(attempt_lease.cleanup_state()),
+              attempt_lease.sealed_capture_bytes().size()};
+    return report.settlement.wait_status == 9u && report.settlement.terminal == 1u &&
+           report.settlement.reaped == 1u && report.final_capture_len != 0u;
+}
+
+static bool canonical_target_phase(int control,
+                                   const Token& token,
+                                   collision_control::StateMachine& machine,
+                                   u64 transaction,
+                                   collision_control::Phase phase,
+                                   std::chrono::steady_clock::time_point deadline) {
+    u64 sequence = 0u;
+    switch (phase) {
+        case collision_control::Phase::ReservationHeld:
+            sequence = 1u;
+            break;
+        case collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen:
+            sequence = 3u;
+            break;
+        case collision_control::Phase::EvidenceClosedReservationHeld:
+            sequence = 5u;
+            break;
+        case collision_control::Phase::ReservationReleased:
+            sequence = 7u;
+            break;
+        case collision_control::Phase::RetryLive:
+            sequence = 9u;
+            break;
+    }
+    if (sequence == 0u) return false;
+    const collision_control::PhaseV2 value{collision_control::kProfileVersion,
+                                           transaction,
+                                           collision_control::Profile::Canonical,
+                                           phase,
+                                           sequence};
+    const Frame frame = collision_control::encode_phase(token, value);
+    return machine.observe(frame, token) &&
+           send_frame(control, frame, remaining_deadline_ms(deadline));
+}
+
+static bool canonical_target_decision(int control,
+                                      const Token& token,
+                                      collision_control::StateMachine& machine,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      collision_control::DecisionKind expected) {
+    Frame frame;
+    collision_control::DecisionV2 decision;
+    return receive_frame_until(control, frame, deadline) &&
+           collision_control::decode_decision(frame, token, decision) &&
+           decision.decision == expected && machine.decide(frame, token);
+}
+
+static bool canonical_target_settlement(int control,
+                                        const Token& token,
+                                        collision_control::StateMachine& machine,
+                                        std::chrono::steady_clock::time_point deadline) {
+    Frame frame;
+    collision_control::SettlementV2 settlement;
+    return receive_frame_until(control, frame, deadline) &&
+           collision_control::decode_settlement(frame, token, settlement) &&
+           machine.settle(frame, token);
+}
+
+static int canonical_target_flow(int control,
+                                 const Token& token,
+                                 const std::vector<unsigned char>& request,
+                                 const std::string& control_path) {
+    u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+    std::string executable_path;
+    if (!parse_canonical_request(request, positive_ipv4, guard_ipv4, executable_path)) return 60;
+    const auto transaction_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    u64 transaction = 0u;
+    ProcIdentity target_identity;
+    if (!canonical_random_transaction(transaction) || !read_proc(getpid(), target_identity) ||
+        target_identity.uid != geteuid() || target_identity.gid != getegid() ||
+        target_identity.supplementary_groups != 0 || !target_identity.no_new_privs ||
+        !target_identity.capabilities_clear || target_identity.netns == 0)
+        return 61;
+
+    private_directory::PrivateDirectoryLease directory;
+    source_lease::WildcardAttemptSourceLease source;
+    executable_lease::ExecutableLease executable;
+    exact_reservation::ExactTcpReservationLease reservation;
+    public_attempt::PublicRutAttemptLease collision_attempt;
+    public_attempt::PublicRutAttemptLease retry_attempt;
+    private_directory::Diagnostic directory_diagnostic;
+    source_lease::Diagnostic source_diagnostic;
+    executable_lease::Diagnostic executable_diagnostic;
+    exact_reservation::Diagnostic reservation_diagnostic;
+    public_attempt::Diagnostic attempt_diagnostic;
+    if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic) ||
+        !source_lease::WildcardAttemptSourceLease::stage(directory.descriptor(),
+                                                         directory.path(),
+                                                         "canonical-listener.rut",
+                                                         source,
+                                                         source_diagnostic) ||
+        !executable_lease::ExecutableLease::create(
+            executable_path, executable, executable_diagnostic) ||
+        !exact_reservation::ExactTcpReservationLease::reserve(
+            guard_ipv4, reservation, reservation_diagnostic))
+        return 62;
+
+    const std::string dotted_guard = [&]() {
+        std::array<char, INET_ADDRSTRLEN> text{};
+        in_addr address{htonl(guard_ipv4)};
+        return inet_ntop(AF_INET, &address, text.data(), text.size()) == nullptr
+                   ? std::string{}
+                   : std::string(text.data());
+    }();
+    if (dotted_guard.empty() || reservation.port() == 0u ||
+        reservation.port() > std::numeric_limits<u16>::max())
+        return 63;
+    const std::string source_bytes = "listen " + dotted_guard + ":" +
+                                     std::to_string(reservation.port()) +
+                                     "\nroute GET \"/\" { return 204 }\n";
+    if (source_bytes.size() > collision_evidence::kMaxSourceBytes ||
+        !source.finalize_exact_bytes(source_bytes, source_diagnostic) ||
+        !reservation.revalidate(reservation_diagnostic))
+        return 64;
+
+    collision_evidence::ReservationSource source_report;
+    if (!canonical_reservation_source(
+            reservation, source, directory, source_bytes, target_identity, source_report))
+        return 65;
+    const collision_evidence::Target evidence_target{static_cast<u64>(target_identity.pid),
+                                                     target_identity.start,
+                                                     static_cast<u64>(target_identity.netns)};
+    const collision_evidence::Envelope source_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::ReservationSource,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::ReservationHeld,
+                                    1u);
+    const Frame source_frame =
+        collision_evidence::encode_reservation_source(token, source_envelope, source_report);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            source_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::ReservationSource),
+            transaction_deadline))
+        return 66;
+
+    Frame command_frame;
+    collision_control::CommandV2 command;
+    collision_control::StateMachine machine;
+    if (!receive_frame_until(control, command_frame, transaction_deadline) ||
+        !collision_control::decode_command(command_frame, token, command) ||
+        command.transaction_id != transaction || !machine.begin(command_frame, token) ||
+        !canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::ReservationHeld,
+                                transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeCollisionExec))
+        return 67;
+
+    const std::array<std::string_view, 9u> arguments = {executable.canonical_path(),
+                                                        source.path(),
+                                                        "--shards",
+                                                        "1",
+                                                        "--no-pin",
+                                                        "--drain",
+                                                        "0",
+                                                        "--opt",
+                                                        "2"};
+    const std::string expected_cmdline = [&]() {
+        std::string value;
+        for (const std::string_view argument : arguments) {
+            value.append(argument);
+            value.push_back('\0');
+        }
+        return value;
+    }();
+    if (expected_cmdline.size() > collision_evidence::kMaxCmdline ||
+        !collision_attempt.prepare(
+            source, executable, arguments, transaction_deadline, {}, attempt_diagnostic) ||
+        !collision_attempt.exec_and_observe(
+            source, executable, transaction_deadline, attempt_diagnostic) ||
+        (collision_attempt.state() != public_attempt::State::EarlyDeath &&
+         collision_attempt.state() != public_attempt::State::ExecObservedLive) ||
+        !collision_attempt.settle_natural(1, transaction_deadline, attempt_diagnostic))
+        return 68;
+    const bool collision_live = collision_attempt.exec_observation().outcome ==
+                                public_attempt::handoff::ExecOutcome::ExecObservedLive;
+    std::string collision_capture = collision_attempt.sealed_capture_bytes();
+    privileged_listener::CollisionLogEvidence collision_classifier;
+    privileged_listener::Diagnostic collision_diagnostic;
+    if (collision_capture.empty() ||
+        !privileged_listener::classify_collision_log(
+            collision_capture, source.path(), 2u, collision_classifier, collision_diagnostic) ||
+        collision_attempt.state() != public_attempt::State::NaturalReapedEvidenceOpen)
+        return 69;
+    collision_evidence::CollisionAttempt collision_report;
+    if (!canonical_attempt_projection(collision_attempt,
+                                      source,
+                                      reservation,
+                                      target_identity,
+                                      expected_cmdline,
+                                      collision_classifier,
+                                      collision_live,
+                                      collision_report))
+        return 70;
+    const collision_evidence::Envelope collision_envelope = canonical_expected_envelope(
+        transaction,
+        evidence_target,
+        collision_evidence::ReportKind::CollisionAttempt,
+        collision_evidence::Binding::Phase,
+        collision_evidence::Phase::CollisionNaturallyRejectedEvidenceOpen,
+        3u);
+    const Frame collision_frame =
+        collision_evidence::encode_collision_attempt(token, collision_envelope, collision_report);
+    const collision_evidence::CollisionCapture capture_report{
+        static_cast<u64>(collision_capture.size()), collision_capture};
+    const collision_evidence::Envelope collision_capture_envelope = canonical_expected_envelope(
+        transaction,
+        evidence_target,
+        collision_evidence::ReportKind::CollisionCapture,
+        collision_evidence::Binding::Phase,
+        collision_evidence::Phase::CollisionNaturallyRejectedEvidenceOpen,
+        3u);
+    const Frame capture_frame = collision_evidence::encode_collision_capture(
+        token, collision_capture_envelope, capture_report);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::CollisionAttempt),
+            transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            capture_frame,
+            collision_evidence::max_payload(collision_evidence::ReportKind::CollisionCapture),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeEvidenceClose) ||
+        !collision_attempt.close_evidence(attempt_diagnostic) ||
+        !reservation.revalidate(reservation_diagnostic) || !source.revalidate(source_diagnostic))
+        return 71;
+
+    collision_evidence::EvidenceClosed closed_report;
+    closed_report.attempt_state = collision_report.header.attempt_state;
+    // Build the closed projection only after the capture FD is closed. The
+    // report helper reads only immutable source/G identities and cleanup state.
+    if (!canonical_evidence_closed_projection(
+            collision_attempt, source, reservation, collision_live, closed_report))
+        return 72;
+    const collision_evidence::Envelope closed_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::EvidenceClosed,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::EvidenceClosedReservationHeld,
+                                    5u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::EvidenceClosedReservationHeld,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_evidence_closed(token, closed_envelope, closed_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::EvidenceClosed),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeReservationRelease))
+        return 73;
+
+    const int released_fd = reservation.descriptor();
+    const u64 released_inode = reservation.socket_inode();
+    if (released_fd < 0 || released_inode == 0u || !reservation.release(reservation_diagnostic))
+        return 74;
+    collision_evidence::Release release_report;
+    if (!canonical_release_projection(reservation, release_report)) return 75;
+    release_report.g_fd = static_cast<u64>(released_fd);
+    release_report.g_inode = released_inode;
+    const collision_evidence::Envelope release_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::Release,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::ReservationReleased,
+                                    7u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::ReservationReleased,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_release(token, release_envelope, release_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::Release),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeRetryExec))
+        return 76;
+
+    if (!retry_attempt.prepare(
+            source, executable, arguments, transaction_deadline, {}, attempt_diagnostic) ||
+        !retry_attempt.exec_and_observe(
+            source, executable, transaction_deadline, attempt_diagnostic) ||
+        retry_attempt.state() != public_attempt::State::ExecObservedLive)
+        return 77;
+    std::string startup_capture;
+    u64 startup_backend = 0u;
+    bool retry_ready = false;
+    const privileged_listener::ListenerPlan retry_plan{
+        guard_ipv4, positive_ipv4, reservation.port()};
+    while (std::chrono::steady_clock::now() < transaction_deadline) {
+        std::string candidate;
+        ProcIdentity first, second;
+        privileged_listener::ProcTcpTable table;
+        std::vector<u64> sockets;
+        privileged_listener::ListenerEvidence listener;
+        privileged_listener::Diagnostic listener_diagnostic;
+        if (retry_attempt.snapshot_capture(candidate, attempt_diagnostic) &&
+            exact_log_ready(candidate, source.path(), reservation.port(), startup_backend) &&
+            read_proc(retry_attempt.child_pid(), first) &&
+            read_proc(retry_attempt.child_pid(), second) && same_process_identity(first, second) &&
+            first.pid == retry_attempt.child_pid() && first.ppid == getpid() &&
+            first.netns == target_identity.netns && canonical_empty_environment(first.pid) &&
+            source.revalidate(source_diagnostic) && executable.revalidate(executable_diagnostic) &&
+            canonical_pidfd_live(retry_attempt.observation_pidfd()) &&
+            exact_pidfd_binding(retry_attempt.observation_pidfd(), retry_attempt.child_pid()) &&
+            read_process_tcp_table(retry_attempt.child_pid(), table) &&
+            process_socket_inodes(retry_attempt.child_pid(), sockets) &&
+            privileged_listener::classify_listener_evidence(
+                table,
+                retry_plan,
+                sockets,
+                privileged_listener::ListenerEvidenceKind::ExactPositive,
+                listener,
+                listener_diagnostic) &&
+            listener.child_owned_inode != 0u) {
+            startup_capture = candidate;
+            retry_ready = true;
+            break;
+        }
+        (void)poll(nullptr, 0, 5);
+    }
+    if (!retry_ready) return 78;
+    collision_evidence::RetryLive retry_report;
+    if (!canonical_retry_live_projection(retry_attempt,
+                                         source,
+                                         reservation,
+                                         expected_cmdline,
+                                         startup_backend,
+                                         startup_capture,
+                                         retry_report))
+        return 79;
+    const collision_evidence::Envelope retry_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryLive,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::RetryLive,
+                                    9u);
+    const collision_evidence::RetryLiveCapture retry_capture_report{
+        static_cast<u64>(startup_capture.size()), startup_capture};
+    const collision_evidence::Envelope retry_capture_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryLiveCapture,
+                                    collision_evidence::Binding::Phase,
+                                    collision_evidence::Phase::RetryLive,
+                                    9u);
+    if (!canonical_target_phase(control,
+                                token,
+                                machine,
+                                transaction,
+                                collision_control::Phase::RetryLive,
+                                transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_live(token, retry_envelope, retry_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLive),
+            transaction_deadline) ||
+        !canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_live_capture(
+                token, retry_capture_envelope, retry_capture_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLiveCapture),
+            transaction_deadline) ||
+        !canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::AuthorizeRetrySettlement) ||
+        !retry_attempt.settle_killed(SIGKILL, transaction_deadline, attempt_diagnostic))
+        return 80;
+
+    std::string final_capture;
+    if (!retry_attempt.snapshot_capture(final_capture, attempt_diagnostic) ||
+        final_capture.size() < startup_capture.size() ||
+        std::memcmp(final_capture.data(), startup_capture.data(), startup_capture.size()) != 0)
+        return 81;
+    collision_evidence::RetrySettlement settlement_report;
+    if (!canonical_retry_settlement_projection(retry_attempt, source, settlement_report)) return 82;
+    const collision_evidence::Envelope settlement_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetrySettlement,
+                                    collision_evidence::Binding::Settlement,
+                                    collision_evidence::Phase::RetryLive,
+                                    11u);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_settlement(
+                token, settlement_envelope, settlement_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetrySettlement),
+            transaction_deadline) ||
+        !retry_attempt.close_evidence(attempt_diagnostic) || !source.remove(source_diagnostic) ||
+        !directory.settle(directory_diagnostic) || !executable.close(executable_diagnostic))
+        return 83;
+    const collision_evidence::RetryFinalCapture final_report{static_cast<u64>(final_capture.size()),
+                                                             final_capture};
+    const collision_evidence::Envelope final_envelope =
+        canonical_expected_envelope(transaction,
+                                    evidence_target,
+                                    collision_evidence::ReportKind::RetryFinalCapture,
+                                    collision_evidence::Binding::Settlement,
+                                    collision_evidence::Phase::RetryLive,
+                                    11u);
+    if (!canonical_send_evidence(
+            control,
+            token,
+            collision_evidence::encode_retry_final_capture(token, final_envelope, final_report),
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryFinalCapture),
+            transaction_deadline) ||
+        !canonical_target_settlement(control, token, machine, transaction_deadline))
+        return 84;
+    if (!canonical_target_decision(control,
+                                   token,
+                                   machine,
+                                   transaction_deadline,
+                                   collision_control::DecisionKind::Finish) ||
+        machine.state() != collision_control::State::Complete)
+        return 85;
+    close(control);
+    (void)control_path;
+    return 0;
+}
+
+static bool canonical_parent_phase(int target_fd,
+                                   const Token& token,
+                                   collision_control::StateMachine& machine,
+                                   std::chrono::steady_clock::time_point deadline,
+                                   collision_control::Phase expected_phase) {
+    Frame frame;
+    collision_control::PhaseV2 phase;
+    return receive_frame_until(target_fd, frame, deadline) &&
+           collision_control::decode_phase(frame, token, phase) && phase.phase == expected_phase &&
+           machine.observe(frame, token);
+}
+
+static bool canonical_parent_g_evidence(const collision_evidence::ReservationSource& source,
+                                        const ProcIdentity& target) {
+    if (target.pid <= 1 || source.g_fd > static_cast<u64>(std::numeric_limits<int>::max()))
+        return false;
+    const int descriptor = static_cast<int>(source.g_fd);
+    std::array<char, collision_evidence::kMaxProcLink + 1u> link_buffer{};
+    const std::string link_path =
+        "/proc/" + std::to_string(target.pid) + "/fd/" + std::to_string(descriptor);
+    const ssize_t link_size = readlink(link_path.c_str(), link_buffer.data(), link_buffer.size());
+    if (link_size <= 0 || static_cast<std::size_t>(link_size) >= link_buffer.size()) return false;
+    const std::string link(link_buffer.data(), static_cast<std::size_t>(link_size));
+    if (link != source.proc_link) return false;
+
+    std::string fdinfo;
+    if (!read_file("/proc/" + std::to_string(target.pid) + "/fdinfo/" + std::to_string(descriptor),
+                   fdinfo,
+                   4096u))
+        return false;
+    std::istringstream lines(fdinfo);
+    std::string key, value;
+    u64 flags = 0u;
+    bool found_flags = false;
+    while (lines >> key) {
+        if (key == "flags:") {
+            if (found_flags || !(lines >> value) || value.empty()) return false;
+            u64 parsed = 0u;
+            const auto result =
+                std::from_chars(value.data(), value.data() + value.size(), parsed, 8);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) return false;
+            flags = parsed;
+            found_flags = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return found_flags && (flags & static_cast<u64>(O_CLOEXEC)) != 0u &&
+           (flags & ~static_cast<u64>(O_CLOEXEC)) == source.g_f_getfl;
+}
+
+static bool canonical_parent_decision(int target_fd,
+                                      const Token& token,
+                                      collision_control::StateMachine& machine,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      collision_control::DecisionKind decision) {
+    collision_control::Phase phase = collision_control::Phase::ReservationHeld;
+    u64 sequence = 2u;
+    switch (decision) {
+        case collision_control::DecisionKind::AuthorizeCollisionExec:
+            phase = collision_control::Phase::ReservationHeld;
+            sequence = 2u;
+            break;
+        case collision_control::DecisionKind::AuthorizeEvidenceClose:
+            phase = collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen;
+            sequence = 4u;
+            break;
+        case collision_control::DecisionKind::AuthorizeReservationRelease:
+            phase = collision_control::Phase::EvidenceClosedReservationHeld;
+            sequence = 6u;
+            break;
+        case collision_control::DecisionKind::AuthorizeRetryExec:
+            phase = collision_control::Phase::ReservationReleased;
+            sequence = 8u;
+            break;
+        case collision_control::DecisionKind::AuthorizeRetrySettlement:
+        case collision_control::DecisionKind::Finish:
+            phase = collision_control::Phase::RetryLive;
+            sequence = decision == collision_control::DecisionKind::Finish ? 12u : 10u;
+            break;
+    }
+    const collision_control::DecisionV2 value{collision_control::kProfileVersion,
+                                              machine.transaction_id(),
+                                              collision_control::Profile::Canonical,
+                                              decision,
+                                              phase,
+                                              sequence};
+    const Frame frame = collision_control::encode_decision(token, value);
+    collision_control::DecisionV2 checked;
+    return collision_control::decode_decision(frame, token, checked) &&
+           checked.decision == decision && machine.decide(frame, token) &&
+           send_frame(target_fd, frame, remaining_deadline_ms(deadline));
+}
+
+static bool canonical_parent_validate_source(const collision_evidence::Envelope& envelope,
+                                             const collision_evidence::ReservationSource& source,
+                                             const ProcIdentity& target,
+                                             u32 positive_ipv4,
+                                             u32 guard_ipv4,
+                                             const std::string& executable,
+                                             std::string& error) {
+    std::array<char, INET_ADDRSTRLEN> dotted{};
+    in_addr address{htonl(guard_ipv4)};
+    if (inet_ntop(AF_INET, &address, dotted.data(), dotted.size()) == nullptr) {
+        error = "guard address formatting failed";
+        return false;
+    }
+    const std::string expected_bytes = "listen " + std::string(dotted.data()) + ":" +
+                                       std::to_string(source.port) +
+                                       "\nroute GET \"/\" { return 204 }\n";
+    const std::string prefix = "/tmp/rut377-private-";
+    const std::string suffix = "/canonical-listener.rut";
+    if (!collision_evidence::valid_envelope(envelope,
+                                            collision_evidence::ReportKind::ReservationSource) ||
+        envelope.binding != collision_evidence::Binding::Phase ||
+        envelope.phase != collision_evidence::Phase::ReservationHeld || envelope.sequence != 1u ||
+        envelope.target.pid != static_cast<u64>(target.pid) ||
+        envelope.target.start != target.start ||
+        envelope.target.netns != static_cast<u64>(target.netns) || positive_ipv4 == 0u ||
+        positive_ipv4 == guard_ipv4 ||
+        source.reservation_state != static_cast<u64>(collision_evidence::ReservationState::Held) ||
+        source.ipv4 != guard_ipv4 || source.port == 0u || source.port > 65535u ||
+        source.g_fd <= 2u || source.g_f_getfd != static_cast<u64>(FD_CLOEXEC) ||
+        (source.g_f_getfl & static_cast<u64>(O_ACCMODE)) != static_cast<u64>(O_RDWR) ||
+        source.dev == 0u || source.ino == 0u || source.mode == 0u ||
+        (source.mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFSOCK) ||
+        source.rdev != 0u || source.socket_domain != static_cast<u64>(AF_INET) ||
+        source.socket_type != static_cast<u64>(SOCK_STREAM) || source.socket_protocol != 0u ||
+        source.reuseaddr != 0u || source.reuseport != 0u || source.acceptconn != 0u ||
+        source.proc_link != "socket:[" + std::to_string(source.ino) + "]" ||
+        source.proc_link_len != source.proc_link.size() || source.proc_link.size() > 29u ||
+        source.directory_dev == 0u || source.directory_ino == 0u ||
+        (source.directory_mode & 0777u) != 0700u || source.directory_uid != getuid() ||
+        source.directory_gid != getgid() ||
+        source.source_state != static_cast<u64>(collision_evidence::SourceState::Active) ||
+        source.source_dev == 0u || source.source_ino == 0u ||
+        (source.source_mode & static_cast<u64>(S_IFMT)) != static_cast<u64>(S_IFREG) ||
+        (source.source_mode & 0777u) != 0600u || source.source_uid != getuid() ||
+        source.source_gid != getgid() || source.source_size != source.bytes_len ||
+        source.source_nlink != 1u || source.path_len != source.source_path.size() ||
+        source.bytes_len != source.source_bytes.size() ||
+        source.bytes_len != expected_bytes.size() || source.source_bytes != expected_bytes ||
+        source.path_len > collision_evidence::kMaxSourcePath ||
+        source.bytes_len > collision_evidence::kMaxSourceBytes ||
+        source.source_path.rfind(prefix, 0u) != 0u ||
+        source.source_path.size() <= prefix.size() + suffix.size() ||
+        source.source_path.compare(
+            source.source_path.size() - suffix.size(), suffix.size(), suffix) != 0 ||
+        source.source_path.find('\0') != std::string::npos || executable.empty() ||
+        !canonical_parent_g_evidence(source, target)) {
+        error = "reservation/source bootstrap projection was not exact";
+        return false;
+    }
+    const std::string directory_path = source.source_path.substr(
+        0u, source.source_path.size() - std::string("/canonical-listener.rut").size());
+    struct stat directory_status{}, source_status{};
+    if (lstat(directory_path.c_str(), &directory_status) != 0 ||
+        !S_ISDIR(directory_status.st_mode) ||
+        static_cast<u64>(directory_status.st_dev) != source.directory_dev ||
+        static_cast<u64>(directory_status.st_ino) != source.directory_ino ||
+        lstat(source.source_path.c_str(), &source_status) != 0 ||
+        static_cast<u64>(source_status.st_dev) != source.source_dev ||
+        static_cast<u64>(source_status.st_ino) != source.source_ino ||
+        static_cast<u64>(source_status.st_size) != source.source_size ||
+        source_status.st_nlink != 1u || source_status.st_uid != getuid() ||
+        source_status.st_gid != getgid()) {
+        error = "random source path/stat identity was not independently observed";
+        return false;
+    }
+    std::string observed_bytes;
+    if (!read_file(source.source_path, observed_bytes, collision_evidence::kMaxSourceBytes) ||
+        observed_bytes != expected_bytes) {
+        error = "source bytes were not independently read at report1 bootstrap";
+        return false;
+    }
+    (void)positive_ipv4;
+    return true;
+}
+
+static bool canonical_parent_pidfd_info(pid_t target, int fd, pid_t child) {
+    if (target <= 1 || fd < 0 || child <= 1) return false;
+    std::string text;
+    if (!read_file(
+            "/proc/" + std::to_string(target) + "/fdinfo/" + std::to_string(fd), text, 4096u))
+        return false;
+    std::istringstream lines(text);
+    std::string key;
+    bool found = false;
+    while (lines >> key) {
+        if (key == "Pid:") {
+            long value = 0;
+            if (found || !(lines >> value) || value != child) return false;
+            found = true;
+        }
+        std::string rest;
+        std::getline(lines, rest);
+    }
+    return found;
+}
+
+static bool canonical_parent_retry_identity(const collision_evidence::RetryLive& report,
+                                            const ProcIdentity& target,
+                                            const std::string& executable,
+                                            const collision_evidence::Target& evidence_target,
+                                            u32 positive_ipv4,
+                                            u32 guard_ipv4,
+                                            std::string& error) {
+    if (report.header.child_pid <= 1u ||
+        report.header.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
+        report.header.child_pid == 0u || report.header.child_start == 0u ||
+        report.pidfd.pidfd_fd > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        report.procs.first_tag != 1u || report.procs.second_tag != 1u ||
+        report.procs.first != report.procs.second ||
+        report.procs.first.pid != report.header.child_pid ||
+        report.procs.first.start != report.header.child_start ||
+        report.procs.first.ppid != evidence_target.pid ||
+        report.procs.first.netns != evidence_target.netns)
+        return false;
+    const pid_t child = static_cast<pid_t>(report.header.child_pid);
+    ProcIdentity first, second;
+    const std::string expected_cmdline = report.cmdline;
+    if (!read_proc(child, first) || !read_proc(child, second) ||
+        !same_process_identity(first, second) || first.start != report.header.child_start ||
+        first.ppid != target.pid || first.uid != getuid() || first.gid != getgid() ||
+        first.netns != target.netns || first.exe != executable ||
+        first.cmdline != expected_cmdline || !canonical_empty_environment(child) ||
+        !pidfd_link_matches(target.pid, static_cast<int>(report.pidfd.pidfd_fd)) ||
+        !canonical_parent_pidfd_info(target.pid, static_cast<int>(report.pidfd.pidfd_fd), child) ||
+        [&]() {
+            u64 socket_inode = 0u;
+            return canonical_target_socket_evidence(child,
+                                                    positive_ipv4,
+                                                    guard_ipv4,
+                                                    static_cast<u16>(report.port),
+                                                    socket_inode) &&
+                   socket_inode != 0u;
+        }()) {
+        error = "retry child/pidfd/socket identity was not independently observed";
+        return false;
+    }
+    return report.pidfd.poll_result == 0u && report.pidfd.revents == 0u;
+}
+
+static bool run_canonical_collision_release_parent(int target_fd,
+                                                   const Token& token,
+                                                   const HeldTopologySnapshot& topology,
+                                                   const std::string& executable,
+                                                   const ProcIdentity& target_proc,
+                                                   std::string& error) {
+    u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
+    if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
+        !parse_canonical_ipv4(topology.guard_ip, guard_ipv4)) {
+        error = "held topology addresses were not canonical IPv4";
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    const std::vector<unsigned char> request =
+        canonical_request_payload(positive_ipv4, guard_ipv4, executable);
+    if (!send_frame(
+            target_fd, Frame{kGuardReserve, token, request}, remaining_deadline_ms(deadline))) {
+        error = "canonical reservation request transport failed";
+        return false;
+    }
+    Frame source_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::ReservationSource),
+            deadline,
+            source_frame)) {
+        error = "canonical report1 transport failed";
+        return false;
+    }
+    const collision_evidence::Envelope source_envelope = canonical_envelope_from_frame(
+        source_frame, collision_evidence::ReportKind::ReservationSource);
+    collision_evidence::ReservationSource source;
+    if (!collision_evidence::decode_reservation_source(
+            source_frame, token, source_envelope, source) ||
+        !canonical_parent_validate_source(
+            source_envelope, source, target_proc, positive_ipv4, guard_ipv4, executable, error))
+        return false;
+    const collision_evidence::Target evidence_target{
+        source_envelope.target.pid, source_envelope.target.start, source_envelope.target.netns};
+    const std::array<std::string_view, 9u> arguments = {
+        executable, source.source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"};
+    std::string expected_cmdline;
+    for (const std::string_view argument : arguments) {
+        expected_cmdline.append(argument);
+        expected_cmdline.push_back('\0');
+    }
+    collision_evidence::ReceiverContext receiver_context{token,
+                                                         source_envelope.transaction,
+                                                         source_envelope.domain,
+                                                         evidence_target,
+                                                         source,
+                                                         expected_cmdline};
+    collision_evidence::Receiver receiver(receiver_context);
+    if (!receiver.observe(source_frame)) {
+        error = "report1 strict receiver replay failed";
+        return false;
+    }
+    collision_control::StateMachine machine;
+    const collision_control::CommandV2 command{collision_control::kProfileVersion,
+                                               source_envelope.transaction,
+                                               collision_control::Profile::Canonical,
+                                               0u};
+    const Frame command_frame = collision_control::encode_command(token, command);
+    if (!machine.begin(command_frame, token) ||
+        !send_frame(target_fd, command_frame, remaining_deadline_ms(deadline)) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::ReservationHeld) ||
+        !canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeCollisionExec) ||
+        !canonical_parent_phase(target_fd,
+                                token,
+                                machine,
+                                deadline,
+                                collision_control::Phase::CollisionNaturallyRejectedEvidenceOpen)) {
+        error = "collision control reservation/exec barrier failed";
+        return false;
+    }
+    Frame collision_frame, capture_frame;
+    const auto collision_max =
+        collision_evidence::max_payload(collision_evidence::ReportKind::CollisionAttempt);
+    const auto capture_max =
+        collision_evidence::max_payload(collision_evidence::ReportKind::CollisionCapture);
+    if (!canonical_receive_evidence(target_fd, token, collision_max, deadline, collision_frame) ||
+        !canonical_receive_evidence(target_fd, token, capture_max, deadline, capture_frame) ||
+        !receiver.observe(collision_frame) || !receiver.observe(capture_frame)) {
+        error = "collision reports 2/3 were malformed or out of order";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeEvidenceClose) ||
+        !canonical_parent_phase(target_fd,
+                                token,
+                                machine,
+                                deadline,
+                                collision_control::Phase::EvidenceClosedReservationHeld)) {
+        error = "collision evidence-close barrier failed";
+        return false;
+    }
+    Frame closed_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::EvidenceClosed),
+            deadline,
+            closed_frame) ||
+        !receiver.observe(closed_frame)) {
+        error = "report4 evidence-closed transport/replay failed";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeReservationRelease) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::ReservationReleased)) {
+        error = "one-shot reservation release barrier failed";
+        return false;
+    }
+    Frame release_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::Release),
+            deadline,
+            release_frame) ||
+        !receiver.observe(release_frame)) {
+        error = "report5 release receipt transport/replay failed";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeRetryExec) ||
+        !canonical_parent_phase(
+            target_fd, token, machine, deadline, collision_control::Phase::RetryLive)) {
+        error = "retry execution barrier failed";
+        return false;
+    }
+    Frame retry_frame, retry_capture_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLive),
+            deadline,
+            retry_frame)) {
+        error = "report6 retry-live transport failed";
+        return false;
+    }
+    const collision_evidence::Envelope retry_envelope =
+        canonical_envelope_from_frame(retry_frame, collision_evidence::ReportKind::RetryLive);
+    collision_evidence::RetryLive retry_live;
+    if (!collision_evidence::decode_retry_live(retry_frame, token, retry_envelope, retry_live) ||
+        !canonical_parent_retry_identity(
+            retry_live, target_proc, executable, evidence_target, guard_ipv4, positive_ipv4, error))
+        return false;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryLiveCapture),
+            deadline,
+            retry_capture_frame) ||
+        !receiver.observe(retry_frame) || !receiver.observe(retry_capture_frame)) {
+        error = "report7 live capture transport/replay failed";
+        return false;
+    }
+    collision_evidence::RetryLiveCapture retry_capture;
+    const collision_evidence::Envelope retry_capture_envelope = canonical_envelope_from_frame(
+        retry_capture_frame, collision_evidence::ReportKind::RetryLiveCapture);
+    if (!collision_evidence::decode_retry_live_capture(
+            retry_capture_frame, token, retry_capture_envelope, retry_capture) ||
+        !exact_log_ready(
+            retry_capture.capture, source.source_path, source.port, retry_live.startup.backend)) {
+        error = "retry startup capture was not exact";
+        return false;
+    }
+    if (!canonical_parent_decision(target_fd,
+                                   token,
+                                   machine,
+                                   deadline,
+                                   collision_control::DecisionKind::AuthorizeRetrySettlement)) {
+        error = "retry settlement barrier failed";
+        return false;
+    }
+    Frame settlement_frame, final_frame;
+    if (!canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetrySettlement),
+            deadline,
+            settlement_frame) ||
+        !receiver.observe(settlement_frame) ||
+        !canonical_receive_evidence(
+            target_fd,
+            token,
+            collision_evidence::max_payload(collision_evidence::ReportKind::RetryFinalCapture),
+            deadline,
+            final_frame) ||
+        !receiver.observe(final_frame)) {
+        error = "reports 8/9 transport/replay failed";
+        return false;
+    }
+    collision_evidence::RetryFinalCapture final_capture;
+    const collision_evidence::Envelope final_envelope = canonical_envelope_from_frame(
+        final_frame, collision_evidence::ReportKind::RetryFinalCapture);
+    if (!collision_evidence::decode_retry_final_capture(
+            final_frame, token, final_envelope, final_capture) ||
+        final_capture.capture.size() < retry_capture.capture.size() ||
+        std::memcmp(final_capture.capture.data(),
+                    retry_capture.capture.data(),
+                    retry_capture.capture.size()) != 0 ||
+        receiver.state() != collision_evidence::State::AwaitFinish) {
+        error = "final capture prefix/evidence receiver completion failed";
+        return false;
+    }
+    const collision_control::SettlementV2 settlement{
+        collision_control::kProfileVersion,
+        machine.transaction_id(),
+        collision_control::Profile::Canonical,
+        collision_control::SettlementKind::AttemptSettled,
+        collision_control::Phase::RetryLive,
+        11u};
+    const Frame settlement_control = collision_control::encode_settlement(token, settlement);
+    if (!machine.settle(settlement_control, token) ||
+        !send_frame(target_fd, settlement_control, remaining_deadline_ms(deadline)) ||
+        !canonical_parent_decision(
+            target_fd, token, machine, deadline, collision_control::DecisionKind::Finish) ||
+        machine.state() != collision_control::State::Complete || !receiver.finish()) {
+        error = "control settlement/finish ordering failed";
+        return false;
+    }
+    return true;
+}
+
 static std::vector<unsigned char> encode_guard_report(const GuardReport& report) {
     const std::array<u64, kGuardReportFields> fields{
         report.plan.positive_ipv4,
@@ -4286,6 +5767,8 @@ static int secured_target_main(const char* control_path,
             close(control);
             return 0;
         }
+        if (canonical_collision_scenario(scenario) && command.type == kGuardReserve)
+            return canonical_target_flow(control, token, command.payload, control_path);
         if (command.type == kGuardReserve && listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             ProcIdentity secured_identity;
@@ -5000,9 +6483,10 @@ static OwnedWaitResult wait_listener_target_bounded(pid_t target,
                                                     ino_t expected_netns,
                                                     uid_t expected_uid,
                                                     gid_t expected_gid,
+                                                    int target_wait_ms,
                                                     int& target_status) {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kListenerDeadlineMs * 2);
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(target_wait_ms);
     bool custody_received = false;
     bool custody_peer_closed = false;
     bool root_loss_observed = false;
@@ -5521,6 +7005,9 @@ static int dropped_broker_main(const char* executable,
                                                          static_cast<ino_t>(expected_netns),
                                                          caller_uid,
                                                          caller_gid,
+                                                         canonical_collision_scenario(scenario)
+                                                             ? kWildcardAttemptAggregateWaitMs
+                                                             : kListenerDeadlineMs * 2,
                                                          target_status)
                           : wait_owned_child_bounded(target,
                                                      executable,
@@ -5781,8 +7268,10 @@ static int root_broker_main(const char* executable,
         return abandoned == OwnedWaitResult::Exited ? 28 : 29;
     }
     int status = 0;
-    const int dropped_wait_ms =
-        listener_scenario_name(scenario) ? kListenerDeadlineMs * 3 : kBrokerDeadlineMs;
+    const int dropped_wait_ms = canonical_collision_scenario(scenario)
+                                    ? kWildcardAttemptAggregateWaitMs
+                                : listener_scenario_name(scenario) ? kListenerDeadlineMs * 3
+                                                                   : kBrokerDeadlineMs;
     const OwnedWaitResult dropped_wait_result =
         wait_owned_child_bounded(dropped,
                                  executable,
@@ -10976,6 +12465,10 @@ static bool run_session(const std::string& sudo_path,
                 error = "target PING/PONG/release failed";
                 break;
             }
+        } else if (canonical_collision_scenario(scenario)) {
+            if (!run_canonical_collision_release_parent(
+                    target_fd, token, topology, rut_executable.path, target_proc, error))
+                break;
         } else if (listener_scenario_name(scenario)) {
             u32 positive_ipv4 = 0u, guard_ipv4 = 0u;
             if (!parse_canonical_ipv4(topology.positive_ip, positive_ipv4) ||
@@ -11491,6 +12984,16 @@ static bool run_positive(const std::string& sudo_path,
                      "listener-cleanup-observation-failure",
                      error)) {
         error = "listener-cleanup-observation-failure: " + error;
+        return false;
+    }
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
+                     "listener-canonical-collision-release",
+                     error)) {
+        error = "listener-canonical-collision-release: " + error;
         return false;
     }
     return true;
