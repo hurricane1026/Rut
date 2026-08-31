@@ -624,7 +624,7 @@ bool missing_payload_is_bounded() {
 
 int main() {
     bool ok = true;
-    ok = check(golden_frames(), "exact frame 51--58 golden bytes") && ok;
+    ok = check(golden_frames(), "v2 exact frames and unchanged v1 common headers") && ok;
     ok = check(round_trips(), "v2 closed-domain round trips") && ok;
     ok = check(atomic_decoder_rejections(), "authenticated atomic decoder rejection") && ok;
     for (unsigned int repetition = 0u; repetition != 200u; ++repetition)
