@@ -3712,6 +3712,82 @@ static bool canonical_parent_retry_identity(const collision_evidence::RetryLive&
     return report.pidfd.poll_result == 0u && report.pidfd.revents == 0u;
 }
 
+static bool canonical_parent_cleanup_residue(const collision_evidence::ReservationSource& source,
+                                             const ProcIdentity& target,
+                                             const std::string& executable,
+                                             std::string& error) {
+    const std::string directory_path = source.source_path.substr(
+        0u, source.source_path.size() - std::string("/canonical-listener.rut").size());
+    struct stat ignored{};
+    errno = 0;
+    if (lstat(source.source_path.c_str(), &ignored) == 0 || errno != ENOENT) {
+        error = "source path remained after canonical cleanup";
+        return false;
+    }
+    errno = 0;
+    if (lstat(directory_path.c_str(), &ignored) == 0 || errno != ENOENT) {
+        error = "private directory remained after canonical cleanup";
+        return false;
+    }
+    privileged_listener::ProcTcpTable table;
+    std::vector<u64> sockets;
+    if (!read_process_tcp_table(target.pid, table) || !process_socket_inodes(target.pid, sockets)) {
+        error = "Target cleanup residue could not be independently observed";
+        return false;
+    }
+    for (std::size_t index = 0u; index != table.count; ++index)
+        if (table.rows[index].local_port == source.port) {
+            error = "selected B:P remained after canonical cleanup";
+            return false;
+        }
+    if (std::find(sockets.begin(), sockets.end(), source.ino) != sockets.end()) {
+        error = "released G socket inode remained in Target FD table";
+        return false;
+    }
+    const int directory_fd = open(("/proc/" + std::to_string(target.pid) + "/fd").c_str(),
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        error = "Target FD residue could not be independently enumerated";
+        return false;
+    }
+    DIR* directory = fdopendir(directory_fd);
+    if (directory == nullptr) {
+        close(directory_fd);
+        error = "Target FD residue directory could not be opened";
+        return false;
+    }
+    const std::string deleted_source = source.source_path + " (deleted)";
+    const std::string deleted_directory = directory_path + " (deleted)";
+    bool clean = true;
+    errno = 0;
+    while (dirent* entry = readdir(directory)) {
+        int descriptor = -1;
+        const char* const begin = entry->d_name;
+        const char* const end = begin + std::strlen(begin);
+        const auto parsed = std::from_chars(begin, end, descriptor, 10);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || descriptor < 0) continue;
+        std::array<char, collision_evidence::kMaxCmdline + 1u> link_buffer{};
+        const ssize_t length =
+            readlinkat(directory_fd, entry->d_name, link_buffer.data(), link_buffer.size() - 1u);
+        if (length <= 0 || static_cast<std::size_t>(length) >= link_buffer.size()) {
+            clean = false;
+            break;
+        }
+        const std::string link(link_buffer.data(), static_cast<std::size_t>(length));
+        if (link == executable || link == source.source_path || link == deleted_source ||
+            link == directory_path || link == deleted_directory) {
+            clean = false;
+            break;
+        }
+    }
+    const int read_error = errno;
+    if (closedir(directory) != 0 || read_error != 0 || !clean) {
+        error = "Target retained executable/source/directory FD residue";
+        return false;
+    }
+    return true;
+}
+
 static bool run_canonical_collision_release_parent(int target_fd,
                                                    const Token& token,
                                                    const HeldTopologySnapshot& topology,
@@ -3941,6 +4017,7 @@ static bool run_canonical_collision_release_parent(int target_fd,
         error = "final capture prefix/evidence receiver completion failed";
         return false;
     }
+    if (!canonical_parent_cleanup_residue(source, target_proc, executable, error)) return false;
     const collision_control::SettlementV2 settlement{
         collision_control::kProfileVersion,
         machine.transaction_id(),
