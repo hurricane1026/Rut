@@ -25,6 +25,7 @@ using rut::test::fixture_wildcard_paused_child_lease::Diagnostic;
 using rut::test::fixture_wildcard_paused_child_lease::FailurePhase;
 using rut::test::fixture_wildcard_paused_child_lease::HooksForTesting;
 using rut::test::fixture_wildcard_paused_child_lease::PausedChildLease;
+using rut::test::fixture_wildcard_paused_child_lease::SettlementReceipt;
 
 using Clock = std::chrono::steady_clock;
 
@@ -104,8 +105,13 @@ void canonical() {
     check(PausedChildLease::create(deadline(), lease, diagnostic), "canonical create");
     check(lease.active() && lease.child_pid() > 0 && lease.observation_pidfd() >= 0,
           "canonical state");
+    const auto settlement = lease.settlement_receipt();
+    check(settlement != nullptr && settlement->sigkill_attempts == 0 && !settlement->sigkill_sent,
+          "canonical default signal evidence");
     check(lease.validate_paused(deadline(), diagnostic), "canonical validation");
     check(lease.release(deadline(), diagnostic), "canonical release");
+    check(settlement->sigkill_attempts == 0 && !settlement->sigkill_sent,
+          "canonical release signal evidence");
     check(!lease.active() && lease.released(), "canonical settled");
     check(fd_snapshot() == baseline && child_snapshot() == children, "canonical residue");
     const auto settled_fds = fd_snapshot();
@@ -366,6 +372,123 @@ void expired_and_destructor() {
           "destructor child not reaped");
 }
 
+void cleanup_does_not_resignal_after_success() {
+    const auto baseline_fds = fd_snapshot();
+    const auto baseline_children = child_snapshot();
+    HooksForTesting hooks;
+    hooks.post_sigkill_delay_ms = 250;
+    PausedChildLease lease;
+    Diagnostic diagnostic;
+    check(PausedChildLease::create_with_hooks_for_testing(deadline(), hooks, lease, diagnostic),
+          "no-resignal create");
+    const auto settlement = lease.settlement_receipt();
+    check(settlement != nullptr, "no-resignal settlement");
+
+    check(!lease.cleanup(deadline(200), diagnostic), "no-resignal first cleanup accepted");
+    check(diagnostic.phase == FailurePhase::Wait && diagnostic.error_number == ETIMEDOUT,
+          "no-resignal first cleanup diagnostic");
+    check(lease.active() && settlement->sigkill_attempts == 1 && settlement->sigkill_sent &&
+              !settlement->terminal && !settlement->reaped,
+          "no-resignal first cleanup evidence");
+
+    check(lease.cleanup(deadline(), diagnostic), "no-resignal retry cleanup");
+    check(!lease.active() && settlement->sigkill_attempts == 1 && settlement->sigkill_sent &&
+              settlement->terminal && settlement->reaped && WIFSIGNALED(settlement->wait_status) &&
+              WTERMSIG(settlement->wait_status) == SIGKILL,
+          "no-resignal retry evidence");
+    check(fd_snapshot() == baseline_fds && child_snapshot() == baseline_children,
+          "no-resignal retry residue");
+}
+
+struct DestructorSettlementEvidence {
+    std::uint32_t sigkill_attempts = 0;
+    bool sigkill_sent = false;
+    bool terminal = false;
+    bool reaped = false;
+    bool status_is_sigkill = false;
+    bool no_residue = false;
+    bool first_cleanup_timed_out = false;
+};
+
+bool write_destructor_evidence(int fd, const DestructorSettlementEvidence& evidence) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&evidence);
+    std::size_t written = 0;
+    while (written != sizeof(evidence)) {
+        const ssize_t result = write(fd, bytes + written, sizeof(evidence) - written);
+        if (result > 0) {
+            written += static_cast<std::size_t>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+void destructor_does_not_resignal_after_success() {
+    const auto baseline_fds = fd_snapshot();
+    const auto baseline_children = child_snapshot();
+    int evidence_pipe[2] = {-1, -1};
+    check(pipe2(evidence_pipe, O_CLOEXEC) == 0, "destructor no-resignal pipe");
+    const pid_t witness = fork();
+    check(witness >= 0, "destructor no-resignal fork");
+    if (witness == 0) {
+        close(evidence_pipe[0]);
+        const auto witness_fds = fd_snapshot();
+        const auto witness_children = child_snapshot();
+        Diagnostic diagnostic;
+        std::shared_ptr<const SettlementReceipt> settlement;
+        DestructorSettlementEvidence evidence;
+        {
+            HooksForTesting hooks;
+            hooks.post_sigkill_delay_ms = 250;
+            PausedChildLease lease;
+            if (PausedChildLease::create_with_hooks_for_testing(
+                    deadline(), hooks, lease, diagnostic)) {
+                settlement = lease.settlement_receipt();
+                evidence.first_cleanup_timed_out = !lease.cleanup(deadline(200), diagnostic) &&
+                                                   diagnostic.phase == FailurePhase::Wait &&
+                                                   diagnostic.error_number == ETIMEDOUT;
+            }
+        }
+        if (settlement != nullptr) {
+            evidence.sigkill_attempts = settlement->sigkill_attempts;
+            evidence.sigkill_sent = settlement->sigkill_sent;
+            evidence.terminal = settlement->terminal;
+            evidence.reaped = settlement->reaped;
+            evidence.status_is_sigkill = WIFSIGNALED(settlement->wait_status) &&
+                                         WTERMSIG(settlement->wait_status) == SIGKILL;
+        }
+        evidence.no_residue = fd_snapshot() == witness_fds && child_snapshot() == witness_children;
+        const bool wrote = write_destructor_evidence(evidence_pipe[1], evidence);
+        close(evidence_pipe[1]);
+        _exit(wrote ? 0 : 1);
+    }
+    close(evidence_pipe[1]);
+    pollfd readable{evidence_pipe[0], POLLIN | POLLERR | POLLHUP, 0};
+    const int ready = poll(&readable, 1, 5000);
+    if (ready <= 0) kill_by_pidfd(witness, "destructor no-resignal timeout kill");
+    DestructorSettlementEvidence evidence;
+    ssize_t received = -1;
+    if (ready == 1 && (readable.revents & POLLIN) != 0) {
+        do {
+            received = read(evidence_pipe[0], &evidence, sizeof(evidence));
+        } while (received < 0 && errno == EINTR);
+    }
+    close(evidence_pipe[0]);
+    int witness_status = 0;
+    check(waitpid(witness, &witness_status, 0) == witness, "destructor no-resignal reap");
+    check(ready == 1 && received == static_cast<ssize_t>(sizeof(evidence)) &&
+              WIFEXITED(witness_status) && WEXITSTATUS(witness_status) == 0,
+          "destructor no-resignal bounded witness");
+    check(evidence.first_cleanup_timed_out && evidence.sigkill_attempts == 1 &&
+              evidence.sigkill_sent && evidence.terminal && evidence.reaped &&
+              evidence.status_is_sigkill && evidence.no_residue,
+          "destructor no-resignal evidence");
+    check(fd_snapshot() == baseline_fds && child_snapshot() == baseline_children,
+          "destructor no-resignal parent residue");
+}
+
 int failing_pidfd(pid_t, unsigned int) {
     errno = ENOSYS;
     return -1;
@@ -485,6 +608,8 @@ int main() {
         release_retry_expired_deadline();
         dead_child_reap();
         expired_and_destructor();
+        cleanup_does_not_resignal_after_success();
+        destructor_does_not_resignal_after_success();
         creation_failures();
         close_uncertainty();
         injected_close_uncertainty();

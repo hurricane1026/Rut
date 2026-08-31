@@ -48,6 +48,10 @@ struct CleanupState {
 struct SettlementReceipt {
     pid_t child_pid = -1;
     ProcIdentity identity;
+    // Monotonic evidence for real owned pidfd SIGKILL syscalls. A successful
+    // send never becomes eligible for another attempt, even before reap.
+    std::uint32_t sigkill_attempts = 0;
+    bool sigkill_sent = false;
     bool terminal = false;
     bool reaped = false;
     int wait_status = 0;
@@ -121,6 +125,8 @@ struct HooksForTesting {
     unsigned int child_delay_ms = 0;
     unsigned int child_post_ready_delay_ms = 0;
     unsigned int post_release_delay_ms = 0;
+    // Runs only after a real owned SIGKILL succeeds and its receipt is set.
+    unsigned int post_sigkill_delay_ms = 0;
     int child_close_failure_fd = -1;
     int child_retain_fd_for_testing = -1;
     volatile int* child_close_attempt_evidence = nullptr;
@@ -254,6 +260,7 @@ private:
     bool release_sent_ = false;
     bool child_reaped_ = false;
     bool release_close_uncertain_ = false;
+    bool owned_sigkill_sent_ = false;
     int child_status_ = 0;
     enum class Mode : std::uint8_t { Plain, Prepared };
     Mode mode_ = Mode::Plain;
@@ -274,6 +281,7 @@ private:
     ino_t authority_ino_ = 0;
     int (*close_hook_)(int, void*) = nullptr;
     void* close_context_ = nullptr;
+    unsigned int post_sigkill_delay_ms_ = 0;
     std::shared_ptr<CleanupState> cleanup_state_;
     std::shared_ptr<SettlementReceipt> settlement_;
 };
