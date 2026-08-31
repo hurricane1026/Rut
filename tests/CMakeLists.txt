@@ -39,6 +39,27 @@ set_tests_properties(test_fixture_collision_release_protocol PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30)
 
+# Linux-only, tests-only exact raw TCP reservation custody for #377. This owns
+# one bound non-listening socket and performs no broker, runtime or RUT work.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(fixture_exact_tcp_reservation_lease STATIC
+        fixture_exact_tcp_reservation_lease.cc)
+    target_include_directories(fixture_exact_tcp_reservation_lease PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+
+    add_executable(test_fixture_exact_tcp_reservation_lease
+        test_fixture_exact_tcp_reservation_lease.cc)
+    target_link_libraries(test_fixture_exact_tcp_reservation_lease PRIVATE
+        fixture_exact_tcp_reservation_lease)
+    add_test(NAME test_fixture_exact_tcp_reservation_lease
+        COMMAND test_fixture_exact_tcp_reservation_lease)
+    set_tests_properties(test_fixture_exact_tcp_reservation_lease PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30)
+endif()
+
 # Tests-only identity-bound private /tmp directory custody for #377.
 add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
 target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
