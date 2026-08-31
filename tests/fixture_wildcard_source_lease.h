@@ -92,6 +92,16 @@ public:
                        WildcardAttemptSourceLease& lease,
                        Diagnostic& diagnostic);
 
+    // Creates the same identity-bound source lease from caller-supplied
+    // ordinary-RUT bytes.  This narrow tests-only seam is bounded to the
+    // fixture's exact-read capacity and does not interpret the source.
+    static bool create_exact_bytes(int identity_bound_directory_fd,
+                                   const std::string& directory_path,
+                                   const std::string& basename,
+                                   const std::string& exact_bytes,
+                                   WildcardAttemptSourceLease& lease,
+                                   Diagnostic& diagnostic);
+
     static bool create_with_hooks_for_testing(int identity_bound_directory_fd,
                                               const std::string& directory_path,
                                               const std::string& basename,
@@ -125,6 +135,13 @@ private:
                             const SourceLeaseHooksForTesting* hooks,
                             WildcardAttemptSourceLease& lease,
                             Diagnostic& diagnostic);
+    static bool create_exact_bytes_impl(int identity_bound_directory_fd,
+                                        const std::string& directory_path,
+                                        const std::string& basename,
+                                        const std::string& exact_bytes,
+                                        const SourceLeaseHooksForTesting* hooks,
+                                        WildcardAttemptSourceLease& lease,
+                                        Diagnostic& diagnostic);
     bool validate_directory(Diagnostic& diagnostic) const;
     bool validate_open_source(bool require_link, Diagnostic& diagnostic) const;
     bool read_exact_bytes(Diagnostic& diagnostic) const;

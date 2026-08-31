@@ -218,6 +218,61 @@ bool canonical_creation_test() {
                        "canonical source pathname remained after removal");
 }
 
+bool exact_bytes_creation_and_bounds_test() {
+    PrivateDirectory directory;
+    source_lease::Diagnostic diagnostic;
+    if (!directory.create()) return check(false, "exact source directory setup failed");
+
+    constexpr char exact[] = "listen :0\nroute GET \"/\" { return 204 }\n";
+    source_lease::WildcardAttemptSourceLease canonical;
+    bool ok = check(source_lease::WildcardAttemptSourceLease::create_exact_bytes(
+                        directory.fd, directory.path, "exact.rut", exact, canonical, diagnostic) &&
+                        canonical.source_identity().size == sizeof(exact) - 1u &&
+                        canonical.revalidate(diagnostic),
+                    "bounded exact source creation failed");
+
+    source_lease::WildcardAttemptSourceLease empty;
+    ok = check(!source_lease::WildcardAttemptSourceLease::create_exact_bytes(
+                   directory.fd, directory.path, "empty.rut", "", empty, diagnostic) &&
+                   diagnostic.phase == source_lease::FailurePhase::Argument &&
+                   diagnostic.error_number == EINVAL,
+               "empty exact source was accepted") &&
+         ok;
+
+    source_lease::WildcardAttemptSourceLease embedded_nul;
+    const std::string nul_bytes("a\0b", 3u);
+    ok = check(!source_lease::WildcardAttemptSourceLease::create_exact_bytes(
+                   directory.fd, directory.path, "nul.rut", nul_bytes, embedded_nul, diagnostic) &&
+                   diagnostic.phase == source_lease::FailurePhase::Argument &&
+                   diagnostic.error_number == EINVAL,
+               "embedded-NUL exact source was accepted") &&
+         ok;
+
+    source_lease::WildcardAttemptSourceLease over;
+    const std::string over_bytes(256u, 'x');
+    ok = check(!source_lease::WildcardAttemptSourceLease::create_exact_bytes(
+                   directory.fd, directory.path, "over.rut", over_bytes, over, diagnostic) &&
+                   diagnostic.phase == source_lease::FailurePhase::Argument &&
+                   diagnostic.error_number == EINVAL,
+               "over-bound exact source was accepted") &&
+         ok;
+
+    source_lease::WildcardAttemptSourceLease boundary;
+    const std::string boundary_bytes(255u, 'x');
+    ok = check(source_lease::WildcardAttemptSourceLease::create_exact_bytes(directory.fd,
+                                                                            directory.path,
+                                                                            "boundary.rut",
+                                                                            boundary_bytes,
+                                                                            boundary,
+                                                                            diagnostic) &&
+                   boundary.revalidate(diagnostic),
+               "255-byte exact source boundary was rejected") &&
+         ok;
+    return check(canonical.remove(diagnostic) && boundary.remove(diagnostic),
+                 "exact source cleanup failed") &&
+           ok;
+}
+
 bool embedded_nul_rejection_test() {
     PrivateDirectory directory;
     if (!directory.create()) return check(false, "embedded-NUL directory setup failed");
@@ -528,13 +583,13 @@ bool detached_lease_test() {
 }  // namespace
 
 int main() {
-    const bool ok = canonical_creation_test() && embedded_nul_rejection_test() &&
-                    removal_boundary_replacement_test() && fifo_reopen_is_bounded_test() &&
-                    pread_eintr_retry_test() && rename_replacement_test() &&
-                    in_place_bytes_test() && unlink_recreate_and_removal_refusal_test() &&
-                    symlink_replacement_test() && metadata_and_hardlink_test() &&
-                    length_mutation_test(true) && length_mutation_test(false) &&
-                    distinct_identical_sources_test() && detached_lease_test();
+    const bool ok =
+        canonical_creation_test() && exact_bytes_creation_and_bounds_test() &&
+        embedded_nul_rejection_test() && removal_boundary_replacement_test() &&
+        fifo_reopen_is_bounded_test() && pread_eintr_retry_test() && rename_replacement_test() &&
+        in_place_bytes_test() && unlink_recreate_and_removal_refusal_test() &&
+        symlink_replacement_test() && metadata_and_hardlink_test() && length_mutation_test(true) &&
+        length_mutation_test(false) && distinct_identical_sources_test() && detached_lease_test();
     if (!ok) return 1;
     std::puts("PASS: #377 immutable wildcard-attempt source lease");
     return 0;
