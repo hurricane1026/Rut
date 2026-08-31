@@ -20,6 +20,25 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Pure #377 CollisionRelease v2 authenticated codec/state machine. The library
+# reuses common worker framing but owns no process, listener or runtime state.
+add_library(fixture_collision_release_protocol STATIC
+    fixture_collision_release_protocol.cc)
+target_include_directories(fixture_collision_release_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_protocol PUBLIC fixture_worker_protocol)
+
+add_executable(test_fixture_collision_release_protocol
+    test_fixture_collision_release_protocol.cc)
+target_link_libraries(test_fixture_collision_release_protocol PRIVATE
+    fixture_collision_release_protocol)
+add_test(NAME test_fixture_collision_release_protocol
+    COMMAND test_fixture_collision_release_protocol)
+set_tests_properties(test_fixture_collision_release_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # Tests-only identity-bound private /tmp directory custody for #377.
 add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
 target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
