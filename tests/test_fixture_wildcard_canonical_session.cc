@@ -1,6 +1,7 @@
 #include "fixture_anonymous_log_capture.h"
 #include "fixture_executable_exec_handoff.h"
 #include "fixture_executable_lease.h"
+#include "fixture_private_directory_lease.h"
 #include "fixture_wildcard_paused_child_lease.h"
 #include "fixture_wildcard_source_lease.h"
 #include "fixture_worker_protocol.h"
@@ -22,12 +23,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/fs.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/random.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -35,6 +33,7 @@ namespace capture = rut::test::fixture_anonymous_log_capture;
 namespace child = rut::test::fixture_wildcard_paused_child_lease;
 namespace executable = rut::test::fixture_executable_lease;
 namespace handoff = rut::test::fixture_executable_exec_handoff;
+namespace private_directory = rut::test::fixture_private_directory_lease;
 namespace protocol = rut::test::fixture_worker_protocol;
 namespace source = rut::test::fixture_wildcard_source_lease;
 
@@ -53,323 +52,6 @@ Clock::time_point deadline(int milliseconds = 7000) {
     return Clock::now() + std::chrono::milliseconds(milliseconds);
 }
 
-struct PrivateDirectory {
-    enum class CreationFailurePoint : std::uint8_t {
-        None,
-        AfterIdentity,
-        AfterOpen,
-        AfterFchmod,
-    };
-
-    struct Identity {
-        dev_t device = 0;
-        ino_t inode = 0;
-        mode_t mode = 0;
-        uid_t uid = static_cast<uid_t>(-1);
-        gid_t gid = static_cast<gid_t>(-1);
-    };
-
-    std::string path;
-    std::string basename;
-    std::string owned_basename;
-    std::string saved_basename_for_testing;
-    int parent_fd = -1;
-    int fd = -1;
-    Identity identity;
-    bool active = false;
-    bool owned_entry_known = false;
-    CreationFailurePoint creation_failure = CreationFailurePoint::None;
-    bool fail_next_unlink_for_testing = false;
-    bool block_restore_for_testing = false;
-    bool restore_attempted_for_testing = false;
-    bool restore_succeeded_for_testing = false;
-    int restore_error_for_testing = 0;
-    bool injected_replacement_known = false;
-    Identity injected_replacement;
-    std::vector<std::string> quarantine_names_for_testing;
-    std::size_t quarantine_name_index = 0u;
-    std::shared_ptr<std::vector<std::string>> audit_names =
-        std::make_shared<std::vector<std::string>>();
-
-    static Identity make_identity(const struct stat& status) {
-        return {status.st_dev, status.st_ino, status.st_mode, status.st_uid, status.st_gid};
-    }
-
-    static bool same_identity(const struct stat& status, const Identity& expected) {
-        return S_ISDIR(status.st_mode) && status.st_dev == expected.device &&
-               status.st_ino == expected.inode && status.st_mode == expected.mode &&
-               status.st_uid == expected.uid && status.st_gid == expected.gid &&
-               (status.st_mode & 0777) == 0700;
-    }
-
-    static int rename_noreplace(int directory, const char* old_name, const char* new_name) {
-#ifdef SYS_renameat2
-        return static_cast<int>(
-            syscall(SYS_renameat2, directory, old_name, directory, new_name, RENAME_NOREPLACE));
-#else
-        (void)directory;
-        (void)old_name;
-        (void)new_name;
-        errno = ENOSYS;
-        return -1;
-#endif
-    }
-
-    bool validate_named(const std::string& name, const Identity& expected) const {
-        struct stat named{};
-        if (parent_fd < 0 || fstatat(parent_fd, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !same_identity(named, expected))
-            return false;
-        if (fd < 0) return true;
-        struct stat held{};
-        return fstat(fd, &held) == 0 && same_identity(held, identity);
-    }
-
-    bool ensure_held_descriptor() {
-        if (fd < 0)
-            fd = openat(
-                parent_fd, owned_basename.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        return fd >= 0 && validate_named(owned_basename, identity);
-    }
-
-    static bool safe_component(std::string_view name) {
-        return !name.empty() && name.size() <= 255u && name != "." && name != ".." &&
-               name.find('/') == std::string_view::npos &&
-               name.find('\0') == std::string_view::npos;
-    }
-
-    bool next_quarantine_name(std::string& name) {
-        if (quarantine_name_index < quarantine_names_for_testing.size()) {
-            name = quarantine_names_for_testing[quarantine_name_index++];
-            return safe_component(name);
-        }
-        std::array<unsigned char, 16> random{};
-        std::size_t offset = 0u;
-        for (unsigned int call = 0u; call != 32u && offset != random.size(); ++call) {
-            const ssize_t count = getrandom(random.data() + offset, random.size() - offset, 0);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) return false;
-            offset += static_cast<std::size_t>(count);
-        }
-        if (offset != random.size()) {
-            errno = EAGAIN;
-            return false;
-        }
-        constexpr char hex[] = "0123456789abcdef";
-        name = ".rut377-directory-quarantine-";
-        for (const unsigned char byte : random) {
-            name.push_back(hex[byte >> 4u]);
-            name.push_back(hex[byte & 0x0fu]);
-        }
-        return safe_component(name);
-    }
-
-    bool create(CreationFailurePoint failure = CreationFailurePoint::None) {
-        creation_failure = failure;
-        parent_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (parent_fd < 0) return false;
-        std::array<char, 64> pattern{};
-        std::snprintf(pattern.data(), pattern.size(), "/tmp/rut377-canonical-XXXXXX");
-        char* const created = mkdtemp(pattern.data());
-        if (created == nullptr) return false;
-        path = created;
-        basename = path.substr(std::string_view{"/tmp/"}.size());
-        owned_basename = basename;
-        audit_names->push_back(basename);
-        struct stat named{};
-        if (fstatat(parent_fd, basename.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISDIR(named.st_mode) || named.st_uid != getuid() || named.st_gid != getgid() ||
-            (named.st_mode & 0777) != 0700)
-            return false;
-        identity = make_identity(named);
-        active = true;
-        owned_entry_known = true;
-        if (creation_failure == CreationFailurePoint::AfterIdentity) return false;
-        fd = openat(parent_fd, basename.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0) return false;
-        if (creation_failure == CreationFailurePoint::AfterOpen) return false;
-        if (fchmod(fd, 0700) != 0) return false;
-        if (creation_failure == CreationFailurePoint::AfterFchmod) return false;
-        struct stat status{};
-        if (fstat(fd, &status) != 0 || !same_identity(status, identity)) return false;
-        return validate_named(basename, identity);
-    }
-
-    bool restore_from_quarantine(int unlink_error) {
-        restore_attempted_for_testing = true;
-        restore_succeeded_for_testing = false;
-        restore_error_for_testing = 0;
-        if (block_restore_for_testing) {
-            if (mkdirat(parent_fd, basename.c_str(), 0700) != 0) {
-                restore_error_for_testing = errno;
-                errno = unlink_error;
-                return false;
-            }
-            struct stat replacement{};
-            if (fstatat(parent_fd, basename.c_str(), &replacement, AT_SYMLINK_NOFOLLOW) != 0) {
-                restore_error_for_testing = errno;
-                errno = unlink_error;
-                return false;
-            }
-            injected_replacement = make_identity(replacement);
-            injected_replacement_known = true;
-            audit_names->push_back(basename);
-            block_restore_for_testing = false;
-        }
-        const std::string quarantined = owned_basename;
-        if (rename_noreplace(parent_fd, quarantined.c_str(), basename.c_str()) == 0) {
-            owned_basename = basename;
-            restore_succeeded_for_testing = true;
-            errno = unlink_error;
-            return false;
-        }
-        restore_error_for_testing = errno;
-        // The quarantine name was already proven to be the retained object. Keep
-        // it as the retry target when rollback cannot restore the original name.
-        owned_basename = quarantined;
-        errno = unlink_error;
-        return false;
-    }
-
-    bool settle() {
-        if (!active || !owned_entry_known || !ensure_held_descriptor() ||
-            !validate_named(owned_basename, identity))
-            return false;
-        // The replacement-refusal regression deliberately occupies the original
-        // name. Only its exact restoration helper may remove that attested object.
-        if (!saved_basename_for_testing.empty()) return false;
-
-        if (owned_basename == basename) {
-            bool renamed = false;
-            for (unsigned int attempt = 0u; attempt != 32u; ++attempt) {
-                std::string quarantine;
-                if (!next_quarantine_name(quarantine)) return false;
-                audit_names->push_back(quarantine);
-                if (rename_noreplace(parent_fd, owned_basename.c_str(), quarantine.c_str()) == 0) {
-                    if (!validate_named(quarantine, identity)) {
-                        const int validation_error = errno;
-                        const int rollback =
-                            rename_noreplace(parent_fd, quarantine.c_str(), basename.c_str());
-                        if (rollback == 0)
-                            owned_basename = basename;
-                        else {
-                            owned_basename = quarantine;
-                            owned_entry_known = false;
-                        }
-                        errno = validation_error;
-                        return false;
-                    }
-                    owned_basename = quarantine;
-                    renamed = true;
-                    break;
-                }
-                if (errno != EEXIST) return false;
-            }
-            if (!renamed) {
-                errno = EEXIST;
-                return false;
-            }
-        }
-
-        if (fail_next_unlink_for_testing) {
-            fail_next_unlink_for_testing = false;
-            return restore_from_quarantine(EIO);
-        }
-        if (unlinkat(parent_fd, owned_basename.c_str(), AT_REMOVEDIR) != 0)
-            return restore_from_quarantine(errno);
-        owned_entry_known = false;
-        active = false;
-        owned_basename.clear();
-        const bool synced = fsync(parent_fd) == 0;
-        const int directory_slot = fd;
-        fd = -1;
-        const bool directory_closed = close(directory_slot) == 0;
-        const int parent_slot = parent_fd;
-        parent_fd = -1;
-        const bool parent_closed = close(parent_slot) == 0;
-        if (synced && directory_closed && parent_closed) {
-            path.clear();
-            basename.clear();
-            return true;
-        }
-        return false;
-    }
-
-    bool replace_entry_for_testing(Identity& replacement) {
-        if (!active || !validate_named(basename, identity)) return false;
-        saved_basename_for_testing = basename + ".saved";
-        audit_names->push_back(saved_basename_for_testing);
-        if (rename_noreplace(parent_fd, basename.c_str(), saved_basename_for_testing.c_str()) != 0)
-            return false;
-        if (!validate_named(saved_basename_for_testing, identity)) {
-            const int validation_error = errno;
-            const int rollback =
-                rename_noreplace(parent_fd, saved_basename_for_testing.c_str(), basename.c_str());
-            if (rollback != 0) {
-                owned_basename = saved_basename_for_testing;
-                owned_entry_known = false;
-            }
-            errno = validation_error;
-            return false;
-        }
-        owned_basename = saved_basename_for_testing;
-        if (mkdirat(parent_fd, basename.c_str(), 0700) != 0) {
-            const int create_error = errno;
-            const int rollback =
-                rename_noreplace(parent_fd, saved_basename_for_testing.c_str(), basename.c_str());
-            if (rollback == 0)
-                owned_basename = basename;
-            else
-                owned_basename = saved_basename_for_testing;
-            errno = create_error;
-            return false;
-        }
-        struct stat status{};
-        if (fstatat(parent_fd, basename.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) return false;
-        replacement = make_identity(status);
-        return !same_identity(status, identity);
-    }
-
-    bool replacement_intact_for_testing(const Identity& replacement) const {
-        struct stat status{};
-        return parent_fd >= 0 &&
-               fstatat(parent_fd, basename.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 &&
-               same_identity(status, replacement);
-    }
-
-    bool restore_after_replacement_for_testing(const Identity& replacement) {
-        if (!replacement_intact_for_testing(replacement) ||
-            unlinkat(parent_fd, basename.c_str(), AT_REMOVEDIR) != 0)
-            return false;
-        if (rename_noreplace(parent_fd, saved_basename_for_testing.c_str(), basename.c_str()) != 0)
-            return false;
-        owned_basename = basename;
-        saved_basename_for_testing.clear();
-        return fsync(parent_fd) == 0 && validate_named(basename, identity);
-    }
-
-    bool injected_replacement_intact_for_testing() const {
-        if (!injected_replacement_known) return false;
-        struct stat status{};
-        return parent_fd >= 0 &&
-               fstatat(parent_fd, basename.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 &&
-               same_identity(status, injected_replacement);
-    }
-
-    bool remove_injected_replacement_for_testing() {
-        if (!injected_replacement_intact_for_testing()) return false;
-        if (unlinkat(parent_fd, basename.c_str(), AT_REMOVEDIR) != 0) return false;
-        injected_replacement_known = false;
-        return fsync(parent_fd) == 0;
-    }
-
-    ~PrivateDirectory() {
-        if (active) (void)settle();
-        if (fd >= 0) (void)close(fd);
-        if (parent_fd >= 0) (void)close(parent_fd);
-    }
-};
-
 struct OwnedFd {
     int value = -1;
 
@@ -384,26 +66,6 @@ struct OwnedFd {
         if (value >= 0) (void)close(value);
     }
 };
-
-bool path_absent_no_follow(const std::string& path);
-bool names_absent_no_follow(const std::vector<std::string>& names);
-
-bool directory_replacement_refusal_test() {
-    PrivateDirectory directory;
-    PrivateDirectory::Identity replacement;
-    if (!check(directory.create(), "directory replacement setup") ||
-        !check(directory.replace_entry_for_testing(replacement), "directory replacement injection"))
-        return false;
-    const std::string original = directory.path;
-    const bool refused = !directory.settle();
-    const bool replacement_preserved = directory.replacement_intact_for_testing(replacement);
-    const bool restored = directory.restore_after_replacement_for_testing(replacement);
-    const bool removed = restored && directory.settle();
-    return check(refused && replacement_preserved && restored && removed &&
-                     path_absent_no_follow(original) &&
-                     names_absent_no_follow(*directory.audit_names),
-                 "directory replacement was removed or prevented exact retry");
-}
 
 bool fd_snapshot(std::vector<int>& descriptors) {
     descriptors.clear();
@@ -431,101 +93,6 @@ bool path_absent_no_follow(const std::string& path) {
     struct stat status{};
     errno = 0;
     return lstat(path.c_str(), &status) != 0 && errno == ENOENT;
-}
-
-bool names_absent_no_follow(const std::vector<std::string>& names) {
-    OwnedFd parent{open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (parent.value < 0) return false;
-    for (const std::string& name : names) {
-        struct stat status{};
-        errno = 0;
-        if (fstatat(parent.value, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0 ||
-            errno != ENOENT)
-            return false;
-    }
-    return parent.close_owned();
-}
-
-bool directory_partial_create_cleanup_test() {
-    const std::array failures = {PrivateDirectory::CreationFailurePoint::AfterIdentity,
-                                 PrivateDirectory::CreationFailurePoint::AfterOpen,
-                                 PrivateDirectory::CreationFailurePoint::AfterFchmod};
-    for (const PrivateDirectory::CreationFailurePoint failure : failures) {
-        std::vector<int> baseline;
-        std::vector<int> final;
-        if (!fd_snapshot(baseline)) return false;
-        std::string path;
-        std::shared_ptr<std::vector<std::string>> names;
-        bool failed_as_requested = false;
-        {
-            PrivateDirectory directory;
-            names = directory.audit_names;
-            failed_as_requested = !directory.create(failure);
-            path = directory.path;
-        }
-        if (!failed_as_requested || path.empty() || !names || !path_absent_no_follow(path) ||
-            !names_absent_no_follow(*names) || !fd_snapshot(final) || final != baseline)
-            return false;
-    }
-    return true;
-}
-
-bool directory_quarantine_collision_test() {
-    PrivateDirectory directory;
-    OwnedFd parent{open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    bool created = directory.create();
-    const std::string original = directory.path;
-    const std::string collision = directory.basename + ".collision";
-    const std::string unique = directory.basename + ".unique";
-    PrivateDirectory::Identity collision_identity;
-    bool collision_known = false;
-    if (created && parent.value >= 0 && mkdirat(parent.value, collision.c_str(), 0700) == 0) {
-        struct stat status{};
-        collision_known =
-            fstatat(parent.value, collision.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0;
-        if (collision_known) collision_identity = PrivateDirectory::make_identity(status);
-    }
-    directory.quarantine_names_for_testing = {collision, unique};
-    const bool settled = created && collision_known && directory.settle();
-    struct stat collision_status{};
-    const bool collision_preserved =
-        collision_known && parent.value >= 0 &&
-        fstatat(parent.value, collision.c_str(), &collision_status, AT_SYMLINK_NOFOLLOW) == 0 &&
-        PrivateDirectory::same_identity(collision_status, collision_identity);
-    const bool collision_removed =
-        collision_preserved && unlinkat(parent.value, collision.c_str(), AT_REMOVEDIR) == 0;
-    const bool parent_closed = parent.close_owned();
-    return check(settled && collision_preserved && collision_removed && parent_closed &&
-                     path_absent_no_follow(original) &&
-                     names_absent_no_follow(*directory.audit_names),
-                 "unique quarantine collision handling");
-}
-
-bool directory_unlink_restore_retry_test(bool block_restore) {
-    PrivateDirectory directory;
-    const bool created = directory.create();
-    const std::string original = directory.path;
-    const std::string quarantine = directory.basename + ".retry";
-    directory.quarantine_names_for_testing = {quarantine};
-    directory.fail_next_unlink_for_testing = true;
-    directory.block_restore_for_testing = block_restore;
-    const bool first_refused = created && !directory.settle();
-    const bool expected_restore =
-        directory.restore_attempted_for_testing &&
-        directory.restore_succeeded_for_testing == !block_restore &&
-        directory.restore_error_for_testing == (block_restore ? EEXIST : 0);
-    const bool retry_target = block_restore ? directory.owned_basename == quarantine
-                                            : directory.owned_basename == directory.basename;
-    const bool replacement_preserved =
-        !block_restore || directory.injected_replacement_intact_for_testing();
-    const bool replacement_removed =
-        !block_restore || directory.remove_injected_replacement_for_testing();
-    const bool retried = replacement_removed && directory.settle();
-    return check(first_refused && expected_restore && retry_target && replacement_preserved &&
-                     replacement_removed && retried && path_absent_no_follow(original) &&
-                     names_absent_no_follow(*directory.audit_names),
-                 block_restore ? "post-rename restore failure retained retry custody"
-                               : "post-rename unlink failure restored retry custody");
 }
 
 bool child_snapshot(std::vector<pid_t>& children) {
@@ -701,22 +268,23 @@ bool run_one_canonical_session() {
 
     std::string source_path;
     std::string directory_path;
-    std::shared_ptr<std::vector<std::string>> directory_audit_names;
+    std::shared_ptr<const private_directory::SettlementReceipt> directory_receipt;
     protocol::ProcIdentity launched_identity;
     bool launched_identity_known = false;
     bool ok = true;
     {
         // Declaration order is the reverse of defensive destruction order:
         // child -> handoff -> null -> capture -> executable -> source -> directory.
-        PrivateDirectory directory;
+        private_directory::PrivateDirectoryLease directory;
         source::WildcardAttemptSourceLease source_lease;
         executable::ExecutableLease executable_lease;
         capture::AnonymousLogCapture output;
         OwnedFd null_input;
         handoff::ExecutableExecHandoffLease handoff_lease;
         child::PausedChildLease child_lease;
-        directory_audit_names = directory.audit_names;
+        directory_receipt = directory.settlement_receipt();
 
+        private_directory::Diagnostic directory_diagnostic;
         source::Diagnostic source_diagnostic;
         executable::Diagnostic executable_diagnostic;
         capture::Diagnostic capture_diagnostic;
@@ -729,18 +297,20 @@ bool run_one_canonical_session() {
             return result;
         };
 
-        const bool directory_created = record(directory.create(), "private directory creation");
-        directory_path = directory.path;
+        const bool directory_created = record(
+            private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic),
+            "private directory creation");
+        directory_path = directory.path();
         bool source_created = false;
         if (directory_created) {
-            source_created =
-                record(source::WildcardAttemptSourceLease::create_exact_bytes(directory.fd,
-                                                                              directory.path,
-                                                                              kSourceBasename,
-                                                                              kSourceBytes,
-                                                                              source_lease,
-                                                                              source_diagnostic),
-                       "exact ordinary-RUT source lease");
+            source_created = record(
+                source::WildcardAttemptSourceLease::create_exact_bytes(directory.descriptor(),
+                                                                       directory.path(),
+                                                                       kSourceBasename,
+                                                                       kSourceBytes,
+                                                                       source_lease,
+                                                                       source_diagnostic),
+                "exact ordinary-RUT source lease");
             if (source_created) source_path = source_lease.path();
         }
 
@@ -929,7 +499,9 @@ bool run_one_canonical_session() {
                              "public rut executable settlement");
             if (source_created)
                 (void)record(source_lease.remove(source_diagnostic), "ordinary-RUT source removal");
-            if (directory_created) (void)record(directory.settle(), "private directory settlement");
+            if (directory_created)
+                (void)record(directory.settle(directory_diagnostic),
+                             "private directory settlement");
         } else {
             (void)record(false, "settlement retained after uncertain child cleanup");
         }
@@ -949,9 +521,13 @@ bool run_one_canonical_session() {
         ok = check(path_absent_no_follow(directory_path),
                    "private directory residue after fallback cleanup") &&
              ok;
-    if (directory_audit_names)
-        ok = check(names_absent_no_follow(*directory_audit_names),
-                   "private directory tracked-name residue after fallback cleanup") &&
+    if (directory_receipt)
+        ok = check(directory_receipt->object_removed && directory_receipt->descriptor_closed &&
+                       directory_receipt->path == directory_path &&
+                       !directory_receipt->original_basename.empty() &&
+                       directory_receipt->residue == private_directory::Residue::Absent &&
+                       directory_receipt->state == private_directory::State::Removed,
+                   "private directory retained settlement receipt") &&
              ok;
     ok = check(fd_snapshot(final_fds) && final_fds == baseline_fds, "owned FD residue") && ok;
     ok = check(child_snapshot(final_children) && final_children == baseline_children,
@@ -963,10 +539,7 @@ bool run_one_canonical_session() {
 }  // namespace
 
 int main() {
-    if (!directory_replacement_refusal_test() || !directory_partial_create_cleanup_test() ||
-        !directory_quarantine_collision_test() || !directory_unlink_restore_retry_test(false) ||
-        !directory_unlink_restore_retry_test(true) || !run_one_canonical_session())
-        return 1;
+    if (!run_one_canonical_session()) return 1;
     std::puts("PASS: #377 one fresh canonical public RUT session");
     return 0;
 }

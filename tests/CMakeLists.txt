@@ -20,6 +20,15 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Tests-only identity-bound private /tmp directory custody for #377.
+add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
+target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(test_fixture_private_directory_lease test_fixture_private_directory_lease.cc)
+target_link_libraries(test_fixture_private_directory_lease PRIVATE fixture_private_directory_lease)
+add_test(NAME test_fixture_private_directory_lease COMMAND test_fixture_private_directory_lease)
+set_tests_properties(test_fixture_private_directory_lease PROPERTIES
+    LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
 # Pure #377 paused direct-child lease. This owns only a forked readiness/release
 # barrier and pidfd authority; source, log, listener and runtime state remain
 # in separately reviewed fixtures.
@@ -193,6 +202,7 @@ if(RUT_ENABLE_JIT)
         fixture_anonymous_log_capture
         fixture_executable_exec_handoff
         fixture_executable_lease
+        fixture_private_directory_lease
         fixture_wildcard_paused_child_lease
         fixture_wildcard_source_lease
         fixture_worker_protocol)
