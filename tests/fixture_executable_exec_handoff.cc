@@ -40,6 +40,7 @@ bool exact_live_identity(pid_t pid,
                          int pidfd,
                          const std::string& path,
                          const executable::ExecutableIdentity& expected_executable,
+                         const child_fixture::BoundedExecArguments& expected_arguments,
                          child_fixture::ProcIdentity& identity) {
     if (!pidfd_live(pidfd) || !fixture_worker_protocol::read_proc(pid, identity)) return false;
     std::string environment;
@@ -47,11 +48,64 @@ bool exact_live_identity(pid_t pid,
             "/proc/" + std::to_string(pid) + "/environ", environment, 1) ||
         !environment.empty())
         return false;
-    const std::string expected_argv = path + std::string(1, '\0');
     return identity.pid == pid && identity.ppid == getpid() && identity.exe == path &&
            static_cast<std::uint64_t>(identity.exe_dev) == expected_executable.device &&
            static_cast<std::uint64_t>(identity.exe_ino) == expected_executable.inode &&
-           identity.cmdline == expected_argv;
+           identity.cmdline.size() == expected_arguments.encoded_bytes &&
+           (identity.cmdline.empty() || std::memcmp(identity.cmdline.data(),
+                                                    expected_arguments.arena.data(),
+                                                    identity.cmdline.size()) == 0);
+}
+
+bool pack_arguments(std::span<const std::string_view> input,
+                    std::string_view canonical_path,
+                    child_fixture::BoundedExecArguments& packed,
+                    Diagnostic& diagnostic) {
+    packed = {};
+    if (input.empty()) {
+        fail(diagnostic, FailurePhase::Argument, EINVAL);
+        return false;
+    }
+    if (input.size() > child_fixture::kMaxExecArgumentCount) {
+        fail(diagnostic, FailurePhase::Argument, E2BIG);
+        return false;
+    }
+    if (input.front().size() != canonical_path.size() || canonical_path.empty() ||
+        (canonical_path.size() != 0 &&
+         std::memcmp(input.front().data(), canonical_path.data(), canonical_path.size()) != 0)) {
+        fail(diagnostic, FailurePhase::Argument, EINVAL);
+        return false;
+    }
+    std::size_t encoded = 0;
+    packed.argc = static_cast<std::uint16_t>(input.size());
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const std::string_view argument = input[index];
+        if ((!argument.empty() && std::memchr(argument.data(), '\0', argument.size()) != nullptr)) {
+            fail(diagnostic, FailurePhase::Argument, EINVAL);
+            return false;
+        }
+        if (argument.size() > child_fixture::kMaxExecArgumentEncodedBytes - 1) {
+            fail(diagnostic, FailurePhase::Argument, E2BIG);
+            return false;
+        }
+        const std::size_t encoded_length = argument.size() + 1;
+        if (encoded > child_fixture::kMaxExecArgumentsEncodedBytes - encoded_length) {
+            fail(diagnostic, FailurePhase::Argument, E2BIG);
+            return false;
+        }
+        packed.offsets[index] = static_cast<std::uint16_t>(encoded);
+        if (!argument.empty())
+            std::memcpy(packed.arena.data() + encoded, argument.data(), argument.size());
+        encoded += argument.size();
+        packed.arena[encoded++] = '\0';
+        packed.offsets[index + 1] = static_cast<std::uint16_t>(encoded);
+    }
+    packed.encoded_bytes = static_cast<std::uint16_t>(encoded);
+    if (!child_fixture::validate_bounded_exec_arguments(packed, canonical_path)) {
+        fail(diagnostic, FailurePhase::Argument, EINVAL);
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -245,8 +299,26 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
                                                  bool inject_pre_exec_failure,
                                                  child_fixture::ChildDescriptorPlan& plan,
                                                  Diagnostic& diagnostic) {
+    const std::array<std::string_view, 1> arguments = {canonical_path_};
+    return make_child_plan_with_arguments(borrowed_null_input_fd,
+                                          borrowed_combined_output_fd,
+                                          inject_pre_exec_failure,
+                                          arguments,
+                                          plan,
+                                          diagnostic);
+}
+
+bool ExecutableExecHandoffLease::make_child_plan_with_arguments(
+    int borrowed_null_input_fd,
+    int borrowed_combined_output_fd,
+    bool inject_pre_exec_failure,
+    std::span<const std::string_view> arguments,
+    child_fixture::ChildDescriptorPlan& plan,
+    Diagnostic& diagnostic) {
     diagnostic = {};
     plan = {};
+    child_fixture::BoundedExecArguments packed_arguments{};
+    if (!pack_arguments(arguments, canonical_path_, packed_arguments, diagnostic)) return false;
     if (!active_ || plan_made_ || borrowed_null_input_fd <= 2 || borrowed_combined_output_fd <= 2 ||
         borrowed_null_input_fd == borrowed_combined_output_fd ||
         borrowed_null_input_fd == executable_fd_ || borrowed_combined_output_fd == executable_fd_ ||
@@ -287,18 +359,7 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
     continuation.inject_pre_exec_failure = inject_pre_exec_failure;
     continuation.status_injection = hooks_.child_status_injection;
     continuation.executable_mutation = hooks_.child_executable_mutation;
-    if (canonical_path_.size() + 1 > continuation.argv0.size()) {
-        ::close(status[0]);
-        ::close(status[1]);
-        ::close(reader_authority_one);
-        ::close(reader_authority_two);
-        ::close(writer_authority_one);
-        ::close(writer_authority_two);
-        fail(diagnostic, FailurePhase::Argument, ENAMETOOLONG);
-        return false;
-    }
-    std::copy(canonical_path_.begin(), canonical_path_.end(), continuation.argv0.begin());
-    continuation.argv0[canonical_path_.size()] = '\0';
+    continuation.arguments = packed_arguments;
     child_fixture::ChildDescriptorPlan candidate_plan;
     candidate_plan.combined_output_fd = borrowed_combined_output_fd;
     candidate_plan.null_input_fd = borrowed_null_input_fd;
@@ -339,6 +400,7 @@ bool ExecutableExecHandoffLease::make_child_plan(int borrowed_null_input_fd,
         return false;
     }
     auto child_use_receipt = std::make_shared<child_fixture::PreparedChildUseReceipt>();
+    child_use_receipt->expected_arguments_ = packed_arguments;
     candidate_plan.child_use_receipt_ = child_use_receipt;
     child_use_receipt_ = child_use_receipt;
     plan = candidate_plan;
@@ -527,9 +589,12 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
         return hooks_.proc_snapshot_allowed == nullptr ||
                hooks_.proc_snapshot_allowed(hooks_.context);
     };
-    if (!proc_allowed() ||
-        !exact_live_identity(
-            child_pid_, child.observation_pidfd(), canonical_path_, identity_, observation.first)) {
+    if (!proc_allowed() || !exact_live_identity(child_pid_,
+                                                child.observation_pidfd(),
+                                                canonical_path_,
+                                                identity_,
+                                                child_use_receipt_->expected_arguments_,
+                                                observation.first)) {
         observation.outcome = pidfd_live(child.observation_pidfd()) ? ExecOutcome::ProtocolFailure
                                                                     : ExecOutcome::EarlyDeath;
         Diagnostic proc_diagnostic;
@@ -548,6 +613,7 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
                                                 child.observation_pidfd(),
                                                 canonical_path_,
                                                 identity_,
+                                                child_use_receipt_->expected_arguments_,
                                                 observation.second)) {
         observation.outcome = pidfd_live(child.observation_pidfd()) ? ExecOutcome::ProtocolFailure
                                                                     : ExecOutcome::EarlyDeath;
@@ -572,6 +638,20 @@ bool ExecutableExecHandoffLease::release_and_observe(executable::ExecutableLease
         fail(proc_diagnostic, FailurePhase::Proc, ESTALE);
         diagnostic = proc_diagnostic;
         publish_status(observation.outcome, proc_diagnostic);
+        return reportable_success;
+    }
+    if (hooks_.post_exec_observation_mutation != nullptr)
+        hooks_.post_exec_observation_mutation(
+            observation.first, observation.second, hooks_.context);
+    if (!child.attest_post_exec_identity(
+            observation.first, observation.second, deadline, child_diagnostic)) {
+        observation.outcome = ExecOutcome::ProtocolFailure;
+        Diagnostic child_identity_diagnostic;
+        fail(child_identity_diagnostic,
+             FailurePhase::Child,
+             child_diagnostic.error_number == 0 ? ESTALE : child_diagnostic.error_number);
+        diagnostic = child_identity_diagnostic;
+        publish_status(observation.outcome, child_identity_diagnostic);
         return reportable_success;
     }
     observation.outcome = ExecOutcome::ExecObservedLive;

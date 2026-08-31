@@ -3,12 +3,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -72,6 +76,31 @@ std::vector<int> fd_snapshot() {
 }
 
 std::array<int, 6> status_slots(const handoff::ExecutableExecHandoffLease& lease);
+
+std::string encoded_arguments(std::span<const std::string_view> arguments) {
+    std::string encoded;
+    for (const std::string_view argument : arguments) {
+        if (!argument.empty()) encoded.append(argument.data(), argument.size());
+        encoded.push_back('\0');
+    }
+    return encoded;
+}
+
+bool plan_arguments_equal(const child_fixture::ChildDescriptorPlan& plan,
+                          std::span<const std::string_view> arguments) {
+    const auto& packed = plan.continuation.arguments;
+    const std::string expected = encoded_arguments(arguments);
+    if (packed.argc != arguments.size() || packed.encoded_bytes != expected.size() ||
+        (expected.size() != 0 &&
+         std::memcmp(packed.arena.data(), expected.data(), expected.size()) != 0))
+        return false;
+    std::size_t offset = 0;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        if (packed.offsets[index] != offset) return false;
+        offset += arguments[index].size() + 1;
+    }
+    return packed.offsets[arguments.size()] == offset;
+}
 
 bool legacy_inert_prepared_stdin_cloexec_case() {
     const int original_flags = fcntl(STDIN_FILENO, F_GETFD);
@@ -1145,6 +1174,409 @@ bool destructor_majority_case(bool unique_majority) {
     return result;
 }
 
+bool pack_acceptance_case(const std::vector<std::string_view>& arguments) {
+    std::string self;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    if (!canonical_self(self) || arguments.empty() || arguments.front() != self ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, handoff_diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    child_fixture::ChildDescriptorPlan plan;
+    const bool packed =
+        input >= 0 && output >= 0 &&
+        handoff_lease.make_child_plan_with_arguments(
+            input, output, false, arguments, plan, handoff_diagnostic) &&
+        plan_arguments_equal(plan, arguments) &&
+        child_fixture::validate_bounded_exec_arguments(plan.continuation.arguments, self);
+    const bool closed = packed && handoff_lease.close(handoff_diagnostic) &&
+                        source.close(source_diagnostic) && close(input) == 0 && close(output) == 0;
+    return closed;
+}
+
+bool argument_pack_limits_case() {
+    std::string self;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic diagnostic;
+    if (!canonical_self(self) ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    if (input < 0 || output < 0) return false;
+    const auto baseline = fd_snapshot();
+    child_fixture::ChildDescriptorPlan plan;
+    const std::array<std::string_view, 0> none{};
+    if (handoff_lease.make_child_plan_with_arguments(
+            input, output, false, none, plan, diagnostic) ||
+        diagnostic.phase != handoff::FailurePhase::Argument || fd_snapshot() != baseline)
+        return false;
+    std::array<std::string_view, 10> ten{};
+    ten.fill("x");
+    ten[0] = self;
+    if (handoff_lease.make_child_plan_with_arguments(input, output, false, ten, plan, diagnostic) ||
+        diagnostic.error_number != E2BIG || fd_snapshot() != baseline)
+        return false;
+    for (const std::string_view bad_argv0 :
+         {std::string_view{}, std::string_view{"relative"}, std::string_view{"/different"}}) {
+        const std::array arguments = {bad_argv0};
+        if (handoff_lease.make_child_plan_with_arguments(
+                input, output, false, arguments, plan, diagnostic) ||
+            diagnostic.error_number != EINVAL || fd_snapshot() != baseline)
+            return false;
+    }
+    const std::string embedded("a\0b", 3);
+    const std::array embedded_arguments = {std::string_view{self}, std::string_view{embedded}};
+    if (handoff_lease.make_child_plan_with_arguments(
+            input, output, false, embedded_arguments, plan, diagnostic) ||
+        diagnostic.error_number != EINVAL || fd_snapshot() != baseline)
+        return false;
+    const std::string embedded_argv0 = self + std::string("\0tail", 5);
+    const std::array bad_argv0_nul = {std::string_view{embedded_argv0}};
+    if (handoff_lease.make_child_plan_with_arguments(
+            input, output, false, bad_argv0_nul, plan, diagnostic) ||
+        diagnostic.error_number != EINVAL || fd_snapshot() != baseline)
+        return false;
+    const std::string too_long(4096, 'x');
+    const std::array too_long_arguments = {std::string_view{self}, std::string_view{too_long}};
+    if (handoff_lease.make_child_plan_with_arguments(
+            input, output, false, too_long_arguments, plan, diagnostic) ||
+        diagnostic.error_number != E2BIG || fd_snapshot() != baseline)
+        return false;
+
+    const std::size_t argv0_encoded = self.size() + 1;
+    if (argv0_encoded >= 4096) return false;
+    const std::string first(4095, 'a');
+    const std::size_t exact_tail_encoded = 8192 - argv0_encoded - 4096;
+    if (exact_tail_encoded == 0 || exact_tail_encoded > 4096) return false;
+    const std::string exact_tail(exact_tail_encoded - 1, 'b');
+    const std::string over_tail(exact_tail_encoded, 'b');
+    const std::array over_total = {
+        std::string_view{self}, std::string_view{first}, std::string_view{over_tail}};
+    if (handoff_lease.make_child_plan_with_arguments(
+            input, output, false, over_total, plan, diagnostic) ||
+        diagnostic.error_number != E2BIG || fd_snapshot() != baseline)
+        return false;
+
+    const std::array exact_total = {
+        std::string_view{self}, std::string_view{first}, std::string_view{exact_tail}};
+    const bool packed = handoff_lease.make_child_plan_with_arguments(
+                            input, output, false, exact_total, plan, diagnostic) &&
+                        plan.continuation.arguments.encoded_bytes == 8192 &&
+                        plan_arguments_equal(plan, exact_total);
+    return packed && handoff_lease.close(diagnostic) && source.close(source_diagnostic) &&
+           close(input) == 0 && close(output) == 0;
+}
+
+bool owned_argument_bytes_case() {
+    std::string self;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic diagnostic;
+    if (!canonical_self(self) ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    child_fixture::ChildDescriptorPlan plan;
+    std::string expected;
+    {
+        std::string poisonable = "owned-value";
+        std::string_view null_empty;
+        const std::array arguments = {
+            std::string_view{self}, std::string_view{poisonable}, null_empty, std::string_view{""}};
+        expected = encoded_arguments(arguments);
+        if (input < 0 || output < 0 ||
+            !handoff_lease.make_child_plan_with_arguments(
+                input, output, false, arguments, plan, diagnostic))
+            return false;
+        poisonable.assign(poisonable.size(), 'z');
+    }
+    const auto& packed = plan.continuation.arguments;
+    const bool owned = packed.encoded_bytes == expected.size() &&
+                       std::memcmp(packed.arena.data(), expected.data(), expected.size()) == 0;
+    return owned && handoff_lease.close(diagnostic) && source.close(source_diagnostic) &&
+           close(input) == 0 && close(output) == 0;
+}
+
+using ArgumentMutation = void (*)(child_fixture::ChildContinuation&);
+
+void mutate_argc(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.argc = 0;
+}
+void mutate_encoded(child_fixture::ChildContinuation& continuation) {
+    --continuation.arguments.encoded_bytes;
+}
+void mutate_offset_zero(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.offsets[0] = 1;
+}
+void mutate_boundary(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.offsets[1] = 0;
+}
+void mutate_terminal_offset(child_fixture::ChildContinuation& continuation) {
+    --continuation.arguments.offsets[continuation.arguments.argc];
+}
+void mutate_terminal_nul(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.arena[continuation.arguments.encoded_bytes - 1] = 'x';
+}
+void mutate_early_nul(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.arena[continuation.arguments.offsets[1]] = '\0';
+}
+void mutate_active_arena(child_fixture::ChildContinuation& continuation) {
+    continuation.arguments.arena[continuation.arguments.offsets[1]] ^= 1;
+}
+
+bool argument_mutation_rejected_and_retry_case(ArgumentMutation mutation, bool through_hook) {
+    std::string self;
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    if (!canonical_self(self) ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, handoff_diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    const std::array arguments = {
+        std::string_view{self}, std::string_view{"argument"}, std::string_view{"tail"}};
+    child_fixture::ChildDescriptorPlan original;
+    if (input < 0 || output < 0 ||
+        !handoff_lease.make_child_plan_with_arguments(
+            input, output, false, arguments, original, handoff_diagnostic))
+        return false;
+    child_fixture::ChildDescriptorPlan changed = original;
+    child_fixture::HooksForTesting hooks;
+    if (through_hook) {
+        hooks.pre_fork_continuation_mutation = [](child_fixture::ChildContinuation& continuation,
+                                                  void* opaque) {
+            (*static_cast<ArgumentMutation*>(opaque))(continuation);
+        };
+        hooks.pre_fork_continuation_context = &mutation;
+    } else {
+        mutation(changed.continuation);
+    }
+    const auto baseline = fd_snapshot();
+    child_fixture::PausedChildLease rejected;
+    child_fixture::Diagnostic child_diagnostic;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    const bool created =
+        through_hook ? child_fixture::PausedChildLease::create_prepared_with_hooks_for_testing(
+                           deadline, changed, hooks, rejected, child_diagnostic)
+                     : child_fixture::PausedChildLease::create_prepared(
+                           deadline, changed, rejected, child_diagnostic);
+    int wait_status = 0;
+    errno = 0;
+    if (created || rejected.active() ||
+        child_diagnostic.phase != child_fixture::FailurePhase::Argument ||
+        child_diagnostic.error_number != EINVAL || fd_snapshot() != baseline ||
+        waitpid(-1, &wait_status, WNOHANG) != -1 || errno != ECHILD ||
+        original.child_use_receipt_for_testing()->state() !=
+            child_fixture::PreparedChildUseState::OwnerLive)
+        return false;
+    child_fixture::PausedChildLease child;
+    if (!child_fixture::PausedChildLease::create_prepared(
+            deadline, original, child, child_diagnostic) ||
+        !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
+        !source.close(source_diagnostic))
+        return false;
+    return close(input) == 0 && close(output) == 0;
+}
+
+bool run_live_arguments_case(const std::vector<std::string_view>& arguments) {
+    std::string self;
+    const auto baseline = fd_snapshot();
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    if (!canonical_self(self) || arguments.empty() || arguments.front() != self ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create(source, handoff_lease, handoff_diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    child_fixture::ChildDescriptorPlan plan;
+    child_fixture::PausedChildLease child;
+    child_fixture::Diagnostic child_diagnostic;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    if (input < 0 || output < 0 ||
+        !handoff_lease.make_child_plan_with_arguments(
+            input, output, false, arguments, plan, handoff_diagnostic) ||
+        !child_fixture::PausedChildLease::create_prepared(deadline, plan, child, child_diagnostic))
+        return false;
+    handoff::ExecObservation observation;
+    const std::string expected = encoded_arguments(arguments);
+    if (!handoff_lease.release_and_observe(
+            source, child, deadline, observation, handoff_diagnostic) ||
+        observation.outcome != handoff::ExecOutcome::ExecObservedLive ||
+        observation.first.cmdline != expected || observation.second.cmdline != expected ||
+        !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
+        !source.close(source_diagnostic))
+        return false;
+    if (close(input) != 0 || close(output) != 0 || fd_snapshot() != baseline) return false;
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+void forge_first_post_exec_cmdline(child_fixture::ProcIdentity& first,
+                                   child_fixture::ProcIdentity&,
+                                   void*) {
+    first.cmdline.push_back('x');
+}
+
+bool forged_post_exec_identity_rejected_case() {
+    std::string self;
+    const auto baseline = fd_snapshot();
+    executable::ExecutableLease source;
+    executable::Diagnostic source_diagnostic;
+    handoff::ExecutableExecHandoffLease handoff_lease;
+    handoff::Diagnostic handoff_diagnostic;
+    handoff::HooksForTesting hooks;
+    hooks.post_exec_observation_mutation = forge_first_post_exec_cmdline;
+    if (!canonical_self(self) ||
+        !executable::ExecutableLease::create(self, source, source_diagnostic) ||
+        !handoff::ExecutableExecHandoffLease::create_with_hooks_for_testing(
+            source, hooks, handoff_lease, handoff_diagnostic))
+        return false;
+    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int output = create_capture();
+    const std::array arguments = {
+        std::string_view{self}, std::string_view{""}, std::string_view{"after-empty"}};
+    child_fixture::ChildDescriptorPlan plan;
+    child_fixture::PausedChildLease child;
+    child_fixture::Diagnostic child_diagnostic;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    if (input < 0 || output < 0 ||
+        !handoff_lease.make_child_plan_with_arguments(
+            input, output, false, arguments, plan, handoff_diagnostic) ||
+        !child_fixture::PausedChildLease::create_prepared(deadline, plan, child, child_diagnostic))
+        return false;
+    handoff::ExecObservation observation;
+    if (!handoff_lease.release_and_observe(
+            source, child, deadline, observation, handoff_diagnostic) ||
+        observation.outcome != handoff::ExecOutcome::ProtocolFailure ||
+        handoff_diagnostic.phase != handoff::FailurePhase::Child ||
+        handoff_diagnostic.error_number != ESTALE ||
+        observation.first.cmdline == observation.second.cmdline ||
+        !child.attest_post_exec_identity(
+            observation.second, observation.second, deadline, child_diagnostic) ||
+        !child.cleanup(deadline, child_diagnostic) || !handoff_lease.close(handoff_diagnostic) ||
+        !source.close(source_diagnostic) || close(input) != 0 || close(output) != 0 ||
+        fd_snapshot() != baseline)
+        return false;
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+bool post_exec_destructor_containment_case() {
+    const pid_t subprocess = fork();
+    if (subprocess < 0) return false;
+    if (subprocess == 0) {
+        const auto baseline = fd_snapshot();
+        std::string self;
+        executable::ExecutableLease source;
+        executable::Diagnostic source_diagnostic;
+        if (!canonical_self(self) ||
+            !executable::ExecutableLease::create(self, source, source_diagnostic))
+            _exit(2);
+        const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        const int output = create_capture();
+        const auto owned_baseline = fd_snapshot();
+        {
+            handoff::ExecutableExecHandoffLease handoff_lease;
+            handoff::Diagnostic handoff_diagnostic;
+            child_fixture::ChildDescriptorPlan plan;
+            child_fixture::PausedChildLease child;
+            child_fixture::Diagnostic child_diagnostic;
+            const std::array arguments = {
+                std::string_view{self}, std::string_view{""}, std::string_view{"after-empty"}};
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            if (input < 0 || output < 0 ||
+                !handoff::ExecutableExecHandoffLease::create(
+                    source, handoff_lease, handoff_diagnostic) ||
+                !handoff_lease.make_child_plan_with_arguments(
+                    input, output, false, arguments, plan, handoff_diagnostic) ||
+                !child_fixture::PausedChildLease::create_prepared(
+                    deadline, plan, child, child_diagnostic))
+                _exit(3);
+            handoff::ExecObservation observation;
+            if (!handoff_lease.release_and_observe(
+                    source, child, deadline, observation, handoff_diagnostic) ||
+                observation.outcome != handoff::ExecOutcome::ExecObservedLive)
+                _exit(4);
+            // Reverse destruction is deliberate: child contains and reaps the
+            // attested exec process before H settles its claimed descriptors.
+        }
+        if (fd_snapshot() != owned_baseline || !source.close(source_diagnostic) ||
+            close(input) != 0 || close(output) != 0 || fd_snapshot() != baseline)
+            _exit(5);
+        int status = 0;
+        errno = 0;
+        if (waitpid(-1, &status, WNOHANG) != -1 || errno != ECHILD) _exit(6);
+        _exit(0);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    int status = 0;
+    for (;;) {
+        const pid_t result = waitpid(subprocess, &status, WNOHANG);
+        if (result == subprocess) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void)kill(subprocess, SIGKILL);
+            while (waitpid(subprocess, &status, 0) < 0 && errno == EINTR) {
+            }
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+}
+
+bool bounded_argument_transport_case() {
+    std::string self;
+    if (!canonical_self(self)) return false;
+    const std::string per_argument_max(4095, 'x');
+    if (!pack_acceptance_case({self, per_argument_max}) || !argument_pack_limits_case() ||
+        !owned_argument_bytes_case())
+        return false;
+    const std::array<ArgumentMutation, 8> mutations = {mutate_argc,
+                                                       mutate_encoded,
+                                                       mutate_offset_zero,
+                                                       mutate_boundary,
+                                                       mutate_terminal_offset,
+                                                       mutate_terminal_nul,
+                                                       mutate_early_nul,
+                                                       mutate_active_arena};
+    for (ArgumentMutation mutation : mutations)
+        if (!argument_mutation_rejected_and_retry_case(mutation, false)) return false;
+    if (!argument_mutation_rejected_and_retry_case(mutate_active_arena, true)) return false;
+    if (!run_live_arguments_case({self}) ||
+        !run_live_arguments_case({self, std::string_view{}, "after-empty"}) ||
+        !run_live_arguments_case({self,
+                                  "/tmp/future-source.rut",
+                                  "--shards",
+                                  "1",
+                                  "--no-pin",
+                                  "--drain",
+                                  "0",
+                                  "--opt",
+                                  "2"}))
+        return false;
+    return forged_post_exec_identity_rejected_case() && post_exec_destructor_containment_case();
+}
+
 bool plan_is_reset(const child_fixture::ChildDescriptorPlan& plan) {
     return plan.combined_output_fd == -1 && plan.null_input_fd == -1 && plan.executable_fd == -1 &&
            plan.exec_status_fd == -1 && plan.exec_status_authority_fd == -1 &&
@@ -1476,6 +1908,10 @@ int main() {
     }
     if (!reverse_destruction_settlement_residue_case()) {
         std::fprintf(stderr, "reverse destruction settlement residue case failed\n");
+        return 1;
+    }
+    if (!bounded_argument_transport_case()) {
+        std::fprintf(stderr, "bounded executable argument transport case failed\n");
         return 1;
     }
     if (!run_live_case()) {

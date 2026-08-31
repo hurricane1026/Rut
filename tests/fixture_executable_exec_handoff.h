@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <string_view>
 
 namespace rut::test::fixture_executable_exec_handoff {
 
@@ -89,6 +91,9 @@ struct HooksForTesting {
     // 1 same-inode/new-OFD, 2 different object, 3 clear CLOEXEC.
     std::uint8_t child_executable_mutation = 0;
     bool (*proc_snapshot_allowed)(void*) = nullptr;
+    void (*post_exec_observation_mutation)(child_fixture::ProcIdentity&,
+                                           child_fixture::ProcIdentity&,
+                                           void*) = nullptr;
     bool fail_status_identity_fstat = false;
 };
 
@@ -97,8 +102,8 @@ struct HooksForTesting {
 // descriptors.  Its destructor never signals, waits, reaps, or dereferences a
 // source lease.  Defensive destructor closure is bounded to at most one H-slot
 // replacement; ambiguity preserves every unproven numeric slot.
-// This increment intentionally materializes only argv[0]; arbitrary additional
-// arguments belong to the later fresh-session composition increment.
+// This increment transports at most nine bounded, owned argument byte strings;
+// it does not parse their application-level meaning or compose a session.
 // Numeric accessors are observation-only causal-test seams; the exclusive
 // parent owner does not read them or mutate its FD table during an operation.
 // Deliberate test mutations are detected fail-closed before release or close.
@@ -126,6 +131,12 @@ public:
                          bool inject_pre_exec_failure,
                          child_fixture::ChildDescriptorPlan& plan,
                          Diagnostic& diagnostic);
+    bool make_child_plan_with_arguments(int borrowed_null_input_fd,
+                                        int borrowed_combined_output_fd,
+                                        bool inject_pre_exec_failure,
+                                        std::span<const std::string_view> arguments,
+                                        child_fixture::ChildDescriptorPlan& plan,
+                                        Diagnostic& diagnostic);
     bool release_and_observe(executable::ExecutableLease& source,
                              child_fixture::PausedChildLease& child,
                              std::chrono::steady_clock::time_point deadline,

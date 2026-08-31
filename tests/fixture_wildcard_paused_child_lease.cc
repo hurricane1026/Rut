@@ -27,6 +27,33 @@
 #include <unistd.h>
 
 namespace rut::test::fixture_wildcard_paused_child_lease {
+
+bool validate_bounded_exec_arguments(const BoundedExecArguments& arguments,
+                                     std::string_view canonical_argv0) {
+    const std::size_t argc = arguments.argc;
+    const std::size_t encoded = arguments.encoded_bytes;
+    if (argc == 0 || argc > kMaxExecArgumentCount || encoded == 0 ||
+        encoded > kMaxExecArgumentsEncodedBytes || arguments.offsets[0] != 0 ||
+        arguments.offsets[argc] != encoded)
+        return false;
+    for (std::size_t index = 0; index < argc; ++index) {
+        const std::size_t begin = arguments.offsets[index];
+        const std::size_t end = arguments.offsets[index + 1];
+        if (begin >= end || end > encoded) return false;
+        const std::size_t length = end - begin;
+        if (length > kMaxExecArgumentEncodedBytes || arguments.arena[end - 1] != '\0' ||
+            (length > 1 &&
+             std::memchr(arguments.arena.data() + begin, '\0', length - 1) != nullptr))
+            return false;
+    }
+    const std::size_t argv0_encoded = arguments.offsets[1];
+    if (canonical_argv0.size() >= kMaxExecArgumentEncodedBytes ||
+        argv0_encoded != canonical_argv0.size() + 1)
+        return false;
+    return canonical_argv0.empty() ||
+           std::memcmp(arguments.arena.data(), canonical_argv0.data(), canonical_argv0.size()) == 0;
+}
+
 namespace {
 
 using fixture_worker_protocol::read_file;
@@ -42,6 +69,32 @@ void fail(Diagnostic& diagnostic, FailurePhase phase, int error_number = 0) {
 
 bool before_deadline(std::chrono::steady_clock::time_point deadline) {
     return std::chrono::steady_clock::now() < deadline;
+}
+
+bool same_bounded_exec_arguments(const BoundedExecArguments& first,
+                                 const BoundedExecArguments& second) {
+    if (first.argc != second.argc || first.encoded_bytes != second.encoded_bytes) return false;
+    const std::size_t argc = first.argc;
+    for (std::size_t index = 0; index <= argc; ++index)
+        if (first.offsets[index] != second.offsets[index]) return false;
+    return first.encoded_bytes == 0 ||
+           std::memcmp(first.arena.data(), second.arena.data(), first.encoded_bytes) == 0;
+}
+
+bool same_stable_process_fields(const ProcIdentity& first, const ProcIdentity& second) {
+    return first.pid == second.pid && first.ppid == second.ppid && first.sid == second.sid &&
+           first.start == second.start && first.pgid == second.pgid && first.uid == second.uid &&
+           first.uid != static_cast<uid_t>(-1) && first.gid == second.gid &&
+           first.gid != static_cast<gid_t>(-1) && first.netns == second.netns &&
+           first.no_new_privs == second.no_new_privs &&
+           first.capabilities_clear == second.capabilities_clear &&
+           first.supplementary_groups == second.supplementary_groups;
+}
+
+bool exact_encoded_cmdline(const BoundedExecArguments& arguments, const std::string& cmdline) {
+    return cmdline.size() == arguments.encoded_bytes &&
+           (cmdline.empty() ||
+            std::memcmp(cmdline.data(), arguments.arena.data(), cmdline.size()) == 0);
 }
 
 int remaining_ms(std::chrono::steady_clock::time_point deadline) {
@@ -363,7 +416,7 @@ void child_main(int ready_fd,
                 int null_input_fd,
                 int executable_fd,
                 int exec_status_fd,
-                ChildContinuation continuation,
+                const ChildContinuation& continuation,
                 const int* inherited_fds,
                 std::size_t inherited_fd_count,
                 int injected_close_failure_fd,
@@ -409,8 +462,9 @@ void child_main(int ready_fd,
             if (continuation.executable_mutation == 3) {
                 if (fcntl(executable_fd, F_SETFD, 0) != 0) _exit(133);
             } else {
-                const char* replacement_path =
-                    continuation.executable_mutation == 1 ? continuation.argv0.data() : "/dev/null";
+                const char* replacement_path = continuation.executable_mutation == 1
+                                                   ? continuation.arguments.arena.data()
+                                                   : "/dev/null";
                 const int replacement = open(replacement_path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
                 if (replacement < 0 ||
                     dup3(replacement, executable_fd, O_CLOEXEC) != executable_fd ||
@@ -495,7 +549,11 @@ void child_main(int ready_fd,
             if (!report(1u, EIO)) _exit(135);
             _exit(130);
         }
-        char* argv[] = {continuation.argv0.data(), nullptr};
+        char* argv[10]{};
+        for (std::size_t index = 0; index < continuation.arguments.argc; ++index)
+            argv[index] = const_cast<char*>(continuation.arguments.arena.data() +
+                                            continuation.arguments.offsets[index]);
+        argv[continuation.arguments.argc] = nullptr;
         char* environment[] = {nullptr};
 #ifdef SYS_execveat
         syscall(SYS_execveat, executable_fd, "", argv, environment, AT_EMPTY_PATH);
@@ -564,7 +622,7 @@ PausedChildLease::~PausedChildLease() {
             const bool authority_valid =
                 valid_pidfd_unbounded(
                     authority_pidfd_, child_pid_, true, authority_dev_, authority_ino_) &&
-                read_proc(child_pid_, current) && same_process_identity(identity_, current);
+                read_proc(child_pid_, current) && matches_current_owned_identity(current);
             if (authority_valid && pidfd_signal(authority_pidfd_, SIGKILL)) {
                 do {
                     result = waitpid(child_pid_, &child_status_, 0);
@@ -686,10 +744,18 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
         const bool exec_mode = plan->continuation.kind == ChildContinuationKind::Execveat;
         if (exec_mode) {
             if (plan->null_input_fd <= 2 || plan->executable_fd <= 2 || plan->exec_status_fd <= 2 ||
-                plan->exec_status_authority_fd <= 2 || plan->continuation.argv0.front() != '/' ||
-                plan->continuation.argv0.back() != '\0' ||
-                std::find(plan->continuation.argv0.begin(), plan->continuation.argv0.end(), '\0') ==
-                    plan->continuation.argv0.end()) {
+                plan->exec_status_authority_fd <= 2 || !plan->child_use_receipt_) {
+                fail(diagnostic, FailurePhase::Argument, EINVAL);
+                return false;
+            }
+            const auto& expected = plan->child_use_receipt_->expected_arguments_;
+            const std::size_t expected_argv0_size =
+                expected.argc == 0 || expected.offsets[1] == 0 ? 0 : expected.offsets[1] - 1;
+            const std::string_view canonical_argv0(expected.arena.data(), expected_argv0_size);
+            if (canonical_argv0.empty() || canonical_argv0.front() != '/' ||
+                !validate_bounded_exec_arguments(expected, canonical_argv0) ||
+                !validate_bounded_exec_arguments(plan->continuation.arguments, canonical_argv0) ||
+                !same_bounded_exec_arguments(plan->continuation.arguments, expected)) {
                 fail(diagnostic, FailurePhase::Argument, EINVAL);
                 return false;
             }
@@ -805,7 +871,7 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
     const int child_input_fd = prepared ? plan->null_input_fd : -1;
     const int child_executable_fd = prepared ? plan->executable_fd : -1;
     const int child_exec_status_fd = prepared ? plan->exec_status_fd : -1;
-    const ChildContinuation continuation = prepared ? plan->continuation : ChildContinuation{};
+    ChildContinuation continuation = prepared ? plan->continuation : ChildContinuation{};
     const int* const inherited_fd_data = inherited_fds.data();
     const std::size_t inherited_fd_count = inherited_fds.size();
     const unsigned int child_delay = hooks == nullptr ? 0u : hooks->child_delay_ms;
@@ -822,6 +888,23 @@ bool PausedChildLease::create_impl(std::chrono::steady_clock::time_point deadlin
         close_ignoring(release[0]);
         close_ignoring(release[1]);
         return false;
+    }
+    if (prepared && continuation.kind == ChildContinuationKind::Execveat) {
+        if (hooks != nullptr && hooks->pre_fork_continuation_mutation != nullptr)
+            hooks->pre_fork_continuation_mutation(continuation,
+                                                  hooks->pre_fork_continuation_context);
+        const auto& expected = plan->child_use_receipt_->expected_arguments_;
+        const std::size_t expected_argv0_size = expected.offsets[1] - 1;
+        const std::string_view canonical_argv0(expected.arena.data(), expected_argv0_size);
+        if (!validate_bounded_exec_arguments(continuation.arguments, canonical_argv0) ||
+            !same_bounded_exec_arguments(continuation.arguments, expected)) {
+            fail(diagnostic, FailurePhase::Argument, EINVAL);
+            close_ignoring(ready[0]);
+            close_ignoring(ready[1]);
+            close_ignoring(release[0]);
+            close_ignoring(release[1]);
+            return false;
+        }
     }
     const pid_t child = fork();
     if (child < 0) {
@@ -1072,12 +1155,31 @@ bool PausedChildLease::validate_identity(std::chrono::steady_clock::time_point d
         return false;
     }
     ProcIdentity current;
-    if (!read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
-        current.ppid != parent_pid_) {
+    if (!read_proc(child_pid_, current) || !matches_current_owned_identity(current)) {
         fail(diagnostic, FailurePhase::Identity, ESTALE);
         return false;
     }
     return true;
+}
+
+bool PausedChildLease::matches_owned_post_exec_identity(const ProcIdentity& current) const {
+    if (continuation_.arguments.argc == 0 || continuation_.arguments.offsets[1] == 0) return false;
+    struct stat executable_status{};
+    if (fstat(child_executable_fd_, &executable_status) != 0) return false;
+    const std::size_t argv0_size = continuation_.arguments.offsets[1] - 1;
+    const std::string_view argv0(continuation_.arguments.arena.data(), argv0_size);
+    return same_stable_process_fields(identity_, current) && current.ppid == parent_pid_ &&
+           current.exe_dev == executable_status.st_dev &&
+           current.exe_ino == executable_status.st_ino && current.exe.size() == argv0.size() &&
+           (argv0.empty() || std::memcmp(current.exe.data(), argv0.data(), argv0.size()) == 0) &&
+           exact_encoded_cmdline(continuation_.arguments, current.cmdline);
+}
+
+bool PausedChildLease::matches_current_owned_identity(const ProcIdentity& current) const {
+    if (post_exec_identity_attested_)
+        return same_process_identity(post_exec_identity_, current) &&
+               matches_owned_post_exec_identity(current);
+    return same_process_identity(identity_, current) && current.ppid == parent_pid_;
 }
 
 bool PausedChildLease::validate_bound_child(std::chrono::steady_clock::time_point deadline,
@@ -1367,6 +1469,53 @@ bool PausedChildLease::authorize_exec_release(std::chrono::steady_clock::time_po
     return true;
 }
 
+bool PausedChildLease::attest_post_exec_identity(const ProcIdentity& first,
+                                                 const ProcIdentity& second,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (!active_ || released_ || !release_sent_ || mode_ != Mode::Prepared ||
+        continuation_.kind != ChildContinuationKind::Execveat || !prepared_release_authorized_ ||
+        post_exec_identity_attested_) {
+        fail(diagnostic, FailurePhase::Argument, EALREADY);
+        return false;
+    }
+    if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
+        !validate_pidfd(authority_pidfd_, true, deadline, diagnostic))
+        return false;
+    if (!same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+        return false;
+    }
+    if (!same_process_identity(first, second) || !matches_owned_post_exec_identity(first) ||
+        !matches_owned_post_exec_identity(second)) {
+        fail(diagnostic, FailurePhase::Identity, ESTALE);
+        return false;
+    }
+    ProcIdentity current;
+    if (!read_proc(child_pid_, current) || !same_process_identity(second, current) ||
+        !matches_owned_post_exec_identity(current)) {
+        fail(diagnostic, FailurePhase::Identity, ESTALE);
+        return false;
+    }
+    std::vector<pid_t> children;
+    if (!direct_children(deadline, children, diagnostic)) return false;
+    if (children.size() != 1 || children.front() != child_pid_) {
+        fail(diagnostic, FailurePhase::Children, ECHILD);
+        return false;
+    }
+    if (!validate_pidfd(observation_pidfd_, true, deadline, diagnostic) ||
+        !validate_pidfd(authority_pidfd_, true, deadline, diagnostic) ||
+        !same_open_file_description(observation_pidfd_, authority_pidfd_)) {
+        if (diagnostic.phase == FailurePhase::None)
+            fail(diagnostic, FailurePhase::Pidfd, errno == 0 ? EINVAL : errno);
+        return false;
+    }
+    post_exec_identity_ = current;
+    post_exec_identity_attested_ = true;
+    return true;
+}
+
 bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
                                Diagnostic& diagnostic) {
     diagnostic = {};
@@ -1413,8 +1562,7 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
             record_cleanup(false, diagnostic);
             return false;
         }
-        if (!read_proc(child_pid_, current) || !same_process_identity(identity_, current) ||
-            current.ppid != parent_pid_) {
+        if (!read_proc(child_pid_, current) || !matches_current_owned_identity(current)) {
             fail(diagnostic, FailurePhase::Cleanup, ESTALE);
             record_cleanup(false, diagnostic);
             return false;
