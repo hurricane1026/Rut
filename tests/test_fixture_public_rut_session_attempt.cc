@@ -20,13 +20,11 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 namespace attempt = rut::test::fixture_public_rut_session_attempt;
 namespace directory = rut::test::fixture_private_directory_lease;
 namespace executable = rut::test::fixture_executable_lease;
 namespace protocol = rut::test::fixture_worker_protocol;
 namespace source = rut::test::fixture_wildcard_source_lease;
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -182,24 +180,37 @@ bool run_case(const char* name, const std::function<bool(Owners&)>& body) {
     return ok;
 }
 
-bool partial_prepare(Owners& owners) {
+bool partial_prepare(Owners& owners, attempt::PrepareFailurePoint point) {
     attempt::HooksForTesting hooks;
-    hooks.prepare_failure = attempt::PrepareFailurePoint::AfterChild;
+    hooks.prepare_failure = point;
     attempt::Diagnostic diagnostic;
+    std::shared_ptr<const attempt::CleanupState> cleanup;
+    bool rejected = false;
     {
         attempt::PublicRutAttemptLease lease;
+        cleanup = lease.cleanup_state();
         const auto argv = arguments(owners, "--attempt-live");
-        if (!check(!lease.prepare(owners.source,
+        rejected = !lease.prepare(owners.source,
                                   owners.executable,
                                   argv,
                                   Clock::now() + std::chrono::seconds(2),
                                   hooks,
-                                  diagnostic),
-                   "injected partial prepare failure") ||
-            !check(lease.state() == attempt::State::Failed, "partial prepare retained failure"))
-            return false;
+                                  diagnostic) &&
+                   lease.state() == attempt::State::Failed;
     }
-    return true;
+    return check(
+        rejected && cleanup && cleanup->destructor_attempted &&
+            !cleanup->destructor_reportable_success &&
+            cleanup->diagnostic.phase == attempt::FailurePhase::Injected &&
+            cleanup->diagnostic.error_number == EIO &&
+            cleanup->child_attempted == (point >= attempt::PrepareFailurePoint::AfterChild) &&
+            cleanup->child_settled == cleanup->child_attempted &&
+            cleanup->handoff_attempted == (point >= attempt::PrepareFailurePoint::AfterHandoff) &&
+            cleanup->handoff_closed == cleanup->handoff_attempted &&
+            cleanup->null_attempted == (point >= attempt::PrepareFailurePoint::AfterNullInput) &&
+            cleanup->null_closed == cleanup->null_attempted && cleanup->capture_settle_attempted &&
+            cleanup->capture_settled && cleanup->capture_close_attempted && cleanup->capture_closed,
+        "partial prepare exact destructor evidence");
 }
 
 bool exec_failure(Owners& owners) {
@@ -291,7 +302,22 @@ bool live_kill_and_owned_evidence(Owners& owners) {
     if (!check(lease.expected_cmdline() == expected_cmdline,
                "owned argv/path evidence survives caller poisoning") ||
         !observe_ok(lease, owners, diagnostic) ||
-        !check(lease.state() == attempt::State::ExecObservedLive, "ExecObservedLive state") ||
+        !check(lease.state() == attempt::State::ExecObservedLive, "ExecObservedLive state"))
+        return false;
+    const pid_t child_pid = lease.child_pid();
+    const auto settlement = lease.settlement_receipt();
+    protocol::ProcIdentity after_rejection;
+    pollfd pidfd{lease.observation_pidfd(), POLLIN | POLLERR | POLLHUP, 0};
+    if (!check(
+            !lease.settle_killed(SIGTERM, Clock::now() + std::chrono::seconds(1), diagnostic) &&
+                diagnostic.phase == attempt::FailurePhase::Argument &&
+                diagnostic.error_number == EINVAL &&
+                lease.state() == attempt::State::ExecObservedLive &&
+                lease.child_pid() == child_pid && settlement && !settlement->terminal &&
+                !settlement->reaped && poll(&pidfd, 1, 0) == 0 && pidfd.revents == 0 &&
+                protocol::read_proc(child_pid, after_rejection) &&
+                protocol::same_process_identity(lease.exec_observation().second, after_rejection),
+            "non-SIGKILL rejection preserves exact live child") ||
         !check(lease.settle_killed(SIGKILL, Clock::now() + std::chrono::seconds(2), diagnostic),
                "live SIGKILL/reap") ||
         !check(lease.state() == attempt::State::KilledReapedEvidenceOpen &&
@@ -361,52 +387,58 @@ int close_then_fail_selected(int descriptor, void* opaque) {
     return result;
 }
 
-bool close_uncertainty(Owners& owners, bool handoff_failure) {
-    CloseContext context;
-    context.fail_on = handoff_failure ? 4u : 1u;
-    attempt::HooksForTesting hooks;
-    if (handoff_failure) {
-        hooks.handoff.close_fd = close_then_fail_selected;
-        hooks.handoff.context = &context;
-    } else {
-        hooks.close_null_input = close_then_fail_selected;
-        hooks.null_context = &context;
-    }
-    attempt::Diagnostic diagnostic;
-    attempt::PublicRutAttemptLease lease;
-    return prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) &&
-           observe_ok(lease, owners, diagnostic) &&
-           check(!lease.settle_killed(SIGKILL, Clock::now() + std::chrono::seconds(2), diagnostic),
-                 "close uncertainty cannot report settlement success") &&
-           check(lease.state() == attempt::State::Failed, "close uncertainty retained failure");
-}
-
 bool fail_capture_close = false;
 int capture_close(int descriptor) {
     const int result = close(descriptor);
-    if (fail_capture_close) {
-        fail_capture_close = false;
-        errno = EINTR;
-        return -1;
-    }
-    return result;
+    if (!fail_capture_close) return result;
+    fail_capture_close = false;
+    errno = EINTR;
+    return -1;
 }
 
-bool capture_close_uncertainty(Owners& owners) {
+bool close_uncertainty(Owners& owners, unsigned kind) {
+    CloseContext context;
+    context.fail_on = kind == 0u ? 4u : 1u;
     attempt::HooksForTesting hooks;
-    hooks.capture.close = capture_close;
+    if (kind == 0u) {
+        hooks.handoff.close_fd = close_then_fail_selected;
+        hooks.handoff.context = &context;
+    } else if (kind == 1u) {
+        hooks.close_null_input = close_then_fail_selected;
+        hooks.null_context = &context;
+    } else {
+        hooks.capture.close = capture_close;
+    }
     attempt::Diagnostic diagnostic;
-    attempt::PublicRutAttemptLease lease;
-    if (!prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) ||
-        !observe_ok(lease, owners, diagnostic) ||
-        !check(lease.settle_killed(SIGKILL, Clock::now() + std::chrono::seconds(2), diagnostic),
-               "capture-close settlement"))
-        return false;
-    fail_capture_close = true;
-    return check(!lease.close_evidence(diagnostic),
-                 "capture close uncertainty cannot report success") &&
-           check(lease.state() == attempt::State::Failed,
-                 "capture close uncertainty retained failure");
+    std::shared_ptr<const attempt::CleanupState> cleanup;
+    bool result;
+    {
+        attempt::PublicRutAttemptLease lease;
+        cleanup = lease.cleanup_state();
+        result = prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) &&
+                 observe_ok(lease, owners, diagnostic);
+        const bool settled =
+            lease.settle_killed(SIGKILL, Clock::now() + std::chrono::seconds(2), diagnostic);
+        if (kind == 2u) {
+            fail_capture_close = true;
+            result = settled && !lease.close_evidence(diagnostic) && result;
+        } else {
+            result = !settled && result;
+        }
+        result = lease.state() == attempt::State::Failed && result;
+    }
+    const std::array phases = {attempt::FailurePhase::Handoff,
+                               attempt::FailurePhase::NullInput,
+                               attempt::FailurePhase::Close};
+    const bool false_success = kind == 0u ? cleanup->handoff_attempted && !cleanup->handoff_closed
+                               : kind == 1u
+                                   ? cleanup->null_attempted && !cleanup->null_closed
+                                   : cleanup->capture_close_attempted && !cleanup->capture_closed;
+    return check(result && cleanup && cleanup->destructor_attempted &&
+                     !cleanup->destructor_reportable_success &&
+                     cleanup->diagnostic.phase == phases[kind] &&
+                     cleanup->diagnostic.error_number == EINTR && false_success,
+                 "close uncertainty retained post-destructor failure");
 }
 
 }  // namespace
@@ -422,7 +454,15 @@ int main(int argc, char** argv) {
     }
 
     bool ok = true;
-    ok = run_case("partial prepare", partial_prepare) && ok;
+    constexpr std::array partial_points = {attempt::PrepareFailurePoint::AfterCapture,
+                                           attempt::PrepareFailurePoint::AfterNullInput,
+                                           attempt::PrepareFailurePoint::AfterHandoff,
+                                           attempt::PrepareFailurePoint::AfterPlan,
+                                           attempt::PrepareFailurePoint::AfterChild};
+    for (const auto point : partial_points)
+        ok = run_case("partial prepare",
+                      [point](Owners& owners) { return partial_prepare(owners, point); }) &&
+             ok;
     ok = run_case("exec failure", exec_failure) && ok;
     ok = run_case("early death", early_death) && ok;
     ok = run_case("live kill and evidence", live_kill_and_owned_evidence) && ok;
@@ -432,12 +472,14 @@ int main(int argc, char** argv) {
          ok;
     ok = run_case("synchronous validation", synchronous_validation_failures) && ok;
     ok = run_case("handoff close uncertainty",
-                  [](Owners& owners) { return close_uncertainty(owners, true); }) &&
+                  [](Owners& owners) { return close_uncertainty(owners, 0u); }) &&
          ok;
     ok = run_case("null close uncertainty",
-                  [](Owners& owners) { return close_uncertainty(owners, false); }) &&
+                  [](Owners& owners) { return close_uncertainty(owners, 1u); }) &&
          ok;
-    ok = run_case("capture close uncertainty", capture_close_uncertainty) && ok;
+    ok = run_case("capture close uncertainty",
+                  [](Owners& owners) { return close_uncertainty(owners, 2u); }) &&
+         ok;
     if (!ok) return 1;
     std::puts("PASS: #377 reusable public RUT attempt lease");
     return 0;

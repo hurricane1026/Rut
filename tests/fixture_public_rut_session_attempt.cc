@@ -2,14 +2,12 @@
 
 #include "fixture_worker_protocol.h"
 #include <cerrno>
-#include <cstring>
 
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 namespace rut::test::fixture_public_rut_session_attempt {
 namespace {
 
@@ -64,8 +62,18 @@ PublicRutAttemptLease::~PublicRutAttemptLease() {
 
 bool PublicRutAttemptLease::reject(Diagnostic& diagnostic, FailurePhase phase, int error_number) {
     diagnostic = {phase, nonzero(error_number, EIO)};
-    cleanup_->diagnostic = diagnostic;
+    if (state_ == State::Failed) retain_terminal_failure(diagnostic);
     return false;
+}
+
+void PublicRutAttemptLease::record_attempt(bool result, bool& attempted, bool& succeeded) {
+    succeeded = attempted ? succeeded && result : result;
+    attempted = true;
+}
+
+void PublicRutAttemptLease::retain_terminal_failure(const Diagnostic& diagnostic) {
+    if (diagnostic.phase == FailurePhase::None) return;
+    if (cleanup_->diagnostic.phase == FailurePhase::None) cleanup_->diagnostic = diagnostic;
 }
 
 bool PublicRutAttemptLease::owner_evidence_matches(source::WildcardAttemptSourceLease& source_owner,
@@ -105,14 +113,11 @@ bool PublicRutAttemptLease::prepare(source::WildcardAttemptSourceLease& source_o
     source_identity_ = source_owner.source_identity();
     executable_path_ = executable_owner.canonical_path();
     executable_identity_ = executable_owner.identity();
-    if (!owner_evidence_matches(source_owner, executable_owner, diagnostic)) {
-        cleanup_->diagnostic = diagnostic;
-        return false;
-    }
-    argument_count_ = arguments.size();
+    if (!owner_evidence_matches(source_owner, executable_owner, diagnostic)) return false;
+    std::array<std::string, child::kMaxExecArgumentCount> owned_arguments{};
     expected_cmdline_.clear();
     for (std::size_t index = 0; index < arguments.size(); ++index) {
-        arguments_[index].assign(arguments[index]);
+        owned_arguments[index].assign(arguments[index]);
         expected_cmdline_.append(arguments[index]);
         expected_cmdline_.push_back('\0');
     }
@@ -152,14 +157,14 @@ bool PublicRutAttemptLease::prepare(source::WildcardAttemptSourceLease& source_o
     }
 
     std::array<std::string_view, child::kMaxExecArgumentCount> owned_views{};
-    for (std::size_t index = 0; index < argument_count_; ++index)
-        owned_views[index] = arguments_[index];
+    for (std::size_t index = 0; index < arguments.size(); ++index)
+        owned_views[index] = owned_arguments[index];
     child::ChildDescriptorPlan plan;
     if (!handoff_.make_child_plan_with_arguments(
             null_input_.value,
             capture_.descriptor(),
             false,
-            std::span<const std::string_view>(owned_views.data(), argument_count_),
+            std::span<const std::string_view>(owned_views.data(), arguments.size()),
             plan,
             handoff_diagnostic)) {
         state_ = State::Failed;
@@ -191,10 +196,7 @@ bool PublicRutAttemptLease::exec_and_observe(source::WildcardAttemptSourceLease&
                                              Diagnostic& diagnostic) {
     diagnostic = {};
     if (state_ != State::Prepared) return reject(diagnostic, FailurePhase::Argument, EALREADY);
-    if (!owner_evidence_matches(source_owner, executable_owner, diagnostic)) {
-        cleanup_->diagnostic = diagnostic;
-        return false;
-    }
+    if (!owner_evidence_matches(source_owner, executable_owner, diagnostic)) return false;
     handoff::Diagnostic handoff_diagnostic;
     const bool observed = handoff_.release_and_observe(
         executable_owner, child_, deadline, observation_, handoff_diagnostic);
@@ -233,26 +235,28 @@ bool PublicRutAttemptLease::settle_after_reap(State success_state, Diagnostic& d
     bool success = true;
     handoff::Diagnostic handoff_diagnostic;
     if (handoff_.active()) {
-        cleanup_->handoff_closed = handoff_.close(handoff_diagnostic);
-        success = cleanup_->handoff_closed && success;
-        if (!cleanup_->handoff_closed)
+        const bool closed = handoff_.close(handoff_diagnostic);
+        record_attempt(closed, cleanup_->handoff_attempted, cleanup_->handoff_closed);
+        success = closed && success;
+        if (!closed)
             diagnostic = {FailurePhase::Handoff, nonzero(handoff_diagnostic.error_number, EIO)};
     }
     if (null_input_.value >= 0) {
-        cleanup_->null_closed = null_input_.close_owned();
-        success = cleanup_->null_closed && success;
-        if (!cleanup_->null_closed && diagnostic.phase == FailurePhase::None)
+        const bool closed = null_input_.close_owned();
+        record_attempt(closed, cleanup_->null_attempted, cleanup_->null_closed);
+        success = closed && success;
+        if (!closed && diagnostic.phase == FailurePhase::None)
             diagnostic = {FailurePhase::NullInput, nonzero(errno, EIO)};
     }
     capture::Diagnostic capture_diagnostic;
     if (capture_.active() && !capture_.settled()) {
-        cleanup_->capture_settled = capture_.settle(capture_diagnostic);
-        success = cleanup_->capture_settled && success;
-        if (!cleanup_->capture_settled && diagnostic.phase == FailurePhase::None)
+        const bool settled = capture_.settle(capture_diagnostic);
+        record_attempt(settled, cleanup_->capture_settle_attempted, cleanup_->capture_settled);
+        success = settled && success;
+        if (!settled && diagnostic.phase == FailurePhase::None)
             diagnostic = {FailurePhase::Capture, nonzero(capture_diagnostic.error_number, EIO)};
     }
     if (capture_.settled()) {
-        cleanup_->capture_settled = true;
         capture::Diagnostic snapshot_diagnostic;
         const bool snapshotted = capture_.snapshot(sealed_capture_bytes_, snapshot_diagnostic);
         success = snapshotted && success;
@@ -260,7 +264,7 @@ bool PublicRutAttemptLease::settle_after_reap(State success_state, Diagnostic& d
             diagnostic = {FailurePhase::Snapshot, nonzero(snapshot_diagnostic.error_number, EIO)};
     }
     state_ = success ? success_state : State::Failed;
-    cleanup_->diagnostic = success ? Diagnostic{} : diagnostic;
+    if (!success) retain_terminal_failure(diagnostic);
     return success;
 }
 
@@ -285,8 +289,9 @@ bool PublicRutAttemptLease::settle_natural(int expected_exit,
     }
     state_ = State::NaturalTerminalObserved;
     child::Diagnostic child_diagnostic;
-    cleanup_->child_settled = child_.cleanup(deadline, child_diagnostic);
-    const bool exact = cleanup_->child_settled && settlement_ && settlement_->terminal &&
+    const bool child_settled = child_.cleanup(deadline, child_diagnostic);
+    record_attempt(child_settled, cleanup_->child_attempted, cleanup_->child_settled);
+    const bool exact = child_settled && settlement_ && settlement_->terminal &&
                        settlement_->reaped && settlement_->error_number == 0 &&
                        WIFEXITED(settlement_->wait_status) &&
                        WEXITSTATUS(settlement_->wait_status) == expected_exit;
@@ -298,7 +303,7 @@ bool PublicRutAttemptLease::settle_natural(int expected_exit,
         state_ = State::Failed;
         if (diagnostic.phase == FailurePhase::None)
             diagnostic = {FailurePhase::Settlement, nonzero(child_diagnostic.error_number, EPROTO)};
-        cleanup_->diagnostic = diagnostic;
+        retain_terminal_failure(diagnostic);
         return false;
     }
     return true;
@@ -308,7 +313,7 @@ bool PublicRutAttemptLease::settle_killed(int expected_signal,
                                           Clock::time_point deadline,
                                           Diagnostic& diagnostic) {
     diagnostic = {};
-    if (state_ != State::ExecObservedLive || expected_signal <= 0 || expected_signal >= NSIG)
+    if (state_ != State::ExecObservedLive || expected_signal != SIGKILL)
         return reject(diagnostic, FailurePhase::Argument, EINVAL);
     fixture_worker_protocol::ProcIdentity current;
     pollfd descriptor{child_.observation_pidfd(), POLLIN | POLLERR | POLLHUP, 0};
@@ -322,8 +327,9 @@ bool PublicRutAttemptLease::settle_killed(int expected_signal,
         return reject(diagnostic, FailurePhase::Child, ESTALE);
 
     child::Diagnostic child_diagnostic;
-    cleanup_->child_settled = child_.cleanup(deadline, child_diagnostic);
-    const bool exact = cleanup_->child_settled && settlement_ && settlement_->terminal &&
+    const bool child_settled = child_.cleanup(deadline, child_diagnostic);
+    record_attempt(child_settled, cleanup_->child_attempted, cleanup_->child_settled);
+    const bool exact = child_settled && settlement_ && settlement_->terminal &&
                        settlement_->reaped && settlement_->error_number == 0 &&
                        WIFSIGNALED(settlement_->wait_status) &&
                        WTERMSIG(settlement_->wait_status) == expected_signal;
@@ -334,7 +340,7 @@ bool PublicRutAttemptLease::settle_killed(int expected_signal,
         state_ = State::Failed;
         if (diagnostic.phase == FailurePhase::None)
             diagnostic = {FailurePhase::Settlement, nonzero(child_diagnostic.error_number, EPROTO)};
-        cleanup_->diagnostic = diagnostic;
+        retain_terminal_failure(diagnostic);
         return false;
     }
     return true;
@@ -345,13 +351,13 @@ bool PublicRutAttemptLease::close_evidence(Diagnostic& diagnostic) {
     if (state_ != State::NaturalReapedEvidenceOpen && state_ != State::KilledReapedEvidenceOpen)
         return reject(diagnostic, FailurePhase::Argument, EALREADY);
     capture::Diagnostic capture_diagnostic;
-    cleanup_->capture_closed = capture_.close(capture_diagnostic);
-    if (!cleanup_->capture_closed) {
+    const bool closed = capture_.close(capture_diagnostic);
+    record_attempt(closed, cleanup_->capture_close_attempted, cleanup_->capture_closed);
+    if (!closed) {
         state_ = State::Failed;
         return reject(diagnostic, FailurePhase::Close, capture_diagnostic.error_number);
     }
     state_ = State::EvidenceClosed;
-    cleanup_->diagnostic = {};
     return true;
 }
 
@@ -361,37 +367,42 @@ void PublicRutAttemptLease::destructor_cleanup() {
     const auto until = Clock::now() + std::chrono::seconds(7);
     if (child_.active()) {
         child::Diagnostic child_diagnostic;
-        cleanup_->child_settled = child_.cleanup(until, child_diagnostic);
-        if (!cleanup_->child_settled)
+        const bool settled = child_.cleanup(until, child_diagnostic);
+        record_attempt(settled, cleanup_->child_attempted, cleanup_->child_settled);
+        if (!settled)
             diagnostic = {FailurePhase::Child, nonzero(child_diagnostic.error_number, EIO)};
     }
     const bool safe = !settlement_ || (settlement_->terminal && settlement_->reaped);
     if (safe) {
         if (handoff_.active()) {
             handoff::Diagnostic handoff_diagnostic;
-            cleanup_->handoff_closed = handoff_.close(handoff_diagnostic);
-            if (!cleanup_->handoff_closed && diagnostic.phase == FailurePhase::None)
+            const bool closed = handoff_.close(handoff_diagnostic);
+            record_attempt(closed, cleanup_->handoff_attempted, cleanup_->handoff_closed);
+            if (!closed && diagnostic.phase == FailurePhase::None)
                 diagnostic = {FailurePhase::Handoff, nonzero(handoff_diagnostic.error_number, EIO)};
         }
         if (null_input_.value >= 0) {
-            cleanup_->null_closed = null_input_.close_owned();
-            if (!cleanup_->null_closed && diagnostic.phase == FailurePhase::None)
+            const bool closed = null_input_.close_owned();
+            record_attempt(closed, cleanup_->null_attempted, cleanup_->null_closed);
+            if (!closed && diagnostic.phase == FailurePhase::None)
                 diagnostic = {FailurePhase::NullInput, nonzero(errno, EIO)};
         }
         capture::Diagnostic capture_diagnostic;
         if (capture_.active() && !capture_.settled()) {
-            cleanup_->capture_settled = capture_.settle(capture_diagnostic);
-            if (!cleanup_->capture_settled && diagnostic.phase == FailurePhase::None)
+            const bool settled = capture_.settle(capture_diagnostic);
+            record_attempt(settled, cleanup_->capture_settle_attempted, cleanup_->capture_settled);
+            if (!settled && diagnostic.phase == FailurePhase::None)
                 diagnostic = {FailurePhase::Capture, nonzero(capture_diagnostic.error_number, EIO)};
         }
         if (capture_.active()) {
-            cleanup_->capture_closed = capture_.close(capture_diagnostic);
-            if (!cleanup_->capture_closed && diagnostic.phase == FailurePhase::None)
+            const bool closed = capture_.close(capture_diagnostic);
+            record_attempt(closed, cleanup_->capture_close_attempted, cleanup_->capture_closed);
+            if (!closed && diagnostic.phase == FailurePhase::None)
                 diagnostic = {FailurePhase::Close, nonzero(capture_diagnostic.error_number, EIO)};
         }
     }
     cleanup_->destructor_reportable_success = false;
-    cleanup_->diagnostic = diagnostic;
+    retain_terminal_failure(diagnostic);
 }
 
 }  // namespace rut::test::fixture_public_rut_session_attempt

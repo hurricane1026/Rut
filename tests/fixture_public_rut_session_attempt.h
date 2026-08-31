@@ -12,15 +12,12 @@
 #include <span>
 #include <string>
 #include <string_view>
-
 namespace rut::test::fixture_public_rut_session_attempt {
-
 namespace capture = fixture_anonymous_log_capture;
 namespace child = fixture_wildcard_paused_child_lease;
 namespace executable = fixture_executable_lease;
 namespace handoff = fixture_executable_exec_handoff;
 namespace source = fixture_wildcard_source_lease;
-
 enum class State : std::uint8_t {
     Empty,
     Prepared,
@@ -33,7 +30,6 @@ enum class State : std::uint8_t {
     EvidenceClosed,
     Failed,
 };
-
 enum class FailurePhase : std::uint8_t {
     None,
     Argument,
@@ -76,8 +72,11 @@ struct HooksForTesting {
 
 struct CleanupState {
     bool destructor_attempted = false, destructor_reportable_success = false;
-    bool child_settled = false, handoff_closed = false, null_closed = false;
-    bool capture_settled = false, capture_closed = false;
+    bool child_attempted = false, child_settled = false;
+    bool handoff_attempted = false, handoff_closed = false;
+    bool null_attempted = false, null_closed = false;
+    bool capture_settle_attempted = false, capture_settled = false;
+    bool capture_close_attempted = false, capture_closed = false;
     Diagnostic diagnostic;
 };
 // Owners are borrowed synchronously; destruction runs child, handoff, null, then capture.
@@ -134,6 +133,8 @@ private:
                                 Diagnostic& diagnostic) const;
     bool settle_after_reap(State success_state, Diagnostic& diagnostic);
     bool reject(Diagnostic& diagnostic, FailurePhase phase, int error_number);
+    void record_attempt(bool result, bool& attempted, bool& succeeded);
+    void retain_terminal_failure(const Diagnostic& diagnostic);
     void destructor_cleanup();
 
     capture::AnonymousLogCapture capture_;
@@ -145,8 +146,6 @@ private:
     source::SourceIdentity source_identity_;
     std::string executable_path_;
     executable::ExecutableIdentity executable_identity_;
-    std::array<std::string, child::kMaxExecArgumentCount> arguments_{};
-    std::size_t argument_count_ = 0u;
     std::string expected_cmdline_;
     std::string sealed_capture_bytes_;
     handoff::ExecObservation observation_;
