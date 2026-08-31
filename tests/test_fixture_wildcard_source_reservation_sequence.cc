@@ -24,6 +24,43 @@ namespace {
 using Snapshot = std::map<int, std::string>;
 constexpr char kBasename[] = "attempt.rut";
 
+class StderrSilence {
+public:
+    bool start() {
+        if (saved_ >= 0) return false;
+        std::fflush(stderr);
+        original_flags_ = fcntl(STDERR_FILENO, F_GETFD);
+        saved_ = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        const int sink = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        const bool redirected = original_flags_ >= 0 && saved_ >= 0 && sink >= 0 &&
+                                dup2(sink, STDERR_FILENO) == STDERR_FILENO;
+        const int redirect_error = errno;
+        if (sink >= 0) (void)close(sink);
+        if (!redirected) {
+            if (saved_ >= 0) (void)close(saved_);
+            saved_ = -1;
+            errno = redirect_error;
+        }
+        return redirected;
+    }
+    bool finish() {
+        if (saved_ < 0) return false;
+        std::fflush(stderr);
+        const int retained = saved_;
+        saved_ = -1;
+        const bool restored = dup2(retained, STDERR_FILENO) == STDERR_FILENO &&
+                              fcntl(STDERR_FILENO, F_SETFD, original_flags_) == 0;
+        return close(retained) == 0 && restored;
+    }
+    ~StderrSilence() {
+        if (saved_ >= 0) (void)finish();
+    }
+
+private:
+    int saved_ = -1;
+    int original_flags_ = 0;
+};
+
 bool check(bool condition, const char* message) {
     if (!condition) std::fprintf(stderr, "FAIL: %s (errno=%d)\n", message, errno);
     return condition;
@@ -412,6 +449,83 @@ bool mutation_failures() {
     return check(ok, "pre-write identity and postverify mutations are terminal");
 }
 
+enum class ReplacementRole { Writer, Reader };
+struct SameInodeReplacement {
+    ReplacementRole role = ReplacementRole::Writer;
+    int foreign = -1;
+    int target = -1;
+    bool replaced = false;
+};
+
+void replace_with_same_inode_ofd(int, const char*, int writer, int reader, void* opaque) {
+    auto& context = *static_cast<SameInodeReplacement*>(opaque);
+    context.target = context.role == ReplacementRole::Writer ? writer : reader;
+    context.replaced =
+        context.foreign >= 0 && dup3(context.foreign, context.target, O_CLOEXEC) == context.target;
+}
+
+bool same_inode_replacement_destructor_case(ReplacementRole role) {
+    Snapshot before;
+    Snapshot after;
+    source::SourceIdentity identity;
+    std::shared_ptr<const source::CleanupState> cleanup;
+    SameInodeReplacement replacement{role};
+    StderrSilence silence;
+    directory::PrivateDirectoryLease directory_lease;
+    directory::Diagnostic directory_diagnostic;
+    bool ok = snapshot(before) && silence.start() &&
+              make_directory(directory_lease, directory_diagnostic);
+    {
+        source::WildcardAttemptSourceLease source_lease;
+        source::Diagnostic diagnostic;
+        source::StagedSourceHooksForTesting hooks;
+        hooks.before_finalize_identity = replace_with_same_inode_ofd;
+        hooks.context = &replacement;
+        ok = ok && source::WildcardAttemptSourceLease::stage_with_hooks_for_testing(
+                       directory_lease.descriptor(),
+                       directory_lease.path(),
+                       kBasename,
+                       hooks,
+                       source_lease,
+                       diagnostic);
+        identity = source_lease.source_identity();
+        const int flags = role == ReplacementRole::Writer ? O_RDONLY | O_NONBLOCK : O_WRONLY;
+        replacement.foreign =
+            openat(directory_lease.descriptor(), kBasename, flags | O_CLOEXEC | O_NOFOLLOW);
+        ok = ok && replacement.foreign >= 0 &&
+             !source_lease.finalize_exact_bytes("listen :3\n", diagnostic) &&
+             replacement.replaced && source_lease.state() == source::State::FinalizeFailed &&
+             source_failed(diagnostic, source::FailurePhase::Lease, ESTALE);
+        cleanup = source_lease.cleanup_state();
+    }
+    struct stat foreign_status{};
+    struct stat target_status{};
+    struct stat path_status{};
+    ok = ok && cleanup && cleanup->attempted && !cleanup->succeeded &&
+         source_failed(cleanup->diagnostic, source::FailurePhase::Quarantine, ESTALE) &&
+         replacement.target >= 0 && replacement.foreign >= 0 &&
+         fstat(replacement.foreign, &foreign_status) == 0 &&
+         fstat(replacement.target, &target_status) == 0 &&
+         fstatat(directory_lease.descriptor(), kBasename, &path_status, AT_SYMLINK_NOFOLLOW) == 0 &&
+         static_cast<std::uint64_t>(foreign_status.st_dev) == identity.device &&
+         static_cast<std::uint64_t>(foreign_status.st_ino) == identity.inode &&
+         target_status.st_dev == foreign_status.st_dev &&
+         target_status.st_ino == foreign_status.st_ino &&
+         path_status.st_dev == foreign_status.st_dev &&
+         path_status.st_ino == foreign_status.st_ino && close(replacement.target) == 0 &&
+         close(replacement.foreign) == 0 &&
+         unlinkat(directory_lease.descriptor(), kBasename, 0) == 0 &&
+         fsync(directory_lease.descriptor()) == 0 && directory_lease.settle(directory_diagnostic) &&
+         silence.finish() && snapshot(after) && before == after;
+    return ok;
+}
+
+bool same_inode_replacement_destructors() {
+    return check(same_inode_replacement_destructor_case(ReplacementRole::Writer) &&
+                     same_inode_replacement_destructor_case(ReplacementRole::Reader),
+                 "same-inode wrong-role OFDs survive destructor ownership refusal");
+}
+
 struct WriterCapture {
     int descriptor = -1;
 };
@@ -585,7 +699,8 @@ int main() {
     if (addresses.empty()) return 77;
     const bool ok = canonical_sequence(addresses.front()) && argument_retry() &&
                     post_create_boundary_cleanup() && operation_failures() && mutation_failures() &&
-                    active_mutation_and_destructors() && cleanup_and_legacy();
+                    same_inode_replacement_destructors() && active_mutation_and_destructors() &&
+                    cleanup_and_legacy();
     if (ok) std::puts("PASS: staged wildcard source/reservation sequence");
     return ok ? 0 : 1;
 }

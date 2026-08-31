@@ -812,9 +812,11 @@ bool WildcardAttemptSourceLease::quarantine_and_remove(BoundaryHookForTesting ho
     struct stat entry{};
     const bool reader_owned = source_fd_ < 0 ? writer_fd_ >= 0
                                              : (fstat(source_fd_, &reader) == 0 &&
-                                                same_source_object(reader, expected, true));
+                                                same_source_object(reader, expected, true) &&
+                                                descriptor_flags(source_fd_, O_RDONLY, true));
     const bool writer_owned = writer_fd_ < 0 || (fstat(writer_fd_, &writer) == 0 &&
-                                                 same_source_object(writer, expected, true));
+                                                 same_source_object(writer, expected, true) &&
+                                                 descriptor_flags(writer_fd_, O_WRONLY, false));
     const bool entry_owned =
         fstatat(directory_fd_, owned_basename_.c_str(), &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
         same_source_object(entry, expected, true);
@@ -993,20 +995,23 @@ void WildcardAttemptSourceLease::close_descriptors(Diagnostic& diagnostic) {
     diagnostic = {};
     const auto close_operation =
         staged_hooks_.close_operation == nullptr ? real_close : staged_hooks_.close_operation;
-    auto close_owned_source = [&](int& fd) {
+    auto close_owned_source = [&](int& fd, int access_mode, bool nonblocking) {
         if (fd < 0) return true;
         struct stat status{};
         if (!source_identity_known_ || fstat(fd, &status) != 0 ||
-            !same_owned_source_descriptor(status, source_identity_))
+            !same_owned_source_descriptor(status, source_identity_) ||
+            !descriptor_flags(fd, access_mode, nonblocking))
             return false;
         const int detached = fd;
         fd = -1;
         errno = 0;
         return close_operation(detached, staged_hooks_.context) == 0;
     };
-    const bool writer_closed = close_owned_source(writer_fd_);
+    const bool writer_closed = close_owned_source(writer_fd_, O_WRONLY, false);
     const int writer_error = errno == 0 ? EIO : errno;
-    const bool source_closed = close_owned_source(source_fd_);
+    const int source_access = source_fd_is_created_ ? O_WRONLY : O_RDONLY;
+    const bool source_nonblocking = !source_fd_is_created_;
+    const bool source_closed = close_owned_source(source_fd_, source_access, source_nonblocking);
     const int source_error = errno == 0 ? EIO : errno;
     source_fd_is_created_ = false;
     bool directory_closed = true;
