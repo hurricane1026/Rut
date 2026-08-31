@@ -114,6 +114,32 @@ constexpr bool contains(Str a, char needle) {
     return false;
 }
 
+bool parse_canonical_ipv4_endpoint(Str endpoint, u32* ipv4_host, Str* port) {
+    if (endpoint.ptr == nullptr || ipv4_host == nullptr || port == nullptr) return false;
+    u32 pos = 0u;
+    u32 address = 0u;
+    for (u32 octet = 0u; octet < 4u; octet++) {
+        const u32 start = pos;
+        u32 value = 0u;
+        while (pos < endpoint.len && endpoint.ptr[pos] >= '0' && endpoint.ptr[pos] <= '9') {
+            if (pos - start == 3u) return false;
+            value = value * 10u + static_cast<u32>(endpoint.ptr[pos] - '0');
+            if (value > 255u) return false;
+            pos++;
+        }
+        const u32 digits = pos - start;
+        if (digits == 0u || (digits > 1u && endpoint.ptr[start] == '0')) return false;
+        const char delimiter = octet == 3u ? ':' : '.';
+        if (pos >= endpoint.len || endpoint.ptr[pos] != delimiter) return false;
+        address = (address << 8u) | value;
+        pos++;
+    }
+    if (pos == endpoint.len) return false;
+    *ipv4_host = address;
+    *port = endpoint.slice(pos, endpoint.len);
+    return true;
+}
+
 static_assert(kMaxProxyPassUriLen == kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxProxyLocationPathLen <= kMaxForwardTargetTransformPrefixLen);
 static_assert(kMaxExactLocalReturnPathLen == kMaxExactStrictLocalResponsePathLen);
@@ -544,6 +570,15 @@ private:
             address = ListenerAddress::IPv4Exact;
             ipv4_host = 0x7f000001u;
             port_text = port_text.slice(sizeof(kExactLoopbackPrefix) - 1u, port_text.len);
+        } else {
+            u32 parsed_ipv4 = 0u;
+            Str parsed_port{};
+            if (parse_canonical_ipv4_endpoint(port_text, &parsed_ipv4, &parsed_port) &&
+                parsed_ipv4 != 0u) {
+                address = ListenerAddress::IPv4Exact;
+                ipv4_host = parsed_ipv4;
+                port_text = parsed_port;
+            }
         }
         u16 value = 0;
         if (!parse_port(port_text, &value))

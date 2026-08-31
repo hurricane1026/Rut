@@ -375,6 +375,47 @@ bool listener_endpoint_matches(uintptr_t source_base,
     return parsed_port != 0u && parsed_port == expected_port;
 }
 
+// Call only after the listener's complete source range and common-source
+// provenance have been established. Exact numeric addresses use their canonical
+// decimal spelling so the semantic address cannot drift from source provenance.
+bool exact_ipv4_listener_endpoint_matches(uintptr_t source_base,
+                                          const Span& value_span,
+                                          u32 expected_ipv4_host,
+                                          u16 expected_port) {
+    u32 pos = value_span.start;
+    u32 address = 0u;
+    for (u32 octet = 0u; octet < 4u; octet++) {
+        const u32 start = pos;
+        u32 value = 0u;
+        while (pos < value_span.end) {
+            const char byte = *trusted_source_at(source_base, pos);
+            if (byte < '0' || byte > '9') break;
+            if (pos - start == 3u) return false;
+            value = value * 10u + static_cast<u32>(byte - '0');
+            if (value > 255u) return false;
+            pos++;
+        }
+        const u32 digits = pos - start;
+        if (digits == 0u || (digits > 1u && *trusted_source_at(source_base, start) == '0'))
+            return false;
+        const char delimiter = octet == 3u ? ':' : '.';
+        if (pos >= value_span.end || *trusted_source_at(source_base, pos) != delimiter)
+            return false;
+        address = (address << 8u) | value;
+        pos++;
+    }
+    if (address != expected_ipv4_host || pos == value_span.end) return false;
+    u32 parsed_port = 0u;
+    for (; pos < value_span.end; pos++) {
+        const char byte = *trusted_source_at(source_base, pos);
+        if (byte < '0' || byte > '9') return false;
+        const u32 digit = static_cast<u32>(byte - '0');
+        if (parsed_port > (65535u - digit) / 10u) return false;
+        parsed_port = parsed_port * 10u + digit;
+    }
+    return parsed_port != 0u && parsed_port == expected_port;
+}
+
 // Call only after validate_proxy_location has established the complete common-source
 // provenance and source positions for both borrows.
 bool is_exact_api_root_empty_query_composition(const Location& location) {
@@ -411,8 +452,7 @@ FrontendResult<bool> validate_listener(const Server& server,
     const Listen& listener = server.listen;
     if (listener.port == 0)
         return invalid_integer(listener.span, lit_str("invalid model listen port"));
-    if (!listener_address_valid(listener.address, listener.ipv4_host) ||
-        (listener.address == ListenerAddress::IPv4Exact && listener.ipv4_host != 0x7f000001u))
+    if (!listener_address_valid(listener.address, listener.ipv4_host))
         return unsupported(listener.span, lit_str("invalid model listen address"));
     if (!span_position_is_coherent(server.span, listener.span))
         return unsupported(is_valid_span(listener.span) ? listener.span : server.span,
@@ -478,11 +518,15 @@ FrontendResult<bool> validate_listener(const Server& server,
         return false;
     }
 
-    if (!listener_endpoint_matches(source_base,
-                                   listener.value_span,
-                                   kExactLoopbackPrefix,
-                                   sizeof(kExactLoopbackPrefix) - 1u,
-                                   listener.port))
+    const bool exact_loopback = listener.ipv4_host == 0x7f000001u;
+    if (!(exact_loopback
+              ? listener_endpoint_matches(source_base,
+                                          listener.value_span,
+                                          kExactLoopbackPrefix,
+                                          sizeof(kExactLoopbackPrefix) - 1u,
+                                          listener.port)
+              : exact_ipv4_listener_endpoint_matches(
+                    source_base, listener.value_span, listener.ipv4_host, listener.port)))
         return unsupported(listener.value_span, lit_str("invalid exact listen endpoint model"));
     const ProxyPass& proxy = server.location.proxy_pass;
     const bool has_no_exact_action = !server.exact_local_return.present &&
@@ -502,6 +546,17 @@ FrontendResult<bool> validate_listener(const Server& server,
         proxy_profile == ProxyLocationProfile::RootWithoutUri &&
         (!has_exact_absolute_redirect || server.exact_absolute_redirect.response.status == 301u ||
          server.exact_absolute_redirect.response.status == 302u);
+    if (!exact_loopback) {
+        const bool minimal_numeric_profile =
+            proxy_profile == ProxyLocationProfile::RootWithoutUri && has_no_exact_action &&
+            !server.location.proxy_read_timeout.present &&
+            !proxy_hide_header_has_inventory(server.location.proxy_hide_header);
+        if (!minimal_numeric_profile)
+            return unsupported(
+                listener.span,
+                lit_str("numeric exact listen requires the minimal root proxy profile"));
+        return true;
+    }
     if (!exact_prefix_replacement && !exact_prefix_without_uri && !exact_root_profile)
         return unsupported(listener.span,
                            lit_str("exact listen requires the minimal root proxy profile"));
@@ -1392,6 +1447,16 @@ public:
         return true;
     }
 
+    bool put_ipv4_host(u32 address) {
+        const u8 octets[4] = {
+            static_cast<u8>(address >> 24u),
+            static_cast<u8>(address >> 16u),
+            static_cast<u8>(address >> 8u),
+            static_cast<u8>(address),
+        };
+        return put_ipv4(octets);
+    }
+
 private:
     bool put_u8(u8 value) {
         char digits[3];
@@ -1925,8 +1990,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return out_of_memory(server.span, lit_str("generated RUT source is too large"));
     };
 
-    if (!(exact_listener ? put("listen 127.0.0.1:") : put("listen :")) ||
-        !writer.put_u16(server.listen.port) || !put("\n") ||
+    if (!(exact_listener ? put("listen ") : put("listen :")) ||
+        (exact_listener && !writer.put_ipv4_host(server.listen.ipv4_host)) ||
+        (exact_listener && !put(":")) || !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
         !writer.put_u16(proxy.port) || !put("\"\n"))
