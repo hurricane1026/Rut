@@ -39,6 +39,27 @@ set_tests_properties(test_fixture_collision_release_protocol PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30)
 
+# Pure #377 type-59 Canonical collision/release scalar evidence codec and
+# nine-event receiver.  It reuses only the common v1 frame/token transport;
+# no broker, process, socket, or runtime target is linked.
+add_library(fixture_collision_release_evidence_protocol STATIC
+    fixture_collision_release_evidence_protocol.cc)
+target_include_directories(fixture_collision_release_evidence_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_collision_release_evidence_protocol PUBLIC
+    fixture_worker_protocol)
+
+add_executable(test_fixture_collision_release_evidence_protocol
+    test_fixture_collision_release_evidence_protocol.cc)
+target_link_libraries(test_fixture_collision_release_evidence_protocol PRIVATE
+    fixture_collision_release_evidence_protocol)
+add_test(NAME test_fixture_collision_release_evidence_protocol
+    COMMAND test_fixture_collision_release_evidence_protocol)
+set_tests_properties(test_fixture_collision_release_evidence_protocol PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # Linux-only, tests-only exact raw TCP reservation custody for #377. This owns
 # one bound non-listening socket and performs no broker, runtime or RUT work.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -75,6 +96,7 @@ set_tests_properties(test_fixture_private_directory_lease PROPERTIES
 add_library(fixture_wildcard_paused_child_lease STATIC
     fixture_wildcard_paused_child_lease.cc
 )
+
 target_link_libraries(fixture_wildcard_paused_child_lease PRIVATE fixture_worker_protocol)
 target_include_directories(fixture_wildcard_paused_child_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
