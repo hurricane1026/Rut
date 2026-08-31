@@ -39,6 +39,42 @@ constexpr const char* kStageLabel = "rut.stage=358-stage2a2";
 constexpr const char* kSidecarStage = "358-held-namespace-sidecar";
 constexpr const char* kSidecarRole = "held-namespace-sidecar";
 
+static const char* sidecar_revalidation_fault_name(HeldNamespaceSidecarRevalidationFault fault) {
+    switch (fault) {
+        case HeldNamespaceSidecarRevalidationFault::None:
+            return "none";
+        case HeldNamespaceSidecarRevalidationFault::Token:
+            return "token";
+        case HeldNamespaceSidecarRevalidationFault::Role:
+            return "role";
+        case HeldNamespaceSidecarRevalidationFault::Id:
+            return "id";
+        case HeldNamespaceSidecarRevalidationFault::ImageReference:
+            return "image-reference";
+        case HeldNamespaceSidecarRevalidationFault::ImageId:
+            return "image-id";
+        case HeldNamespaceSidecarRevalidationFault::NetworkMode:
+            return "network-mode";
+        case HeldNamespaceSidecarRevalidationFault::Pid:
+            return "pid";
+        case HeldNamespaceSidecarRevalidationFault::StartIdentity:
+            return "start-identity";
+        case HeldNamespaceSidecarRevalidationFault::NetworkNamespace:
+            return "network-namespace";
+        case HeldNamespaceSidecarRevalidationFault::Arguments:
+            return "arguments";
+        case HeldNamespaceSidecarRevalidationFault::ReadOnlyRoot:
+            return "read-only-root";
+        case HeldNamespaceSidecarRevalidationFault::CapabilityDrop:
+            return "capability-drop";
+        case HeldNamespaceSidecarRevalidationFault::NoNewPrivileges:
+            return "no-new-privileges";
+        case HeldNamespaceSidecarRevalidationFault::PublishedPorts:
+            return "published-ports";
+    }
+    return "invalid";
+}
+
 struct CommandResult {
     bool started = false;
     bool timed_out = false;
@@ -467,19 +503,130 @@ static bool sha256_identity(const std::string& identity) {
            lowercase_hex(identity.substr(7), 64);
 }
 
+static bool exact_json_shape(const std::string& text) {
+    if (text == "null") return true;
+    if (text.size() < 2) return false;
+    const char opening = text.front();
+    const char closing = text.back();
+    if (!((opening == '[' && closing == ']') || (opening == '{' && closing == '}'))) return false;
+    bool quoted = false;
+    bool escaped = false;
+    int square_depth = 0;
+    int brace_depth = 0;
+    for (char character : text) {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quoted && character == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (character == '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (quoted) continue;
+        if (character == '[')
+            ++square_depth;
+        else if (character == ']' && --square_depth < 0)
+            return false;
+        else if (character == '{')
+            ++brace_depth;
+        else if (character == '}' && --brace_depth < 0)
+            return false;
+    }
+    return !quoted && !escaped && square_depth == 0 && brace_depth == 0;
+}
+
+static bool parse_exact_bool(const std::string& text, bool& value) {
+    if (text == "true") {
+        value = true;
+        return true;
+    }
+    if (text == "false") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_sidecar_inspect_record(const std::string& record,
+                                         HeldNamespaceSidecarSnapshot& snapshot,
+                                         std::string& error) {
+    std::vector<std::string> fields;
+    if (!split_exact(trim(record), '|', 17, fields)) {
+        error = "sidecar inspection record was malformed: expected exactly 17 fields";
+        return false;
+    }
+    char* end = nullptr;
+    const long parsed_pid = strtol(fields[9].c_str(), &end, 10);
+    if (end == fields[9].c_str() || *end != '\0' || parsed_pid < 0) {
+        error = "sidecar inspection PID was malformed";
+        return false;
+    }
+    bool running = false;
+    bool read_only = false;
+    if (!parse_exact_bool(fields[8], running) || !parse_exact_bool(fields[12], read_only)) {
+        error = "sidecar inspection boolean was malformed";
+        return false;
+    }
+    for (size_t index : {size_t{11}, size_t{13}, size_t{14}, size_t{15}, size_t{16}}) {
+        if (!exact_json_shape(fields[index])) {
+            error = "sidecar inspection JSON was malformed at field " + std::to_string(index);
+            return false;
+        }
+    }
+    snapshot = {};
+    snapshot.id = fields[0];
+    snapshot.name = fields[1].size() > 1 && fields[1][0] == '/' ? fields[1].substr(1) : fields[1];
+    snapshot.pinned_image_reference = fields[2];
+    snapshot.image_id = fields[3];
+    snapshot.stage = fields[4];
+    snapshot.token = fields[5];
+    snapshot.role = fields[6];
+    snapshot.network_mode = fields[7];
+    snapshot.running = running;
+    snapshot.pid = static_cast<pid_t>(parsed_pid);
+    snapshot.path = fields[10];
+    snapshot.arguments_json = fields[11];
+    snapshot.read_only_root = read_only;
+    snapshot.no_published_ports = no_published_ports(fields[13], fields[14]);
+    snapshot.capability_drop_all = fields[15] == "[\"ALL\"]";
+    snapshot.no_new_privileges = fields[16] == "[\"no-new-privileges\"]";
+    return true;
+}
+
 static bool sidecar_snapshot_equal(const HeldNamespaceSidecarSnapshot& left,
                                    const HeldNamespaceSidecarSnapshot& right) {
     return left.token == right.token && left.stage == right.stage && left.role == right.role &&
            left.name == right.name && left.id == right.id &&
            left.pinned_image_reference == right.pinned_image_reference &&
-           left.image_id == right.image_id && left.network_mode == right.network_mode &&
-           left.path == right.path && left.arguments_json == right.arguments_json &&
-           left.pid == right.pid && left.start == right.start && left.netns == right.netns &&
+           left.expected_image_id == right.expected_image_id && left.image_id == right.image_id &&
+           left.network_mode == right.network_mode && left.path == right.path &&
+           left.arguments_json == right.arguments_json && left.pid == right.pid &&
+           left.start == right.start && left.netns == right.netns &&
            left.host_netns == right.host_netns && left.running == right.running &&
            left.read_only_root == right.read_only_root &&
            left.capability_drop_all == right.capability_drop_all &&
            left.no_new_privileges == right.no_new_privileges &&
            left.no_published_ports == right.no_published_ports;
+}
+
+static bool sidecar_stopped_identity_equal(const HeldNamespaceSidecarSnapshot& stopped,
+                                           const HeldNamespaceSidecarSnapshot& recorded) {
+    return stopped.token == recorded.token && stopped.stage == recorded.stage &&
+           stopped.role == recorded.role && stopped.name == recorded.name &&
+           stopped.id == recorded.id &&
+           stopped.pinned_image_reference == recorded.pinned_image_reference &&
+           stopped.expected_image_id == recorded.expected_image_id &&
+           stopped.image_id == recorded.image_id && stopped.network_mode == recorded.network_mode &&
+           stopped.path == recorded.path && stopped.arguments_json == recorded.arguments_json &&
+           !stopped.running && stopped.pid == 0 &&
+           stopped.read_only_root == recorded.read_only_root &&
+           stopped.capability_drop_all == recorded.capability_drop_all &&
+           stopped.no_new_privileges == recorded.no_new_privileges &&
+           stopped.no_published_ports == recorded.no_published_ports;
 }
 
 static std::string proc_hex(u32 value) {
@@ -916,6 +1063,14 @@ public:
     u64 holder_start() const { return holder_start_; }
     const std::string& holder_id() const { return holder_id_; }
     const HeldNamespaceSidecarSnapshot& sidecar_snapshot() const { return sidecar_snapshot_; }
+    void set_expected_sidecar_image_id(std::string image_id) {
+        expected_sidecar_image_id_ = std::move(image_id);
+    }
+    void set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault fault) {
+        sidecar_revalidation_fault_ = fault;
+    }
+    bool sidecar_exists() const { return sidecar_exists_; }
+    bool cleanup_reported_timeout_observed() const { return cleanup_reported_timeout_observed_; }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -1309,7 +1464,23 @@ public:
             error = "unexpected sidecar death injection failed: " + trim(result.output);
             return false;
         }
-        error = "injected unexpected held-namespace sidecar death";
+        HeldNamespaceSidecarSnapshot stopped;
+        std::string inspect_error;
+        if (!inspect_sidecar(sidecar_id_, stopped, inspect_error) ||
+            !sidecar_stopped_identity_equal(stopped, sidecar_snapshot_)) {
+            error = "unexpected sidecar death did not yield the exact stopped immutable identity";
+            if (!inspect_error.empty()) error += ": " + inspect_error;
+            return false;
+        }
+        ProcIdentity possibly_live{};
+        if (proc_identity(sidecar_snapshot_.pid, possibly_live, false) &&
+            possibly_live.start == sidecar_snapshot_.start) {
+            error = "unexpected sidecar death left the recorded /proc identity live";
+            return false;
+        }
+        unexpected_sidecar_death_verified_ = true;
+        error =
+            "verified unexpected sidecar death: exact stopped identity and no live /proc witness";
         return true;
     }
 
@@ -1425,35 +1596,63 @@ private:
             error = "sidecar inspection failed: " + trim(result.output);
             return false;
         }
-        std::vector<std::string> fields;
-        if (!split_exact(trim(result.output), '|', 17, fields)) {
-            error = "sidecar inspection record was malformed";
-            return false;
+        std::string record = trim(result.output);
+        if (sidecar_revalidation_fault_ != HeldNamespaceSidecarRevalidationFault::None) {
+            std::vector<std::string> fields;
+            if (!split_exact(record, '|', 17, fields)) {
+                error = "sidecar revalidation fault could not split the trusted inspect record";
+                return false;
+            }
+            switch (sidecar_revalidation_fault_) {
+                case HeldNamespaceSidecarRevalidationFault::Token:
+                    fields[5] = "wrong";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::Role:
+                    fields[6] = "wrong";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::Id:
+                    fields[0] = std::string(64, 'd');
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::ImageReference:
+                    fields[2] = "nginx:latest";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::ImageId:
+                    fields[3] = "sha256:" + std::string(64, 'd');
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::NetworkMode:
+                    fields[7] = "bridge";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::Pid:
+                    fields[9] = std::to_string(holder_pid_);
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::Arguments:
+                    fields[11] = "[\"wrong\"]";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::ReadOnlyRoot:
+                    fields[12] = "false";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::CapabilityDrop:
+                    fields[15] = "[]";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::NoNewPrivileges:
+                    fields[16] = "[]";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::PublishedPorts:
+                    fields[13] = "{\"80/tcp\":[{\"HostPort\":\"80\"}]}";
+                    break;
+                case HeldNamespaceSidecarRevalidationFault::StartIdentity:
+                case HeldNamespaceSidecarRevalidationFault::NetworkNamespace:
+                case HeldNamespaceSidecarRevalidationFault::None:
+                    break;
+            }
+            record.clear();
+            for (size_t index = 0; index < fields.size(); ++index) {
+                if (index != 0) record += '|';
+                record += fields[index];
+            }
         }
-        char* end = nullptr;
-        const long parsed_pid = strtol(fields[9].c_str(), &end, 10);
-        if (end == fields[9].c_str() || *end != '\0' || parsed_pid < 0) {
-            error = "sidecar inspection PID was malformed";
-            return false;
-        }
-        snapshot = {};
-        snapshot.id = fields[0];
-        snapshot.name =
-            fields[1].size() > 1 && fields[1][0] == '/' ? fields[1].substr(1) : fields[1];
-        snapshot.pinned_image_reference = fields[2];
-        snapshot.image_id = fields[3];
-        snapshot.stage = fields[4];
-        snapshot.token = fields[5];
-        snapshot.role = fields[6];
-        snapshot.network_mode = fields[7];
-        snapshot.running = fields[8] == "true";
-        snapshot.pid = static_cast<pid_t>(parsed_pid);
-        snapshot.path = fields[10];
-        snapshot.arguments_json = fields[11];
-        snapshot.read_only_root = fields[12] == "true";
-        snapshot.no_published_ports = no_published_ports(fields[13], fields[14]);
-        snapshot.capability_drop_all = fields[15] == "[\"ALL\"]";
-        snapshot.no_new_privileges = fields[16] == "[\"no-new-privileges\"]";
+        if (!parse_sidecar_inspect_record(record, snapshot, error)) return false;
+        snapshot.expected_image_id = expected_sidecar_image_id_;
         if (snapshot.running && snapshot.pid > 1) {
             ProcIdentity identity{};
             ProcIdentity host_identity{};
@@ -1467,6 +1666,10 @@ private:
             snapshot.netns = identity.netns;
             snapshot.host_netns = host_identity.netns;
         }
+        if (sidecar_revalidation_fault_ == HeldNamespaceSidecarRevalidationFault::StartIdentity)
+            ++snapshot.start;
+        if (sidecar_revalidation_fault_ == HeldNamespaceSidecarRevalidationFault::NetworkNamespace)
+            ++snapshot.netns;
         return true;
     }
 
@@ -1540,27 +1743,40 @@ private:
         const bool had_discovered_snapshot = !sidecar_snapshot_.image_id.empty();
         const std::string recorded_image_id =
             had_discovered_snapshot ? sidecar_snapshot_.image_id : current.image_id;
-        const bool ownership_exact = !sidecar_id_.empty() && current.id == sidecar_id_ &&
-                                     current.name == sidecar_name_ && current.token == token_ &&
-                                     current.stage == kSidecarStage &&
-                                     current.role == kSidecarRole &&
-                                     current.pinned_image_reference == RUT_PINNED_NGINX_IMAGE &&
-                                     current.image_id == recorded_image_id;
+        const bool ownership_exact =
+            !sidecar_id_.empty() && current.id == sidecar_id_ && current.name == sidecar_name_ &&
+            current.token == token_ && current.stage == kSidecarStage &&
+            current.role == kSidecarRole &&
+            current.pinned_image_reference == RUT_PINNED_NGINX_IMAGE &&
+            current.expected_image_id == expected_sidecar_image_id_ &&
+            current.image_id == expected_sidecar_image_id_ && current.image_id == recorded_image_id;
         if (!ownership_exact) {
             error = "refusing sidecar deletion because immutable identity/ownership changed";
             return false;
         }
         std::string semantic_error;
         const HeldTopologySnapshot topology = topology_snapshot();
+        const bool expected_stopped_identity =
+            unexpected_sidecar_death_verified_ && had_discovered_snapshot &&
+            sidecar_stopped_identity_equal(current, sidecar_snapshot_);
         const bool semantic_exact =
-            validate_held_namespace_sidecar_snapshot(topology, current, semantic_error) &&
-            (!had_discovered_snapshot || sidecar_snapshot_equal(current, sidecar_snapshot_));
+            expected_stopped_identity ||
+            (validate_held_namespace_sidecar_snapshot(topology, current, semantic_error) &&
+             (!had_discovered_snapshot || sidecar_snapshot_equal(current, sidecar_snapshot_)));
         if (!semantic_exact && semantic_error.empty())
             semantic_error = "sidecar PID/start/netns/security evidence changed before cleanup";
+        if (!semantic_exact) {
+            error =
+                "refusing sidecar deletion after exact revalidation rejection: " + semantic_error;
+            return false;
+        }
 
         CommandResult result;
         const bool command_ok = run_command(
             {"docker", "rm", "-f", sidecar_id_}, result, 15000, cleanup_reported_timeout_);
+        if (cleanup_reported_timeout_ && result.timed_out && WIFEXITED(result.status) &&
+            WEXITSTATUS(result.status) == 0)
+            cleanup_reported_timeout_observed_ = true;
         std::string absent_error;
         if ((!command_ok || !exited_zero(result)) && !result.timed_out) {
             error = "sidecar cleanup command failed: " + trim(result.output);
@@ -1572,10 +1788,6 @@ private:
         }
         sidecar_exists_ = false;
         cleanup_reported_timeout_ = false;
-        if (!semantic_exact) {
-            error = semantic_error;
-            return false;
-        }
         return true;
     }
 
@@ -1773,9 +1985,14 @@ private:
     bool holder_exists_ = false;
     bool timeout_recovery_ = false;
     std::string sidecar_id_;
+    std::string expected_sidecar_image_id_;
     HeldNamespaceSidecarSnapshot sidecar_snapshot_;
     bool sidecar_exists_ = false;
     bool cleanup_reported_timeout_ = false;
+    bool cleanup_reported_timeout_observed_ = false;
+    bool unexpected_sidecar_death_verified_ = false;
+    HeldNamespaceSidecarRevalidationFault sidecar_revalidation_fault_ =
+        HeldNamespaceSidecarRevalidationFault::None;
 };
 
 static bool write_manifest(const TempDir& temp, const Fixture& fixture) {
@@ -1810,11 +2027,19 @@ static bool preflight(Fixture& fixture, std::string& error) {
         error = "Docker daemon/permissions unavailable: " + trim(result.output);
         return false;
     }
-    if (!run_command({"docker", "image", "inspect", RUT_PINNED_NGINX_IMAGE}, result) ||
+    if (!run_command({"docker", "image", "inspect", "-f", "{{.Id}}", RUT_PINNED_NGINX_IMAGE},
+                     result) ||
         !exited_zero(result)) {
         error = "exact pinned image unavailable: " + trim(result.output);
         return false;
     }
+    const std::string expected_image_id = trim(result.output);
+    if (!sha256_identity(expected_image_id) ||
+        result.output.find('\n') != result.output.rfind('\n')) {
+        error = "pinned image inspection did not return one full sha256 image ID";
+        return false;
+    }
+    fixture.set_expected_sidecar_image_id(expected_image_id);
     std::string ip_path;
     for (const char* candidate : {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"})
         if (access(candidate, X_OK) == 0) {
@@ -1851,6 +2076,12 @@ static bool preflight(Fixture& fixture, std::string& error) {
 
 }  // namespace
 
+bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
+                                                 HeldNamespaceSidecarSnapshot& snapshot,
+                                                 std::string& error) {
+    return parse_sidecar_inspect_record(record, snapshot, error);
+}
+
 bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topology,
                                               const HeldNamespaceSidecarSnapshot& sidecar,
                                               std::string& error) {
@@ -1870,7 +2101,8 @@ bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topolo
         !require(full_container_id(sidecar.id), "full ID") ||
         !require(sidecar.pinned_image_reference == RUT_PINNED_NGINX_IMAGE,
                  "pinned image reference") ||
-        !require(sha256_identity(sidecar.image_id), "image ID") ||
+        !require(sha256_identity(sidecar.expected_image_id), "expected image ID") ||
+        !require(sidecar.image_id == sidecar.expected_image_id, "anchored image ID") ||
         !require(sidecar.network_mode == "container:" + topology.holder_id, "network mode") ||
         !require(sidecar.path == "/bin/sleep", "entrypoint") ||
         !require(sidecar.arguments_json == "[\"infinity\"]", "arguments") ||
@@ -2078,6 +2310,95 @@ bool pure_validation_self_checks(std::string& error) {
         error = "published-port mutation validation was not causal";
         return false;
     }
+    std::vector<std::string> raw_sidecar_fields{
+        std::string(64, 'b'),
+        "/rut358-sidecar-0123456789abcdef",
+        RUT_PINNED_NGINX_IMAGE,
+        "sha256:" + std::string(64, 'c'),
+        kSidecarStage,
+        "0123456789abcdef",
+        kSidecarRole,
+        "container:" + std::string(64, 'a'),
+        "true",
+        "101",
+        "/bin/sleep",
+        "[\"infinity\"]",
+        "true",
+        "{}",
+        "null",
+        "[\"ALL\"]",
+        "[\"no-new-privileges\"]",
+    };
+    const auto raw_record = [](const std::vector<std::string>& fields) {
+        std::string record;
+        for (size_t index = 0; index < fields.size(); ++index) {
+            if (index != 0) record += '|';
+            record += fields[index];
+        }
+        return record;
+    };
+    HeldNamespaceSidecarSnapshot parsed_raw;
+    std::string raw_error;
+    if (!parse_sidecar_inspect_record(raw_record(raw_sidecar_fields), parsed_raw, raw_error)) {
+        error = "valid exact 17-field sidecar inspect record was rejected: " + raw_error;
+        return false;
+    }
+    const std::array<std::string, 17> raw_mutations{
+        std::string(64, 'd'),
+        "/wrong",
+        "nginx:latest",
+        "sha256:" + std::string(64, 'd'),
+        "wrong-stage",
+        "wrong-token",
+        "wrong-role",
+        "bridge",
+        "false",
+        "102",
+        "/bin/sh",
+        "[\"wrong\"]",
+        "false",
+        "{\"80/tcp\":[{\"HostPort\":\"80\"}]}",
+        "{\"80/tcp\":[{\"HostPort\":\"80\"}]}",
+        "[]",
+        "[]",
+    };
+    for (size_t index = 0; index < raw_sidecar_fields.size(); ++index) {
+        std::vector<std::string> changed_fields = raw_sidecar_fields;
+        changed_fields[index] = raw_mutations[index];
+        HeldNamespaceSidecarSnapshot changed;
+        raw_error.clear();
+        if (!parse_sidecar_inspect_record(raw_record(changed_fields), changed, raw_error) ||
+            sidecar_snapshot_equal(parsed_raw, changed)) {
+            error =
+                "raw sidecar inspect field mutation was hidden at field " + std::to_string(index);
+            return false;
+        }
+    }
+    std::vector<std::vector<std::string>> malformed_records;
+    std::vector<std::string> short_record = raw_sidecar_fields;
+    short_record.pop_back();
+    malformed_records.push_back(std::move(short_record));
+    for (const auto& mutation : {std::pair<size_t, const char*>{9, "not-a-pid"},
+                                 {8, "maybe"},
+                                 {12, "maybe"},
+                                 {11, "[\"unterminated"},
+                                 {13, "{"},
+                                 {14, "["},
+                                 {15, "[\"ALL\""},
+                                 {16, "not-json"}}) {
+        std::vector<std::string> malformed = raw_sidecar_fields;
+        malformed[mutation.first] = mutation.second;
+        malformed_records.push_back(std::move(malformed));
+    }
+    for (const auto& malformed : malformed_records) {
+        HeldNamespaceSidecarSnapshot ignored;
+        raw_error.clear();
+        if (parse_sidecar_inspect_record(raw_record(malformed), ignored, raw_error) ||
+            raw_error.empty()) {
+            error = "malformed sidecar inspect record was accepted";
+            return false;
+        }
+    }
     HeldTopologySnapshot topology;
     topology.token = "0123456789abcdef";
     topology.holder_id = std::string(64, 'a');
@@ -2091,6 +2412,7 @@ bool pure_validation_self_checks(std::string& error) {
     sidecar.name = "rut358-sidecar-" + topology.token;
     sidecar.id = std::string(64, 'b');
     sidecar.pinned_image_reference = RUT_PINNED_NGINX_IMAGE;
+    sidecar.expected_image_id = "sha256:" + std::string(64, 'c');
     sidecar.image_id = "sha256:" + std::string(64, 'c');
     sidecar.network_mode = "container:" + topology.holder_id;
     sidecar.path = "/bin/sleep";
@@ -2121,6 +2443,7 @@ bool pure_validation_self_checks(std::string& error) {
     mutate([](auto& value) { value.name = "wrong"; });
     mutate([](auto& value) { value.id = std::string(63, 'b'); });
     mutate([](auto& value) { value.pinned_image_reference = "nginx:latest"; });
+    mutate([](auto& value) { value.expected_image_id = "sha256:" + std::string(64, 'd'); });
     mutate([](auto& value) { value.image_id = "sha256:" + std::string(64, 'g'); });
     mutate([](auto& value) { value.network_mode = "bridge"; });
     mutate([](auto& value) { value.path = "/bin/sh"; });
@@ -2145,8 +2468,6 @@ bool pure_validation_self_checks(std::string& error) {
     for (const auto& change :
          {std::function<void(HeldNamespaceSidecarSnapshot&)>(
               [](auto& value) { value.id = std::string(64, 'd'); }),
-          std::function<void(HeldNamespaceSidecarSnapshot&)>(
-              [](auto& value) { value.image_id = "sha256:" + std::string(64, 'd'); }),
           std::function<void(HeldNamespaceSidecarSnapshot&)>([](auto& value) { value.pid += 1; }),
           std::function<void(HeldNamespaceSidecarSnapshot&)>(
               [](auto& value) { value.start += 1; })}) {
@@ -2449,15 +2770,21 @@ RunResult run_with_held_topology(HeldTopologyProbePolicy policy,
     return result;
 }
 
-RunResult run_with_held_topology_and_sidecar(const HeldTopologyAndSidecarCallback& callback,
-                                             HeldNamespaceSidecarFailurePoint failure_point) {
-    return run_with_held_topology_and_sidecar(
-        HeldTopologyProbePolicy::RequireHostRefusalProbes, callback, failure_point);
+RunResult run_with_held_topology_and_sidecar(
+    const HeldTopologyAndSidecarCallback& callback,
+    HeldNamespaceSidecarFailurePoint failure_point,
+    HeldNamespaceSidecarRevalidationFault revalidation_fault) {
+    return run_with_held_topology_and_sidecar(HeldTopologyProbePolicy::RequireHostRefusalProbes,
+                                              callback,
+                                              failure_point,
+                                              revalidation_fault);
 }
 
-RunResult run_with_held_topology_and_sidecar(HeldTopologyProbePolicy policy,
-                                             const HeldTopologyAndSidecarCallback& callback,
-                                             HeldNamespaceSidecarFailurePoint failure_point) {
+RunResult run_with_held_topology_and_sidecar(
+    HeldTopologyProbePolicy policy,
+    const HeldTopologyAndSidecarCallback& callback,
+    HeldNamespaceSidecarFailurePoint failure_point,
+    HeldNamespaceSidecarRevalidationFault revalidation_fault) {
     RunResult result;
     std::string token;
     if (!callback || !high_entropy_token(token)) {
@@ -2491,35 +2818,43 @@ RunResult run_with_held_topology_and_sidecar(HeldTopologyProbePolicy policy,
         if (result.error.empty()) result.error = "held-topology sidecar preflight failed";
         return result;
     }
-    const auto finish_after_cleanup = [&](bool expected_injection,
-                                          bool expected_semantic_cleanup_failure) {
+    const auto finish_after_cleanup = [&](bool semantic_success) {
         std::string cleanup_error;
         const bool cleanup_ok = fixture.cleanup(cleanup_error);
+        result.cleanup_complete = cleanup_ok;
+        if (failure_point == HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout &&
+            semantic_success) {
+            if (fixture.cleanup_reported_timeout_observed())
+                result.semantic_receipt =
+                    "verified sidecar cleanup actual-success/reported-timeout recovery";
+            else
+                semantic_success = false;
+            if (!result.semantic_receipt.empty()) result.error = result.semantic_receipt;
+        }
         if (!cleanup_ok && !cleanup_error.empty()) {
             if (!result.error.empty()) result.error += "; ";
             result.error += cleanup_error;
         }
         std::string residue_error;
         const bool residue_free = audit(residue_error);
+        result.residue_free = residue_free;
         if (!residue_free) {
             if (!result.error.empty()) result.error += "; ";
             result.error += residue_error;
         }
-        result.success =
-            expected_injection && residue_free && (cleanup_ok || expected_semantic_cleanup_failure);
+        result.success = semantic_success && cleanup_ok && residue_free;
         return result;
     };
     if (!fixture.create_networks(FailurePoint::None, result.error) ||
         !fixture.create_holder(FailurePoint::None, result.error) ||
         !fixture.attach_holder(FailurePoint::None, result.error) ||
         !fixture.verify_topology(FailurePoint::None, result.error))
-        return finish_after_cleanup(false, false);
+        return finish_after_cleanup(false);
 
     static constexpr u16 kProbePort = 41857;
     HeldTopologyProbeEvidence probe_evidence;
     probe_evidence.policy = policy;
-    if (!fixture.probe_port_absent(kProbePort, result.error))
-        return finish_after_cleanup(false, false);
+    if (!fixture.probe_port_absent(kProbePort, result.error)) return finish_after_cleanup(false);
     ++probe_evidence.selected_port_absence_checks;
     if (policy == HeldTopologyProbePolicy::RequireHostRefusalProbes) {
         const auto probe_refused = [&](const std::string& address) {
@@ -2529,19 +2864,19 @@ RunResult run_with_held_topology_and_sidecar(HeldTopologyProbePolicy policy,
             return true;
         };
         if (!probe_refused(fixture.positive_ip()) || !probe_refused(fixture.guard_ip()))
-            return finish_after_cleanup(false, false);
+            return finish_after_cleanup(false);
     }
     std::string probe_error;
     if (!validate_held_topology_probe_evidence(probe_evidence, policy, probe_error)) {
         result.error = probe_error;
-        return finish_after_cleanup(false, false);
+        return finish_after_cleanup(false);
     }
     ProcIdentity holder_identity{};
     if (!proc_identity(fixture.holder_pid(), holder_identity, false) ||
         !container_netns_inode(fixture.holder_name(), holder_identity.netns) ||
         holder_identity.start != fixture.holder_start()) {
         result.error = "sidecar topology lost exact holder process identity";
-        return finish_after_cleanup(false, false);
+        return finish_after_cleanup(false);
     }
     HeldTopologySnapshot topology;
     topology.token = fixture.token();
@@ -2568,27 +2903,42 @@ RunResult run_with_held_topology_and_sidecar(HeldTopologyProbePolicy policy,
             failure_point == HeldNamespaceSidecarFailurePoint::AfterDiscovery ||
             failure_point == HeldNamespaceSidecarFailurePoint::AfterVerification ||
             failure_point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout;
-        return finish_after_cleanup(expected, false);
+        if (expected) result.semantic_receipt = result.error;
+        return finish_after_cleanup(expected);
     }
     if (failure_point == HeldNamespaceSidecarFailurePoint::UnexpectedDeath) {
         if (!fixture.terminate_sidecar_unexpectedly(result.error))
-            return finish_after_cleanup(false, false);
-        return finish_after_cleanup(true, true);
+            return finish_after_cleanup(false);
+        result.semantic_receipt = result.error;
+        return finish_after_cleanup(true);
     }
-    if (!callback(topology, fixture.sidecar_snapshot(), result.error))
-        return finish_after_cleanup(false, false);
+    if (!callback(topology, fixture.sidecar_snapshot(), result.error)) {
+        result.semantic_receipt = result.error;
+        return finish_after_cleanup(false);
+    }
     if (failure_point == HeldNamespaceSidecarFailurePoint::AfterCallbackEntry) {
         result.error = "injected held-namespace sidecar failure after callback entry";
-        return finish_after_cleanup(true, false);
+        result.semantic_receipt = result.error;
+        return finish_after_cleanup(true);
     }
-    if (!fixture.cleanup(result.error)) return finish_after_cleanup(false, false);
-    std::string residue_error;
-    if (!audit(residue_error)) {
-        result.error = residue_error;
-        return result;
+    if (revalidation_fault != HeldNamespaceSidecarRevalidationFault::None) {
+        fixture.set_sidecar_revalidation_fault(revalidation_fault);
+        std::string rejection_error;
+        const bool unexpectedly_removed = fixture.cleanup(rejection_error);
+        fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
+        if (unexpectedly_removed || !fixture.sidecar_exists() ||
+            rejection_error.find("refusing sidecar deletion") == std::string::npos) {
+            result.error = "injected sidecar revalidation fault was not rejected before removal";
+            if (!rejection_error.empty()) result.error += ": " + rejection_error;
+            return finish_after_cleanup(false);
+        }
+        result.semantic_receipt =
+            std::string("verified pre-removal sidecar revalidation rejection ") +
+            sidecar_revalidation_fault_name(revalidation_fault) + ": " + rejection_error;
+        result.error = result.semantic_receipt;
+        return finish_after_cleanup(true);
     }
-    result.success = true;
-    return result;
+    return finish_after_cleanup(true);
 }
 
 }  // namespace rut::test::ipv4_topology

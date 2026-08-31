@@ -29,7 +29,10 @@ struct RunResult {
     bool success = false;
     bool prerequisite_failure = false;
     bool optional_skip_safe = false;
+    bool cleanup_complete = false;
+    bool residue_free = false;
     std::string error;
+    std::string semantic_receipt;
 };
 
 // Controls only the host-parent verification performed after Docker topology
@@ -78,6 +81,7 @@ struct HeldNamespaceSidecarSnapshot {
     std::string name;
     std::string id;
     std::string pinned_image_reference;
+    std::string expected_image_id;
     std::string image_id;
     std::string network_mode;
     std::string path;
@@ -104,6 +108,27 @@ enum class HeldNamespaceSidecarFailurePoint {
     UnexpectedDeath,
 };
 
+// A bounded test-only seam.  Each value corrupts one field of the raw Docker
+// inspect record during the first cleanup revalidation.  Production callers
+// leave this disabled.
+enum class HeldNamespaceSidecarRevalidationFault {
+    None,
+    Token,
+    Role,
+    Id,
+    ImageReference,
+    ImageId,
+    NetworkMode,
+    Pid,
+    StartIdentity,
+    NetworkNamespace,
+    Arguments,
+    ReadOnlyRoot,
+    CapabilityDrop,
+    NoNewPrivileges,
+    PublishedPorts,
+};
+
 using HeldTopologyCallback =
     std::function<bool(const HeldTopologySnapshot& snapshot, std::string& error)>;
 using HeldTopologyAndSidecarCallback =
@@ -117,11 +142,18 @@ RunResult run_with_held_topology(HeldTopologyProbePolicy policy,
                                  const HeldTopologyCallback& callback);
 RunResult run_with_held_topology_and_sidecar(
     const HeldTopologyAndSidecarCallback& callback,
-    HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None);
+    HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None,
+    HeldNamespaceSidecarRevalidationFault revalidation_fault =
+        HeldNamespaceSidecarRevalidationFault::None);
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,
-    HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None);
+    HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None,
+    HeldNamespaceSidecarRevalidationFault revalidation_fault =
+        HeldNamespaceSidecarRevalidationFault::None);
+bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
+                                                 HeldNamespaceSidecarSnapshot& snapshot,
+                                                 std::string& error);
 bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topology,
                                               const HeldNamespaceSidecarSnapshot& sidecar,
                                               std::string& error);
