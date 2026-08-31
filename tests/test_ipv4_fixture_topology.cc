@@ -1,8 +1,12 @@
 #include "fixture_ipv4_topology.h"
 #include <cstdlib>
 #include <iostream>
+#include <string>
+#include <utility>
 
 using rut::test::ipv4_topology::FailurePoint;
+using rut::test::ipv4_topology::HeldNamespaceSidecarFailurePoint;
+using rut::test::ipv4_topology::HeldNamespaceSidecarRevalidationFault;
 using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::RunResult;
@@ -154,6 +158,97 @@ int main() {
         std::cerr << "FAIL [#358 Stage 2a3b held topology callback]: " << held.error << "\n";
         return 1;
     }
+    const auto sidecar_callback =
+        [&](const rut::test::ipv4_topology::HeldTopologySnapshot& topology,
+            const rut::test::ipv4_topology::HeldNamespaceSidecarSnapshot& sidecar,
+            std::string& error) {
+            return rut::test::ipv4_topology::validate_held_namespace_sidecar_snapshot(
+                topology, sidecar, error);
+        };
+    const RunResult sidecar_normal =
+        rut::test::ipv4_topology::run_with_held_topology_and_sidecar(sidecar_callback);
+    if (sidecar_normal.prerequisite_failure || !sidecar_normal.success ||
+        !sidecar_normal.cleanup_complete || !sidecar_normal.residue_free ||
+        !sidecar_normal.semantic_receipt.empty() || !sidecar_normal.error.empty()) {
+        std::cerr << "FAIL [#358 held-namespace sidecar normal lifecycle]: " << sidecar_normal.error
+                  << "\n";
+        return 1;
+    }
+    for (const auto& injection :
+         {std::pair{HeldNamespaceSidecarFailurePoint::AfterCreate,
+                    std::string("injected held-namespace sidecar failure after create")},
+          std::pair{HeldNamespaceSidecarFailurePoint::AfterDiscovery,
+                    std::string("injected held-namespace sidecar failure after discovery")},
+          std::pair{HeldNamespaceSidecarFailurePoint::AfterVerification,
+                    std::string("injected held-namespace sidecar failure after verification")},
+          std::pair{HeldNamespaceSidecarFailurePoint::AfterCallbackEntry,
+                    std::string("injected held-namespace sidecar failure after callback entry")},
+          std::pair{HeldNamespaceSidecarFailurePoint::CreateReportedTimeout,
+                    std::string("injected sidecar actual-success/reported-timeout; recovered exact "
+                                "identity")},
+          std::pair{HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout,
+                    std::string("verified sidecar cleanup actual-success/reported-timeout "
+                                "recovery")},
+          std::pair{HeldNamespaceSidecarFailurePoint::UnexpectedDeath,
+                    std::string("verified unexpected sidecar death: exact stopped identity and no "
+                                "live /proc witness")}}) {
+        const RunResult injected = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
+            sidecar_callback, injection.first);
+        if (injected.prerequisite_failure || !injected.success || !injected.cleanup_complete ||
+            !injected.residue_free || injected.semantic_receipt != injection.second ||
+            injected.error != injection.second) {
+            std::cerr << "FAIL [#358 held-namespace sidecar failure-atomic matrix]: "
+                      << injected.error << "\n";
+            return 1;
+        }
+    }
+    bool failing_callback_ran = false;
+    const RunResult callback_failure = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
+        [&](const rut::test::ipv4_topology::HeldTopologySnapshot&,
+            const rut::test::ipv4_topology::HeldNamespaceSidecarSnapshot&,
+            std::string& error) {
+            failing_callback_ran = true;
+            error = "injected sidecar callback failure";
+            return false;
+        });
+    if (callback_failure.prerequisite_failure || callback_failure.success ||
+        !callback_failure.cleanup_complete || !callback_failure.residue_free ||
+        !failing_callback_ran || callback_failure.error != "injected sidecar callback failure" ||
+        callback_failure.semantic_receipt != "injected sidecar callback failure") {
+        std::cerr << "FAIL [#358 held-namespace sidecar callback cleanup]: "
+                  << callback_failure.error << "\n";
+        return 1;
+    }
+    for (const auto& fault :
+         {std::pair{HeldNamespaceSidecarRevalidationFault::Token, "token"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::Role, "role"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::Id, "id"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::ImageReference, "image-reference"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::ImageId, "image-id"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::NetworkMode, "network-mode"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::Pid, "pid"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::StartIdentity, "start-identity"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::NetworkNamespace, "network-namespace"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::Arguments, "arguments"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::ReadOnlyRoot, "read-only-root"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::CapabilityDrop, "capability-drop"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::NoNewPrivileges, "no-new-privileges"},
+          std::pair{HeldNamespaceSidecarRevalidationFault::PublishedPorts, "published-ports"}}) {
+        const RunResult rejected = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
+            sidecar_callback, HeldNamespaceSidecarFailurePoint::None, fault.first);
+        const std::string expected_receipt_prefix =
+            std::string("verified pre-removal sidecar revalidation rejection ") + fault.second +
+            ": refusing sidecar deletion";
+        if (rejected.prerequisite_failure || !rejected.success || !rejected.cleanup_complete ||
+            !rejected.residue_free || rejected.semantic_receipt.empty() ||
+            rejected.error != rejected.semantic_receipt ||
+            rejected.semantic_receipt.find(expected_receipt_prefix) != 0) {
+            std::cerr << "FAIL [#358 held-namespace sidecar revalidation mutation]: "
+                      << rejected.error << "\n";
+            return 1;
+        }
+    }
     std::cerr << "PASS: #358 Stage 2a2 Docker topology/IPAM and failure-atomic cleanup\n";
+    std::cerr << "PASS: #358 held-namespace sibling-container lease and zero-residue cleanup\n";
     return 0;
 }
