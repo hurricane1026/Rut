@@ -168,6 +168,22 @@ target_link_libraries(test_fixture_wildcard_source_lease PRIVATE fixture_wildcar
 add_test(NAME test_fixture_wildcard_source_lease COMMAND test_fixture_wildcard_source_lease)
 set_tests_properties(test_fixture_wildcard_source_lease PROPERTIES LABELS "unit" TIMEOUT 30)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_fixture_wildcard_source_reservation_sequence
+        test_fixture_wildcard_source_reservation_sequence.cc)
+    target_link_libraries(test_fixture_wildcard_source_reservation_sequence PRIVATE
+        fixture_wildcard_source_lease
+        fixture_exact_tcp_reservation_lease
+        fixture_private_directory_lease)
+    add_test(NAME test_fixture_wildcard_source_reservation_sequence
+        COMMAND test_fixture_wildcard_source_reservation_sequence)
+    set_tests_properties(test_fixture_wildcard_source_reservation_sequence PROPERTIES
+        LABELS "unit"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30)
+endif()
+
 # Pure #377 bounded anonymous stdout/stderr capture. This is an unprivileged
 # memfd/seals self-check and is not connected to a child, broker or runtime.
 add_library(fixture_anonymous_log_capture STATIC fixture_anonymous_log_capture.cc)
