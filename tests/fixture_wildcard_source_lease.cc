@@ -202,6 +202,21 @@ bool WildcardAttemptSourceLease::create(int identity_bound_directory_fd,
         identity_bound_directory_fd, directory_path, basename, plan, nullptr, lease, diagnostic);
 }
 
+bool WildcardAttemptSourceLease::create_exact_bytes(int identity_bound_directory_fd,
+                                                    const std::string& directory_path,
+                                                    const std::string& basename,
+                                                    const std::string& exact_bytes,
+                                                    WildcardAttemptSourceLease& lease,
+                                                    Diagnostic& diagnostic) {
+    return create_exact_bytes_impl(identity_bound_directory_fd,
+                                   directory_path,
+                                   basename,
+                                   exact_bytes,
+                                   nullptr,
+                                   lease,
+                                   diagnostic);
+}
+
 bool WildcardAttemptSourceLease::create_with_hooks_for_testing(
     int identity_bound_directory_fd,
     const std::string& directory_path,
@@ -221,15 +236,6 @@ bool WildcardAttemptSourceLease::create_impl(int identity_bound_directory_fd,
                                              const SourceLeaseHooksForTesting* hooks,
                                              WildcardAttemptSourceLease& lease,
                                              Diagnostic& diagnostic) {
-    diagnostic = {};
-    if (lease.active_ || lease.cleanup_required_ || lease.directory_fd_ >= 0 ||
-        lease.source_fd_ >= 0 || identity_bound_directory_fd < 0 || directory_path.empty() ||
-        directory_path.find('\0') != std::string::npos || directory_path.front() != '/' ||
-        directory_path.back() == '/' || !safe_path_component(basename)) {
-        fail(diagnostic, FailurePhase::Argument, EINVAL);
-        return false;
-    }
-
     std::string expected;
     fixture_privileged_listener::Diagnostic listener_diagnostic;
     if (!fixture_privileged_listener::build_listener_source(
@@ -238,6 +244,26 @@ bool WildcardAttemptSourceLease::create_impl(int identity_bound_directory_fd,
             expected,
             listener_diagnostic) ||
         expected.empty() || expected.find('\0') != std::string::npos) {
+        fail(diagnostic, FailurePhase::Argument, EINVAL);
+        return false;
+    }
+    return create_exact_bytes_impl(
+        identity_bound_directory_fd, directory_path, basename, expected, hooks, lease, diagnostic);
+}
+
+bool WildcardAttemptSourceLease::create_exact_bytes_impl(int identity_bound_directory_fd,
+                                                         const std::string& directory_path,
+                                                         const std::string& basename,
+                                                         const std::string& exact_bytes,
+                                                         const SourceLeaseHooksForTesting* hooks,
+                                                         WildcardAttemptSourceLease& lease,
+                                                         Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (lease.active_ || lease.cleanup_required_ || lease.directory_fd_ >= 0 ||
+        lease.source_fd_ >= 0 || identity_bound_directory_fd < 0 || directory_path.empty() ||
+        directory_path.find('\0') != std::string::npos || directory_path.front() != '/' ||
+        directory_path.back() == '/' || !safe_path_component(basename) || exact_bytes.empty() ||
+        exact_bytes.size() > 255u || exact_bytes.find('\0') != std::string::npos) {
         fail(diagnostic, FailurePhase::Argument, EINVAL);
         return false;
     }
@@ -286,7 +312,7 @@ bool WildcardAttemptSourceLease::create_impl(int identity_bound_directory_fd,
     lease.basename_ = basename;
     lease.owned_basename_ = basename;
     lease.path_ = directory_path + "/" + basename;
-    lease.expected_bytes_ = expected;
+    lease.expected_bytes_ = exact_bytes;
     lease.directory_identity_ = make_directory_identity(directory_status);
     lease.cleanup_state_ = std::make_shared<CleanupState>();
 
@@ -300,12 +326,12 @@ bool WildcardAttemptSourceLease::create_impl(int identity_bound_directory_fd,
     lease.source_identity_ = make_source_identity(created_status);
     lease.source_identity_known_ = true;
 
-    if (!write_all(lease.source_fd_, expected) || fsync(lease.source_fd_) != 0 ||
+    if (!write_all(lease.source_fd_, exact_bytes) || fsync(lease.source_fd_) != 0 ||
         fstat(lease.source_fd_, &created_status) != 0 || !S_ISREG(created_status.st_mode) ||
         created_status.st_uid != getuid() || created_status.st_gid != getgid() ||
         (created_status.st_mode & 0777) != 0600 || created_status.st_nlink != 1u ||
         created_status.st_size < 0 ||
-        static_cast<std::uint64_t>(created_status.st_size) != expected.size()) {
+        static_cast<std::uint64_t>(created_status.st_size) != exact_bytes.size()) {
         const Diagnostic original{FailurePhase::Write, errno};
         return lease.fail_created(original, diagnostic);
     }

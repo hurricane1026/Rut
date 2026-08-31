@@ -20,6 +20,15 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Tests-only identity-bound private /tmp directory custody for #377.
+add_library(fixture_private_directory_lease STATIC fixture_private_directory_lease.cc)
+target_include_directories(fixture_private_directory_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(test_fixture_private_directory_lease test_fixture_private_directory_lease.cc)
+target_link_libraries(test_fixture_private_directory_lease PRIVATE fixture_private_directory_lease)
+add_test(NAME test_fixture_private_directory_lease COMMAND test_fixture_private_directory_lease)
+set_tests_properties(test_fixture_private_directory_lease PROPERTIES
+    LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
+
 # Pure #377 paused direct-child lease. This owns only a forked readiness/release
 # barrier and pidfd authority; source, log, listener and runtime state remain
 # in separately reviewed fixtures.
@@ -184,6 +193,29 @@ set_tests_properties(test_fixture_wildcard_lease_composition PROPERTIES
     TIMEOUT 30)
 
 if(RUT_ENABLE_JIT)
+    # One fresh #377 public-RUT session composing the accepted immutable source,
+    # executable, capture, prepared-child and bounded-argv leases. This is a
+    # tests-only startup control-plane witness, not a listener/HTTP claim.
+    add_executable(test_fixture_wildcard_canonical_session
+        test_fixture_wildcard_canonical_session.cc)
+    target_link_libraries(test_fixture_wildcard_canonical_session PRIVATE
+        fixture_anonymous_log_capture
+        fixture_executable_exec_handoff
+        fixture_executable_lease
+        fixture_private_directory_lease
+        fixture_wildcard_paused_child_lease
+        fixture_wildcard_source_lease
+        fixture_worker_protocol)
+    target_compile_definitions(test_fixture_wildcard_canonical_session PRIVATE
+        RUT_SERVER_BINARY="$<TARGET_FILE:rut>")
+    add_dependencies(test_fixture_wildcard_canonical_session rut)
+    add_test(NAME test_fixture_wildcard_canonical_session
+        COMMAND test_fixture_wildcard_canonical_session)
+    set_tests_properties(test_fixture_wildcard_canonical_session PROPERTIES
+        LABELS "integration;jit;network"
+        RUN_SERIAL TRUE
+        TIMEOUT 30)
+
     add_executable(test_fixture_privileged_listener_loader
         test_fixture_privileged_listener_loader.cc)
     target_link_libraries(test_fixture_privileged_listener_loader PRIVATE
