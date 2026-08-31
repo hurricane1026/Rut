@@ -878,6 +878,16 @@ if(RUT_ENABLE_JIT)
     set_tests_properties(test_fixture_wildcard_attempt_protocol PROPERTIES
         LABELS "unit"
     )
+    add_test(NAME test_fixture_canonical_target_cleanup
+             COMMAND test_fixture_privileged_broker
+                     --canonical-target-cleanup-self-check)
+    set_tests_properties(test_fixture_canonical_target_cleanup PROPERTIES
+        LABELS "integration;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
     add_test(
         NAME test_nginx_downstream_gate_spike
         COMMAND test_nginx_differential --nginx-gate-spike

@@ -3035,6 +3035,242 @@ static bool canonical_target_settlement(int control,
            machine.settle(frame, token);
 }
 
+enum class CanonicalCleanupPhase : std::uint8_t {
+    None,
+    RetryAttempt,
+    CollisionAttempt,
+    UnsafeChild,
+    Reservation,
+    Source,
+    Directory,
+    Executable,
+};
+
+struct CanonicalCleanupResult {
+    CanonicalCleanupPhase first_failure = CanonicalCleanupPhase::None;
+    int error_number = 0;
+    bool retry_attempted = false;
+    bool collision_attempted = false;
+    bool children_terminal = false;
+    bool reservation_attempted = false;
+    bool reservation_settled = false;
+    bool source_attempted = false;
+    bool source_settled = false;
+    bool directory_attempted = false;
+    bool directory_settled = false;
+    bool executable_attempted = false;
+    bool executable_settled = false;
+    std::array<CanonicalCleanupPhase, 6u> order{};
+    std::size_t order_size = 0u;
+
+    bool success() const { return first_failure == CanonicalCleanupPhase::None; }
+};
+
+static void canonical_record_cleanup_step(CanonicalCleanupResult& result,
+                                          CanonicalCleanupPhase phase) {
+    if (result.order_size < result.order.size()) result.order[result.order_size++] = phase;
+}
+
+static int canonical_nonzero_error(int error_number) {
+    return error_number == 0 ? EIO : error_number;
+}
+
+static void canonical_retain_cleanup_failure(CanonicalCleanupResult& result,
+                                             CanonicalCleanupPhase phase,
+                                             int error_number) {
+    if (result.first_failure != CanonicalCleanupPhase::None) return;
+    result.first_failure = phase;
+    result.error_number = canonical_nonzero_error(error_number);
+}
+
+static bool canonical_attempt_child_terminal(const public_attempt::PublicRutAttemptLease& attempt) {
+    const auto receipt = attempt.settlement_receipt();
+    if (!receipt) return attempt.child_pid() <= 0;
+    return receipt->terminal && receipt->reaped;
+}
+
+static bool canonical_source_requires_cleanup(
+    const source_lease::WildcardAttemptSourceLease& source) {
+    switch (source.state()) {
+        case source_lease::State::Fresh:
+        case source_lease::State::Removed:
+            return false;
+        case source_lease::State::Staged:
+        case source_lease::State::Active:
+        case source_lease::State::FinalizeFailed:
+            return true;
+    }
+    return false;
+}
+
+static bool canonical_source_is_settled(const source_lease::WildcardAttemptSourceLease& source) {
+    switch (source.state()) {
+        case source_lease::State::Fresh:
+        case source_lease::State::Removed:
+            return true;
+        case source_lease::State::Staged:
+        case source_lease::State::Active:
+        case source_lease::State::FinalizeFailed:
+            return false;
+    }
+    return false;
+}
+
+static bool canonical_directory_requires_cleanup(
+    const private_directory::PrivateDirectoryLease& directory) {
+    switch (directory.state()) {
+        case private_directory::State::Owned:
+        case private_directory::State::Quarantined:
+        case private_directory::State::Removed:
+            return true;
+        case private_directory::State::Empty:
+        case private_directory::State::PendingIdentity:
+        case private_directory::State::BindingLost:
+        case private_directory::State::RenamePendingValidation:
+        case private_directory::State::Unresolved:
+            return false;
+    }
+    return false;
+}
+
+static bool canonical_directory_is_settled(
+    const private_directory::PrivateDirectoryLease& directory) {
+    const auto receipt = directory.settlement_receipt();
+    if (directory.state() == private_directory::State::Empty) return true;
+    return directory.state() == private_directory::State::Removed && receipt &&
+           receipt->settlement_complete;
+}
+
+// One deterministic Target-owned epilogue. Both attempt cleanups always run
+// under the caller's single absolute deadline. Outer owners are touched only
+// after every acquired direct child is proven terminal and reaped.
+static CanonicalCleanupResult canonical_target_cleanup(
+    public_attempt::PublicRutAttemptLease& retry_attempt,
+    public_attempt::PublicRutAttemptLease& collision_attempt,
+    exact_reservation::ExactTcpReservationLease& reservation,
+    source_lease::WildcardAttemptSourceLease& source,
+    private_directory::PrivateDirectoryLease& directory,
+    executable_lease::ExecutableLease& executable,
+    std::chrono::steady_clock::time_point cleanup_deadline) {
+    CanonicalCleanupResult result;
+    public_attempt::Diagnostic retry_diagnostic;
+    result.retry_attempted = true;
+    canonical_record_cleanup_step(result, CanonicalCleanupPhase::RetryAttempt);
+    const bool retry_cleaned = retry_attempt.cleanup(cleanup_deadline, retry_diagnostic);
+    if (!retry_cleaned)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::RetryAttempt, retry_diagnostic.error_number);
+
+    public_attempt::Diagnostic collision_diagnostic;
+    result.collision_attempted = true;
+    canonical_record_cleanup_step(result, CanonicalCleanupPhase::CollisionAttempt);
+    const bool collision_cleaned =
+        collision_attempt.cleanup(cleanup_deadline, collision_diagnostic);
+    if (!collision_cleaned)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::CollisionAttempt, collision_diagnostic.error_number);
+
+    result.children_terminal = canonical_attempt_child_terminal(retry_attempt) &&
+                               canonical_attempt_child_terminal(collision_attempt);
+    if (!result.children_terminal) {
+        canonical_retain_cleanup_failure(result, CanonicalCleanupPhase::UnsafeChild, ECHILD);
+        return result;
+    }
+
+    exact_reservation::Diagnostic reservation_diagnostic;
+    if (reservation.state() == exact_reservation::State::Held) {
+        result.reservation_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Reservation);
+        const bool released = reservation.release(reservation_diagnostic);
+        if (!released)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Reservation, reservation_diagnostic.error_number);
+    }
+    switch (reservation.state()) {
+        case exact_reservation::State::Fresh:
+        case exact_reservation::State::Released:
+            result.reservation_settled = true;
+            break;
+        case exact_reservation::State::Held:
+        case exact_reservation::State::BindingLost:
+        case exact_reservation::State::ReleaseUncertain:
+            result.reservation_settled = false;
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Reservation, reservation_diagnostic.error_number);
+            break;
+    }
+
+    source_lease::Diagnostic source_diagnostic;
+    if (canonical_source_requires_cleanup(source)) {
+        result.source_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Source);
+        const bool removed = source.remove(source_diagnostic);
+        if (!removed)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Source, source_diagnostic.error_number);
+    }
+    result.source_settled = canonical_source_is_settled(source);
+    if (!result.source_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Source, source_diagnostic.error_number);
+
+    private_directory::Diagnostic directory_diagnostic;
+    if (result.source_settled && canonical_directory_requires_cleanup(directory)) {
+        result.directory_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Directory);
+        const bool settled = directory.settle(directory_diagnostic);
+        if (!settled)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Directory, directory_diagnostic.error_number);
+    }
+    result.directory_settled = canonical_directory_is_settled(directory);
+    if (!result.directory_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Directory, directory_diagnostic.error_number);
+
+    executable_lease::Diagnostic executable_diagnostic;
+    if (executable.active()) {
+        result.executable_attempted = true;
+        canonical_record_cleanup_step(result, CanonicalCleanupPhase::Executable);
+        const bool closed = executable.close(executable_diagnostic);
+        if (!closed)
+            canonical_retain_cleanup_failure(
+                result, CanonicalCleanupPhase::Executable, executable_diagnostic.error_number);
+    }
+    result.executable_settled = !executable.active();
+    if (!result.executable_settled)
+        canonical_retain_cleanup_failure(
+            result, CanonicalCleanupPhase::Executable, executable_diagnostic.error_number);
+    return result;
+}
+
+static bool canonical_success_owners_settled(
+    const public_attempt::PublicRutAttemptLease& retry_attempt,
+    const public_attempt::PublicRutAttemptLease& collision_attempt,
+    const exact_reservation::ExactTcpReservationLease& reservation,
+    const source_lease::WildcardAttemptSourceLease& source,
+    const private_directory::PrivateDirectoryLease& directory,
+    const executable_lease::ExecutableLease& executable) {
+    const auto reservation_receipt = reservation.release_receipt();
+    const auto source_cleanup = source.cleanup_state();
+    const auto directory_receipt = directory.settlement_receipt();
+    const auto executable_cleanup = executable.cleanup_state();
+    const auto retry_cleanup = retry_attempt.cleanup_state();
+    const auto collision_cleanup = collision_attempt.cleanup_state();
+    return reservation.state() == exact_reservation::State::Released && reservation_receipt &&
+           reservation_receipt->reportable_success &&
+           source.state() == source_lease::State::Removed && source_cleanup &&
+           source_cleanup->succeeded && directory.state() == private_directory::State::Removed &&
+           directory_receipt && directory_receipt->settlement_complete && !executable.active() &&
+           executable_cleanup && executable_cleanup->reportable_success && retry_cleanup &&
+           retry_cleanup->explicit_cleanup_complete &&
+           retry_cleanup->explicit_cleanup_reportable_success && collision_cleanup &&
+           collision_cleanup->explicit_cleanup_complete &&
+           collision_cleanup->explicit_cleanup_reportable_success &&
+           canonical_attempt_child_terminal(retry_attempt) &&
+           canonical_attempt_child_terminal(collision_attempt);
+}
+
 static int canonical_target_flow(int control,
                                  const Token& token,
                                  const std::vector<unsigned char>& request,
@@ -3043,6 +3279,7 @@ static int canonical_target_flow(int control,
     std::string executable_path;
     if (!parse_canonical_request(request, positive_ipv4, guard_ipv4, executable_path)) return 60;
     const auto transaction_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    const auto cleanup_deadline = transaction_deadline + std::chrono::seconds(10);
     u64 transaction = 0u;
     ProcIdentity target_identity;
     if (!canonical_random_transaction(transaction) || !read_proc(getpid(), target_identity) ||
@@ -3062,6 +3299,22 @@ static int canonical_target_flow(int control,
     executable_lease::Diagnostic executable_diagnostic;
     exact_reservation::Diagnostic reservation_diagnostic;
     public_attempt::Diagnostic attempt_diagnostic;
+    auto fail = [&](int exit_code) {
+        const CanonicalCleanupResult cleanup = canonical_target_cleanup(retry_attempt,
+                                                                        collision_attempt,
+                                                                        reservation,
+                                                                        source,
+                                                                        directory,
+                                                                        executable,
+                                                                        cleanup_deadline);
+        if (!cleanup.success())
+            std::fprintf(stderr,
+                         "FAIL [#377 canonical Target cleanup]: exit=%d phase=%u errno=%d\n",
+                         exit_code,
+                         static_cast<unsigned>(cleanup.first_failure),
+                         cleanup.error_number);
+        return exit_code;
+    };
     if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic) ||
         !source_lease::WildcardAttemptSourceLease::stage(directory.descriptor(),
                                                          directory.path(),
@@ -3072,7 +3325,7 @@ static int canonical_target_flow(int control,
             executable_path, executable, executable_diagnostic) ||
         !exact_reservation::ExactTcpReservationLease::reserve(
             guard_ipv4, reservation, reservation_diagnostic))
-        return 62;
+        return fail(62);
 
     const std::string dotted_guard = [&]() {
         std::array<char, INET_ADDRSTRLEN> text{};
@@ -3083,19 +3336,19 @@ static int canonical_target_flow(int control,
     }();
     if (dotted_guard.empty() || reservation.port() == 0u ||
         reservation.port() > std::numeric_limits<u16>::max())
-        return 63;
+        return fail(63);
     const std::string source_bytes = "listen " + dotted_guard + ":" +
                                      std::to_string(reservation.port()) +
                                      "\nroute GET \"/\" { return 204 }\n";
     if (source_bytes.size() > collision_evidence::kMaxSourceBytes ||
         !source.finalize_exact_bytes(source_bytes, source_diagnostic) ||
         !reservation.revalidate(reservation_diagnostic))
-        return 64;
+        return fail(64);
 
     collision_evidence::ReservationSource source_report;
     if (!canonical_reservation_source(
             reservation, source, directory, source_bytes, target_identity, source_report))
-        return 65;
+        return fail(65);
     const collision_evidence::Target evidence_target{static_cast<u64>(target_identity.pid),
                                                      target_identity.start,
                                                      static_cast<u64>(target_identity.netns)};
@@ -3114,7 +3367,7 @@ static int canonical_target_flow(int control,
             source_frame,
             collision_evidence::max_payload(collision_evidence::ReportKind::ReservationSource),
             transaction_deadline))
-        return 66;
+        return fail(66);
 
     Frame command_frame;
     collision_control::CommandV2 command;
@@ -3133,7 +3386,7 @@ static int canonical_target_flow(int control,
                                    machine,
                                    transaction_deadline,
                                    collision_control::DecisionKind::AuthorizeCollisionExec))
-        return 67;
+        return fail(67);
 
     const std::array<std::string_view, 9u> arguments = {executable.canonical_path(),
                                                         source.path(),
@@ -3160,7 +3413,7 @@ static int canonical_target_flow(int control,
         (collision_attempt.state() != public_attempt::State::EarlyDeath &&
          collision_attempt.state() != public_attempt::State::ExecObservedLive) ||
         !collision_attempt.settle_natural(1, transaction_deadline, attempt_diagnostic))
-        return 68;
+        return fail(68);
     const bool collision_live = collision_attempt.exec_observation().outcome ==
                                 public_attempt::handoff::ExecOutcome::ExecObservedLive;
     std::string collision_capture = collision_attempt.sealed_capture_bytes();
@@ -3170,7 +3423,7 @@ static int canonical_target_flow(int control,
         !privileged_listener::classify_collision_log(
             collision_capture, source.path(), 2u, collision_classifier, collision_diagnostic) ||
         collision_attempt.state() != public_attempt::State::NaturalReapedEvidenceOpen)
-        return 69;
+        return fail(69);
     collision_evidence::CollisionAttempt collision_report;
     if (!canonical_attempt_projection(collision_attempt,
                                       source,
@@ -3180,7 +3433,7 @@ static int canonical_target_flow(int control,
                                       collision_classifier,
                                       collision_live,
                                       collision_report))
-        return 70;
+        return fail(70);
     const collision_evidence::Envelope collision_envelope = canonical_expected_envelope(
         transaction,
         evidence_target,
@@ -3226,7 +3479,7 @@ static int canonical_target_flow(int control,
                                    collision_control::DecisionKind::AuthorizeEvidenceClose) ||
         !collision_attempt.close_evidence(attempt_diagnostic) ||
         !reservation.revalidate(reservation_diagnostic) || !source.revalidate(source_diagnostic))
-        return 71;
+        return fail(71);
 
     collision_evidence::EvidenceClosed closed_report;
     closed_report.attempt_state = collision_report.header.attempt_state;
@@ -3234,7 +3487,7 @@ static int canonical_target_flow(int control,
     // report helper reads only immutable source/G identities and cleanup state.
     if (!canonical_evidence_closed_projection(
             collision_attempt, source, reservation, collision_live, closed_report))
-        return 72;
+        return fail(72);
     const collision_evidence::Envelope closed_envelope =
         canonical_expected_envelope(transaction,
                                     evidence_target,
@@ -3259,14 +3512,14 @@ static int canonical_target_flow(int control,
                                    machine,
                                    transaction_deadline,
                                    collision_control::DecisionKind::AuthorizeReservationRelease))
-        return 73;
+        return fail(73);
 
     const int released_fd = reservation.descriptor();
     const u64 released_inode = reservation.socket_inode();
     if (released_fd < 0 || released_inode == 0u || !reservation.release(reservation_diagnostic))
-        return 74;
+        return fail(74);
     collision_evidence::Release release_report;
-    if (!canonical_release_projection(reservation, release_report)) return 75;
+    if (!canonical_release_projection(reservation, release_report)) return fail(75);
     release_report.g_fd = static_cast<u64>(released_fd);
     release_report.g_inode = released_inode;
     const collision_evidence::Envelope release_envelope =
@@ -3293,14 +3546,14 @@ static int canonical_target_flow(int control,
                                    machine,
                                    transaction_deadline,
                                    collision_control::DecisionKind::AuthorizeRetryExec))
-        return 76;
+        return fail(76);
 
     if (!retry_attempt.prepare(
             source, executable, arguments, transaction_deadline, {}, attempt_diagnostic) ||
         !retry_attempt.exec_and_observe(
             source, executable, transaction_deadline, attempt_diagnostic) ||
         retry_attempt.state() != public_attempt::State::ExecObservedLive)
-        return 77;
+        return fail(77);
     std::string startup_capture;
     u64 startup_backend = 0u;
     bool retry_ready = false;
@@ -3338,7 +3591,7 @@ static int canonical_target_flow(int control,
         }
         (void)poll(nullptr, 0, 5);
     }
-    if (!retry_ready) return 78;
+    if (!retry_ready) return fail(78);
     collision_evidence::RetryLive retry_report;
     if (!canonical_retry_live_projection(retry_attempt,
                                          source,
@@ -3347,7 +3600,7 @@ static int canonical_target_flow(int control,
                                          startup_backend,
                                          startup_capture,
                                          retry_report))
-        return 79;
+        return fail(79);
     const collision_evidence::Envelope retry_envelope =
         canonical_expected_envelope(transaction,
                                     evidence_target,
@@ -3389,15 +3642,16 @@ static int canonical_target_flow(int control,
                                    transaction_deadline,
                                    collision_control::DecisionKind::AuthorizeRetrySettlement) ||
         !retry_attempt.settle_killed(SIGKILL, transaction_deadline, attempt_diagnostic))
-        return 80;
+        return fail(80);
 
     std::string final_capture;
     if (!retry_attempt.snapshot_capture(final_capture, attempt_diagnostic) ||
         final_capture.size() < startup_capture.size() ||
         std::memcmp(final_capture.data(), startup_capture.data(), startup_capture.size()) != 0)
-        return 81;
+        return fail(81);
     collision_evidence::RetrySettlement settlement_report;
-    if (!canonical_retry_settlement_projection(retry_attempt, source, settlement_report)) return 82;
+    if (!canonical_retry_settlement_projection(retry_attempt, source, settlement_report))
+        return fail(82);
     const collision_evidence::Envelope settlement_envelope =
         canonical_expected_envelope(transaction,
                                     evidence_target,
@@ -3411,10 +3665,20 @@ static int canonical_target_flow(int control,
             collision_evidence::encode_retry_settlement(
                 token, settlement_envelope, settlement_report),
             collision_evidence::max_payload(collision_evidence::ReportKind::RetrySettlement),
-            transaction_deadline) ||
-        !retry_attempt.close_evidence(attempt_diagnostic) || !source.remove(source_diagnostic) ||
-        !directory.settle(directory_diagnostic) || !executable.close(executable_diagnostic))
-        return 83;
+            transaction_deadline))
+        return fail(83);
+    if (!retry_attempt.close_evidence(attempt_diagnostic)) return fail(83);
+    const CanonicalCleanupResult normal_cleanup = canonical_target_cleanup(retry_attempt,
+                                                                           collision_attempt,
+                                                                           reservation,
+                                                                           source,
+                                                                           directory,
+                                                                           executable,
+                                                                           cleanup_deadline);
+    if (!normal_cleanup.success() ||
+        !canonical_success_owners_settled(
+            retry_attempt, collision_attempt, reservation, source, directory, executable))
+        return fail(83);
     const collision_evidence::RetryFinalCapture final_report{static_cast<u64>(final_capture.size()),
                                                              final_capture};
     const collision_evidence::Envelope final_envelope =
@@ -3431,17 +3695,288 @@ static int canonical_target_flow(int control,
             collision_evidence::max_payload(collision_evidence::ReportKind::RetryFinalCapture),
             transaction_deadline) ||
         !canonical_target_settlement(control, token, machine, transaction_deadline))
-        return 84;
+        return fail(84);
     if (!canonical_target_decision(control,
                                    token,
                                    machine,
                                    transaction_deadline,
                                    collision_control::DecisionKind::Finish) ||
         machine.state() != collision_control::State::Complete)
-        return 85;
+        return fail(85);
     close(control);
     (void)control_path;
     return 0;
+}
+
+enum class CanonicalCleanupSelfCheckResult : std::uint8_t { Pass, Prerequisite, Fail };
+
+static bool canonical_cleanup_order(const CanonicalCleanupResult& result,
+                                    std::initializer_list<CanonicalCleanupPhase> expected) {
+    if (result.order_size != expected.size()) return false;
+    return std::equal(expected.begin(), expected.end(), result.order.begin());
+}
+
+static bool canonical_cleanup_setup(u32 ipv4,
+                                    const std::string& self,
+                                    private_directory::PrivateDirectoryLease& directory,
+                                    source_lease::WildcardAttemptSourceLease& source,
+                                    executable_lease::ExecutableLease& executable,
+                                    exact_reservation::ExactTcpReservationLease& reservation,
+                                    std::string& error) {
+    private_directory::Diagnostic directory_diagnostic;
+    source_lease::Diagnostic source_diagnostic;
+    executable_lease::Diagnostic executable_diagnostic;
+    exact_reservation::Diagnostic reservation_diagnostic;
+    if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic)) {
+        error = "canonical cleanup self-check directory acquisition failed";
+        return false;
+    }
+    if (!source_lease::WildcardAttemptSourceLease::stage(directory.descriptor(),
+                                                         directory.path(),
+                                                         "canonical-cleanup-self-check.rut",
+                                                         source,
+                                                         source_diagnostic)) {
+        error = "canonical cleanup self-check source acquisition failed";
+        return false;
+    }
+    if (!executable_lease::ExecutableLease::create(self, executable, executable_diagnostic)) {
+        error = "canonical cleanup self-check executable acquisition failed";
+        return false;
+    }
+    if (!exact_reservation::ExactTcpReservationLease::reserve(
+            ipv4, reservation, reservation_diagnostic)) {
+        error = "canonical cleanup self-check reservation acquisition failed";
+        return false;
+    }
+    if (!source.finalize_exact_bytes("route GET \"/\" { return 204 }\n", source_diagnostic)) {
+        error = "canonical cleanup self-check source finalization failed";
+        return false;
+    }
+    return true;
+}
+
+static CanonicalCleanupSelfCheckResult canonical_target_cleanup_self_check(
+    const char* executable_argument, std::string& error) {
+    std::array<char, PATH_MAX> resolved{};
+    if (realpath(executable_argument, resolved.data()) == nullptr || resolved.front() != '/') {
+        error = "canonical cleanup self-check executable was not canonical";
+        return CanonicalCleanupSelfCheckResult::Fail;
+    }
+    const std::string self(resolved.data());
+    std::vector<u32> addresses;
+    exact_reservation::Diagnostic discovery_diagnostic;
+    if (!exact_reservation::discover_eligible_ipv4(addresses, discovery_diagnostic) ||
+        addresses.empty()) {
+        error = "canonical cleanup self-check has no eligible nonloopback IPv4 address";
+        return CanonicalCleanupSelfCheckResult::Prerequisite;
+    }
+    const u32 ipv4 = addresses.front();
+    const auto cleanup_deadline = [] {
+        return std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    };
+
+    // Acquisition failure after the first real owner must still terminalize
+    // both empty attempt wrappers and settle the acquired directory.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        private_directory::Diagnostic directory_diagnostic;
+        if (!private_directory::PrivateDirectoryLease::create(directory, directory_diagnostic)) {
+            error = "canonical acquisition-failure self-check setup failed";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
+                                                                       collision_attempt,
+                                                                       reservation,
+                                                                       source,
+                                                                       directory,
+                                                                       executable,
+                                                                       cleanup_deadline());
+        if (!result.success() || !result.children_terminal || result.reservation_attempted ||
+            result.source_attempted || !result.directory_attempted || result.executable_attempted ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Directory}) ||
+            !canonical_directory_is_settled(directory)) {
+            error = "canonical acquisition-failure cleanup order/state was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // A collision-side partial prepare owns a real paused direct child while G
+    // is held. Cleanup must reap it before releasing G and the outer owners.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::HooksForTesting hooks;
+        hooks.prepare_failure = public_attempt::PrepareFailurePoint::AfterChild;
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = collision_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), hooks, attempt_diagnostic);
+        const pid_t child = collision_attempt.child_pid();
+        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
+                                                                       collision_attempt,
+                                                                       reservation,
+                                                                       source,
+                                                                       directory,
+                                                                       executable,
+                                                                       cleanup_deadline());
+        if (prepared || child <= 0 || !result.success() || !result.children_terminal ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Reservation,
+                                      CanonicalCleanupPhase::Source,
+                                      CanonicalCleanupPhase::Directory,
+                                      CanonicalCleanupPhase::Executable}) ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical G-held collision-partial cleanup was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // After G release, execute this same binary into a private live-child mode
+    // and model a transport failure. The epilogue must settle that exact child
+    // before removing source/directory/executable owners.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        exact_reservation::Diagnostic reservation_diagnostic;
+        if (!reservation.release(reservation_diagnostic)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            error = "canonical retry-live self-check could not release G";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = retry_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), {}, attempt_diagnostic);
+        const bool live = prepared &&
+                          retry_attempt.exec_and_observe(
+                              source, executable, cleanup_deadline(), attempt_diagnostic) &&
+                          retry_attempt.state() == public_attempt::State::ExecObservedLive;
+        const CanonicalCleanupResult result = canonical_target_cleanup(retry_attempt,
+                                                                       collision_attempt,
+                                                                       reservation,
+                                                                       source,
+                                                                       directory,
+                                                                       executable,
+                                                                       cleanup_deadline());
+        if (!live || !result.success() || !result.children_terminal ||
+            result.reservation_attempted ||
+            !canonical_cleanup_order(result,
+                                     {CanonicalCleanupPhase::RetryAttempt,
+                                      CanonicalCleanupPhase::CollisionAttempt,
+                                      CanonicalCleanupPhase::Source,
+                                      CanonicalCleanupPhase::Directory,
+                                      CanonicalCleanupPhase::Executable}) ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical G-released retry-live cleanup was not exact";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+
+    // An expired attempt-cleanup deadline must leave every outer owner intact.
+    // A later explicit call is used only by this self-check to settle its real
+    // owned child and prove that the first call did not release anything.
+    {
+        private_directory::PrivateDirectoryLease directory;
+        source_lease::WildcardAttemptSourceLease source;
+        executable_lease::ExecutableLease executable;
+        exact_reservation::ExactTcpReservationLease reservation;
+        public_attempt::PublicRutAttemptLease collision_attempt;
+        public_attempt::PublicRutAttemptLease retry_attempt;
+        if (!canonical_cleanup_setup(
+                ipv4, self, directory, source, executable, reservation, error)) {
+            (void)canonical_target_cleanup(retry_attempt,
+                                           collision_attempt,
+                                           reservation,
+                                           source,
+                                           directory,
+                                           executable,
+                                           cleanup_deadline());
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+        const std::array<std::string_view, 3u> arguments = {
+            executable.canonical_path(), source.path(), "--canonical-cleanup-live-self-check"};
+        public_attempt::Diagnostic attempt_diagnostic;
+        const bool prepared = retry_attempt.prepare(
+            source, executable, arguments, cleanup_deadline(), {}, attempt_diagnostic);
+        const CanonicalCleanupResult first =
+            canonical_target_cleanup(retry_attempt,
+                                     collision_attempt,
+                                     reservation,
+                                     source,
+                                     directory,
+                                     executable,
+                                     std::chrono::steady_clock::now());
+        const bool outer_preserved = reservation.state() == exact_reservation::State::Held &&
+                                     source.state() == source_lease::State::Active &&
+                                     directory.state() == private_directory::State::Owned &&
+                                     executable.active();
+        const CanonicalCleanupResult recovery = canonical_target_cleanup(retry_attempt,
+                                                                         collision_attempt,
+                                                                         reservation,
+                                                                         source,
+                                                                         directory,
+                                                                         executable,
+                                                                         cleanup_deadline());
+        if (!prepared || first.success() || first.children_terminal || !outer_preserved ||
+            first.order_size != 2u || first.order[0] != CanonicalCleanupPhase::RetryAttempt ||
+            first.order[1] != CanonicalCleanupPhase::CollisionAttempt || !recovery.success() ||
+            !canonical_success_owners_settled(
+                retry_attempt, collision_attempt, reservation, source, directory, executable)) {
+            error = "canonical cleanup failure did not preserve outer owners";
+            return CanonicalCleanupSelfCheckResult::Fail;
+        }
+    }
+    return CanonicalCleanupSelfCheckResult::Pass;
 }
 
 static bool canonical_parent_phase(int target_fd,
@@ -13111,6 +13646,26 @@ static bool run_positive(const std::string& sudo_path,
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 3 && strcmp(argv[2], "--canonical-cleanup-live-self-check") == 0) {
+        for (;;) pause();
+    }
+    if (argc == 2 && strcmp(argv[1], "--canonical-target-cleanup-self-check") == 0) {
+        std::string error;
+        const CanonicalCleanupSelfCheckResult result =
+            canonical_target_cleanup_self_check(argv[0], error);
+        switch (result) {
+            case CanonicalCleanupSelfCheckResult::Pass:
+                std::cerr << "PASS: #377 canonical Target cleanup self-check\n";
+                return 0;
+            case CanonicalCleanupSelfCheckResult::Prerequisite:
+                std::cerr << "SKIP [#377 canonical Target cleanup self-check]: " << error << "\n";
+                return 77;
+            case CanonicalCleanupSelfCheckResult::Fail:
+                std::cerr << "FAIL [#377 canonical Target cleanup self-check]: " << error << "\n";
+                return 1;
+        }
+        return 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--wildcard-attempt-protocol-self-check") == 0) {
         std::string error;
         if (!wildcard_attempt_protocol_self_check(error)) {
