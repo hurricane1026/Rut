@@ -3671,11 +3671,13 @@ static bool canonical_parent_retry_identity(const collision_evidence::RetryLive&
                                             const collision_evidence::Target& evidence_target,
                                             u32 positive_ipv4,
                                             u32 guard_ipv4,
+                                            u16 expected_port,
                                             std::string& error) {
     if (report.header.child_pid <= 1u ||
         report.header.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
         report.header.child_pid == 0u || report.header.child_start == 0u ||
         report.pidfd.pidfd_fd > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        report.port != expected_port || report.startup.port != expected_port ||
         report.procs.first_tag != 1u || report.procs.second_tag != 1u ||
         report.procs.first != report.procs.second ||
         report.procs.first.pid != report.header.child_pid ||
@@ -3871,8 +3873,14 @@ static bool run_canonical_collision_release_parent(int target_fd,
         canonical_envelope_from_frame(retry_frame, collision_evidence::ReportKind::RetryLive);
     collision_evidence::RetryLive retry_live;
     if (!collision_evidence::decode_retry_live(retry_frame, token, retry_envelope, retry_live) ||
-        !canonical_parent_retry_identity(
-            retry_live, target_proc, executable, evidence_target, guard_ipv4, positive_ipv4, error))
+        !canonical_parent_retry_identity(retry_live,
+                                         target_proc,
+                                         executable,
+                                         evidence_target,
+                                         guard_ipv4,
+                                         positive_ipv4,
+                                         static_cast<u16>(source.port),
+                                         error))
         return false;
     if (!canonical_receive_evidence(
             target_fd,
