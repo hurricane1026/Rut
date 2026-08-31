@@ -3457,7 +3457,9 @@ static bool canonical_parent_phase(int target_fd,
 }
 
 static bool canonical_parent_g_evidence(const collision_evidence::ReservationSource& source,
-                                        const ProcIdentity& target) {
+                                        const ProcIdentity& target,
+                                        u32 positive_ipv4,
+                                        u32 guard_ipv4) {
     if (target.pid <= 1 || source.g_fd > static_cast<u64>(std::numeric_limits<int>::max()))
         return false;
     const int descriptor = static_cast<int>(source.g_fd);
@@ -3491,8 +3493,16 @@ static bool canonical_parent_g_evidence(const collision_evidence::ReservationSou
         std::string rest;
         std::getline(lines, rest);
     }
-    return found_flags && (flags & static_cast<u64>(O_CLOEXEC)) != 0u &&
-           (flags & ~static_cast<u64>(O_CLOEXEC)) == source.g_f_getfl;
+    if (!found_flags || (flags & static_cast<u64>(O_CLOEXEC)) == 0u ||
+        (flags & ~static_cast<u64>(O_CLOEXEC)) != source.g_f_getfl)
+        return false;
+    privileged_listener::ProcTcpTable table;
+    privileged_listener::Diagnostic diagnostic;
+    privileged_listener::GuardReservationEvidence reservation;
+    const privileged_listener::ListenerPlan plan{positive_ipv4, guard_ipv4, source.port};
+    return read_process_tcp_table(target.pid, table) &&
+           privileged_listener::classify_guard_reservation(
+               table, plan, source.ino, reservation, diagnostic);
 }
 
 static bool canonical_parent_decision(int target_fd,
@@ -3594,7 +3604,7 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         source.source_path.compare(
             source.source_path.size() - suffix.size(), suffix.size(), suffix) != 0 ||
         source.source_path.find('\0') != std::string::npos || executable.empty() ||
-        !canonical_parent_g_evidence(source, target)) {
+        !canonical_parent_g_evidence(source, target, positive_ipv4, guard_ipv4)) {
         error = "reservation/source bootstrap projection was not exact";
         return false;
     }
