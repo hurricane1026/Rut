@@ -361,6 +361,93 @@ bool PublicRutAttemptLease::close_evidence(Diagnostic& diagnostic) {
     return true;
 }
 
+bool PublicRutAttemptLease::cleanup(Clock::time_point deadline, Diagnostic& diagnostic) {
+    diagnostic = {};
+    ++cleanup_->explicit_cleanup_calls;
+    cleanup_->explicit_cleanup_attempted = true;
+    if (cleanup_->explicit_cleanup_complete) {
+        diagnostic = cleanup_->explicit_cleanup_diagnostic;
+        return cleanup_->explicit_cleanup_reportable_success;
+    }
+
+    Diagnostic first_failure;
+    if (child_.active()) {
+        child::Diagnostic child_diagnostic;
+        bool settled = child_.cleanup(deadline, child_diagnostic);
+        // Exec failure is published immediately before the child exits.  If
+        // that transition wins the pidfd liveness check, the child cleanup
+        // reports Pidfd/EIO without signalling or detaching anything. Retry
+        // only that explicit transition race under the unchanged deadline;
+        // the next waitpid observes and reaps the already-dead direct child.
+        while (!settled && child_.active() &&
+               child_diagnostic.phase == child::FailurePhase::Pidfd &&
+               child_diagnostic.error_number == EIO && settlement_ && !settlement_->terminal &&
+               !settlement_->reaped && Clock::now() < deadline) {
+            const int timeout = remaining_ms(deadline);
+            if (timeout <= 0) break;
+            (void)poll(nullptr, 0, timeout > 1 ? 1 : timeout);
+            settled = child_.cleanup(deadline, child_diagnostic);
+        }
+        record_attempt(settled, cleanup_->child_attempted, cleanup_->child_settled);
+        if (!settled)
+            first_failure = {FailurePhase::Child, nonzero(child_diagnostic.error_number, EIO)};
+    }
+
+    // A live or not-provably-reaped child may still use every following
+    // owner. Preserve them and allow a later call with the same caller's next
+    // deadline to finish the direct-child cleanup.
+    const bool safe = !settlement_ || (settlement_->terminal && settlement_->reaped);
+    if (!safe) {
+        if (first_failure.phase == FailurePhase::None)
+            first_failure = {FailurePhase::Child, ECHILD};
+        diagnostic = first_failure;
+        cleanup_->explicit_cleanup_diagnostic = diagnostic;
+        retain_terminal_failure(diagnostic);
+        state_ = State::Failed;
+        return false;
+    }
+
+    if (handoff_.active()) {
+        handoff::Diagnostic handoff_diagnostic;
+        const bool closed = handoff_.close(handoff_diagnostic);
+        record_attempt(closed, cleanup_->handoff_attempted, cleanup_->handoff_closed);
+        if (!closed && first_failure.phase == FailurePhase::None)
+            first_failure = {FailurePhase::Handoff, nonzero(handoff_diagnostic.error_number, EIO)};
+    }
+    if (null_input_.value >= 0) {
+        const bool closed = null_input_.close_owned();
+        const int close_error = errno;
+        record_attempt(closed, cleanup_->null_attempted, cleanup_->null_closed);
+        if (!closed && first_failure.phase == FailurePhase::None)
+            first_failure = {FailurePhase::NullInput, nonzero(close_error, EIO)};
+    }
+    capture::Diagnostic capture_diagnostic;
+    if (capture_.active() && !capture_.settled()) {
+        const bool settled = capture_.settle(capture_diagnostic);
+        record_attempt(settled, cleanup_->capture_settle_attempted, cleanup_->capture_settled);
+        if (!settled && first_failure.phase == FailurePhase::None)
+            first_failure = {FailurePhase::Capture, nonzero(capture_diagnostic.error_number, EIO)};
+    }
+    if (capture_.active()) {
+        const bool closed = capture_.close(capture_diagnostic);
+        record_attempt(closed, cleanup_->capture_close_attempted, cleanup_->capture_closed);
+        if (!closed && first_failure.phase == FailurePhase::None)
+            first_failure = {FailurePhase::Close, nonzero(capture_diagnostic.error_number, EIO)};
+    }
+
+    cleanup_->explicit_cleanup_complete = true;
+    cleanup_->explicit_cleanup_reportable_success = first_failure.phase == FailurePhase::None;
+    cleanup_->explicit_cleanup_diagnostic = first_failure;
+    diagnostic = first_failure;
+    if (cleanup_->explicit_cleanup_reportable_success) {
+        if (state_ != State::Empty) state_ = State::EvidenceClosed;
+        return true;
+    }
+    state_ = State::Failed;
+    retain_terminal_failure(diagnostic);
+    return false;
+}
+
 void PublicRutAttemptLease::destructor_cleanup() {
     cleanup_->destructor_attempted = true;
     Diagnostic diagnostic;

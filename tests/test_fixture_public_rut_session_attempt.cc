@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 namespace attempt = rut::test::fixture_public_rut_session_attempt;
 namespace directory = rut::test::fixture_private_directory_lease;
@@ -180,12 +181,28 @@ bool run_case(const char* name, const std::function<bool(Owners&)>& body) {
     return ok;
 }
 
+bool empty_cleanup(Owners&) {
+    attempt::PublicRutAttemptLease lease;
+    attempt::Diagnostic diagnostic;
+    const auto cleanup = lease.cleanup_state();
+    return check(lease.cleanup(Clock::now(), diagnostic), "empty cleanup") &&
+           check(lease.state() == attempt::State::Empty && cleanup->explicit_cleanup_complete &&
+                     cleanup->explicit_cleanup_reportable_success,
+                 "empty cleanup state") &&
+           check(lease.cleanup(Clock::now(), diagnostic), "empty cleanup replay") &&
+           check(cleanup->explicit_cleanup_calls == 2u && !cleanup->child_attempted &&
+                     !cleanup->handoff_attempted && !cleanup->null_attempted &&
+                     !cleanup->capture_settle_attempted && !cleanup->capture_close_attempted,
+                 "empty cleanup has no owner operations");
+}
+
 bool partial_prepare(Owners& owners, attempt::PrepareFailurePoint point) {
     attempt::HooksForTesting hooks;
     hooks.prepare_failure = point;
     attempt::Diagnostic diagnostic;
     std::shared_ptr<const attempt::CleanupState> cleanup;
     bool rejected = false;
+    bool explicitly_cleaned = false;
     {
         attempt::PublicRutAttemptLease lease;
         cleanup = lease.cleanup_state();
@@ -197,10 +214,34 @@ bool partial_prepare(Owners& owners, attempt::PrepareFailurePoint point) {
                                   hooks,
                                   diagnostic) &&
                    lease.state() == attempt::State::Failed;
+        const attempt::Diagnostic prepare_diagnostic = diagnostic;
+        explicitly_cleaned = lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic) &&
+                             diagnostic.phase == attempt::FailurePhase::None &&
+                             lease.state() == attempt::State::EvidenceClosed;
+        const unsigned child_attempts = cleanup->child_attempted ? 1u : 0u;
+        const unsigned handoff_attempts = cleanup->handoff_attempted ? 1u : 0u;
+        const unsigned null_attempts = cleanup->null_attempted ? 1u : 0u;
+        const unsigned capture_settle_attempts = cleanup->capture_settle_attempted ? 1u : 0u;
+        const unsigned capture_close_attempts = cleanup->capture_close_attempted ? 1u : 0u;
+        explicitly_cleaned =
+            check(lease.cleanup(Clock::now(), diagnostic), "partial cleanup idempotent replay") &&
+            check(cleanup->explicit_cleanup_calls == 2u &&
+                      static_cast<unsigned>(cleanup->child_attempted) == child_attempts &&
+                      static_cast<unsigned>(cleanup->handoff_attempted) == handoff_attempts &&
+                      static_cast<unsigned>(cleanup->null_attempted) == null_attempts &&
+                      static_cast<unsigned>(cleanup->capture_settle_attempted) ==
+                          capture_settle_attempts &&
+                      static_cast<unsigned>(cleanup->capture_close_attempted) ==
+                          capture_close_attempts,
+                  "partial cleanup does not repeat owned operations") &&
+            prepare_diagnostic.phase == attempt::FailurePhase::Injected &&
+            prepare_diagnostic.error_number == EIO && explicitly_cleaned;
     }
     return check(
-        rejected && cleanup && cleanup->destructor_attempted &&
-            !cleanup->destructor_reportable_success &&
+        rejected && explicitly_cleaned && cleanup && cleanup->explicit_cleanup_attempted &&
+            cleanup->explicit_cleanup_complete && cleanup->explicit_cleanup_reportable_success &&
+            cleanup->explicit_cleanup_diagnostic.phase == attempt::FailurePhase::None &&
+            cleanup->destructor_attempted && !cleanup->destructor_reportable_success &&
             cleanup->diagnostic.phase == attempt::FailurePhase::Injected &&
             cleanup->diagnostic.error_number == EIO &&
             cleanup->child_attempted == (point >= attempt::PrepareFailurePoint::AfterChild) &&
@@ -255,6 +296,15 @@ bool exec_failure(Owners& owners) {
         result = check(lease.exec_observation().outcome ==
                            rut::test::fixture_executable_exec_handoff::ExecOutcome::ExecFailure,
                        "honest exec-failure evidence") &&
+                 result;
+        const auto settlement = lease.settlement_receipt();
+        const bool bounded_cleanup =
+            lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic);
+        result = check(bounded_cleanup, "exec-failure bounded cleanup") &&
+                 check(settlement && settlement->terminal && settlement->reaped &&
+                           settlement->error_number == 0 && WIFEXITED(settlement->wait_status) &&
+                           WEXITSTATUS(settlement->wait_status) == 131,
+                       "exec-failure natural settlement receipt") &&
                  result;
     }
     if (bad_executable.active())
@@ -351,6 +401,112 @@ bool natural_exit(Owners& owners, bool timeout_first) {
            check(lease.close_evidence(diagnostic), "natural evidence close");
 }
 
+bool live_bounded_cleanup(Owners& owners) {
+    attempt::HooksForTesting hooks;
+    attempt::Diagnostic diagnostic;
+    attempt::PublicRutAttemptLease lease;
+    if (!prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) ||
+        !observe_ok(lease, owners, diagnostic))
+        return false;
+    const pid_t child_pid = lease.child_pid();
+    const auto settlement = lease.settlement_receipt();
+    const auto cleanup_state = lease.cleanup_state();
+    const auto cleanup_deadline = Clock::now() + std::chrono::seconds(2);
+    if (!check(lease.cleanup(cleanup_deadline, diagnostic), "independent live cleanup deadline") ||
+        !check(Clock::now() < cleanup_deadline, "live cleanup honored caller deadline") ||
+        !check(lease.state() == attempt::State::EvidenceClosed && settlement &&
+                   settlement->child_pid == child_pid && settlement->terminal &&
+                   settlement->reaped && WIFSIGNALED(settlement->wait_status) &&
+                   WTERMSIG(settlement->wait_status) == SIGKILL,
+               "live cleanup exact terminal receipt") ||
+        !check(cleanup_state->child_attempted && cleanup_state->child_settled &&
+                   cleanup_state->handoff_closed && cleanup_state->null_closed &&
+                   cleanup_state->capture_settled && cleanup_state->capture_closed,
+               "live cleanup fixed owner settlement"))
+        return false;
+    return check(lease.cleanup(Clock::now(), diagnostic), "live cleanup idempotent replay") &&
+           check(cleanup_state->explicit_cleanup_calls == 2u, "live cleanup replay call evidence");
+}
+
+bool live_cleanup_deadline_retry(Owners& owners) {
+    attempt::HooksForTesting hooks;
+    attempt::Diagnostic diagnostic;
+    attempt::PublicRutAttemptLease lease;
+    if (!prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) ||
+        !observe_ok(lease, owners, diagnostic))
+        return false;
+    const auto settlement = lease.settlement_receipt();
+    const auto cleanup = lease.cleanup_state();
+    if (!check(!lease.cleanup(Clock::now(), diagnostic) &&
+                   diagnostic.phase == attempt::FailurePhase::Child &&
+                   diagnostic.error_number == ETIMEDOUT,
+               "expired cleanup deadline fails bounded") ||
+        !check(settlement && !settlement->terminal && !settlement->reaped &&
+                   cleanup->child_attempted && !cleanup->child_settled &&
+                   !cleanup->handoff_attempted && !cleanup->null_attempted &&
+                   !cleanup->capture_settle_attempted && !cleanup->capture_close_attempted,
+               "expired cleanup preserves child-used owners"))
+        return false;
+    return check(lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic),
+                 "later independent cleanup deadline succeeds") &&
+           check(settlement->terminal && settlement->reaped &&
+                     WIFSIGNALED(settlement->wait_status) &&
+                     WTERMSIG(settlement->wait_status) == SIGKILL &&
+                     cleanup->explicit_cleanup_complete &&
+                     cleanup->explicit_cleanup_reportable_success && cleanup->handoff_closed &&
+                     cleanup->null_closed && cleanup->capture_settled && cleanup->capture_closed,
+                 "deadline retry settles exact child and owners");
+}
+
+bool natural_timeout_then_cleanup(Owners& owners) {
+    attempt::HooksForTesting hooks;
+    attempt::Diagnostic diagnostic;
+    attempt::PublicRutAttemptLease lease;
+    if (!prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) ||
+        !observe_ok(lease, owners, diagnostic) ||
+        !check(!lease.settle_natural(1, Clock::now(), diagnostic) &&
+                   diagnostic.phase == attempt::FailurePhase::Wait &&
+                   diagnostic.error_number == ETIMEDOUT &&
+                   lease.state() == attempt::State::ExecObservedLive,
+               "natural settlement timeout preserves cleanup authority"))
+        return false;
+    const auto settlement = lease.settlement_receipt();
+    return check(lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic),
+                 "cleanup after natural settlement timeout") &&
+           check(settlement && settlement->terminal && settlement->reaped &&
+                     WIFSIGNALED(settlement->wait_status) &&
+                     WTERMSIG(settlement->wait_status) == SIGKILL,
+                 "timeout cleanup exact killed receipt");
+}
+
+bool closed_evidence_cleanup_replay(Owners& owners) {
+    attempt::HooksForTesting hooks;
+    hooks.handoff.post_eof_delay_ms = 100u;
+    attempt::Diagnostic diagnostic;
+    attempt::PublicRutAttemptLease lease;
+    if (!prepare_ok(lease, owners, "--attempt-exit1", hooks, diagnostic) ||
+        !observe_ok(lease, owners, diagnostic) ||
+        !lease.settle_natural(1, Clock::now() + std::chrono::seconds(2), diagnostic) ||
+        !lease.close_evidence(diagnostic))
+        return false;
+    const auto cleanup_state = lease.cleanup_state();
+    const auto before = *cleanup_state;
+    return check(lease.cleanup(Clock::now(), diagnostic), "closed evidence cleanup") &&
+           check(lease.cleanup(Clock::now(), diagnostic), "closed evidence cleanup replay") &&
+           check(cleanup_state->explicit_cleanup_calls == 2u &&
+                     cleanup_state->child_attempted == before.child_attempted &&
+                     cleanup_state->child_settled == before.child_settled &&
+                     cleanup_state->handoff_attempted == before.handoff_attempted &&
+                     cleanup_state->handoff_closed == before.handoff_closed &&
+                     cleanup_state->null_attempted == before.null_attempted &&
+                     cleanup_state->null_closed == before.null_closed &&
+                     cleanup_state->capture_settle_attempted == before.capture_settle_attempted &&
+                     cleanup_state->capture_settled == before.capture_settled &&
+                     cleanup_state->capture_close_attempted == before.capture_close_attempted &&
+                     cleanup_state->capture_closed == before.capture_closed,
+                 "closed evidence cleanup does not repeat settled owners");
+}
+
 bool synchronous_validation_failures(Owners& owners) {
     attempt::HooksForTesting hooks;
     attempt::Diagnostic diagnostic;
@@ -441,6 +597,46 @@ bool close_uncertainty(Owners& owners, unsigned kind) {
                  "close uncertainty retained post-destructor failure");
 }
 
+bool explicit_cleanup_close_failure(Owners& owners) {
+    CloseContext context;
+    // release_and_observe retires three status writers first; fail the first
+    // handoff descriptor close performed by attempt cleanup.
+    context.fail_on = 4u;
+    attempt::HooksForTesting hooks;
+    hooks.handoff.close_fd = close_then_fail_selected;
+    hooks.handoff.context = &context;
+    attempt::Diagnostic diagnostic;
+    attempt::PublicRutAttemptLease lease;
+    if (!prepare_ok(lease, owners, "--attempt-live", hooks, diagnostic) ||
+        !observe_ok(lease, owners, diagnostic))
+        return false;
+    const auto settlement = lease.settlement_receipt();
+    const auto cleanup = lease.cleanup_state();
+    if (!check(!lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic) &&
+                   diagnostic.phase == attempt::FailurePhase::Handoff &&
+                   diagnostic.error_number == EINTR,
+               "explicit cleanup retains first close failure") ||
+        !check(settlement && settlement->terminal && settlement->reaped &&
+                   WIFSIGNALED(settlement->wait_status) &&
+                   WTERMSIG(settlement->wait_status) == SIGKILL,
+               "close failure follows exact child settlement") ||
+        !check(cleanup->child_attempted && cleanup->child_settled && cleanup->handoff_attempted &&
+                   !cleanup->handoff_closed && cleanup->null_attempted && cleanup->null_closed &&
+                   cleanup->capture_settle_attempted && cleanup->capture_settled &&
+                   cleanup->capture_close_attempted && cleanup->capture_closed &&
+                   cleanup->explicit_cleanup_complete &&
+                   !cleanup->explicit_cleanup_reportable_success,
+               "close failure still cleans remaining owners"))
+        return false;
+    const unsigned calls_after_cleanup = context.calls;
+    return check(!lease.cleanup(Clock::now(), diagnostic) &&
+                     diagnostic.phase == attempt::FailurePhase::Handoff &&
+                     diagnostic.error_number == EINTR,
+                 "failed cleanup idempotent diagnostic replay") &&
+           check(context.calls == calls_after_cleanup && cleanup->explicit_cleanup_calls == 2u,
+                 "failed cleanup does not repeat closes");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -454,6 +650,7 @@ int main(int argc, char** argv) {
     }
 
     bool ok = true;
+    ok = run_case("empty cleanup", empty_cleanup) && ok;
     constexpr std::array partial_points = {attempt::PrepareFailurePoint::AfterCapture,
                                            attempt::PrepareFailurePoint::AfterNullInput,
                                            attempt::PrepareFailurePoint::AfterHandoff,
@@ -470,6 +667,10 @@ int main(int argc, char** argv) {
     ok = run_case("natural timeout retry",
                   [](Owners& owners) { return natural_exit(owners, true); }) &&
          ok;
+    ok = run_case("live bounded cleanup", live_bounded_cleanup) && ok;
+    ok = run_case("live cleanup deadline retry", live_cleanup_deadline_retry) && ok;
+    ok = run_case("natural timeout then cleanup", natural_timeout_then_cleanup) && ok;
+    ok = run_case("closed evidence cleanup replay", closed_evidence_cleanup_replay) && ok;
     ok = run_case("synchronous validation", synchronous_validation_failures) && ok;
     ok = run_case("handoff close uncertainty",
                   [](Owners& owners) { return close_uncertainty(owners, 0u); }) &&
@@ -480,6 +681,7 @@ int main(int argc, char** argv) {
     ok = run_case("capture close uncertainty",
                   [](Owners& owners) { return close_uncertainty(owners, 2u); }) &&
          ok;
+    ok = run_case("explicit cleanup close failure", explicit_cleanup_close_failure) && ok;
     if (!ok) return 1;
     std::puts("PASS: #377 reusable public RUT attempt lease");
     return 0;
