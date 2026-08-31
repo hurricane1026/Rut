@@ -840,11 +840,21 @@ if(RUT_ENABLE_JIT)
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
         fixture_ancestry_bundle
+        fixture_collision_release_evidence_protocol
+        fixture_collision_release_evidence_transport
+        fixture_collision_release_protocol
         fixture_direct_launch
+        fixture_exact_tcp_reservation_lease
+        fixture_executable_exec_handoff
+        fixture_executable_lease
         fixture_identity_bundle
+        fixture_private_directory_lease
         fixture_privileged_ancestry
         fixture_privileged_listener
+        fixture_public_rut_session_attempt
         fixture_worker_protocol
+        fixture_wildcard_paused_child_lease
+        fixture_wildcard_source_lease
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -855,11 +865,12 @@ if(RUT_ENABLE_JIT)
     add_dependencies(test_fixture_privileged_broker rut)
     add_test(NAME test_fixture_privileged_broker
              COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+    set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 120
+        TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}
         SKIP_RETURN_CODE 77
     )
     add_test(NAME test_fixture_wildcard_attempt_protocol
@@ -867,6 +878,23 @@ if(RUT_ENABLE_JIT)
                      --wildcard-attempt-protocol-self-check)
     set_tests_properties(test_fixture_wildcard_attempt_protocol PROPERTIES
         LABELS "unit"
+    )
+    add_test(NAME test_fixture_canonical_wait_strategy
+             COMMAND test_fixture_privileged_broker
+                     --canonical-wait-strategy-self-check)
+    set_tests_properties(test_fixture_canonical_wait_strategy PROPERTIES
+        LABELS "unit"
+        TIMEOUT 30
+    )
+    add_test(NAME test_fixture_canonical_target_cleanup
+             COMMAND test_fixture_privileged_broker
+                     --canonical-target-cleanup-self-check)
+    set_tests_properties(test_fixture_canonical_target_cleanup PROPERTIES
+        LABELS "integration;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
     )
     add_test(
         NAME test_nginx_downstream_gate_spike
