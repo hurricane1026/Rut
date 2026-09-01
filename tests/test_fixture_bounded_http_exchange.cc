@@ -1,4 +1,5 @@
 #include "fixture_bounded_http_exchange.h"
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -97,6 +98,8 @@ static std::string valid_response() {
 struct ServerState {
     bool failed = false;
     const char* diagnostic = nullptr;
+    bool allow_send_failure = false;
+    bool allow_empty_request = false;
 };
 
 static void server_failure(ServerState& state, const char* diagnostic) {
@@ -129,11 +132,43 @@ static void serve_response(int listener, const std::string& response, ServerStat
                 break;
             }
             char request[128]{};
-            ssize_t received;
-            do {
-                received = recv(client, request, sizeof(request), 0);
-            } while (received < 0 && errno == EINTR);
-            if (!check(received > 0, "server recv request")) {
+            std::size_t received_total = 0;
+            for (;;) {
+                pollfd request_descriptor{client, POLLIN, 0};
+                int request_ready;
+                do {
+                    request_ready = poll(&request_descriptor, 1, 3000);
+                } while (request_ready < 0 && errno == EINTR);
+                if (!check(request_ready > 0, "server request poll")) {
+                    server_failure(state, "server request poll failed");
+                    break;
+                }
+                if (request_descriptor.revents & (POLLERR | POLLNVAL)) {
+                    server_failure(state, "server request poll reported an error");
+                    break;
+                }
+                if (received_total == sizeof(request)) {
+                    server_failure(state, "server request exceeded bounded size");
+                    break;
+                }
+                const std::size_t available = std::min(received_total, sizeof(request));
+                const ssize_t received =
+                    recv(client, request + available, sizeof(request) - available, 0);
+                if (received == 0) break;
+                if (received < 0 && errno == EINTR) continue;
+                if (received < 0) {
+                    server_failure(state, "server recv failed");
+                    break;
+                }
+                if (received_total + static_cast<std::size_t>(received) > sizeof(request)) {
+                    server_failure(state, "server request exceeded bounded size");
+                    break;
+                }
+                received_total += static_cast<std::size_t>(received);
+            }
+            if (state.failed) break;
+            if (received_total == 0 && state.allow_empty_request) break;
+            if (!check(received_total > 0, "server recv request")) {
                 server_failure(state, "server recv failed");
                 break;
             }
@@ -141,6 +176,7 @@ static void serve_response(int listener, const std::string& response, ServerStat
             while (sent < response.size()) {
                 const ssize_t count =
                     send(client, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+                if (count <= 0 && state.allow_send_failure) break;
                 if (!check(count > 0, "server send response")) {
                     server_failure(state, "server send failed");
                     break;
@@ -154,12 +190,19 @@ static void serve_response(int listener, const std::string& response, ServerStat
     if (client >= 0) close(client);
 }
 
-static bool exchange_server(const std::string& response, Outcome expected) {
+static bool exchange_server(const std::string& response,
+                            Outcome expected,
+                            Observation* result_observation = nullptr,
+                            bool allow_send_failure = false,
+                            std::int64_t deadline_ns_override = 0,
+                            bool allow_empty_request = false) {
     bool ok = true;
     std::uint16_t port = 0;
     const int listener = open_listener(port);
     if (listener < 0) return false;
     ServerState state;
+    state.allow_send_failure = allow_send_failure;
+    state.allow_empty_request = allow_empty_request;
     std::thread server;
     try {
         server = std::thread(serve_response, listener, std::cref(response), std::ref(state));
@@ -170,9 +213,13 @@ static bool exchange_server(const std::string& response, Outcome expected) {
     Observation observation;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto deadline_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count();
+        deadline_ns_override != 0
+            ? deadline_ns_override
+            : std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
+                  .count();
     const bool complete =
         exchange("127.0.0.1", port, "GET / HTTP/1.1\r\n\r\n", deadline_ns, observation);
+    if (result_observation != nullptr) *result_observation = observation;
     if (!check(observation.outcome == expected, "bounded exchange outcome")) ok = false;
     if (!check(complete == (expected == Outcome::Complete), "bounded exchange completion result"))
         ok = false;
@@ -183,6 +230,45 @@ static bool exchange_server(const std::string& response, Outcome expected) {
     if (!check(close(listener) == 0, "listener close")) ok = false;
     return ok;
 }
+
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+static int shutdown_calls = 0;
+static std::int64_t seam_now_value = 0;
+static std::int64_t seam_deadline = 0;
+static int seam_clock_calls = 0;
+static int seam_deadline_call = 0;
+
+static std::int64_t fixed_seam_clock() {
+    return seam_now_value;
+}
+
+static std::int64_t threshold_seam_clock() {
+    ++seam_clock_calls;
+    return seam_clock_calls >= seam_deadline_call ? seam_deadline : seam_now_value;
+}
+
+static int shutdown_eintr_then_success(int fd, int how) {
+    ++shutdown_calls;
+    if (shutdown_calls == 1) {
+        errno = EINTR;
+        return -1;
+    }
+    return ::shutdown(fd, how);
+}
+
+static int shutdown_not_connected(int, int) {
+    ++shutdown_calls;
+    errno = ENOTCONN;
+    return -1;
+}
+
+static int shutdown_eintr_until_deadline(int, int) {
+    ++shutdown_calls;
+    errno = EINTR;
+    seam_now_value += 250000000LL;
+    return -1;
+}
+#endif
 
 int main() {
     bool ok = true;
@@ -232,6 +318,79 @@ int main() {
 
     const int descriptors_before = open_fd_count();
     if (!exchange_server(valid_response(), Outcome::Complete)) ok = false;
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+    {
+        Observation observation;
+        shutdown_calls = 0;
+        test_seam::install(nullptr, shutdown_eintr_then_success);
+        const bool exchanged = exchange_server(valid_response(), Outcome::Complete, &observation);
+        test_seam::reset();
+        if (!check(exchanged && shutdown_calls == 2, "shutdown EINTR is retried")) ok = false;
+        if (!check(observation.send_completed && observation.write_shutdown_started &&
+                       observation.write_shutdown_completed && observation.read_started &&
+                       observation.eof_observed &&
+                       observation.send_completed_nanoseconds <
+                           observation.write_shutdown_completed_nanoseconds &&
+                       observation.write_shutdown_completed_nanoseconds <
+                           observation.completion_nanoseconds,
+                   "successful exchange observes send/shutdown/read ordering"))
+            ok = false;
+    }
+    {
+        Observation observation;
+        shutdown_calls = 0;
+        test_seam::install(nullptr, shutdown_not_connected);
+        const bool exchanged =
+            exchange_server(valid_response(), Outcome::WriteShutdownFailed, &observation, true);
+        test_seam::reset();
+        if (!check(exchanged && shutdown_calls == 1 &&
+                       observation.outcome == Outcome::WriteShutdownFailed &&
+                       observation.error_number == ENOTCONN && observation.send_completed &&
+                       observation.write_shutdown_started &&
+                       !observation.write_shutdown_completed && !observation.read_started &&
+                       !observation.eof_observed,
+                   "terminal shutdown error preserves errno and prevents reads"))
+            ok = false;
+    }
+    {
+        bool found = false;
+        for (seam_deadline_call = 6; seam_deadline_call <= 24 && !found; ++seam_deadline_call) {
+            Observation observation;
+            seam_now_value = 1000000000000LL;
+            seam_deadline = seam_now_value + 1000000000LL;
+            seam_clock_calls = 0;
+            test_seam::install(threshold_seam_clock, nullptr);
+            (void)exchange_server(valid_response(),
+                                  Outcome::DeadlineExceeded,
+                                  &observation,
+                                  true,
+                                  seam_deadline,
+                                  true);
+            test_seam::reset();
+            found = observation.outcome == Outcome::DeadlineExceeded &&
+                    observation.send_completed && !observation.write_shutdown_started &&
+                    !observation.write_shutdown_completed && !observation.read_started;
+        }
+        if (!check(found, "deadline before shutdown is deterministic")) ok = false;
+    }
+    {
+        Observation observation;
+        shutdown_calls = 0;
+        seam_now_value = 1000000000000LL;
+        seam_deadline = seam_now_value + 1000000000LL;
+        test_seam::install(fixed_seam_clock, shutdown_eintr_until_deadline);
+        const bool exchanged = exchange_server(
+            valid_response(), Outcome::DeadlineExceeded, &observation, true, seam_deadline);
+        test_seam::reset();
+        if (!check(exchanged && shutdown_calls == 4 &&
+                       observation.outcome == Outcome::DeadlineExceeded &&
+                       observation.send_completed && observation.write_shutdown_started &&
+                       !observation.write_shutdown_completed && !observation.read_started &&
+                       !observation.eof_observed,
+                   "repeated shutdown EINTR stops at deadline"))
+            ok = false;
+    }
+#endif
     const std::string truncated = valid_response().substr(0, valid_response().size() - 1u);
     if (!exchange_server(truncated, Outcome::ResponseTruncated)) ok = false;
     if (!exchange_server(std::string(5000u, 'x'), Outcome::ResponseLimitExceeded)) ok = false;

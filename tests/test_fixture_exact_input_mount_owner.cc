@@ -1068,7 +1068,7 @@ int main(int argc, char** argv) {
     ExactInputMountDiagnostic lifecycle_selfcheck_diagnostic;
     if (!exact_input_mount_test_nginx_lifecycle_self_checks(lifecycle_mutation_rejections,
                                                             lifecycle_selfcheck_diagnostic) ||
-        lifecycle_mutation_rejections != 55u) {
+        lifecycle_mutation_rejections != 58u) {
         std::cerr << "FAIL [#358 nginx lifecycle pure mutation matrix]: "
                   << lifecycle_selfcheck_diagnostic.message << "\n";
         return 1;
@@ -1921,10 +1921,17 @@ int main(int argc, char** argv) {
             !lifecycle.cgroup_empty_after_stop || !lifecycle.removed_nonforce ||
             !lifecycle.exact_absence || !lifecycle.baseline_restored || !lifecycle.http.attempted ||
             lifecycle.http.outcome != rut::test::bounded_http_exchange::Outcome::Complete ||
-            !lifecycle.http.eof_observed || !lifecycle.http_response_exact ||
-            !lifecycle.upstream_absence_before || !lifecycle.upstream_absence_after ||
-            !lifecycle.logs_captured || !lifecycle.scoped_refusal_log_exact ||
-            lifecycle.operation_failed || lifecycle.container_id.size() != 64u ||
+            !lifecycle.http.eof_observed || !lifecycle.http.send_completed ||
+            !lifecycle.http.write_shutdown_started || !lifecycle.http.write_shutdown_completed ||
+            lifecycle.http.send_completed_nanoseconds <= 0 ||
+            lifecycle.http.write_shutdown_completed_nanoseconds <=
+                lifecycle.http.send_completed_nanoseconds ||
+            lifecycle.http.write_shutdown_completed_nanoseconds >=
+                lifecycle.http.completion_nanoseconds ||
+            !lifecycle.http_response_exact || !lifecycle.upstream_absence_before ||
+            !lifecycle.upstream_absence_after || !lifecycle.logs_captured ||
+            !lifecycle.scoped_refusal_log_exact || lifecycle.operation_failed ||
+            lifecycle.container_id.size() != 64u ||
             lifecycle.container_name != "rut358-nginx-" + context.token ||
             ![&] {
                 const std::uint64_t commands = exact_input_mount_test_command_count();
@@ -1936,6 +1943,12 @@ int main(int argc, char** argv) {
                        replay.sample_a.listener_inode == lifecycle.sample_a.listener_inode &&
                        replay.sample_b.listener_inode == lifecycle.sample_b.listener_inode &&
                        replay.remove_count == lifecycle.remove_count &&
+                       replay.http.write_shutdown_started ==
+                           lifecycle.http.write_shutdown_started &&
+                       replay.http.write_shutdown_completed ==
+                           lifecycle.http.write_shutdown_completed &&
+                       replay.http.write_shutdown_completed_nanoseconds ==
+                           lifecycle.http.write_shutdown_completed_nanoseconds &&
                        replay.terminal_frozen == lifecycle.terminal_frozen &&
                        exact_input_mount_test_command_count() == commands;
             }() ||

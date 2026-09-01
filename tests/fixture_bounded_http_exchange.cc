@@ -17,10 +17,25 @@
 namespace rut::test::bounded_http_exchange {
 namespace {
 
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+test_seam::ClockFunction clock_function = nullptr;
+test_seam::ShutdownFunction shutdown_function = nullptr;
+#endif
+
 std::int64_t now_ns() {
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+    if (clock_function != nullptr) return clock_function();
+#endif
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+int shutdown_write(int fd) {
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+    if (shutdown_function != nullptr) return shutdown_function(fd, SHUT_WR);
+#endif
+    return shutdown(fd, SHUT_WR);
 }
 
 struct WaitResult {
@@ -240,6 +255,18 @@ bool exchange(const std::string& ipv4,
     }
     observation.send_completed = true;
     observation.send_completed_nanoseconds = now_ns();
+    for (;;) {
+        if (now_ns() >= deadline_ns)
+            return fail(Outcome::DeadlineExceeded, "write shutdown deadline exceeded");
+        observation.write_shutdown_started = true;
+        if (shutdown_write(fd) == 0) {
+            observation.write_shutdown_completed = true;
+            observation.write_shutdown_completed_nanoseconds = now_ns();
+            break;
+        }
+        if (errno == EINTR) continue;
+        return fail(Outcome::WriteShutdownFailed, "write shutdown failed", errno);
+    }
     observation.read_started = true;
     std::array<char, 1024> buffer{};
     for (;;) {
@@ -298,5 +325,21 @@ bool exchange(const std::string& ipv4,
     observation.completion_nanoseconds = now_ns();
     return true;
 }
+
+#ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
+namespace test_seam {
+
+void install(ClockFunction clock, ShutdownFunction shutdown) {
+    clock_function = clock;
+    shutdown_function = shutdown;
+}
+
+void reset() {
+    clock_function = nullptr;
+    shutdown_function = nullptr;
+}
+
+}  // namespace test_seam
+#endif
 
 }  // namespace rut::test::bounded_http_exchange

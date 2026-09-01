@@ -25,6 +25,10 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
 add_executable(test_fixture_bounded_http_exchange
     test_fixture_bounded_http_exchange.cc)
 add_library(fixture_bounded_http_exchange STATIC fixture_bounded_http_exchange.cc)
+target_compile_definitions(fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
+target_compile_definitions(test_fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
 target_include_directories(fixture_bounded_http_exchange PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(test_fixture_bounded_http_exchange PRIVATE

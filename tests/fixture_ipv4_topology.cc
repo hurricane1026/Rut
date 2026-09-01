@@ -7048,7 +7048,14 @@ static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObser
         return false;
     }
     if (!observation.http.attempted || observation.http.outcome != Outcome::Complete ||
-        !observation.http.eof_observed || observation.http.raw_response.empty()) {
+        !observation.http.eof_observed || observation.http.raw_response.empty() ||
+        !observation.http.send_started || !observation.http.send_completed ||
+        !observation.http.write_shutdown_started || !observation.http.write_shutdown_completed ||
+        observation.http.send_completed_nanoseconds <= 0 ||
+        observation.http.write_shutdown_completed_nanoseconds <=
+            observation.http.send_completed_nanoseconds ||
+        observation.http.write_shutdown_completed_nanoseconds >=
+            observation.http.completion_nanoseconds) {
         error = "bounded nginx HTTP exchange did not complete with EOF";
         return false;
     }
@@ -9515,6 +9522,13 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     valid_http.http.outcome = Outcome::Complete;
     valid_http.http.terminal_frozen = true;
     valid_http.http.eof_observed = true;
+    valid_http.http.send_started = true;
+    valid_http.http.send_completed = true;
+    valid_http.http.write_shutdown_started = true;
+    valid_http.http.write_shutdown_completed = true;
+    valid_http.http.send_completed_nanoseconds = 2000000000LL;
+    valid_http.http.write_shutdown_completed_nanoseconds = 3000000000LL;
+    valid_http.http.completion_nanoseconds = 4000000000LL;
     valid_http.http.request = http_request;
     valid_http.http.raw_response = http_wire;
     if (!parse_response(http_wire, valid_http.http.parsed, error)) {
@@ -9570,6 +9584,16 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     if (!reject_http(http_mutation)) return false;
     http_mutation = valid_http;
     http_mutation.http.request = "GET /private HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.write_shutdown_started = false;
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.write_shutdown_completed = false;
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.write_shutdown_completed_nanoseconds =
+        http_mutation.http.send_completed_nanoseconds;
     if (!reject_http(http_mutation)) return false;
     ParsedResponse limited;
     std::string parse_error;
@@ -9704,7 +9728,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         return false;
     }
     ++mutation_rejections;
-    return mutation_rejections == 55u;
+    return mutation_rejections == 58u;
 }
 
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
