@@ -13,9 +13,40 @@ enum class ExactInputMountState : std::uint8_t {
     Empty,
     SettingUp,
     ReadyForObservation,
+    ObservingInput,
+    InputReadObserved,
     Recovering,
     Settled,
     Unresolved,
+};
+
+enum class ExactInputReadOutcome : std::uint8_t {
+    None,
+    Complete,
+    SourceRevalidationFailed,
+    ContainerIdentityFailed,
+    CommandStartFailed,
+    DeadlineExceeded,
+    OutputLimitExceeded,
+    StreamError,
+    ExitSignaled,
+    ExitNonzero,
+    StderrNotEmpty,
+    ByteMismatch,
+};
+
+enum class ExactInputReadLaunchStage : std::uint8_t {
+    None,
+    ProcessGroup,
+    ParentDeathGuard,
+    StdoutDuplication,
+    StderrDuplication,
+    DescriptorCustody,
+    SubtreeConfinement,
+    Execute,
+    PidfdOpen,
+    PidfdIdentity,
+    ExecStatusProtocol,
 };
 
 enum class ExactInputMountTerminalResult : std::uint8_t {
@@ -39,6 +70,7 @@ enum class ExactInputMountPhase : std::uint8_t {
     Sidecar,
     MountInspect,
     FileRevalidation,
+    InputObservation,
     SidecarSettlement,
     TopologyRevalidation,
     InputSettlement,
@@ -76,6 +108,8 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     RejectSidecarRevalidationOnce,
     DisconnectNetworkBeforeInputCleanup,
     RejectNetworkASettlementOnce,
+    InputReadRejectSourceRevalidation,
+    InputReadPostCommandSidecarDeath,
 };
 
 struct ExactInputMountOptions {
@@ -120,6 +154,97 @@ struct ExactInputMountSnapshot {
     bool exact_proc_credentials = false;
     bool parser_mutation_matrix_passed = false;
     std::uint32_t parser_rejections = 0;
+};
+
+struct ExactInputReadObservation {
+    ExactInputReadOutcome outcome = ExactInputReadOutcome::None;
+    bool attempted = false;
+    bool terminal_frozen = false;
+    bool command_started = false;
+    bool stdout_eof = false;
+    bool stderr_eof = false;
+    bool child_reaped = false;
+    bool wait_status_valid = false;
+    bool process_group_owned = false;
+    bool process_group_gone = false;
+    bool pidfd_opened = false;
+    bool pidfd_identity_verified = false;
+    bool pidfd_closed_after_group_gone = false;
+    bool final_deadline_recorded = false;
+    bool cleanup_completed_before_final_deadline = false;
+    bool leader_exit_observed_before_group_cleanup = false;
+    bool descendant_group_member_observed = false;
+    bool supervisor_session_verified = false;
+    bool supervisor_subreaper_verified = false;
+    bool actual_exec_observed = false;
+    bool subtree_confinement_installed = false;
+    bool group_echild_observed = false;
+    bool control_eof_cleanup = false;
+    bool setpgid_denied = false;
+    bool setsid_denied = false;
+    bool clone_parent_observed = false;
+    std::uint32_t adopted_reap_count = 0;
+    bool foreign_process_survived = false;
+    bool foreign_fd_excluded = false;
+    bool deadline_exceeded = false;
+    bool output_overflow = false;
+    bool pre_source_revalidated = false;
+    bool pre_container_identity = false;
+    bool pre_mount_inspected = false;
+    // These fields prove the inert sidecar's actual /proc UID/GID within fresh
+    // immutable-identity brackets. They are not credential proof for the
+    // transient docker-exec /bin/cat process.
+    bool pre_proc_credentials = false;
+    bool post_source_revalidated = false;
+    bool post_container_identity = false;
+    bool post_mount_inspected = false;
+    bool post_proc_credentials = false;
+    bool registered_identity_matched = false;
+    bool registered_mount_matched = false;
+    std::size_t expected_size = 0;
+    int stdout_read_errno = 0;
+    int stderr_read_errno = 0;
+    ExactInputReadLaunchStage launch_failure_stage = ExactInputReadLaunchStage::None;
+    int launch_errno = 0;
+    int wait_status = 0;
+    std::vector<std::string> command_argv;
+    std::string resolved_executable;
+    std::string stdout_bytes;
+    std::string stderr_bytes;
+    ExactInputMountDiagnostic diagnostic;
+};
+
+enum class ExactInputReadRunnerTestCase : std::uint8_t {
+    CommandStartFailure,
+    ImmediateExecSuccess,
+    LeaderExitWithDescendant,
+    ForkHandoffChain,
+    SubtreeConfinement,
+    ParentControlEof,
+    StatusShort,
+    StatusOversize,
+    StatusMultiple,
+    StatusBadMagic,
+    StatusBadVersion,
+    StatusReserved,
+    StatusNoneStage,
+    StatusPidfdOpenStage,
+    StatusPidfdIdentityStage,
+    StatusExecStatusProtocolStage,
+    StatusUnknownStage,
+    StatusZeroErrno,
+    StatusNegativeErrno,
+    StatusZeroBytePreExecDeath,
+    ForeignFdExcluded,
+    MaxSizeExact,
+    EmbeddedNulExact,
+    HeldOpenAfterExactBytes,
+    ExtraByteThenEof,
+    BeyondSentinel,
+    ReadErrorAfterBytes,
+    ExitSignaled,
+    ExitNonzero,
+    NonemptyStderr,
 };
 
 struct ExactInputMountRecoveryReceipt {
@@ -170,6 +295,9 @@ struct ExactInputMountRecoveryReceipt {
 // mutate fixture state and exists to prove that a never-started controller and
 // a frozen terminal replay issue no external commands.
 std::uint64_t exact_input_mount_test_command_count();
+bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
+                                             ExactInputReadObservation& observation,
+                                             ExactInputMountDiagnostic& diagnostic);
 
 class ExactInputMountRecoveryController;
 
@@ -208,6 +336,9 @@ public:
     bool snapshot(const ExactInputMountHandle& handle,
                   ExactInputMountSnapshot& snapshot,
                   ExactInputMountDiagnostic& diagnostic) const;
+    bool observe_input_read(const ExactInputMountHandle& handle,
+                            ExactInputReadObservation& observation,
+                            ExactInputMountDiagnostic& diagnostic);
     bool finish(ExactInputMountHandle& handle,
                 ExactInputMountRecoveryReceipt& receipt,
                 ExactInputMountDiagnostic& diagnostic);
