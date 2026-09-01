@@ -1887,7 +1887,7 @@ int main(int argc, char** argv) {
             !lifecycle.sample_a.source_revalidated || !lifecycle.sample_a.mount_verified ||
             !lifecycle.sample_a.topology_verified || !lifecycle.sample_a.cgroup_exact ||
             !lifecycle.sample_a.pidfile_exact || !lifecycle.sample_a.tcp_exact ||
-            !lifecycle.sample_a.tcp6_port_absent ||
+            !lifecycle.sample_a.tcp6_port_absent || !lifecycle.sample_a.upstream_port_9000_absent ||
             !lifecycle.sample_a.end_container_identity_verified ||
             !lifecycle.sample_a.end_source_revalidated || !lifecycle.sample_a.end_mount_verified ||
             !lifecycle.sample_a.end_topology_verified || !lifecycle.sample_a.end_cgroup_exact ||
@@ -1898,7 +1898,7 @@ int main(int argc, char** argv) {
             !lifecycle.sample_b.source_revalidated || !lifecycle.sample_b.mount_verified ||
             !lifecycle.sample_b.topology_verified || !lifecycle.sample_b.cgroup_exact ||
             !lifecycle.sample_b.pidfile_exact || !lifecycle.sample_b.tcp_exact ||
-            !lifecycle.sample_b.tcp6_port_absent ||
+            !lifecycle.sample_b.tcp6_port_absent || !lifecycle.sample_b.upstream_port_9000_absent ||
             !lifecycle.sample_b.end_container_identity_verified ||
             !lifecycle.sample_b.end_source_revalidated || !lifecycle.sample_b.end_mount_verified ||
             !lifecycle.sample_b.end_topology_verified || !lifecycle.sample_b.end_cgroup_exact ||
@@ -1919,7 +1919,11 @@ int main(int argc, char** argv) {
             lifecycle.term_attempted || lifecycle.kill_attempted ||
             lifecycle.force_remove_attempted || lifecycle.uncertain_cleanup ||
             !lifecycle.cgroup_empty_after_stop || !lifecycle.removed_nonforce ||
-            !lifecycle.exact_absence || !lifecycle.baseline_restored ||
+            !lifecycle.exact_absence || !lifecycle.baseline_restored || !lifecycle.http.attempted ||
+            lifecycle.http.outcome != rut::test::bounded_http_exchange::Outcome::Complete ||
+            !lifecycle.http.eof_observed || !lifecycle.http_response_exact ||
+            !lifecycle.upstream_absence_before || !lifecycle.upstream_absence_after ||
+            !lifecycle.logs_captured || !lifecycle.scoped_refusal_log_exact ||
             lifecycle.operation_failed || lifecycle.container_id.size() != 64u ||
             lifecycle.container_name != "rut358-nginx-" + context.token ||
             ![&] {
@@ -1969,6 +1973,10 @@ int main(int argc, char** argv) {
                         true},
              std::tuple{ExactInputMountFailurePoint::NginxStartReportedTimeout,
                         ExactInputNginxLifecycleOutcome::StartFailed,
+                        1u,
+                        true},
+             std::tuple{ExactInputMountFailurePoint::NginxRejectHttpObservation,
+                        ExactInputNginxLifecycleOutcome::SampleFailed,
                         1u,
                         true},
              std::tuple{ExactInputMountFailurePoint::NginxRemoveUnresolved,

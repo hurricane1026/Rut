@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fixture_bounded_http_exchange.h"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -203,6 +204,7 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     NginxStartReportedTimeout,
     NginxRejectPostCreateIdentity,
     NginxRejectSampleA,
+    NginxRejectHttpObservation,
     NginxRejectSampleB,
     NginxDriftSampleB,
     NginxRejectBaseline,
@@ -401,6 +403,7 @@ struct ExactInputNginxProcessSample {
     bool pidfile_exact = false;
     bool tcp_exact = false;
     bool tcp6_port_absent = false;
+    bool upstream_port_9000_absent = false;
     bool end_container_identity_verified = false;
     bool end_source_revalidated = false;
     bool end_mount_verified = false;
@@ -454,6 +457,13 @@ struct ExactInputNginxLifecycleObservation {
     std::string container_name;
     std::string container_id;
     std::vector<std::string> create_argv;
+    bounded_http_exchange::Observation http;
+    bool http_response_exact = false;
+    bool upstream_absence_before = false;
+    bool upstream_absence_after = false;
+    bool logs_captured = false;
+    bool scoped_refusal_log_exact = false;
+    std::string nginx_logs;
     ExactInputNginxProcessSample sample_a;
     ExactInputNginxProcessSample sample_b;
     ExactInputMountDiagnostic diagnostic;
