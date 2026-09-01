@@ -2549,6 +2549,12 @@ enum class PureHolderRetirementFault : std::uint8_t {
     RemovalTimeoutHolderAbsent,
     RemovalRecoveryUncertain,
     StoppedRecoveryIdentityMutation,
+    StoppedNetworkAMissingMembership,
+    StoppedNetworkAWrongMembership,
+    StoppedNetworkAExtraMembership,
+    StoppedNetworkBMissingMembership,
+    StoppedNetworkBWrongMembership,
+    StoppedNetworkBExtraMembership,
     HolderIdAbsence,
     HolderNameAbsence,
     ProcessAbsence,
@@ -2593,6 +2599,18 @@ static CleanupPhaseResult pure_holder_retirement_transition(PureHolderRetirement
         if (state.holder_stopped &&
             fault == PureHolderRetirementFault::StoppedRecoveryIdentityMutation) {
             error = "pure stopped holder immutable identity mutation was rejected";
+            state.operation_ok = false;
+            return {false, false};
+        }
+        const bool stopped_membership_fault =
+            fault == PureHolderRetirementFault::StoppedNetworkAMissingMembership ||
+            fault == PureHolderRetirementFault::StoppedNetworkAWrongMembership ||
+            fault == PureHolderRetirementFault::StoppedNetworkAExtraMembership ||
+            fault == PureHolderRetirementFault::StoppedNetworkBMissingMembership ||
+            fault == PureHolderRetirementFault::StoppedNetworkBWrongMembership ||
+            fault == PureHolderRetirementFault::StoppedNetworkBExtraMembership;
+        if (state.holder_stopped && stopped_membership_fault) {
+            error = "pure stopped holder retained endpoint membership mutation was rejected";
             state.operation_ok = false;
             return {false, false};
         }
@@ -2776,6 +2794,21 @@ static bool pure_holder_retirement_self_checks(std::string& error) {
             mutated.holder_remove_count != 1u || mutated.network_remove_count != 0u) {
             error = "pure stopped holder identity mutation was not fail-closed";
             return false;
+        }
+        for (PureHolderRetirementFault fault :
+             {PureHolderRetirementFault::StoppedNetworkAMissingMembership,
+              PureHolderRetirementFault::StoppedNetworkAWrongMembership,
+              PureHolderRetirementFault::StoppedNetworkAExtraMembership,
+              PureHolderRetirementFault::StoppedNetworkBMissingMembership,
+              PureHolderRetirementFault::StoppedNetworkBWrongMembership,
+              PureHolderRetirementFault::StoppedNetworkBExtraMembership}) {
+            mutated = stopped;
+            result = pure_holder_retirement_transition(mutated, fault, error);
+            if (result.settled || result.operation_ok || !mutated.holder_exists ||
+                mutated.holder_remove_count != 1u || mutated.network_remove_count != 0u) {
+                error = "pure stopped holder endpoint mutation reached retry command";
+                return false;
+            }
         }
         result = pure_holder_retirement_transition(stopped, PureHolderRetirementFault::None, error);
         if (!result.settled || result.operation_ok || stopped.holder_exists ||
@@ -3002,7 +3035,7 @@ public:
         return true;
     }
 
-    bool verify_topology(FailurePoint point, std::string& error) {
+    bool verify_holder_endpoint_associations(std::string& error) {
         CommandResult result;
         if (!run_command({"docker",
                           "inspect",
@@ -3011,7 +3044,7 @@ public:
                           ".Config.Labels \"rut.token\"}} {{range $name,$v := "
                           ".NetworkSettings.Networks}}{{$name}}|{{$v.NetworkID}}|{{$v.IPAddress}}|{"
                           "{$v.Gateway}} {{end}}",
-                          holder_name_},
+                          holder_id_},
                          result) ||
             !exited_zero(result)) {
             error = "holder membership inspection failed: " + trim(result.output);
@@ -3078,6 +3111,17 @@ public:
         }
         if (!verify_membership(network_a_, error) || !verify_membership(network_b_, error))
             return false;
+        return true;
+    }
+
+    bool verify_stopped_holder_retained_topology(std::string& error) {
+        return verify_network(network_a_, error) && verify_network(network_b_, error) &&
+               verify_holder_endpoint_associations(error);
+    }
+
+    bool verify_topology(FailurePoint point, std::string& error) {
+        if (!verify_holder_endpoint_associations(error)) return false;
+        CommandResult result;
         if (!run_command(
                 {"docker",
                  "inspect",
@@ -3552,11 +3596,15 @@ private:
         if (holder_exists_) {
             std::string validation_error;
             bool validation_ok = recovery_identity_validated || validate_holder(validation_error);
-            if (require_retained_topology)
-                validation_ok =
-                    validation_ok && verify_network(network_a_, validation_error) &&
-                    verify_network(network_b_, validation_error) &&
-                    (stopped_recovery || verify_topology(FailurePoint::None, validation_error));
+            if (require_retained_topology) {
+                if (stopped_recovery)
+                    validation_ok =
+                        validation_ok && verify_stopped_holder_retained_topology(validation_error);
+                else
+                    validation_ok = validation_ok && verify_network(network_a_, validation_error) &&
+                                    verify_network(network_b_, validation_error) &&
+                                    verify_topology(FailurePoint::None, validation_error);
+            }
             if (!validation_ok) {
                 if (!error.empty()) error += "; ";
                 error += validation_error.empty()
