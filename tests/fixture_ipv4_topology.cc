@@ -2460,6 +2460,7 @@ static bool container_netns_inode(const std::string& holder, ino_t& inode) {
 enum class CleanupProgress : std::uint8_t {
     Active,
     SidecarSettled,
+    HolderSettled,
     TopologySettled,
 };
 
@@ -2481,9 +2482,11 @@ struct CleanupEvidence {
     bool network_a_exists = false;
     bool network_b_exists = false;
     bool sidecar_operation_ok = true;
+    bool holder_operation_ok = true;
     bool topology_operation_ok = true;
     bool cleanup_reported_timeout_observed = false;
     bool sidecar_creation_may_have_mutated = false;
+    bool holder_removal_may_have_mutated = false;
 };
 
 struct SetupEventEvidence {
@@ -2496,6 +2499,244 @@ struct SetupEventEvidence {
     u32 holder_attach_a_verify_count = 0;
     u32 holder_attach_b_count = 0;
 };
+
+enum class PureHolderRetirementFault : std::uint8_t {
+    None,
+    HolderId,
+    HolderName,
+    HolderPid,
+    HolderStart,
+    NetworkIdentity,
+    NetworkIpam,
+    PreRemovalMembership,
+    RemovalTimeoutHolderPresent,
+    RemovalTimeoutHolderAbsent,
+    RemovalRecoveryUncertain,
+    HolderIdAbsence,
+    HolderNameAbsence,
+    ProcessAbsence,
+    RetainedNetworkIdentity,
+    RetainedNetworkIpam,
+    RetainedNetworkMembership,
+};
+
+struct PureHolderRetirementState {
+    CleanupProgress progress = CleanupProgress::SidecarSettled;
+    bool sidecar_exists = false;
+    bool sidecar_mutation_uncertain = false;
+    bool holder_exists = true;
+    bool holder_removal_uncertain = false;
+    bool operation_ok = true;
+    u32 observation_count = 0;
+    u32 holder_remove_count = 0;
+    u32 network_remove_count = 0;
+    HeldNamespaceOldGenerationAbsence absence;
+    CleanupPhaseResult frozen;
+};
+
+static CleanupPhaseResult pure_holder_retirement_transition(PureHolderRetirementState& state,
+                                                            PureHolderRetirementFault fault,
+                                                            std::string& error) {
+    error.clear();
+    if (state.progress >= CleanupProgress::HolderSettled) return state.frozen;
+    if (state.progress != CleanupProgress::SidecarSettled || state.sidecar_exists ||
+        state.sidecar_mutation_uncertain) {
+        error = "pure holder retirement rejected unsettled sidecar authority";
+        return {false, false};
+    }
+
+    if (state.holder_removal_uncertain) {
+        ++state.observation_count;
+        if (fault == PureHolderRetirementFault::RemovalRecoveryUncertain) {
+            error = "pure holder retirement recovery observation was uncertain";
+            state.operation_ok = false;
+            return {false, false};
+        }
+        if (!state.holder_exists) state.holder_removal_uncertain = false;
+    }
+
+    ++state.observation_count;
+    const bool pre_removal_fault = fault == PureHolderRetirementFault::HolderId ||
+                                   fault == PureHolderRetirementFault::HolderName ||
+                                   fault == PureHolderRetirementFault::HolderPid ||
+                                   fault == PureHolderRetirementFault::HolderStart ||
+                                   fault == PureHolderRetirementFault::NetworkIdentity ||
+                                   fault == PureHolderRetirementFault::NetworkIpam ||
+                                   fault == PureHolderRetirementFault::PreRemovalMembership;
+    if (pre_removal_fault) {
+        error = "pure holder retirement pre-removal revalidation rejected mutation";
+        state.operation_ok = false;
+        return {false, false};
+    }
+
+    CleanupPhaseResult result;
+    if (state.holder_exists) {
+        ++state.holder_remove_count;
+        if (fault == PureHolderRetirementFault::RemovalTimeoutHolderPresent) {
+            state.holder_removal_uncertain = true;
+            state.operation_ok = false;
+            error = "pure holder retirement outcome was uncertain with exact holder retained";
+            return {false, false};
+        }
+        state.holder_exists = false;
+        result.holder_removed = fault != PureHolderRetirementFault::RemovalTimeoutHolderAbsent;
+        if (fault == PureHolderRetirementFault::RemovalTimeoutHolderAbsent)
+            state.operation_ok = false;
+    }
+
+    ++state.observation_count;
+    if (fault == PureHolderRetirementFault::HolderIdAbsence ||
+        fault == PureHolderRetirementFault::HolderNameAbsence ||
+        fault == PureHolderRetirementFault::ProcessAbsence) {
+        error = "pure holder retirement rejected incomplete old witness absence";
+        state.operation_ok = false;
+        return {false, false};
+    }
+    state.absence.holder = {std::string(64, 'c'), 100, 1000, true, true};
+    state.absence.holder_name = "rut358-holder-pure";
+    state.absence.holder_name_absent = true;
+
+    ++state.observation_count;
+    if (fault == PureHolderRetirementFault::RetainedNetworkIdentity ||
+        fault == PureHolderRetirementFault::RetainedNetworkIpam ||
+        fault == PureHolderRetirementFault::RetainedNetworkMembership) {
+        error = "pure holder retirement rejected retained-network mutation";
+        state.operation_ok = false;
+        return {false, false};
+    }
+    state.progress = CleanupProgress::HolderSettled;
+    result.settled = true;
+    result.operation_ok = state.operation_ok;
+    result.holder_settled = true;
+    state.frozen = result;
+    return result;
+}
+
+static bool pure_holder_retirement_self_checks(std::string& error) {
+    {
+        PureHolderRetirementState illegal;
+        illegal.progress = CleanupProgress::Active;
+        const CleanupPhaseResult result =
+            pure_holder_retirement_transition(illegal, PureHolderRetirementFault::None, error);
+        if (result.settled || result.operation_ok || illegal.observation_count != 0u ||
+            illegal.holder_remove_count != 0u) {
+            error = "pure holder retirement accepted a pre-sidecar call";
+            return false;
+        }
+    }
+    {
+        PureHolderRetirementState uncertain_sidecar;
+        uncertain_sidecar.sidecar_mutation_uncertain = true;
+        const CleanupPhaseResult result = pure_holder_retirement_transition(
+            uncertain_sidecar, PureHolderRetirementFault::None, error);
+        if (result.settled || result.operation_ok || uncertain_sidecar.observation_count != 0u ||
+            uncertain_sidecar.holder_remove_count != 0u) {
+            error = "pure holder retirement accepted uncertain sidecar authority";
+            return false;
+        }
+    }
+    for (PureHolderRetirementFault fault : {PureHolderRetirementFault::HolderId,
+                                            PureHolderRetirementFault::HolderName,
+                                            PureHolderRetirementFault::HolderPid,
+                                            PureHolderRetirementFault::HolderStart,
+                                            PureHolderRetirementFault::NetworkIdentity,
+                                            PureHolderRetirementFault::NetworkIpam,
+                                            PureHolderRetirementFault::PreRemovalMembership}) {
+        PureHolderRetirementState mutation;
+        const CleanupPhaseResult result = pure_holder_retirement_transition(mutation, fault, error);
+        if (result.settled || result.operation_ok || mutation.holder_remove_count != 0u ||
+            mutation.network_remove_count != 0u) {
+            error = "pure holder retirement accepted a pre-removal identity/topology mutation";
+            return false;
+        }
+    }
+    for (PureHolderRetirementFault fault : {PureHolderRetirementFault::HolderIdAbsence,
+                                            PureHolderRetirementFault::HolderNameAbsence,
+                                            PureHolderRetirementFault::ProcessAbsence,
+                                            PureHolderRetirementFault::RetainedNetworkIdentity,
+                                            PureHolderRetirementFault::RetainedNetworkIpam,
+                                            PureHolderRetirementFault::RetainedNetworkMembership}) {
+        PureHolderRetirementState mutation;
+        const CleanupPhaseResult result = pure_holder_retirement_transition(mutation, fault, error);
+        if (result.settled || result.operation_ok || mutation.holder_remove_count != 1u ||
+            mutation.network_remove_count != 0u || mutation.holder_exists) {
+            error = "pure holder retirement accepted incomplete absence/retained-network proof";
+            return false;
+        }
+    }
+    {
+        PureHolderRetirementState timeout;
+        CleanupPhaseResult result = pure_holder_retirement_transition(
+            timeout, PureHolderRetirementFault::RemovalTimeoutHolderPresent, error);
+        if (result.settled || result.operation_ok || !timeout.holder_exists ||
+            !timeout.holder_removal_uncertain || timeout.holder_remove_count != 1u ||
+            timeout.network_remove_count != 0u) {
+            error = "pure holder retirement timeout did not retain exact retry authority";
+            return false;
+        }
+        const u32 observations_before = timeout.observation_count;
+        result = pure_holder_retirement_transition(
+            timeout, PureHolderRetirementFault::RemovalRecoveryUncertain, error);
+        if (result.settled || result.operation_ok || !timeout.holder_exists ||
+            timeout.holder_remove_count != 1u ||
+            timeout.observation_count != observations_before + 1u) {
+            error = "pure holder retirement uncertain recovery did not fail closed";
+            return false;
+        }
+        result = pure_holder_retirement_transition(timeout, PureHolderRetirementFault::None, error);
+        if (!result.settled || result.operation_ok || timeout.holder_exists ||
+            timeout.holder_remove_count != 2u || timeout.network_remove_count != 0u) {
+            error = "pure holder retirement bounded exact-ID retry did not settle";
+            return false;
+        }
+    }
+    {
+        PureHolderRetirementState timeout_absent;
+        const CleanupPhaseResult first = pure_holder_retirement_transition(
+            timeout_absent, PureHolderRetirementFault::RemovalTimeoutHolderAbsent, error);
+        if (!first.settled || first.operation_ok || timeout_absent.holder_exists ||
+            timeout_absent.holder_remove_count != 1u || timeout_absent.network_remove_count != 0u ||
+            timeout_absent.absence.phase != HeldNamespaceGenerationRotationPhase::None) {
+            error = "pure holder timeout recovery did not bind exact absence evidence";
+            return false;
+        }
+        const PureHolderRetirementState frozen = timeout_absent;
+        std::string replay_error = "stale";
+        const CleanupPhaseResult replay = pure_holder_retirement_transition(
+            timeout_absent, PureHolderRetirementFault::HolderId, replay_error);
+        if (!replay.settled || replay.operation_ok || !replay_error.empty() ||
+            timeout_absent.observation_count != frozen.observation_count ||
+            timeout_absent.holder_remove_count != frozen.holder_remove_count ||
+            timeout_absent.network_remove_count != 0u) {
+            error = "pure holder retirement replay was not frozen/inert";
+            return false;
+        }
+    }
+    {
+        PureHolderRetirementState success;
+        const CleanupPhaseResult result =
+            pure_holder_retirement_transition(success, PureHolderRetirementFault::None, error);
+        if (!result.settled || !result.operation_ok || !result.holder_settled ||
+            !result.holder_removed || success.progress != CleanupProgress::HolderSettled ||
+            success.holder_exists || success.holder_remove_count != 1u ||
+            success.network_remove_count != 0u || !success.absence.holder.container_id_absent ||
+            !success.absence.holder.process_identity_absent ||
+            !success.absence.holder_name_absent) {
+            error = "pure holder retirement success lacked monotonic exact evidence";
+            return false;
+        }
+        const u32 observations = success.observation_count;
+        const CleanupPhaseResult replay = pure_holder_retirement_transition(
+            success, PureHolderRetirementFault::RetainedNetworkMembership, error);
+        if (!replay.settled || !replay.operation_ok || !replay.holder_removed || !error.empty() ||
+            success.observation_count != observations || success.holder_remove_count != 1u ||
+            success.network_remove_count != 0u) {
+            error = "pure clean holder retirement replay was not frozen/inert";
+            return false;
+        }
+    }
+    return true;
+}
 
 enum class TopologySettlementEvent : std::uint8_t {
     Holder,
@@ -2511,9 +2752,11 @@ static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvi
            left.network_a_exists == right.network_a_exists &&
            left.network_b_exists == right.network_b_exists &&
            left.sidecar_operation_ok == right.sidecar_operation_ok &&
+           left.holder_operation_ok == right.holder_operation_ok &&
            left.topology_operation_ok == right.topology_operation_ok &&
            left.cleanup_reported_timeout_observed == right.cleanup_reported_timeout_observed &&
-           left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated;
+           left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated &&
+           left.holder_removal_may_have_mutated == right.holder_removal_may_have_mutated;
 }
 
 static bool proc_tcp_port_absent(const std::string& table, u16 port) {
@@ -2557,6 +2800,9 @@ public:
     u64 holder_start() const { return holder_start_; }
     const std::string& holder_id() const { return holder_id_; }
     const HeldNamespaceSidecarSnapshot& sidecar_snapshot() const { return sidecar_snapshot_; }
+    const HeldNamespaceOldGenerationAbsence& holder_retirement_absence() const {
+        return holder_retirement_absence_;
+    }
     void set_expected_sidecar_image_id(std::string image_id) {
         expected_sidecar_image_id_ = std::move(image_id);
     }
@@ -2575,9 +2821,11 @@ public:
                 network_a_.exists,
                 network_b_.exists,
                 sidecar_settlement_operation_ok_,
+                holder_settlement_operation_ok_,
                 topology_settlement_operation_ok_,
                 cleanup_reported_timeout_observed_,
-                sidecar_creation_may_have_mutated_};
+                sidecar_creation_may_have_mutated_,
+                holder_removal_may_have_mutated_};
     }
     const SetupEventEvidence& setup_event_evidence() const { return setup_event_evidence_; }
     HeldTopologySnapshot current_topology_snapshot() const { return topology_snapshot(); }
@@ -2827,6 +3075,7 @@ public:
             // The selected port is checked by probe_port_absent below; this
             // branch only rejects an obviously malformed proc table.
         }
+        topology_verified_ = true;
         if (point == FailurePoint::AfterTopologyVerified) return injected(error);
         return true;
     }
@@ -3173,6 +3422,117 @@ public:
         return {true, operation_ok};
     }
 
+    CleanupPhaseResult cleanup_holder_phase(std::string& error) {
+        return cleanup_holder_phase_impl(error, true);
+    }
+
+private:
+    CleanupPhaseResult cleanup_holder_phase_impl(std::string& error,
+                                                 bool require_retained_topology) {
+        if (cleanup_progress_ >= CleanupProgress::HolderSettled) return frozen_holder_settlement_;
+        if (cleanup_progress_ != CleanupProgress::SidecarSettled || sidecar_exists_ ||
+            sidecar_creation_may_have_mutated_) {
+            if (!error.empty()) error += "; ";
+            error += "refusing holder retirement before exact sidecar settlement";
+            return {false, false};
+        }
+        if (require_retained_topology && !topology_verified_) {
+            if (!error.empty()) error += "; ";
+            error += "refusing holder-only retirement without verified retained topology";
+            return {false, false};
+        }
+
+        CleanupPhaseResult result;
+        bool operation_ok = !holder_disappearance_operation_failure_;
+        if (holder_disappearance_operation_failure_) {
+            if (!error.empty()) error += "; ";
+            error += "holder disappeared before identity-safe cleanup";
+        }
+
+        if (holder_exists_ && holder_removal_may_have_mutated_) {
+            bool exact_id_present = false;
+            std::string recovery_error;
+            if (prove_holder_absent(recovery_error, &exact_id_present)) {
+                holder_exists_ = false;
+                holder_removal_may_have_mutated_ = false;
+                operation_ok = false;
+            } else if (!exact_id_present) {
+                if (!error.empty()) error += "; ";
+                error += "uncertain holder retirement recovery failed closed: " + recovery_error;
+                holder_settlement_operation_ok_ = false;
+                return {false, false};
+            }
+        }
+
+        if (holder_exists_) {
+            std::string validation_error;
+            bool validation_ok = validate_holder(validation_error);
+            if (require_retained_topology)
+                validation_ok = validation_ok && verify_network(network_a_, validation_error) &&
+                                verify_network(network_b_, validation_error) &&
+                                verify_topology(FailurePoint::None, validation_error);
+            if (!validation_ok) {
+                if (!error.empty()) error += "; ";
+                error += validation_error.empty()
+                             ? "holder retirement pre-removal revalidation failed"
+                             : validation_error;
+                holder_settlement_operation_ok_ = false;
+                return {false, false};
+            }
+
+            CommandResult removal;
+            holder_removal_may_have_mutated_ = true;
+            const bool command_ok = run_command({"docker", "rm", "-f", holder_id_}, removal);
+            if (!command_ok || !exited_zero(removal)) {
+                operation_ok = false;
+                if (!error.empty()) error += "; ";
+                error += removal.timed_out
+                             ? "holder retirement outcome was uncertain"
+                             : "holder retirement command failed: " + trim(removal.output);
+            } else {
+                result.holder_removed = true;
+            }
+        }
+
+        if (!holder_exists_ && holder_id_.empty() && !require_retained_topology) {
+            cleanup_progress_ = CleanupProgress::HolderSettled;
+            frozen_holder_settlement_ = {true, operation_ok, true};
+            holder_settlement_operation_ok_ = holder_settlement_operation_ok_ && operation_ok;
+            frozen_holder_settlement_.operation_ok = holder_settlement_operation_ok_;
+            return frozen_holder_settlement_;
+        }
+
+        std::string absence_error;
+        if (!prove_holder_absent(absence_error)) {
+            if (!error.empty()) error += "; ";
+            error += "holder retirement absence proof failed: " + absence_error;
+            holder_settlement_operation_ok_ = false;
+            // Exact ID/name/PID/start and both network identities remain
+            // recorded.  A bounded retry first revalidates them and never
+            // creates a same-name replacement from this state.
+            return {false, false};
+        }
+        holder_exists_ = false;
+        holder_removal_may_have_mutated_ = false;
+
+        std::string retained_error;
+        if (require_retained_topology && !verify_retained_networks_after_holder(retained_error)) {
+            if (!error.empty()) error += "; ";
+            error += "post-holder retained network proof failed: " + retained_error;
+            holder_settlement_operation_ok_ = false;
+            return {false, false};
+        }
+
+        cleanup_progress_ = CleanupProgress::HolderSettled;
+        holder_settlement_operation_ok_ = holder_settlement_operation_ok_ && operation_ok;
+        frozen_holder_settlement_ = result;
+        frozen_holder_settlement_.settled = true;
+        frozen_holder_settlement_.operation_ok = holder_settlement_operation_ok_;
+        frozen_holder_settlement_.holder_settled = true;
+        return frozen_holder_settlement_;
+    }
+
+public:
     CleanupPhaseResult cleanup_topology_phase(std::string& error,
                                               TopologySettlementCallback callback = nullptr,
                                               void* callback_context = nullptr) {
@@ -3186,35 +3546,18 @@ public:
         }
 
         CleanupPhaseResult phase_result;
-        bool operation_ok = !holder_disappearance_operation_failure_;
+        const CleanupPhaseResult holder = cleanup_holder_phase_impl(error, topology_verified_);
+        if (!holder.settled) return holder;
+        phase_result.holder_settled = true;
+        phase_result.holder_removed = holder.holder_removed;
+        bool operation_ok = holder.operation_ok;
         const auto notify = [&](TopologySettlementEvent event, bool removed) {
             if (callback == nullptr) return true;
             if (callback(callback_context, event, removed, error)) return true;
             phase_result.operation_ok = operation_ok;
             return false;
         };
-        if (holder_disappearance_operation_failure_) {
-            if (!error.empty()) error += "; ";
-            error += "holder disappeared before identity-safe cleanup";
-        }
-        if (holder_exists_) {
-            if (!validate_holder(error))
-                operation_ok = false;
-            else {
-                CommandResult result;
-                if (!run_command({"docker", "rm", "-f", holder_name_}, result) ||
-                    !exited_zero(result)) {
-                    error = "holder cleanup failed: " + trim(result.output);
-                    operation_ok = false;
-                } else {
-                    holder_exists_ = false;
-                    phase_result.holder_removed = true;
-                }
-            }
-        }
-        phase_result.holder_settled = !holder_exists_;
-        if (phase_result.holder_settled &&
-            !notify(TopologySettlementEvent::Holder, phase_result.holder_removed))
+        if (!notify(TopologySettlementEvent::Holder, phase_result.holder_removed))
             return phase_result;
         if (network_b_.exists) {
             if (network_b_.id.empty()) {
@@ -3677,7 +4020,7 @@ private:
                           "inspect",
                           "-f",
                           "{{.Id}} {{.Name}} {{index .Config.Labels \"rut.stage\"}} {{index "
-                          ".Config.Labels \"rut.token\"}}",
+                          ".Config.Labels \"rut.token\"}} {{.State.Running}} {{.State.Pid}}",
                           holder_name_},
                          result) ||
             !exited_zero(result)) {
@@ -3685,8 +4028,9 @@ private:
             return false;
         }
         std::istringstream fields(trim(result.output));
-        std::string id, name, stage, token;
-        if (!(fields >> id >> name >> stage >> token)) {
+        std::string id, name, stage, token, running;
+        pid_t pid = -1;
+        if (!(fields >> id >> name >> stage >> token >> running >> pid)) {
             error = "holder identity inspection was malformed";
             return false;
         }
@@ -3696,10 +4040,69 @@ private:
             return false;
         }
         if (id != holder_id_ || name != "/" + holder_name_ || stage != "358-stage2a2" ||
-            token != token_) {
+            token != token_ || running != "true" || pid != holder_pid_) {
             error = "refusing holder deletion because exact identity/labels changed";
             return false;
         }
+        ProcIdentity identity{};
+        if (holder_pid_ <= 1 || holder_start_ == 0u ||
+            !proc_identity(holder_pid_, identity, false) || identity.start != holder_start_) {
+            error = "refusing holder deletion because exact PID/start identity changed";
+            return false;
+        }
+        return true;
+    }
+
+    bool prove_holder_absent(std::string& error, bool* exact_id_present = nullptr) {
+        if (exact_id_present != nullptr) *exact_id_present = false;
+        if (holder_id_.empty() || holder_name_.empty() || holder_pid_ <= 1 || holder_start_ == 0u) {
+            error = "holder absence proof lacked exact recorded ID/name/PID/start authority";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command({"docker", "ps", "-aq", "--no-trunc", "--filter", "id=" + holder_id_},
+                         result) ||
+            !exited_zero(result)) {
+            error = "exact old holder ID absence inspection was uncertain";
+            return false;
+        }
+        const std::string matching_id = trim(result.output);
+        if (!matching_id.empty()) {
+            if (matching_id != holder_id_) {
+                error = "exact old holder ID absence inspection returned an unexpected identity";
+                return false;
+            }
+            if (exact_id_present != nullptr) *exact_id_present = true;
+            error = "exact old holder ID did not provably disappear";
+            return false;
+        }
+        if (!run_command(
+                {"docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + holder_name_ + "$"},
+                result) ||
+            !exited_zero(result) || !trim(result.output).empty()) {
+            error = "exact old holder stable name did not provably disappear";
+            return false;
+        }
+        ProcIdentity current{};
+        if (proc_identity(holder_pid_, current, false)) {
+            if (current.start == holder_start_) {
+                error = "exact old holder PID/start process witness remains";
+                return false;
+            }
+        } else {
+            errno = 0;
+            if (kill(holder_pid_, 0) == 0 || errno == EPERM) {
+                error = "old holder process witness could not be authoritatively inspected";
+                return false;
+            }
+            if (errno != ESRCH) {
+                error = "old holder process absence probe failed";
+                return false;
+            }
+        }
+        holder_retirement_absence_.holder = {holder_id_, holder_pid_, holder_start_, true, true};
+        holder_retirement_absence_.holder_name = holder_name_;
+        holder_retirement_absence_.holder_name_absent = true;
         return true;
     }
 
@@ -3762,6 +4165,51 @@ private:
         return true;
     }
 
+    bool verify_empty_membership(const Network& network, std::string& error) {
+        CommandResult result;
+        if (!run_command({"docker",
+                          "network",
+                          "inspect",
+                          "-f",
+                          "{{.Id}}|{{.Name}} {{range $id,$v := .Containers}}{{$id}}|{{$v.Name}}|{{"
+                          "$v.IPv4Address}} {{end}}",
+                          network.name},
+                         result) ||
+            !exited_zero(result)) {
+            error = "retained network membership inspection failed";
+            return false;
+        }
+        std::istringstream fields(trim(result.output));
+        std::string network_header;
+        std::vector<std::string> header_fields;
+        std::string unexpected_member;
+        if (!(fields >> network_header) || !split_exact(network_header, '|', 2, header_fields) ||
+            header_fields[0] != network.id || header_fields[1] != network.name ||
+            (fields >> unexpected_member)) {
+            error = "retained network identity/membership was not exactly empty";
+            return false;
+        }
+        return true;
+    }
+
+    bool verify_retained_networks_after_holder(std::string& error) {
+        std::string expected_positive;
+        std::string expected_guard;
+        if (!network_a_.exists || !network_b_.exists || !verify_network(network_a_, error) ||
+            !verify_network(network_b_, error) ||
+            !choose_address(network_a_.subnet, network_a_.gateway, expected_positive) ||
+            !choose_address(network_b_.subnet, network_b_.gateway, expected_guard) ||
+            expected_positive != positive_ip_ || expected_guard != guard_ip_) {
+            if (error.empty())
+                error = "retained network/IPAM addressing plan changed after holder retirement";
+            return false;
+        }
+        if (!verify_empty_membership(network_a_, error) ||
+            !verify_empty_membership(network_b_, error))
+            return false;
+        return true;
+    }
+
     std::string token_;
     std::string holder_name_;
     std::string sidecar_name_;
@@ -3784,11 +4232,16 @@ private:
     bool cleanup_reported_timeout_observed_ = false;
     bool unexpected_sidecar_death_verified_ = false;
     bool holder_disappearance_operation_failure_ = false;
+    bool holder_removal_may_have_mutated_ = false;
     SetupEventEvidence setup_event_evidence_;
     bool network_b_test_disconnected_ = false;
+    bool topology_verified_ = false;
     CleanupProgress cleanup_progress_ = CleanupProgress::Active;
     bool sidecar_settlement_operation_ok_ = true;
+    bool holder_settlement_operation_ok_ = true;
     bool topology_settlement_operation_ok_ = true;
+    CleanupPhaseResult frozen_holder_settlement_;
+    HeldNamespaceOldGenerationAbsence holder_retirement_absence_;
     HeldNamespaceSidecarRevalidationFault sidecar_revalidation_fault_ =
         HeldNamespaceSidecarRevalidationFault::None;
 };
@@ -9080,6 +9533,7 @@ bool audit_zero_residue(const std::string& token,
 }
 
 bool pure_validation_self_checks(std::string& error) {
+    if (!pure_holder_retirement_self_checks(error)) return false;
     if (!held_namespace_generation_rotation_self_checks(error)) return false;
     u32 low = 0, high = 0;
     if (parse_cidr("10.0.0.1/24", low, high) || parse_cidr("10.0.0.0/31", low, high) ||
