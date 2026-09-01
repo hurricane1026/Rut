@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/kcmp.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -121,7 +122,13 @@ bool complete(const std::shared_ptr<const input::CleanupReceipt>& receipt) {
            receipt->path_quarantined && receipt->exact_unlinked && receipt->detached_inode_proven &&
            receipt->descriptor_closed && receipt->directory_settled &&
            receipt->settlement_complete && receipt->state == input::State::Settled &&
-           receipt->quarantine_residue == input::Residue::Absent;
+           receipt->original_residue == input::Residue::Absent &&
+           receipt->quarantine_residue == input::Residue::Absent &&
+           receipt->writer_close.attempts == 1u && receipt->writer_close.succeeded &&
+           receipt->reader_close.attempts == 1u && receipt->reader_close.succeeded &&
+           receipt->authority_one_close.attempts == 1u && receipt->authority_one_close.succeeded &&
+           receipt->authority_two_close.attempts == 1u && receipt->authority_two_close.succeeded &&
+           receipt->directory_close.attempts == 1u && receipt->directory_close.succeeded;
 }
 
 bool invalid_argument_tests() {
@@ -169,8 +176,10 @@ bool normal_lifecycle_and_ordering_test() {
             unlinkat(AT_FDCWD, owner.path().c_str(), AT_REMOVEDIR) != 0 && errno == ENOTEMPTY;
         ok = ordering && fstat(lease.descriptor(), &held) == 0 &&
              stat_at(owner.descriptor(), lease.basename(), named) && same_inode(held, named) &&
-             (held.st_mode & 0777) == 0600 && held.st_uid == getuid() && held.st_gid == getgid() &&
-             held.st_nlink == 1u && held.st_size == static_cast<off_t>(sizeof(kBytes) - 1u) &&
+             (held.st_mode & 0777) == 0600 &&
+             held.st_uid == static_cast<uid_t>(lease.identity().uid) &&
+             held.st_gid == static_cast<gid_t>(lease.identity().gid) && held.st_nlink == 1u &&
+             held.st_size == static_cast<off_t>(sizeof(kBytes) - 1u) &&
              (fd_flags & FD_CLOEXEC) != 0 && (status_flags & O_ACCMODE) == O_RDONLY &&
              lease.revalidate(diagnostic) && lease.revalidate(diagnostic) &&
              lease.cleanup(diagnostic) && lease.cleanup(diagnostic) && complete(receipt);
@@ -191,6 +200,8 @@ input::FailurePhase phase_for(input::CreationFaultForTesting fault) {
             return input::FailurePhase::Hook;
         case input::CreationFaultForTesting::Open:
             return input::FailurePhase::Open;
+        case input::CreationFaultForTesting::Identity:
+            return input::FailurePhase::Identity;
         case input::CreationFaultForTesting::WritePartial:
         case input::CreationFaultForTesting::WriteError:
             return input::FailurePhase::Write;
@@ -210,6 +221,7 @@ input::FailurePhase phase_for(input::CreationFaultForTesting fault) {
 bool creation_failure_tests() {
     constexpr std::array faults = {input::CreationFaultForTesting::PreOpen,
                                    input::CreationFaultForTesting::Open,
+                                   input::CreationFaultForTesting::Identity,
                                    input::CreationFaultForTesting::WritePartial,
                                    input::CreationFaultForTesting::WriteError,
                                    input::CreationFaultForTesting::Sync,
@@ -235,6 +247,33 @@ bool creation_failure_tests() {
         if (!check(refused, "creation fault was not causal or left residue")) return false;
     }
     return true;
+}
+
+bool early_identity_failure_atomic_test() {
+    std::vector<int> before, after;
+    if (!fd_snapshot(before)) return false;
+    bool result = false;
+    {
+        directory::PrivateDirectoryLease owner;
+        directory::Diagnostic directory_diagnostic;
+        input::ExactInputFileLease lease;
+        input::Diagnostic diagnostic;
+        if (!make_directory(35u, owner, directory_diagnostic)) return false;
+        auto hooks = input_hooks(36u);
+        hooks.creation_fault = input::CreationFaultForTesting::Identity;
+        const mode_t old_mask = umask(0777);
+        const bool created = input::ExactInputFileLease::create_with_hooks_for_testing(
+            owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic);
+        umask(old_mask);
+        const auto receipt = lease.cleanup_receipt();
+        result = !created && failed(diagnostic, input::FailurePhase::Identity) &&
+                 lease.identity().size == 0u && lease.identity().links == 1u &&
+                 receipt->original_residue == input::Residue::Absent &&
+                 receipt->quarantine_residue == input::Residue::Absent &&
+                 directory_empty(owner.descriptor()) && owner.settle(directory_diagnostic);
+    }
+    return check(result && fd_snapshot(after) && before == after,
+                 "post-first-fstat identity failure leaked path or descriptor");
 }
 
 bool byte_metadata_mutation_tests() {
@@ -316,14 +355,184 @@ bool descriptor_mutation_tests() {
          fcntl(leased, F_SETFD, FD_CLOEXEC) == 0 && !lease.revalidate(diagnostic) &&
          dup2(access_saved, leased) == leased && fcntl(leased, F_SETFD, FD_CLOEXEC) == 0 &&
          close(access_saved) == 0 && close(wrong_access) == 0 && lease.revalidate(diagnostic);
-    const int saved = fcntl(leased, F_DUPFD_CLOEXEC, 3);
     const int foreign = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    ok = ok && saved >= 0 && foreign >= 0 && dup2(foreign, leased) == leased &&
-         !lease.revalidate(diagnostic) && !lease.cleanup(diagnostic) &&
-         fcntl(foreign, F_GETFD) >= 0 && dup2(saved, leased) == leased &&
-         fcntl(leased, F_SETFD, FD_CLOEXEC) == 0 && close(saved) == 0 &&
-         lease.cleanup(diagnostic) && close(foreign) == 0 && owner.settle(directory_diagnostic);
+    ok = ok && foreign >= 0 && dup2(foreign, leased) == leased &&
+         fcntl(leased, F_SETFD, FD_CLOEXEC) == 0 && !lease.revalidate(diagnostic) &&
+         lease.cleanup(diagnostic) && lease.cleanup_receipt()->foreign_reader_preserved &&
+         fcntl(leased, F_GETFD) >= 0 && close(leased) == 0 && close(foreign) == 0 &&
+         owner.settle(directory_diagnostic);
     return check(ok, "descriptor flags/replacement was accepted or foreign FD was closed");
+}
+
+bool embedded_nul_test() {
+    constexpr std::array<unsigned char, 7> bytes = {'a', 0, 'b', 0xffu, 'c', 0, 'd'};
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::ExactInputFileLease lease;
+    input::Diagnostic diagnostic;
+    if (!make_directory(57u, owner, directory_diagnostic)) return false;
+    auto hooks = input_hooks(58u);
+    const bool ok = input::ExactInputFileLease::create_with_hooks_for_testing(
+                        owner, bytes.data(), bytes.size(), hooks, lease, diagnostic) &&
+                    lease.revalidate(diagnostic) && lease.cleanup(diagnostic) &&
+                    owner.settle(directory_diagnostic);
+    return check(ok, "embedded-NUL uninterpreted bytes were not preserved");
+}
+
+int real_kcmp(int first, int second) {
+#ifdef SYS_kcmp
+    return static_cast<int>(syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, first, second));
+#else
+    (void)first;
+    (void)second;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+struct KcmpState {
+    bool deny = false;
+};
+int controlled_kcmp(int first, int second, void* opaque) {
+    auto& state = *static_cast<KcmpState*>(opaque);
+    if (state.deny) {
+        errno = EPERM;
+        return -1;
+    }
+    return real_kcmp(first, second);
+}
+
+bool exact_ofd_tests() {
+    {
+        directory::PrivateDirectoryLease owner;
+        directory::Diagnostic directory_diagnostic;
+        input::ExactInputFileLease lease;
+        input::Diagnostic diagnostic;
+        if (!make_directory(110u, owner, directory_diagnostic) ||
+            !create(111u, owner, lease, diagnostic))
+            return false;
+        const int slot = lease.descriptor();
+        const int fresh =
+            openat(owner.descriptor(), lease.basename().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        const bool refused =
+            fresh >= 0 && dup2(fresh, slot) == slot && fcntl(slot, F_SETFD, FD_CLOEXEC) == 0 &&
+            !lease.revalidate(diagnostic) && failed(diagnostic, input::FailurePhase::Revalidate) &&
+            lease.cleanup(diagnostic) && lease.cleanup_receipt()->foreign_reader_preserved &&
+            fcntl(slot, F_GETFD) >= 0 && close(slot) == 0 && close(fresh) == 0 &&
+            owner.settle(directory_diagnostic);
+        if (!check(refused, "same-inode new OFD was accepted or closed as owned")) return false;
+    }
+    {
+        directory::PrivateDirectoryLease owner;
+        directory::Diagnostic directory_diagnostic;
+        input::ExactInputFileLease lease;
+        input::Diagnostic diagnostic;
+        KcmpState state;
+        auto hooks = input_hooks(114u);
+        hooks.kcmp = controlled_kcmp;
+        hooks.context = &state;
+        if (!make_directory(113u, owner, directory_diagnostic) ||
+            !input::ExactInputFileLease::create_with_hooks_for_testing(
+                owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic))
+            return false;
+        state.deny = true;
+        const bool denied = !lease.revalidate(diagnostic) &&
+                            failed(diagnostic, input::FailurePhase::Revalidate) &&
+                            !lease.cleanup(diagnostic) &&
+                            failed(diagnostic, input::FailurePhase::DescriptorClose) &&
+                            !lease.cleanup_receipt()->settlement_complete;
+        state.deny = false;
+        const bool recovered = lease.cleanup(diagnostic) && owner.settle(directory_diagnostic);
+        if (!check(denied && recovered, "denied exact-OFD proof did not fail closed/recover"))
+            return false;
+    }
+    return true;
+}
+
+struct CloseReuseState {
+    input::DescriptorRole target = input::DescriptorRole::Reader;
+    int reused = -1;
+    unsigned target_calls = 0u;
+};
+int close_and_reuse(int descriptor, input::DescriptorRole role, void* opaque) {
+    auto& state = *static_cast<CloseReuseState*>(opaque);
+    if (role != state.target) return close(descriptor);
+    ++state.target_calls;
+    if (close(descriptor) != 0) return -1;
+    const int replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (replacement < 0) return -1;
+    if (replacement != descriptor) {
+        if (dup2(replacement, descriptor) != descriptor ||
+            fcntl(descriptor, F_SETFD, FD_CLOEXEC) != 0) {
+            const int saved = errno;
+            close(replacement);
+            errno = saved;
+            return -1;
+        }
+        if (close(replacement) != 0) return -1;
+    }
+    state.reused = descriptor;
+    errno = EIO;
+    return -1;
+}
+
+const input::CloseOutcome& outcome_for(const input::CleanupReceipt& receipt,
+                                       input::DescriptorRole role) {
+    switch (role) {
+        case input::DescriptorRole::Writer:
+            return receipt.writer_close;
+        case input::DescriptorRole::Reader:
+            return receipt.reader_close;
+        case input::DescriptorRole::AuthorityOne:
+            return receipt.authority_one_close;
+        case input::DescriptorRole::AuthorityTwo:
+            return receipt.authority_two_close;
+        case input::DescriptorRole::Directory:
+            return receipt.directory_close;
+    }
+    return receipt.reader_close;
+}
+
+bool close_reuse_case(input::DescriptorRole role, unsigned tag) {
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::Diagnostic diagnostic;
+    CloseReuseState state{.target = role};
+    std::shared_ptr<const input::CleanupReceipt> receipt;
+    bool result = false;
+    {
+        input::ExactInputFileLease lease;
+        if (!make_directory(tag, owner, directory_diagnostic)) return false;
+        auto hooks = input_hooks(tag + 1u);
+        hooks.close = close_and_reuse;
+        hooks.context = &state;
+        const bool created = input::ExactInputFileLease::create_with_hooks_for_testing(
+            owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic);
+        receipt = lease.cleanup_receipt();
+        if (role == input::DescriptorRole::Writer) {
+            result = !created && failed(diagnostic, input::FailurePhase::WriterClose);
+        } else {
+            result = created && !lease.cleanup(diagnostic) &&
+                     failed(diagnostic, input::FailurePhase::DescriptorClose);
+        }
+        const auto& outcome = outcome_for(*receipt, role);
+        result = result && state.target_calls == 1u && state.reused >= 0 &&
+                 fcntl(state.reused, F_GETFD) >= 0 && outcome.attempted && outcome.attempts == 1u &&
+                 !outcome.succeeded && outcome.uncertain && !receipt->settlement_complete &&
+                 !lease.cleanup(diagnostic) && state.target_calls == 1u && outcome.attempts == 1u &&
+                 fcntl(state.reused, F_GETFD) >= 0;
+    }
+    result = result && state.target_calls == 1u && fcntl(state.reused, F_GETFD) >= 0 &&
+             close(state.reused) == 0 && directory_empty(owner.descriptor()) &&
+             owner.settle(directory_diagnostic);
+    return check(result, "one-shot close retried or closed a reused foreign slot");
+}
+
+bool one_shot_close_tests() {
+    return close_reuse_case(input::DescriptorRole::Writer, 120u) &&
+           close_reuse_case(input::DescriptorRole::Reader, 123u) &&
+           close_reuse_case(input::DescriptorRole::AuthorityOne, 126u) &&
+           close_reuse_case(input::DescriptorRole::AuthorityTwo, 129u);
 }
 
 input::FailurePhase cleanup_phase(input::CleanupFaultForTesting fault) {
@@ -344,8 +553,7 @@ input::FailurePhase cleanup_phase(input::CleanupFaultForTesting fault) {
 bool cleanup_fault_tests() {
     constexpr std::array faults = {input::CleanupFaultForTesting::QuarantineRename,
                                    input::CleanupFaultForTesting::Unlink,
-                                   input::CleanupFaultForTesting::DirectorySync,
-                                   input::CleanupFaultForTesting::ReaderCloseUncertain};
+                                   input::CleanupFaultForTesting::DirectorySync};
     unsigned tag = 60u;
     for (const auto fault : faults) {
         directory::PrivateDirectoryLease owner;
@@ -430,15 +638,137 @@ bool quarantine_exchange_test() {
     return check(restored, "quarantine exchange touched foreign inode or prevented safe recovery");
 #endif
 }
+
+bool final_unlink_exchange_test() {
+#ifndef SYS_renameat2
+    return true;
+#else
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::ExactInputFileLease lease;
+    input::Diagnostic diagnostic;
+    if (!make_directory(84u, owner, directory_diagnostic)) return false;
+    ExchangeMutation mutation{.foreign_name = "foreign-final-window", .quarantine = {}};
+    if (!write_file(owner.descriptor(), mutation.foreign_name, "foreign-final")) return false;
+    auto hooks = input_hooks(85u);
+    hooks.before_final_remove = exchange_after_rename;
+    hooks.context = &mutation;
+    if (!input::ExactInputFileLease::create_with_hooks_for_testing(
+            owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic))
+        return false;
+    const std::string original = lease.basename();
+    struct stat foreign_before{}, foreign_after{};
+    const bool refused = stat_at(owner.descriptor(), mutation.foreign_name, foreign_before) &&
+                         !lease.cleanup(diagnostic) && mutation.exchanged &&
+                         failed(diagnostic, input::FailurePhase::Unlink) &&
+                         stat_at(owner.descriptor(), mutation.quarantine, foreign_after) &&
+                         same_inode(foreign_before, foreign_after) &&
+                         !lease.cleanup_receipt()->exact_unlinked;
+    const std::string foreign_saved = "foreign-final-survived";
+    const bool restored = refused &&
+                          renameat(owner.descriptor(),
+                                   mutation.quarantine.c_str(),
+                                   owner.descriptor(),
+                                   foreign_saved.c_str()) == 0 &&
+                          renameat(owner.descriptor(),
+                                   mutation.foreign_name.c_str(),
+                                   owner.descriptor(),
+                                   original.c_str()) == 0 &&
+                          lease.cleanup(diagnostic) &&
+                          stat_at(owner.descriptor(), foreign_saved, foreign_after) &&
+                          same_inode(foreign_before, foreign_after) &&
+                          unlinkat(owner.descriptor(), foreign_saved.c_str(), 0) == 0 &&
+                          owner.settle(directory_diagnostic);
+    return check(restored, "final-unlink exchange deleted foreign content or obscured residue");
+#endif
+}
+
+bool both_name_residue_gate_test() {
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::ExactInputFileLease lease;
+    input::Diagnostic diagnostic;
+    if (!make_directory(90u, owner, directory_diagnostic)) return false;
+    auto hooks = input_hooks(91u);
+    hooks.cleanup_fault = input::CleanupFaultForTesting::DirectorySync;
+    if (!input::ExactInputFileLease::create_with_hooks_for_testing(
+            owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic))
+        return false;
+    const std::string original = lease.basename();
+    const bool first = !lease.cleanup(diagnostic) &&
+                       failed(diagnostic, input::FailurePhase::DirectorySettlement) &&
+                       write_file(owner.descriptor(), original, "foreign-original") &&
+                       !lease.cleanup(diagnostic) &&
+                       failed(diagnostic, input::FailurePhase::Detached) &&
+                       lease.cleanup_receipt()->original_residue == input::Residue::Present &&
+                       !lease.cleanup_receipt()->settlement_complete;
+    struct stat foreign{};
+    const bool preserved = first && stat_at(owner.descriptor(), original, foreign) &&
+                           unlinkat(owner.descriptor(), original.c_str(), 0) == 0 &&
+                           lease.cleanup(diagnostic) && complete(lease.cleanup_receipt()) &&
+                           owner.settle(directory_diagnostic);
+    return check(preserved, "settlement ignored a recreated original basename");
+}
+
+bool same_diagnostic(const input::Diagnostic& left, const input::Diagnostic& right) {
+    return left.phase == right.phase && left.error_number == right.error_number;
+}
+bool same_close(const input::CloseOutcome& left, const input::CloseOutcome& right) {
+    return left.attempts == right.attempts && left.attempted == right.attempted &&
+           left.succeeded == right.succeeded && left.uncertain == right.uncertain &&
+           left.error_number == right.error_number;
+}
+bool same_receipt(const input::CleanupReceipt& left, const input::CleanupReceipt& right) {
+    return left.attempted == right.attempted &&
+           left.semantic_validated == right.semantic_validated &&
+           left.path_quarantined == right.path_quarantined &&
+           left.exact_unlinked == right.exact_unlinked &&
+           left.detached_inode_proven == right.detached_inode_proven &&
+           left.descriptor_closed == right.descriptor_closed &&
+           left.directory_settled == right.directory_settled &&
+           left.settlement_complete == right.settlement_complete &&
+           left.foreign_reader_preserved == right.foreign_reader_preserved &&
+           left.original_residue == right.original_residue &&
+           left.quarantine_residue == right.quarantine_residue && left.state == right.state &&
+           same_diagnostic(left.diagnostic, right.diagnostic) &&
+           left.original_basename == right.original_basename &&
+           left.quarantine_basename == right.quarantine_basename && left.path == right.path &&
+           same_close(left.writer_close, right.writer_close) &&
+           same_close(left.reader_close, right.reader_close) &&
+           same_close(left.authority_one_close, right.authority_one_close) &&
+           same_close(left.authority_two_close, right.authority_two_close) &&
+           same_close(left.directory_close, right.directory_close);
+}
+
+bool terminal_receipt_freeze_test() {
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::ExactInputFileLease lease;
+    input::Diagnostic diagnostic;
+    if (!make_directory(95u, owner, directory_diagnostic) ||
+        !create(96u, owner, lease, diagnostic) || !lease.cleanup(diagnostic))
+        return false;
+    const input::CleanupReceipt frozen = *lease.cleanup_receipt();
+    const bool calls = lease.cleanup(diagnostic) && !lease.revalidate(diagnostic) &&
+                       failed(diagnostic, input::FailurePhase::Revalidate) &&
+                       !input::ExactInputFileLease::create(
+                           owner, kBytes, sizeof(kBytes) - 1u, lease, diagnostic) &&
+                       failed(diagnostic, input::FailurePhase::Argument);
+    return check(calls && same_receipt(frozen, *lease.cleanup_receipt()) &&
+                     owner.settle(directory_diagnostic),
+                 "post-settlement call mutated frozen receipt evidence");
+}
 }  // namespace
 
 int main() {
     if (!invalid_argument_tests() || !normal_lifecycle_and_ordering_test() ||
-        !creation_failure_tests() || !byte_metadata_mutation_tests() ||
-        !replacement_test(ReplacementKind::Regular, 45u) ||
+        !creation_failure_tests() || !early_identity_failure_atomic_test() ||
+        !byte_metadata_mutation_tests() || !replacement_test(ReplacementKind::Regular, 45u) ||
         !replacement_test(ReplacementKind::Symlink, 48u) ||
         !replacement_test(ReplacementKind::Fifo, 51u) || !descriptor_mutation_tests() ||
-        !cleanup_fault_tests() || !quarantine_exchange_test())
+        !embedded_nul_test() || !exact_ofd_tests() || !one_shot_close_tests() ||
+        !cleanup_fault_tests() || !quarantine_exchange_test() || !final_unlink_exchange_test() ||
+        !both_name_residue_gate_test() || !terminal_receipt_freeze_test())
         return 1;
     std::puts("PASS: #358 exact input file lease");
 }

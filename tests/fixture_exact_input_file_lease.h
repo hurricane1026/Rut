@@ -62,6 +62,14 @@ struct Identity {
     std::uint64_t links = 0u;
 };
 
+struct CloseOutcome {
+    unsigned attempts = 0u;
+    bool attempted = false;
+    bool succeeded = false;
+    bool uncertain = false;
+    int error_number = 0;
+};
+
 struct CleanupReceipt {
     bool attempted = false;
     bool semantic_validated = false;
@@ -71,6 +79,7 @@ struct CleanupReceipt {
     bool descriptor_closed = false;
     bool directory_settled = false;
     bool settlement_complete = false;
+    bool foreign_reader_preserved = false;
     Residue original_residue = Residue::Unknown;
     Residue quarantine_residue = Residue::Unknown;
     State state = State::Empty;
@@ -78,12 +87,18 @@ struct CleanupReceipt {
     std::string original_basename;
     std::string quarantine_basename;
     std::string path;
+    CloseOutcome writer_close;
+    CloseOutcome reader_close;
+    CloseOutcome authority_one_close;
+    CloseOutcome authority_two_close;
+    CloseOutcome directory_close;
 };
 
 enum class CreationFaultForTesting : std::uint8_t {
     None,
     PreOpen,
     Open,
+    Identity,
     WritePartial,
     WriteError,
     Sync,
@@ -104,6 +119,16 @@ using QuarantineHookForTesting = void (*)(int directory_fd,
                                           const char* original,
                                           const char* quarantine,
                                           void* context);
+using KcmpForTesting = int (*)(int first, int second, void* context);
+
+enum class DescriptorRole : std::uint8_t {
+    Writer,
+    Reader,
+    AuthorityOne,
+    AuthorityTwo,
+    Directory,
+};
+using CloseForTesting = int (*)(int descriptor, DescriptorRole role, void* context);
 
 struct HooksForTesting {
     std::string creation_seed;
@@ -111,11 +136,19 @@ struct HooksForTesting {
     CreationFaultForTesting creation_fault = CreationFaultForTesting::None;
     CleanupFaultForTesting cleanup_fault = CleanupFaultForTesting::None;
     QuarantineHookForTesting after_quarantine_rename = nullptr;
+    QuarantineHookForTesting before_final_remove = nullptr;
+    KcmpForTesting kcmp = nullptr;
+    CloseForTesting close = nullptr;
     void* context = nullptr;
 };
 
 // Tests-only owner for one nonempty bounded uninterpreted byte string. The
 // caller's PrivateDirectoryLease must remain active until cleanup completes.
+// The owner is non-thread-safe.  The caller excludes concurrent mutation of
+// the process FD table and the private directory namespace; deterministic
+// boundary hooks model mutations at every accepted check/use boundary. The
+// defensive reader cleanup tolerates at most one numeric slot replacement;
+// two coordinated foreign slots sharing one new OFD are outside the contract.
 class ExactInputFileLease {
 public:
     ExactInputFileLease();
@@ -158,6 +191,8 @@ private:
                      Diagnostic& diagnostic);
     bool validate_directory(Diagnostic& diagnostic) const;
     bool validate_reader(bool linked, Diagnostic& diagnostic) const;
+    bool validate_private_authorities(bool linked, Diagnostic& diagnostic) const;
+    bool same_open_file_description(int first, int second, Diagnostic& diagnostic) const;
     bool validate_named(const std::string& name,
                         bool exact_semantics,
                         Diagnostic& diagnostic) const;
@@ -166,6 +201,10 @@ private:
     bool finish_detached(Diagnostic& diagnostic);
     bool close_reader(Diagnostic& diagnostic);
     bool close_directory(Diagnostic& diagnostic);
+    bool close_one(int& descriptor,
+                   DescriptorRole role,
+                   CloseOutcome& outcome,
+                   Diagnostic& diagnostic);
     bool creation_failed(const Diagnostic& cause, Diagnostic& diagnostic);
     bool reject(Diagnostic& diagnostic, FailurePhase phase, int error_number);
     void remember(const Diagnostic& diagnostic);
@@ -175,6 +214,8 @@ private:
     int directory_fd_ = -1;
     int writer_fd_ = -1;
     int reader_fd_ = -1;
+    int authority_one_fd_ = -1;
+    int authority_two_fd_ = -1;
     std::string directory_path_;
     std::string current_basename_;
     std::string expected_bytes_;

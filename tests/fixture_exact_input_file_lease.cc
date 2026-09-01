@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/kcmp.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -40,9 +41,19 @@ bool same_linked_file(const struct stat& value, const Identity& expected, bool l
            static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
            static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
            static_cast<std::uint64_t>(value.st_gid) == expected.gid && value.st_size >= 0 &&
-           value.st_uid == getuid() && value.st_gid == getgid() &&
            static_cast<std::uint64_t>(value.st_size) == expected.size &&
            value.st_nlink == (linked ? 1u : 0u) && (value.st_mode & 0777) == 0600;
+}
+
+int ordinary_kcmp(int first, int second) {
+#ifdef SYS_kcmp
+    return static_cast<int>(syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, first, second));
+#else
+    (void)first;
+    (void)second;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 bool same_directory(const struct stat& value,
@@ -125,7 +136,7 @@ Residue observe(int directory, const std::string& name) {
 ExactInputFileLease::ExactInputFileLease() : receipt_(std::make_shared<CleanupReceipt>()) {}
 
 ExactInputFileLease::~ExactInputFileLease() {
-    if (state_ != State::Empty && state_ != State::Settled) {
+    if (state_ != State::Empty && state_ != State::Settled && state_ != State::Unresolved) {
         Diagnostic diagnostic;
         if (!cleanup(diagnostic)) {
             std::fprintf(stderr,
@@ -156,6 +167,7 @@ bool ExactInputFileLease::create_with_hooks_for_testing(
 }
 
 void ExactInputFileLease::remember(const Diagnostic& diagnostic) {
+    if (state_ == State::Settled) return;
     if (receipt_->diagnostic.phase == FailurePhase::None && diagnostic.phase != FailurePhase::None)
         receipt_->diagnostic = diagnostic;
 }
@@ -194,11 +206,42 @@ bool ExactInputFileLease::validate_reader(bool linked, Diagnostic& diagnostic) c
         return false;
     }
     if (!same_linked_file(held, identity_, linked) ||
-        !descriptor_flags(reader_fd_, O_RDONLY, false)) {
+        !descriptor_flags(reader_fd_, O_RDONLY, false) ||
+        !validate_private_authorities(linked, diagnostic) ||
+        !same_open_file_description(reader_fd_, authority_one_fd_, diagnostic) ||
+        !same_open_file_description(reader_fd_, authority_two_fd_, diagnostic)) {
+        if (diagnostic.phase != FailurePhase::None) return false;
         diagnostic = {FailurePhase::Revalidate, ESTALE};
         return false;
     }
     return true;
+}
+
+bool ExactInputFileLease::same_open_file_description(int first,
+                                                     int second,
+                                                     Diagnostic& diagnostic) const {
+    diagnostic = {};
+    errno = 0;
+    const int compared = hooks_.kcmp == nullptr ? ordinary_kcmp(first, second)
+                                                : hooks_.kcmp(first, second, hooks_.context);
+    const int comparison_error = errno == 0 ? EIO : errno;
+    if (compared == 0) return true;
+    diagnostic = {FailurePhase::Revalidate, compared > 0 ? EXDEV : comparison_error};
+    return false;
+}
+
+bool ExactInputFileLease::validate_private_authorities(bool linked, Diagnostic& diagnostic) const {
+    struct stat first{};
+    struct stat second{};
+    if (authority_one_fd_ < 0 || authority_two_fd_ < 0 || fstat(authority_one_fd_, &first) != 0 ||
+        fstat(authority_two_fd_, &second) != 0 || !same_linked_file(first, identity_, linked) ||
+        !same_linked_file(second, identity_, linked) ||
+        !descriptor_flags(authority_one_fd_, O_RDONLY, false) ||
+        !descriptor_flags(authority_two_fd_, O_RDONLY, false)) {
+        diagnostic = {FailurePhase::Revalidate, errno == 0 ? ESTALE : errno};
+        return false;
+    }
+    return same_open_file_description(authority_one_fd_, authority_two_fd_, diagnostic);
 }
 
 bool ExactInputFileLease::validate_named(const std::string& name,
@@ -257,7 +300,8 @@ bool ExactInputFileLease::create_impl(
     Diagnostic& diagnostic) {
     diagnostic = {};
     if (state_ != State::Empty || directory_fd_ >= 0 || writer_fd_ >= 0 || reader_fd_ >= 0 ||
-        bytes == nullptr || size == 0u || size > kMaximumInputBytes)
+        authority_one_fd_ >= 0 || authority_two_fd_ >= 0 || bytes == nullptr || size == 0u ||
+        size > kMaximumInputBytes)
         return reject(diagnostic, FailurePhase::Argument, EINVAL);
     hooks_ = hooks == nullptr ? HooksForTesting{} : *hooks;
     if (!valid_seed(hooks_.creation_seed) || !valid_seed(hooks_.quarantine_seed))
@@ -307,17 +351,23 @@ bool ExactInputFileLease::create_impl(
     if (!opened) return creation_failed({FailurePhase::Open, EEXIST}, diagnostic);
     transition(State::Creating);
 
-    if (fchmod(writer_fd_, 0600) != 0)
-        return creation_failed({FailurePhase::Identity, errno}, diagnostic);
+    // Capture the created inode immediately.  Every later failure therefore
+    // has an exact descriptor and dev/inode authority for cleanup.
     struct stat created{};
-    if (fstat(writer_fd_, &created) != 0 || !S_ISREG(created.st_mode) ||
-        created.st_uid != getuid() || created.st_gid != getgid() || created.st_nlink != 1u ||
-        created.st_size != 0 || (created.st_mode & 0777) != 0600 ||
-        !descriptor_flags(writer_fd_, O_WRONLY, false))
+    if (fstat(writer_fd_, &created) != 0 || !S_ISREG(created.st_mode) || created.st_nlink != 1u ||
+        created.st_size != 0 || !descriptor_flags(writer_fd_, O_WRONLY, false))
         return creation_failed({FailurePhase::Identity, errno == 0 ? ESTALE : errno}, diagnostic);
     identity_ = make_identity(created);
-    identity_.size = size;
     identity_known_ = true;
+    if (hooks_.creation_fault == CreationFaultForTesting::Identity)
+        return creation_failed({FailurePhase::Identity, EIO}, diagnostic);
+    if (fchmod(writer_fd_, 0600) != 0)
+        return creation_failed({FailurePhase::Identity, errno}, diagnostic);
+    if (fstat(writer_fd_, &created) != 0 || !S_ISREG(created.st_mode) ||
+        !same_inode(created, identity_) || created.st_nlink != 1u || created.st_size != 0 ||
+        (created.st_mode & 0777) != 0600 || !descriptor_flags(writer_fd_, O_WRONLY, false))
+        return creation_failed({FailurePhase::Identity, errno == 0 ? ESTALE : errno}, diagnostic);
+    identity_ = make_identity(created);
 
     std::size_t offset = 0u;
     bool partial_injected = false;
@@ -340,6 +390,12 @@ bool ExactInputFileLease::create_impl(
     if (hooks_.creation_fault == CreationFaultForTesting::Sync)
         return creation_failed({FailurePhase::Sync, EIO}, diagnostic);
     if (fsync(writer_fd_) != 0) return creation_failed({FailurePhase::Sync, errno}, diagnostic);
+    if (fstat(writer_fd_, &created) != 0 || !same_inode(created, identity_) ||
+        created.st_size < 0 || static_cast<std::size_t>(created.st_size) != size ||
+        created.st_nlink != 1u || (created.st_mode & 0777) != 0600)
+        return creation_failed({FailurePhase::Verification, errno == 0 ? ESTALE : errno},
+                               diagnostic);
+    identity_ = make_identity(created);
 
     if (hooks_.creation_fault == CreationFaultForTesting::Reopen)
         return creation_failed({FailurePhase::Reopen, EIO}, diagnostic);
@@ -348,6 +404,10 @@ bool ExactInputFileLease::create_impl(
     if (reader_fd_ < 0) return creation_failed({FailurePhase::Reopen, errno}, diagnostic);
     if (reader_fd_ == writer_fd_)
         return creation_failed({FailurePhase::Reopen, ESTALE}, diagnostic);
+    authority_one_fd_ = fcntl(reader_fd_, F_DUPFD_CLOEXEC, 3);
+    if (authority_one_fd_ < 0) return creation_failed({FailurePhase::Reopen, errno}, diagnostic);
+    authority_two_fd_ = fcntl(reader_fd_, F_DUPFD_CLOEXEC, 3);
+    if (authority_two_fd_ < 0) return creation_failed({FailurePhase::Reopen, errno}, diagnostic);
 
     struct stat writer{};
     struct stat reader{};
@@ -358,18 +418,20 @@ bool ExactInputFileLease::create_impl(
         fstatat(directory_fd_, current_basename_.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
         same_linked_file(writer, identity_, true) && same_linked_file(reader, identity_, true) &&
         same_linked_file(named, identity_, true) && descriptor_flags(writer_fd_, O_WRONLY, false) &&
-        descriptor_flags(reader_fd_, O_RDONLY, false) && validate_bytes(diagnostic);
+        descriptor_flags(reader_fd_, O_RDONLY, false) &&
+        validate_private_authorities(true, diagnostic) &&
+        same_open_file_description(reader_fd_, authority_one_fd_, diagnostic) &&
+        same_open_file_description(reader_fd_, authority_two_fd_, diagnostic) &&
+        validate_bytes(diagnostic);
     if (!verified)
         return creation_failed({FailurePhase::Verification,
                                 diagnostic.error_number == 0 ? ESTALE : diagnostic.error_number},
                                diagnostic);
 
-    const int closing_writer = writer_fd_;
-    const int close_result = close(closing_writer);
-    if (close_result != 0) return creation_failed({FailurePhase::WriterClose, errno}, diagnostic);
-    if (hooks_.creation_fault == CreationFaultForTesting::WriterCloseUncertain)
-        return creation_failed({FailurePhase::WriterClose, EIO}, diagnostic);
-    writer_fd_ = -1;
+    Diagnostic close_diagnostic;
+    if (!close_one(writer_fd_, DescriptorRole::Writer, receipt_->writer_close, close_diagnostic))
+        return creation_failed({FailurePhase::WriterClose, close_diagnostic.error_number},
+                               diagnostic);
 
     transition(State::Active);
     return true;
@@ -394,6 +456,10 @@ bool ExactInputFileLease::creation_failed(const Diagnostic& cause, Diagnostic& d
 
 bool ExactInputFileLease::revalidate(Diagnostic& diagnostic) {
     diagnostic = {};
+    if (state_ == State::Settled) {
+        diagnostic = {FailurePhase::Revalidate, EALREADY};
+        return false;
+    }
     if (state_ != State::Active && state_ != State::BindingLost)
         return reject(diagnostic, FailurePhase::Revalidate, EINVAL);
     Diagnostic local;
@@ -473,7 +539,8 @@ bool ExactInputFileLease::quarantine(Diagnostic& diagnostic) {
 bool ExactInputFileLease::finish_detached(Diagnostic& diagnostic) {
     if (!receipt_->detached_inode_proven) {
         struct stat held{};
-        const int authority = reader_fd_ >= 0 ? reader_fd_ : writer_fd_;
+        const int authority = authority_one_fd_ >= 0 ? authority_one_fd_
+                                                     : (reader_fd_ >= 0 ? reader_fd_ : writer_fd_);
         if (authority < 0 || fstat(authority, &held) != 0 || !same_inode(held, identity_) ||
             held.st_nlink != 0u)
             return reject(diagnostic,
@@ -489,16 +556,26 @@ bool ExactInputFileLease::finish_detached(Diagnostic& diagnostic) {
     if (fsync(directory_fd_) != 0)
         return reject(diagnostic, FailurePhase::DirectorySettlement, errno);
     observe_residues();
-    if (receipt_->quarantine_residue != Residue::Absent)
-        return reject(diagnostic, FailurePhase::Detached, ESTALE);
+    if (receipt_->original_residue != Residue::Absent ||
+        receipt_->quarantine_residue != Residue::Absent)
+        return reject(diagnostic,
+                      FailurePhase::Detached,
+                      receipt_->original_residue == Residue::Present ||
+                              receipt_->quarantine_residue == Residue::Present
+                          ? EEXIST
+                          : ESTALE);
 
     Diagnostic close_diagnostic;
-    if (!close_reader(close_diagnostic)) {
-        diagnostic = close_diagnostic;
-        return false;
-    }
-    if (!close_directory(close_diagnostic)) {
-        diagnostic = close_diagnostic;
+    const bool descriptors_closed = close_reader(close_diagnostic);
+    const Diagnostic descriptor_diagnostic = close_diagnostic;
+    const bool close_uncertain =
+        receipt_->writer_close.uncertain || receipt_->reader_close.uncertain ||
+        receipt_->authority_one_close.uncertain || receipt_->authority_two_close.uncertain;
+    const bool directory_closed =
+        descriptors_closed || close_uncertain ? close_directory(close_diagnostic) : false;
+    if (!descriptors_closed || !directory_closed) {
+        diagnostic = !descriptors_closed ? descriptor_diagnostic : close_diagnostic;
+        if (close_uncertain || receipt_->directory_close.uncertain) transition(State::Unresolved);
         return false;
     }
     transition(State::Settled);
@@ -506,70 +583,157 @@ bool ExactInputFileLease::finish_detached(Diagnostic& diagnostic) {
     return true;
 }
 
+bool ExactInputFileLease::close_one(int& descriptor,
+                                    DescriptorRole role,
+                                    CloseOutcome& outcome,
+                                    Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (outcome.attempted) {
+        if (outcome.succeeded) return true;
+        diagnostic = {role == DescriptorRole::Directory ? FailurePhase::DirectorySettlement
+                                                        : FailurePhase::DescriptorClose,
+                      outcome.error_number == 0 ? EIO : outcome.error_number};
+        return false;
+    }
+    if (descriptor < 0) return true;
+    const int closing = descriptor;
+    descriptor = -1;  // A real close is one-shot even when its result is uncertain.
+    outcome.attempts = 1u;
+    outcome.attempted = true;
+    errno = 0;
+    const int result =
+        hooks_.close == nullptr ? close(closing) : hooks_.close(closing, role, hooks_.context);
+    int error = errno == 0 ? EIO : errno;
+    const bool inject = (role == DescriptorRole::Writer &&
+                         hooks_.creation_fault == CreationFaultForTesting::WriterCloseUncertain) ||
+                        (role == DescriptorRole::Reader &&
+                         hooks_.cleanup_fault == CleanupFaultForTesting::ReaderCloseUncertain &&
+                         !cleanup_fault_consumed_);
+    if (inject) {
+        cleanup_fault_consumed_ = true;
+        error = EIO;
+    }
+    if (result == 0 && !inject) {
+        outcome.succeeded = true;
+        return true;
+    }
+    outcome.uncertain = true;
+    outcome.error_number = error;
+    diagnostic = {role == DescriptorRole::Directory ? FailurePhase::DirectorySettlement
+                                                    : FailurePhase::DescriptorClose,
+                  error};
+    return false;
+}
+
 bool ExactInputFileLease::close_reader(Diagnostic& diagnostic) {
     diagnostic = {};
-    auto close_exact = [&](int& descriptor, int access_mode, bool inject) {
-        if (descriptor < 0) return true;
-        struct stat held{};
-        if (fstat(descriptor, &held) != 0) {
-            if (errno == EBADF) {
-                descriptor = -1;
-                return true;
-            }
-            return false;
-        }
-        if (!same_inode(held, identity_) || !descriptor_flags(descriptor, access_mode, false)) {
-            errno = ESTALE;
-            return false;
-        }
-        const int closing = descriptor;
-        if (!inject) descriptor = -1;
-        const int result = close(closing);
-        if (result != 0) return false;
-        if (inject) {
-            errno = EIO;
-            return false;
-        }
-        return true;
-    };
+    std::array<int*, 3> slots = {&reader_fd_, &authority_one_fd_, &authority_two_fd_};
+    const std::array<int, 3> descriptors = {reader_fd_, authority_one_fd_, authority_two_fd_};
+    std::array<bool, 3> original_members{};
+    unsigned live = 0u;
+    for (const int descriptor : descriptors)
+        if (descriptor >= 0) ++live;
 
-    const bool writer_closed = close_exact(writer_fd_, O_WRONLY, false);
-    const int writer_error = errno == 0 ? EIO : errno;
-    const bool inject_reader =
-        hooks_.cleanup_fault == CleanupFaultForTesting::ReaderCloseUncertain &&
-        !cleanup_fault_consumed_;
-    if (inject_reader) cleanup_fault_consumed_ = true;
-    const bool reader_closed = close_exact(reader_fd_, O_RDONLY, inject_reader);
-    const int reader_error = errno == 0 ? EIO : errno;
-    receipt_->descriptor_closed = writer_closed && reader_closed;
-    if (!receipt_->descriptor_closed)
-        return reject(diagnostic,
-                      FailurePhase::DescriptorClose,
-                      !writer_closed ? writer_error : reader_error);
+    int comparison_error = 0;
+    unsigned same_edges = 0u;
+    if (live == 1u && state_ == State::Creating) {
+        for (std::size_t index = 0u; index != descriptors.size(); ++index)
+            original_members[index] = descriptors[index] >= 0;
+    } else if (live != 0u) {
+        for (std::size_t first = 0u; first != descriptors.size(); ++first) {
+            if (descriptors[first] < 0) continue;
+            for (std::size_t second = first + 1u; second != descriptors.size(); ++second) {
+                if (descriptors[second] < 0) continue;
+                Diagnostic relation;
+                if (same_open_file_description(descriptors[first], descriptors[second], relation)) {
+                    original_members[first] = true;
+                    original_members[second] = true;
+                    ++same_edges;
+                } else if (relation.error_number != EXDEV && comparison_error == 0) {
+                    comparison_error = relation.error_number;
+                }
+            }
+        }
+        if (same_edges == 0u)
+            return reject(diagnostic,
+                          FailurePhase::DescriptorClose,
+                          comparison_error == 0 ? ESTALE : comparison_error);
+    }
+
+    for (std::size_t index = 0u; index != slots.size(); ++index) {
+        if (*slots[index] < 0 || original_members[index]) continue;
+        // Under the documented at-most-one replacement boundary, the exact
+        // two-member OFD majority proves every nonmember foreign. Consume its
+        // numeric slot without closing it.
+        *slots[index] = -1;
+        if (index == 0u) receipt_->foreign_reader_preserved = true;
+    }
+
+    Diagnostic first_failure;
+    auto close_role = [&](int& descriptor, DescriptorRole role, CloseOutcome& outcome) {
+        Diagnostic local;
+        const bool closed = close_one(descriptor, role, outcome, local);
+        if (!closed && first_failure.phase == FailurePhase::None) first_failure = local;
+        return closed;
+    };
+    const bool writer_closed =
+        close_role(writer_fd_, DescriptorRole::Writer, receipt_->writer_close);
+    const bool reader_closed =
+        !original_members[0] ||
+        close_role(reader_fd_, DescriptorRole::Reader, receipt_->reader_close);
+    const bool first_closed =
+        !original_members[1] ||
+        close_role(authority_one_fd_, DescriptorRole::AuthorityOne, receipt_->authority_one_close);
+    const bool second_closed =
+        !original_members[2] ||
+        close_role(authority_two_fd_, DescriptorRole::AuthorityTwo, receipt_->authority_two_close);
+    receipt_->descriptor_closed = writer_closed && reader_closed && first_closed && second_closed;
+    if (!receipt_->descriptor_closed) {
+        diagnostic = first_failure.phase == FailurePhase::None
+                         ? Diagnostic{FailurePhase::DescriptorClose, EIO}
+                         : first_failure;
+        remember(diagnostic);
+        return false;
+    }
     return true;
 }
 
 bool ExactInputFileLease::close_directory(Diagnostic& diagnostic) {
     if (directory_fd_ < 0) {
-        receipt_->directory_settled = true;
-        return true;
+        if (!receipt_->directory_close.attempted || receipt_->directory_close.succeeded) {
+            receipt_->directory_settled = true;
+            return true;
+        }
+        diagnostic = {FailurePhase::DirectorySettlement,
+                      receipt_->directory_close.error_number == 0
+                          ? EIO
+                          : receipt_->directory_close.error_number};
+        return false;
     }
     struct stat held{};
     if (fstat(directory_fd_, &held) != 0 || !same_directory(held, directory_identity_) ||
         !descriptor_flags(directory_fd_, O_RDONLY, true))
         return reject(diagnostic, FailurePhase::DirectorySettlement, errno == 0 ? ESTALE : errno);
-    const int closing = directory_fd_;
-    directory_fd_ = -1;
-    if (close(closing) != 0) return reject(diagnostic, FailurePhase::DirectorySettlement, errno);
+    if (!close_one(
+            directory_fd_, DescriptorRole::Directory, receipt_->directory_close, diagnostic)) {
+        remember(diagnostic);
+        return false;
+    }
     receipt_->directory_settled = true;
     return true;
 }
 
 bool ExactInputFileLease::cleanup(Diagnostic& diagnostic) {
     diagnostic = {};
-    receipt_->attempted = true;
     if (state_ == State::Settled) return true;
+    receipt_->attempted = true;
     if (state_ == State::Empty) return reject(diagnostic, FailurePhase::Argument, EINVAL);
+    if (state_ == State::Unresolved) {
+        diagnostic = receipt_->diagnostic.phase == FailurePhase::None
+                         ? Diagnostic{FailurePhase::DescriptorClose, EIO}
+                         : receipt_->diagnostic;
+        return false;
+    }
 
     if (state_ != State::Quarantined && state_ != State::Detached) {
         Diagnostic semantic;
@@ -583,6 +747,19 @@ bool ExactInputFileLease::cleanup(Diagnostic& diagnostic) {
         if (hooks_.cleanup_fault == CleanupFaultForTesting::Unlink && !cleanup_fault_consumed_) {
             cleanup_fault_consumed_ = true;
             return reject(diagnostic, FailurePhase::Unlink, EIO);
+        }
+        if (hooks_.before_final_remove != nullptr)
+            hooks_.before_final_remove(directory_fd_,
+                                       receipt_->original_basename.c_str(),
+                                       current_basename_.c_str(),
+                                       hooks_.context);
+        // The boundary hook runs after the first validation.  Under this
+        // lease's exclusive-namespace contract, this is the final possible
+        // mutation boundary and this second validation is the unlink gate.
+        if (!validate_named(current_basename_, false, named)) {
+            transition(State::BindingLost);
+            observe_residues();
+            return reject(diagnostic, FailurePhase::Unlink, named.error_number);
         }
         if (unlinkat(directory_fd_, current_basename_.c_str(), 0) != 0)
             return reject(diagnostic, FailurePhase::Unlink, errno);
