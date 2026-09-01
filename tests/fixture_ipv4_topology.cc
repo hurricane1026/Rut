@@ -372,6 +372,242 @@ static bool run_command(const std::vector<std::string>& arguments,
     return reaped && !result.timed_out;
 }
 
+struct ExactReadCommandResult {
+    bool started = false;
+    bool deadline_exceeded = false;
+    bool output_overflow = false;
+    bool stdout_eof = false;
+    bool stderr_eof = false;
+    bool child_reaped = false;
+    bool wait_status_valid = false;
+    bool process_group_owned = false;
+    bool process_group_gone = false;
+    int stdout_read_errno = 0;
+    int stderr_read_errno = 0;
+    int wait_status = 0;
+    std::string stdout_bytes;
+    std::string stderr_bytes;
+};
+
+enum class ExactReadRunnerFault : std::uint8_t {
+    None,
+    Start,
+    StdoutReadAfterBytes,
+};
+
+static void reap_exact_read_child(pid_t child, ExactReadCommandResult& result) {
+    while (!result.child_reaped) {
+        const pid_t waited = waitpid(child, &result.wait_status, 0);
+        if (waited == child) {
+            result.child_reaped = true;
+            result.wait_status_valid = true;
+        } else if (waited < 0 && errno == EINTR) {
+            continue;
+        } else if (waited < 0 && errno == ECHILD) {
+            result.child_reaped = true;
+        } else {
+            break;
+        }
+    }
+}
+
+static bool run_exact_read_command(const std::vector<std::string>& arguments,
+                                   size_t stdout_limit,
+                                   int timeout_ms,
+                                   ExactReadCommandResult& result,
+                                   ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+    ++command_invocation_count;
+    result = {};
+    if (arguments.empty() || stdout_limit == 0u || timeout_ms <= 0 ||
+        fault == ExactReadRunnerFault::Start)
+        return false;
+    int stdout_pipe[2] = {-1, -1};
+    int stderr_pipe[2] = {-1, -1};
+    if (pipe(stdout_pipe) != 0) return false;
+    if (pipe(stderr_pipe) != 0) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        return false;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+        return false;
+    }
+    if (child == 0) {
+        (void)setpgid(0, 0);
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || dup2(stderr_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 1u);
+        for (const std::string& argument : arguments)
+            argv.push_back(const_cast<char*>(argument.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    result.started = true;
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+    (void)setpgid(child, child);
+    result.process_group_owned = getpgid(child) == child;
+    if (!result.process_group_owned) {
+        result.stdout_read_errno = EPROTO;
+        (void)kill(child, SIGKILL);
+        reap_exact_read_child(child, result);
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        result.process_group_gone = process_group_gone(child);
+        return false;
+    }
+    for (const int fd : {stdout_pipe[0], stderr_pipe[0]}) {
+        const int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            if (fd == stdout_pipe[0])
+                result.stdout_read_errno = errno;
+            else
+                result.stderr_read_errno = errno;
+        }
+    }
+    constexpr size_t kStderrLimit = fixture_exact_input_file_lease::kMaximumInputBytes + 1u;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    bool injected_read_error = false;
+    const auto drain = [&](int fd,
+                           std::string& bytes,
+                           size_t limit,
+                           bool& eof,
+                           int& read_error,
+                           bool inject_error) {
+        if (eof || read_error != 0 || result.output_overflow) return;
+        char buffer[4096];
+        for (;;) {
+            const ssize_t count = read(fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                const size_t available = static_cast<size_t>(count);
+                if (bytes.size() > limit) {
+                    result.output_overflow = true;
+                    return;
+                }
+                const size_t remaining = limit - bytes.size();
+                const size_t retained = std::min(remaining, available);
+                bytes.append(buffer, retained);
+                if (available > remaining) {
+                    result.output_overflow = true;
+                    return;
+                }
+                if (inject_error && !injected_read_error && !bytes.empty()) {
+                    injected_read_error = true;
+                    read_error = EIO;
+                    return;
+                }
+                continue;
+            }
+            if (count == 0) {
+                eof = true;
+                return;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            read_error = errno;
+            return;
+        }
+    };
+    bool force_cleanup = result.stdout_read_errno != 0 || result.stderr_read_errno != 0;
+    while (!force_cleanup && !(result.child_reaped && result.stdout_eof && result.stderr_eof)) {
+        drain(stdout_pipe[0],
+              result.stdout_bytes,
+              stdout_limit,
+              result.stdout_eof,
+              result.stdout_read_errno,
+              fault == ExactReadRunnerFault::StdoutReadAfterBytes);
+        drain(stderr_pipe[0],
+              result.stderr_bytes,
+              kStderrLimit,
+              result.stderr_eof,
+              result.stderr_read_errno,
+              false);
+        if (result.output_overflow || result.stdout_read_errno != 0 ||
+            result.stderr_read_errno != 0) {
+            force_cleanup = true;
+            break;
+        }
+        if (!result.child_reaped) {
+            const pid_t waited = waitpid(child, &result.wait_status, WNOHANG);
+            if (waited == child) {
+                result.child_reaped = true;
+                result.wait_status_valid = true;
+            } else if (waited < 0 && errno != EINTR) {
+                if (errno == ECHILD) result.child_reaped = true;
+                force_cleanup = true;
+                break;
+            }
+        }
+        if (result.child_reaped && result.stdout_eof && result.stderr_eof) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            result.deadline_exceeded = true;
+            force_cleanup = true;
+            break;
+        }
+        pollfd descriptors[2] = {{stdout_pipe[0], POLLIN | POLLHUP, 0},
+                                 {stderr_pipe[0], POLLIN | POLLHUP, 0}};
+        (void)poll(descriptors, 2, 25);
+    }
+    if (force_cleanup && !result.child_reaped) {
+        (void)kill(-child, SIGTERM);
+        (void)usleep(100000);
+        (void)kill(-child, SIGKILL);
+    }
+    reap_exact_read_child(child, result);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+    require_group_gone(child, "exact-read command completion PGID remained alive");
+    result.process_group_gone = true;
+    return result.started && !result.deadline_exceeded && !result.output_overflow &&
+           result.stdout_read_errno == 0 && result.stderr_read_errno == 0;
+}
+
+static ExactInputReadOutcome classify_exact_read(const ExactReadCommandResult& result,
+                                                 const std::string& expected) {
+    if (!result.started) return ExactInputReadOutcome::CommandStartFailed;
+    if (result.deadline_exceeded) return ExactInputReadOutcome::DeadlineExceeded;
+    if (result.output_overflow) return ExactInputReadOutcome::OutputLimitExceeded;
+    if (result.stdout_read_errno != 0 || result.stderr_read_errno != 0 || !result.stdout_eof ||
+        !result.stderr_eof || !result.child_reaped || !result.wait_status_valid ||
+        !result.process_group_gone)
+        return ExactInputReadOutcome::StreamError;
+    if (WIFSIGNALED(result.wait_status)) return ExactInputReadOutcome::ExitSignaled;
+    if (!WIFEXITED(result.wait_status) || WEXITSTATUS(result.wait_status) != 0)
+        return ExactInputReadOutcome::ExitNonzero;
+    if (!result.stderr_bytes.empty()) return ExactInputReadOutcome::StderrNotEmpty;
+    if (result.stdout_bytes != expected) return ExactInputReadOutcome::ByteMismatch;
+    return ExactInputReadOutcome::Complete;
+}
+
+static void copy_exact_read_result(const ExactReadCommandResult& result,
+                                   ExactInputReadObservation& observation) {
+    observation.command_started = result.started;
+    observation.stdout_eof = result.stdout_eof;
+    observation.stderr_eof = result.stderr_eof;
+    observation.child_reaped = result.child_reaped;
+    observation.wait_status_valid = result.wait_status_valid;
+    observation.process_group_owned = result.process_group_owned;
+    observation.process_group_gone = result.process_group_gone;
+    observation.deadline_exceeded = result.deadline_exceeded;
+    observation.output_overflow = result.output_overflow;
+    observation.stdout_read_errno = result.stdout_read_errno;
+    observation.stderr_read_errno = result.stderr_read_errno;
+    observation.wait_status = result.wait_status;
+    observation.stdout_bytes = result.stdout_bytes;
+    observation.stderr_bytes = result.stderr_bytes;
+}
+
 static bool read_file(const std::string& path, std::string& output) {
     output.clear();
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -3125,7 +3361,11 @@ struct ExactInputMountOwner {
     ExactInputMountState state = ExactInputMountState::Empty;
     ExactInputMountSnapshot snapshot;
     ExactInputMountRecoveryReceipt receipt;
+    ExactInputReadObservation read_observation;
+    ExactInputMountDiagnostic read_diagnostic;
     std::vector<std::string> sidecar_argv;
+    HeldNamespaceSidecarSnapshot registered_sidecar;
+    ParsedMountInspect registered_mount;
     bool mutated = false;
     bool settled = false;
     bool topology_complete = false;
@@ -3136,7 +3376,96 @@ struct ExactInputMountOwner {
     bool holder_disappearance_consumed = false;
     bool topology_settlement_fault_consumed = false;
     bool operation_failed = false;
+    bool read_attempted = false;
 };
+
+static bool mount_inspect_equal(const ParsedMountInspect& left, const ParsedMountInspect& right) {
+    const auto mount_equal = [](const ParsedMount& a, const ParsedMount& b) {
+        return a.type == b.type && a.source == b.source && a.destination == b.destination &&
+               a.mode == b.mode && a.propagation == b.propagation && a.read_only == b.read_only;
+    };
+    const auto list_equal = [&](const std::vector<ParsedMount>& a,
+                                const std::vector<ParsedMount>& b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), mount_equal);
+    };
+    return left.id == right.id && left.name == right.name && left.user == right.user &&
+           left.network_mode == right.network_mode && list_equal(left.requested, right.requested) &&
+           list_equal(left.realized, right.realized);
+}
+
+static ExactInputReadOutcome capture_input_read_bracket(ExactInputMountOwner& owner,
+                                                        bool before,
+                                                        ExactInputReadObservation& observation,
+                                                        std::string& error,
+                                                        int& error_number) {
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
+    if (before && owner.options.failure_point ==
+                      ExactInputMountFailurePoint::InputReadRejectSourceRevalidation) {
+        error = "injected exact input source revalidation rejection";
+        return ExactInputReadOutcome::SourceRevalidationFailed;
+    }
+    if (!owner.input.revalidate(file_diagnostic)) {
+        error = "exact input source revalidation failed at input-read bracket";
+        error_number = file_diagnostic.error_number;
+        return ExactInputReadOutcome::SourceRevalidationFailed;
+    }
+    if (before)
+        observation.pre_source_revalidated = true;
+    else
+        observation.post_source_revalidated = true;
+
+    if (!owner.fixture.revalidate_sidecar_identity(error)) {
+        error = "exact sidecar identity failed at input-read bracket: " + error;
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    const HeldNamespaceSidecarSnapshot first = owner.fixture.sidecar_snapshot();
+    if (!sidecar_snapshot_equal(first, owner.registered_sidecar)) {
+        error = "input-read sidecar differed from the registered immutable snapshot";
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    if (before)
+        observation.pre_container_identity = true;
+    else
+        observation.post_container_identity = true;
+    observation.registered_identity_matched = true;
+
+    ParsedMountInspect mount;
+    if (!inspect_exact_mount(
+            owner.fixture, owner.input.path(), owner.input.identity(), mount, error)) {
+        error = "exact mount/Config.User inspection failed at input-read bracket: " + error;
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    if (!mount_inspect_equal(mount, owner.registered_mount)) {
+        error = "input-read mount/Config.User differed from the registered snapshot";
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    if (before)
+        observation.pre_mount_inspected = true;
+    else
+        observation.post_mount_inspected = true;
+    observation.registered_mount_matched = true;
+
+    const auto& identity = owner.input.identity();
+    if (!proc_credentials_exact(first.pid, identity.uid, identity.gid)) {
+        error = "actual sidecar /proc credentials failed at input-read bracket";
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    if (!owner.fixture.revalidate_sidecar_identity(error)) {
+        error = "post-/proc exact sidecar identity failed at input-read bracket: " + error;
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    const HeldNamespaceSidecarSnapshot second = owner.fixture.sidecar_snapshot();
+    if (!sidecar_snapshot_equal(first, second) ||
+        !sidecar_snapshot_equal(second, owner.registered_sidecar)) {
+        error = "sidecar PID/start/netns identity changed across input-read /proc evidence";
+        return ExactInputReadOutcome::ContainerIdentityFailed;
+    }
+    if (before)
+        observation.pre_proc_credentials = true;
+    else
+        observation.post_proc_credentials = true;
+    return ExactInputReadOutcome::Complete;
+}
 
 static void sync_setup_event_evidence(ExactInputMountOwner& owner) {
     const SetupEventEvidence& evidence = owner.fixture.setup_event_evidence();
@@ -3471,6 +3800,8 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
     owner.snapshot.exact_proc_credentials = true;
     owner.snapshot.parser_mutation_matrix_passed = true;
     owner.snapshot.parser_rejections = parser_rejections;
+    owner.registered_sidecar = sidecar;
+    owner.registered_mount = parsed;
     owner.state = ExactInputMountState::ReadyForObservation;
     owner.snapshot.state = owner.state;
     owner.receipt.state = owner.state;
@@ -3708,6 +4039,80 @@ std::uint64_t exact_input_mount_test_command_count() {
     return command_invocation_count;
 }
 
+bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
+                                             ExactInputReadObservation& observation,
+                                             ExactInputMountDiagnostic& diagnostic) {
+    observation = {};
+    diagnostic = {};
+    std::string name;
+    std::string expected;
+    int timeout_ms = 3000;
+    ExactReadRunnerFault fault = ExactReadRunnerFault::None;
+    switch (test_case) {
+        case ExactInputReadRunnerTestCase::CommandStartFailure:
+            name = "start";
+            fault = ExactReadRunnerFault::Start;
+            break;
+        case ExactInputReadRunnerTestCase::MaxSizeExact:
+            name = "max";
+            expected.resize(fixture_exact_input_file_lease::kMaximumInputBytes);
+            for (size_t index = 0; index < expected.size(); ++index)
+                expected[index] = static_cast<char>((index % 251u) + 1u);
+            break;
+        case ExactInputReadRunnerTestCase::EmbeddedNulExact:
+            name = "nul";
+            expected = std::string("a\0b", 3);
+            break;
+        case ExactInputReadRunnerTestCase::HeldOpenAfterExactBytes:
+            name = "held";
+            expected = "held";
+            timeout_ms = 250;
+            break;
+        case ExactInputReadRunnerTestCase::ExtraByteThenEof:
+            name = "extra";
+            expected = "abc";
+            break;
+        case ExactInputReadRunnerTestCase::BeyondSentinel:
+            name = "overflow";
+            expected = "abc";
+            break;
+        case ExactInputReadRunnerTestCase::ReadErrorAfterBytes:
+            name = "read-error";
+            expected = "abc";
+            fault = ExactReadRunnerFault::StdoutReadAfterBytes;
+            break;
+        case ExactInputReadRunnerTestCase::ExitSignaled:
+            name = "signaled";
+            break;
+        case ExactInputReadRunnerTestCase::ExitNonzero:
+            name = "nonzero";
+            break;
+        case ExactInputReadRunnerTestCase::NonemptyStderr:
+            name = "stderr";
+            expected = "abc";
+            break;
+    }
+    if (expected.size() == std::numeric_limits<size_t>::max()) {
+        diagnostic = {ExactInputMountPhase::InputObservation,
+                      EOVERFLOW,
+                      "runner self-check sentinel overflow"};
+        return false;
+    }
+    observation.attempted = true;
+    observation.expected_size = expected.size();
+    observation.command_argv = {"/proc/self/exe", "--exact-input-read-helper", name};
+    ExactReadCommandResult result;
+    (void)run_exact_read_command(
+        observation.command_argv, expected.size() + 1u, timeout_ms, result, fault);
+    copy_exact_read_result(result, observation);
+    observation.outcome = classify_exact_read(result, expected);
+    observation.terminal_frozen = true;
+    if (observation.outcome != ExactInputReadOutcome::Complete)
+        observation.diagnostic = {
+            ExactInputMountPhase::InputObservation, 0, "deterministic exact-read runner outcome"};
+    return true;
+}
+
 static std::int64_t exact_mount_thread_id() {
 #ifdef SYS_gettid
     return static_cast<std::int64_t>(syscall(SYS_gettid));
@@ -3903,6 +4308,112 @@ bool ExactInputMountRecoveryController::snapshot(const ExactInputMountHandle& ha
         return false;
     }
     snapshot_value = owner->snapshot;
+    return true;
+}
+
+bool ExactInputMountRecoveryController::observe_input_read(const ExactInputMountHandle& handle,
+                                                           ExactInputReadObservation& observation,
+                                                           ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, EINVAL, "exact-input owner is absent"};
+        return false;
+    }
+    if (owner->read_attempted) {
+        observation = owner->read_observation;
+        diagnostic = owner->read_diagnostic;
+        return observation.outcome == ExactInputReadOutcome::Complete;
+    }
+    if (owner->state != ExactInputMountState::ReadyForObservation) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "exact-input mount is not ReadyForObservation"};
+        return false;
+    }
+    owner->read_attempted = true;
+    owner->state = ExactInputMountState::ObservingInput;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    ExactInputReadObservation current;
+    current.attempted = true;
+    current.expected_size = owner->bytes.size();
+    const auto freeze_failure =
+        [&](ExactInputReadOutcome outcome, const std::string& message, int error_number = 0) {
+            current.outcome = outcome;
+            current.terminal_frozen = true;
+            current.diagnostic = {ExactInputMountPhase::InputObservation, error_number, message};
+            owner->operation_failed = true;
+            owner_failure(*owner,
+                          diagnostic,
+                          current.diagnostic.phase,
+                          current.diagnostic.message,
+                          current.diagnostic.error_number);
+            owner->read_observation = current;
+            owner->read_diagnostic = current.diagnostic;
+            observation = current;
+            return false;
+        };
+
+    std::string error;
+    int error_number = 0;
+    ExactInputReadOutcome bracket =
+        capture_input_read_bracket(*owner, true, current, error, error_number);
+    if (bracket != ExactInputReadOutcome::Complete)
+        return freeze_failure(bracket, error, error_number);
+
+    if (owner->bytes.size() == std::numeric_limits<size_t>::max())
+        return freeze_failure(ExactInputReadOutcome::OutputLimitExceeded,
+                              "expected input size cannot form a one-byte sentinel",
+                              EOVERFLOW);
+    const size_t stdout_limit = owner->bytes.size() + 1u;
+    const std::string user = std::to_string(owner->input.identity().uid) + ":" +
+                             std::to_string(owner->input.identity().gid);
+    current.command_argv = {"docker",
+                            "exec",
+                            "--user",
+                            user,
+                            owner->registered_sidecar.id,
+                            "/bin/cat",
+                            kExactInputMountDestination};
+    if (!full_container_id(owner->registered_sidecar.id) || current.command_argv.size() != 7u)
+        return freeze_failure(ExactInputReadOutcome::ContainerIdentityFailed,
+                              "registered sidecar ID was not a full immutable Docker ID");
+    ExactReadCommandResult command;
+    (void)run_exact_read_command(current.command_argv, stdout_limit, 15000, command);
+    copy_exact_read_result(command, current);
+
+    if (owner->options.failure_point ==
+        ExactInputMountFailurePoint::InputReadPostCommandSidecarDeath) {
+        std::string death_error;
+        if (!owner->fixture.terminate_sidecar_unexpectedly(death_error))
+            return freeze_failure(ExactInputReadOutcome::ContainerIdentityFailed,
+                                  "post-command sidecar death injection failed: " + death_error);
+    }
+    error.clear();
+    error_number = 0;
+    bracket = capture_input_read_bracket(*owner, false, current, error, error_number);
+    if (bracket != ExactInputReadOutcome::Complete)
+        return freeze_failure(bracket, error, error_number);
+
+    const ExactInputReadOutcome outcome = classify_exact_read(command, owner->bytes);
+    if (outcome != ExactInputReadOutcome::Complete) {
+        std::ostringstream message;
+        message << "exact container input read failed with outcome "
+                << static_cast<unsigned>(outcome);
+        return freeze_failure(outcome, message.str());
+    }
+    current.outcome = ExactInputReadOutcome::Complete;
+    current.terminal_frozen = true;
+    current.diagnostic = {};
+    owner->read_observation = current;
+    owner->read_diagnostic = {};
+    owner->state = ExactInputMountState::InputReadObserved;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    observation = current;
+    diagnostic = {};
     return true;
 }
 

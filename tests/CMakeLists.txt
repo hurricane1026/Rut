@@ -900,6 +900,13 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 360
         SKIP_RETURN_CODE 77
     )
+    add_test(NAME test_fixture_exact_input_read_runner
+             COMMAND test_fixture_exact_input_mount_owner
+                     --exact-input-read-runner-self-check)
+    set_tests_properties(test_fixture_exact_input_read_runner PROPERTIES
+        LABELS "unit"
+        TIMEOUT 30
+    )
     set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"

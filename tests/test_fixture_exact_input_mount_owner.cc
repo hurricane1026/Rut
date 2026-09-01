@@ -117,6 +117,153 @@ bool operation_failure_terminal(const ExactInputMountRecoveryReceipt& receipt,
            receipt.diagnostic.phase == phase;
 }
 
+bool write_all(int fd, const std::string& bytes) {
+    size_t written = 0;
+    while (written < bytes.size()) {
+        const ssize_t count = write(fd, bytes.data() + written, bytes.size() - written);
+        if (count > 0)
+            written += static_cast<size_t>(count);
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else
+            return false;
+    }
+    return true;
+}
+
+int run_exact_read_helper(const std::string& name) {
+    if (name == "max") {
+        std::string bytes(8192, '\0');
+        for (size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = static_cast<char>((index % 251u) + 1u);
+        return write_all(STDOUT_FILENO, bytes) ? 0 : 126;
+    }
+    if (name == "nul") return write_all(STDOUT_FILENO, std::string("a\0b", 3)) ? 0 : 126;
+    if (name == "held") {
+        if (!write_all(STDOUT_FILENO, "held")) return 126;
+        (void)usleep(3000000);
+        return 0;
+    }
+    if (name == "extra") return write_all(STDOUT_FILENO, "abcX") ? 0 : 126;
+    if (name == "overflow") return write_all(STDOUT_FILENO, "abcXY") ? 0 : 126;
+    if (name == "read-error") return write_all(STDOUT_FILENO, "abc") ? 0 : 126;
+    if (name == "signaled") {
+        (void)raise(SIGUSR1);
+        return 126;
+    }
+    if (name == "nonzero") return 23;
+    if (name == "stderr") {
+        if (!write_all(STDOUT_FILENO, "abc") || !write_all(STDERR_FILENO, "bad")) return 126;
+        return 0;
+    }
+    return 125;
+}
+
+bool read_observation_equal(const ExactInputReadObservation& left,
+                            const ExactInputReadObservation& right) {
+    return left.outcome == right.outcome && left.attempted == right.attempted &&
+           left.terminal_frozen == right.terminal_frozen &&
+           left.command_started == right.command_started && left.stdout_eof == right.stdout_eof &&
+           left.stderr_eof == right.stderr_eof && left.child_reaped == right.child_reaped &&
+           left.wait_status_valid == right.wait_status_valid &&
+           left.process_group_owned == right.process_group_owned &&
+           left.process_group_gone == right.process_group_gone &&
+           left.deadline_exceeded == right.deadline_exceeded &&
+           left.output_overflow == right.output_overflow &&
+           left.pre_source_revalidated == right.pre_source_revalidated &&
+           left.pre_container_identity == right.pre_container_identity &&
+           left.pre_mount_inspected == right.pre_mount_inspected &&
+           left.pre_proc_credentials == right.pre_proc_credentials &&
+           left.post_source_revalidated == right.post_source_revalidated &&
+           left.post_container_identity == right.post_container_identity &&
+           left.post_mount_inspected == right.post_mount_inspected &&
+           left.post_proc_credentials == right.post_proc_credentials &&
+           left.registered_identity_matched == right.registered_identity_matched &&
+           left.registered_mount_matched == right.registered_mount_matched &&
+           left.expected_size == right.expected_size &&
+           left.stdout_read_errno == right.stdout_read_errno &&
+           left.stderr_read_errno == right.stderr_read_errno &&
+           left.wait_status == right.wait_status && left.command_argv == right.command_argv &&
+           left.stdout_bytes == right.stdout_bytes && left.stderr_bytes == right.stderr_bytes &&
+           left.diagnostic.phase == right.diagnostic.phase &&
+           left.diagnostic.error_number == right.diagnostic.error_number &&
+           left.diagnostic.message == right.diagnostic.message;
+}
+
+bool exact_read_runner_self_checks(std::string& error) {
+    const std::vector<std::pair<ExactInputReadRunnerTestCase, ExactInputReadOutcome>> cases = {
+        {ExactInputReadRunnerTestCase::CommandStartFailure,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::MaxSizeExact, ExactInputReadOutcome::Complete},
+        {ExactInputReadRunnerTestCase::EmbeddedNulExact, ExactInputReadOutcome::Complete},
+        {ExactInputReadRunnerTestCase::HeldOpenAfterExactBytes,
+         ExactInputReadOutcome::DeadlineExceeded},
+        {ExactInputReadRunnerTestCase::ExtraByteThenEof, ExactInputReadOutcome::ByteMismatch},
+        {ExactInputReadRunnerTestCase::BeyondSentinel, ExactInputReadOutcome::OutputLimitExceeded},
+        {ExactInputReadRunnerTestCase::ReadErrorAfterBytes, ExactInputReadOutcome::StreamError},
+        {ExactInputReadRunnerTestCase::ExitSignaled, ExactInputReadOutcome::ExitSignaled},
+        {ExactInputReadRunnerTestCase::ExitNonzero, ExactInputReadOutcome::ExitNonzero},
+        {ExactInputReadRunnerTestCase::NonemptyStderr, ExactInputReadOutcome::StderrNotEmpty},
+    };
+    for (const auto& [test_case, outcome] : cases) {
+        ExactInputReadObservation observation;
+        ExactInputMountDiagnostic diagnostic;
+        if (!exact_input_mount_test_read_runner_case(test_case, observation, diagnostic) ||
+            observation.outcome != outcome || !observation.attempted ||
+            !observation.terminal_frozen) {
+            error = "deterministic exact-read outcome or process custody differed";
+            return false;
+        }
+        const bool start_failure = test_case == ExactInputReadRunnerTestCase::CommandStartFailure;
+        if (observation.command_started == start_failure ||
+            observation.child_reaped == start_failure ||
+            observation.wait_status_valid == start_failure ||
+            observation.process_group_owned == start_failure ||
+            observation.process_group_gone == start_failure) {
+            error = "exact-read start/child/PGID evidence was not causal";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::MaxSizeExact &&
+            (!observation.stdout_eof || !observation.stderr_eof ||
+             observation.stdout_bytes.size() != 8192u)) {
+            error = "maximum exact output lacked true EOF";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::EmbeddedNulExact &&
+            observation.stdout_bytes != std::string("a\0b", 3)) {
+            error = "embedded-NUL runner output was not binary exact";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::HeldOpenAfterExactBytes &&
+            (!observation.deadline_exceeded || observation.stdout_eof)) {
+            error = "held-open exact bytes were accepted without EOF";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::ExtraByteThenEof &&
+            (!observation.stdout_eof || observation.output_overflow ||
+             observation.stdout_bytes != "abcX")) {
+            error = "expected+1 EOF was not retained as a byte mismatch";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::BeyondSentinel &&
+            !observation.output_overflow) {
+            error = "data beyond the sentinel was not an overflow";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::ReadErrorAfterBytes &&
+            (observation.stdout_bytes.empty() || observation.stdout_read_errno != EIO)) {
+            error = "causal read error did not follow available bytes";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::NonemptyStderr &&
+            observation.stderr_bytes != "bad") {
+            error = "stderr remained merged or empty";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool recover_injected_setup(ExactInputMountFailurePoint point, std::string& error) {
     ExactInputMountRecoveryController controller;
     ExactInputMountHandle handle;
@@ -217,8 +364,19 @@ bool wait_for_abort(pid_t child, std::string& error) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace rut::test::ipv4_topology;
+    if (argc == 3 && std::string(argv[1]) == "--exact-input-read-helper")
+        return run_exact_read_helper(argv[2]);
+    std::string runner_error;
+    if (!exact_read_runner_self_checks(runner_error)) {
+        std::cerr << "FAIL [#358 exact input read runner]: " << runner_error << "\n";
+        return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--exact-input-read-runner-self-check") {
+        std::cerr << "PASS: #358 binary-safe exact input read runner\n";
+        return 0;
+    }
     // Wrong-thread destruction is fatal even before any resource mutation.
     pid_t child = fork();
     if (child < 0) {
@@ -300,6 +458,58 @@ int main() {
         return 1;
     }
 
+    bool wrong_thread_read_accepted = true;
+    std::thread wrong_read_thread([&] {
+        ExactInputReadObservation rejected_observation;
+        ExactInputMountDiagnostic rejected;
+        wrong_thread_read_accepted =
+            controller->observe_input_read(moved, rejected_observation, rejected) ||
+            rejected.phase != ExactInputMountPhase::Thread;
+    });
+    wrong_read_thread.join();
+    if (wrong_thread_read_accepted) {
+        std::cerr << "FAIL [#358 exact input read thread custody]: foreign thread was accepted\n";
+        return 1;
+    }
+    ExactInputReadObservation read_observation;
+    if (!controller->observe_input_read(moved, read_observation, diagnostic) ||
+        read_observation.outcome != ExactInputReadOutcome::Complete ||
+        !read_observation.terminal_frozen || read_observation.stdout_bytes != kConfig ||
+        !read_observation.stderr_bytes.empty() || !read_observation.stdout_eof ||
+        !read_observation.stderr_eof || !read_observation.child_reaped ||
+        !read_observation.wait_status_valid || !read_observation.process_group_owned ||
+        !read_observation.process_group_gone || read_observation.deadline_exceeded ||
+        read_observation.output_overflow || read_observation.stdout_read_errno != 0 ||
+        read_observation.stderr_read_errno != 0 || !read_observation.pre_source_revalidated ||
+        !read_observation.pre_container_identity || !read_observation.pre_mount_inspected ||
+        !read_observation.pre_proc_credentials || !read_observation.post_source_revalidated ||
+        !read_observation.post_container_identity || !read_observation.post_mount_inspected ||
+        !read_observation.post_proc_credentials || !read_observation.registered_identity_matched ||
+        !read_observation.registered_mount_matched ||
+        read_observation.command_argv !=
+            std::vector<std::string>(
+                {"docker",
+                 "exec",
+                 "--user",
+                 std::to_string(snapshot.source_uid) + ":" + std::to_string(snapshot.source_gid),
+                 snapshot.sidecar_id,
+                 "/bin/cat",
+                 kExactInputMountDestination})) {
+        std::cerr << "FAIL [#358 exact input read observation]: " << diagnostic.message << "\n";
+        return 1;
+    }
+    const ExactInputReadObservation frozen_read = read_observation;
+    const std::uint64_t read_commands = exact_input_mount_test_command_count();
+    ExactInputReadObservation read_replay;
+    if (!controller->observe_input_read(moved, read_replay, diagnostic) ||
+        !read_observation_equal(read_replay, frozen_read) ||
+        exact_input_mount_test_command_count() != read_commands ||
+        controller->observe_input_read(handle, read_replay, diagnostic) ||
+        diagnostic.phase != ExactInputMountPhase::Lifecycle) {
+        std::cerr << "FAIL [#358 exact input read one-shot replay]\n";
+        return 1;
+    }
+
     child = fork();
     if (child < 0) {
         std::cerr << "FAIL [#358 exact input mount handle-thread death setup]: fork failed\n";
@@ -357,6 +567,12 @@ int main() {
         if (controller->snapshot(moved, ignored_snapshot, diagnostic) ||
             diagnostic.phase != ExactInputMountPhase::Lifecycle) {
             std::cerr << "FAIL [#358 exact input mount stale generation]: stale handle accepted\n";
+            return 1;
+        }
+        ExactInputReadObservation stale_read;
+        if (controller->observe_input_read(moved, stale_read, diagnostic) ||
+            diagnostic.phase != ExactInputMountPhase::Lifecycle) {
+            std::cerr << "FAIL [#358 exact input read stale generation]: stale handle accepted\n";
             return 1;
         }
     }
@@ -608,18 +824,116 @@ int main() {
             return 1;
         }
     }
+    // A successful cat followed by real sidecar death cannot satisfy the
+    // post-command immutable-identity bracket. Recovery remains sidecar-first
+    // and freezes the original observation failure after proving zero residue.
+    {
+        ExactInputMountRecoveryController died_after_read;
+        ExactInputMountHandle death_handle;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::InputReadPostCommandSidecarDeath;
+        if (!died_after_read.start(
+                kConfig.data(), kConfig.size(), death_handle, diagnostic, options)) {
+            std::cerr << "FAIL [#358 exact input post-read death setup]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        ExactInputReadObservation failed;
+        if (died_after_read.observe_input_read(death_handle, failed, diagnostic) ||
+            failed.outcome != ExactInputReadOutcome::ContainerIdentityFailed ||
+            !failed.pre_source_revalidated || !failed.pre_container_identity ||
+            !failed.pre_mount_inspected || !failed.pre_proc_credentials ||
+            !failed.command_started || !failed.child_reaped || !failed.process_group_owned ||
+            !failed.process_group_gone || failed.post_container_identity ||
+            diagnostic.phase != ExactInputMountPhase::InputObservation) {
+            std::cerr << "FAIL [#358 exact input post-read death bracket]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const ExactInputReadObservation frozen_failed = failed;
+        const std::uint64_t failed_commands = exact_input_mount_test_command_count();
+        ExactInputReadObservation failed_replay;
+        if (died_after_read.observe_input_read(death_handle, failed_replay, diagnostic) ||
+            !read_observation_equal(failed_replay, frozen_failed) ||
+            exact_input_mount_test_command_count() != failed_commands ||
+            died_after_read.finish(death_handle, receipt, diagnostic) ||
+            !operation_failure_terminal(receipt, ExactInputMountPhase::InputObservation) ||
+            receipt.sidecar_order == 0u || receipt.input_order <= receipt.sidecar_order ||
+            receipt.directory_order <= receipt.input_order || !receipt.final_zero_residue) {
+            std::cerr << "FAIL [#358 exact input failed-read recovery]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen_failure = receipt;
+        const std::uint64_t recovery_commands = exact_input_mount_test_command_count();
+        if (died_after_read.recover_all(receipt, diagnostic) ||
+            !receipt_equal(receipt, frozen_failure) ||
+            exact_input_mount_test_command_count() != recovery_commands) {
+            std::cerr << "FAIL [#358 exact input failed-read frozen receipt]\n";
+            return 1;
+        }
+    }
+    // Source-bracket refusal is a one-shot attempted failure with no cat.
+    {
+        ExactInputMountRecoveryController source_rejected;
+        ExactInputMountHandle source_handle;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::InputReadRejectSourceRevalidation;
+        if (!source_rejected.start(
+                kConfig.data(), kConfig.size(), source_handle, diagnostic, options)) {
+            std::cerr << "FAIL [#358 exact input source rejection setup]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const std::uint64_t before_rejection = exact_input_mount_test_command_count();
+        ExactInputReadObservation rejected;
+        if (source_rejected.observe_input_read(source_handle, rejected, diagnostic) ||
+            rejected.outcome != ExactInputReadOutcome::SourceRevalidationFailed ||
+            rejected.command_started || !rejected.attempted || !rejected.terminal_frozen ||
+            exact_input_mount_test_command_count() != before_rejection) {
+            std::cerr << "FAIL [#358 exact input source rejection]: " << diagnostic.message << "\n";
+            return 1;
+        }
+        if (source_rejected.finish(source_handle, receipt, diagnostic) ||
+            !operation_failure_terminal(receipt, ExactInputMountPhase::InputObservation)) {
+            std::cerr << "FAIL [#358 exact input source rejection recovery]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+    }
     // The mounted input is uninterpreted bytes in this slice, including embedded NUL.
     {
         const std::string binary_input("a\0b\n", 4);
         ExactInputMountRecoveryController binary;
         ExactInputMountHandle binary_handle;
         ExactInputMountSnapshot binary_snapshot;
+        ExactInputReadObservation binary_read;
         if (!binary.start(binary_input.data(), binary_input.size(), binary_handle, diagnostic) ||
             !binary.snapshot(binary_handle, binary_snapshot, diagnostic) ||
             binary_snapshot.source_size != binary_input.size() ||
+            !binary.observe_input_read(binary_handle, binary_read, diagnostic) ||
+            binary_read.stdout_bytes != binary_input || !binary_read.stdout_eof ||
             !binary.finish(binary_handle, receipt, diagnostic) || !exact_terminal(receipt)) {
             std::cerr << "FAIL [#358 exact input mount embedded NUL]: " << diagnostic.message
                       << "\n";
+            return 1;
+        }
+    }
+    // The owner computes its capture sentinel from the owned bytes and retains
+    // all 8192 bytes plus true EOF, independent of the public snapshot size.
+    {
+        std::string maximum(8192, '\0');
+        for (size_t index = 0; index < maximum.size(); ++index)
+            maximum[index] = static_cast<char>((index % 251u) + 1u);
+        ExactInputMountRecoveryController max_owner;
+        ExactInputMountHandle max_handle;
+        ExactInputReadObservation max_read;
+        if (!max_owner.start(maximum.data(), maximum.size(), max_handle, diagnostic) ||
+            !max_owner.observe_input_read(max_handle, max_read, diagnostic) ||
+            max_read.expected_size != maximum.size() || max_read.stdout_bytes != maximum ||
+            !max_read.stdout_eof || !max_read.stderr_eof || max_read.output_overflow ||
+            !max_owner.finish(max_handle, receipt, diagnostic) || !exact_terminal(receipt)) {
+            std::cerr << "FAIL [#358 exact input maximum read]: " << diagnostic.message << "\n";
             return 1;
         }
     }
