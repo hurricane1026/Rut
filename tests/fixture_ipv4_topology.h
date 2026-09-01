@@ -146,8 +146,65 @@ struct HeldNamespaceGenerationRotationReceipt {
         HeldNamespaceGenerationRotationPhase::None;
 };
 
+enum class HolderOnlyRecreationState : std::uint8_t {
+    Ready = 0,
+    CreateMayHaveMutated,
+    CreatedStoppedCleanupOnly,
+    StartMayHaveMutated,
+    RunningExactNetworkA,
+    NetworkBConnectMayHaveMutated,
+    RunningExactNetworksAB,
+    Validated,
+    RemovalMayHaveMutated,
+    Settled,
+    Unresolved,
+};
+
+// Evidence for exactly one recreated inert holder.  This deliberately is not
+// a complete holder+sidecar generation receipt.
+struct HolderOnlyRecreationEvidence {
+    bool complete_generation = false;
+    HolderOnlyRecreationState state = HolderOnlyRecreationState::Ready;
+    HeldNamespaceOldGenerationAbsence old_absence;
+    std::string network_a_name;
+    std::string network_a_id;
+    std::string network_a_subnet;
+    std::string network_a_gateway;
+    std::string network_b_name;
+    std::string network_b_id;
+    std::string network_b_subnet;
+    std::string network_b_gateway;
+    std::string positive_ip;
+    std::string guard_ip;
+    std::string holder_name;
+    std::string holder_id;
+    std::string image_id;
+    pid_t holder_pid = -1;
+    std::uint64_t holder_start = 0;
+    bool exact_network_a = false;
+    bool exact_network_b = false;
+    bool exact_security = false;
+    bool network_a_membership_proven_after_start = false;
+    bool old_authority_frozen = false;
+    bool operation_ok = true;
+    std::uint32_t state_visit_mask = 0;
+    std::uint32_t create_command_count = 0;
+    std::uint32_t start_command_count = 0;
+    std::uint32_t connect_b_command_count = 0;
+    std::uint32_t remove_command_count = 0;
+};
+
+enum class HolderOnlyRecreationFailurePoint : std::uint8_t {
+    None,
+    CreateReportedTimeout,
+    StartReportedTimeout,
+    NetworkBConnectReportedTimeout,
+    CleanupReportedTimeout,
+};
+
 enum class HeldNamespaceSidecarFailurePoint {
     None,
+    CreateSuppressedNoObject,
     AfterCreate,
     AfterDiscovery,
     AfterVerification,
@@ -194,6 +251,8 @@ using HeldTopologyAndSidecarCallback =
     std::function<bool(const HeldTopologySnapshot& topology,
                        const HeldNamespaceSidecarSnapshot& sidecar,
                        std::string& error)>;
+using HolderOnlyRecreationCallback =
+    std::function<bool(const HolderOnlyRecreationEvidence& evidence, std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);
@@ -206,6 +265,9 @@ RunResult run_with_held_topology_and_sidecar(
         HeldNamespaceSidecarRevalidationFault::None,
     HeldNamespaceHolderRemovalFailurePoint holder_removal_failure_point =
         HeldNamespaceHolderRemovalFailurePoint::None);
+RunResult run_with_holder_only_recreation(
+    const HolderOnlyRecreationCallback& callback,
+    HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None);
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,
