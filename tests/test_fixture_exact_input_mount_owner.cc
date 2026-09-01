@@ -303,6 +303,71 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.diagnostic.message == right.diagnostic.message;
 }
 
+bool write_bracket_equal(const ExactInputWriteSourceBracket& left,
+                         const ExactInputWriteSourceBracket& right) {
+    return left.source_revalidated == right.source_revalidated &&
+           left.source_bytes_revalidated == right.source_bytes_revalidated &&
+           left.retained_ofd_revalidated == right.retained_ofd_revalidated &&
+           left.container_identity_revalidated == right.container_identity_revalidated &&
+           left.mount_revalidated == right.mount_revalidated &&
+           left.proc_credentials_revalidated == right.proc_credentials_revalidated &&
+           left.registered_identity_matched == right.registered_identity_matched &&
+           left.registered_mount_matched == right.registered_mount_matched &&
+           left.source_path == right.source_path && left.source_device == right.source_device &&
+           left.source_inode == right.source_inode && left.source_mode == right.source_mode &&
+           left.source_uid == right.source_uid && left.source_gid == right.source_gid &&
+           left.source_size == right.source_size && left.source_links == right.source_links &&
+           left.source_mtime_seconds == right.source_mtime_seconds &&
+           left.source_mtime_nanoseconds == right.source_mtime_nanoseconds &&
+           left.source_ctime_seconds == right.source_ctime_seconds &&
+           left.source_ctime_nanoseconds == right.source_ctime_nanoseconds;
+}
+
+bool write_refusal_observation_equal(const ExactInputWriteRefusalObservation& left,
+                                     const ExactInputWriteRefusalObservation& right) {
+    return left.outcome == right.outcome && left.attempted == right.attempted &&
+           left.terminal_frozen == right.terminal_frozen &&
+           left.caller_deadline_recorded == right.caller_deadline_recorded &&
+           left.final_deadline_nanoseconds == right.final_deadline_nanoseconds &&
+           left.credentials == right.credentials &&
+           left.expected_target_stderr == right.expected_target_stderr &&
+           write_bracket_equal(left.initial_bracket, right.initial_bracket) &&
+           write_bracket_equal(left.middle_bracket, right.middle_bracket) &&
+           write_bracket_equal(left.final_bracket, right.final_bracket) &&
+           read_observation_equal(left.control, right.control) &&
+           read_observation_equal(left.target, right.target) &&
+           left.diagnostic.phase == right.diagnostic.phase &&
+           left.diagnostic.error_number == right.diagnostic.error_number &&
+           left.diagnostic.message == right.diagnostic.message;
+}
+
+bool complete_supervisor_evidence(const ExactInputReadObservation& observation) {
+    return observation.attempted && observation.terminal_frozen && observation.command_started &&
+           observation.stdout_eof && observation.stderr_eof && observation.child_reaped &&
+           observation.wait_status_valid && observation.process_group_owned &&
+           observation.process_group_gone && observation.pidfd_opened &&
+           observation.pidfd_identity_verified && observation.pidfd_closed_after_group_gone &&
+           observation.final_deadline_recorded &&
+           observation.cleanup_completed_before_final_deadline &&
+           observation.supervisor_session_verified && observation.supervisor_subreaper_verified &&
+           observation.actual_exec_observed && observation.subtree_confinement_installed &&
+           observation.group_echild_observed && observation.adopted_reap_count > 0u &&
+           !observation.deadline_exceeded && !observation.output_overflow &&
+           observation.stdout_read_errno == 0 && observation.stderr_read_errno == 0 &&
+           !observation.resolved_executable.empty() &&
+           observation.resolved_executable.front() == '/';
+}
+
+bool complete_write_bracket(const ExactInputWriteSourceBracket& bracket) {
+    return bracket.source_revalidated && bracket.source_bytes_revalidated &&
+           bracket.retained_ofd_revalidated && bracket.container_identity_revalidated &&
+           bracket.mount_revalidated && bracket.proc_credentials_revalidated &&
+           bracket.registered_identity_matched && bracket.registered_mount_matched &&
+           !bracket.source_path.empty() && bracket.source_device != 0u &&
+           bracket.source_inode != 0u && (bracket.source_mode & 07777u) == 0600u &&
+           bracket.source_links == 1u;
+}
+
 bool exact_read_runner_self_checks(std::string& error) {
     const std::vector<std::pair<ExactInputReadRunnerTestCase, ExactInputReadOutcome>> cases = {
         {ExactInputReadRunnerTestCase::CommandStartFailure,
@@ -561,6 +626,61 @@ bool recover_injected_setup(ExactInputMountFailurePoint point, std::string& erro
     return true;
 }
 
+bool recover_injected_write_refusal(ExactInputMountFailurePoint point,
+                                    std::size_t expected_attempted_commands,
+                                    std::string& error) {
+    ExactInputMountRecoveryController controller;
+    ExactInputMountHandle handle;
+    ExactInputMountDiagnostic diagnostic;
+    ExactInputMountOptions options;
+    options.failure_point = point;
+    if (!controller.start(kConfig.data(), kConfig.size(), handle, diagnostic, options)) {
+        error = "write-refusal failure setup failed: " + diagnostic.message;
+        return false;
+    }
+    ExactInputReadObservation read;
+    if (!controller.observe_input_read(handle, read, diagnostic)) {
+        error = "write-refusal failure prerequisite read failed: " + diagnostic.message;
+        return false;
+    }
+    const std::uint64_t before = exact_input_mount_test_observation_command_count();
+    ExactInputWriteRefusalObservation failed;
+    if (controller.observe_input_write_refusal(handle, failed, diagnostic) || !failed.attempted ||
+        !failed.terminal_frozen || failed.outcome == ExactInputWriteRefusalOutcome::Complete ||
+        diagnostic.phase != ExactInputMountPhase::WriteRefusalObservation ||
+        exact_input_mount_test_observation_command_count() - before !=
+            expected_attempted_commands) {
+        error = "write-refusal injected failure was not truthful: " + diagnostic.message;
+        return false;
+    }
+    const ExactInputWriteRefusalObservation frozen = failed;
+    const std::uint64_t after = exact_input_mount_test_observation_command_count();
+    ExactInputWriteRefusalObservation replay;
+    if (controller.observe_input_write_refusal(handle, replay, diagnostic) ||
+        !write_refusal_observation_equal(replay, frozen) ||
+        exact_input_mount_test_observation_command_count() != after) {
+        error = "write-refusal failure replay issued a command or changed evidence";
+        return false;
+    }
+    ExactInputMountRecoveryReceipt receipt;
+    if (controller.finish(handle, receipt, diagnostic) ||
+        !operation_failure_terminal(receipt, ExactInputMountPhase::WriteRefusalObservation) ||
+        !receipt.sidecar_settled || !receipt.input_settled || !receipt.directory_settled ||
+        !receipt.holder_settled || !receipt.network_b_settled || !receipt.network_a_settled ||
+        !receipt.final_zero_residue) {
+        error = "write-refusal failure did not settle to exact zero residue: " + diagnostic.message;
+        return false;
+    }
+    const ExactInputMountRecoveryReceipt frozen_receipt = receipt;
+    const std::uint64_t settled_commands = exact_input_mount_test_command_count();
+    if (controller.recover_all(receipt, diagnostic) || !receipt_equal(receipt, frozen_receipt) ||
+        exact_input_mount_test_command_count() != settled_commands) {
+        error = "write-refusal settled failure receipt was not immutable";
+        return false;
+    }
+    return true;
+}
+
 bool wait_for_abort(pid_t child, std::string& error) {
     int status = 0;
     while (waitpid(child, &status, 0) < 0) {
@@ -584,6 +704,15 @@ int main(int argc, char** argv) {
     std::string runner_error;
     if (!exact_read_runner_self_checks(runner_error)) {
         std::cerr << "FAIL [#358 exact input read runner]: " << runner_error << "\n";
+        return 1;
+    }
+    std::uint32_t write_mutation_rejections = 0u;
+    ExactInputMountDiagnostic write_selfcheck_diagnostic;
+    if (!exact_input_mount_test_write_refusal_self_checks(write_mutation_rejections,
+                                                          write_selfcheck_diagnostic) ||
+        write_mutation_rejections != 16u) {
+        std::cerr << "FAIL [#358 write-refusal classifier/mutation matrix]: "
+                  << write_selfcheck_diagnostic.message << "\n";
         return 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--exact-input-read-runner-self-check") {
@@ -684,6 +813,14 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 exact input read thread custody]: foreign thread was accepted\n";
         return 1;
     }
+    const std::uint64_t pre_read_write_commands = exact_input_mount_test_command_count();
+    ExactInputWriteRefusalObservation pre_read_write;
+    if (controller->observe_input_write_refusal(moved, pre_read_write, diagnostic) ||
+        diagnostic.phase != ExactInputMountPhase::Lifecycle ||
+        exact_input_mount_test_command_count() != pre_read_write_commands) {
+        std::cerr << "FAIL [#358 write refusal requires exact read]\n";
+        return 1;
+    }
     ExactInputReadObservation read_observation;
     if (!controller->observe_input_read(moved, read_observation, diagnostic) ||
         read_observation.outcome != ExactInputReadOutcome::Complete ||
@@ -729,6 +866,85 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    bool wrong_thread_write_accepted = true;
+    std::thread wrong_write_thread([&] {
+        ExactInputWriteRefusalObservation rejected_observation;
+        ExactInputMountDiagnostic rejected;
+        wrong_thread_write_accepted =
+            controller->observe_input_write_refusal(moved, rejected_observation, rejected) ||
+            rejected.phase != ExactInputMountPhase::Thread;
+    });
+    wrong_write_thread.join();
+    if (wrong_thread_write_accepted) {
+        std::cerr << "FAIL [#358 exact write-refusal thread custody]: foreign thread accepted\n";
+        return 1;
+    }
+
+    ExactInputWriteRefusalObservation write_refusal;
+    if (!controller->observe_input_write_refusal(moved, write_refusal, diagnostic) ||
+        write_refusal.outcome != ExactInputWriteRefusalOutcome::Complete ||
+        !write_refusal.attempted || !write_refusal.terminal_frozen ||
+        !write_refusal.caller_deadline_recorded || write_refusal.final_deadline_nanoseconds <= 0 ||
+        write_refusal.credentials !=
+            std::to_string(snapshot.source_uid) + ":" + std::to_string(snapshot.source_gid) ||
+        write_refusal.expected_target_stderr !=
+            "dd: failed to open '/etc/nginx/nginx.conf': Read-only file system\n" ||
+        !complete_write_bracket(write_refusal.initial_bracket) ||
+        !write_bracket_equal(write_refusal.initial_bracket, write_refusal.middle_bracket) ||
+        !write_bracket_equal(write_refusal.initial_bracket, write_refusal.final_bracket) ||
+        !complete_supervisor_evidence(write_refusal.control) ||
+        write_refusal.control.outcome != ExactInputReadOutcome::Complete ||
+        !write_refusal.control.stdout_bytes.empty() ||
+        !write_refusal.control.stderr_bytes.empty() ||
+        !complete_supervisor_evidence(write_refusal.target) ||
+        write_refusal.target.outcome != ExactInputReadOutcome::ExitNonzero ||
+        !WIFEXITED(write_refusal.target.wait_status) ||
+        WEXITSTATUS(write_refusal.target.wait_status) != 1 ||
+        !write_refusal.target.stdout_bytes.empty() ||
+        write_refusal.target.stderr_bytes != write_refusal.expected_target_stderr ||
+        write_refusal.control.command_argv != std::vector<std::string>({"docker",
+                                                                        "exec",
+                                                                        "--env",
+                                                                        "LC_ALL=C",
+                                                                        "--user",
+                                                                        write_refusal.credentials,
+                                                                        snapshot.sidecar_id,
+                                                                        "/usr/bin/dd",
+                                                                        "if=/dev/zero",
+                                                                        "of=/dev/null",
+                                                                        "bs=1",
+                                                                        "count=1",
+                                                                        "conv=notrunc",
+                                                                        "status=none"}) ||
+        write_refusal.target.command_argv != std::vector<std::string>({"docker",
+                                                                       "exec",
+                                                                       "--env",
+                                                                       "LC_ALL=C",
+                                                                       "--user",
+                                                                       write_refusal.credentials,
+                                                                       snapshot.sidecar_id,
+                                                                       "/usr/bin/dd",
+                                                                       "if=/etc/nginx/nginx.conf",
+                                                                       "of=/etc/nginx/nginx.conf",
+                                                                       "bs=1",
+                                                                       "count=1",
+                                                                       "conv=notrunc",
+                                                                       "status=none"})) {
+        std::cerr << "FAIL [#358 exact write-refusal observation]: " << diagnostic.message << "\n";
+        return 1;
+    }
+    const ExactInputWriteRefusalObservation frozen_write_refusal = write_refusal;
+    const std::uint64_t write_commands = exact_input_mount_test_command_count();
+    ExactInputWriteRefusalObservation write_replay;
+    if (!controller->observe_input_write_refusal(moved, write_replay, diagnostic) ||
+        !write_refusal_observation_equal(write_replay, frozen_write_refusal) ||
+        exact_input_mount_test_command_count() != write_commands ||
+        controller->observe_input_write_refusal(handle, write_replay, diagnostic) ||
+        diagnostic.phase != ExactInputMountPhase::Lifecycle) {
+        std::cerr << "FAIL [#358 exact write-refusal one-shot replay]\n";
+        return 1;
+    }
+
     child = fork();
     if (child < 0) {
         std::cerr << "FAIL [#358 exact input mount handle-thread death setup]: fork failed\n";
@@ -766,6 +982,83 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 exact input mount recovery]: " << diagnostic.message << "\n";
         return 1;
     }
+    for (const auto& injected : {
+             std::pair{ExactInputMountFailurePoint::WriteRefusalRejectInitialBracket, 0u},
+             std::pair{ExactInputMountFailurePoint::WriteRefusalRejectMiddleBracket, 1u},
+             std::pair{ExactInputMountFailurePoint::WriteRefusalRejectFinalBracket, 2u},
+             std::pair{ExactInputMountFailurePoint::WriteRefusalPostTargetSidecarDeath, 2u},
+         }) {
+        std::string error;
+        if (!recover_injected_write_refusal(injected.first, injected.second, error)) {
+            std::cerr << "FAIL [#358 write-refusal attempted failure recovery]: " << error << "\n";
+            return 1;
+        }
+    }
+    // Destructor fallback distinguishes a truthful operation failure from an
+    // incomplete cleanup: terminal zero-residue operation failure is safe,
+    // while a still-owned graph remains fail-stop.
+    child = fork();
+    if (child < 0) {
+        std::cerr << "FAIL [#358 operation-failure destructor setup]: fork failed\n";
+        return 1;
+    }
+    if (child == 0) {
+        {
+            ExactInputMountRecoveryController implicit;
+            {
+                ExactInputMountHandle implicit_handle;
+                ExactInputMountOptions options;
+                options.failure_point =
+                    ExactInputMountFailurePoint::WriteRefusalRejectInitialBracket;
+                ExactInputMountDiagnostic child_diagnostic;
+                ExactInputReadObservation read;
+                ExactInputWriteRefusalObservation refusal;
+                if (!implicit.start(kConfig.data(),
+                                    kConfig.size(),
+                                    implicit_handle,
+                                    child_diagnostic,
+                                    options) ||
+                    !implicit.observe_input_read(implicit_handle, read, child_diagnostic) ||
+                    implicit.observe_input_write_refusal(
+                        implicit_handle, refusal, child_diagnostic))
+                    _exit(125);
+            }
+        }
+        _exit(0);
+    }
+    int implicit_status = 0;
+    while (waitpid(child, &implicit_status, 0) < 0 && errno == EINTR) {
+    }
+    if (!WIFEXITED(implicit_status) || WEXITSTATUS(implicit_status) != 0) {
+        std::cerr << "FAIL [#358 terminal operation-failure destructor]\n";
+        return 1;
+    }
+
+    // The destructor's pure terminal-settlement guard must reject any
+    // incomplete cleanup. Real-resource destructor fail-stop is covered above
+    // by parent-custodied wrong-thread/live-handle cases; do not intentionally
+    // abort a process that alone owns a Docker graph.
+    ExactInputMountRecoveryReceipt settled_failure;
+    settled_failure.state = ExactInputMountState::Settled;
+    settled_failure.terminal_result = ExactInputMountTerminalResult::SettledWithOperationFailure;
+    settled_failure.attempted = true;
+    settled_failure.graph_mutated = true;
+    settled_failure.sidecar_acquired = settled_failure.input_acquired = true;
+    settled_failure.directory_acquired = settled_failure.holder_acquired = true;
+    settled_failure.network_b_acquired = settled_failure.network_a_acquired = true;
+    settled_failure.sidecar_settled = settled_failure.input_settled = true;
+    settled_failure.directory_settled = settled_failure.holder_settled = true;
+    settled_failure.network_b_settled = settled_failure.network_a_settled = true;
+    settled_failure.final_zero_residue = true;
+    settled_failure.settlement_complete = true;
+    settled_failure.terminal_frozen = true;
+    ExactInputMountRecoveryReceipt incomplete_cleanup = settled_failure;
+    incomplete_cleanup.sidecar_settled = false;
+    if (!exact_input_mount_test_terminal_settlement(settled_failure) ||
+        exact_input_mount_test_terminal_settlement(incomplete_cleanup)) {
+        std::cerr << "FAIL [#358 incomplete-cleanup destructor settlement guard]\n";
+        return 1;
+    }
     const ExactInputMountRecoveryReceipt frozen = receipt;
     ExactInputMountRecoveryReceipt replay;
     if (controller->finish(moved, replay, diagnostic) ||
@@ -792,6 +1085,13 @@ int main(int argc, char** argv) {
         if (controller->observe_input_read(moved, stale_read, diagnostic) ||
             diagnostic.phase != ExactInputMountPhase::Lifecycle) {
             std::cerr << "FAIL [#358 exact input read stale generation]: stale handle accepted\n";
+            return 1;
+        }
+        ExactInputWriteRefusalObservation stale_write;
+        if (controller->observe_input_write_refusal(moved, stale_write, diagnostic) ||
+            diagnostic.phase != ExactInputMountPhase::Lifecycle) {
+            std::cerr
+                << "FAIL [#358 exact write-refusal stale generation]: stale handle accepted\n";
             return 1;
         }
     }
