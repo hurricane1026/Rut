@@ -51,6 +51,8 @@ enum class ExactInputMountState : std::uint8_t {
     InputReadObserved,
     ObservingWriteRefusal,
     WriteRefusalObserved,
+    ObservingNginxLifecycle,
+    NginxLifecycleObserved,
     Recovering,
     Settled,
     Unresolved,
@@ -101,6 +103,22 @@ enum class ExactInputWriteRefusalOutcome : std::uint8_t {
     TargetWrongExit,
     TargetStdoutNotEmpty,
     TargetStderrMismatch,
+};
+
+enum class ExactInputNginxLifecycleOutcome : std::uint8_t {
+    None,
+    Complete,
+    PreflightUnsupported,
+    SourceRevalidationFailed,
+    CreateFailed,
+    IdentityFailed,
+    StartFailed,
+    SampleFailed,
+    SampleDrift,
+    BaselineDrift,
+    GracefulStopFailed,
+    RemovalFailed,
+    DeadlineExceeded,
 };
 
 enum class ExactInputMountTerminalResult : std::uint8_t {
@@ -181,6 +199,15 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     WriteRefusalRejectMiddleBracket,
     WriteRefusalRejectFinalBracket,
     WriteRefusalPostTargetSidecarDeath,
+    NginxCreateReportedTimeout,
+    NginxStartReportedTimeout,
+    NginxRejectPostCreateIdentity,
+    NginxRejectSampleA,
+    NginxRejectSampleB,
+    NginxDriftSampleB,
+    NginxRejectBaseline,
+    NginxRemoveReportedTimeout,
+    NginxRemoveUnresolved,
 };
 
 struct ExactInputMountOptions {
@@ -364,6 +391,74 @@ struct ExactInputWriteRefusalObservation {
     ExactInputMountDiagnostic diagnostic;
 };
 
+struct ExactInputNginxProcessSample {
+    bool complete = false;
+    bool container_identity_verified = false;
+    bool source_revalidated = false;
+    bool mount_verified = false;
+    bool topology_verified = false;
+    bool cgroup_exact = false;
+    bool pidfile_exact = false;
+    bool tcp_exact = false;
+    bool tcp6_port_absent = false;
+    bool end_container_identity_verified = false;
+    bool end_source_revalidated = false;
+    bool end_mount_verified = false;
+    bool end_topology_verified = false;
+    bool end_cgroup_exact = false;
+    bool end_pidfile_exact = false;
+    bool end_process_socket_owned = false;
+    std::int64_t bracket_start_nanoseconds = 0;
+    std::int64_t bracket_end_nanoseconds = 0;
+    std::int64_t monotonic_nanoseconds = 0;
+    std::int64_t master_pid = -1;
+    std::int64_t worker_pid = -1;
+    std::uint64_t master_start = 0;
+    std::uint64_t worker_start = 0;
+    std::uint64_t listener_inode = 0;
+    std::int64_t end_master_pid = -1;
+    std::int64_t end_worker_pid = -1;
+    std::uint64_t end_master_start = 0;
+    std::uint64_t end_worker_start = 0;
+};
+
+struct ExactInputNginxLifecycleObservation {
+    ExactInputNginxLifecycleOutcome outcome = ExactInputNginxLifecycleOutcome::None;
+    bool attempted = false;
+    bool terminal_frozen = false;
+    bool caller_deadline_recorded = false;
+    std::int64_t final_deadline_nanoseconds = 0;
+    bool create_attempted = false;
+    bool created = false;
+    bool start_attempted = false;
+    bool started = false;
+    bool same_source_inode = false;
+    bool same_mount_instance = true;
+    bool sibling_mount_independently_verified = false;
+    bool samples_at_least_250ms_apart = false;
+    bool quit_attempted = false;
+    bool quit_only = false;
+    bool term_attempted = false;
+    bool kill_attempted = false;
+    bool force_remove_attempted = false;
+    bool uncertain_cleanup = false;
+    bool stopped_exit_zero = false;
+    bool cgroup_empty_after_stop = false;
+    bool removed_nonforce = false;
+    bool exact_absence = false;
+    bool baseline_restored = false;
+    bool operation_failed = false;
+    std::uint32_t create_count = 0;
+    std::uint32_t start_count = 0;
+    std::uint32_t remove_count = 0;
+    std::string container_name;
+    std::string container_id;
+    std::vector<std::string> create_argv;
+    ExactInputNginxProcessSample sample_a;
+    ExactInputNginxProcessSample sample_b;
+    ExactInputMountDiagnostic diagnostic;
+};
+
 enum class ExactInputReadRunnerTestCase : std::uint8_t {
     CommandStartFailure,
     ImmediateExecSuccess,
@@ -406,12 +501,14 @@ struct ExactInputMountRecoveryReceipt {
     bool graph_mutated = false;
     bool cleanup_not_applicable = false;
     bool sidecar_acquired = false;
+    bool nginx_sibling_acquired = false;
     bool input_acquired = false;
     bool directory_acquired = false;
     bool holder_acquired = false;
     bool network_b_acquired = false;
     bool network_a_acquired = false;
     bool sidecar_settled = false;
+    bool nginx_sibling_settled = false;
     bool first_topology_revalidated = false;
     bool input_settled = false;
     bool directory_settled = false;
@@ -431,10 +528,14 @@ struct ExactInputMountRecoveryReceipt {
     std::uint32_t holder_create_count = 0;
     std::uint32_t holder_attach_a_verify_count = 0;
     std::uint32_t holder_attach_b_count = 0;
+    std::uint32_t nginx_create_count = 0;
+    std::uint32_t nginx_start_count = 0;
+    std::uint32_t nginx_remove_count = 0;
     std::uint32_t holder_remove_command_count = 0;
     std::uint32_t network_b_remove_command_count = 0;
     std::uint32_t network_a_remove_command_count = 0;
     std::uint32_t sidecar_order = 0;
+    std::uint32_t nginx_sibling_order = 0;
     std::uint32_t input_order = 0;
     std::uint32_t directory_order = 0;
     std::uint32_t holder_order = 0;
@@ -457,6 +558,8 @@ bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_re
                                                       ExactInputMountDiagnostic& diagnostic);
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
                                                 ExactInputMountDiagnostic& diagnostic);
+bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_rejections,
+                                                        ExactInputMountDiagnostic& diagnostic);
 
 class ExactInputMountRecoveryController;
 
@@ -506,6 +609,9 @@ public:
     bool observe_input_write_refusal(const ExactInputMountHandle& handle,
                                      ExactInputWriteRefusalObservation& observation,
                                      ExactInputMountDiagnostic& diagnostic);
+    bool observe_nginx_lifecycle(const ExactInputMountHandle& handle,
+                                 ExactInputNginxLifecycleObservation& observation,
+                                 ExactInputMountDiagnostic& diagnostic);
     bool finish(ExactInputMountHandle& handle,
                 ExactInputMountRecoveryReceipt& receipt,
                 ExactInputMountDiagnostic& diagnostic);

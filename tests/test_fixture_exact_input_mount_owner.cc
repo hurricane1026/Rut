@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -130,15 +131,18 @@ bool topology_config_builder(const ExactInputTopologyBuildRequest& request,
 }
 
 bool exact_terminal(const ExactInputMountRecoveryReceipt& receipt) {
+    const bool nginx_order = !receipt.nginx_sibling_acquired ||
+                             (receipt.nginx_sibling_settled && receipt.nginx_sibling_order != 0u &&
+                              receipt.nginx_sibling_order < receipt.sidecar_order);
     return receipt.state == ExactInputMountState::Settled && receipt.settlement_complete &&
            receipt.terminal_result == ExactInputMountTerminalResult::SettledCleanly &&
            receipt.graph_mutated && !receipt.cleanup_not_applicable && receipt.sidecar_acquired &&
            receipt.input_acquired && receipt.directory_acquired && receipt.holder_acquired &&
            receipt.network_b_acquired && receipt.network_a_acquired && receipt.terminal_frozen &&
-           receipt.sidecar_settled && receipt.input_settled && receipt.directory_settled &&
-           receipt.holder_settled && receipt.network_b_settled && receipt.network_a_settled &&
-           receipt.manifest_not_applicable && receipt.final_zero_residue &&
-           receipt.sidecar_order < receipt.input_order &&
+           nginx_order && receipt.sidecar_settled && receipt.input_settled &&
+           receipt.directory_settled && receipt.holder_settled && receipt.network_b_settled &&
+           receipt.network_a_settled && receipt.manifest_not_applicable &&
+           receipt.final_zero_residue && receipt.sidecar_order < receipt.input_order &&
            receipt.input_order < receipt.directory_order &&
            receipt.directory_order < receipt.holder_order &&
            receipt.holder_order < receipt.network_b_order &&
@@ -150,7 +154,8 @@ bool truthful_partial_terminal(const ExactInputMountRecoveryReceipt& receipt) {
         return settled && (acquired ? order != 0u : order == 0u);
     };
     std::vector<std::uint32_t> events;
-    for (const std::uint32_t order : {receipt.sidecar_order,
+    for (const std::uint32_t order : {receipt.nginx_sibling_order,
+                                      receipt.sidecar_order,
                                       receipt.input_order,
                                       receipt.directory_order,
                                       receipt.holder_order,
@@ -163,6 +168,9 @@ bool truthful_partial_terminal(const ExactInputMountRecoveryReceipt& receipt) {
            receipt.terminal_frozen &&
            receipt.terminal_result == ExactInputMountTerminalResult::SettledCleanly &&
            receipt.graph_mutated && receipt.manifest_not_applicable && receipt.final_zero_residue &&
+           exact_event(receipt.nginx_sibling_acquired,
+                       receipt.nginx_sibling_settled,
+                       receipt.nginx_sibling_order) &&
            exact_event(receipt.sidecar_acquired, receipt.sidecar_settled, receipt.sidecar_order) &&
            exact_event(receipt.input_acquired, receipt.input_settled, receipt.input_order) &&
            exact_event(
@@ -220,12 +228,14 @@ bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
            left.mutation_may_have_occurred == right.mutation_may_have_occurred &&
            left.recovery_required == right.recovery_required &&
            left.cleanup_not_applicable == right.cleanup_not_applicable &&
+           left.nginx_sibling_acquired == right.nginx_sibling_acquired &&
            left.sidecar_acquired == right.sidecar_acquired &&
            left.input_acquired == right.input_acquired &&
            left.directory_acquired == right.directory_acquired &&
            left.holder_acquired == right.holder_acquired &&
            left.network_b_acquired == right.network_b_acquired &&
            left.network_a_acquired == right.network_a_acquired &&
+           left.nginx_sibling_settled == right.nginx_sibling_settled &&
            left.sidecar_settled == right.sidecar_settled &&
            left.first_topology_revalidated == right.first_topology_revalidated &&
            left.input_settled == right.input_settled &&
@@ -246,9 +256,13 @@ bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
            left.holder_create_count == right.holder_create_count &&
            left.holder_attach_a_verify_count == right.holder_attach_a_verify_count &&
            left.holder_attach_b_count == right.holder_attach_b_count &&
+           left.nginx_create_count == right.nginx_create_count &&
+           left.nginx_start_count == right.nginx_start_count &&
+           left.nginx_remove_count == right.nginx_remove_count &&
            left.holder_remove_command_count == right.holder_remove_command_count &&
            left.network_b_remove_command_count == right.network_b_remove_command_count &&
            left.network_a_remove_command_count == right.network_a_remove_command_count &&
+           left.nginx_sibling_order == right.nginx_sibling_order &&
            left.sidecar_order == right.sidecar_order && left.input_order == right.input_order &&
            left.directory_order == right.directory_order &&
            left.holder_order == right.holder_order &&
@@ -836,6 +850,67 @@ bool recover_injected_write_refusal(ExactInputMountFailurePoint point,
     return true;
 }
 
+bool recover_injected_nginx_lifecycle(ExactInputMountFailurePoint point,
+                                      ExactInputNginxLifecycleOutcome expected_outcome,
+                                      std::uint32_t expected_start_count,
+                                      bool expect_frozen_absence,
+                                      std::string& error) {
+    ExactInputMountRecoveryController controller;
+    BuilderContext context;
+    context.controller = &controller;
+    ExactInputMountHandle handle;
+    ExactInputMountDiagnostic diagnostic;
+    ExactInputMountOptions options;
+    options.failure_point = point;
+    ExactInputReadObservation read;
+    ExactInputWriteRefusalObservation write;
+    ExactInputNginxLifecycleObservation lifecycle;
+    if (!controller.start_with_topology_builder(
+            topology_config_builder, &context, handle, diagnostic, options) ||
+        !controller.observe_input_read(handle, read, diagnostic) ||
+        !controller.observe_input_write_refusal(handle, write, diagnostic) ||
+        controller.observe_nginx_lifecycle(handle, lifecycle, diagnostic) ||
+        lifecycle.outcome != expected_outcome || !lifecycle.attempted ||
+        !lifecycle.terminal_frozen || !lifecycle.operation_failed || lifecycle.create_count != 1u ||
+        lifecycle.start_count != expected_start_count ||
+        lifecycle.exact_absence != expect_frozen_absence) {
+        error = "injected nginx lifecycle did not freeze its exact failure: " + diagnostic.message;
+        return false;
+    }
+    const ExactInputNginxLifecycleObservation frozen = lifecycle;
+    const std::uint64_t commands = exact_input_mount_test_command_count();
+    ExactInputNginxLifecycleObservation replay;
+    if (controller.observe_nginx_lifecycle(handle, replay, diagnostic) ||
+        replay.outcome != frozen.outcome || replay.container_id != frozen.container_id ||
+        replay.create_argv != frozen.create_argv || replay.create_count != frozen.create_count ||
+        replay.start_count != frozen.start_count || replay.remove_count != frozen.remove_count ||
+        replay.exact_absence != frozen.exact_absence ||
+        exact_input_mount_test_command_count() != commands) {
+        error = "injected nginx lifecycle replay was not frozen and command-free";
+        return false;
+    }
+    ExactInputMountRecoveryReceipt receipt;
+    if (controller.finish(handle, receipt, diagnostic) ||
+        !operation_failure_terminal(receipt, ExactInputMountPhase::Lifecycle) ||
+        !receipt.nginx_sibling_acquired || !receipt.nginx_sibling_settled ||
+        receipt.nginx_sibling_order == 0u || receipt.nginx_sibling_order >= receipt.sidecar_order ||
+        receipt.nginx_create_count != 1u || receipt.nginx_start_count != expected_start_count ||
+        receipt.nginx_remove_count != 1u) {
+        error =
+            "injected nginx lifecycle did not recover in exact graph order: " + diagnostic.message;
+        return false;
+    }
+    const std::uint64_t settled_commands = exact_input_mount_test_command_count();
+    ExactInputMountRecoveryReceipt replay_receipt;
+    if (controller.recover_all(replay_receipt, diagnostic) ||
+        !receipt_equal(receipt, replay_receipt) ||
+        exact_input_mount_test_command_count() != settled_commands) {
+        error = "injected nginx lifecycle terminal recovery replay was not inert";
+        return false;
+    }
+    return true;
+}
+
 struct BuilderRecoveryCase {
     const char* name;
     BuilderMode mode;
@@ -986,6 +1061,15 @@ int main(int argc, char** argv) {
         builder_mutation_rejections != 20u) {
         std::cerr << "FAIL [#408 topology builder pure mutation matrix]: "
                   << builder_selfcheck_diagnostic.message << "\n";
+        return 1;
+    }
+    std::uint32_t lifecycle_mutation_rejections = 0u;
+    ExactInputMountDiagnostic lifecycle_selfcheck_diagnostic;
+    if (!exact_input_mount_test_nginx_lifecycle_self_checks(lifecycle_mutation_rejections,
+                                                            lifecycle_selfcheck_diagnostic) ||
+        lifecycle_mutation_rejections != 39u) {
+        std::cerr << "FAIL [#358 nginx lifecycle pure mutation matrix]: "
+                  << lifecycle_selfcheck_diagnostic.message << "\n";
         return 1;
     }
     {
@@ -1764,6 +1848,7 @@ int main(int argc, char** argv) {
         ExactInputMountSnapshot built_snapshot;
         ExactInputReadObservation built_read;
         ExactInputWriteRefusalObservation built_write;
+        ExactInputNginxLifecycleObservation lifecycle;
         if (!built.start_with_topology_builder(
                 topology_config_builder, &context, built_handle, diagnostic) ||
             context.calls != 1u || context.expected_bytes.empty() ||
@@ -1778,11 +1863,77 @@ int main(int argc, char** argv) {
             !built.observe_input_read(built_handle, built_read, diagnostic) ||
             built_read.stdout_bytes != context.expected_bytes ||
             !built.observe_input_write_refusal(built_handle, built_write, diagnostic) ||
+            !built.observe_nginx_lifecycle(built_handle, lifecycle, diagnostic) ||
+            lifecycle.outcome != ExactInputNginxLifecycleOutcome::Complete ||
+            !lifecycle.attempted || !lifecycle.terminal_frozen ||
+            !lifecycle.caller_deadline_recorded || lifecycle.final_deadline_nanoseconds <= 0 ||
+            !lifecycle.create_attempted || !lifecycle.created || lifecycle.create_count != 1u ||
+            !lifecycle.start_attempted || !lifecycle.started || lifecycle.start_count != 1u ||
+            lifecycle.remove_count != 1u || !lifecycle.same_source_inode ||
+            lifecycle.same_mount_instance || !lifecycle.sibling_mount_independently_verified ||
+            !lifecycle.sample_a.complete || !lifecycle.sample_b.complete ||
+            !lifecycle.sample_a.container_identity_verified ||
+            !lifecycle.sample_a.source_revalidated || !lifecycle.sample_a.mount_verified ||
+            !lifecycle.sample_a.topology_verified || !lifecycle.sample_a.cgroup_exact ||
+            !lifecycle.sample_a.pidfile_exact || !lifecycle.sample_a.tcp_exact ||
+            !lifecycle.sample_a.tcp6_port_absent ||
+            !lifecycle.sample_a.end_container_identity_verified ||
+            !lifecycle.sample_a.end_source_revalidated || !lifecycle.sample_a.end_mount_verified ||
+            !lifecycle.sample_a.end_topology_verified || !lifecycle.sample_a.end_cgroup_exact ||
+            !lifecycle.sample_a.end_pidfile_exact || !lifecycle.sample_a.end_process_socket_owned ||
+            lifecycle.sample_a.bracket_end_nanoseconds <
+                lifecycle.sample_a.bracket_start_nanoseconds ||
+            !lifecycle.sample_b.container_identity_verified ||
+            !lifecycle.sample_b.source_revalidated || !lifecycle.sample_b.mount_verified ||
+            !lifecycle.sample_b.topology_verified || !lifecycle.sample_b.cgroup_exact ||
+            !lifecycle.sample_b.pidfile_exact || !lifecycle.sample_b.tcp_exact ||
+            !lifecycle.sample_b.tcp6_port_absent ||
+            !lifecycle.sample_b.end_container_identity_verified ||
+            !lifecycle.sample_b.end_source_revalidated || !lifecycle.sample_b.end_mount_verified ||
+            !lifecycle.sample_b.end_topology_verified || !lifecycle.sample_b.end_cgroup_exact ||
+            !lifecycle.sample_b.end_pidfile_exact || !lifecycle.sample_b.end_process_socket_owned ||
+            lifecycle.sample_b.bracket_end_nanoseconds <
+                lifecycle.sample_b.bracket_start_nanoseconds ||
+            !lifecycle.samples_at_least_250ms_apart ||
+            lifecycle.sample_b.bracket_start_nanoseconds -
+                    lifecycle.sample_a.bracket_end_nanoseconds <
+                250000000LL ||
+            lifecycle.sample_a.master_pid != lifecycle.sample_b.master_pid ||
+            lifecycle.sample_a.worker_pid != lifecycle.sample_b.worker_pid ||
+            lifecycle.sample_a.master_start != lifecycle.sample_b.master_start ||
+            lifecycle.sample_a.worker_start != lifecycle.sample_b.worker_start ||
+            lifecycle.sample_a.listener_inode == 0u ||
+            lifecycle.sample_a.listener_inode != lifecycle.sample_b.listener_inode ||
+            !lifecycle.quit_attempted || !lifecycle.quit_only || !lifecycle.stopped_exit_zero ||
+            lifecycle.term_attempted || lifecycle.kill_attempted ||
+            lifecycle.force_remove_attempted || lifecycle.uncertain_cleanup ||
+            !lifecycle.cgroup_empty_after_stop || !lifecycle.removed_nonforce ||
+            !lifecycle.exact_absence || !lifecycle.baseline_restored ||
+            lifecycle.operation_failed || lifecycle.container_id.size() != 64u ||
+            lifecycle.container_name != "rut358-nginx-" + context.token ||
+            ![&] {
+                const std::uint64_t commands = exact_input_mount_test_command_count();
+                ExactInputNginxLifecycleObservation replay;
+                return built.observe_nginx_lifecycle(built_handle, replay, diagnostic) &&
+                       replay.outcome == lifecycle.outcome &&
+                       replay.container_id == lifecycle.container_id &&
+                       replay.create_argv == lifecycle.create_argv &&
+                       replay.sample_a.listener_inode == lifecycle.sample_a.listener_inode &&
+                       replay.sample_b.listener_inode == lifecycle.sample_b.listener_inode &&
+                       replay.remove_count == lifecycle.remove_count &&
+                       replay.terminal_frozen == lifecycle.terminal_frozen &&
+                       exact_input_mount_test_command_count() == commands;
+            }() ||
             !built.finish(built_handle, receipt, diagnostic) || !exact_terminal(receipt) ||
-            !receipt.builder.applicable || !receipt.builder.request_validated ||
-            receipt.builder.invocation_count != 1u || !receipt.builder.returned_normally ||
-            receipt.builder.threw_exception || !receipt.builder.callback_reported_success ||
-            receipt.builder.reentry_attempted || receipt.builder.sink_overflow ||
+            !receipt.nginx_sibling_acquired || !receipt.nginx_sibling_settled ||
+            receipt.nginx_sibling_order == 0u ||
+            receipt.nginx_sibling_order >= receipt.sidecar_order ||
+            receipt.nginx_create_count != 1u || receipt.nginx_start_count != 1u ||
+            receipt.nginx_remove_count != 1u || !receipt.builder.applicable ||
+            !receipt.builder.request_validated || receipt.builder.invocation_count != 1u ||
+            !receipt.builder.returned_normally || receipt.builder.threw_exception ||
+            !receipt.builder.callback_reported_success || receipt.builder.reentry_attempted ||
+            receipt.builder.sink_overflow ||
             receipt.builder.sink_size != context.expected_bytes.size() ||
             !receipt.builder.output_accepted || !receipt.builder.directory_acquired_after_builder ||
             !receipt.builder.input_acquired_after_builder ||
@@ -1797,6 +1948,30 @@ int main(int argc, char** argv) {
             !receipt.mutation_may_have_occurred || !receipt.recovery_required) {
             std::cerr << "FAIL [#408 topology-bound exact input success]: " << diagnostic.message
                       << "\n";
+            return 1;
+        }
+    }
+    for (const auto& test : std::array{
+             std::tuple{ExactInputMountFailurePoint::NginxCreateReportedTimeout,
+                        ExactInputNginxLifecycleOutcome::CreateFailed,
+                        0u,
+                        true},
+             std::tuple{ExactInputMountFailurePoint::NginxStartReportedTimeout,
+                        ExactInputNginxLifecycleOutcome::StartFailed,
+                        1u,
+                        true},
+             std::tuple{ExactInputMountFailurePoint::NginxRemoveUnresolved,
+                        ExactInputNginxLifecycleOutcome::RemovalFailed,
+                        1u,
+                        false},
+         }) {
+        std::string error;
+        if (!recover_injected_nginx_lifecycle(std::get<0>(test),
+                                              std::get<1>(test),
+                                              std::get<2>(test),
+                                              std::get<3>(test),
+                                              error)) {
+            std::cerr << "FAIL [#358 nginx lifecycle uncertain recovery]: " << error << "\n";
             return 1;
         }
     }
