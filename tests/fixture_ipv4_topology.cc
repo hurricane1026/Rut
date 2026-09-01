@@ -1350,7 +1350,6 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
             if (fault == ExactReadRunnerFault::ParentControlEof) {
                 close(control_pair[0]);
                 control_closed = true;
-                result.control_eof_cleanup = true;
             } else if (!exact_read_send_datagram(control_pair[0], &request, sizeof(request))) {
                 close(control_pair[0]);
                 control_closed = true;
@@ -1396,8 +1395,7 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
     result.leader_exit_observed_before_group_cleanup =
         (terminal.flags & kExactReadFlagLeaderExitedBeforeCleanup) != 0u;
     result.descendant_group_member_observed = terminal.reap_count > 1u;
-    result.control_eof_cleanup =
-        result.control_eof_cleanup || (terminal.flags & kExactReadFlagControlEof) != 0u;
+    result.control_eof_cleanup = (terminal.flags & kExactReadFlagControlEof) != 0u;
     result.cleanup_completed_before_final_deadline = exact_read_monotonic_ns() < final_deadline_ns;
     close(supervisor_pidfd);
     result.pidfd_closed_after_group_gone = result.group_echild_observed;
@@ -4920,7 +4918,8 @@ bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_c
             expected = "confined";
             break;
         case ExactInputReadRunnerTestCase::ParentControlEof:
-            name = "immediate";
+            name = "control-eof-descendant";
+            expected = "control-eof-descendant-live";
             fault = ExactReadRunnerFault::ParentControlEof;
             break;
         case ExactInputReadRunnerTestCase::StatusShort:

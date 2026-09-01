@@ -161,6 +161,24 @@ int run_exact_read_helper(const std::string& name, const char* argument = nullpt
         }
         return 0;
     }
+    if (name == "control-eof-descendant") {
+        const pid_t leader = getpid();
+        const pid_t descendant = fork();
+        if (descendant < 0) return 126;
+        if (descendant == 0) {
+            // Do not make either stream reach EOF until this process has
+            // causally observed that its leader exited and it was adopted by
+            // the supervisor subreaper.
+            for (unsigned attempt = 0; attempt < 1000u && getppid() == leader; ++attempt)
+                (void)poll(nullptr, 0, 1);
+            if (getppid() == leader || !write_all(STDOUT_FILENO, "control-eof-descendant-live"))
+                _exit(125);
+            if (close(STDOUT_FILENO) != 0 || close(STDERR_FILENO) != 0) _exit(125);
+            (void)poll(nullptr, 0, 3000);
+            _exit(124);
+        }
+        return 0;
+    }
     if (name == "handoff") {
         constexpr unsigned kGenerations = 32;
         for (unsigned generation = 0; generation < kGenerations; ++generation) {
@@ -398,7 +416,12 @@ bool exact_read_runner_self_checks(std::string& error) {
             return false;
         }
         if (test_case == ExactInputReadRunnerTestCase::ParentControlEof &&
-            !observation.control_eof_cleanup) {
+            (!observation.control_eof_cleanup || !observation.stdout_eof ||
+             !observation.stderr_eof || observation.stdout_bytes != "control-eof-descendant-live" ||
+             !observation.leader_exit_observed_before_group_cleanup ||
+             !observation.descendant_group_member_observed ||
+             observation.adopted_reap_count != 2u || !observation.group_echild_observed ||
+             !observation.cleanup_completed_before_final_deadline)) {
             error = "parent control EOF did not causally trigger supervisor cleanup";
             return false;
         }
