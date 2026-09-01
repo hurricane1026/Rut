@@ -5,6 +5,7 @@
 #include <utility>
 
 using rut::test::ipv4_topology::FailurePoint;
+using rut::test::ipv4_topology::HeldNamespaceHolderRemovalFailurePoint;
 using rut::test::ipv4_topology::HeldNamespaceSidecarFailurePoint;
 using rut::test::ipv4_topology::HeldNamespaceSidecarRevalidationFault;
 using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
@@ -210,6 +211,22 @@ int main() {
                       << injected.error << "\n";
             return 1;
         }
+    }
+    const RunResult holder_suppressed =
+        rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
+            sidecar_callback,
+            HeldNamespaceSidecarFailurePoint::None,
+            HeldNamespaceSidecarRevalidationFault::None,
+            HeldNamespaceHolderRemovalFailurePoint::SuppressFirstCommand);
+    const std::string holder_suppressed_receipt =
+        "verified running holder suppressed-removal exact-ID recovery and zero residue";
+    if (holder_suppressed.prerequisite_failure || !holder_suppressed.success ||
+        !holder_suppressed.cleanup_complete || !holder_suppressed.residue_free ||
+        holder_suppressed.semantic_receipt != holder_suppressed_receipt ||
+        holder_suppressed.error != holder_suppressed_receipt) {
+        std::cerr << "FAIL [#412 running-holder uncertain-removal recovery]: "
+                  << holder_suppressed.error << "\n";
+        return 1;
     }
     bool failing_callback_ran = false;
     const RunResult callback_failure = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
