@@ -167,6 +167,7 @@ static void require_group_gone(pid_t pgid, const char* reason) {
 // Translation-unit-private evidence used only to prove that terminal cleanup
 // replay does not issue another external command.
 static u64 command_invocation_count = 0;
+static u64 observation_command_invocation_count = 0;
 
 static bool run_command(const std::vector<std::string>& arguments,
                         CommandResult& result,
@@ -1090,21 +1091,20 @@ static bool exact_read_validate_receipt(const ExactReadSupervisorReceipt& receip
            receipt.reserved == 0u && receipt.worker_pid > 0;
 }
 
-static bool run_exact_read_command(const std::vector<std::string>& arguments,
-                                   size_t stdout_limit,
-                                   int timeout_ms,
-                                   ExactReadCommandResult& result,
-                                   ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+static bool run_exact_read_command_until(const std::vector<std::string>& arguments,
+                                         size_t stdout_limit,
+                                         std::int64_t final_deadline_ns,
+                                         ExactReadCommandResult& result,
+                                         ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
     ++command_invocation_count;
+    ++observation_command_invocation_count;
     result = {};
-    if (arguments.empty() || stdout_limit == 0u || timeout_ms <= 0) return false;
     const std::int64_t now_ns = exact_read_monotonic_ns();
-    if (now_ns <= 0 || timeout_ms > (std::numeric_limits<std::int64_t>::max() - now_ns) / 1000000LL)
+    if (arguments.empty() || stdout_limit == 0u || now_ns <= 0 || final_deadline_ns <= now_ns)
         return false;
-    const std::int64_t final_deadline_ns =
-        now_ns + static_cast<std::int64_t>(timeout_ms) * 1000000LL;
+    const std::int64_t remaining_ms = (final_deadline_ns - now_ns) / 1000000LL;
     const std::int64_t cleanup_reserve_ns =
-        static_cast<std::int64_t>(std::min(200, std::max(50, timeout_ms / 2))) * 1000000LL;
+        std::min<std::int64_t>(200, std::max<std::int64_t>(50, remaining_ms / 2)) * 1000000LL;
     const std::int64_t begin_cleanup_ns = final_deadline_ns - cleanup_reserve_ns;
     result.final_deadline_recorded = true;
 
@@ -1402,6 +1402,24 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
     return result.started && !result.deadline_exceeded && !result.output_overflow &&
            result.stdout_read_errno == 0 && result.stderr_read_errno == 0 &&
            result.cleanup_completed_before_final_deadline && result.group_echild_observed;
+}
+
+static bool run_exact_read_command(const std::vector<std::string>& arguments,
+                                   size_t stdout_limit,
+                                   int timeout_ms,
+                                   ExactReadCommandResult& result,
+                                   ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
+    const std::int64_t now_ns = exact_read_monotonic_ns();
+    if (now_ns <= 0 || timeout_ms <= 0 ||
+        timeout_ms > (std::numeric_limits<std::int64_t>::max() - now_ns) / 1000000LL) {
+        result = {};
+        return false;
+    }
+    return run_exact_read_command_until(arguments,
+                                        stdout_limit,
+                                        now_ns + static_cast<std::int64_t>(timeout_ms) * 1000000LL,
+                                        result,
+                                        fault);
 }
 static ExactInputReadOutcome classify_exact_read(const ExactReadCommandResult& result,
                                                  const std::string& expected) {
@@ -4212,6 +4230,8 @@ struct ExactInputMountOwner {
     ExactInputMountRecoveryReceipt receipt;
     ExactInputReadObservation read_observation;
     ExactInputMountDiagnostic read_diagnostic;
+    ExactInputWriteRefusalObservation write_refusal_observation;
+    ExactInputMountDiagnostic write_refusal_diagnostic;
     std::vector<std::string> sidecar_argv;
     HeldNamespaceSidecarSnapshot registered_sidecar;
     ParsedMountInspect registered_mount;
@@ -4226,6 +4246,7 @@ struct ExactInputMountOwner {
     bool topology_settlement_fault_consumed = false;
     bool operation_failed = false;
     bool read_attempted = false;
+    bool write_refusal_attempted = false;
 };
 
 static bool mount_inspect_equal(const ParsedMountInspect& left, const ParsedMountInspect& right) {
@@ -4314,6 +4335,291 @@ static ExactInputReadOutcome capture_input_read_bracket(ExactInputMountOwner& ow
     else
         observation.post_proc_credentials = true;
     return ExactInputReadOutcome::Complete;
+}
+
+static bool exact_write_source_bracket_equal(const ExactInputWriteSourceBracket& left,
+                                             const ExactInputWriteSourceBracket& right) {
+    return left.source_revalidated == right.source_revalidated &&
+           left.source_bytes_revalidated == right.source_bytes_revalidated &&
+           left.retained_ofd_revalidated == right.retained_ofd_revalidated &&
+           left.container_identity_revalidated == right.container_identity_revalidated &&
+           left.mount_revalidated == right.mount_revalidated &&
+           left.proc_credentials_revalidated == right.proc_credentials_revalidated &&
+           left.registered_identity_matched == right.registered_identity_matched &&
+           left.registered_mount_matched == right.registered_mount_matched &&
+           left.source_path == right.source_path && left.source_device == right.source_device &&
+           left.source_inode == right.source_inode && left.source_mode == right.source_mode &&
+           left.source_uid == right.source_uid && left.source_gid == right.source_gid &&
+           left.source_size == right.source_size && left.source_links == right.source_links &&
+           left.source_mtime_seconds == right.source_mtime_seconds &&
+           left.source_mtime_nanoseconds == right.source_mtime_nanoseconds &&
+           left.source_ctime_seconds == right.source_ctime_seconds &&
+           left.source_ctime_nanoseconds == right.source_ctime_nanoseconds;
+}
+
+static bool capture_write_refusal_bracket(ExactInputMountOwner& owner,
+                                          ExactInputMountFailurePoint rejection,
+                                          ExactInputWriteSourceBracket& bracket,
+                                          std::string& error,
+                                          int& error_number) {
+    if (owner.options.failure_point == rejection) {
+        error = "injected write-refusal bracket rejection";
+        return false;
+    }
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
+    if (!owner.input.revalidate(file_diagnostic)) {
+        error = "exact source/OFD/bytes revalidation failed at write-refusal bracket";
+        error_number = file_diagnostic.error_number;
+        return false;
+    }
+    bracket.source_revalidated = true;
+    bracket.source_bytes_revalidated = true;
+    bracket.retained_ofd_revalidated = true;
+
+    struct stat descriptor_stat{};
+    struct stat path_stat{};
+    if (fstat(owner.input.descriptor(), &descriptor_stat) != 0 ||
+        lstat(owner.input.path().c_str(), &path_stat) != 0) {
+        error_number = errno;
+        error = "source metadata capture failed at write-refusal bracket";
+        return false;
+    }
+    const auto& expected = owner.input.identity();
+    const auto exact_stat = [&](const struct stat& value) {
+        return static_cast<std::uint64_t>(value.st_dev) == expected.device &&
+               static_cast<std::uint64_t>(value.st_ino) == expected.inode &&
+               static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
+               static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
+               static_cast<std::uint64_t>(value.st_gid) == expected.gid &&
+               static_cast<std::uint64_t>(value.st_size) == expected.size &&
+               static_cast<std::uint64_t>(value.st_nlink) == expected.links;
+    };
+    if (!exact_stat(descriptor_stat) || !exact_stat(path_stat) ||
+        descriptor_stat.st_mtim.tv_sec != path_stat.st_mtim.tv_sec ||
+        descriptor_stat.st_mtim.tv_nsec != path_stat.st_mtim.tv_nsec ||
+        descriptor_stat.st_ctim.tv_sec != path_stat.st_ctim.tv_sec ||
+        descriptor_stat.st_ctim.tv_nsec != path_stat.st_ctim.tv_nsec) {
+        error = "source path/descriptor metadata differed at write-refusal bracket";
+        return false;
+    }
+    bracket.source_path = owner.input.path();
+    bracket.source_device = expected.device;
+    bracket.source_inode = expected.inode;
+    bracket.source_mode = expected.mode;
+    bracket.source_uid = expected.uid;
+    bracket.source_gid = expected.gid;
+    bracket.source_size = expected.size;
+    bracket.source_links = expected.links;
+    bracket.source_mtime_seconds = descriptor_stat.st_mtim.tv_sec;
+    bracket.source_mtime_nanoseconds = descriptor_stat.st_mtim.tv_nsec;
+    bracket.source_ctime_seconds = descriptor_stat.st_ctim.tv_sec;
+    bracket.source_ctime_nanoseconds = descriptor_stat.st_ctim.tv_nsec;
+
+    if (!owner.fixture.revalidate_sidecar_identity(error)) {
+        error = "exact sidecar identity failed at write-refusal bracket: " + error;
+        return false;
+    }
+    const HeldNamespaceSidecarSnapshot first = owner.fixture.sidecar_snapshot();
+    if (!sidecar_snapshot_equal(first, owner.registered_sidecar)) {
+        error = "write-refusal sidecar differed from registered immutable snapshot";
+        return false;
+    }
+    bracket.container_identity_revalidated = true;
+    bracket.registered_identity_matched = true;
+
+    ParsedMountInspect mount;
+    if (!inspect_exact_mount(
+            owner.fixture, owner.input.path(), owner.input.identity(), mount, error)) {
+        error = "exact mount/Config.User inspection failed at write-refusal bracket: " + error;
+        return false;
+    }
+    if (!mount_inspect_equal(mount, owner.registered_mount)) {
+        error = "write-refusal mount/Config.User differed from registered snapshot";
+        return false;
+    }
+    bracket.mount_revalidated = true;
+    bracket.registered_mount_matched = true;
+
+    if (!proc_credentials_exact(first.pid, expected.uid, expected.gid)) {
+        error = "actual sidecar /proc credentials failed at write-refusal bracket";
+        return false;
+    }
+    if (!owner.fixture.revalidate_sidecar_identity(error)) {
+        error = "post-/proc sidecar identity failed at write-refusal bracket: " + error;
+        return false;
+    }
+    const HeldNamespaceSidecarSnapshot second = owner.fixture.sidecar_snapshot();
+    if (!sidecar_snapshot_equal(first, second) ||
+        !sidecar_snapshot_equal(second, owner.registered_sidecar)) {
+        error = "sidecar identity changed across write-refusal /proc evidence";
+        return false;
+    }
+    bracket.proc_credentials_revalidated = true;
+    return true;
+}
+
+static bool exact_supervisor_command_complete(const ExactReadCommandResult& result) {
+    return result.started && result.stdout_eof && result.stderr_eof && result.child_reaped &&
+           result.wait_status_valid && result.process_group_owned && result.process_group_gone &&
+           result.pidfd_opened && result.pidfd_identity_verified &&
+           result.pidfd_closed_after_group_gone && result.final_deadline_recorded &&
+           result.cleanup_completed_before_final_deadline && result.supervisor_session_verified &&
+           result.supervisor_subreaper_verified && result.actual_exec_observed &&
+           result.subtree_confinement_installed && result.group_echild_observed &&
+           result.adopted_reap_count > 0u && !result.deadline_exceeded && !result.output_overflow &&
+           result.stdout_read_errno == 0 && result.stderr_read_errno == 0;
+}
+
+static ExactInputWriteRefusalOutcome classify_write_control(const ExactReadCommandResult& result) {
+    if (!result.started) return ExactInputWriteRefusalOutcome::CommandStartFailed;
+    if (result.deadline_exceeded) return ExactInputWriteRefusalOutcome::DeadlineExceeded;
+    if (result.output_overflow) return ExactInputWriteRefusalOutcome::OutputLimitExceeded;
+    if (!exact_supervisor_command_complete(result))
+        return ExactInputWriteRefusalOutcome::StreamError;
+    if (WIFSIGNALED(result.wait_status)) return ExactInputWriteRefusalOutcome::ExitSignaled;
+    if (!WIFEXITED(result.wait_status) || WEXITSTATUS(result.wait_status) != 0)
+        return ExactInputWriteRefusalOutcome::ControlExitNonzero;
+    if (!result.stdout_bytes.empty() || !result.stderr_bytes.empty())
+        return ExactInputWriteRefusalOutcome::ControlOutputMismatch;
+    return ExactInputWriteRefusalOutcome::Complete;
+}
+
+static ExactInputWriteRefusalOutcome classify_write_target(const ExactReadCommandResult& result,
+                                                           const std::string& expected_stderr) {
+    if (!result.started) return ExactInputWriteRefusalOutcome::CommandStartFailed;
+    if (result.deadline_exceeded) return ExactInputWriteRefusalOutcome::DeadlineExceeded;
+    if (result.output_overflow) return ExactInputWriteRefusalOutcome::OutputLimitExceeded;
+    if (!exact_supervisor_command_complete(result))
+        return ExactInputWriteRefusalOutcome::StreamError;
+    if (WIFSIGNALED(result.wait_status)) return ExactInputWriteRefusalOutcome::ExitSignaled;
+    if (!WIFEXITED(result.wait_status)) return ExactInputWriteRefusalOutcome::TargetWrongExit;
+    if (WEXITSTATUS(result.wait_status) == 0)
+        return ExactInputWriteRefusalOutcome::TargetUnexpectedSuccess;
+    if (WEXITSTATUS(result.wait_status) != 1) return ExactInputWriteRefusalOutcome::TargetWrongExit;
+    if (!result.stdout_bytes.empty()) return ExactInputWriteRefusalOutcome::TargetStdoutNotEmpty;
+    if (result.stderr_bytes != expected_stderr)
+        return ExactInputWriteRefusalOutcome::TargetStderrMismatch;
+    return ExactInputWriteRefusalOutcome::Complete;
+}
+
+static bool write_refusal_self_checks_impl(std::uint32_t& mutation_rejections,
+                                           ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    mutation_rejections = 0u;
+    ExactReadCommandResult valid;
+    valid.started = valid.stdout_eof = valid.stderr_eof = valid.child_reaped = true;
+    valid.wait_status_valid = valid.process_group_owned = valid.process_group_gone = true;
+    valid.pidfd_opened = valid.pidfd_identity_verified = true;
+    valid.pidfd_closed_after_group_gone = valid.final_deadline_recorded = true;
+    valid.cleanup_completed_before_final_deadline = true;
+    valid.supervisor_session_verified = valid.supervisor_subreaper_verified = true;
+    valid.actual_exec_observed = valid.subtree_confinement_installed = true;
+    valid.group_echild_observed = true;
+    valid.adopted_reap_count = 1u;
+    const std::string expected =
+        "dd: failed to open '/etc/nginx/nginx.conf': Read-only file system\n";
+    ExactReadCommandResult target = valid;
+    target.wait_status = 1 << 8;
+    target.stderr_bytes = expected;
+    if (classify_write_control(valid) != ExactInputWriteRefusalOutcome::Complete ||
+        classify_write_target(target, expected) != ExactInputWriteRefusalOutcome::Complete) {
+        diagnostic = {ExactInputMountPhase::WriteRefusalObservation,
+                      0,
+                      "valid write-refusal classifier seed was rejected"};
+        return false;
+    }
+    const auto control_rejects = [&](ExactReadCommandResult changed,
+                                     ExactInputWriteRefusalOutcome expected_outcome) {
+        if (classify_write_control(changed) != expected_outcome) return false;
+        ++mutation_rejections;
+        return true;
+    };
+    ExactReadCommandResult changed = valid;
+    changed.wait_status = 23 << 8;
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::ControlExitNonzero)) return false;
+    changed = valid;
+    changed.stderr_bytes = "unexpected";
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::ControlOutputMismatch))
+        return false;
+    changed = valid;
+    changed.deadline_exceeded = true;
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::DeadlineExceeded)) return false;
+    changed = valid;
+    changed.wait_status = SIGUSR1;
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::ExitSignaled)) return false;
+    changed = valid;
+    changed.stdout_read_errno = EIO;
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::StreamError)) return false;
+    changed = valid;
+    changed.group_echild_observed = false;
+    if (!control_rejects(changed, ExactInputWriteRefusalOutcome::StreamError)) return false;
+
+    const auto target_rejects = [&](ExactReadCommandResult changed_result,
+                                    ExactInputWriteRefusalOutcome expected_outcome) {
+        if (classify_write_target(changed_result, expected) != expected_outcome) return false;
+        ++mutation_rejections;
+        return true;
+    };
+    changed = target;
+    changed.wait_status = 0;
+    if (!target_rejects(changed, ExactInputWriteRefusalOutcome::TargetUnexpectedSuccess))
+        return false;
+    changed = target;
+    changed.wait_status = 2 << 8;
+    if (!target_rejects(changed, ExactInputWriteRefusalOutcome::TargetWrongExit)) return false;
+    changed = target;
+    changed.stderr_bytes = "wrong";
+    if (!target_rejects(changed, ExactInputWriteRefusalOutcome::TargetStderrMismatch)) return false;
+    changed = target;
+    changed.stdout_bytes = "x";
+    if (!target_rejects(changed, ExactInputWriteRefusalOutcome::TargetStdoutNotEmpty)) return false;
+
+    ExactInputWriteSourceBracket bracket;
+    bracket.source_revalidated = bracket.source_bytes_revalidated = true;
+    bracket.retained_ofd_revalidated = bracket.container_identity_revalidated = true;
+    bracket.mount_revalidated = bracket.proc_credentials_revalidated = true;
+    bracket.registered_identity_matched = bracket.registered_mount_matched = true;
+    bracket.source_path = "/tmp/private/nginx.conf";
+    bracket.source_device = 1u;
+    bracket.source_inode = 2u;
+    bracket.source_mode = S_IFREG | 0600u;
+    bracket.source_uid = bracket.source_gid = 1000u;
+    bracket.source_size = 3u;
+    bracket.source_links = 1u;
+    bracket.source_mtime_seconds = 4;
+    bracket.source_mtime_nanoseconds = 5;
+    bracket.source_ctime_seconds = 6;
+    bracket.source_ctime_nanoseconds = 7;
+    const auto bracket_rejects = [&](ExactInputWriteSourceBracket mutated) {
+        if (exact_write_source_bracket_equal(bracket, mutated)) return false;
+        ++mutation_rejections;
+        return true;
+    };
+    auto mutated = bracket;
+    mutated.source_bytes_revalidated = false;
+    if (!bracket_rejects(mutated)) return false;
+    mutated = bracket;
+    mutated.retained_ofd_revalidated = false;
+    if (!bracket_rejects(mutated)) return false;
+    mutated = bracket;
+    mutated.registered_identity_matched = false;
+    if (!bracket_rejects(mutated)) return false;
+    mutated = bracket;
+    mutated.registered_mount_matched = false;
+    if (!bracket_rejects(mutated)) return false;
+    mutated = bracket;
+    ++mutated.source_inode;
+    if (!bracket_rejects(mutated)) return false;
+    mutated = bracket;
+    ++mutated.source_ctime_nanoseconds;
+    if (!bracket_rejects(mutated)) return false;
+    if (mutation_rejections != 16u) {
+        diagnostic = {ExactInputMountPhase::WriteRefusalObservation,
+                      0,
+                      "write-refusal classifier/mutation rejection count differed"};
+        return false;
+    }
+    return true;
 }
 
 static void sync_setup_event_evidence(ExactInputMountOwner& owner) {
@@ -4888,6 +5194,15 @@ std::uint64_t exact_input_mount_test_command_count() {
     return command_invocation_count;
 }
 
+std::uint64_t exact_input_mount_test_observation_command_count() {
+    return observation_command_invocation_count;
+}
+
+bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_rejections,
+                                                      ExactInputMountDiagnostic& diagnostic) {
+    return write_refusal_self_checks_impl(mutation_rejections, diagnostic);
+}
+
 bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
                                              ExactInputReadObservation& observation,
                                              ExactInputMountDiagnostic& diagnostic) {
@@ -5200,6 +5515,21 @@ ExactInputMountRecoveryController::ExactInputMountRecoveryController()
     if (cookie_ == 0u) cookie_ = 1u;
 }
 
+static bool exact_mount_terminal_settlement(const ExactInputMountRecoveryReceipt& receipt) {
+    const auto settled_if_acquired = [](bool acquired, bool settled) {
+        return !acquired || settled;
+    };
+    return receipt.state == ExactInputMountState::Settled && receipt.attempted &&
+           receipt.terminal_result != ExactInputMountTerminalResult::None &&
+           receipt.final_zero_residue && receipt.settlement_complete && receipt.terminal_frozen &&
+           settled_if_acquired(receipt.sidecar_acquired, receipt.sidecar_settled) &&
+           settled_if_acquired(receipt.input_acquired, receipt.input_settled) &&
+           settled_if_acquired(receipt.directory_acquired, receipt.directory_settled) &&
+           settled_if_acquired(receipt.holder_acquired, receipt.holder_settled) &&
+           settled_if_acquired(receipt.network_b_acquired, receipt.network_b_settled) &&
+           settled_if_acquired(receipt.network_a_acquired, receipt.network_a_settled);
+}
+
 ExactInputMountRecoveryController::~ExactInputMountRecoveryController() {
     ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
     const ExactInputMountRecoveryReceipt* receipt = owner == nullptr ? nullptr : &owner->receipt;
@@ -5209,7 +5539,10 @@ ExactInputMountRecoveryController::~ExactInputMountRecoveryController() {
     if (owner != nullptr && !owner->settled) {
         ExactInputMountRecoveryReceipt recovered;
         ExactInputMountDiagnostic diagnostic;
-        if (!recover_impl(recovered, diagnostic))
+        const bool operation_ok = recover_impl(recovered, diagnostic);
+        if (!operation_ok && (recovered.terminal_result !=
+                                  ExactInputMountTerminalResult::SettledWithOperationFailure ||
+                              !exact_mount_terminal_settlement(recovered)))
             exact_mount_fatal("bounded destructor recovery did not settle the graph",
                               &owner->receipt);
     }
@@ -5327,6 +5660,7 @@ bool ExactInputMountRecoveryController::observe_input_read(const ExactInputMount
         diagnostic = owner->read_diagnostic;
         return observation.outcome == ExactInputReadOutcome::Complete;
     }
+
     if (owner->state != ExactInputMountState::ReadyForObservation) {
         diagnostic = {ExactInputMountPhase::Lifecycle,
                       EINVAL,
@@ -5411,6 +5745,189 @@ bool ExactInputMountRecoveryController::observe_input_read(const ExactInputMount
     owner->read_observation = current;
     owner->read_diagnostic = {};
     owner->state = ExactInputMountState::InputReadObserved;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    observation = current;
+    diagnostic = {};
+    return true;
+}
+
+bool ExactInputMountRecoveryController::observe_input_write_refusal(
+    const ExactInputMountHandle& handle,
+    ExactInputWriteRefusalObservation& observation,
+    ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, EINVAL, "exact-input owner is absent"};
+        return false;
+    }
+    if (owner->write_refusal_attempted) {
+        observation = owner->write_refusal_observation;
+        diagnostic = owner->write_refusal_diagnostic;
+        return observation.outcome == ExactInputWriteRefusalOutcome::Complete;
+    }
+    if (owner->state != ExactInputMountState::InputReadObserved || !owner->read_attempted ||
+        owner->read_observation.outcome != ExactInputReadOutcome::Complete) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "write-refusal observation requires a successful exact input read"};
+        return false;
+    }
+
+    owner->write_refusal_attempted = true;
+    owner->state = ExactInputMountState::ObservingWriteRefusal;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    ExactInputWriteRefusalObservation current;
+    current.attempted = true;
+    current.expected_target_stderr =
+        "dd: failed to open '/etc/nginx/nginx.conf': Read-only file system\n";
+    const std::int64_t now_ns = exact_read_monotonic_ns();
+    if (now_ns > 0 && now_ns <= std::numeric_limits<std::int64_t>::max() - 30000000000LL) {
+        current.caller_deadline_recorded = true;
+        current.final_deadline_nanoseconds = now_ns + 30000000000LL;
+    }
+    const auto freeze_failure = [&](ExactInputWriteRefusalOutcome outcome,
+                                    const std::string& message,
+                                    int error_number = 0) {
+        current.outcome = outcome;
+        current.terminal_frozen = true;
+        current.diagnostic = {ExactInputMountPhase::WriteRefusalObservation, error_number, message};
+        owner->operation_failed = true;
+        owner_failure(*owner,
+                      diagnostic,
+                      current.diagnostic.phase,
+                      current.diagnostic.message,
+                      current.diagnostic.error_number);
+        owner->write_refusal_observation = current;
+        owner->write_refusal_diagnostic = current.diagnostic;
+        observation = current;
+        return false;
+    };
+    if (!current.caller_deadline_recorded)
+        return freeze_failure(ExactInputWriteRefusalOutcome::DeadlineExceeded,
+                              "caller-owned write-refusal deadline could not be formed",
+                              EOVERFLOW);
+
+    std::string error;
+    int error_number = 0;
+    if (!capture_write_refusal_bracket(
+            *owner,
+            ExactInputMountFailurePoint::WriteRefusalRejectInitialBracket,
+            current.initial_bracket,
+            error,
+            error_number))
+        return freeze_failure(
+            ExactInputWriteRefusalOutcome::SourceRevalidationFailed, error, error_number);
+
+    const auto& identity = owner->input.identity();
+    current.credentials = std::to_string(identity.uid) + ":" + std::to_string(identity.gid);
+    if ((identity.mode & 07777u) != 0600u || current.credentials != owner->registered_mount.user ||
+        !full_container_id(owner->registered_sidecar.id))
+        return freeze_failure(
+            ExactInputWriteRefusalOutcome::ContainerIdentityFailed,
+            "source-owner DAC or immutable container credential evidence differed");
+
+    current.control.attempted = true;
+    current.control.command_argv = {"docker",
+                                    "exec",
+                                    "--env",
+                                    "LC_ALL=C",
+                                    "--user",
+                                    current.credentials,
+                                    owner->registered_sidecar.id,
+                                    "/usr/bin/dd",
+                                    "if=/dev/zero",
+                                    "of=/dev/null",
+                                    "bs=1",
+                                    "count=1",
+                                    "conv=notrunc",
+                                    "status=none"};
+    ExactReadCommandResult control;
+    (void)run_exact_read_command_until(
+        current.control.command_argv, 1u, current.final_deadline_nanoseconds, control);
+    copy_exact_read_result(control, current.control);
+    current.control.outcome = classify_exact_read(control, {});
+    current.control.terminal_frozen = true;
+    ExactInputWriteRefusalOutcome outcome = classify_write_control(control);
+    if (outcome != ExactInputWriteRefusalOutcome::Complete) {
+        std::ostringstream message;
+        message << "write-refusal positive control failed with outcome "
+                << static_cast<unsigned>(outcome);
+        return freeze_failure(outcome, message.str());
+    }
+
+    error.clear();
+    error_number = 0;
+    if (!capture_write_refusal_bracket(*owner,
+                                       ExactInputMountFailurePoint::WriteRefusalRejectMiddleBracket,
+                                       current.middle_bracket,
+                                       error,
+                                       error_number) ||
+        !exact_write_source_bracket_equal(current.initial_bracket, current.middle_bracket))
+        return freeze_failure(
+            ExactInputWriteRefusalOutcome::SourceRevalidationFailed,
+            error.empty() ? "source/mount identity changed after positive control" : error,
+            error_number);
+
+    current.target.attempted = true;
+    current.target.command_argv = {"docker",
+                                   "exec",
+                                   "--env",
+                                   "LC_ALL=C",
+                                   "--user",
+                                   current.credentials,
+                                   owner->registered_sidecar.id,
+                                   "/usr/bin/dd",
+                                   "if=/etc/nginx/nginx.conf",
+                                   "of=/etc/nginx/nginx.conf",
+                                   "bs=1",
+                                   "count=1",
+                                   "conv=notrunc",
+                                   "status=none"};
+    ExactReadCommandResult target;
+    (void)run_exact_read_command_until(
+        current.target.command_argv, 1u, current.final_deadline_nanoseconds, target);
+    copy_exact_read_result(target, current.target);
+    current.target.outcome = classify_exact_read(target, {});
+    current.target.terminal_frozen = true;
+    outcome = classify_write_target(target, current.expected_target_stderr);
+
+    if (owner->options.failure_point ==
+        ExactInputMountFailurePoint::WriteRefusalPostTargetSidecarDeath) {
+        std::string death_error;
+        if (!owner->fixture.terminate_sidecar_unexpectedly(death_error))
+            return freeze_failure(ExactInputWriteRefusalOutcome::ContainerIdentityFailed,
+                                  "post-target sidecar death injection failed: " + death_error);
+    }
+    error.clear();
+    error_number = 0;
+    const bool final_bracket_ok =
+        capture_write_refusal_bracket(*owner,
+                                      ExactInputMountFailurePoint::WriteRefusalRejectFinalBracket,
+                                      current.final_bracket,
+                                      error,
+                                      error_number);
+    if (outcome != ExactInputWriteRefusalOutcome::Complete) {
+        std::ostringstream message;
+        message << "write-refusal target failed with outcome " << static_cast<unsigned>(outcome);
+        return freeze_failure(outcome, message.str());
+    }
+    if (!final_bracket_ok ||
+        !exact_write_source_bracket_equal(current.initial_bracket, current.final_bracket))
+        return freeze_failure(
+            ExactInputWriteRefusalOutcome::SourceRevalidationFailed,
+            error.empty() ? "source/mount identity changed after refusal target" : error,
+            error_number);
+
+    current.outcome = ExactInputWriteRefusalOutcome::Complete;
+    current.terminal_frozen = true;
+    current.diagnostic = {};
+    owner->write_refusal_observation = current;
+    owner->write_refusal_diagnostic = {};
+    owner->state = ExactInputMountState::WriteRefusalObserved;
     owner->snapshot.state = owner->state;
     owner->receipt.state = owner->state;
     observation = current;

@@ -15,6 +15,8 @@ enum class ExactInputMountState : std::uint8_t {
     ReadyForObservation,
     ObservingInput,
     InputReadObserved,
+    ObservingWriteRefusal,
+    WriteRefusalObserved,
     Recovering,
     Settled,
     Unresolved,
@@ -49,6 +51,24 @@ enum class ExactInputReadLaunchStage : std::uint8_t {
     ExecStatusProtocol,
 };
 
+enum class ExactInputWriteRefusalOutcome : std::uint8_t {
+    None,
+    Complete,
+    SourceRevalidationFailed,
+    ContainerIdentityFailed,
+    CommandStartFailed,
+    DeadlineExceeded,
+    OutputLimitExceeded,
+    StreamError,
+    ExitSignaled,
+    ControlExitNonzero,
+    ControlOutputMismatch,
+    TargetUnexpectedSuccess,
+    TargetWrongExit,
+    TargetStdoutNotEmpty,
+    TargetStderrMismatch,
+};
+
 enum class ExactInputMountTerminalResult : std::uint8_t {
     None,
     SettledCleanly,
@@ -71,6 +91,7 @@ enum class ExactInputMountPhase : std::uint8_t {
     MountInspect,
     FileRevalidation,
     InputObservation,
+    WriteRefusalObservation,
     SidecarSettlement,
     TopologyRevalidation,
     InputSettlement,
@@ -110,6 +131,10 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     RejectNetworkASettlementOnce,
     InputReadRejectSourceRevalidation,
     InputReadPostCommandSidecarDeath,
+    WriteRefusalRejectInitialBracket,
+    WriteRefusalRejectMiddleBracket,
+    WriteRefusalRejectFinalBracket,
+    WriteRefusalPostTargetSidecarDeath,
 };
 
 struct ExactInputMountOptions {
@@ -214,6 +239,45 @@ struct ExactInputReadObservation {
     ExactInputMountDiagnostic diagnostic;
 };
 
+struct ExactInputWriteSourceBracket {
+    bool source_revalidated = false;
+    bool source_bytes_revalidated = false;
+    bool retained_ofd_revalidated = false;
+    bool container_identity_revalidated = false;
+    bool mount_revalidated = false;
+    bool proc_credentials_revalidated = false;
+    bool registered_identity_matched = false;
+    bool registered_mount_matched = false;
+    std::string source_path;
+    std::uint64_t source_device = 0;
+    std::uint64_t source_inode = 0;
+    std::uint64_t source_mode = 0;
+    std::uint64_t source_uid = 0;
+    std::uint64_t source_gid = 0;
+    std::uint64_t source_size = 0;
+    std::uint64_t source_links = 0;
+    std::int64_t source_mtime_seconds = 0;
+    std::int64_t source_mtime_nanoseconds = 0;
+    std::int64_t source_ctime_seconds = 0;
+    std::int64_t source_ctime_nanoseconds = 0;
+};
+
+struct ExactInputWriteRefusalObservation {
+    ExactInputWriteRefusalOutcome outcome = ExactInputWriteRefusalOutcome::None;
+    bool attempted = false;
+    bool terminal_frozen = false;
+    bool caller_deadline_recorded = false;
+    std::int64_t final_deadline_nanoseconds = 0;
+    std::string credentials;
+    std::string expected_target_stderr;
+    ExactInputWriteSourceBracket initial_bracket;
+    ExactInputWriteSourceBracket middle_bracket;
+    ExactInputWriteSourceBracket final_bracket;
+    ExactInputReadObservation control;
+    ExactInputReadObservation target;
+    ExactInputMountDiagnostic diagnostic;
+};
+
 enum class ExactInputReadRunnerTestCase : std::uint8_t {
     CommandStartFailure,
     ImmediateExecSuccess,
@@ -295,9 +359,12 @@ struct ExactInputMountRecoveryReceipt {
 // mutate fixture state and exists to prove that a never-started controller and
 // a frozen terminal replay issue no external commands.
 std::uint64_t exact_input_mount_test_command_count();
+std::uint64_t exact_input_mount_test_observation_command_count();
 bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
                                              ExactInputReadObservation& observation,
                                              ExactInputMountDiagnostic& diagnostic);
+bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_rejections,
+                                                      ExactInputMountDiagnostic& diagnostic);
 
 class ExactInputMountRecoveryController;
 
@@ -339,6 +406,9 @@ public:
     bool observe_input_read(const ExactInputMountHandle& handle,
                             ExactInputReadObservation& observation,
                             ExactInputMountDiagnostic& diagnostic);
+    bool observe_input_write_refusal(const ExactInputMountHandle& handle,
+                                     ExactInputWriteRefusalObservation& observation,
+                                     ExactInputMountDiagnostic& diagnostic);
     bool finish(ExactInputMountHandle& handle,
                 ExactInputMountRecoveryReceipt& receipt,
                 ExactInputMountDiagnostic& diagnostic);
