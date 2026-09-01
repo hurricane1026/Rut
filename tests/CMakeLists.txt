@@ -834,6 +834,7 @@ if(RUT_ENABLE_JIT)
     target_link_libraries(test_ipv4_fixture_topology PRIVATE
         fixture_exact_input_file_lease
         fixture_private_directory_lease
+        fixture_privileged_listener
     )
     target_compile_definitions(test_ipv4_fixture_topology PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
@@ -886,6 +887,7 @@ if(RUT_ENABLE_JIT)
     target_link_libraries(test_fixture_exact_input_mount_owner PRIVATE
         fixture_exact_input_file_lease
         fixture_private_directory_lease
+        fixture_privileged_listener
         Threads::Threads
     )
     target_compile_definitions(test_fixture_exact_input_mount_owner PRIVATE

@@ -3,8 +3,10 @@
 #include "fixture_exact_input_file_lease.h"
 #include "fixture_exact_input_mount_owner.h"
 #include "fixture_private_directory_lease.h"
+#include "fixture_privileged_listener.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -54,6 +56,8 @@ using u64 = std::uint64_t;
 constexpr const char* kStageLabel = "rut.stage=358-stage2a2";
 constexpr const char* kSidecarStage = "358-held-namespace-sidecar";
 constexpr const char* kSidecarRole = "held-namespace-sidecar";
+constexpr const char* kNginxStage = "358-nginx-lifecycle";
+constexpr const char* kNginxRole = "nginx-pid1-sibling";
 
 static const char* sidecar_revalidation_fault_name(HeldNamespaceSidecarRevalidationFault fault) {
     switch (fault) {
@@ -169,6 +173,19 @@ static void require_group_gone(pid_t pgid, const char* reason) {
 // replay does not issue another external command.
 static u64 command_invocation_count = 0;
 static u64 observation_command_invocation_count = 0;
+static std::int64_t command_deadline_cap_ns = 0;
+
+class CommandDeadlineScope {
+public:
+    explicit CommandDeadlineScope(std::int64_t deadline_ns) : previous_(command_deadline_cap_ns) {
+        command_deadline_cap_ns = deadline_ns;
+    }
+    ~CommandDeadlineScope() { command_deadline_cap_ns = previous_; }
+    void set(std::int64_t deadline_ns) { command_deadline_cap_ns = deadline_ns; }
+
+private:
+    std::int64_t previous_ = 0;
+};
 
 static bool run_command(const std::vector<std::string>& arguments,
                         CommandResult& result,
@@ -178,6 +195,18 @@ static bool run_command(const std::vector<std::string>& arguments,
                         DescendantProbe* descendant_probe = nullptr,
                         size_t output_limit = 65536) {
     ++command_invocation_count;
+    if (command_deadline_cap_ns > 0) {
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+        if (now >= command_deadline_cap_ns) {
+            result = {};
+            result.timed_out = true;
+            return false;
+        }
+        const std::int64_t remaining_ms = (command_deadline_cap_ns - now + 999999LL) / 1000000LL;
+        timeout_ms = static_cast<int>(std::min<std::int64_t>(timeout_ms, remaining_ms));
+    }
     result = {};
     if (arguments.empty()) return false;
     int pipe_fds[2] = {-1, -1};
@@ -4218,6 +4247,364 @@ static bool inspect_exact_mount(Fixture& fixture,
                                          error);
 }
 
+struct NginxSiblingLease {
+    std::string name;
+    std::string id;
+    std::string cgroup_path;
+    pid_t master_pid = -1;
+    pid_t worker_pid = -1;
+    int master_pidfd = -1;
+    int worker_pidfd = -1;
+    bool mutation_may_have_occurred = false;
+    bool exists = false;
+    bool running = false;
+    bool operation_failed = false;
+};
+
+static int remaining_command_ms(std::int64_t limit_ns) {
+    const std::int64_t now = exact_read_monotonic_ns();
+    if (now <= 0 || now >= limit_ns) return 0;
+    const std::int64_t remaining = limit_ns - now;
+    const std::int64_t rounded = (remaining + 999999LL) / 1000000LL;
+    return static_cast<int>(std::min<std::int64_t>(rounded, 30000LL));
+}
+
+static bool run_command_before(const std::vector<std::string>& argv,
+                               std::int64_t limit_ns,
+                               CommandResult& result,
+                               bool reported_timeout = false,
+                               size_t output_limit = 65536u) {
+    const int timeout_ms = remaining_command_ms(limit_ns);
+    if (timeout_ms <= 0) {
+        result = {};
+        result.timed_out = true;
+        return false;
+    }
+    return run_command(argv, result, timeout_ms, reported_timeout, false, nullptr, output_limit);
+}
+
+static bool parse_positive_pid(const std::string& text, pid_t& pid) {
+    char* end = nullptr;
+    errno = 0;
+    const long value = strtol(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0' || value <= 1 ||
+        value > std::numeric_limits<pid_t>::max())
+        return false;
+    pid = static_cast<pid_t>(value);
+    return true;
+}
+
+static bool proc_status_scalar(pid_t pid, const char* wanted, std::int64_t& value) {
+    std::string status;
+    if (!read_file("/proc/" + std::to_string(pid) + "/status", status)) return false;
+    std::istringstream lines(status);
+    std::string line;
+    std::size_t matches = 0u;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string label;
+        long long parsed = 0;
+        if ((fields >> label >> parsed) && label == wanted) {
+            value = parsed;
+            ++matches;
+        }
+    }
+    return matches == 1u;
+}
+
+static bool proc_nspid_ends_one(pid_t pid) {
+    std::string status;
+    if (!read_file("/proc/" + std::to_string(pid) + "/status", status)) return false;
+    std::istringstream lines(status);
+    std::string line;
+    std::size_t matches = 0u;
+    bool exact = false;
+    while (std::getline(lines, line)) {
+        if (line.rfind("NSpid:", 0u) != 0u) continue;
+        ++matches;
+        std::istringstream values(line.substr(6u));
+        long long value = 0;
+        long long last = 0;
+        std::size_t count = 0u;
+        while (values >> value) {
+            last = value;
+            ++count;
+        }
+        exact = count >= 2u && last == 1;
+    }
+    return matches == 1u && exact;
+}
+
+static bool read_unified_cgroup(pid_t pid, std::string& path) {
+    std::string value;
+    if (!read_file("/proc/" + std::to_string(pid) + "/cgroup", value)) return false;
+    std::istringstream lines(value);
+    std::string line;
+    std::size_t count = 0u;
+    while (std::getline(lines, line)) {
+        if (line.rfind("0::/", 0u) != 0u || line.find('\0') != std::string::npos) return false;
+        path = line.substr(3u);
+        ++count;
+    }
+    return count == 1u && !path.empty() && path[0] == '/' && path.find("..") == std::string::npos;
+}
+
+static bool unified_cgroup_preflight() {
+    std::string self_path;
+    std::string controllers;
+    return read_unified_cgroup(getpid(), self_path) &&
+           read_file("/sys/fs/cgroup/cgroup.controllers", controllers) && !controllers.empty();
+}
+
+static bool exact_cgroup_members(const std::string& path,
+                                 pid_t expected_master,
+                                 pid_t& worker,
+                                 std::string& error) {
+    std::string contents;
+    if (!read_file("/sys/fs/cgroup" + path + "/cgroup.procs", contents)) {
+        error = "unified cgroup membership is unavailable";
+        return false;
+    }
+    std::istringstream lines(contents);
+    std::string line;
+    std::vector<pid_t> members;
+    while (std::getline(lines, line)) {
+        pid_t parsed = -1;
+        if (!parse_positive_pid(line, parsed) ||
+            std::find(members.begin(), members.end(), parsed) != members.end()) {
+            error = "cgroup.procs was malformed or duplicated";
+            return false;
+        }
+        members.push_back(parsed);
+    }
+    if (members.size() != 2u ||
+        std::find(members.begin(), members.end(), expected_master) == members.end()) {
+        error = "nginx cgroup membership was not exactly master plus one worker";
+        return false;
+    }
+    worker = members[0] == expected_master ? members[1] : members[0];
+    std::int64_t ppid = 0;
+    if (!proc_status_scalar(worker, "PPid:", ppid) || ppid != expected_master) {
+        error = "nginx worker was not the direct child of the master";
+        return false;
+    }
+    return true;
+}
+
+static bool same_proc_namespace(pid_t left, pid_t right, const char* name) {
+    struct stat a{};
+    struct stat b{};
+    return stat(("/proc/" + std::to_string(left) + "/ns/" + name).c_str(), &a) == 0 &&
+           stat(("/proc/" + std::to_string(right) + "/ns/" + name).c_str(), &b) == 0 &&
+           a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+static bool distinct_proc_namespace(pid_t left, pid_t right, const char* name) {
+    struct stat a{};
+    struct stat b{};
+    return stat(("/proc/" + std::to_string(left) + "/ns/" + name).c_str(), &a) == 0 &&
+           stat(("/proc/" + std::to_string(right) + "/ns/" + name).c_str(), &b) == 0 &&
+           (a.st_dev != b.st_dev || a.st_ino != b.st_ino);
+}
+
+static bool same_proc_executable(pid_t left, pid_t right) {
+    struct stat a{};
+    struct stat b{};
+    return stat(("/proc/" + std::to_string(left) + "/exe").c_str(), &a) == 0 &&
+           stat(("/proc/" + std::to_string(right) + "/exe").c_str(), &b) == 0 &&
+           a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+static bool proc_executable_is_nginx(pid_t pid) {
+    struct stat running{};
+    struct stat image{};
+    return stat(("/proc/" + std::to_string(pid) + "/exe").c_str(), &running) == 0 &&
+           stat(("/proc/" + std::to_string(pid) + "/root/usr/sbin/nginx").c_str(), &image) == 0 &&
+           running.st_dev == image.st_dev && running.st_ino == image.st_ino;
+}
+
+static bool proc_socket_inodes(pid_t pid, std::vector<std::uint64_t>& inodes) {
+    const std::string directory = "/proc/" + std::to_string(pid) + "/fd";
+    DIR* opened = opendir(directory.c_str());
+    if (opened == nullptr) return false;
+    bool ok = true;
+    while (dirent* entry = readdir(opened)) {
+        if (entry->d_name[0] == '.') continue;
+        const std::string path = directory + "/" + entry->d_name;
+        std::array<char, 256> target{};
+        const ssize_t size = readlink(path.c_str(), target.data(), target.size() - 1u);
+        if (size < 0) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            break;
+        }
+        target[static_cast<std::size_t>(size)] = '\0';
+        const std::string value(target.data());
+        if (value.rfind("socket:[", 0u) != 0u || value.back() != ']') continue;
+        const std::string number = value.substr(8u, value.size() - 9u);
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long inode = strtoull(number.c_str(), &end, 10);
+        if (errno != 0 || end == number.c_str() || *end != '\0' || inode == 0u) {
+            ok = false;
+            break;
+        }
+        if (std::find(inodes.begin(), inodes.end(), inode) == inodes.end()) inodes.push_back(inode);
+    }
+    closedir(opened);
+    return ok;
+}
+
+static bool strict_tcp6_port_absent(const std::string& contents, u16 port) {
+    if (contents.empty() || contents.size() > fixture_privileged_listener::kMaxProcBytes ||
+        contents.back() != '\n' || contents.find('\0') != std::string::npos)
+        return false;
+    std::istringstream lines(contents);
+    std::string line;
+    if (!std::getline(lines, line) || line.find("local_address") == std::string::npos ||
+        line.find("inode") == std::string::npos)
+        return false;
+    std::size_t rows = 0u;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string slot, local;
+        if (!(fields >> slot >> local) || ++rows > fixture_privileged_listener::kMaxProcRows)
+            return false;
+        const size_t colon = local.find(':');
+        if (colon != 32u || local.size() != 37u) return false;
+        for (size_t index = 0u; index < 32u; ++index)
+            if (!std::isxdigit(static_cast<unsigned char>(local[index]))) return false;
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long selected = strtoul(local.c_str() + 33u, &end, 16);
+        if (errno != 0 || end != local.c_str() + 37u || selected > 0xffffu) return false;
+        if (selected == port) return false;
+    }
+    return true;
+}
+
+static bool nginx_samples_stable(const ExactInputNginxProcessSample& first,
+                                 const ExactInputNginxProcessSample& second) {
+    return first.complete && second.complete &&
+           second.monotonic_nanoseconds - first.monotonic_nanoseconds >= 250000000LL &&
+           first.master_pid == second.master_pid && first.worker_pid == second.worker_pid &&
+           first.master_start == second.master_start && first.worker_start == second.worker_start &&
+           first.listener_inode != 0u && first.listener_inode == second.listener_inode;
+}
+
+static bool nginx_graceful_cleanup_complete(const ExactInputNginxLifecycleObservation& value) {
+    return !value.operation_failed && value.quit_attempted && value.quit_only &&
+           value.stopped_exit_zero && value.cgroup_empty_after_stop && value.removed_nonforce &&
+           value.exact_absence;
+}
+
+static bool mountinfo_entry(pid_t pid,
+                            const std::string& destination,
+                            std::uint64_t& mount_id,
+                            bool& read_only,
+                            bool& tmpfs) {
+    std::string contents;
+    if (!read_file("/proc/" + std::to_string(pid) + "/mountinfo", contents)) return false;
+    std::istringstream lines(contents);
+    std::string line;
+    std::size_t matches = 0u;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string id, parent, device, root, point, options, token;
+        if (!(fields >> id >> parent >> device >> root >> point >> options)) return false;
+        bool separator = false;
+        std::string filesystem;
+        while (fields >> token) {
+            if (token == "-") {
+                separator = true;
+                if (!(fields >> filesystem)) return false;
+                break;
+            }
+        }
+        if (!separator || point != destination) continue;
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = strtoull(id.c_str(), &end, 10);
+        if (errno != 0 || end == id.c_str() || *end != '\0' || parsed == 0u) return false;
+        mount_id = parsed;
+        read_only = options == "ro" || options.rfind("ro,", 0u) == 0u ||
+                    options.find(",ro,") != std::string::npos ||
+                    (options.size() > 3u && options.compare(options.size() - 3u, 3u, ",ro") == 0);
+        tmpfs = filesystem == "tmpfs";
+        ++matches;
+    }
+    return matches == 1u;
+}
+
+static bool exact_nginx_create_argv(const std::vector<std::string>& argv,
+                                    const std::string& name,
+                                    const std::string& token,
+                                    const std::string& holder_id,
+                                    const std::string& source,
+                                    const std::string& credentials) {
+    const std::string mount = "type=bind,src=" + source + ",dst=" + kExactInputMountDestination +
+                              ",readonly,bind-propagation=rprivate";
+    const std::string global =
+        "daemon off; master_process on; worker_processes 1; pid /tmp/rut-" + token + "-nginx.pid;";
+    const std::vector<std::string> expected = {
+        "docker",
+        "create",
+        "--pull=never",
+        "--name",
+        name,
+        "--label",
+        std::string("rut.stage=") + kNginxStage,
+        "--label",
+        "rut.token=" + token,
+        "--label",
+        std::string("rut.role=") + kNginxRole,
+        "--network",
+        "container:" + holder_id,
+        "--user",
+        credentials,
+        "--workdir",
+        "/",
+        "--env",
+        "LC_ALL=C",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--restart",
+        "no",
+        "--stop-signal",
+        "SIGQUIT",
+        "--mount",
+        mount,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=" +
+            credentials.substr(0u, credentials.find(':')) +
+            ",gid=" + credentials.substr(credentials.find(':') + 1u),
+        "--tmpfs",
+        "/var/cache/nginx:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=" +
+            credentials.substr(0u, credentials.find(':')) +
+            ",gid=" + credentials.substr(credentials.find(':') + 1u),
+        "--tmpfs",
+        "/var/log/nginx:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=" +
+            credentials.substr(0u, credentials.find(':')) +
+            ",gid=" + credentials.substr(credentials.find(':') + 1u),
+        "--entrypoint",
+        "/usr/sbin/nginx",
+        RUT_PINNED_NGINX_IMAGE,
+        "-c",
+        kExactInputMountDestination,
+        "-e",
+        "stderr",
+        "-g",
+        global};
+    return argv == expected && std::find(argv.begin(), argv.end(), "--rm") == argv.end() &&
+           std::find(argv.begin(), argv.end(), "--privileged") == argv.end() &&
+           std::find(argv.begin(), argv.end(), "-p") == argv.end() &&
+           std::find(argv.begin(), argv.end(), "--publish") == argv.end() &&
+           std::find(argv.begin(), argv.end(), "-v") == argv.end();
+}
+
 struct ExactInputMountOwner {
     explicit ExactInputMountOwner(std::string token_value, std::string bytes_value)
         : bytes(std::move(bytes_value)), fixture(std::move(token_value)) {
@@ -4247,6 +4634,9 @@ struct ExactInputMountOwner {
     ExactInputMountDiagnostic read_diagnostic;
     ExactInputWriteRefusalObservation write_refusal_observation;
     ExactInputMountDiagnostic write_refusal_diagnostic;
+    ExactInputNginxLifecycleObservation nginx_lifecycle_observation;
+    ExactInputMountDiagnostic nginx_lifecycle_diagnostic;
+    NginxSiblingLease nginx_sibling;
     std::vector<std::string> sidecar_argv;
     HeldNamespaceSidecarSnapshot registered_sidecar;
     ParsedMountInspect registered_mount;
@@ -4263,8 +4653,393 @@ struct ExactInputMountOwner {
     bool operation_failed = false;
     bool read_attempted = false;
     bool write_refusal_attempted = false;
+    bool nginx_lifecycle_attempted = false;
+    bool nginx_unresolved_fault_consumed = false;
     HeldTopologySnapshot builder_baseline;
 };
+
+struct NginxInspectEvidence {
+    std::string id;
+    pid_t pid = -1;
+    int exit_code = -1;
+    bool running = false;
+};
+
+static bool topology_snapshot_equal(const HeldTopologySnapshot& left,
+                                    const HeldTopologySnapshot& right);
+
+static bool contains_exact_json_string(const std::string& json, const std::string& value) {
+    const std::string needle = "\"" + value + "\"";
+    const size_t first = json.find(needle);
+    return first != std::string::npos &&
+           json.find(needle, first + needle.size()) == std::string::npos;
+}
+
+static bool tmpfs_option_exact_enough(const std::string& options,
+                                      const std::string& uid,
+                                      const std::string& gid,
+                                      const char* size) {
+    const std::array<std::string, 8> required{"rw",
+                                              "noexec",
+                                              "nosuid",
+                                              "nodev",
+                                              std::string("size=") + size,
+                                              "mode=0700",
+                                              "uid=" + uid,
+                                              "gid=" + gid};
+    for (const std::string& token : required)
+        if (options.find(token) == std::string::npos) return false;
+    return true;
+}
+
+static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
+                                  NginxInspectEvidence& evidence,
+                                  std::string& error,
+                                  std::int64_t deadline_ns) {
+    const std::string target =
+        owner.nginx_sibling.id.empty() ? owner.nginx_sibling.name : owner.nginx_sibling.id;
+    const std::string format =
+        "{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.Image}}|{{index .Config.Labels \"rut.stage\"}}|"
+        "{{index .Config.Labels \"rut.token\"}}|{{index .Config.Labels \"rut.role\"}}|"
+        "{{.HostConfig.NetworkMode}}|{{.Config.User}}|{{.Config.WorkingDir}}|{{json .Config.Env}}|"
+        "{{.Path}}|{{json .Args}}|{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|"
+        "{{json .HostConfig.SecurityOpt}}|{{json .HostConfig.PortBindings}}|"
+        "{{json .Config.ExposedPorts}}|{{json .NetworkSettings.Ports}}|"
+        "{{.HostConfig.RestartPolicy.Name}}|{{.Config.StopSignal}}|"
+        "{{index .HostConfig.Tmpfs \"/tmp\"}}|{{index .HostConfig.Tmpfs \"/var/cache/nginx\"}}|"
+        "{{index .HostConfig.Tmpfs \"/var/log/nginx\"}}|{{.State.Running}}|{{.State.Pid}}|"
+        "{{.State.ExitCode}}|{{len .HostConfig.Mounts}}|{{range .HostConfig.Mounts}}"
+        "{{.Type}}#{{.Source}}#{{.Target}}#{{.ReadOnly}}#{{.BindOptions.Propagation}};{{end}}|"
+        "{{len .Mounts}}|{{range .Mounts}}{{.Type}}#{{.Source}}#{{.Destination}}#{{.RW}}#"
+        "{{.Propagation}};{{end}}|{{.HostConfig.Privileged}}|{{.Config.Tty}}|"
+        "{{.Config.OpenStdin}}|{{.Config.AttachStdin}}|{{json .HostConfig.CapAdd}}";
+    CommandResult result;
+    if (!run_command_before({"docker", "inspect", "-f", format, target}, deadline_ns, result) ||
+        !exited_zero(result)) {
+        error = "nginx sibling inspection failed: " + trim(result.output);
+        return false;
+    }
+    std::vector<std::string> fields;
+    if (!split_exact(trim(result.output), '|', 36u, fields)) {
+        error = "nginx sibling inspection record was malformed";
+        return false;
+    }
+    bool running = false;
+    pid_t pid = -1;
+    char* exit_end = nullptr;
+    errno = 0;
+    const long exit_code = strtol(fields[26].c_str(), &exit_end, 10);
+    const auto& identity = owner.input.identity();
+    const std::string uid = std::to_string(identity.uid);
+    const std::string gid = std::to_string(identity.gid);
+    const std::string credentials = uid + ":" + gid;
+    const std::string expected_args =
+        "[\"-c\",\"/etc/nginx/nginx.conf\",\"-e\",\"stderr\",\"-g\",\"daemon off; "
+        "master_process on; worker_processes 1; pid /tmp/rut-" +
+        owner.fixture.token() + "-nginx.pid;\"]";
+    const std::string requested =
+        "bind#" + owner.input.path() + "#" + kExactInputMountDestination + "#true#rprivate;";
+    const std::string realized_prefix =
+        "bind#" + owner.input.path() + "#" + kExactInputMountDestination + "#false#rprivate;";
+    if (!parse_exact_bool(fields[24], running) ||
+        (running && !parse_positive_pid(fields[25], pid)) || (!running && fields[25] != "0") ||
+        errno != 0 || exit_end == fields[26].c_str() || *exit_end != '\0' || exit_code < 0 ||
+        fields[0].size() != 64u || !full_container_id(fields[0]) ||
+        fields[1] != "/" + owner.nginx_sibling.name ||
+        (!owner.nginx_sibling.id.empty() && fields[0] != owner.nginx_sibling.id) ||
+        fields[2] != RUT_PINNED_NGINX_IMAGE || fields[3] != owner.registered_sidecar.image_id ||
+        fields[4] != kNginxStage || fields[5] != owner.fixture.token() || fields[6] != kNginxRole ||
+        fields[7] != "container:" + owner.fixture.holder_id() || fields[8] != credentials ||
+        fields[9] != "/" || !contains_exact_json_string(fields[10], "LC_ALL=C") ||
+        fields[11] != "/usr/sbin/nginx" || fields[12] != expected_args || fields[13] != "true" ||
+        fields[14] != "[\"ALL\"]" || fields[15] != "[\"no-new-privileges\"]" ||
+        !no_published_ports(fields[16], fields[18]) || fields[17] == "null" || fields[19] != "no" ||
+        fields[20] != "SIGQUIT" || !tmpfs_option_exact_enough(fields[21], uid, gid, "1m") ||
+        !tmpfs_option_exact_enough(fields[22], uid, gid, "4m") ||
+        !tmpfs_option_exact_enough(fields[23], uid, gid, "4m") || fields[27] != "1" ||
+        fields[28] != requested || fields[29] != "1" || fields[30] != realized_prefix ||
+        fields[31] != "false" || fields[32] != "false" || fields[33] != "false" ||
+        fields[34] != "false" || fields[35] != "null") {
+        error = "nginx sibling immutable/security/mount/tmpfs identity was not exact";
+        return false;
+    }
+    evidence.id = fields[0];
+    evidence.running = running;
+    evidence.pid = pid;
+    evidence.exit_code = static_cast<int>(exit_code);
+    return true;
+}
+
+static bool nginx_live_mounts_exact(ExactInputMountOwner& owner,
+                                    pid_t master,
+                                    bool& same_mount_instance,
+                                    std::string& error) {
+    const auto& identity = owner.input.identity();
+    struct stat source{};
+    struct stat mounted{};
+    if (fstat(owner.input.descriptor(), &source) != 0 ||
+        stat(("/proc/" + std::to_string(master) + "/root" + kExactInputMountDestination).c_str(),
+             &mounted) != 0 ||
+        source.st_dev != mounted.st_dev || source.st_ino != mounted.st_ino ||
+        mounted.st_uid != identity.uid || mounted.st_gid != identity.gid) {
+        error = "live nginx bind did not retain the exact source inode/credentials";
+        return false;
+    }
+    std::uint64_t nginx_mount_id = 0u;
+    std::uint64_t sidecar_mount_id = 0u;
+    bool nginx_ro = false, sidecar_ro = false, nginx_tmp = false, sidecar_tmp = false;
+    const bool nginx_mount =
+        mountinfo_entry(master, kExactInputMountDestination, nginx_mount_id, nginx_ro, nginx_tmp);
+    const bool sidecar_mount = mountinfo_entry(owner.registered_sidecar.pid,
+                                               kExactInputMountDestination,
+                                               sidecar_mount_id,
+                                               sidecar_ro,
+                                               sidecar_tmp);
+    if (!nginx_mount || !sidecar_mount || !nginx_ro || !sidecar_ro) {
+        std::ostringstream detail;
+        detail << "live nginx/sidecar bind mount evidence was not exact and read-only: nginx="
+               << nginx_mount << "/" << nginx_ro << "/" << nginx_tmp << "/" << nginx_mount_id
+               << " sidecar=" << sidecar_mount << "/" << sidecar_ro << "/" << sidecar_tmp << "/"
+               << sidecar_mount_id;
+        error = detail.str();
+        return false;
+    }
+    // Mount IDs are scoped to a mount namespace and can numerically collide.
+    // A shared instance requires both the same namespace and the same local ID.
+    if (!distinct_proc_namespace(master, owner.registered_sidecar.pid, "mnt")) {
+        error = "nginx sibling did not own an independently verified mount namespace";
+        return false;
+    }
+    same_mount_instance = false;
+    if (same_mount_instance) {
+        error = "nginx sibling unexpectedly shared the sidecar mount instance";
+        return false;
+    }
+    for (const char* destination_text : {"/tmp", "/var/cache/nginx", "/var/log/nginx"}) {
+        const std::string destination(destination_text);
+        std::uint64_t id = 0u;
+        bool ro = false;
+        bool tmpfs = false;
+        struct stat status{};
+        if (!mountinfo_entry(master, destination, id, ro, tmpfs) || ro || !tmpfs ||
+            stat(("/proc/" + std::to_string(master) + "/root" + destination).c_str(), &status) !=
+                0 ||
+            status.st_uid != identity.uid || status.st_gid != identity.gid ||
+            (status.st_mode & 0777u) != 0700u) {
+            error = "live nginx tmpfs ownership/mode/type was not exact";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool capture_nginx_sample(ExactInputMountOwner& owner,
+                                 ExactInputNginxProcessSample& sample,
+                                 std::int64_t deadline_ns,
+                                 bool first,
+                                 std::string& error) {
+    sample = {};
+    sample.monotonic_nanoseconds = exact_read_monotonic_ns();
+    if (sample.monotonic_nanoseconds <= 0 || sample.monotonic_nanoseconds >= deadline_ns) {
+        error = "nginx process sample exceeded its phase deadline";
+        return false;
+    }
+    fixture_exact_input_file_lease::Diagnostic source_diagnostic;
+    if (!owner.input.revalidate(source_diagnostic)) {
+        error = "exact input source/OFD changed during nginx sample";
+        return false;
+    }
+    sample.source_revalidated = true;
+    if (!owner.fixture.verify_topology(FailurePoint::None, error) ||
+        !topology_snapshot_equal(owner.builder_baseline,
+                                 owner.fixture.current_topology_snapshot())) {
+        if (error.empty()) error = "nginx sample topology changed";
+        return false;
+    }
+    sample.topology_verified = true;
+    NginxInspectEvidence inspect;
+    if (!inspect_nginx_sibling(owner, inspect, error, deadline_ns) || !inspect.running)
+        return false;
+    sample.container_identity_verified = true;
+    sample.master_pid = inspect.pid;
+    ProcIdentity master{};
+    if (!proc_identity(inspect.pid, master) ||
+        master.netns != owner.builder_baseline.holder_netns ||
+        !proc_credentials_exact(
+            inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
+        !proc_nspid_ends_one(inspect.pid)) {
+        error = "nginx master PID/start/credentials/netns/NSpid evidence was not exact";
+        return false;
+    }
+    sample.master_start = master.start;
+    std::string cgroup;
+    pid_t worker = -1;
+    if (!read_unified_cgroup(inspect.pid, cgroup) ||
+        cgroup.find(owner.nginx_sibling.id) == std::string::npos ||
+        !exact_cgroup_members(cgroup, inspect.pid, worker, error)) {
+        if (error.empty()) error = "unified cgroup proof is unsupported";
+        return false;
+    }
+    sample.cgroup_exact = true;
+    sample.worker_pid = worker;
+    ProcIdentity worker_identity{};
+    std::string worker_cgroup;
+    if (!proc_identity(worker, worker_identity) || worker_identity.netns != master.netns ||
+        !proc_credentials_exact(worker, owner.input.identity().uid, owner.input.identity().gid) ||
+        !read_unified_cgroup(worker, worker_cgroup) || worker_cgroup != cgroup ||
+        !same_proc_namespace(inspect.pid, worker, "pid") ||
+        !same_proc_namespace(inspect.pid, worker, "mnt") ||
+        !same_proc_namespace(inspect.pid, worker, "net") ||
+        !same_proc_executable(inspect.pid, worker) || !proc_executable_is_nginx(inspect.pid)) {
+        error = "nginx worker executable/credential/cgroup/namespace identity was not exact";
+        return false;
+    }
+    sample.worker_start = worker_identity.start;
+    if (first) {
+#ifdef SYS_pidfd_open
+        owner.nginx_sibling.master_pidfd =
+            static_cast<int>(syscall(SYS_pidfd_open, inspect.pid, 0u));
+        owner.nginx_sibling.worker_pidfd = static_cast<int>(syscall(SYS_pidfd_open, worker, 0u));
+#else
+        errno = ENOSYS;
+#endif
+        if (owner.nginx_sibling.master_pidfd < 0 || owner.nginx_sibling.worker_pidfd < 0 ||
+            !pidfd_targets_exact_pid(owner.nginx_sibling.master_pidfd, inspect.pid) ||
+            !pidfd_targets_exact_pid(owner.nginx_sibling.worker_pidfd, worker)) {
+            error = "nginx master/worker pidfd identity proof is unavailable";
+            return false;
+        }
+        owner.nginx_sibling.master_pid = inspect.pid;
+        owner.nginx_sibling.worker_pid = worker;
+        owner.nginx_sibling.cgroup_path = cgroup;
+    } else if (owner.nginx_sibling.master_pid != inspect.pid ||
+               owner.nginx_sibling.worker_pid != worker ||
+               !pidfd_targets_exact_pid(owner.nginx_sibling.master_pidfd, inspect.pid) ||
+               !pidfd_targets_exact_pid(owner.nginx_sibling.worker_pidfd, worker) ||
+               owner.nginx_sibling.cgroup_path != cgroup) {
+        error = "nginx pidfd/process-set identity drifted between samples";
+        return false;
+    }
+    bool same_mount = true;
+    if (!nginx_live_mounts_exact(owner, inspect.pid, same_mount, error)) return false;
+    sample.mount_verified = true;
+    const std::string pidfile = "/proc/" + std::to_string(inspect.pid) + "/root/tmp/rut-" +
+                                owner.fixture.token() + "-nginx.pid";
+    std::string pid_bytes;
+    if (!read_file(pidfile, pid_bytes) || pid_bytes != "1\n") {
+        error = "nginx pidfile did not contain exact container PID 1";
+        return false;
+    }
+    sample.pidfile_exact = true;
+    std::vector<std::uint64_t> sockets;
+    if (!proc_socket_inodes(inspect.pid, sockets) || !proc_socket_inodes(worker, sockets)) {
+        error = "nginx process socket ownership scan failed";
+        return false;
+    }
+    std::string tcp;
+    std::string tcp6;
+    if (!read_file("/proc/" + std::to_string(inspect.pid) + "/net/tcp", tcp) ||
+        !read_file("/proc/" + std::to_string(inspect.pid) + "/net/tcp6", tcp6)) {
+        error = "nginx namespace TCP/TCP6 tables were unavailable";
+        return false;
+    }
+    u32 positive = 0u, guard = 0u;
+    fixture_privileged_listener::ProcTcpTable table;
+    fixture_privileged_listener::Diagnostic parser_diagnostic;
+    fixture_privileged_listener::ListenerEvidence listener;
+    if (!parse_ipv4(owner.builder_baseline.positive_ip, positive) ||
+        !parse_ipv4(owner.builder_baseline.guard_ip, guard) ||
+        !fixture_privileged_listener::parse_proc_net_tcp(tcp, table, parser_diagnostic)) {
+        error = "nginx TCP table or listener plan was rejected";
+        return false;
+    }
+    std::vector<std::uint64_t> selected_owned;
+    for (std::size_t index = 0u; index < table.count; ++index) {
+        const auto& row = table.rows[index];
+        if (row.local_port == kExactInputTopologyBuilderPort && row.state == 0x0au &&
+            std::find(sockets.begin(), sockets.end(), row.inode) != sockets.end() &&
+            std::find(selected_owned.begin(), selected_owned.end(), row.inode) ==
+                selected_owned.end())
+            selected_owned.push_back(row.inode);
+    }
+    if (!fixture_privileged_listener::classify_listener_evidence(
+            table,
+            fixture_privileged_listener::ListenerPlan{
+                positive, guard, kExactInputTopologyBuilderPort},
+            selected_owned,
+            fixture_privileged_listener::ListenerEvidenceKind::ExactPositive,
+            listener,
+            parser_diagnostic) ||
+        listener.child_owned_inode == 0u ||
+        !strict_tcp6_port_absent(tcp6, kExactInputTopologyBuilderPort)) {
+        error = "nginx exact IPv4 listener/TCP6 absence evidence was rejected";
+        return false;
+    }
+    sample.tcp_exact = true;
+    sample.tcp6_port_absent = true;
+    sample.listener_inode = listener.child_owned_inode;
+    sample.complete = true;
+    return true;
+}
+
+static bool nginx_sibling_absent(ExactInputMountOwner& owner,
+                                 std::int64_t deadline_ns,
+                                 std::string& error) {
+    CommandResult result;
+    if (!owner.nginx_sibling.id.empty()) {
+        if (!run_command_before(
+                {"docker", "inspect", owner.nginx_sibling.id}, deadline_ns, result) ||
+            exited_zero(result)) {
+            if (result.timed_out) {
+                error = "exact nginx sibling ID absence remained uncertain";
+                return false;
+            }
+        }
+    }
+    if (!run_command_before({"docker",
+                             "ps",
+                             "-aq",
+                             "--no-trunc",
+                             "--filter",
+                             "name=^/" + owner.nginx_sibling.name + "$"},
+                            deadline_ns,
+                            result) ||
+        !exited_zero(result) || !trim(result.output).empty()) {
+        error = "nginx sibling name absence was not proven";
+        return false;
+    }
+    if (!run_command_before({"docker",
+                             "ps",
+                             "-aq",
+                             "--no-trunc",
+                             "--filter",
+                             "label=rut.token=" + owner.fixture.token(),
+                             "--filter",
+                             std::string("label=rut.role=") + kNginxRole},
+                            deadline_ns,
+                            result) ||
+        !exited_zero(result) || !trim(result.output).empty()) {
+        error = "nginx token/role absence was not proven";
+        return false;
+    }
+    return true;
+}
+
+static bool cgroup_empty(const std::string& path) {
+    std::string contents;
+    if (path.empty()) return false;
+    const std::string file = "/sys/fs/cgroup" + path + "/cgroup.procs";
+    if (read_file(file, contents)) return trim(contents).empty();
+    const std::string directory = "/sys/fs/cgroup" + path;
+    return access(directory.c_str(), F_OK) != 0 && errno == ENOENT;
+}
+
+static void close_nginx_pidfds(NginxSiblingLease& lease) {
+    if (lease.master_pidfd >= 0) close(lease.master_pidfd);
+    if (lease.worker_pidfd >= 0) close(lease.worker_pidfd);
+    lease.master_pidfd = -1;
+    lease.worker_pidfd = -1;
+}
 
 static void owner_failure(ExactInputMountOwner& owner,
                           ExactInputMountDiagnostic& diagnostic,
@@ -5449,6 +6224,172 @@ static bool setup_exact_input_mount_from_topology_builder(ExactInputMountOwner& 
     return setup_exact_input_mount_sidecar_suffix(owner, parser_rejections, diagnostic);
 }
 
+static bool pidfd_dead(int descriptor) {
+    if (descriptor < 0) return false;
+    pollfd item{descriptor, POLLIN, 0};
+    return poll(&item, 1u, 0) == 1 && (item.revents & POLLIN) != 0;
+}
+
+static bool wait_nginx_stopped(ExactInputMountOwner& owner,
+                               std::int64_t limit_ns,
+                               int& exit_code,
+                               std::string& error) {
+    while (remaining_command_ms(limit_ns) > 0) {
+        NginxInspectEvidence inspect;
+        if (!inspect_nginx_sibling(owner, inspect, error, limit_ns)) return false;
+        if (!inspect.running) {
+            exit_code = inspect.exit_code;
+            return true;
+        }
+        (void)poll(nullptr, 0, 25);
+    }
+    error = "nginx sibling did not stop before phase deadline";
+    return false;
+}
+
+static bool settle_nginx_sibling(ExactInputMountOwner& owner,
+                                 ExactInputNginxLifecycleObservation& observation,
+                                 std::int64_t final_deadline_ns,
+                                 bool require_quit_only,
+                                 std::string& error) {
+    NginxSiblingLease& lease = owner.nginx_sibling;
+    if (!lease.mutation_may_have_occurred && !lease.exists) {
+        close_nginx_pidfds(lease);
+        return true;
+    }
+    const std::int64_t quit_deadline = final_deadline_ns - 8000000000LL;
+    const std::int64_t term_deadline = final_deadline_ns - 5000000000LL;
+    const std::int64_t kill_deadline = final_deadline_ns - 3000000000LL;
+    NginxInspectEvidence inspect;
+    std::string inspect_error;
+    if (!inspect_nginx_sibling(owner, inspect, inspect_error, final_deadline_ns)) {
+        std::string absent_error;
+        if (nginx_sibling_absent(owner, final_deadline_ns, absent_error)) {
+            lease.exists = false;
+            lease.running = false;
+            lease.mutation_may_have_occurred = false;
+            lease.operation_failed = true;
+            observation.operation_failed = true;
+            observation.exact_absence = true;
+            close_nginx_pidfds(lease);
+            error = "nginx sibling disappeared before identity-safe settlement";
+            return true;
+        }
+        error = inspect_error + "; " + absent_error;
+        return false;
+    }
+    lease.id = inspect.id;
+    lease.exists = true;
+    lease.running = inspect.running;
+    bool operation_ok = true;
+    int exit_code = inspect.exit_code;
+    if (inspect.running) {
+        CommandResult signal;
+        observation.quit_attempted = true;
+        if (!run_command_before(
+                {"docker", "kill", "--signal=SIGQUIT", lease.id}, quit_deadline, signal) ||
+            !exited_zero(signal) || !wait_nginx_stopped(owner, quit_deadline, exit_code, error)) {
+            operation_ok = false;
+            CommandResult term;
+            (void)run_command_before(
+                {"docker", "kill", "--signal=SIGTERM", lease.id}, term_deadline, term);
+            if (!wait_nginx_stopped(owner, term_deadline, exit_code, inspect_error)) {
+                CommandResult killed;
+                (void)run_command_before(
+                    {"docker", "kill", "--signal=SIGKILL", lease.id}, kill_deadline, killed);
+                if (!wait_nginx_stopped(owner, kill_deadline, exit_code, inspect_error)) {
+                    error = "nginx sibling remained live after QUIT/TERM/KILL escalation";
+                    return false;
+                }
+            }
+        } else {
+            observation.quit_only = true;
+        }
+    }
+    observation.stopped_exit_zero = exit_code == 0;
+    if (require_quit_only && (!observation.quit_only || !observation.stopped_exit_zero))
+        operation_ok = false;
+
+    const auto death_deadline = std::min<std::int64_t>(kill_deadline, final_deadline_ns);
+    while (remaining_command_ms(death_deadline) > 0 &&
+           ((!pidfd_dead(lease.master_pidfd) && lease.master_pidfd >= 0) ||
+            (!pidfd_dead(lease.worker_pidfd) && lease.worker_pidfd >= 0)))
+        (void)poll(nullptr, 0, 10);
+    observation.cgroup_empty_after_stop = cgroup_empty(lease.cgroup_path);
+    if ((!pidfd_dead(lease.master_pidfd) && lease.master_pidfd >= 0) ||
+        (!pidfd_dead(lease.worker_pidfd) && lease.worker_pidfd >= 0) ||
+        (!lease.cgroup_path.empty() && !observation.cgroup_empty_after_stop))
+        operation_ok = false;
+
+    CommandResult logs;
+    if (!run_command_before({"docker", "logs", lease.id}, kill_deadline, logs, false, 8192u) ||
+        !exited_zero(logs))
+        operation_ok = false;
+
+    if (owner.options.failure_point == ExactInputMountFailurePoint::NginxRemoveUnresolved &&
+        !owner.nginx_unresolved_fault_consumed) {
+        owner.nginx_unresolved_fault_consumed = true;
+        observation.operation_failed = true;
+        lease.operation_failed = true;
+        error = "injected unresolved nginx removal response";
+        return false;
+    }
+    CommandResult removal;
+    ++observation.remove_count;
+    ++owner.receipt.nginx_remove_count;
+    const bool report_timeout =
+        owner.options.failure_point == ExactInputMountFailurePoint::NginxRemoveReportedTimeout;
+    const bool removal_ok =
+        run_command_before({"docker", "rm", lease.id}, final_deadline_ns, removal, report_timeout);
+    if (report_timeout && removal.timed_out) operation_ok = false;
+    if ((!removal_ok || !exited_zero(removal)) && !removal.timed_out) {
+        CommandResult forced;
+        operation_ok = false;
+        (void)run_command_before({"docker", "rm", "-f", lease.id}, final_deadline_ns, forced);
+    } else if (!removal.timed_out) {
+        observation.removed_nonforce = true;
+    }
+    std::string absent_error;
+    if (!nginx_sibling_absent(owner, final_deadline_ns, absent_error)) {
+        error = "nginx sibling removal/absence proof failed: " + absent_error;
+        return false;
+    }
+    observation.exact_absence = true;
+    lease.exists = false;
+    lease.running = false;
+    lease.mutation_may_have_occurred = false;
+    close_nginx_pidfds(lease);
+    if (!operation_ok) {
+        lease.operation_failed = true;
+        observation.operation_failed = true;
+        if (error.empty()) error = "nginx sibling required uncertain or escalated settlement";
+    }
+    return true;
+}
+
+static bool revalidate_nginx_baseline(ExactInputMountOwner& owner, std::string& error) {
+    fixture_exact_input_file_lease::Diagnostic source_diagnostic;
+    if (!owner.input.revalidate(source_diagnostic) ||
+        !owner.fixture.revalidate_sidecar_identity(error) ||
+        !sidecar_snapshot_equal(owner.fixture.sidecar_snapshot(), owner.registered_sidecar)) {
+        if (error.empty()) error = "source or inert sidecar changed after nginx lifecycle";
+        return false;
+    }
+    ParsedMountInspect mount;
+    if (!inspect_exact_mount(
+            owner.fixture, owner.input.path(), owner.input.identity(), mount, error) ||
+        !mount_inspect_equal(mount, owner.registered_mount) ||
+        !owner.fixture.verify_topology(FailurePoint::None, error) ||
+        !topology_snapshot_equal(owner.builder_baseline,
+                                 owner.fixture.current_topology_snapshot()) ||
+        !owner.fixture.probe_port_absent(kExactInputTopologyBuilderPort, error) ||
+        !owner.fixture.probe_tcp6_port_absent(kExactInputTopologyBuilderPort, error)) {
+        if (error.empty()) error = "post-nginx source/mount/topology/listener baseline drifted";
+        return false;
+    }
+    return true;
+}
+
 static bool recover_exact_input_mount(ExactInputMountOwner& owner,
                                       ExactInputMountDiagnostic& diagnostic) {
     if (owner.settled) {
@@ -5481,12 +6422,42 @@ static bool recover_exact_input_mount(ExactInputMountOwner& owner,
     }
     std::string error;
     std::uint32_t order = std::max({owner.receipt.sidecar_order,
+                                    owner.receipt.nginx_sibling_order,
                                     owner.receipt.input_order,
                                     owner.receipt.directory_order,
                                     owner.receipt.holder_order,
                                     owner.receipt.network_b_order,
                                     owner.receipt.network_a_order});
     bool just_disconnected = false;
+
+    if (!owner.receipt.nginx_sibling_acquired && !owner.nginx_sibling.mutation_may_have_occurred &&
+        !owner.nginx_sibling.exists)
+        owner.receipt.nginx_sibling_settled = true;
+
+    if ((owner.receipt.nginx_sibling_acquired || owner.nginx_sibling.mutation_may_have_occurred ||
+         owner.nginx_sibling.exists) &&
+        !owner.receipt.nginx_sibling_settled) {
+        const std::int64_t now = exact_read_monotonic_ns();
+        if (now <= 0 || now > std::numeric_limits<std::int64_t>::max() - 30000000000LL) {
+            owner_failure(owner,
+                          diagnostic,
+                          ExactInputMountPhase::Lifecycle,
+                          "nginx recovery deadline could not be formed",
+                          EOVERFLOW);
+            return false;
+        }
+        error.clear();
+        ExactInputNginxLifecycleObservation recovery_observation =
+            owner.nginx_lifecycle_observation;
+        if (!settle_nginx_sibling(owner, recovery_observation, now + 30000000000LL, false, error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::Lifecycle, error);
+            return false;
+        }
+        owner.receipt.nginx_sibling_settled = true;
+        if (owner.receipt.nginx_sibling_acquired) owner.receipt.nginx_sibling_order = ++order;
+        if (owner.nginx_sibling.operation_failed)
+            owner_operation_failure(owner, ExactInputMountPhase::Lifecycle, error);
+    }
 
     if (owner.options.failure_point ==
             ExactInputMountFailurePoint::DisconnectNetworkBeforeInputCleanup &&
@@ -5690,6 +6661,111 @@ std::uint64_t exact_input_mount_test_observation_command_count() {
 bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_rejections,
                                                       ExactInputMountDiagnostic& diagnostic) {
     return write_refusal_self_checks_impl(mutation_rejections, diagnostic);
+}
+
+bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_rejections,
+                                                        ExactInputMountDiagnostic& diagnostic) {
+    mutation_rejections = 0u;
+    diagnostic = {};
+    ExactInputNginxProcessSample first;
+    first.complete = true;
+    first.monotonic_nanoseconds = 1000000000LL;
+    first.master_pid = 101;
+    first.worker_pid = 102;
+    first.master_start = 201u;
+    first.worker_start = 202u;
+    first.listener_inode = 301u;
+    ExactInputNginxProcessSample second = first;
+    second.monotonic_nanoseconds += 250000000LL;
+    if (!nginx_samples_stable(first, second)) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid nginx sample seed was rejected"};
+        return false;
+    }
+    const auto reject_sample = [&](ExactInputNginxProcessSample mutation) {
+        if (nginx_samples_stable(first, mutation)) return false;
+        ++mutation_rejections;
+        return true;
+    };
+    ExactInputNginxProcessSample mutation = second;
+    mutation.complete = false;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    mutation.monotonic_nanoseconds = first.monotonic_nanoseconds + 249999999LL;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    ++mutation.master_pid;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    ++mutation.worker_pid;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    ++mutation.master_start;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    ++mutation.worker_start;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    ++mutation.listener_inode;
+    if (!reject_sample(mutation)) return false;
+    ExactInputNginxProcessSample zero_listener = first;
+    zero_listener.listener_inode = 0u;
+    if (nginx_samples_stable(zero_listener, second)) return false;
+    ++mutation_rejections;
+
+    ExactInputNginxLifecycleObservation cleanup;
+    cleanup.quit_attempted = true;
+    cleanup.quit_only = true;
+    cleanup.stopped_exit_zero = true;
+    cleanup.cgroup_empty_after_stop = true;
+    cleanup.removed_nonforce = true;
+    cleanup.exact_absence = true;
+    if (!nginx_graceful_cleanup_complete(cleanup)) return false;
+    const auto reject_cleanup = [&](ExactInputNginxLifecycleObservation value) {
+        if (nginx_graceful_cleanup_complete(value)) return false;
+        ++mutation_rejections;
+        return true;
+    };
+#define RUT_REJECT_NGINX_CLEANUP(field, value)                 \
+    do {                                                       \
+        ExactInputNginxLifecycleObservation changed = cleanup; \
+        changed.field = value;                                 \
+        if (!reject_cleanup(std::move(changed))) return false; \
+    } while (false)
+    RUT_REJECT_NGINX_CLEANUP(operation_failed, true);
+    RUT_REJECT_NGINX_CLEANUP(quit_attempted, false);
+    RUT_REJECT_NGINX_CLEANUP(quit_only, false);
+    RUT_REJECT_NGINX_CLEANUP(stopped_exit_zero, false);
+    RUT_REJECT_NGINX_CLEANUP(cgroup_empty_after_stop, false);
+    RUT_REJECT_NGINX_CLEANUP(removed_nonforce, false);
+    RUT_REJECT_NGINX_CLEANUP(exact_absence, false);
+#undef RUT_REJECT_NGINX_CLEANUP
+
+    const std::string header =
+        "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout "
+        "inode\n";
+    const std::string absent =
+        header +
+        " 0: 00000000000000000000000000000000:A380 00000000000000000000000000000000:0000 0A\n";
+    const std::string present =
+        header +
+        " 0: 00000000000000000000000000000000:A381 00000000000000000000000000000000:0000 0A\n";
+    if (!strict_tcp6_port_absent(absent, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(present, kExactInputTopologyBuilderPort)) {
+        diagnostic = {
+            ExactInputMountPhase::Lifecycle, 0, "strict nginx TCP6 parser self-check failed"};
+        return false;
+    }
+    mutation_rejections += 2u;
+    const std::int64_t final = 30000000000LL;
+    if (!(final - 15000000000LL < final - 12000000000LL &&
+          final - 12000000000LL < final - 8000000000LL &&
+          final - 8000000000LL < final - 5000000000LL &&
+          final - 5000000000LL < final - 3000000000LL)) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "nginx deadline partition was invalid"};
+        return false;
+    }
+    ++mutation_rejections;
+    return mutation_rejections == 18u;
 }
 
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
@@ -6141,6 +7217,7 @@ static bool exact_mount_terminal_settlement(const ExactInputMountRecoveryReceipt
     return receipt.state == ExactInputMountState::Settled && receipt.attempted &&
            receipt.terminal_result != ExactInputMountTerminalResult::None &&
            receipt.final_zero_residue && receipt.settlement_complete && receipt.terminal_frozen &&
+           settled_if_acquired(receipt.nginx_sibling_acquired, receipt.nginx_sibling_settled) &&
            settled_if_acquired(receipt.sidecar_acquired, receipt.sidecar_settled) &&
            settled_if_acquired(receipt.input_acquired, receipt.input_settled) &&
            settled_if_acquired(receipt.directory_acquired, receipt.directory_settled) &&
@@ -6663,6 +7740,298 @@ bool ExactInputMountRecoveryController::observe_input_write_refusal(
     owner->write_refusal_observation = current;
     owner->write_refusal_diagnostic = {};
     owner->state = ExactInputMountState::WriteRefusalObserved;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    observation = current;
+    diagnostic = {};
+    return true;
+}
+
+bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
+    const ExactInputMountHandle& handle,
+    ExactInputNginxLifecycleObservation& observation,
+    ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, EINVAL, "exact-input owner is absent"};
+        return false;
+    }
+    if (owner->nginx_lifecycle_attempted) {
+        observation = owner->nginx_lifecycle_observation;
+        diagnostic = owner->nginx_lifecycle_diagnostic;
+        return observation.outcome == ExactInputNginxLifecycleOutcome::Complete;
+    }
+    if (owner->state != ExactInputMountState::WriteRefusalObserved ||
+        !owner->write_refusal_attempted ||
+        owner->write_refusal_observation.outcome != ExactInputWriteRefusalOutcome::Complete ||
+        !owner->receipt.builder.applicable || !owner->receipt.builder.output_accepted) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "nginx lifecycle requires topology-built input and successful write refusal"};
+        return false;
+    }
+
+    owner->nginx_lifecycle_attempted = true;
+    owner->state = ExactInputMountState::ObservingNginxLifecycle;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    ExactInputNginxLifecycleObservation current;
+    current.attempted = true;
+    current.container_name = "rut358-nginx-" + owner->fixture.token();
+    owner->nginx_sibling.name = current.container_name;
+    const std::int64_t now = exact_read_monotonic_ns();
+    if (now > 0 && now <= std::numeric_limits<std::int64_t>::max() - 30000000000LL) {
+        current.caller_deadline_recorded = true;
+        current.final_deadline_nanoseconds = now + 30000000000LL;
+    }
+    const auto freeze_failure = [&](ExactInputNginxLifecycleOutcome outcome,
+                                    const std::string& message,
+                                    int error_number = 0) {
+        current.outcome = outcome;
+        current.terminal_frozen = true;
+        current.operation_failed = true;
+        current.diagnostic = {ExactInputMountPhase::Lifecycle, error_number, message};
+        owner->operation_failed = true;
+        owner->nginx_sibling.operation_failed = true;
+        std::string cleanup_error;
+        if (current.caller_deadline_recorded && !current.quit_attempted &&
+            current.remove_count == 0u &&
+            (owner->nginx_sibling.mutation_may_have_occurred || owner->nginx_sibling.exists)) {
+            command_deadline_cap_ns = current.final_deadline_nanoseconds;
+            if (!settle_nginx_sibling(
+                    *owner, current, current.final_deadline_nanoseconds, false, cleanup_error))
+                current.diagnostic.message += "; cleanup unresolved: " + cleanup_error;
+            else {
+                std::string baseline_error;
+                if (!revalidate_nginx_baseline(*owner, baseline_error))
+                    current.diagnostic.message +=
+                        "; baseline revalidation failed: " + baseline_error;
+                else
+                    current.baseline_restored = true;
+            }
+        }
+        owner_failure(*owner,
+                      diagnostic,
+                      current.diagnostic.phase,
+                      current.diagnostic.message,
+                      current.diagnostic.error_number);
+        owner->nginx_lifecycle_observation = current;
+        owner->nginx_lifecycle_diagnostic = current.diagnostic;
+        observation = current;
+        return false;
+    };
+    if (!current.caller_deadline_recorded)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::DeadlineExceeded,
+                              "nginx lifecycle deadline could not be formed",
+                              EOVERFLOW);
+    if (!unified_cgroup_preflight())
+        return freeze_failure(ExactInputNginxLifecycleOutcome::PreflightUnsupported,
+                              "unified cgroup v2 process-membership proof is unsupported",
+                              ENOTSUP);
+
+    const std::int64_t sample_a_deadline = current.final_deadline_nanoseconds - 15000000000LL;
+    const std::int64_t sample_b_deadline = current.final_deadline_nanoseconds - 12000000000LL;
+    CommandDeadlineScope command_deadline(sample_a_deadline);
+    fixture_exact_input_file_lease::Diagnostic source_diagnostic;
+    std::string error;
+    if (!owner->input.revalidate(source_diagnostic) ||
+        !owner->fixture.revalidate_sidecar_identity(error) ||
+        !owner->fixture.verify_topology(FailurePoint::None, error) ||
+        !topology_snapshot_equal(owner->builder_baseline,
+                                 owner->fixture.current_topology_snapshot()))
+        return freeze_failure(ExactInputNginxLifecycleOutcome::SourceRevalidationFailed,
+                              "pre-create source/sidecar/topology bracket failed: " + error,
+                              source_diagnostic.error_number);
+
+    const auto& identity = owner->input.identity();
+    const std::string credentials =
+        std::to_string(identity.uid) + ":" + std::to_string(identity.gid);
+    const std::string uid = std::to_string(identity.uid);
+    const std::string gid = std::to_string(identity.gid);
+    const std::string mount = "type=bind,src=" + owner->input.path() +
+                              ",dst=" + kExactInputMountDestination +
+                              ",readonly,bind-propagation=rprivate";
+    const std::string global = "daemon off; master_process on; worker_processes 1; pid /tmp/rut-" +
+                               owner->fixture.token() + "-nginx.pid;";
+    current.create_argv = {
+        "docker",
+        "create",
+        "--pull=never",
+        "--name",
+        current.container_name,
+        "--label",
+        std::string("rut.stage=") + kNginxStage,
+        "--label",
+        "rut.token=" + owner->fixture.token(),
+        "--label",
+        std::string("rut.role=") + kNginxRole,
+        "--network",
+        "container:" + owner->fixture.holder_id(),
+        "--user",
+        credentials,
+        "--workdir",
+        "/",
+        "--env",
+        "LC_ALL=C",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--restart",
+        "no",
+        "--stop-signal",
+        "SIGQUIT",
+        "--mount",
+        mount,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=" + uid + ",gid=" + gid,
+        "--tmpfs",
+        "/var/cache/nginx:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=" + uid + ",gid=" + gid,
+        "--tmpfs",
+        "/var/log/nginx:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=" + uid + ",gid=" + gid,
+        "--entrypoint",
+        "/usr/sbin/nginx",
+        RUT_PINNED_NGINX_IMAGE,
+        "-c",
+        kExactInputMountDestination,
+        "-e",
+        "stderr",
+        "-g",
+        global};
+    if (!exact_nginx_create_argv(current.create_argv,
+                                 current.container_name,
+                                 owner->fixture.token(),
+                                 owner->fixture.holder_id(),
+                                 owner->input.path(),
+                                 credentials))
+        return freeze_failure(ExactInputNginxLifecycleOutcome::IdentityFailed,
+                              "nginx create argv was not exact");
+
+    owner->nginx_sibling.mutation_may_have_occurred = true;
+    owner->recovery_required = true;
+    owner->receipt.recovery_required = true;
+    owner->receipt.mutation_may_have_occurred = true;
+    current.create_attempted = true;
+    ++current.create_count;
+    ++owner->receipt.nginx_create_count;
+    CommandResult create;
+    const bool create_reported_timeout =
+        owner->options.failure_point == ExactInputMountFailurePoint::NginxCreateReportedTimeout;
+    const bool create_ok =
+        run_command_before(current.create_argv, sample_a_deadline, create, create_reported_timeout);
+    if ((!create_ok || !exited_zero(create)) && !create.timed_out)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::CreateFailed,
+                              "nginx sibling create failed: " + trim(create.output));
+    if (full_container_id(trim(create.output))) owner->nginx_sibling.id = trim(create.output);
+    NginxInspectEvidence created;
+    if (!inspect_nginx_sibling(*owner, created, error, sample_a_deadline) || created.running)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::IdentityFailed,
+                              "post-create nginx identity rejection: " + error);
+    owner->nginx_sibling.id = created.id;
+    owner->nginx_sibling.exists = true;
+    owner->receipt.nginx_sibling_acquired = true;
+    owner->mutated = true;
+    owner->receipt.graph_mutated = true;
+    current.created = true;
+    current.container_id = created.id;
+    if (create_reported_timeout)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::CreateFailed,
+                              "nginx create actual-success/reported-timeout operation failure",
+                              ETIMEDOUT);
+    if (owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectPostCreateIdentity)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::IdentityFailed,
+                              "injected post-create nginx identity rejection");
+
+    current.start_attempted = true;
+    ++current.start_count;
+    ++owner->receipt.nginx_start_count;
+    CommandResult start;
+    const bool start_reported_timeout =
+        owner->options.failure_point == ExactInputMountFailurePoint::NginxStartReportedTimeout;
+    const bool start_ok = run_command_before({"docker", "start", owner->nginx_sibling.id},
+                                             sample_a_deadline,
+                                             start,
+                                             start_reported_timeout);
+    if ((!start_ok || !exited_zero(start)) && !start.timed_out)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::StartFailed,
+                              "nginx sibling start failed: " + trim(start.output));
+    owner->nginx_sibling.running = true;
+    current.started = true;
+    if (start_reported_timeout)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::StartFailed,
+                              "nginx start actual-success/reported-timeout operation failure",
+                              ETIMEDOUT);
+
+    bool sample_a_ok = false;
+    std::string first_sample_error;
+    while (remaining_command_ms(sample_a_deadline) > 0) {
+        error.clear();
+        if (capture_nginx_sample(*owner, current.sample_a, sample_a_deadline, true, error)) {
+            sample_a_ok = true;
+            break;
+        }
+        if (first_sample_error.empty()) first_sample_error = error;
+        close_nginx_pidfds(owner->nginx_sibling);
+        owner->nginx_sibling.master_pid = -1;
+        owner->nginx_sibling.worker_pid = -1;
+        owner->nginx_sibling.cgroup_path.clear();
+        (void)poll(nullptr, 0, 25);
+    }
+    if (!sample_a_ok ||
+        owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectSampleA)
+        return freeze_failure(
+            ExactInputNginxLifecycleOutcome::SampleFailed,
+            first_sample_error.empty() ? "injected/rejected nginx sample A" : first_sample_error);
+    current.same_source_inode = true;
+    current.same_mount_instance = false;
+    current.sibling_mount_independently_verified = true;
+
+    command_deadline.set(sample_b_deadline);
+    const std::int64_t earliest_b = current.sample_a.monotonic_nanoseconds + 250000000LL;
+    while (exact_read_monotonic_ns() < earliest_b && remaining_command_ms(sample_b_deadline) > 0)
+        (void)poll(nullptr, 0, 10);
+    if (!capture_nginx_sample(*owner, current.sample_b, sample_b_deadline, false, error) ||
+        owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectSampleB)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::SampleFailed,
+                              error.empty() ? "injected/rejected nginx sample B" : error);
+    if (owner->options.failure_point == ExactInputMountFailurePoint::NginxDriftSampleB)
+        ++current.sample_b.worker_start;
+    current.samples_at_least_250ms_apart =
+        current.sample_b.monotonic_nanoseconds - current.sample_a.monotonic_nanoseconds >=
+        250000000LL;
+    const bool stable = current.samples_at_least_250ms_apart &&
+                        nginx_samples_stable(current.sample_a, current.sample_b);
+    if (!stable)
+        return freeze_failure(ExactInputNginxLifecycleOutcome::SampleDrift,
+                              "nginx process/listener evidence drifted between stable samples");
+
+    command_deadline.set(current.final_deadline_nanoseconds);
+    if (!settle_nginx_sibling(*owner, current, current.final_deadline_nanoseconds, true, error))
+        return freeze_failure(ExactInputNginxLifecycleOutcome::RemovalFailed,
+                              "nginx sibling cleanup did not settle: " + error);
+    if (!nginx_graceful_cleanup_complete(current)) {
+        std::ostringstream failure;
+        failure << "nginx lifecycle required uncertain/escalated cleanup: quit-only="
+                << current.quit_only << " exit-zero=" << current.stopped_exit_zero
+                << " cgroup-empty=" << current.cgroup_empty_after_stop
+                << " nonforce=" << current.removed_nonforce << " absent=" << current.exact_absence
+                << " detail=" << error;
+        return freeze_failure(ExactInputNginxLifecycleOutcome::GracefulStopFailed, failure.str());
+    }
+    if (owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectBaseline ||
+        !revalidate_nginx_baseline(*owner, error))
+        return freeze_failure(ExactInputNginxLifecycleOutcome::BaselineDrift,
+                              error.empty() ? "injected post-nginx baseline drift" : error);
+    current.baseline_restored = true;
+    current.outcome = ExactInputNginxLifecycleOutcome::Complete;
+    current.terminal_frozen = true;
+    current.diagnostic = {};
+    owner->nginx_lifecycle_observation = current;
+    owner->nginx_lifecycle_diagnostic = {};
+    owner->state = ExactInputMountState::NginxLifecycleObserved;
     owner->snapshot.state = owner->state;
     owner->receipt.state = owner->state;
     observation = current;
