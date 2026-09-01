@@ -433,6 +433,7 @@ bool ExactInputFileLease::create_impl(
         return creation_failed({FailurePhase::WriterClose, close_diagnostic.error_number},
                                diagnostic);
 
+    active_published_ = true;
     transition(State::Active);
     return true;
 }
@@ -536,11 +537,103 @@ bool ExactInputFileLease::quarantine(Diagnostic& diagnostic) {
     return true;
 }
 
+bool ExactInputFileLease::resolve_descriptor_custody(Diagnostic& diagnostic) {
+    diagnostic = {};
+    if (custody_resolved_) return true;
+    if (state_ == State::Creating) return true;
+
+    if (!custody_hook_consumed_) {
+        custody_hook_consumed_ = true;
+        if (hooks_.before_cleanup_custody != nullptr)
+            hooks_.before_cleanup_custody(
+                reader_fd_, authority_one_fd_, authority_two_fd_, hooks_.context);
+    }
+
+    const std::array<int, 3> descriptors = {reader_fd_, authority_one_fd_, authority_two_fd_};
+    for (const int descriptor : descriptors) {
+        if (descriptor < 0 || fcntl(descriptor, F_GETFD) < 0)
+            return reject(diagnostic,
+                          FailurePhase::DescriptorClose,
+                          descriptor < 0 ? EBADF : (errno == 0 ? EIO : errno));
+    }
+
+    enum class Relation : std::uint8_t { Different, Same };
+    std::array<std::array<Relation, 3>, 3> relations{};
+    unsigned same_edges = 0u;
+    for (std::size_t first = 0u; first != descriptors.size(); ++first) {
+        for (std::size_t second = first + 1u; second != descriptors.size(); ++second) {
+            Diagnostic relation;
+            if (same_open_file_description(descriptors[first], descriptors[second], relation)) {
+                relations[first][second] = Relation::Same;
+                ++same_edges;
+            } else if (relation.error_number == EXDEV) {
+                relations[first][second] = Relation::Different;
+            } else {
+                return reject(diagnostic,
+                              FailurePhase::DescriptorClose,
+                              relation.error_number == 0 ? EIO : relation.error_number);
+            }
+        }
+    }
+
+    original_members_ = {};
+    if (same_edges == 3u) {
+        original_members_.fill(true);
+    } else if (same_edges == 1u) {
+        for (std::size_t first = 0u; first != descriptors.size(); ++first)
+            for (std::size_t second = first + 1u; second != descriptors.size(); ++second)
+                if (relations[first][second] == Relation::Same) {
+                    original_members_[first] = true;
+                    original_members_[second] = true;
+                }
+    } else {
+        // Zero same edges has no original majority. Two same edges violates
+        // equivalence transitivity. Both are outside the one-replacement
+        // boundary and must leave every numeric slot untouched.
+        original_members_ = {};
+        return reject(diagnostic, FailurePhase::DescriptorClose, ESTALE);
+    }
+
+    for (std::size_t index = 0u; index != descriptors.size(); ++index) {
+        if (!original_members_[index]) continue;
+        struct stat held{};
+        if (fstat(descriptors[index], &held) != 0 || !same_linked_file(held, identity_, true) ||
+            !descriptor_flags(descriptors[index], O_RDONLY, false)) {
+            original_members_ = {};
+            return reject(diagnostic, FailurePhase::DescriptorClose, errno == 0 ? ESTALE : errno);
+        }
+    }
+
+    std::array<int*, 3> slots = {&reader_fd_, &authority_one_fd_, &authority_two_fd_};
+    std::array<bool*, 3> preserved = {&receipt_->foreign_reader_preserved,
+                                      &receipt_->foreign_authority_one_preserved,
+                                      &receipt_->foreign_authority_two_preserved};
+    for (std::size_t index = 0u; index != slots.size(); ++index) {
+        if (original_members_[index]) continue;
+        // The two-member exact-OFD majority proves this sole nonmember foreign.
+        // Relinquish the numeric slot without inspecting or closing it again.
+        *slots[index] = -1;
+        *preserved[index] = true;
+    }
+    custody_resolved_ = true;
+    return true;
+}
+
+int ExactInputFileLease::proven_original_descriptor() const {
+    const std::array<int, 3> descriptors = {reader_fd_, authority_one_fd_, authority_two_fd_};
+    for (std::size_t index = 0u; index != descriptors.size(); ++index)
+        if (original_members_[index] && descriptors[index] >= 0) return descriptors[index];
+    return -1;
+}
+
 bool ExactInputFileLease::finish_detached(Diagnostic& diagnostic) {
     if (!receipt_->detached_inode_proven) {
         struct stat held{};
-        const int authority = authority_one_fd_ >= 0 ? authority_one_fd_
-                                                     : (reader_fd_ >= 0 ? reader_fd_ : writer_fd_);
+        const int authority =
+            custody_resolved_
+                ? proven_original_descriptor()
+                : (authority_one_fd_ >= 0 ? authority_one_fd_
+                                          : (reader_fd_ >= 0 ? reader_fd_ : writer_fd_));
         if (authority < 0 || fstat(authority, &held) != 0 || !same_inode(held, identity_) ||
             held.st_nlink != 0u)
             return reject(diagnostic,
@@ -629,14 +722,20 @@ bool ExactInputFileLease::close_reader(Diagnostic& diagnostic) {
     diagnostic = {};
     std::array<int*, 3> slots = {&reader_fd_, &authority_one_fd_, &authority_two_fd_};
     const std::array<int, 3> descriptors = {reader_fd_, authority_one_fd_, authority_two_fd_};
-    std::array<bool, 3> original_members{};
+    std::array<bool, 3> original_members = original_members_;
     unsigned live = 0u;
     for (const int descriptor : descriptors)
         if (descriptor >= 0) ++live;
 
     int comparison_error = 0;
     unsigned same_edges = 0u;
-    if (live == 1u && state_ == State::Creating) {
+    if (custody_resolved_) {
+        // The all-pairs proof was completed before namespace mutation. Any
+        // foreign numeric slot has already been relinquished without close.
+    } else if (!active_published_) {
+        // Creation has never published a borrowed descriptor. Every live
+        // reader/authority slot is still exclusively internal and owned even
+        // after namespace state advances to Detached during rollback.
         for (std::size_t index = 0u; index != descriptors.size(); ++index)
             original_members[index] = descriptors[index] >= 0;
     } else if (live != 0u) {
@@ -660,13 +759,18 @@ bool ExactInputFileLease::close_reader(Diagnostic& diagnostic) {
                           comparison_error == 0 ? ESTALE : comparison_error);
     }
 
-    for (std::size_t index = 0u; index != slots.size(); ++index) {
+    for (std::size_t index = 0u; !custody_resolved_ && index != slots.size(); ++index) {
         if (*slots[index] < 0 || original_members[index]) continue;
         // Under the documented at-most-one replacement boundary, the exact
         // two-member OFD majority proves every nonmember foreign. Consume its
         // numeric slot without closing it.
         *slots[index] = -1;
-        if (index == 0u) receipt_->foreign_reader_preserved = true;
+        if (index == 0u)
+            receipt_->foreign_reader_preserved = true;
+        else if (index == 1u)
+            receipt_->foreign_authority_one_preserved = true;
+        else
+            receipt_->foreign_authority_two_preserved = true;
     }
 
     Diagnostic first_failure;
@@ -687,7 +791,20 @@ bool ExactInputFileLease::close_reader(Diagnostic& diagnostic) {
     const bool second_closed =
         !original_members[2] ||
         close_role(authority_two_fd_, DescriptorRole::AuthorityTwo, receipt_->authority_two_close);
-    receipt_->descriptor_closed = writer_closed && reader_closed && first_closed && second_closed;
+    const bool reader_settled =
+        original_members[0]
+            ? reader_closed
+            : (custody_resolved_ ? receipt_->foreign_reader_preserved : reader_closed);
+    const bool first_settled =
+        original_members[1]
+            ? first_closed
+            : (custody_resolved_ ? receipt_->foreign_authority_one_preserved : first_closed);
+    const bool second_settled =
+        original_members[2]
+            ? second_closed
+            : (custody_resolved_ ? receipt_->foreign_authority_two_preserved : second_closed);
+    receipt_->descriptor_closed =
+        writer_closed && reader_settled && first_settled && second_settled;
     if (!receipt_->descriptor_closed) {
         diagnostic = first_failure.phase == FailurePhase::None
                          ? Diagnostic{FailurePhase::DescriptorClose, EIO}
@@ -734,6 +851,11 @@ bool ExactInputFileLease::cleanup(Diagnostic& diagnostic) {
                          : receipt_->diagnostic;
         return false;
     }
+
+    // Establish the exact original majority before the first pathname
+    // mutation. If KCMP is denied/unavailable or the documented one-slot
+    // boundary is violated, neither the namespace nor any descriptor changes.
+    if (state_ != State::Creating && !resolve_descriptor_custody(diagnostic)) return false;
 
     if (state_ != State::Quarantined && state_ != State::Detached) {
         Diagnostic semantic;

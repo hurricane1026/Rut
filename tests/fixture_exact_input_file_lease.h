@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fixture_private_directory_lease.h"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -80,6 +81,8 @@ struct CleanupReceipt {
     bool directory_settled = false;
     bool settlement_complete = false;
     bool foreign_reader_preserved = false;
+    bool foreign_authority_one_preserved = false;
+    bool foreign_authority_two_preserved = false;
     Residue original_residue = Residue::Unknown;
     Residue quarantine_residue = Residue::Unknown;
     State state = State::Empty;
@@ -128,6 +131,10 @@ enum class DescriptorRole : std::uint8_t {
     AuthorityTwo,
     Directory,
 };
+using CustodyHookForTesting = void (*)(int reader,
+                                       int authority_one,
+                                       int authority_two,
+                                       void* context);
 using CloseForTesting = int (*)(int descriptor, DescriptorRole role, void* context);
 
 struct HooksForTesting {
@@ -137,6 +144,7 @@ struct HooksForTesting {
     CleanupFaultForTesting cleanup_fault = CleanupFaultForTesting::None;
     QuarantineHookForTesting after_quarantine_rename = nullptr;
     QuarantineHookForTesting before_final_remove = nullptr;
+    CustodyHookForTesting before_cleanup_custody = nullptr;
     KcmpForTesting kcmp = nullptr;
     CloseForTesting close = nullptr;
     void* context = nullptr;
@@ -199,6 +207,8 @@ private:
     bool validate_bytes(Diagnostic& diagnostic) const;
     bool quarantine(Diagnostic& diagnostic);
     bool finish_detached(Diagnostic& diagnostic);
+    bool resolve_descriptor_custody(Diagnostic& diagnostic);
+    int proven_original_descriptor() const;
     bool close_reader(Diagnostic& diagnostic);
     bool close_directory(Diagnostic& diagnostic);
     bool close_one(int& descriptor,
@@ -224,7 +234,11 @@ private:
     HooksForTesting hooks_;
     State state_ = State::Empty;
     bool identity_known_ = false;
+    bool active_published_ = false;
     bool cleanup_fault_consumed_ = false;
+    bool custody_hook_consumed_ = false;
+    bool custody_resolved_ = false;
+    std::array<bool, 3> original_members_{};
     std::shared_ptr<CleanupReceipt> receipt_;
 };
 

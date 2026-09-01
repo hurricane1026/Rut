@@ -128,7 +128,9 @@ bool complete(const std::shared_ptr<const input::CleanupReceipt>& receipt) {
            receipt->reader_close.attempts == 1u && receipt->reader_close.succeeded &&
            receipt->authority_one_close.attempts == 1u && receipt->authority_one_close.succeeded &&
            receipt->authority_two_close.attempts == 1u && receipt->authority_two_close.succeeded &&
-           receipt->directory_close.attempts == 1u && receipt->directory_close.succeeded;
+           receipt->directory_close.attempts == 1u && receipt->directory_close.succeeded &&
+           !receipt->foreign_reader_preserved && !receipt->foreign_authority_one_preserved &&
+           !receipt->foreign_authority_two_preserved;
 }
 
 bool invalid_argument_tests() {
@@ -391,12 +393,12 @@ int real_kcmp(int first, int second) {
 }
 
 struct KcmpState {
-    bool deny = false;
+    int error_number = 0;
 };
 int controlled_kcmp(int first, int second, void* opaque) {
     auto& state = *static_cast<KcmpState*>(opaque);
-    if (state.deny) {
-        errno = EPERM;
+    if (state.error_number != 0) {
+        errno = state.error_number;
         return -1;
     }
     return real_kcmp(first, second);
@@ -435,18 +437,112 @@ bool exact_ofd_tests() {
             !input::ExactInputFileLease::create_with_hooks_for_testing(
                 owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic))
             return false;
-        state.deny = true;
-        const bool denied = !lease.revalidate(diagnostic) &&
-                            failed(diagnostic, input::FailurePhase::Revalidate) &&
-                            !lease.cleanup(diagnostic) &&
-                            failed(diagnostic, input::FailurePhase::DescriptorClose) &&
-                            !lease.cleanup_receipt()->settlement_complete;
-        state.deny = false;
-        const bool recovered = lease.cleanup(diagnostic) && owner.settle(directory_diagnostic);
-        if (!check(denied && recovered, "denied exact-OFD proof did not fail closed/recover"))
+        const std::string name = lease.basename();
+        for (const int error_number : {EPERM, EACCES, ENOSYS}) {
+            state.error_number = error_number;
+            struct stat named{};
+            std::vector<int> before, after;
+            const bool denied =
+                fd_snapshot(before) && !lease.cleanup(diagnostic) &&
+                failed(diagnostic, input::FailurePhase::DescriptorClose) &&
+                diagnostic.error_number == error_number &&
+                stat_at(owner.descriptor(), name, named) &&
+                static_cast<std::uint64_t>(named.st_dev) == lease.identity().device &&
+                static_cast<std::uint64_t>(named.st_ino) == lease.identity().inode &&
+                !lease.cleanup_receipt()->path_quarantined &&
+                !lease.cleanup_receipt()->exact_unlinked &&
+                !lease.cleanup_receipt()->settlement_complete && fd_snapshot(after) &&
+                before == after;
+            if (!check(denied, "denied exact-OFD proof mutated namespace or descriptors"))
+                return false;
+        }
+        state.error_number = 0;
+        if (!check(lease.cleanup(diagnostic) && owner.settle(directory_diagnostic),
+                   "denied exact-OFD proof did not recover"))
             return false;
     }
     return true;
+}
+
+struct CustodyReplacementState {
+    input::DescriptorRole role = input::DescriptorRole::Reader;
+    int fresh = -1;
+    int target = -1;
+    bool replaced = false;
+};
+
+const input::CloseOutcome& outcome_for(const input::CleanupReceipt& receipt,
+                                       input::DescriptorRole role);
+
+void replace_custody_slot(int reader, int authority_one, int authority_two, void* opaque) {
+    auto& state = *static_cast<CustodyReplacementState*>(opaque);
+    if (state.role == input::DescriptorRole::Reader)
+        state.target = reader;
+    else if (state.role == input::DescriptorRole::AuthorityOne)
+        state.target = authority_one;
+    else if (state.role == input::DescriptorRole::AuthorityTwo)
+        state.target = authority_two;
+    if (state.target < 0 || state.fresh < 0) return;
+    state.replaced = dup2(state.fresh, state.target) == state.target &&
+                     fcntl(state.target, F_SETFD, FD_CLOEXEC) == 0;
+}
+
+bool role_preserved(const input::CleanupReceipt& receipt, input::DescriptorRole role) {
+    if (role == input::DescriptorRole::Reader) return receipt.foreign_reader_preserved;
+    if (role == input::DescriptorRole::AuthorityOne) return receipt.foreign_authority_one_preserved;
+    if (role == input::DescriptorRole::AuthorityTwo) return receipt.foreign_authority_two_preserved;
+    return false;
+}
+
+bool symmetric_custody_replacement_case(input::DescriptorRole role, unsigned tag) {
+    directory::PrivateDirectoryLease owner;
+    directory::Diagnostic directory_diagnostic;
+    input::ExactInputFileLease lease;
+    input::Diagnostic diagnostic;
+    CustodyReplacementState state{.role = role};
+    if (!make_directory(tag, owner, directory_diagnostic)) return false;
+    auto hooks = input_hooks(tag + 1u);
+    hooks.before_cleanup_custody = replace_custody_slot;
+    hooks.context = &state;
+    if (!input::ExactInputFileLease::create_with_hooks_for_testing(
+            owner, kBytes, sizeof(kBytes) - 1u, hooks, lease, diagnostic))
+        return false;
+    state.fresh =
+        openat(owner.descriptor(), lease.basename().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (state.fresh < 0) return false;
+
+    const auto receipt = lease.cleanup_receipt();
+    const bool settled =
+        lease.cleanup(diagnostic) && state.replaced && receipt->settlement_complete &&
+        receipt->descriptor_closed && receipt->detached_inode_proven && receipt->exact_unlinked &&
+        receipt->original_residue == input::Residue::Absent &&
+        receipt->quarantine_residue == input::Residue::Absent && role_preserved(*receipt, role) &&
+        fcntl(state.target, F_GETFD) >= 0 && real_kcmp(state.target, state.fresh) == 0 &&
+        directory_empty(owner.descriptor());
+
+    const std::array<input::DescriptorRole, 3> roles = {input::DescriptorRole::Reader,
+                                                        input::DescriptorRole::AuthorityOne,
+                                                        input::DescriptorRole::AuthorityTwo};
+    bool evidence = settled;
+    for (const auto current : roles) {
+        const auto& outcome = outcome_for(*receipt, current);
+        if (current == role)
+            evidence = evidence && role_preserved(*receipt, current) && !outcome.attempted &&
+                       outcome.attempts == 0u;
+        else
+            evidence = evidence && !role_preserved(*receipt, current) && outcome.attempted &&
+                       outcome.attempts == 1u && outcome.succeeded && !outcome.uncertain;
+    }
+    const bool closed =
+        state.target != state.fresh && close(state.target) == 0 && close(state.fresh) == 0;
+    return check(evidence && closed && owner.settle(directory_diagnostic),
+                 "symmetric custody replacement was closed or settled without role evidence");
+}
+
+bool symmetric_custody_replacement_tests() {
+    return symmetric_custody_replacement_case(input::DescriptorRole::Reader, 140u) &&
+           symmetric_custody_replacement_case(input::DescriptorRole::AuthorityOne, 143u) &&
+           symmetric_custody_replacement_case(input::DescriptorRole::AuthorityTwo, 146u);
 }
 
 struct CloseReuseState {
@@ -499,6 +595,7 @@ bool close_reuse_case(input::DescriptorRole role, unsigned tag) {
     input::Diagnostic diagnostic;
     CloseReuseState state{.target = role};
     std::shared_ptr<const input::CleanupReceipt> receipt;
+    input::CloseOutcome frozen;
     bool result = false;
     {
         input::ExactInputFileLease lease;
@@ -511,20 +608,29 @@ bool close_reuse_case(input::DescriptorRole role, unsigned tag) {
         receipt = lease.cleanup_receipt();
         if (role == input::DescriptorRole::Writer) {
             result = !created && failed(diagnostic, input::FailurePhase::WriterClose);
+        } else if (role == input::DescriptorRole::Directory) {
+            result = created && !lease.cleanup(diagnostic) &&
+                     failed(diagnostic, input::FailurePhase::DirectorySettlement);
         } else {
             result = created && !lease.cleanup(diagnostic) &&
                      failed(diagnostic, input::FailurePhase::DescriptorClose);
         }
         const auto& outcome = outcome_for(*receipt, role);
+        frozen = outcome;
         result = result && state.target_calls == 1u && state.reused >= 0 &&
                  fcntl(state.reused, F_GETFD) >= 0 && outcome.attempted && outcome.attempts == 1u &&
                  !outcome.succeeded && outcome.uncertain && !receipt->settlement_complete &&
                  !lease.cleanup(diagnostic) && state.target_calls == 1u && outcome.attempts == 1u &&
                  fcntl(state.reused, F_GETFD) >= 0;
     }
+    const auto& final_outcome = outcome_for(*receipt, role);
     result = result && state.target_calls == 1u && fcntl(state.reused, F_GETFD) >= 0 &&
-             close(state.reused) == 0 && directory_empty(owner.descriptor()) &&
-             owner.settle(directory_diagnostic);
+             final_outcome.attempts == frozen.attempts &&
+             final_outcome.attempted == frozen.attempted &&
+             final_outcome.succeeded == frozen.succeeded &&
+             final_outcome.uncertain == frozen.uncertain &&
+             final_outcome.error_number == frozen.error_number && close(state.reused) == 0 &&
+             directory_empty(owner.descriptor()) && owner.settle(directory_diagnostic);
     return check(result, "one-shot close retried or closed a reused foreign slot");
 }
 
@@ -532,7 +638,8 @@ bool one_shot_close_tests() {
     return close_reuse_case(input::DescriptorRole::Writer, 120u) &&
            close_reuse_case(input::DescriptorRole::Reader, 123u) &&
            close_reuse_case(input::DescriptorRole::AuthorityOne, 126u) &&
-           close_reuse_case(input::DescriptorRole::AuthorityTwo, 129u);
+           close_reuse_case(input::DescriptorRole::AuthorityTwo, 129u) &&
+           close_reuse_case(input::DescriptorRole::Directory, 132u);
 }
 
 input::FailurePhase cleanup_phase(input::CleanupFaultForTesting fault) {
@@ -728,6 +835,8 @@ bool same_receipt(const input::CleanupReceipt& left, const input::CleanupReceipt
            left.directory_settled == right.directory_settled &&
            left.settlement_complete == right.settlement_complete &&
            left.foreign_reader_preserved == right.foreign_reader_preserved &&
+           left.foreign_authority_one_preserved == right.foreign_authority_one_preserved &&
+           left.foreign_authority_two_preserved == right.foreign_authority_two_preserved &&
            left.original_residue == right.original_residue &&
            left.quarantine_residue == right.quarantine_residue && left.state == right.state &&
            same_diagnostic(left.diagnostic, right.diagnostic) &&
@@ -766,9 +875,10 @@ int main() {
         !byte_metadata_mutation_tests() || !replacement_test(ReplacementKind::Regular, 45u) ||
         !replacement_test(ReplacementKind::Symlink, 48u) ||
         !replacement_test(ReplacementKind::Fifo, 51u) || !descriptor_mutation_tests() ||
-        !embedded_nul_test() || !exact_ofd_tests() || !one_shot_close_tests() ||
-        !cleanup_fault_tests() || !quarantine_exchange_test() || !final_unlink_exchange_test() ||
-        !both_name_residue_gate_test() || !terminal_receipt_freeze_test())
+        !embedded_nul_test() || !exact_ofd_tests() || !symmetric_custody_replacement_tests() ||
+        !one_shot_close_tests() || !cleanup_fault_tests() || !quarantine_exchange_test() ||
+        !final_unlink_exchange_test() || !both_name_residue_gate_test() ||
+        !terminal_receipt_freeze_test())
         return 1;
     std::puts("PASS: #358 exact input file lease");
 }
