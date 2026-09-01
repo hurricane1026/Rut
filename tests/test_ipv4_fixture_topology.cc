@@ -75,11 +75,6 @@ int main() {
                      "socket policy evidence was accepted\n";
         return 1;
     }
-    const char* pure_only = std::getenv("RUT_IPV4_TOPOLOGY_PURE_ONLY");
-    if (pure_only != nullptr && std::string(pure_only) == "1") {
-        std::cerr << "PASS: #412 pure holder retirement/recovery validation\n";
-        return 0;
-    }
     const RunResult preflight = rut::test::ipv4_topology::run(FailurePoint::AfterNetworkACreated);
     if (preflight.prerequisite_failure) {
         if (!preflight.optional_skip_safe) {
