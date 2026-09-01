@@ -8,6 +8,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <new>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -4459,95 +4461,175 @@ static bool proc_socket_inodes(pid_t pid, std::vector<std::uint64_t>& inodes) {
     return ok;
 }
 
-static bool strict_tcp6_port_absent(const std::string& contents, u16 port) {
-    if (contents.empty() || contents.size() > fixture_privileged_listener::kMaxProcBytes ||
-        contents.back() != '\n' || contents.find('\0') != std::string::npos)
-        return false;
-    std::istringstream lines(contents);
-    std::string line;
-    if (!std::getline(lines, line)) return false;
-    {
-        std::istringstream header_stream(line);
-        std::vector<std::string> header;
-        std::string token;
-        while (header_stream >> token) header.push_back(token);
-        const std::vector<std::string> expected{"sl",
-                                                "local_address",
-                                                "remote_address",
-                                                "st",
-                                                "tx_queue",
-                                                "rx_queue",
-                                                "tr",
-                                                "tm->when",
-                                                "retrnsmt",
-                                                "uid",
-                                                "timeout",
-                                                "inode"};
-        if (header != expected) {
-            auto kernel_variant = expected;
-            kernel_variant[2] = "rem_address";
-            if (header != kernel_variant) return false;
-        }
-    }
-    const auto exact_hex = [](const std::string& value, std::size_t size) {
-        return value.size() == size &&
-               std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-                   return std::isxdigit(byte) != 0;
-               });
-    };
-    const auto exact_pair = [&](const std::string& value, std::size_t left, std::size_t right) {
-        return value.size() == left + right + 1u && value[left] == ':' &&
-               exact_hex(value.substr(0u, left), left) && exact_hex(value.substr(left + 1u), right);
-    };
-    const auto exact_decimal = [](const std::string& value) {
-        if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-                return std::isdigit(byte) != 0;
-            }))
-            return false;
-        char* end = nullptr;
-        errno = 0;
-        (void)strtoull(value.c_str(), &end, 10);
-        return errno == 0 && end != value.c_str() && *end == '\0';
-    };
-    std::size_t rows = 0u;
-    while (std::getline(lines, line)) {
-        std::istringstream fields(line);
-        std::vector<std::string> tokens;
-        std::string token;
-        while (fields >> token) tokens.push_back(token);
-        if (++rows > fixture_privileged_listener::kMaxProcRows || tokens.size() != 17u)
-            return false;
-        const std::string& slot = tokens[0];
-        const std::string& local = tokens[1];
-        if (slot.size() < 2u || slot.back() != ':' ||
-            !exact_decimal(slot.substr(0u, slot.size() - 1u)) || local.size() != 37u ||
-            local[32] != ':' || !exact_hex(local.substr(0u, 32u), 32u) ||
-            !exact_hex(local.substr(33u), 4u) || tokens[2].size() != 37u || tokens[2][32] != ':' ||
-            !exact_hex(tokens[2].substr(0u, 32u), 32u) || !exact_hex(tokens[2].substr(33u), 4u) ||
-            !exact_hex(tokens[3], 2u) || !exact_pair(tokens[4], 8u, 8u) ||
-            !exact_pair(tokens[5], 2u, 8u) || !exact_hex(tokens[6], 8u) ||
-            !exact_decimal(tokens[7]) || !exact_decimal(tokens[8]) || !exact_decimal(tokens[9]) ||
-            !exact_decimal(tokens[10]) || !exact_hex(tokens[11], 16u) ||
-            !exact_decimal(tokens[12]) || !exact_decimal(tokens[13]) ||
-            !exact_decimal(tokens[14]) || !exact_decimal(tokens[15]) || !exact_decimal(tokens[16]))
-            return false;
-        char* end = nullptr;
-        errno = 0;
-        const unsigned long selected = strtoul(local.c_str() + 33u, &end, 16);
-        if (errno != 0 || end != local.c_str() + 37u || selected > 0xffffu) return false;
-        if (selected == port) return false;
+using NginxProcTcpTable = fixture_privileged_listener::ProcTcpTable;
+
+static bool nginx_proc_unsigned(std::string_view text, int base, u64 maximum, u64& value) {
+    if (text.empty()) return false;
+    value = 0u;
+    const char* const begin = text.data();
+    const char* const end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, value, base);
+    return parsed.ec == std::errc{} && parsed.ptr == end && value <= maximum;
+}
+
+static bool nginx_proc_signed_ssthresh(std::string_view text) {
+    std::int64_t value = 0;
+    if (text.empty()) return false;
+    const char* const begin = text.data();
+    const char* const end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, value, 10);
+    return parsed.ec == std::errc{} && parsed.ptr == end && value >= -1 &&
+           value <= std::numeric_limits<std::int32_t>::max();
+}
+
+template <std::size_t Size>
+static bool nginx_proc_tokens(std::string_view line,
+                              std::array<std::string_view, Size>& tokens,
+                              std::size_t& count) {
+    count = 0u;
+    std::size_t cursor = 0u;
+    while (cursor < line.size()) {
+        while (cursor < line.size() && (line[cursor] == ' ' || line[cursor] == '\t')) ++cursor;
+        if (cursor == line.size()) break;
+        const std::size_t begin = cursor;
+        while (cursor < line.size() && line[cursor] != ' ' && line[cursor] != '\t') ++cursor;
+        if (count == tokens.size() || cursor - begin > 64u) return false;
+        tokens[count++] = line.substr(begin, cursor - begin);
     }
     return true;
 }
 
-static bool strict_exact_nginx_listener(const fixture_privileged_listener::ProcTcpTable& table,
+static bool nginx_proc_exact_hex(std::string_view text, std::size_t width, u64& value) {
+    return text.size() == width && width <= 16u &&
+           nginx_proc_unsigned(text, 16, std::numeric_limits<u64>::max(), value);
+}
+
+static bool nginx_proc_hex_pair(std::string_view text,
+                                std::size_t left_width,
+                                std::size_t right_width,
+                                u64 left_maximum = std::numeric_limits<u64>::max(),
+                                u64 right_maximum = std::numeric_limits<u64>::max()) {
+    if (text.size() != left_width + right_width + 1u || text[left_width] != ':') return false;
+    u64 left = 0u;
+    u64 right = 0u;
+    return nginx_proc_exact_hex(text.substr(0u, left_width), left_width, left) &&
+           nginx_proc_exact_hex(text.substr(left_width + 1u), right_width, right) &&
+           left <= left_maximum && right <= right_maximum;
+}
+
+static bool nginx_proc_endpoint(std::string_view text,
+                                std::size_t address_width,
+                                u32& ipv4,
+                                u16& port) {
+    if ((address_width != 8u && address_width != 32u) || text.size() != address_width + 5u ||
+        text[address_width] != ':')
+        return false;
+    u64 parsed_port = 0u;
+    if (!nginx_proc_exact_hex(text.substr(address_width + 1u), 4u, parsed_port)) return false;
+    port = static_cast<u16>(parsed_port);
+    ipv4 = 0u;
+    if (address_width == 8u) {
+        u64 raw = 0u;
+        if (!nginx_proc_exact_hex(text.substr(0u, address_width), address_width, raw)) return false;
+        const u32 value = static_cast<u32>(raw);
+        ipv4 = ((value & 0x000000ffu) << 24u) | ((value & 0x0000ff00u) << 8u) |
+               ((value & 0x00ff0000u) >> 8u) | ((value & 0xff000000u) >> 24u);
+        return true;
+    }
+    u64 half = 0u;
+    return nginx_proc_exact_hex(text.substr(0u, 16u), 16u, half) &&
+           nginx_proc_exact_hex(text.substr(16u, 16u), 16u, half);
+}
+
+static bool parse_nginx_proc_net_tcp(const std::string& contents,
+                                     std::size_t address_width,
+                                     NginxProcTcpTable& table) {
+    table = {};
+    if (contents.empty() || contents.size() > fixture_privileged_listener::kMaxProcBytes ||
+        contents.back() != '\n' || contents.find('\0') != std::string::npos ||
+        (address_width != 8u && address_width != 32u))
+        return false;
+
+    std::size_t offset = 0u;
+    std::size_t line_number = 0u;
+    while (offset < contents.size()) {
+        const std::size_t newline = contents.find('\n', offset);
+        if (newline == std::string::npos || newline - offset > 512u) return false;
+        const std::string_view line(contents.data() + offset, newline - offset);
+        offset = newline + 1u;
+        std::array<std::string_view, 18u> tokens{};
+        std::size_t count = 0u;
+        if (!nginx_proc_tokens(line, tokens, count)) return false;
+        if (line_number++ == 0u) {
+            if (count != 12u || tokens[0] != "sl" || tokens[1] != "local_address" ||
+                (tokens[2] != "remote_address" && tokens[2] != "rem_address") ||
+                tokens[3] != "st" || tokens[4] != "tx_queue" || tokens[5] != "rx_queue" ||
+                tokens[6] != "tr" || tokens[7] != "tm->when" || tokens[8] != "retrnsmt" ||
+                tokens[9] != "uid" || tokens[10] != "timeout" || tokens[11] != "inode")
+                return false;
+            continue;
+        }
+        if (count < 12u || table.count == table.rows.size()) return false;
+        u64 slot = 0u;
+        if (tokens[0].size() < 2u || tokens[0].back() != ':' ||
+            !nginx_proc_unsigned(tokens[0].substr(0u, tokens[0].size() - 1u),
+                                 10,
+                                 std::numeric_limits<u32>::max(),
+                                 slot))
+            return false;
+        fixture_privileged_listener::ProcTcpRecord row{};
+        u32 remote_ipv4 = 0u;
+        u16 remote_port = 0u;
+        u64 state = 0u;
+        u64 ignored = 0u;
+        if (!nginx_proc_endpoint(tokens[1], address_width, row.local_ipv4, row.local_port) ||
+            !nginx_proc_endpoint(tokens[2], address_width, remote_ipv4, remote_port) ||
+            !nginx_proc_exact_hex(tokens[3], 2u, state) || state == 0u || state > 0x0cu ||
+            !nginx_proc_hex_pair(tokens[4], 8u, 8u) ||
+            !nginx_proc_hex_pair(tokens[5], 2u, 8u, 4u) ||
+            !nginx_proc_exact_hex(tokens[6], 8u, ignored) ||
+            !nginx_proc_unsigned(tokens[7], 10, std::numeric_limits<u32>::max(), ignored) ||
+            !nginx_proc_unsigned(
+                tokens[8], 10, std::numeric_limits<std::int32_t>::max(), ignored) ||
+            !nginx_proc_unsigned(tokens[9], 10, std::numeric_limits<u64>::max(), row.inode) ||
+            !nginx_proc_unsigned(
+                tokens[10], 10, std::numeric_limits<std::int32_t>::max(), ignored) ||
+            !nginx_proc_exact_hex(tokens[11], sizeof(void*) * 2u, ignored))
+            return false;
+        row.state = static_cast<std::uint8_t>(state);
+        const bool short_kernel_row = row.state == 0x06u;
+        if (short_kernel_row) {
+            if (count != 12u) return false;
+        } else {
+            if (count != 17u ||
+                !nginx_proc_unsigned(tokens[12], 10, std::numeric_limits<u64>::max(), ignored) ||
+                !nginx_proc_unsigned(tokens[13], 10, std::numeric_limits<u64>::max(), ignored) ||
+                !nginx_proc_unsigned(tokens[14], 10, std::numeric_limits<u32>::max(), ignored) ||
+                !nginx_proc_unsigned(tokens[15], 10, std::numeric_limits<u32>::max(), ignored) ||
+                !nginx_proc_signed_ssthresh(tokens[16]))
+                return false;
+        }
+        table.rows[table.count++] = row;
+    }
+    return true;
+}
+
+static bool strict_tcp6_port_absent(const std::string& contents, u16 port) {
+    NginxProcTcpTable table;
+    if (!parse_nginx_proc_net_tcp(contents, 32u, table)) return false;
+    for (std::size_t index = 0u; index < table.count; ++index)
+        if (table.rows[index].local_port == port) return false;
+    return true;
+}
+
+static bool strict_exact_nginx_listener(const NginxProcTcpTable& table,
                                         u32 positive,
                                         u32 guard,
                                         const std::vector<std::uint64_t>& process_socket_inodes,
                                         fixture_privileged_listener::ListenerEvidence& listener,
                                         fixture_privileged_listener::Diagnostic& diagnostic) {
     std::size_t selected_rows = 0u;
-    std::uint64_t selected_inode = 0u;
+    u64 selected_inode = 0u;
     for (std::size_t index = 0u; index < table.count; ++index) {
         const auto& row = table.rows[index];
         if (row.local_port != kExactInputTopologyBuilderPort) continue;
@@ -4562,7 +4644,7 @@ static bool strict_exact_nginx_listener(const fixture_privileged_listener::ProcT
     return fixture_privileged_listener::classify_listener_evidence(
         table,
         fixture_privileged_listener::ListenerPlan{positive, guard, kExactInputTopologyBuilderPort},
-        std::vector<std::uint64_t>{selected_inode},
+        std::vector<u64>{selected_inode},
         fixture_privileged_listener::ListenerEvidenceKind::ExactPositive,
         listener,
         diagnostic);
@@ -5145,12 +5227,12 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
         return false;
     }
     u32 positive = 0u, guard = 0u;
-    fixture_privileged_listener::ProcTcpTable table;
+    NginxProcTcpTable table;
     fixture_privileged_listener::Diagnostic parser_diagnostic;
     fixture_privileged_listener::ListenerEvidence listener;
     if (!parse_ipv4(owner.builder_baseline.positive_ip, positive) ||
         !parse_ipv4(owner.builder_baseline.guard_ip, guard) ||
-        !fixture_privileged_listener::parse_proc_net_tcp(tcp, table, parser_diagnostic)) {
+        !parse_nginx_proc_net_tcp(tcp, 8u, table)) {
         error = "nginx TCP table or listener plan was rejected";
         return false;
     }
@@ -6966,22 +7048,29 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     const auto tcp_row = [](const std::string& local,
                             const std::string& state,
                             const std::string& inode,
-                            unsigned slot) {
+                            unsigned slot,
+                            const std::string& ssthresh = "0") {
         return " " + std::to_string(slot) + ": " + local + " 00000000:0000 " + state +
                " 00000000:00000000 00:00000000 00000000 1000 0 " + inode +
-               " 1 0000000000000000 100 0 0 10 0\n";
+               " 1 0000000000000000 100 0 0 10 " + ssthresh + "\n";
+    };
+    const auto tcp_time_wait_row = [](const std::string& local, unsigned slot) {
+        return " " + std::to_string(slot) + ": " + local +
+               " 0100007F:C350 06 00000000:00000000 03:00000001 00000000 1000 0 0 "
+               "3 0000000000000000\n";
     };
     const auto exact_listener = [&](const std::string& contents) {
-        fixture_privileged_listener::ProcTcpTable table;
+        NginxProcTcpTable table;
         fixture_privileged_listener::Diagnostic parser;
         fixture_privileged_listener::ListenerEvidence listener;
-        return fixture_privileged_listener::parse_proc_net_tcp(contents, table, parser) &&
+        return parse_nginx_proc_net_tcp(contents, 8u, table) &&
                strict_exact_nginx_listener(
                    table, 0x0a010203u, 0x0a010204u, {301u}, listener, parser) &&
                listener.child_owned_inode == 301u;
     };
     const std::string valid_tcp = tcp_header + tcp_row("0302010A:A381", "0A", "301", 0u) +
-                                  tcp_row("00000000:A380", "07", "999", 1u);
+                                  tcp_row("00000000:A380", "07", "999", 1u, "-1") +
+                                  tcp_time_wait_row("0100007F:C001", 2u);
     if (!exact_listener(valid_tcp)) {
         diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid strict nginx TCP seed failed"};
         return false;
@@ -6993,39 +7082,68 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         if (exact_listener(rejected)) return false;
         ++mutation_rejections;
     }
-    fixture_privileged_listener::ProcTcpTable malformed_table;
-    fixture_privileged_listener::Diagnostic malformed_diagnostic;
-    if (fixture_privileged_listener::parse_proc_net_tcp(
-            tcp_header + " 0: 0302010A:A381 00000000:0000 0A\n",
-            malformed_table,
-            malformed_diagnostic))
+    const auto reject_tcp = [&](std::string contents) {
+        NginxProcTcpTable ignored;
+        if (parse_nginx_proc_net_tcp(contents, 8u, ignored)) return false;
+        ++mutation_rejections;
+        return true;
+    };
+    const std::string selected_ten_tokens = tcp_header +
+                                            " 0: 0302010A:A381 00000000:0000 0A 00000000:00000000 "
+                                            "00:00000000 00000000 1000 0 301\n";
+    if (!reject_tcp(selected_ten_tokens) ||
+        !reject_tcp(tcp_header +
+                    " 0: 0302010A:A381 00000000:0000 0A 00000000-00000000 "
+                    "00:00000000 00000000 1000 0 301 1 0000000000000000 100 0 0 10 0\n") ||
+        !reject_tcp(tcp_header +
+                    " 0: 0302010A:A381 00000000:0000 0A 00000000:00000000 "
+                    "00-00000000 00000000 1000 0 301 1 0000000000000000 100 0 0 10 0\n") ||
+        !reject_tcp(tcp_header + tcp_row("0302010A:A381", "0A", "301", 0u) +
+                    " 1: 00000000:A380 00000000:0000 07 00000000:00000000 "
+                    "00:00000000 00000000 uid 0 999 1 0000000000000000 100 0 0 10 0\n") ||
+        !reject_tcp(tcp_header + tcp_row("0302010A:A381", "0A", "301", 0u) +
+                    " 1: 00000000:A380 00000000:0000 07 00000000:00000000 "
+                    "00:00000000 00000000 1000 0 inode 1 0000000000000000 100 0 0 10 0\n") ||
+        !reject_tcp(tcp_header + tcp_row("0302010A:A381", "0A", "301", 0u) +
+                    " 1: 00000000:A380 00000000:0000 07 00000000:00000000 "
+                    "00:00000000 00000000 1000 0 999 1 0000000000000000 metric 0 0 10 0\n"))
         return false;
-    ++mutation_rejections;
 
     const std::string tcp6_header =
         "  sl  local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid "
         "timeout inode\n";
-    const auto tcp6_row = [](const char* port, const char* state, const char* inode) {
-        return std::string(" 0: 00000000000000000000000000000000:") + port +
-               " 00000000000000000000000000000000:0000 " + state +
-               " 00000000:00000000 00:00000000 00000000 1000 0 " + inode +
-               " 1 0000000000000000 100 0 0 10 0\n";
+    const auto tcp6_row =
+        [](const char* port, const char* state, const char* inode, const char* ssthresh = "0") {
+            return std::string(" 0: 00000000000000000000000000000000:") + port +
+                   " 00000000000000000000000000000000:0000 " + state +
+                   " 00000000:00000000 00:00000000 00000000 1000 0 " + inode +
+                   " 1 0000000000000000 100 0 0 10 " + ssthresh + "\n";
+        };
+    const auto tcp6_time_wait_row = [](const char* port) {
+        return std::string(" 1: 00000000000000000000000000000000:") + port +
+               " 00000000000000000000000000010000:C350 06 00000000:00000000 "
+               "03:00000001 00000000 1000 0 0 3 0000000000000000\n";
     };
-    const std::string absent = tcp6_header + tcp6_row("A380", "0A", "401");
-    const std::string present = absent + tcp6_row("A381", "07", "402");
+    const std::string absent =
+        tcp6_header + tcp6_row("A380", "0A", "401", "-1") + tcp6_time_wait_row("C001");
+    const std::string present_standard = absent + tcp6_row("A381", "07", "402");
+    const std::string present_time_wait = absent + tcp6_time_wait_row("A381");
     const std::string malformed_tcp6 = tcp6_header + tcp6_row("A380", "0A", "not-an-inode");
-    const std::string truncated_tcp6 = tcp6_header +
-                                       " 0: 00000000000000000000000000000000:A380 "
-                                       "00000000000000000000000000000000:0000 0A\n";
+    const std::string malformed_unrelated_tcp6 =
+        tcp6_header +
+        " 0: 00000000000000000000000000000000:A380 "
+        "00000000000000000000000000000000:0000 0A 00000000:00000000 "
+        "00:00000000 00000000 1000 0 401 1 0000000000000000 100 0 0 10 -2\n";
     if (!strict_tcp6_port_absent(absent, kExactInputTopologyBuilderPort) ||
-        strict_tcp6_port_absent(present, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(present_standard, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(present_time_wait, kExactInputTopologyBuilderPort) ||
         strict_tcp6_port_absent(malformed_tcp6, kExactInputTopologyBuilderPort) ||
-        strict_tcp6_port_absent(truncated_tcp6, kExactInputTopologyBuilderPort)) {
+        strict_tcp6_port_absent(malformed_unrelated_tcp6, kExactInputTopologyBuilderPort)) {
         diagnostic = {
             ExactInputMountPhase::Lifecycle, 0, "strict nginx TCP6 parser self-check failed"};
         return false;
     }
-    mutation_rejections += 3u;
+    mutation_rejections += 4u;
     if (!nginx_auto_remove_disabled("false") || nginx_auto_remove_disabled("true") ||
         nginx_auto_remove_disabled("False") || nginx_auto_remove_disabled("false "))
         return false;
@@ -7044,7 +7162,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         return false;
     }
     ++mutation_rejections;
-    return mutation_rejections == 33u;
+    return mutation_rejections == 39u;
 }
 
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
