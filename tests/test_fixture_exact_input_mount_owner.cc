@@ -11,7 +11,9 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -136,6 +138,7 @@ bool write_all(int fd, const std::string& bytes) {
 }
 
 int run_exact_read_helper(const std::string& name, const char* argument = nullptr) {
+    if (name == "immediate") return 0;
     if (name == "max") {
         std::string bytes(8192, '\0');
         for (size_t index = 0; index < bytes.size(); ++index)
@@ -157,6 +160,48 @@ int run_exact_read_helper(const std::string& name, const char* argument = nullpt
             _exit(0);
         }
         return 0;
+    }
+    if (name == "handoff") {
+        constexpr unsigned kGenerations = 32;
+        for (unsigned generation = 0; generation < kGenerations; ++generation) {
+            const pid_t next = fork();
+            if (next < 0) return 126;
+            if (next > 0) return 0;
+        }
+        errno = 0;
+        const bool setpgid_blocked = setpgid(0, 0) < 0 && errno == EPERM;
+        errno = 0;
+        const bool setsid_blocked = setsid() < 0 && errno == EPERM;
+        if (!setpgid_blocked || !setsid_blocked || !write_all(STDOUT_FILENO, "handoff")) _exit(126);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        (void)poll(nullptr, 0, 3000);
+        _exit(0);
+    }
+    if (name == "confinement") {
+        const pid_t ordinary = fork();
+        if (ordinary < 0) return 126;
+        if (ordinary == 0) {
+            errno = 0;
+            const bool group_denied = setpgid(0, 0) < 0 && errno == EPERM;
+            errno = 0;
+            const bool session_denied = setsid() < 0 && errno == EPERM;
+            _exit(group_denied && session_denied ? 0 : 125);
+        }
+        int ordinary_status = 0;
+        if (waitpid(ordinary, &ordinary_status, 0) != ordinary || !WIFEXITED(ordinary_status) ||
+            WEXITSTATUS(ordinary_status) != 0)
+            return 125;
+#ifdef SYS_clone
+        const pid_t clone_parent =
+            static_cast<pid_t>(syscall(SYS_clone, CLONE_PARENT | SIGCHLD, 0, nullptr, nullptr, 0));
+        if (clone_parent < 0) return 126;
+        if (clone_parent == 0) _exit(0);
+        int ignored = 0;
+        errno = 0;
+        if (waitpid(clone_parent, &ignored, WNOHANG) >= 0 || errno != ECHILD) return 125;
+#endif
+        return write_all(STDOUT_FILENO, "confined") ? 0 : 126;
     }
     if (name == "fd-excluded") {
         if (argument == nullptr) return 126;
@@ -194,7 +239,6 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.wait_status_valid == right.wait_status_valid &&
            left.process_group_owned == right.process_group_owned &&
            left.process_group_gone == right.process_group_gone &&
-           left.group_absence_confirmations == right.group_absence_confirmations &&
            left.pidfd_opened == right.pidfd_opened &&
            left.pidfd_identity_verified == right.pidfd_identity_verified &&
            left.pidfd_closed_after_group_gone == right.pidfd_closed_after_group_gone &&
@@ -204,6 +248,16 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.leader_exit_observed_before_group_cleanup ==
                right.leader_exit_observed_before_group_cleanup &&
            left.descendant_group_member_observed == right.descendant_group_member_observed &&
+           left.supervisor_session_verified == right.supervisor_session_verified &&
+           left.supervisor_subreaper_verified == right.supervisor_subreaper_verified &&
+           left.actual_exec_observed == right.actual_exec_observed &&
+           left.subtree_confinement_installed == right.subtree_confinement_installed &&
+           left.group_echild_observed == right.group_echild_observed &&
+           left.control_eof_cleanup == right.control_eof_cleanup &&
+           left.setpgid_denied == right.setpgid_denied &&
+           left.setsid_denied == right.setsid_denied &&
+           left.clone_parent_observed == right.clone_parent_observed &&
+           left.adopted_reap_count == right.adopted_reap_count &&
            left.foreign_process_survived == right.foreign_process_survived &&
            left.foreign_fd_excluded == right.foreign_fd_excluded &&
            left.deadline_exceeded == right.deadline_exceeded &&
@@ -223,8 +277,9 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.stderr_read_errno == right.stderr_read_errno &&
            left.launch_failure_stage == right.launch_failure_stage &&
            left.launch_errno == right.launch_errno && left.wait_status == right.wait_status &&
-           left.command_argv == right.command_argv && left.stdout_bytes == right.stdout_bytes &&
-           left.stderr_bytes == right.stderr_bytes &&
+           left.command_argv == right.command_argv &&
+           left.resolved_executable == right.resolved_executable &&
+           left.stdout_bytes == right.stdout_bytes && left.stderr_bytes == right.stderr_bytes &&
            left.diagnostic.phase == right.diagnostic.phase &&
            left.diagnostic.error_number == right.diagnostic.error_number &&
            left.diagnostic.message == right.diagnostic.message;
@@ -234,8 +289,32 @@ bool exact_read_runner_self_checks(std::string& error) {
     const std::vector<std::pair<ExactInputReadRunnerTestCase, ExactInputReadOutcome>> cases = {
         {ExactInputReadRunnerTestCase::CommandStartFailure,
          ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::ImmediateExecSuccess, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::LeaderExitWithDescendant,
          ExactInputReadOutcome::DeadlineExceeded},
+        {ExactInputReadRunnerTestCase::ForkHandoffChain, ExactInputReadOutcome::Complete},
+        {ExactInputReadRunnerTestCase::SubtreeConfinement, ExactInputReadOutcome::Complete},
+        {ExactInputReadRunnerTestCase::ParentControlEof, ExactInputReadOutcome::Complete},
+        {ExactInputReadRunnerTestCase::StatusShort, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusOversize, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusMultiple, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusBadMagic, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusBadVersion, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusReserved, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusNoneStage, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusPidfdOpenStage,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusPidfdIdentityStage,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusExecStatusProtocolStage,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusUnknownStage,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusZeroErrno, ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusNegativeErrno,
+         ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::StatusZeroBytePreExecDeath,
+         ExactInputReadOutcome::CommandStartFailed},
         {ExactInputReadRunnerTestCase::ForeignFdExcluded, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::MaxSizeExact, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::EmbeddedNulExact, ExactInputReadOutcome::Complete},
@@ -257,20 +336,40 @@ bool exact_read_runner_self_checks(std::string& error) {
             error = "deterministic exact-read outcome or process custody differed";
             return false;
         }
-        const bool start_failure = test_case == ExactInputReadRunnerTestCase::CommandStartFailure;
+        const bool protocol_failure =
+            test_case >= ExactInputReadRunnerTestCase::StatusShort &&
+            test_case <= ExactInputReadRunnerTestCase::StatusZeroBytePreExecDeath;
+        const bool start_failure =
+            test_case == ExactInputReadRunnerTestCase::CommandStartFailure || protocol_failure;
         if (observation.command_started == start_failure || !observation.child_reaped ||
             !observation.wait_status_valid || !observation.process_group_owned ||
             !observation.process_group_gone || !observation.pidfd_opened ||
             !observation.pidfd_identity_verified || !observation.pidfd_closed_after_group_gone ||
-            observation.group_absence_confirmations < 2u || !observation.final_deadline_recorded ||
-            !observation.cleanup_completed_before_final_deadline) {
+            !observation.final_deadline_recorded ||
+            !observation.cleanup_completed_before_final_deadline ||
+            !observation.supervisor_session_verified ||
+            !observation.supervisor_subreaper_verified ||
+            !observation.subtree_confinement_installed || !observation.group_echild_observed ||
+            observation.adopted_reap_count == 0u ||
+            observation.actual_exec_observed == start_failure) {
             error = "exact-read start/child/PGID evidence was not causal";
             return false;
         }
-        if (start_failure &&
+        if (observation.resolved_executable.empty() ||
+            observation.resolved_executable.front() != '/') {
+            error = "direct execve executable evidence was not resolved without a shell";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::CommandStartFailure &&
             (observation.launch_failure_stage != ExactInputReadLaunchStage::Execute ||
              observation.launch_errno != ENOENT)) {
             error = "real exec failure did not preserve exact stage and errno";
+            return false;
+        }
+        if (protocol_failure &&
+            (observation.launch_failure_stage != ExactInputReadLaunchStage::ExecStatusProtocol ||
+             observation.launch_errno != EPROTO)) {
+            error = "malformed exec-status datagram was not rejected fail closed";
             return false;
         }
         if (test_case == ExactInputReadRunnerTestCase::LeaderExitWithDescendant &&
@@ -286,6 +385,23 @@ bool exact_read_runner_self_checks(std::string& error) {
             error = "execed helper inherited the sentinel foreign descriptor";
             return false;
         }
+        if (test_case == ExactInputReadRunnerTestCase::ForkHandoffChain &&
+            (observation.adopted_reap_count != 33u || !observation.setpgid_denied ||
+             !observation.setsid_denied || !observation.descendant_group_member_observed)) {
+            error = "32-generation handoff chain escaped exact subreaper/group custody";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::SubtreeConfinement &&
+            (!observation.setpgid_denied || !observation.setsid_denied ||
+             !observation.clone_parent_observed || observation.adopted_reap_count != 2u)) {
+            error = "seccomp or CLONE_PARENT custody evidence was incomplete";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::ParentControlEof &&
+            !observation.control_eof_cleanup) {
+            error = "parent control EOF did not causally trigger supervisor cleanup";
+            return false;
+        }
         if (test_case == ExactInputReadRunnerTestCase::MaxSizeExact &&
             (!observation.stdout_eof || !observation.stderr_eof ||
              observation.stdout_bytes.size() != 8192u)) {
@@ -298,8 +414,8 @@ bool exact_read_runner_self_checks(std::string& error) {
             return false;
         }
         if (test_case == ExactInputReadRunnerTestCase::HeldOpenAfterExactBytes &&
-            (!observation.deadline_exceeded || observation.stdout_eof)) {
-            error = "held-open exact bytes were accepted without EOF";
+            (!observation.deadline_exceeded || !observation.stdout_eof)) {
+            error = "held-open exact bytes did not require bounded cleanup before EOF";
             return false;
         }
         if (test_case == ExactInputReadRunnerTestCase::ExtraByteThenEof &&
@@ -321,6 +437,17 @@ bool exact_read_runner_self_checks(std::string& error) {
         if (test_case == ExactInputReadRunnerTestCase::NonemptyStderr &&
             observation.stderr_bytes != "bad") {
             error = "stderr remained merged or empty";
+            return false;
+        }
+    }
+    for (unsigned repetition = 0; repetition < 32u; ++repetition) {
+        ExactInputReadObservation observation;
+        ExactInputMountDiagnostic diagnostic;
+        if (!exact_input_mount_test_read_runner_case(
+                ExactInputReadRunnerTestCase::ForkHandoffChain, observation, diagnostic) ||
+            observation.outcome != ExactInputReadOutcome::Complete ||
+            observation.adopted_reap_count != 33u || !observation.group_echild_observed) {
+            error = "repeated 32-generation handoff custody was not deterministic";
             return false;
         }
     }
@@ -542,12 +669,18 @@ int main(int argc, char** argv) {
         !read_observation.stderr_eof || !read_observation.child_reaped ||
         !read_observation.wait_status_valid || !read_observation.process_group_owned ||
         !read_observation.process_group_gone || read_observation.deadline_exceeded ||
-        read_observation.output_overflow || read_observation.stdout_read_errno != 0 ||
-        read_observation.stderr_read_errno != 0 || !read_observation.pre_source_revalidated ||
-        !read_observation.pre_container_identity || !read_observation.pre_mount_inspected ||
-        !read_observation.pre_proc_credentials || !read_observation.post_source_revalidated ||
-        !read_observation.post_container_identity || !read_observation.post_mount_inspected ||
-        !read_observation.post_proc_credentials || !read_observation.registered_identity_matched ||
+        !read_observation.supervisor_session_verified ||
+        !read_observation.supervisor_subreaper_verified || !read_observation.actual_exec_observed ||
+        !read_observation.subtree_confinement_installed ||
+        !read_observation.group_echild_observed || read_observation.adopted_reap_count == 0u ||
+        read_observation.resolved_executable.empty() ||
+        read_observation.resolved_executable.front() != '/' || read_observation.output_overflow ||
+        read_observation.stdout_read_errno != 0 || read_observation.stderr_read_errno != 0 ||
+        !read_observation.pre_source_revalidated || !read_observation.pre_container_identity ||
+        !read_observation.pre_mount_inspected || !read_observation.pre_proc_credentials ||
+        !read_observation.post_source_revalidated || !read_observation.post_container_identity ||
+        !read_observation.post_mount_inspected || !read_observation.post_proc_credentials ||
+        !read_observation.registered_identity_matched ||
         !read_observation.registered_mount_matched ||
         read_observation.command_argv !=
             std::vector<std::string>(
@@ -907,7 +1040,10 @@ int main(int argc, char** argv) {
             !failed.pre_source_revalidated || !failed.pre_container_identity ||
             !failed.pre_mount_inspected || !failed.pre_proc_credentials ||
             !failed.command_started || !failed.child_reaped || !failed.process_group_owned ||
-            !failed.process_group_gone || failed.post_container_identity ||
+            !failed.process_group_gone || !failed.supervisor_session_verified ||
+            !failed.supervisor_subreaper_verified || !failed.actual_exec_observed ||
+            !failed.subtree_confinement_installed || !failed.group_echild_observed ||
+            failed.post_container_identity ||
             diagnostic.phase != ExactInputMountPhase::InputObservation) {
             std::cerr << "FAIL [#358 exact input post-read death bracket]: " << diagnostic.message
                       << "\n";

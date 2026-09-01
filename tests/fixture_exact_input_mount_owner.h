@@ -38,9 +38,11 @@ enum class ExactInputReadOutcome : std::uint8_t {
 enum class ExactInputReadLaunchStage : std::uint8_t {
     None,
     ProcessGroup,
+    ParentDeathGuard,
     StdoutDuplication,
     StderrDuplication,
     DescriptorCustody,
+    SubtreeConfinement,
     Execute,
     PidfdOpen,
     PidfdIdentity,
@@ -165,7 +167,6 @@ struct ExactInputReadObservation {
     bool wait_status_valid = false;
     bool process_group_owned = false;
     bool process_group_gone = false;
-    std::uint32_t group_absence_confirmations = 0;
     bool pidfd_opened = false;
     bool pidfd_identity_verified = false;
     bool pidfd_closed_after_group_gone = false;
@@ -173,6 +174,16 @@ struct ExactInputReadObservation {
     bool cleanup_completed_before_final_deadline = false;
     bool leader_exit_observed_before_group_cleanup = false;
     bool descendant_group_member_observed = false;
+    bool supervisor_session_verified = false;
+    bool supervisor_subreaper_verified = false;
+    bool actual_exec_observed = false;
+    bool subtree_confinement_installed = false;
+    bool group_echild_observed = false;
+    bool control_eof_cleanup = false;
+    bool setpgid_denied = false;
+    bool setsid_denied = false;
+    bool clone_parent_observed = false;
+    std::uint32_t adopted_reap_count = 0;
     bool foreign_process_survived = false;
     bool foreign_fd_excluded = false;
     bool deadline_exceeded = false;
@@ -197,6 +208,7 @@ struct ExactInputReadObservation {
     int launch_errno = 0;
     int wait_status = 0;
     std::vector<std::string> command_argv;
+    std::string resolved_executable;
     std::string stdout_bytes;
     std::string stderr_bytes;
     ExactInputMountDiagnostic diagnostic;
@@ -204,7 +216,25 @@ struct ExactInputReadObservation {
 
 enum class ExactInputReadRunnerTestCase : std::uint8_t {
     CommandStartFailure,
+    ImmediateExecSuccess,
     LeaderExitWithDescendant,
+    ForkHandoffChain,
+    SubtreeConfinement,
+    ParentControlEof,
+    StatusShort,
+    StatusOversize,
+    StatusMultiple,
+    StatusBadMagic,
+    StatusBadVersion,
+    StatusReserved,
+    StatusNoneStage,
+    StatusPidfdOpenStage,
+    StatusPidfdIdentityStage,
+    StatusExecStatusProtocolStage,
+    StatusUnknownStage,
+    StatusZeroErrno,
+    StatusNegativeErrno,
+    StatusZeroBytePreExecDeath,
     ForeignFdExcluded,
     MaxSizeExact,
     EmbeddedNulExact,
