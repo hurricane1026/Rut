@@ -181,6 +181,13 @@ enum class HeldNamespaceSidecarRevalidationFault {
     PublishedPorts,
 };
 
+// A narrowly typed tests-only holder-removal seam.  It is consumed only after
+// exact live holder/topology revalidation and launches no command.
+enum class HeldNamespaceHolderRemovalFailurePoint {
+    None,
+    SuppressFirstCommand,
+};
+
 using HeldTopologyCallback =
     std::function<bool(const HeldTopologySnapshot& snapshot, std::string& error)>;
 using HeldTopologyAndSidecarCallback =
@@ -196,13 +203,17 @@ RunResult run_with_held_topology_and_sidecar(
     const HeldTopologyAndSidecarCallback& callback,
     HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None,
     HeldNamespaceSidecarRevalidationFault revalidation_fault =
-        HeldNamespaceSidecarRevalidationFault::None);
+        HeldNamespaceSidecarRevalidationFault::None,
+    HeldNamespaceHolderRemovalFailurePoint holder_removal_failure_point =
+        HeldNamespaceHolderRemovalFailurePoint::None);
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,
     HeldNamespaceSidecarFailurePoint failure_point = HeldNamespaceSidecarFailurePoint::None,
     HeldNamespaceSidecarRevalidationFault revalidation_fault =
-        HeldNamespaceSidecarRevalidationFault::None);
+        HeldNamespaceSidecarRevalidationFault::None,
+    HeldNamespaceHolderRemovalFailurePoint holder_removal_failure_point =
+        HeldNamespaceHolderRemovalFailurePoint::None);
 bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
                                                  HeldNamespaceSidecarSnapshot& snapshot,
                                                  std::string& error);
