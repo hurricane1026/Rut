@@ -891,6 +891,16 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_fixture_exact_input_mount_owner PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # This shared tests-only source deliberately accepts throwing callbacks
+        # and catches them before they can escape into the fixture controller.
+        foreach(_target IN ITEMS
+                test_ipv4_fixture_topology
+                test_fixture_privileged_broker
+                test_fixture_exact_input_mount_owner)
+            target_compile_options(${_target} PRIVATE -fexceptions)
+        endforeach()
+    endif()
     add_test(NAME test_fixture_exact_input_mount_owner
              COMMAND test_fixture_exact_input_mount_owner)
     set_tests_properties(test_fixture_exact_input_mount_owner PROPERTIES

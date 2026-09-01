@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -24,6 +25,109 @@ using namespace rut::test::ipv4_topology;
 const std::string kConfig =
     "events {}\nhttp { server { listen 8080; location / { proxy_pass "
     "http://127.0.0.1:9000; } } }\n";
+
+enum class BuilderMode {
+    Success,
+    Empty,
+    False,
+    Overflow,
+    ThrowStandard,
+    ThrowNonstandard,
+    Reenter
+};
+
+struct BuilderContext {
+    BuilderMode mode = BuilderMode::Success;
+    ExactInputMountRecoveryController* controller = nullptr;
+    std::uint32_t calls = 0;
+    std::string token;
+    std::string positive_ip;
+    std::string guard_ip;
+    std::string expected_bytes;
+    bool foreign_thread_rejected = false;
+    bool recursive_entries_rejected = false;
+    bool recursive_commands_unchanged = false;
+};
+
+bool topology_config_builder(const ExactInputTopologyBuildRequest& request,
+                             ExactInputTopologyBuildSink& sink,
+                             void* opaque) {
+    auto& context = *static_cast<BuilderContext*>(opaque);
+    ++context.calls;
+    context.token = request.token.data();
+    context.positive_ip = request.positive_ipv4.data();
+    context.guard_ip = request.guard_ipv4.data();
+    context.expected_bytes = "events {}\nhttp { server { listen " + context.positive_ip +
+                             ":41857; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
+    if (request.port != kExactInputTopologyBuilderPort || context.token.size() != 48u ||
+        context.positive_ip.empty() || context.guard_ip.empty() ||
+        context.positive_ip == context.guard_ip)
+        return false;
+    if (context.mode == BuilderMode::Empty) return true;
+    if (context.mode == BuilderMode::False) return false;
+    if (context.mode == BuilderMode::ThrowStandard) throw std::runtime_error("untrusted detail");
+    if (context.mode == BuilderMode::ThrowNonstandard) throw 17;
+    if (context.mode == BuilderMode::Overflow) {
+        std::string maximum(kExactInputBuilderCapacity, 'x');
+        if (!sink.append(maximum.data(), maximum.size())) return false;
+        const char extra = 'y';
+        (void)sink.append(&extra, 1u);
+        return true;
+    }
+    if (!sink.append(context.expected_bytes.data(), context.expected_bytes.size())) return false;
+    if (context.mode != BuilderMode::Reenter) return true;
+
+    ExactInputMountHandle unused;
+    std::thread foreign([&] {
+        ExactInputMountDiagnostic diagnostic;
+        ExactInputMountSnapshot snapshot;
+        ExactInputReadObservation read;
+        ExactInputWriteRefusalObservation write;
+        ExactInputMountRecoveryReceipt receipt;
+        const bool rejected =
+            !context.controller->start(kConfig.data(), kConfig.size(), unused, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->start_with_topology_builder(
+                topology_config_builder, opaque, unused, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->snapshot(unused, snapshot, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->observe_input_read(unused, read, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->observe_input_write_refusal(unused, write, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->finish(unused, receipt, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread &&
+            !context.controller->recover_all(receipt, diagnostic) &&
+            diagnostic.phase == ExactInputMountPhase::Thread;
+        context.foreign_thread_rejected = rejected;
+    });
+    foreign.join();
+    const std::uint64_t commands = exact_input_mount_test_command_count();
+    ExactInputMountDiagnostic diagnostic;
+    ExactInputMountSnapshot snapshot;
+    ExactInputReadObservation read;
+    ExactInputWriteRefusalObservation write;
+    ExactInputMountRecoveryReceipt receipt;
+    context.recursive_entries_rejected =
+        !context.controller->start(kConfig.data(), kConfig.size(), unused, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->start_with_topology_builder(
+            topology_config_builder, opaque, unused, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->snapshot(unused, snapshot, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->observe_input_read(unused, read, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->observe_input_write_refusal(unused, write, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->finish(unused, receipt, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder &&
+        !context.controller->recover_all(receipt, diagnostic) &&
+        diagnostic.phase == ExactInputMountPhase::InputBuilder;
+    context.recursive_commands_unchanged = exact_input_mount_test_command_count() == commands;
+    return true;
+}
 
 bool exact_terminal(const ExactInputMountRecoveryReceipt& receipt) {
     return receipt.state == ExactInputMountState::Settled && receipt.settlement_complete &&
@@ -71,10 +175,50 @@ bool truthful_partial_terminal(const ExactInputMountRecoveryReceipt& receipt) {
            strict_event_order;
 }
 
+bool builder_bracket_equal(const ExactInputBuilderBracketEvidence& left,
+                           const ExactInputBuilderBracketEvidence& right) {
+    return left.topology_verified == right.topology_verified &&
+           left.snapshot_equal_to_a == right.snapshot_equal_to_a &&
+           left.tcp_absence_verified == right.tcp_absence_verified &&
+           left.tcp_absence_pre_equal == right.tcp_absence_pre_equal &&
+           left.tcp_absence_post_equal == right.tcp_absence_post_equal &&
+           left.tcp6_absence_verified == right.tcp6_absence_verified &&
+           left.tcp6_absence_pre_equal == right.tcp6_absence_pre_equal &&
+           left.tcp6_absence_post_equal == right.tcp6_absence_post_equal &&
+           left.positive_refusal_verified == right.positive_refusal_verified &&
+           left.positive_refusal_pre_equal == right.positive_refusal_pre_equal &&
+           left.positive_refusal_post_equal == right.positive_refusal_post_equal &&
+           left.guard_refusal_verified == right.guard_refusal_verified &&
+           left.guard_refusal_pre_equal == right.guard_refusal_pre_equal &&
+           left.guard_refusal_post_equal == right.guard_refusal_post_equal;
+}
+
+bool builder_evidence_equal(const ExactInputBuilderEvidence& left,
+                            const ExactInputBuilderEvidence& right) {
+    return left.applicable == right.applicable &&
+           left.request_validated == right.request_validated && left.token == right.token &&
+           left.positive_ipv4 == right.positive_ipv4 && left.guard_ipv4 == right.guard_ipv4 &&
+           left.port == right.port && builder_bracket_equal(left.bracket_a, right.bracket_a) &&
+           builder_bracket_equal(left.bracket_b, right.bracket_b) &&
+           builder_bracket_equal(left.bracket_c, right.bracket_c) &&
+           builder_bracket_equal(left.bracket_d, right.bracket_d) &&
+           left.invocation_count == right.invocation_count &&
+           left.returned_normally == right.returned_normally &&
+           left.threw_exception == right.threw_exception &&
+           left.callback_reported_success == right.callback_reported_success &&
+           left.reentry_attempted == right.reentry_attempted && left.sink_size == right.sink_size &&
+           left.sink_overflow == right.sink_overflow &&
+           left.output_accepted == right.output_accepted &&
+           left.directory_acquired_after_builder == right.directory_acquired_after_builder &&
+           left.input_acquired_after_builder == right.input_acquired_after_builder;
+}
+
 bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
                    const ExactInputMountRecoveryReceipt& right) {
     return left.state == right.state && left.terminal_result == right.terminal_result &&
            left.attempted == right.attempted && left.graph_mutated == right.graph_mutated &&
+           left.mutation_may_have_occurred == right.mutation_may_have_occurred &&
+           left.recovery_required == right.recovery_required &&
            left.cleanup_not_applicable == right.cleanup_not_applicable &&
            left.sidecar_acquired == right.sidecar_acquired &&
            left.input_acquired == right.input_acquired &&
@@ -110,6 +254,7 @@ bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
            left.holder_order == right.holder_order &&
            left.network_b_order == right.network_b_order &&
            left.network_a_order == right.network_a_order &&
+           builder_evidence_equal(left.builder, right.builder) &&
            left.diagnostic.phase == right.diagnostic.phase &&
            left.diagnostic.error_number == right.diagnostic.error_number &&
            left.diagnostic.message == right.diagnostic.message;
@@ -366,6 +511,16 @@ bool complete_write_bracket(const ExactInputWriteSourceBracket& bracket) {
            !bracket.source_path.empty() && bracket.source_device != 0u &&
            bracket.source_inode != 0u && (bracket.source_mode & 07777u) == 0600u &&
            bracket.source_links == 1u;
+}
+
+bool complete_builder_bracket(const ExactInputBuilderBracketEvidence& bracket) {
+    return bracket.topology_verified && bracket.snapshot_equal_to_a &&
+           bracket.tcp_absence_verified && bracket.tcp_absence_pre_equal &&
+           bracket.tcp_absence_post_equal && bracket.tcp6_absence_verified &&
+           bracket.tcp6_absence_pre_equal && bracket.tcp6_absence_post_equal &&
+           bracket.positive_refusal_verified && bracket.positive_refusal_pre_equal &&
+           bracket.positive_refusal_post_equal && bracket.guard_refusal_verified &&
+           bracket.guard_refusal_pre_equal && bracket.guard_refusal_post_equal;
 }
 
 bool exact_read_runner_self_checks(std::string& error) {
@@ -681,6 +836,115 @@ bool recover_injected_write_refusal(ExactInputMountFailurePoint point,
     return true;
 }
 
+struct BuilderRecoveryCase {
+    const char* name;
+    BuilderMode mode;
+    ExactInputMountFailurePoint failure_point;
+    ExactInputMountPhase failure_phase;
+    int failure_errno;
+    const char* failure_message;
+    bool returned_normally;
+    bool threw_exception;
+    bool callback_reported_success;
+    bool sink_overflow;
+    bool output_accepted;
+    bool directory_acquired;
+    bool prove_fresh_generation;
+};
+
+bool recover_topology_builder_failure(const BuilderRecoveryCase& test, std::string& error) {
+    ExactInputMountRecoveryController controller;
+    BuilderContext context;
+    context.mode = test.mode;
+    context.controller = &controller;
+    ExactInputMountHandle never_borrowed;
+    ExactInputMountDiagnostic diagnostic;
+    ExactInputMountOptions options;
+    options.failure_point = test.failure_point;
+    if (controller.start_with_topology_builder(
+            topology_config_builder, &context, never_borrowed, diagnostic, options) ||
+        diagnostic.phase != test.failure_phase || diagnostic.error_number != test.failure_errno ||
+        diagnostic.message != test.failure_message || context.calls != 1u) {
+        error = std::string(test.name) + " did not freeze its exact initial failure";
+        return false;
+    }
+    const ExactInputMountDiagnostic frozen_failure = diagnostic;
+    const std::uint64_t failed_commands = exact_input_mount_test_command_count();
+    BuilderContext blocked_context;
+    blocked_context.controller = &controller;
+    if (controller.start_with_topology_builder(
+            topology_config_builder, &blocked_context, never_borrowed, diagnostic) ||
+        diagnostic.phase != ExactInputMountPhase::Capacity || blocked_context.calls != 0u ||
+        context.calls != 1u || exact_input_mount_test_command_count() != failed_commands) {
+        error = std::string(test.name) + " did not retain the busy failed generation";
+        return false;
+    }
+
+    ExactInputMountRecoveryReceipt receipt;
+    if (!controller.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt) ||
+        !receipt.mutation_may_have_occurred || !receipt.recovery_required ||
+        receipt.cleanup_not_applicable || !receipt.builder.applicable ||
+        !receipt.builder.request_validated || receipt.builder.invocation_count != 1u ||
+        receipt.builder.returned_normally != test.returned_normally ||
+        receipt.builder.threw_exception != test.threw_exception ||
+        receipt.builder.callback_reported_success != test.callback_reported_success ||
+        receipt.builder.reentry_attempted || receipt.builder.sink_overflow != test.sink_overflow ||
+        receipt.builder.output_accepted != test.output_accepted ||
+        receipt.builder.directory_acquired_after_builder != test.directory_acquired ||
+        receipt.builder.input_acquired_after_builder ||
+        receipt.directory_acquired != test.directory_acquired || receipt.input_acquired ||
+        receipt.sidecar_acquired || !receipt.holder_acquired || !receipt.network_b_acquired ||
+        !receipt.network_a_acquired || !complete_builder_bracket(receipt.builder.bracket_a) ||
+        !complete_builder_bracket(receipt.builder.bracket_b) ||
+        receipt.builder.bracket_d.topology_verified ||
+        receipt.diagnostic.phase != frozen_failure.phase ||
+        receipt.diagnostic.error_number != frozen_failure.error_number ||
+        receipt.diagnostic.message != frozen_failure.message ||
+        !receipt.first_topology_revalidated || !receipt.second_topology_revalidated ||
+        receipt.sidecar_order != 0u || receipt.input_order != 0u ||
+        receipt.directory_order != (test.directory_acquired ? 1u : 0u) ||
+        receipt.holder_order != (test.directory_acquired ? 2u : 1u) ||
+        receipt.network_b_order != (test.directory_acquired ? 3u : 2u) ||
+        receipt.network_a_order != (test.directory_acquired ? 4u : 3u) ||
+        receipt.holder_remove_command_count != 1u || receipt.network_b_remove_command_count != 1u ||
+        receipt.network_a_remove_command_count != 1u ||
+        receipt.builder.bracket_c.topology_verified != test.directory_acquired) {
+        error = std::string(test.name) +
+                " did not produce truthful bracketed ordered zero-residue recovery";
+        return false;
+    }
+    const std::size_t expected_sink_size =
+        test.sink_overflow ? kExactInputBuilderCapacity
+                           : (test.output_accepted ? context.expected_bytes.size() : 0u);
+    if (receipt.builder.sink_size != expected_sink_size) {
+        error = std::string(test.name) + " froze an unexpected builder sink size";
+        return false;
+    }
+
+    const ExactInputMountRecoveryReceipt frozen_receipt = receipt;
+    const std::uint64_t terminal_commands = exact_input_mount_test_command_count();
+    ExactInputMountRecoveryReceipt replay;
+    if (!controller.recover_all(replay, diagnostic) || !receipt_equal(replay, frozen_receipt) ||
+        exact_input_mount_test_command_count() != terminal_commands || context.calls != 1u) {
+        error = std::string(test.name) + " terminal replay changed evidence or ran work";
+        return false;
+    }
+
+    if (test.prove_fresh_generation) {
+        BuilderContext fresh_context;
+        fresh_context.controller = &controller;
+        ExactInputMountHandle fresh_handle;
+        if (!controller.start_with_topology_builder(
+                topology_config_builder, &fresh_context, fresh_handle, diagnostic) ||
+            fresh_context.calls != 1u || !controller.finish(fresh_handle, receipt, diagnostic) ||
+            !exact_terminal(receipt) || receipt.builder.invocation_count != 1u) {
+            error = std::string(test.name) + " did not permit one clean fresh generation";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool wait_for_abort(pid_t child, std::string& error) {
     int status = 0;
     while (waitpid(child, &status, 0) < 0) {
@@ -714,6 +978,33 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 write-refusal classifier/mutation matrix]: "
                   << write_selfcheck_diagnostic.message << "\n";
         return 1;
+    }
+    std::uint32_t builder_mutation_rejections = 0u;
+    ExactInputMountDiagnostic builder_selfcheck_diagnostic;
+    if (!exact_input_mount_test_builder_self_checks(builder_mutation_rejections,
+                                                    builder_selfcheck_diagnostic) ||
+        builder_mutation_rejections != 20u) {
+        std::cerr << "FAIL [#408 topology builder pure mutation matrix]: "
+                  << builder_selfcheck_diagnostic.message << "\n";
+        return 1;
+    }
+    {
+        ExactInputTopologyBuildSink binary;
+        const std::string nul("a\0b", 3u);
+        if (!binary.append(nul.data(), nul.size()) || binary.size() != nul.size() ||
+            std::string(binary.data(), binary.size()) != nul || binary.overflowed()) {
+            std::cerr << "FAIL [#408 topology builder embedded NUL sink]\n";
+            return 1;
+        }
+        ExactInputTopologyBuildSink maximum;
+        std::string bytes(kExactInputBuilderCapacity, 'x');
+        const char sentinel = 'y';
+        if (!maximum.append(bytes.data(), bytes.size()) || maximum.size() != bytes.size() ||
+            maximum.overflowed() || maximum.append(&sentinel, 1u) || !maximum.overflowed() ||
+            maximum.append(nullptr, 0u) || maximum.size() != kExactInputBuilderCapacity) {
+            std::cerr << "FAIL [#408 topology builder capacity/sticky overflow sink]\n";
+            return 1;
+        }
     }
     if (argc == 2 && std::string(argv[1]) == "--exact-input-read-runner-self-check") {
         std::cerr << "PASS: #358 binary-safe exact input read runner\n";
@@ -978,7 +1269,10 @@ int main(int argc, char** argv) {
 
     ExactInputMountRecoveryReceipt receipt;
     if (!controller->finish(moved, receipt, diagnostic) || !exact_terminal(receipt) ||
-        !receipt.first_topology_revalidated || !receipt.second_topology_revalidated) {
+        !receipt.first_topology_revalidated || !receipt.second_topology_revalidated ||
+        receipt.builder.applicable || receipt.builder.request_validated ||
+        receipt.builder.invocation_count != 0u || receipt.builder.output_accepted ||
+        receipt.mutation_may_have_occurred || receipt.recovery_required) {
         std::cerr << "FAIL [#358 exact input mount recovery]: " << diagnostic.message << "\n";
         return 1;
     }
@@ -1165,6 +1459,7 @@ int main(int argc, char** argv) {
         if (pre_mutation.start(kConfig.data(), kConfig.size(), unused, diagnostic, options) ||
             diagnostic.phase != ExactInputMountPhase::Preflight ||
             !pre_mutation.recover_all(receipt, diagnostic) || !receipt.cleanup_not_applicable ||
+            receipt.mutation_may_have_occurred || receipt.recovery_required ||
             receipt.graph_mutated || !receipt.settlement_complete || !receipt.terminal_frozen ||
             receipt.terminal_result != ExactInputMountTerminalResult::SettledCleanly ||
             receipt.sidecar_settled || receipt.input_settled || receipt.directory_settled ||
@@ -1456,6 +1751,297 @@ int main(int argc, char** argv) {
             !max_read.stdout_eof || !max_read.stderr_eof || max_read.output_overflow ||
             !max_owner.finish(max_handle, receipt, diagnostic) || !exact_terminal(receipt)) {
             std::cerr << "FAIL [#358 exact input maximum read]: " << diagnostic.message << "\n";
+            return 1;
+        }
+    }
+    // #408 success: the callback alone owns formatting and the exact bytes are
+    // observed through the already-proven read and write-refusal suffix.
+    {
+        ExactInputMountRecoveryController built;
+        BuilderContext context;
+        context.controller = &built;
+        ExactInputMountHandle built_handle;
+        ExactInputMountSnapshot built_snapshot;
+        ExactInputReadObservation built_read;
+        ExactInputWriteRefusalObservation built_write;
+        if (!built.start_with_topology_builder(
+                topology_config_builder, &context, built_handle, diagnostic) ||
+            context.calls != 1u || context.expected_bytes.empty() ||
+            context.expected_bytes.find("listen " + context.positive_ip + ":41857") ==
+                std::string::npos ||
+            context.expected_bytes.find("listen 0.0.0.0:") != std::string::npos ||
+            context.expected_bytes.find("listen 41857") != std::string::npos ||
+            context.expected_bytes.find("listen " + context.guard_ip + ":41857") !=
+                std::string::npos ||
+            !built.snapshot(built_handle, built_snapshot, diagnostic) ||
+            built_snapshot.source_size != context.expected_bytes.size() ||
+            !built.observe_input_read(built_handle, built_read, diagnostic) ||
+            built_read.stdout_bytes != context.expected_bytes ||
+            !built.observe_input_write_refusal(built_handle, built_write, diagnostic) ||
+            !built.finish(built_handle, receipt, diagnostic) || !exact_terminal(receipt) ||
+            !receipt.builder.applicable || !receipt.builder.request_validated ||
+            receipt.builder.invocation_count != 1u || !receipt.builder.returned_normally ||
+            receipt.builder.threw_exception || !receipt.builder.callback_reported_success ||
+            receipt.builder.reentry_attempted || receipt.builder.sink_overflow ||
+            receipt.builder.sink_size != context.expected_bytes.size() ||
+            !receipt.builder.output_accepted || !receipt.builder.directory_acquired_after_builder ||
+            !receipt.builder.input_acquired_after_builder ||
+            !complete_builder_bracket(receipt.builder.bracket_a) ||
+            !complete_builder_bracket(receipt.builder.bracket_b) ||
+            !complete_builder_bracket(receipt.builder.bracket_c) ||
+            !complete_builder_bracket(receipt.builder.bracket_d) ||
+            std::string(receipt.builder.token.data()) != context.token ||
+            std::string(receipt.builder.positive_ipv4.data()) != context.positive_ip ||
+            std::string(receipt.builder.guard_ipv4.data()) != context.guard_ip ||
+            receipt.builder.port != kExactInputTopologyBuilderPort ||
+            !receipt.mutation_may_have_occurred || !receipt.recovery_required) {
+            std::cerr << "FAIL [#408 topology-bound exact input success]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+    }
+    // Every public entry rejects during the callback. Foreign-thread entries
+    // touch no controller state; same-thread entries latch one fail-closed outer
+    // result after authoritative bracket B. Recovery is explicit and replay is inert.
+    {
+        ExactInputMountRecoveryController reentrant;
+        BuilderContext context;
+        context.mode = BuilderMode::Reenter;
+        context.controller = &reentrant;
+        ExactInputMountHandle never_borrowed;
+        if (reentrant.start_with_topology_builder(
+                topology_config_builder, &context, never_borrowed, diagnostic) ||
+            diagnostic.phase != ExactInputMountPhase::InputBuilder || context.calls != 1u ||
+            !context.foreign_thread_rejected || !context.recursive_entries_rejected ||
+            !context.recursive_commands_unchanged) {
+            std::cerr << "FAIL [#408 topology builder recursive/foreign entry]: "
+                      << diagnostic.message << "\n";
+            return 1;
+        }
+        const std::uint64_t failed_commands = exact_input_mount_test_command_count();
+        if (reentrant.start_with_topology_builder(
+                topology_config_builder, &context, never_borrowed, diagnostic) ||
+            diagnostic.phase != ExactInputMountPhase::Capacity || context.calls != 1u ||
+            exact_input_mount_test_command_count() != failed_commands ||
+            !reentrant.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt) ||
+            !receipt.builder.reentry_attempted || receipt.builder.invocation_count != 1u ||
+            !complete_builder_bracket(receipt.builder.bracket_a) ||
+            !complete_builder_bracket(receipt.builder.bracket_b)) {
+            std::cerr << "FAIL [#408 topology builder busy/recovery]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen = receipt;
+        const std::uint64_t terminal_commands = exact_input_mount_test_command_count();
+        if (!reentrant.recover_all(receipt, diagnostic) || !receipt_equal(receipt, frozen) ||
+            exact_input_mount_test_command_count() != terminal_commands) {
+            std::cerr << "FAIL [#408 topology builder terminal replay]\n";
+            return 1;
+        }
+        BuilderContext next_generation;
+        next_generation.controller = &reentrant;
+        ExactInputMountHandle next_handle;
+        if (!reentrant.start_with_topology_builder(
+                topology_config_builder, &next_generation, next_handle, diagnostic) ||
+            next_generation.calls != 1u || !reentrant.finish(next_handle, receipt, diagnostic) ||
+            !exact_terminal(receipt) || receipt.builder.invocation_count != 1u) {
+            std::cerr << "FAIL [#408 topology builder fresh generation]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+    }
+    // These are real controller generations, not classifier-only cases. Each
+    // callback/output boundary retains the failed slot through authoritative B,
+    // then proves ordered explicit cleanup and inert terminal replay. Only the
+    // deepest uncertain-input prefix repeats with a fresh successful generation.
+    for (const BuilderRecoveryCase& test : std::array<BuilderRecoveryCase, 7>{{
+             {"callback false",
+              BuilderMode::False,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder reported failure",
+              true,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"callback standard exception",
+              BuilderMode::ThrowStandard,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder threw an exception",
+              false,
+              true,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"callback non-standard exception",
+              BuilderMode::ThrowNonstandard,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder threw an exception",
+              false,
+              true,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"empty successful sink",
+              BuilderMode::Empty,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              EINVAL,
+              "topology input builder produced empty output",
+              true,
+              false,
+              true,
+              false,
+              false,
+              false,
+              false},
+             {"sticky sink overflow",
+              BuilderMode::Overflow,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              EOVERFLOW,
+              "topology input builder output exceeded 8192 bytes",
+              true,
+              false,
+              true,
+              true,
+              false,
+              false,
+              false},
+             {"directory may have mutated",
+              BuilderMode::Success,
+              ExactInputMountFailurePoint::BuilderDirectoryMayHaveMutated,
+              ExactInputMountPhase::Directory,
+              0,
+              "injected uncertain directory creation result",
+              true,
+              false,
+              true,
+              false,
+              true,
+              false,
+              false},
+             {"input may have mutated",
+              BuilderMode::Success,
+              ExactInputMountFailurePoint::BuilderInputMayHaveMutated,
+              ExactInputMountPhase::InputFile,
+              0,
+              "injected uncertain exact input creation result",
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              true},
+         }}) {
+        std::string error;
+        if (!recover_topology_builder_failure(test, error)) {
+            std::cerr << "FAIL [#408 topology builder real failure recovery]: " << error << "\n";
+            return 1;
+        }
+    }
+    // Synthetic evidence corruption never mutates the live topology. Each
+    // bracket/observation rejects locally, retains capacity, and recovers the
+    // exact acquired prefix before the next independent owner generation.
+    struct BuilderFaultExpectation {
+        ExactInputMountFailurePoint point;
+        std::uint32_t calls;
+        bool output;
+        bool directory;
+        bool input;
+    };
+    for (const BuilderFaultExpectation expectation : std::array<BuilderFaultExpectation, 8>{{
+             {ExactInputMountFailurePoint::BuilderRejectBracketA, 0u, false, false, false},
+             {ExactInputMountFailurePoint::BuilderRejectBracketB, 1u, false, false, false},
+             {ExactInputMountFailurePoint::BuilderRejectBracketC, 1u, true, true, false},
+             {ExactInputMountFailurePoint::BuilderRejectBracketD, 1u, true, true, true},
+             {ExactInputMountFailurePoint::BuilderRejectTcpBracket, 0u, false, false, false},
+             {ExactInputMountFailurePoint::BuilderRejectTcp6Bracket, 0u, false, false, false},
+             {ExactInputMountFailurePoint::BuilderRejectPositiveProbeBracket,
+              0u,
+              false,
+              false,
+              false},
+             {ExactInputMountFailurePoint::BuilderRejectGuardProbeBracket, 0u, false, false, false},
+         }}) {
+        ExactInputMountRecoveryController corrupted;
+        BuilderContext context;
+        context.controller = &corrupted;
+        ExactInputMountHandle never_borrowed;
+        ExactInputMountOptions options;
+        options.failure_point = expectation.point;
+        if (corrupted.start_with_topology_builder(
+                topology_config_builder, &context, never_borrowed, diagnostic, options) ||
+            diagnostic.phase != ExactInputMountPhase::InputBuilder ||
+            context.calls != expectation.calls || !corrupted.recover_all(receipt, diagnostic) ||
+            !truthful_partial_terminal(receipt) ||
+            receipt.diagnostic.phase != ExactInputMountPhase::InputBuilder ||
+            !receipt.builder.applicable || receipt.builder.invocation_count != expectation.calls ||
+            receipt.builder.output_accepted != expectation.output ||
+            receipt.builder.directory_acquired_after_builder != expectation.directory ||
+            receipt.builder.input_acquired_after_builder != expectation.input ||
+            receipt.directory_acquired != expectation.directory ||
+            receipt.input_acquired != expectation.input || !receipt.mutation_may_have_occurred ||
+            !receipt.recovery_required || !receipt.graph_mutated) {
+            std::cerr << "FAIL [#408 topology builder synthetic bracket corruption]: "
+                      << diagnostic.message << "\n";
+            return 1;
+        }
+    }
+    {
+        ExactInputMountRecoveryController priority;
+        BuilderContext context;
+        context.mode = BuilderMode::ThrowStandard;
+        context.controller = &priority;
+        ExactInputMountHandle never_borrowed;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::BuilderRejectBracketB;
+        if (priority.start_with_topology_builder(
+                topology_config_builder, &context, never_borrowed, diagnostic, options) ||
+            diagnostic.phase != ExactInputMountPhase::InputBuilder ||
+            diagnostic.message != "builder whole topology bracket differed from bracket A" ||
+            !priority.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt) ||
+            !receipt.builder.threw_exception || receipt.builder.returned_normally ||
+            receipt.builder.invocation_count != 1u ||
+            receipt.diagnostic.message !=
+                "builder whole topology bracket differed from bracket A") {
+            std::cerr << "FAIL [#408 topology bracket B failure priority]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+    }
+    {
+        ExactInputMountRecoveryController uncertain;
+        BuilderContext context;
+        context.controller = &uncertain;
+        ExactInputMountHandle never_borrowed;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::BuilderNetworkMayHaveMutated;
+        if (uncertain.start_with_topology_builder(
+                topology_config_builder, &context, never_borrowed, diagnostic, options) ||
+            diagnostic.phase != ExactInputMountPhase::Networks || context.calls != 0u ||
+            !uncertain.recover_all(receipt, diagnostic) || !receipt.mutation_may_have_occurred ||
+            !receipt.recovery_required || receipt.graph_mutated || receipt.cleanup_not_applicable ||
+            !receipt.settlement_complete || !receipt.terminal_frozen ||
+            !receipt.final_zero_residue ||
+            receipt.terminal_result != ExactInputMountTerminalResult::SettledCleanly ||
+            receipt.network_a_acquired || receipt.network_b_acquired || receipt.holder_acquired ||
+            receipt.directory_acquired || receipt.input_acquired || receipt.sidecar_acquired) {
+            std::cerr << "FAIL [#408 possible versus proven mutation receipt]: "
+                      << diagnostic.message << "\n";
             return 1;
         }
     }

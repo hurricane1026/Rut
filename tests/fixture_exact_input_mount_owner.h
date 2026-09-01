@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -8,6 +10,38 @@
 namespace rut::test::ipv4_topology {
 
 inline constexpr const char* kExactInputMountDestination = "/etc/nginx/nginx.conf";
+inline constexpr std::uint16_t kExactInputTopologyBuilderPort = 41857u;
+inline constexpr std::size_t kExactInputBuilderCapacity = 8192u;
+
+struct ExactInputTopologyBuildRequest {
+    std::array<char, 49> token{};
+    std::array<char, 16> positive_ipv4{};
+    std::array<char, 16> guard_ipv4{};
+    std::uint16_t port = 0;
+};
+
+class ExactInputTopologyBuildSink {
+public:
+    ExactInputTopologyBuildSink() = default;
+    ExactInputTopologyBuildSink(const ExactInputTopologyBuildSink&) = delete;
+    ExactInputTopologyBuildSink& operator=(const ExactInputTopologyBuildSink&) = delete;
+    ExactInputTopologyBuildSink(ExactInputTopologyBuildSink&&) = delete;
+    ExactInputTopologyBuildSink& operator=(ExactInputTopologyBuildSink&&) = delete;
+
+    bool append(const void* bytes, std::size_t size) noexcept;
+    const char* data() const noexcept { return bytes_.data(); }
+    std::size_t size() const noexcept { return size_; }
+    bool overflowed() const noexcept { return overflowed_; }
+
+private:
+    std::array<char, kExactInputBuilderCapacity> bytes_{};
+    std::size_t size_ = 0;
+    bool overflowed_ = false;
+};
+
+using ExactInputTopologyBuilder = bool (*)(const ExactInputTopologyBuildRequest& request,
+                                           ExactInputTopologyBuildSink& sink,
+                                           void* context);
 
 enum class ExactInputMountState : std::uint8_t {
     Empty,
@@ -87,6 +121,7 @@ enum class ExactInputMountPhase : std::uint8_t {
     Networks,
     Holder,
     Topology,
+    InputBuilder,
     Sidecar,
     MountInspect,
     FileRevalidation,
@@ -119,6 +154,17 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     AfterHolderAttachedB,
     AfterHolder,
     AfterTopology,
+    BuilderRejectBracketA,
+    BuilderRejectBracketB,
+    BuilderRejectBracketC,
+    BuilderRejectBracketD,
+    BuilderRejectTcpBracket,
+    BuilderRejectTcp6Bracket,
+    BuilderRejectPositiveProbeBracket,
+    BuilderRejectGuardProbeBracket,
+    BuilderNetworkMayHaveMutated,
+    BuilderDirectoryMayHaveMutated,
+    BuilderInputMayHaveMutated,
     AfterSidecarCreate,
     AfterMountInspect,
     SidecarCreateReportedTimeout,
@@ -179,6 +225,46 @@ struct ExactInputMountSnapshot {
     bool exact_proc_credentials = false;
     bool parser_mutation_matrix_passed = false;
     std::uint32_t parser_rejections = 0;
+};
+
+struct ExactInputBuilderBracketEvidence {
+    bool topology_verified = false;
+    bool snapshot_equal_to_a = false;
+    bool tcp_absence_verified = false;
+    bool tcp_absence_pre_equal = false;
+    bool tcp_absence_post_equal = false;
+    bool tcp6_absence_verified = false;
+    bool tcp6_absence_pre_equal = false;
+    bool tcp6_absence_post_equal = false;
+    bool positive_refusal_verified = false;
+    bool positive_refusal_pre_equal = false;
+    bool positive_refusal_post_equal = false;
+    bool guard_refusal_verified = false;
+    bool guard_refusal_pre_equal = false;
+    bool guard_refusal_post_equal = false;
+};
+
+struct ExactInputBuilderEvidence {
+    bool applicable = false;
+    bool request_validated = false;
+    std::array<char, 49> token{};
+    std::array<char, 16> positive_ipv4{};
+    std::array<char, 16> guard_ipv4{};
+    std::uint16_t port = 0;
+    ExactInputBuilderBracketEvidence bracket_a;
+    ExactInputBuilderBracketEvidence bracket_b;
+    ExactInputBuilderBracketEvidence bracket_c;
+    ExactInputBuilderBracketEvidence bracket_d;
+    std::uint32_t invocation_count = 0;
+    bool returned_normally = false;
+    bool threw_exception = false;
+    bool callback_reported_success = false;
+    bool reentry_attempted = false;
+    std::size_t sink_size = 0;
+    bool sink_overflow = false;
+    bool output_accepted = false;
+    bool directory_acquired_after_builder = false;
+    bool input_acquired_after_builder = false;
 };
 
 struct ExactInputReadObservation {
@@ -315,6 +401,8 @@ struct ExactInputMountRecoveryReceipt {
     ExactInputMountState state = ExactInputMountState::Empty;
     ExactInputMountTerminalResult terminal_result = ExactInputMountTerminalResult::None;
     bool attempted = false;
+    bool mutation_may_have_occurred = false;
+    bool recovery_required = false;
     bool graph_mutated = false;
     bool cleanup_not_applicable = false;
     bool sidecar_acquired = false;
@@ -352,6 +440,7 @@ struct ExactInputMountRecoveryReceipt {
     std::uint32_t holder_order = 0;
     std::uint32_t network_b_order = 0;
     std::uint32_t network_a_order = 0;
+    ExactInputBuilderEvidence builder;
     ExactInputMountDiagnostic diagnostic;
 };
 
@@ -366,6 +455,8 @@ bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_c
                                              ExactInputMountDiagnostic& diagnostic);
 bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_rejections,
                                                       ExactInputMountDiagnostic& diagnostic);
+bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
+                                                ExactInputMountDiagnostic& diagnostic);
 
 class ExactInputMountRecoveryController;
 
@@ -401,6 +492,11 @@ public:
                ExactInputMountHandle& handle,
                ExactInputMountDiagnostic& diagnostic,
                const ExactInputMountOptions& options = {});
+    bool start_with_topology_builder(ExactInputTopologyBuilder builder,
+                                     void* context,
+                                     ExactInputMountHandle& handle,
+                                     ExactInputMountDiagnostic& diagnostic,
+                                     const ExactInputMountOptions& options = {});
     bool snapshot(const ExactInputMountHandle& handle,
                   ExactInputMountSnapshot& snapshot,
                   ExactInputMountDiagnostic& diagnostic) const;
@@ -430,6 +526,10 @@ private:
     std::int64_t construction_thread_ = -1;
     bool borrowed_ = false;
     bool recovering_ = false;
+    std::atomic<bool> start_in_progress_{false};
+    std::atomic<bool> builder_active_{false};
+    mutable std::atomic<bool> reentry_attempted_{false};
+    std::atomic<std::int64_t> operation_thread_{-1};
 };
 
 }  // namespace rut::test::ipv4_topology

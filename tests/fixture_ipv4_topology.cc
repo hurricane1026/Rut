@@ -16,6 +16,7 @@
 #include <limits>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -2480,6 +2481,23 @@ static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvi
            left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated;
 }
 
+static bool proc_tcp_port_absent(const std::string& table, u16 port) {
+    std::ostringstream port_hex;
+    port_hex << std::uppercase << std::setfill('0') << std::setw(4) << std::hex << port;
+    std::istringstream lines(table);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string index;
+        std::string local_endpoint;
+        if (!(fields >> index >> local_endpoint)) continue;
+        const size_t colon = local_endpoint.rfind(':');
+        if (colon != std::string::npos && local_endpoint.substr(colon + 1u) == port_hex.str())
+            return false;
+    }
+    return true;
+}
+
 class Fixture {
 public:
     explicit Fixture(std::string token) : token_(std::move(token)) {
@@ -2527,6 +2545,7 @@ public:
                 sidecar_creation_may_have_mutated_};
     }
     const SetupEventEvidence& setup_event_evidence() const { return setup_event_evidence_; }
+    HeldTopologySnapshot current_topology_snapshot() const { return topology_snapshot(); }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -2778,30 +2797,26 @@ public:
     }
 
     bool probe_port_absent(u16 port, std::string& error) {
-        std::string tcp;
-        if (!read_file("/proc/" + std::to_string(holder_pid_) + "/net/tcp", tcp)) {
-            error = "holder /proc/net/tcp read failed";
-            return false;
-        }
-        std::ostringstream port_hex;
-        port_hex << std::uppercase << std::setfill('0') << std::setw(4) << std::hex << port;
-        std::istringstream lines(tcp);
-        std::string line;
-        while (std::getline(lines, line)) {
-            std::istringstream fields(line);
-            std::string index, local_endpoint;
-            if (fields >> index >> local_endpoint) {
-                const size_t colon = local_endpoint.find(':');
-                if (colon != std::string::npos &&
-                    local_endpoint.substr(colon + 1) == port_hex.str()) {
-                    error = "selected probe port appeared in holder /proc/net/tcp";
-                    return false;
-                }
-            }
-        }
-        return true;
+        return probe_port_absent_in("tcp", port, error);
     }
 
+    bool probe_tcp6_port_absent(u16 port, std::string& error) {
+        return probe_port_absent_in("tcp6", port, error);
+    }
+
+private:
+    bool probe_port_absent_in(const char* table, u16 port, std::string& error) {
+        std::string tcp;
+        if (!read_file("/proc/" + std::to_string(holder_pid_) + "/net/" + table, tcp)) {
+            error = std::string("holder /proc/net/") + table + " read failed";
+            return false;
+        }
+        if (proc_tcp_port_absent(tcp, port)) return true;
+        error = std::string("selected probe port appeared in holder /proc/net/") + table;
+        return false;
+    }
+
+public:
     bool probe_refused(const std::string& address, u16 port, std::string& error) {
         const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0) {
@@ -4210,7 +4225,7 @@ struct ExactInputMountOwner {
     }
 
     ~ExactInputMountOwner() {
-        if (mutated && !settled) {
+        if ((mutated || recovery_required) && !settled) {
             dprintf(STDERR_FILENO,
                     "fatal exact-input mount owner destruction before settlement: phase=%u "
                     "error=%s\n",
@@ -4236,6 +4251,7 @@ struct ExactInputMountOwner {
     HeldNamespaceSidecarSnapshot registered_sidecar;
     ParsedMountInspect registered_mount;
     bool mutated = false;
+    bool recovery_required = false;
     bool settled = false;
     bool topology_complete = false;
     bool disconnect_injected = false;
@@ -4247,7 +4263,162 @@ struct ExactInputMountOwner {
     bool operation_failed = false;
     bool read_attempted = false;
     bool write_refusal_attempted = false;
+    HeldTopologySnapshot builder_baseline;
 };
+
+static void owner_failure(ExactInputMountOwner& owner,
+                          ExactInputMountDiagnostic& diagnostic,
+                          ExactInputMountPhase phase,
+                          const std::string& message,
+                          int error_number = 0);
+
+static bool topology_snapshot_equal(const HeldTopologySnapshot& left,
+                                    const HeldTopologySnapshot& right) {
+    return left.token == right.token && left.network_a_name == right.network_a_name &&
+           left.network_a_id == right.network_a_id &&
+           left.network_a_subnet == right.network_a_subnet &&
+           left.network_a_gateway == right.network_a_gateway &&
+           left.network_b_name == right.network_b_name && left.network_b_id == right.network_b_id &&
+           left.network_b_subnet == right.network_b_subnet &&
+           left.network_b_gateway == right.network_b_gateway &&
+           left.holder_name == right.holder_name && left.holder_id == right.holder_id &&
+           left.positive_ip == right.positive_ip && left.guard_ip == right.guard_ip &&
+           left.holder_pid == right.holder_pid && left.holder_start == right.holder_start &&
+           left.holder_netns == right.holder_netns;
+}
+
+static bool valid_builder_topology(const HeldTopologySnapshot& snapshot, std::string& error) {
+    u32 positive = 0;
+    u32 guard = 0;
+    std::string canonical_positive;
+    std::string canonical_guard;
+    if (!lowercase_hex(snapshot.token, 48u) || snapshot.holder_pid <= 1 ||
+        snapshot.holder_start == 0u || snapshot.holder_netns == 0u ||
+        !parse_ipv4(snapshot.positive_ip, positive) || !format_ipv4(positive, canonical_positive) ||
+        canonical_positive != snapshot.positive_ip || !parse_ipv4(snapshot.guard_ip, guard) ||
+        !format_ipv4(guard, canonical_guard) || canonical_guard != snapshot.guard_ip ||
+        positive == 0u || guard == 0u || positive == guard || (positive >> 24u) == 127u ||
+        (guard >> 24u) == 127u) {
+        error = "builder topology request was not canonical, nonloopback, distinct and live";
+        return false;
+    }
+    return true;
+}
+
+static bool fresh_builder_identity(Fixture& fixture,
+                                   const HeldTopologySnapshot& baseline,
+                                   HeldTopologySnapshot& snapshot,
+                                   std::string& error) {
+    if (!fixture.verify_topology(FailurePoint::None, error)) return false;
+    snapshot = fixture.current_topology_snapshot();
+    if (!valid_builder_topology(snapshot, error) || !topology_snapshot_equal(baseline, snapshot)) {
+        if (error.empty()) error = "builder topology identity drifted from bracket A";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_builder_bracket(ExactInputMountOwner& owner,
+                                    ExactInputBuilderBracketEvidence& evidence,
+                                    ExactInputMountFailurePoint bracket_fault,
+                                    ExactInputMountDiagnostic& diagnostic) {
+    std::string error;
+    HeldTopologySnapshot bracket;
+    if (!owner.fixture.verify_topology(FailurePoint::None, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Topology, error);
+        return false;
+    }
+    bracket = owner.fixture.current_topology_snapshot();
+    if (!valid_builder_topology(bracket, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::InputBuilder, error);
+        return false;
+    }
+    evidence.topology_verified = true;
+    const bool is_a = owner.builder_baseline.token.empty();
+    if (is_a) owner.builder_baseline = bracket;
+    if (owner.options.failure_point == bracket_fault) ++bracket.holder_start;
+    if (!topology_snapshot_equal(owner.builder_baseline, bracket)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputBuilder,
+                      "builder whole topology bracket differed from bracket A");
+        return false;
+    }
+    evidence.snapshot_equal_to_a = true;
+
+    const auto enclosed = [&](ExactInputMountFailurePoint fault,
+                              bool (Fixture::*operation)(u16, std::string&),
+                              bool& observed,
+                              bool& pre_equal,
+                              bool& post_equal) {
+        HeldTopologySnapshot before;
+        HeldTopologySnapshot after;
+        if (!fresh_builder_identity(owner.fixture, owner.builder_baseline, before, error))
+            return false;
+        pre_equal = true;
+        if (!(owner.fixture.*operation)(kExactInputTopologyBuilderPort, error)) return false;
+        observed = true;
+        if (!fresh_builder_identity(owner.fixture, owner.builder_baseline, after, error))
+            return false;
+        if (owner.options.failure_point == fault) ++after.holder_start;
+        post_equal = topology_snapshot_equal(owner.builder_baseline, after);
+        if (!post_equal) error = "builder observation topology bracket drifted";
+        return post_equal;
+    };
+    if (!enclosed(ExactInputMountFailurePoint::BuilderRejectTcpBracket,
+                  &Fixture::probe_port_absent,
+                  evidence.tcp_absence_verified,
+                  evidence.tcp_absence_pre_equal,
+                  evidence.tcp_absence_post_equal) ||
+        !enclosed(ExactInputMountFailurePoint::BuilderRejectTcp6Bracket,
+                  &Fixture::probe_tcp6_port_absent,
+                  evidence.tcp6_absence_verified,
+                  evidence.tcp6_absence_pre_equal,
+                  evidence.tcp6_absence_post_equal)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::InputBuilder, error);
+        return false;
+    }
+
+    const auto enclosed_refusal = [&](ExactInputMountFailurePoint fault,
+                                      const std::string& address,
+                                      bool& observed,
+                                      bool& pre_equal,
+                                      bool& post_equal) {
+        HeldTopologySnapshot before;
+        HeldTopologySnapshot after;
+        if (!fresh_builder_identity(owner.fixture, owner.builder_baseline, before, error))
+            return false;
+        pre_equal = true;
+        if (!owner.fixture.probe_refused(address, kExactInputTopologyBuilderPort, error))
+            return false;
+        observed = true;
+        if (!fresh_builder_identity(owner.fixture, owner.builder_baseline, after, error))
+            return false;
+        if (owner.options.failure_point == fault) ++after.holder_start;
+        post_equal = topology_snapshot_equal(owner.builder_baseline, after);
+        if (!post_equal) error = "builder refusal-probe topology bracket drifted";
+        return post_equal;
+    };
+    if (!enclosed_refusal(ExactInputMountFailurePoint::BuilderRejectPositiveProbeBracket,
+                          owner.builder_baseline.positive_ip,
+                          evidence.positive_refusal_verified,
+                          evidence.positive_refusal_pre_equal,
+                          evidence.positive_refusal_post_equal) ||
+        !enclosed_refusal(ExactInputMountFailurePoint::BuilderRejectGuardProbeBracket,
+                          owner.builder_baseline.guard_ip,
+                          evidence.guard_refusal_verified,
+                          evidence.guard_refusal_pre_equal,
+                          evidence.guard_refusal_post_equal)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::InputBuilder, error);
+        return false;
+    }
+    HeldTopologySnapshot final_snapshot;
+    if (!fresh_builder_identity(owner.fixture, owner.builder_baseline, final_snapshot, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::InputBuilder, error);
+        return false;
+    }
+    return true;
+}
 
 static bool mount_inspect_equal(const ParsedMountInspect& left, const ParsedMountInspect& right) {
     const auto mount_equal = [](const ParsedMount& a, const ParsedMount& b) {
@@ -4686,7 +4857,7 @@ static void owner_failure(ExactInputMountOwner& owner,
                           ExactInputMountDiagnostic& diagnostic,
                           ExactInputMountPhase phase,
                           const std::string& message,
-                          int error_number = 0) {
+                          int error_number) {
     diagnostic = {phase, error_number, message};
     if (owner.receipt.diagnostic.phase == ExactInputMountPhase::None)
         owner.receipt.diagnostic = diagnostic;
@@ -4718,6 +4889,10 @@ static bool injected_setup_failure(ExactInputMountOwner& owner,
                   std::string("injected exact-input mount setup failure after ") + boundary);
     return true;
 }
+
+static bool setup_exact_input_mount_sidecar_suffix(ExactInputMountOwner& owner,
+                                                   std::uint32_t parser_rejections,
+                                                   ExactInputMountDiagnostic& diagnostic);
 
 static bool setup_exact_input_mount(ExactInputMountOwner& owner,
                                     ExactInputMountDiagnostic& diagnostic) {
@@ -4865,6 +5040,14 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
                                ExactInputMountPhase::Topology,
                                "topology"))
         return false;
+    return setup_exact_input_mount_sidecar_suffix(owner, parser_rejections, diagnostic);
+}
+
+static bool setup_exact_input_mount_sidecar_suffix(ExactInputMountOwner& owner,
+                                                   std::uint32_t parser_rejections,
+                                                   ExactInputMountDiagnostic& diagnostic) {
+    std::string error;
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
     if (!owner.input.revalidate(file_diagnostic)) {
         owner_failure(owner,
                       diagnostic,
@@ -4873,7 +5056,6 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
                       file_diagnostic.error_number);
         return false;
     }
-
     HeldNamespaceSidecarFailurePoint sidecar_point = HeldNamespaceSidecarFailurePoint::None;
     if (owner.options.failure_point == ExactInputMountFailurePoint::AfterSidecarCreate)
         sidecar_point = HeldNamespaceSidecarFailurePoint::AfterCreate;
@@ -4971,6 +5153,302 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
     return true;
 }
 
+static void invoke_topology_builder(ExactInputTopologyBuilder builder,
+                                    const ExactInputTopologyBuildRequest& request,
+                                    void* context,
+                                    ExactInputTopologyBuildSink& sink,
+                                    ExactInputBuilderEvidence& evidence,
+                                    std::atomic<bool>& builder_active) {
+    ++evidence.invocation_count;
+    builder_active.store(true, std::memory_order_release);
+    try {
+        evidence.callback_reported_success = builder(request, sink, context);
+        evidence.returned_normally = true;
+    } catch (...) {
+        evidence.threw_exception = true;
+    }
+    builder_active.store(false, std::memory_order_release);
+    evidence.sink_size = sink.size();
+    evidence.sink_overflow = sink.overflowed();
+}
+
+static bool validate_topology_builder_output(const ExactInputBuilderEvidence& evidence,
+                                             const ExactInputTopologyBuildSink& sink,
+                                             ExactInputMountDiagnostic& diagnostic) {
+    if (evidence.reentry_attempted) {
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EDEADLK,
+                      "topology input builder attempted controller re-entry"};
+        return false;
+    }
+    if (evidence.threw_exception) {
+        diagnostic = {
+            ExactInputMountPhase::InputBuilder, 0, "topology input builder threw an exception"};
+        return false;
+    }
+    if (!evidence.callback_reported_success) {
+        diagnostic = {
+            ExactInputMountPhase::InputBuilder, 0, "topology input builder reported failure"};
+        return false;
+    }
+    if (sink.overflowed()) {
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EOVERFLOW,
+                      "topology input builder output exceeded 8192 bytes"};
+        return false;
+    }
+    if (sink.size() == 0u) {
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EINVAL,
+                      "topology input builder produced empty output"};
+        return false;
+    }
+    diagnostic = {};
+    return true;
+}
+
+static bool setup_exact_input_mount_from_topology_builder(ExactInputMountOwner& owner,
+                                                          ExactInputTopologyBuilder builder,
+                                                          void* context,
+                                                          std::atomic<bool>& builder_active,
+                                                          std::atomic<bool>& reentry_attempted,
+                                                          ExactInputMountDiagnostic& diagnostic) {
+    owner.state = ExactInputMountState::SettingUp;
+    owner.snapshot.state = owner.state;
+    owner.receipt.builder.applicable = true;
+    std::string error;
+    std::uint32_t parser_rejections = 0;
+    if (!mount_parser_self_checks(parser_rejections, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::MountInspect, error);
+        return false;
+    }
+    if (owner.options.failure_point == ExactInputMountFailurePoint::PreflightBeforeMutation) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Preflight,
+                      "injected exact-input mount preflight failure before mutation");
+        return false;
+    }
+    if (!docker_user_namespace_preflight(error) || !preflight(owner.fixture, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Preflight, error);
+        return false;
+    }
+
+    // Docker create/connect operations can report an uncertain result.  Recovery
+    // authority is raised before the first command; graph_mutated remains causal.
+    owner.recovery_required = true;
+    owner.receipt.recovery_required = true;
+    owner.receipt.mutation_may_have_occurred = true;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::BuilderNetworkMayHaveMutated) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Networks,
+                      "injected uncertain first network creation result");
+        return false;
+    }
+    FailurePoint network_point = FailurePoint::None;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkACreated)
+        network_point = FailurePoint::AfterNetworkACreated;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkAVerified)
+        network_point = FailurePoint::AfterNetworkAVerified;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkBCreated)
+        network_point = FailurePoint::AfterNetworkBCreated;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkBVerified)
+        network_point = FailurePoint::AfterNetworkBVerified;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterBothIpamVerified)
+        network_point = FailurePoint::AfterBothIpamVerified;
+    const bool networks_created = owner.fixture.create_networks(network_point, error);
+    sync_setup_event_evidence(owner);
+    const CleanupEvidence network_evidence = owner.fixture.cleanup_evidence();
+    owner.receipt.network_a_acquired = network_evidence.network_a_exists;
+    owner.receipt.network_b_acquired = network_evidence.network_b_exists;
+    if (owner.receipt.network_a_acquired || owner.receipt.network_b_acquired) {
+        owner.mutated = true;
+        owner.receipt.graph_mutated = true;
+    }
+    if (!networks_created) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Networks, error);
+        return false;
+    }
+    owner.receipt.network_a_acquired = true;
+    owner.receipt.network_b_acquired = true;
+    owner.mutated = true;
+    owner.receipt.graph_mutated = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterNetworks,
+                               ExactInputMountPhase::Networks,
+                               "networks"))
+        return false;
+    const FailurePoint holder_point =
+        owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderCreated
+            ? FailurePoint::AfterHolderCreated
+            : FailurePoint::None;
+    const bool holder_created = owner.fixture.create_holder(holder_point, error);
+    sync_setup_event_evidence(owner);
+    owner.receipt.holder_acquired = owner.fixture.cleanup_evidence().holder_exists;
+    if (!holder_created) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Holder, error);
+        return false;
+    }
+    owner.receipt.holder_acquired = true;
+    FailurePoint attach_point = FailurePoint::None;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderAttachedA)
+        attach_point = FailurePoint::AfterHolderAttachedA;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderAttachedB)
+        attach_point = FailurePoint::AfterHolderAttachedB;
+    if (!owner.fixture.attach_holder(attach_point, error)) {
+        sync_setup_event_evidence(owner);
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Holder, error);
+        return false;
+    }
+    sync_setup_event_evidence(owner);
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterHolder,
+                               ExactInputMountPhase::Holder,
+                               "holder"))
+        return false;
+    if (!owner.fixture.verify_topology(FailurePoint::None, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Topology, error);
+        return false;
+    }
+    owner.topology_complete = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterTopology,
+                               ExactInputMountPhase::Topology,
+                               "topology"))
+        return false;
+
+    if (!capture_builder_bracket(owner,
+                                 owner.receipt.builder.bracket_a,
+                                 ExactInputMountFailurePoint::BuilderRejectBracketA,
+                                 diagnostic))
+        return false;
+    ExactInputTopologyBuildRequest request;
+    std::copy(owner.builder_baseline.token.begin(),
+              owner.builder_baseline.token.end(),
+              request.token.begin());
+    std::copy(owner.builder_baseline.positive_ip.begin(),
+              owner.builder_baseline.positive_ip.end(),
+              request.positive_ipv4.begin());
+    std::copy(owner.builder_baseline.guard_ip.begin(),
+              owner.builder_baseline.guard_ip.end(),
+              request.guard_ipv4.begin());
+    request.port = kExactInputTopologyBuilderPort;
+    owner.receipt.builder.token = request.token;
+    owner.receipt.builder.positive_ipv4 = request.positive_ipv4;
+    owner.receipt.builder.guard_ipv4 = request.guard_ipv4;
+    owner.receipt.builder.port = request.port;
+    owner.receipt.builder.request_validated = true;
+
+    ExactInputTopologyBuildSink sink;
+    invoke_topology_builder(builder, request, context, sink, owner.receipt.builder, builder_active);
+    owner.receipt.builder.reentry_attempted = reentry_attempted.load(std::memory_order_acquire);
+
+    // B is authoritative and always wins over callback/re-entry/output errors.
+    if (!capture_builder_bracket(owner,
+                                 owner.receipt.builder.bracket_b,
+                                 ExactInputMountFailurePoint::BuilderRejectBracketB,
+                                 diagnostic))
+        return false;
+    ExactInputMountDiagnostic builder_diagnostic;
+    if (!validate_topology_builder_output(owner.receipt.builder, sink, builder_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      builder_diagnostic.phase,
+                      builder_diagnostic.message,
+                      builder_diagnostic.error_number);
+        return false;
+    }
+    owner.bytes.assign(sink.data(), sink.size());
+    owner.receipt.builder.output_accepted = true;
+
+    fixture_private_directory_lease::Diagnostic directory_diagnostic;
+    if (owner.options.failure_point ==
+        ExactInputMountFailurePoint::BuilderDirectoryMayHaveMutated) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Directory,
+                      "injected uncertain directory creation result");
+        return false;
+    }
+    if (!fixture_private_directory_lease::PrivateDirectoryLease::create(owner.directory,
+                                                                        directory_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Directory,
+                      "exact input private directory creation failed",
+                      directory_diagnostic.error_number);
+        return false;
+    }
+    owner.receipt.directory_acquired = true;
+    owner.receipt.builder.directory_acquired_after_builder = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterDirectory,
+                               ExactInputMountPhase::Directory,
+                               "directory"))
+        return false;
+    if (!capture_builder_bracket(owner,
+                                 owner.receipt.builder.bracket_c,
+                                 ExactInputMountFailurePoint::BuilderRejectBracketC,
+                                 diagnostic))
+        return false;
+
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::BuilderInputMayHaveMutated) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "injected uncertain exact input creation result");
+        return false;
+    }
+    if (!fixture_exact_input_file_lease::ExactInputFileLease::create(owner.directory,
+                                                                     owner.bytes.data(),
+                                                                     owner.bytes.size(),
+                                                                     owner.input,
+                                                                     file_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input file creation failed",
+                      file_diagnostic.error_number);
+        return false;
+    }
+    owner.receipt.input_acquired = true;
+    owner.receipt.builder.input_acquired_after_builder = true;
+    char canonical[PATH_MAX]{};
+    if (realpath(owner.input.path().c_str(), canonical) == nullptr ||
+        owner.input.path() != canonical ||
+        owner.input.path().find_first_of(",|#;\n\r\t ") != std::string::npos) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input file path was not canonical and delimiter-safe",
+                      errno);
+        return false;
+    }
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterInputFile,
+                               ExactInputMountPhase::InputFile,
+                               "input file"))
+        return false;
+    if (!capture_builder_bracket(owner,
+                                 owner.receipt.builder.bracket_d,
+                                 ExactInputMountFailurePoint::BuilderRejectBracketD,
+                                 diagnostic))
+        return false;
+    return setup_exact_input_mount_sidecar_suffix(owner, parser_rejections, diagnostic);
+}
+
 static bool recover_exact_input_mount(ExactInputMountOwner& owner,
                                       ExactInputMountDiagnostic& diagnostic) {
     if (owner.settled) {
@@ -4988,7 +5466,7 @@ static bool recover_exact_input_mount(ExactInputMountOwner& owner,
     owner.snapshot.state = owner.state;
     owner.receipt.state = owner.state;
     owner.receipt.attempted = true;
-    if (!owner.mutated) {
+    if (!owner.mutated && !owner.recovery_required) {
         owner.receipt.cleanup_not_applicable = true;
         owner.receipt.final_zero_residue = true;
         owner.receipt.settlement_complete = true;
@@ -5190,6 +5668,17 @@ static bool recover_exact_input_mount(ExactInputMountOwner& owner,
 
 }  // namespace
 
+bool ExactInputTopologyBuildSink::append(const void* bytes, std::size_t size) noexcept {
+    if (overflowed_) return false;
+    if ((bytes == nullptr && size != 0u) || size > bytes_.size() - size_) {
+        overflowed_ = true;
+        return false;
+    }
+    if (size != 0u) std::memcpy(bytes_.data() + size_, bytes, size);
+    size_ += size;
+    return true;
+}
+
 std::uint64_t exact_input_mount_test_command_count() {
     return command_invocation_count;
 }
@@ -5201,6 +5690,136 @@ std::uint64_t exact_input_mount_test_observation_command_count() {
 bool exact_input_mount_test_write_refusal_self_checks(std::uint32_t& mutation_rejections,
                                                       ExactInputMountDiagnostic& diagnostic) {
     return write_refusal_self_checks_impl(mutation_rejections, diagnostic);
+}
+
+bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
+                                                ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    mutation_rejections = 0u;
+    HeldTopologySnapshot seed;
+    seed.token = std::string(48u, 'a');
+    seed.network_a_name = "a-name";
+    seed.network_a_id = std::string(64u, 'b');
+    seed.network_a_subnet = "10.1.0.0/24";
+    seed.network_a_gateway = "10.1.0.1";
+    seed.network_b_name = "b-name";
+    seed.network_b_id = std::string(64u, 'c');
+    seed.network_b_subnet = "10.2.0.0/24";
+    seed.network_b_gateway = "10.2.0.1";
+    seed.holder_name = "holder";
+    seed.holder_id = std::string(64u, 'd');
+    seed.positive_ip = "10.1.0.2";
+    seed.guard_ip = "10.2.0.2";
+    seed.holder_pid = 123;
+    seed.holder_start = 456u;
+    seed.holder_netns = 789u;
+    std::string error;
+    if (!valid_builder_topology(seed, error)) {
+        diagnostic = {
+            ExactInputMountPhase::InputBuilder, 0, "valid builder self-check seed failed"};
+        return false;
+    }
+    const auto reject = [&](HeldTopologySnapshot mutation) {
+        if (topology_snapshot_equal(seed, mutation)) return false;
+        ++mutation_rejections;
+        return true;
+    };
+#define RUT_REJECT_BUILDER_FIELD(field, value)          \
+    do {                                                \
+        HeldTopologySnapshot mutation = seed;           \
+        mutation.field = value;                         \
+        if (!reject(std::move(mutation))) return false; \
+    } while (false)
+    RUT_REJECT_BUILDER_FIELD(token, std::string(48u, 'e'));
+    RUT_REJECT_BUILDER_FIELD(network_a_name, "changed");
+    RUT_REJECT_BUILDER_FIELD(network_a_id, std::string(64u, 'e'));
+    RUT_REJECT_BUILDER_FIELD(network_a_subnet, "10.3.0.0/24");
+    RUT_REJECT_BUILDER_FIELD(network_a_gateway, "10.1.0.9");
+    RUT_REJECT_BUILDER_FIELD(network_b_name, "changed-b");
+    RUT_REJECT_BUILDER_FIELD(network_b_id, std::string(64u, 'f'));
+    RUT_REJECT_BUILDER_FIELD(network_b_subnet, "10.4.0.0/24");
+    RUT_REJECT_BUILDER_FIELD(network_b_gateway, "10.2.0.9");
+    RUT_REJECT_BUILDER_FIELD(holder_name, "changed-holder");
+    RUT_REJECT_BUILDER_FIELD(holder_id, std::string(64u, '0'));
+    RUT_REJECT_BUILDER_FIELD(positive_ip, "10.1.0.3");
+    RUT_REJECT_BUILDER_FIELD(guard_ip, "10.2.0.3");
+    RUT_REJECT_BUILDER_FIELD(holder_pid, 124);
+    RUT_REJECT_BUILDER_FIELD(holder_start, 457u);
+    RUT_REJECT_BUILDER_FIELD(holder_netns, 790u);
+#undef RUT_REJECT_BUILDER_FIELD
+    const std::string header =
+        "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout";
+    const std::string absent4 = header + "\n 0: 0100007F:A380 00000000:0000 0A\n";
+    const std::string present4 = header + "\n 0: 00000000:A381 00000000:0000 0A\n";
+    const std::string absent6 = header + "\n 0: 00000000000000000000000000000000:A380 0:0 0A\n";
+    const std::string present6 = header + "\n 0: 00000000000000000000000000000000:A381 0:0 0A\n";
+    if (!proc_tcp_port_absent(absent4, kExactInputTopologyBuilderPort) ||
+        proc_tcp_port_absent(present4, kExactInputTopologyBuilderPort) ||
+        !proc_tcp_port_absent(absent6, kExactInputTopologyBuilderPort) ||
+        proc_tcp_port_absent(present6, kExactInputTopologyBuilderPort)) {
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      0,
+                      "TCP/TCP6 selected-port parser self-check failed"};
+        return false;
+    }
+    mutation_rejections += 4u;
+
+    ExactInputTopologyBuildRequest request;
+    std::atomic<bool> active{false};
+    const auto evaluate = [&](ExactInputTopologyBuilder builder,
+                              bool reentry,
+                              const char* expected_message,
+                              int expected_errno) {
+        ExactInputTopologyBuildSink sink;
+        ExactInputBuilderEvidence evidence;
+        invoke_topology_builder(builder, request, nullptr, sink, evidence, active);
+        evidence.reentry_attempted = reentry;
+        ExactInputMountDiagnostic outcome;
+        if (validate_topology_builder_output(evidence, sink, outcome) ||
+            outcome.phase != ExactInputMountPhase::InputBuilder ||
+            outcome.message != expected_message || outcome.error_number != expected_errno ||
+            active.load(std::memory_order_acquire) || evidence.invocation_count != 1u)
+            return false;
+        return true;
+    };
+    const auto empty =
+        +[](const ExactInputTopologyBuildRequest&, ExactInputTopologyBuildSink&, void*) {
+            return true;
+        };
+    const auto rejected =
+        +[](const ExactInputTopologyBuildRequest&, ExactInputTopologyBuildSink&, void*) {
+            return false;
+        };
+    const auto overflow =
+        +[](const ExactInputTopologyBuildRequest&, ExactInputTopologyBuildSink& sink, void*) {
+            std::array<char, kExactInputBuilderCapacity> bytes{};
+            const char extra = 'x';
+            return sink.append(bytes.data(), bytes.size()) && !sink.append(&extra, 1u);
+        };
+    const auto standard_throw =
+        +[](const ExactInputTopologyBuildRequest&, ExactInputTopologyBuildSink&, void*) -> bool {
+        throw std::runtime_error("must not escape");
+    };
+    const auto nonstandard_throw =
+        +[](const ExactInputTopologyBuildRequest&, ExactInputTopologyBuildSink&, void*) -> bool {
+        throw 17;
+    };
+    if (!evaluate(rejected, false, "topology input builder reported failure", 0) ||
+        !evaluate(
+            overflow, false, "topology input builder output exceeded 8192 bytes", EOVERFLOW) ||
+        !evaluate(empty, false, "topology input builder produced empty output", EINVAL) ||
+        !evaluate(standard_throw, false, "topology input builder threw an exception", 0) ||
+        !evaluate(nonstandard_throw, false, "topology input builder threw an exception", 0) ||
+        !evaluate(standard_throw,
+                  true,
+                  "topology input builder attempted controller re-entry",
+                  EDEADLK)) {
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      0,
+                      "builder callback outcome/priority self-check failed"};
+        return false;
+    }
+    return true;
 }
 
 bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
@@ -5560,10 +6179,29 @@ bool ExactInputMountRecoveryController::start(const void* bytes,
                                               ExactInputMountDiagnostic& diagnostic,
                                               const ExactInputMountOptions& options) {
     diagnostic = {};
-    if (exact_mount_thread_id() != construction_thread_) {
+    const std::int64_t thread = exact_mount_thread_id();
+    if (thread != construction_thread_) {
         diagnostic = {ExactInputMountPhase::Thread, 0, "start called from a foreign thread"};
         return false;
     }
+    if (start_in_progress_.load(std::memory_order_acquire)) {
+        if (builder_active_.load(std::memory_order_acquire))
+            reentry_attempted_.store(true, std::memory_order_release);
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EDEADLK,
+                      "start re-entry during an active setup operation"};
+        return false;
+    }
+    operation_thread_.store(thread, std::memory_order_release);
+    start_in_progress_.store(true, std::memory_order_release);
+    struct Guard {
+        std::atomic<bool>& active;
+        std::atomic<std::int64_t>& thread;
+        ~Guard() {
+            active.store(false, std::memory_order_release);
+            thread.store(-1, std::memory_order_release);
+        }
+    } guard{start_in_progress_, operation_thread_};
     if (bytes == nullptr || size == 0u ||
         size > fixture_exact_input_file_lease::kMaximumInputBytes || handle.borrowed_ ||
         handle.controller_address_ != 0u || handle.controller_cookie_ != 0u ||
@@ -5615,10 +6253,103 @@ bool ExactInputMountRecoveryController::start(const void* bytes,
     return true;
 }
 
+bool ExactInputMountRecoveryController::start_with_topology_builder(
+    ExactInputTopologyBuilder builder,
+    void* context,
+    ExactInputMountHandle& handle,
+    ExactInputMountDiagnostic& diagnostic,
+    const ExactInputMountOptions& options) {
+    diagnostic = {};
+    const std::int64_t thread = exact_mount_thread_id();
+    if (thread != construction_thread_) {
+        diagnostic = {
+            ExactInputMountPhase::Thread, 0, "topology-builder start called from a foreign thread"};
+        return false;
+    }
+    if (start_in_progress_.load(std::memory_order_acquire)) {
+        if (builder_active_.load(std::memory_order_acquire))
+            reentry_attempted_.store(true, std::memory_order_release);
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EDEADLK,
+                      "topology-builder start re-entry during active setup"};
+        return false;
+    }
+    if (builder == nullptr || handle.borrowed_ || handle.controller_address_ != 0u ||
+        handle.controller_cookie_ != 0u || handle.generation_ != 0u) {
+        diagnostic = {
+            ExactInputMountPhase::Argument, EINVAL, "invalid topology-builder start argument"};
+        return false;
+    }
+    ExactInputMountOwner* prior = exact_mount_owner(owner_cookie_);
+    if (borrowed_ || (prior != nullptr && !prior->settled)) {
+        diagnostic = {ExactInputMountPhase::Capacity, EBUSY, "the fixed exact-input slot is busy"};
+        return false;
+    }
+    if (prior != nullptr) {
+        delete prior;
+        owner_cookie_ = 0;
+    }
+    if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EOVERFLOW,
+                      "exact-input handle generation cannot wrap"};
+        return false;
+    }
+    std::string token;
+    if (!high_entropy_token(token)) {
+        diagnostic = {ExactInputMountPhase::Preflight,
+                      errno,
+                      "high-entropy topology-builder owner token generation failed"};
+        return false;
+    }
+    ExactInputMountOwner* owner =
+        new (std::nothrow) ExactInputMountOwner(std::move(token), std::string{});
+    if (owner == nullptr) {
+        diagnostic = {
+            ExactInputMountPhase::Capacity, ENOMEM, "topology-builder owner allocation failed"};
+        return false;
+    }
+    owner->options = options;
+    owner_cookie_ = reinterpret_cast<std::uintptr_t>(owner);
+    ++generation_;
+    owner->snapshot.generation = generation_;
+    reentry_attempted_.store(false, std::memory_order_release);
+    operation_thread_.store(thread, std::memory_order_release);
+    start_in_progress_.store(true, std::memory_order_release);
+    struct Guard {
+        std::atomic<bool>& start;
+        std::atomic<bool>& builder;
+        std::atomic<std::int64_t>& thread;
+        ~Guard() {
+            builder.store(false, std::memory_order_release);
+            start.store(false, std::memory_order_release);
+            thread.store(-1, std::memory_order_release);
+        }
+    } guard{start_in_progress_, builder_active_, operation_thread_};
+    if (!setup_exact_input_mount_from_topology_builder(
+            *owner, builder, context, builder_active_, reentry_attempted_, diagnostic))
+        return false;
+    handle.controller_address_ = reinterpret_cast<std::uintptr_t>(this);
+    handle.controller_cookie_ = cookie_;
+    handle.generation_ = generation_;
+    handle.slot_ = 0;
+    handle.borrowed_ = true;
+    borrowed_ = true;
+    return true;
+}
+
 bool ExactInputMountRecoveryController::validate_handle(
     const ExactInputMountHandle& handle, ExactInputMountDiagnostic& diagnostic) const {
     if (exact_mount_thread_id() != construction_thread_) {
         diagnostic = {ExactInputMountPhase::Thread, 0, "handle operation called on foreign thread"};
+        return false;
+    }
+    if (start_in_progress_.load(std::memory_order_acquire)) {
+        if (builder_active_.load(std::memory_order_acquire))
+            reentry_attempted_.store(true, std::memory_order_release);
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EDEADLK,
+                      "handle operation re-entry during active topology builder"};
         return false;
     }
     if (!borrowed_ || !handle.borrowed_ ||
@@ -5994,6 +6725,14 @@ bool ExactInputMountRecoveryController::recover_all(ExactInputMountRecoveryRecei
     diagnostic = {};
     if (exact_mount_thread_id() != construction_thread_) {
         diagnostic = {ExactInputMountPhase::Thread, 0, "recover_all called on a foreign thread"};
+        return false;
+    }
+    if (start_in_progress_.load(std::memory_order_acquire)) {
+        if (builder_active_.load(std::memory_order_acquire))
+            reentry_attempted_.store(true, std::memory_order_release);
+        diagnostic = {ExactInputMountPhase::InputBuilder,
+                      EDEADLK,
+                      "recover_all re-entry during active topology builder"};
         return false;
     }
     if (borrowed_) {
