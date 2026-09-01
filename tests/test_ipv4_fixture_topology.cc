@@ -267,6 +267,7 @@ int main() {
                         evidence.state != HolderOnlyRecreationState::Validated ||
                         !evidence.old_authority_frozen || !evidence.exact_network_a ||
                         !evidence.exact_network_b || !evidence.exact_security ||
+                        !evidence.network_a_membership_proven_after_start ||
                         evidence.operation_ok != recreation.operation_ok_before_cleanup ||
                         evidence.create_command_count != 1u || evidence.start_command_count != 1u ||
                         evidence.connect_b_command_count != 1u ||

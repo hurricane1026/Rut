@@ -2545,6 +2545,8 @@ struct RecreatedHolderOwner {
     bool start_may_have_mutated = false;
     bool connect_b_may_have_mutated = false;
     bool removal_may_have_mutated = false;
+    bool running_identity_validated = false;
+    bool network_a_membership_proven_after_start = false;
     bool operation_ok = true;
     u32 state_visit_mask = 1u << static_cast<unsigned>(HolderOnlyRecreationState::Ready);
     HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None;
@@ -4643,7 +4645,36 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         }
         return true;
     };
+    const auto verify_stopped_network_a_config = [&]() {
+        CommandResult inspect;
+        if (!run_command({"docker",
+                          "inspect",
+                          "-f",
+                          "{{range $name,$v := .NetworkSettings.Networks}}{{$name}}|{{"
+                          "$v.NetworkID}}|{{if $v.IPAMConfig}}{{$v.IPAMConfig.IPv4Address}}{{end}} "
+                          "{{end}}",
+                          fresh.id},
+                         inspect) ||
+            !exited_zero(inspect)) {
+            error = "recreated stopped holder network configuration inspection failed";
+            return false;
+        }
+        std::istringstream fields(trim(inspect.output));
+        std::string network;
+        std::string extra;
+        std::vector<std::string> parts;
+        if (!(fields >> network) || (fields >> extra) || !split_exact(network, '|', 3, parts) ||
+            parts[0] != network_a_.name || parts[1] != network_a_.id || parts[2] != positive_ip_) {
+            error = "recreated stopped holder exact network-A/static-IP config was not exact";
+            return false;
+        }
+        return true;
+    };
     const auto verify_memberships = [&](bool require_b) {
+        if (!fresh.running_identity_validated || fresh.pid <= 1 || fresh.start == 0u) {
+            error = "refusing recreated-holder membership proof before running PID/start authority";
+            return false;
+        }
         CommandResult inspect;
         if (!run_command({"docker",
                           "inspect",
@@ -4804,7 +4835,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         return false;
     }
     HolderCleanupIdentity identity;
-    if (!inspect_exact(false, identity) || !verify_memberships(false)) return false;
+    if (!inspect_exact(false, identity) || !verify_stopped_network_a_config()) return false;
     fresh.image_id = identity.image_id;
     fresh.create_may_have_mutated = false;
     transition_recreated_holder(HolderOnlyRecreationState::CreatedStoppedCleanupOnly);
@@ -4853,8 +4884,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         (identity.pid == holder_retirement_absence_.holder.pid &&
          process.start == holder_retirement_absence_.holder.start) ||
         (identity.pid == holder_retirement_absence_.sidecar.pid &&
-         process.start == holder_retirement_absence_.sidecar.start) ||
-        !verify_memberships(false)) {
+         process.start == holder_retirement_absence_.sidecar.start)) {
         transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         fresh.operation_ok = false;
         error = "recreated holder running A identity/process witness was not exact";
@@ -4862,6 +4892,13 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
     }
     fresh.pid = identity.pid;
     fresh.start = process.start;
+    fresh.running_identity_validated = true;
+    if (!verify_memberships(false)) {
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
+        fresh.operation_ok = false;
+        return false;
+    }
+    fresh.network_a_membership_proven_after_start = true;
     fresh.start_may_have_mutated = false;
     transition_recreated_holder(HolderOnlyRecreationState::RunningExactNetworkA);
     if (start.timed_out) fresh.operation_ok = false;
@@ -4927,6 +4964,8 @@ HolderOnlyRecreationEvidence Fixture::holder_only_recreation_evidence() const {
         recreated_holder_.state >= HolderOnlyRecreationState::RunningExactNetworksAB &&
         recreated_holder_.state != HolderOnlyRecreationState::Unresolved;
     evidence.exact_security = recreated_holder_.state == HolderOnlyRecreationState::Validated;
+    evidence.network_a_membership_proven_after_start =
+        recreated_holder_.network_a_membership_proven_after_start;
     evidence.old_authority_frozen = holder_retirement_absence_.phase ==
                                     HeldNamespaceGenerationRotationPhase::OldGenerationAbsent;
     evidence.operation_ok = recreated_holder_.operation_ok;
@@ -11606,9 +11645,10 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
         evidence.holder_id == old_topology.holder_id || evidence.holder_id == old_sidecar.id ||
         !full_container_id(evidence.holder_id) || evidence.holder_pid <= 1 ||
         evidence.holder_start == 0u || !evidence.exact_network_a || !evidence.exact_network_b ||
-        !evidence.exact_security || !evidence.old_authority_frozen ||
-        evidence.create_command_count != 1u || evidence.start_command_count != 1u ||
-        evidence.connect_b_command_count != 1u || evidence.remove_command_count != 0u ||
+        !evidence.exact_security || !evidence.network_a_membership_proven_after_start ||
+        !evidence.old_authority_frozen || evidence.create_command_count != 1u ||
+        evidence.start_command_count != 1u || evidence.connect_b_command_count != 1u ||
+        evidence.remove_command_count != 0u ||
         evidence.operation_ok != operation_expected_before_cleanup ||
         evidence.state_visit_mask != validated_state_mask ||
         (evidence.holder_pid == old_topology.holder_pid &&

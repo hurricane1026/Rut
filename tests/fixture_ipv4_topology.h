@@ -184,6 +184,7 @@ struct HolderOnlyRecreationEvidence {
     bool exact_network_a = false;
     bool exact_network_b = false;
     bool exact_security = false;
+    bool network_a_membership_proven_after_start = false;
     bool old_authority_frozen = false;
     bool operation_ok = true;
     std::uint32_t state_visit_mask = 0;
