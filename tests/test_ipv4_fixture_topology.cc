@@ -10,6 +10,7 @@ using rut::test::ipv4_topology::HeldNamespaceSidecarFailurePoint;
 using rut::test::ipv4_topology::HeldNamespaceSidecarRevalidationFault;
 using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
+using rut::test::ipv4_topology::HolderOnlyRecreationState;
 using rut::test::ipv4_topology::RunResult;
 
 int main() {
@@ -226,6 +227,27 @@ int main() {
         holder_suppressed.error != holder_suppressed_receipt) {
         std::cerr << "FAIL [#412 running-holder uncertain-removal recovery]: "
                   << holder_suppressed.error << "\n";
+        return 1;
+    }
+    const RunResult holder_recreated = rut::test::ipv4_topology::run_with_holder_only_recreation(
+        [](const rut::test::ipv4_topology::HolderOnlyRecreationEvidence& evidence,
+           std::string& error) {
+            if (evidence.complete_generation ||
+                evidence.state != HolderOnlyRecreationState::Validated ||
+                !evidence.old_authority_frozen || !evidence.exact_network_a ||
+                !evidence.exact_network_b || !evidence.exact_security) {
+                error = "holder-only recreation callback received incomplete evidence";
+                return false;
+            }
+            return true;
+        });
+    const std::string holder_recreated_receipt =
+        "verified holder-only recreation with incomplete-generation evidence and zero residue";
+    if (holder_recreated.prerequisite_failure || !holder_recreated.success ||
+        !holder_recreated.cleanup_complete || !holder_recreated.residue_free ||
+        holder_recreated.semantic_receipt != holder_recreated_receipt ||
+        holder_recreated.error != holder_recreated_receipt) {
+        std::cerr << "FAIL [#412 holder-only recreation owner]: " << holder_recreated.error << "\n";
         return 1;
     }
     bool failing_callback_ran = false;
