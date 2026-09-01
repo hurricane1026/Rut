@@ -185,6 +185,8 @@ struct HolderOnlyRecreationEvidence {
     bool exact_network_b = false;
     bool exact_security = false;
     bool old_authority_frozen = false;
+    bool operation_ok = true;
+    std::uint32_t state_visit_mask = 0;
     std::uint32_t create_command_count = 0;
     std::uint32_t start_command_count = 0;
     std::uint32_t connect_b_command_count = 0;
@@ -201,6 +203,7 @@ enum class HolderOnlyRecreationFailurePoint : std::uint8_t {
 
 enum class HeldNamespaceSidecarFailurePoint {
     None,
+    CreateSuppressedNoObject,
     AfterCreate,
     AfterDiscovery,
     AfterVerification,

@@ -2546,6 +2546,7 @@ struct RecreatedHolderOwner {
     bool connect_b_may_have_mutated = false;
     bool removal_may_have_mutated = false;
     bool operation_ok = true;
+    u32 state_visit_mask = 1u << static_cast<unsigned>(HolderOnlyRecreationState::Ready);
     HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None;
     std::string id;
     std::string image_id;
@@ -2557,239 +2558,6 @@ struct RecreatedHolderOwner {
     u32 remove_command_count = 0;
     HolderOnlyRecreationEvidence frozen_evidence;
 };
-
-enum class PureHolderRecreationFault : std::uint8_t {
-    None,
-    MissingPrecondition,
-    MissingOldSidecarProcessAuthority,
-    RetainedNetworkMismatch,
-    RetainedNetworkNonempty,
-    SameNameCollision,
-    CreateTimeoutExact,
-    CreateTimeoutNonexact,
-    StartFailureStoppedExact,
-    StartTimeoutExact,
-    ConnectTimeoutComplete,
-    ConnectTimeoutPartial,
-    ConnectTimeoutMutated,
-    ValidationFailure,
-    CleanupTimeoutAbsent,
-    CleanupTimeoutSameId,
-    CleanupIdentityMutation,
-};
-
-struct PureHolderRecreationState {
-    HolderOnlyRecreationState state = HolderOnlyRecreationState::Ready;
-    bool operation_ok = true;
-    bool old_authority_frozen = true;
-    bool networks_empty = true;
-    bool topology_release_blocked = false;
-    u32 create_count = 0;
-    u32 start_count = 0;
-    u32 connect_count = 0;
-    u32 remove_count = 0;
-    u32 network_remove_count = 0;
-};
-
-static PureHolderRecreationState pure_holder_recreation_run(PureHolderRecreationFault fault) {
-    PureHolderRecreationState value;
-    if (fault == PureHolderRecreationFault::MissingPrecondition ||
-        fault == PureHolderRecreationFault::MissingOldSidecarProcessAuthority ||
-        fault == PureHolderRecreationFault::RetainedNetworkMismatch ||
-        fault == PureHolderRecreationFault::RetainedNetworkNonempty ||
-        fault == PureHolderRecreationFault::SameNameCollision) {
-        value.operation_ok = false;
-        return value;
-    }
-    value.topology_release_blocked = true;
-    value.state = HolderOnlyRecreationState::CreateMayHaveMutated;
-    ++value.create_count;
-    if (fault == PureHolderRecreationFault::CreateTimeoutNonexact) {
-        value.state = HolderOnlyRecreationState::Unresolved;
-        value.operation_ok = false;
-        return value;
-    }
-    if (fault == PureHolderRecreationFault::CreateTimeoutExact) value.operation_ok = false;
-    value.state = HolderOnlyRecreationState::CreatedStoppedCleanupOnly;
-    value.state = HolderOnlyRecreationState::StartMayHaveMutated;
-    ++value.start_count;
-    if (fault == PureHolderRecreationFault::StartFailureStoppedExact) {
-        value.operation_ok = false;
-        ++value.remove_count;
-        value.state = HolderOnlyRecreationState::Settled;
-        value.topology_release_blocked = false;
-        return value;
-    }
-    if (fault == PureHolderRecreationFault::StartTimeoutExact) value.operation_ok = false;
-    value.state = HolderOnlyRecreationState::RunningExactNetworkA;
-    value.state = HolderOnlyRecreationState::NetworkBConnectMayHaveMutated;
-    ++value.connect_count;
-    if (fault == PureHolderRecreationFault::ConnectTimeoutMutated) {
-        value.state = HolderOnlyRecreationState::Unresolved;
-        value.operation_ok = false;
-        return value;
-    }
-    if (fault == PureHolderRecreationFault::ConnectTimeoutPartial) {
-        value.operation_ok = false;
-        value.state = HolderOnlyRecreationState::RunningExactNetworkA;
-        ++value.remove_count;
-        value.state = HolderOnlyRecreationState::Settled;
-        value.topology_release_blocked = false;
-        return value;
-    }
-    if (fault == PureHolderRecreationFault::ConnectTimeoutComplete) value.operation_ok = false;
-    value.state = HolderOnlyRecreationState::RunningExactNetworksAB;
-    if (fault == PureHolderRecreationFault::ValidationFailure) {
-        value.operation_ok = false;
-        ++value.remove_count;
-        value.state = HolderOnlyRecreationState::Settled;
-        value.topology_release_blocked = false;
-        return value;
-    }
-    value.state = HolderOnlyRecreationState::Validated;
-    if (fault == PureHolderRecreationFault::CleanupIdentityMutation) {
-        value.state = HolderOnlyRecreationState::Unresolved;
-        value.operation_ok = false;
-        return value;
-    }
-    value.state = HolderOnlyRecreationState::RemovalMayHaveMutated;
-    ++value.remove_count;
-    if (fault == PureHolderRecreationFault::CleanupTimeoutSameId) {
-        value.operation_ok = false;
-        return value;
-    }
-    if (fault == PureHolderRecreationFault::CleanupTimeoutAbsent) value.operation_ok = false;
-    value.state = HolderOnlyRecreationState::Settled;
-    value.topology_release_blocked = false;
-    return value;
-}
-
-static PureHolderRecreationState pure_holder_recreation_terminal_replay(
-    const PureHolderRecreationState& frozen) {
-    if (frozen.state == HolderOnlyRecreationState::Settled) return frozen;
-    return frozen;
-}
-
-static PureHolderRecreationState pure_holder_recreation_removal_retry(
-    PureHolderRecreationState value, bool same_identity, bool now_absent) {
-    if (value.state != HolderOnlyRecreationState::RemovalMayHaveMutated) return value;
-    if (!same_identity && !now_absent) {
-        value.state = HolderOnlyRecreationState::Unresolved;
-        return value;
-    }
-    if (same_identity) ++value.remove_count;
-    value.state = HolderOnlyRecreationState::Settled;
-    value.topology_release_blocked = false;
-    return value;
-}
-
-static bool pure_holder_recreation_self_checks(std::string& error) {
-    const PureHolderRecreationState normal =
-        pure_holder_recreation_run(PureHolderRecreationFault::None);
-    if (normal.state != HolderOnlyRecreationState::Settled || !normal.operation_ok ||
-        normal.topology_release_blocked || !normal.old_authority_frozen || !normal.networks_empty ||
-        normal.create_count != 1u || normal.start_count != 1u || normal.connect_count != 1u ||
-        normal.remove_count != 1u || normal.network_remove_count != 0u) {
-        error = "pure holder-only recreation normal flow was not monotonic/exact";
-        return false;
-    }
-    const PureHolderRecreationState replay = pure_holder_recreation_terminal_replay(normal);
-    if (replay.state != normal.state || replay.operation_ok != normal.operation_ok ||
-        replay.old_authority_frozen != normal.old_authority_frozen ||
-        replay.topology_release_blocked != normal.topology_release_blocked ||
-        replay.create_count != normal.create_count || replay.start_count != normal.start_count ||
-        replay.connect_count != normal.connect_count ||
-        replay.remove_count != normal.remove_count ||
-        replay.network_remove_count != normal.network_remove_count) {
-        error = "pure holder-only terminal replay was not frozen/command-free";
-        return false;
-    }
-    for (PureHolderRecreationFault fault :
-         {PureHolderRecreationFault::MissingPrecondition,
-          PureHolderRecreationFault::MissingOldSidecarProcessAuthority,
-          PureHolderRecreationFault::RetainedNetworkMismatch,
-          PureHolderRecreationFault::RetainedNetworkNonempty,
-          PureHolderRecreationFault::SameNameCollision}) {
-        const PureHolderRecreationState rejected = pure_holder_recreation_run(fault);
-        if (rejected.state != HolderOnlyRecreationState::Ready || rejected.operation_ok ||
-            rejected.topology_release_blocked || rejected.create_count != 0u ||
-            rejected.remove_count != 0u || rejected.network_remove_count != 0u) {
-            error = "pure holder-only recreation precondition reached mutation authority";
-            return false;
-        }
-    }
-    const PureHolderRecreationState create_exact =
-        pure_holder_recreation_run(PureHolderRecreationFault::CreateTimeoutExact);
-    const PureHolderRecreationState start_timeout =
-        pure_holder_recreation_run(PureHolderRecreationFault::StartTimeoutExact);
-    const PureHolderRecreationState connect_complete =
-        pure_holder_recreation_run(PureHolderRecreationFault::ConnectTimeoutComplete);
-    const PureHolderRecreationState cleanup_absent =
-        pure_holder_recreation_run(PureHolderRecreationFault::CleanupTimeoutAbsent);
-    for (const PureHolderRecreationState* recovered :
-         {&create_exact, &start_timeout, &connect_complete, &cleanup_absent}) {
-        if (recovered->state != HolderOnlyRecreationState::Settled || recovered->operation_ok ||
-            recovered->topology_release_blocked || recovered->remove_count != 1u ||
-            recovered->network_remove_count != 0u) {
-            error = "pure exact timeout recovery did not settle one owned holder";
-            return false;
-        }
-    }
-    for (PureHolderRecreationFault fault : {PureHolderRecreationFault::CreateTimeoutNonexact,
-                                            PureHolderRecreationFault::ConnectTimeoutMutated,
-                                            PureHolderRecreationFault::CleanupIdentityMutation}) {
-        const PureHolderRecreationState unresolved = pure_holder_recreation_run(fault);
-        if (unresolved.state != HolderOnlyRecreationState::Unresolved || unresolved.operation_ok ||
-            !unresolved.topology_release_blocked || unresolved.network_remove_count != 0u) {
-            error = "pure ambiguous holder authority did not remain unresolved/fail-closed";
-            return false;
-        }
-    }
-    for (PureHolderRecreationFault fault : {PureHolderRecreationFault::StartFailureStoppedExact,
-                                            PureHolderRecreationFault::ConnectTimeoutPartial,
-                                            PureHolderRecreationFault::ValidationFailure}) {
-        const PureHolderRecreationState partial = pure_holder_recreation_run(fault);
-        if (partial.state != HolderOnlyRecreationState::Settled || partial.operation_ok ||
-            partial.remove_count != 1u || partial.topology_release_blocked ||
-            partial.network_remove_count != 0u) {
-            error = "pure partial/stopped recreated holder was not cleanup-only";
-            return false;
-        }
-    }
-    const PureHolderRecreationState removal_present =
-        pure_holder_recreation_run(PureHolderRecreationFault::CleanupTimeoutSameId);
-    if (removal_present.state != HolderOnlyRecreationState::RemovalMayHaveMutated ||
-        removal_present.operation_ok || !removal_present.topology_release_blocked ||
-        removal_present.remove_count != 1u || removal_present.network_remove_count != 0u) {
-        error = "pure same-ID cleanup timeout lost bounded retry authority";
-        return false;
-    }
-    const PureHolderRecreationState removal_retry =
-        pure_holder_recreation_removal_retry(removal_present, true, false);
-    if (removal_retry.state != HolderOnlyRecreationState::Settled || removal_retry.operation_ok ||
-        removal_retry.topology_release_blocked || removal_retry.remove_count != 2u ||
-        removal_retry.network_remove_count != 0u) {
-        error = "pure same-ID removal retry did not revalidate/settle exact ownership";
-        return false;
-    }
-    const PureHolderRecreationState removal_mutated =
-        pure_holder_recreation_removal_retry(removal_present, false, false);
-    if (removal_mutated.state != HolderOnlyRecreationState::Unresolved ||
-        removal_mutated.operation_ok || !removal_mutated.topology_release_blocked ||
-        removal_mutated.remove_count != 1u || removal_mutated.network_remove_count != 0u) {
-        error = "pure removal retry config mutation did not fail closed before another command";
-        return false;
-    }
-    const PureHolderRecreationState removal_absent =
-        pure_holder_recreation_removal_retry(removal_present, false, true);
-    if (removal_absent.state != HolderOnlyRecreationState::Settled || removal_absent.operation_ok ||
-        removal_absent.topology_release_blocked || removal_absent.remove_count != 1u ||
-        removal_absent.network_remove_count != 0u) {
-        error = "pure removal retry absence did not settle without duplicate command";
-        return false;
-    }
-    return true;
-}
 
 enum class PureHolderRetirementFault : std::uint8_t {
     None,
@@ -3219,6 +2987,7 @@ public:
     bool recreate_holder_only(HolderOnlyRecreationFailurePoint failure_point, std::string& error);
     bool cleanup_recreated_holder(std::string& error);
     HolderOnlyRecreationEvidence holder_only_recreation_evidence() const;
+    void transition_recreated_holder(HolderOnlyRecreationState state);
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -3647,6 +3416,10 @@ private:
         // From this boundary onward Docker may have accepted the unique-name
         // create even when command/recovery evidence is incomplete.
         sidecar_creation_may_have_mutated_ = true;
+        if (point == HeldNamespaceSidecarFailurePoint::CreateSuppressedNoObject) {
+            error = "injected sidecar create suppression with no Docker object";
+            return false;
+        }
         if (!run_command(create_arguments, result, 15000, reported_timeout) ||
             !exited_zero(result)) {
             if (reported_timeout && result.timed_out && WIFEXITED(result.status) &&
@@ -4281,10 +4054,11 @@ private:
             error = "token/role-labelled sidecar residue remains";
             return false;
         }
-        if (sidecar_snapshot_.pid <= 1 || sidecar_snapshot_.start == 0u) {
-            error = "old sidecar absence proof lacked exact PID/start authority";
-            return false;
-        }
+        const bool rotation_witness_recorded =
+            full_container_id(sidecar_id_) && sidecar_snapshot_.id == sidecar_id_ &&
+            sidecar_snapshot_.name == sidecar_name_ && sidecar_snapshot_.pid > 1 &&
+            sidecar_snapshot_.start != 0u;
+        if (!rotation_witness_recorded) return true;
         ProcIdentity current{};
         if (proc_identity(sidecar_snapshot_.pid, current, false)) {
             if (current.start == sidecar_snapshot_.start) {
@@ -4797,6 +4571,11 @@ private:
         HeldNamespaceSidecarRevalidationFault::None;
 };
 
+void Fixture::transition_recreated_holder(HolderOnlyRecreationState state) {
+    recreated_holder_.state = state;
+    recreated_holder_.state_visit_mask |= 1u << static_cast<unsigned>(state);
+}
+
 bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_point,
                                    std::string& error) {
     error.clear();
@@ -4859,7 +4638,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
             !immutable_exact(identity, running)) {
             error = "recreated holder immutable identity was not exact";
             if (!inspect_error.empty()) error += ": " + inspect_error;
-            fresh.state = HolderOnlyRecreationState::Unresolved;
+            transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
             return false;
         }
         return true;
@@ -4958,7 +4737,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         return true;
     };
 
-    fresh.state = HolderOnlyRecreationState::CreateMayHaveMutated;
+    transition_recreated_holder(HolderOnlyRecreationState::CreateMayHaveMutated);
     fresh.create_may_have_mutated = true;
     ++fresh.create_command_count;
     CommandResult create;
@@ -5019,7 +4798,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         }
     }
     if ((!create_ok && !create.timed_out) || !full_container_id(fresh.id)) {
-        fresh.state = HolderOnlyRecreationState::Unresolved;
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         fresh.operation_ok = false;
         error = "recreated holder create outcome could not be adopted by exact full ID";
         return false;
@@ -5028,10 +4807,10 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
     if (!inspect_exact(false, identity) || !verify_memberships(false)) return false;
     fresh.image_id = identity.image_id;
     fresh.create_may_have_mutated = false;
-    fresh.state = HolderOnlyRecreationState::CreatedStoppedCleanupOnly;
+    transition_recreated_holder(HolderOnlyRecreationState::CreatedStoppedCleanupOnly);
     if (create.timed_out) fresh.operation_ok = false;
 
-    fresh.state = HolderOnlyRecreationState::StartMayHaveMutated;
+    transition_recreated_holder(HolderOnlyRecreationState::StartMayHaveMutated);
     fresh.start_may_have_mutated = true;
     ++fresh.start_command_count;
     CommandResult start;
@@ -5046,9 +4825,9 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         if (inspect_holder_cleanup_identity(fresh.id, stopped, stopped_error) &&
             immutable_exact(stopped, false)) {
             fresh.start_may_have_mutated = false;
-            fresh.state = HolderOnlyRecreationState::CreatedStoppedCleanupOnly;
+            transition_recreated_holder(HolderOnlyRecreationState::CreatedStoppedCleanupOnly);
         } else {
-            fresh.state = HolderOnlyRecreationState::Unresolved;
+            transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         }
         fresh.operation_ok = false;
         error = "recreated holder start failed; stopped exact holder is cleanup-only";
@@ -5057,14 +4836,14 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
     std::string running_inspect_error;
     if (!inspect_holder_cleanup_identity(fresh.id, identity, running_inspect_error) ||
         !immutable_exact(identity, identity.running)) {
-        fresh.state = HolderOnlyRecreationState::Unresolved;
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         fresh.operation_ok = false;
         error = "recreated holder start recovery identity was ambiguous";
         return false;
     }
     if (!identity.running) {
         fresh.start_may_have_mutated = false;
-        fresh.state = HolderOnlyRecreationState::CreatedStoppedCleanupOnly;
+        transition_recreated_holder(HolderOnlyRecreationState::CreatedStoppedCleanupOnly);
         fresh.operation_ok = false;
         error = "recreated holder remained stopped after start and is cleanup-only";
         return false;
@@ -5076,7 +4855,7 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         (identity.pid == holder_retirement_absence_.sidecar.pid &&
          process.start == holder_retirement_absence_.sidecar.start) ||
         !verify_memberships(false)) {
-        fresh.state = HolderOnlyRecreationState::Unresolved;
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         fresh.operation_ok = false;
         error = "recreated holder running A identity/process witness was not exact";
         return false;
@@ -5084,10 +4863,10 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
     fresh.pid = identity.pid;
     fresh.start = process.start;
     fresh.start_may_have_mutated = false;
-    fresh.state = HolderOnlyRecreationState::RunningExactNetworkA;
+    transition_recreated_holder(HolderOnlyRecreationState::RunningExactNetworkA);
     if (start.timed_out) fresh.operation_ok = false;
 
-    fresh.state = HolderOnlyRecreationState::NetworkBConnectMayHaveMutated;
+    transition_recreated_holder(HolderOnlyRecreationState::NetworkBConnectMayHaveMutated);
     fresh.connect_b_may_have_mutated = true;
     ++fresh.connect_b_command_count;
     CommandResult connect;
@@ -5100,20 +4879,20 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         !verify_memberships(true)) {
         fresh.operation_ok = false;
         if (fresh.state != HolderOnlyRecreationState::Unresolved)
-            fresh.state = HolderOnlyRecreationState::RunningExactNetworkA;
+            transition_recreated_holder(HolderOnlyRecreationState::RunningExactNetworkA);
         if (error.empty()) error = "recreated holder B-connect did not yield exact A+B topology";
         return false;
     }
     fresh.connect_b_may_have_mutated = false;
-    fresh.state = HolderOnlyRecreationState::RunningExactNetworksAB;
+    transition_recreated_holder(HolderOnlyRecreationState::RunningExactNetworksAB);
     if (connect.timed_out) fresh.operation_ok = false;
     if (!verify_network(network_a_, error) || !verify_network(network_b_, error) ||
         !inspect_exact(true, identity) || !verify_memberships(true)) {
-        fresh.state = HolderOnlyRecreationState::Unresolved;
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         fresh.operation_ok = false;
         return false;
     }
-    fresh.state = HolderOnlyRecreationState::Validated;
+    transition_recreated_holder(HolderOnlyRecreationState::Validated);
     fresh.frozen_evidence = holder_only_recreation_evidence();
     return true;
 }
@@ -5150,6 +4929,8 @@ HolderOnlyRecreationEvidence Fixture::holder_only_recreation_evidence() const {
     evidence.exact_security = recreated_holder_.state == HolderOnlyRecreationState::Validated;
     evidence.old_authority_frozen = holder_retirement_absence_.phase ==
                                     HeldNamespaceGenerationRotationPhase::OldGenerationAbsent;
+    evidence.operation_ok = recreated_holder_.operation_ok;
+    evidence.state_visit_mask = recreated_holder_.state_visit_mask;
     evidence.create_command_count = recreated_holder_.create_command_count;
     evidence.start_command_count = recreated_holder_.start_command_count;
     evidence.connect_b_command_count = recreated_holder_.connect_b_command_count;
@@ -5185,17 +4966,17 @@ bool Fixture::cleanup_recreated_holder(std::string& error) {
                 {"docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + holder_name_ + "$"},
                 name) ||
             !exited_zero(name) || !trim(name.output).empty()) {
-            fresh.state = HolderOnlyRecreationState::Unresolved;
+            transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
             error = "recreated holder removal recovery could not prove exact name absence";
             return false;
         }
     } else if (!immutable_exact) {
-        fresh.state = HolderOnlyRecreationState::Unresolved;
+        transition_recreated_holder(HolderOnlyRecreationState::Unresolved);
         error = "recreated holder cleanup immutable identity changed; refusing deletion";
         return false;
     }
     if (present) {
-        fresh.state = HolderOnlyRecreationState::RemovalMayHaveMutated;
+        transition_recreated_holder(HolderOnlyRecreationState::RemovalMayHaveMutated);
         fresh.removal_may_have_mutated = true;
         ++fresh.remove_command_count;
         CommandResult removal;
@@ -5235,7 +5016,7 @@ bool Fixture::cleanup_recreated_holder(std::string& error) {
         error = "recreated holder cleanup did not retain exact empty networks: " + inspect_error;
         return false;
     }
-    fresh.state = HolderOnlyRecreationState::Settled;
+    transition_recreated_holder(HolderOnlyRecreationState::Settled);
     fresh.frozen_evidence = {};
     fresh.frozen_evidence = holder_only_recreation_evidence();
     return true;
@@ -10528,7 +10309,6 @@ bool audit_zero_residue(const std::string& token,
 }
 
 bool pure_validation_self_checks(std::string& error) {
-    if (!pure_holder_recreation_self_checks(error)) return false;
     if (!pure_holder_retirement_self_checks(error)) return false;
     if (!held_namespace_generation_rotation_self_checks(error)) return false;
     u32 low = 0, high = 0;
@@ -11321,6 +11101,45 @@ RunResult run_with_held_topology_and_sidecar(
     topology.probe_evidence = probe_evidence;
 
     if (!fixture.create_sidecar(failure_point, result.error)) {
+        if (failure_point == HeldNamespaceSidecarFailurePoint::CreateSuppressedNoObject) {
+            if (result.error != "injected sidecar create suppression with no Docker object") {
+                result.error = "no-object sidecar suppression did not stop at the causal seam";
+                return finish_after_cleanup(false);
+            }
+            std::string cleanup_error;
+            if (!fixture.cleanup(cleanup_error) || !cleanup_error.empty()) {
+                result.error =
+                    "no-object sidecar cleanup did not settle generically: " + cleanup_error;
+                return finish_after_cleanup(false);
+            }
+            const HeldNamespaceOldGenerationAbsence absence = fixture.holder_retirement_absence();
+            const CleanupEvidence terminal = fixture.cleanup_evidence();
+            if (absence.phase != HeldNamespaceGenerationRotationPhase::None ||
+                !absence.sidecar.container_id.empty() || absence.sidecar.pid != -1 ||
+                absence.sidecar.start != 0u || absence.sidecar.container_id_absent ||
+                absence.sidecar.process_identity_absent || !absence.sidecar_name.empty() ||
+                absence.sidecar_name_absent ||
+                terminal.progress != CleanupProgress::TopologySettled || terminal.sidecar_exists ||
+                terminal.holder_exists || terminal.network_a_exists || terminal.network_b_exists ||
+                terminal.sidecar_creation_may_have_mutated) {
+                result.error =
+                    "no-object generic cleanup fabricated old-sidecar rotation authority";
+                return finish_after_cleanup(false);
+            }
+            const u64 commands_before_replay = command_invocation_count;
+            std::string caller_history = "preserve-no-object-history";
+            if (!fixture.cleanup(caller_history) ||
+                caller_history != "preserve-no-object-history" ||
+                command_invocation_count != commands_before_replay ||
+                !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+                result.error = "no-object generic cleanup replay was not frozen/command-free";
+                return finish_after_cleanup(false);
+            }
+            result.semantic_receipt =
+                "verified no-object sidecar cleanup without rotation authority";
+            result.error = result.semantic_receipt;
+            return finish_after_cleanup(true);
+        }
         if (failure_point ==
             HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable) {
             if (result.error !=
@@ -11760,6 +11579,18 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
 
     if (!fixture.recreate_holder_only(failure_point, result.error)) return finish(false);
     const HolderOnlyRecreationEvidence evidence = fixture.holder_only_recreation_evidence();
+    const u32 validated_state_mask =
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::Ready)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::CreateMayHaveMutated)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::CreatedStoppedCleanupOnly)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::StartMayHaveMutated)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::RunningExactNetworkA)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::NetworkBConnectMayHaveMutated)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::RunningExactNetworksAB)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::Validated));
+    const bool operation_expected_before_cleanup =
+        failure_point == HolderOnlyRecreationFailurePoint::None ||
+        failure_point == HolderOnlyRecreationFailurePoint::CleanupReportedTimeout;
     if (evidence.complete_generation || evidence.state != HolderOnlyRecreationState::Validated ||
         evidence.old_absence.phase != HeldNamespaceGenerationRotationPhase::OldGenerationAbsent ||
         evidence.network_a_id != old_topology.network_a_id ||
@@ -11777,6 +11608,8 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
         !evidence.exact_security || !evidence.old_authority_frozen ||
         evidence.create_command_count != 1u || evidence.start_command_count != 1u ||
         evidence.connect_b_command_count != 1u || evidence.remove_command_count != 0u ||
+        evidence.operation_ok != operation_expected_before_cleanup ||
+        evidence.state_visit_mask != validated_state_mask ||
         (evidence.holder_pid == old_topology.holder_pid &&
          evidence.holder_start == old_topology.holder_start) ||
         (evidence.holder_pid == old_sidecar.pid && evidence.holder_start == old_sidecar.start) ||
@@ -11793,8 +11626,15 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
         return finish(false);
     }
     const HolderOnlyRecreationEvidence settled = fixture.holder_only_recreation_evidence();
+    const u32 settled_state_mask =
+        validated_state_mask |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::RemovalMayHaveMutated)) |
+        (1u << static_cast<unsigned>(HolderOnlyRecreationState::Settled));
     if (settled.state != HolderOnlyRecreationState::Settled || settled.complete_generation ||
         settled.holder_id != evidence.holder_id || settled.remove_command_count != 1u ||
+        settled.operation_ok != (failure_point == HolderOnlyRecreationFailurePoint::None) ||
+        settled.state_visit_mask != settled_state_mask || settled.create_command_count != 1u ||
+        settled.start_command_count != 1u || settled.connect_b_command_count != 1u ||
         !cleanup_evidence_equal(old_cleanup_frozen, fixture.cleanup_evidence())) {
         result.error = "recreated holder settlement mutated old frozen cleanup authority";
         return finish(false);
@@ -11826,8 +11666,29 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
         result.error = audit_error;
         return result;
     }
-    result.semantic_receipt =
-        "verified holder-only recreation with incomplete-generation evidence and zero residue";
+    switch (failure_point) {
+        case HolderOnlyRecreationFailurePoint::None:
+            result.semantic_receipt =
+                "verified holder-only recreation with incomplete-generation evidence and zero "
+                "residue";
+            break;
+        case HolderOnlyRecreationFailurePoint::CreateReportedTimeout:
+            result.semantic_receipt =
+                "verified holder-only create reported-timeout exact recovery and zero residue";
+            break;
+        case HolderOnlyRecreationFailurePoint::StartReportedTimeout:
+            result.semantic_receipt =
+                "verified holder-only start reported-timeout exact recovery and zero residue";
+            break;
+        case HolderOnlyRecreationFailurePoint::NetworkBConnectReportedTimeout:
+            result.semantic_receipt =
+                "verified holder-only B-connect reported-timeout exact recovery and zero residue";
+            break;
+        case HolderOnlyRecreationFailurePoint::CleanupReportedTimeout:
+            result.semantic_receipt =
+                "verified holder-only cleanup reported-timeout exact absence and zero residue";
+            break;
+    }
     result.error = result.semantic_receipt;
     result.success = true;
     return result;

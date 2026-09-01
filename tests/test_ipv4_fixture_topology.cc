@@ -10,6 +10,7 @@ using rut::test::ipv4_topology::HeldNamespaceSidecarFailurePoint;
 using rut::test::ipv4_topology::HeldNamespaceSidecarRevalidationFault;
 using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
+using rut::test::ipv4_topology::HolderOnlyRecreationFailurePoint;
 using rut::test::ipv4_topology::HolderOnlyRecreationState;
 using rut::test::ipv4_topology::RunResult;
 
@@ -177,7 +178,9 @@ int main() {
         return 1;
     }
     for (const auto& injection :
-         {std::pair{HeldNamespaceSidecarFailurePoint::AfterCreate,
+         {std::pair{HeldNamespaceSidecarFailurePoint::CreateSuppressedNoObject,
+                    std::string("verified no-object sidecar cleanup without rotation authority")},
+          std::pair{HeldNamespaceSidecarFailurePoint::AfterCreate,
                     std::string("injected held-namespace sidecar failure after create")},
           std::pair{HeldNamespaceSidecarFailurePoint::AfterDiscovery,
                     std::string("injected held-namespace sidecar failure after discovery")},
@@ -229,26 +232,59 @@ int main() {
                   << holder_suppressed.error << "\n";
         return 1;
     }
-    const RunResult holder_recreated = rut::test::ipv4_topology::run_with_holder_only_recreation(
-        [](const rut::test::ipv4_topology::HolderOnlyRecreationEvidence& evidence,
-           std::string& error) {
-            if (evidence.complete_generation ||
-                evidence.state != HolderOnlyRecreationState::Validated ||
-                !evidence.old_authority_frozen || !evidence.exact_network_a ||
-                !evidence.exact_network_b || !evidence.exact_security) {
-                error = "holder-only recreation callback received incomplete evidence";
-                return false;
-            }
-            return true;
-        });
-    const std::string holder_recreated_receipt =
-        "verified holder-only recreation with incomplete-generation evidence and zero residue";
-    if (holder_recreated.prerequisite_failure || !holder_recreated.success ||
-        !holder_recreated.cleanup_complete || !holder_recreated.residue_free ||
-        holder_recreated.semantic_receipt != holder_recreated_receipt ||
-        holder_recreated.error != holder_recreated_receipt) {
-        std::cerr << "FAIL [#412 holder-only recreation owner]: " << holder_recreated.error << "\n";
-        return 1;
+    struct HolderRecreationCase {
+        HolderOnlyRecreationFailurePoint point;
+        const char* receipt;
+        bool operation_ok_before_cleanup;
+    };
+    for (const HolderRecreationCase& recreation :
+         {HolderRecreationCase{
+              HolderOnlyRecreationFailurePoint::None,
+              "verified holder-only recreation with incomplete-generation evidence and zero "
+              "residue",
+              true},
+          HolderRecreationCase{
+              HolderOnlyRecreationFailurePoint::CreateReportedTimeout,
+              "verified holder-only create reported-timeout exact recovery and zero residue",
+              false},
+          HolderRecreationCase{
+              HolderOnlyRecreationFailurePoint::StartReportedTimeout,
+              "verified holder-only start reported-timeout exact recovery and zero residue",
+              false},
+          HolderRecreationCase{
+              HolderOnlyRecreationFailurePoint::NetworkBConnectReportedTimeout,
+              "verified holder-only B-connect reported-timeout exact recovery and zero residue",
+              false},
+          HolderRecreationCase{
+              HolderOnlyRecreationFailurePoint::CleanupReportedTimeout,
+              "verified holder-only cleanup reported-timeout exact absence and zero residue",
+              true}}) {
+        const RunResult holder_recreated =
+            rut::test::ipv4_topology::run_with_holder_only_recreation(
+                [&](const rut::test::ipv4_topology::HolderOnlyRecreationEvidence& evidence,
+                    std::string& error) {
+                    if (evidence.complete_generation ||
+                        evidence.state != HolderOnlyRecreationState::Validated ||
+                        !evidence.old_authority_frozen || !evidence.exact_network_a ||
+                        !evidence.exact_network_b || !evidence.exact_security ||
+                        evidence.operation_ok != recreation.operation_ok_before_cleanup ||
+                        evidence.create_command_count != 1u || evidence.start_command_count != 1u ||
+                        evidence.connect_b_command_count != 1u ||
+                        evidence.remove_command_count != 0u) {
+                        error = "holder-only recreation callback received incomplete evidence";
+                        return false;
+                    }
+                    return true;
+                },
+                recreation.point);
+        if (holder_recreated.prerequisite_failure || !holder_recreated.success ||
+            !holder_recreated.cleanup_complete || !holder_recreated.residue_free ||
+            holder_recreated.semantic_receipt != recreation.receipt ||
+            holder_recreated.error != recreation.receipt) {
+            std::cerr << "FAIL [#412 holder-only recreation owner]: " << holder_recreated.error
+                      << "\n";
+            return 1;
+        }
     }
     bool failing_callback_ran = false;
     const RunResult callback_failure = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
