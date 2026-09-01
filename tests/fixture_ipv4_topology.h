@@ -97,6 +97,55 @@ struct HeldNamespaceSidecarSnapshot {
     bool no_published_ports = false;
 };
 
+// Pure value evidence for replacing only the holder/sidecar generation while
+// retaining the exact Docker networks and addressing plan.  It deliberately
+// records process identity as (pid,start): a numeric PID may be reused by a
+// later generation when its start time differs.
+struct HeldNamespaceGenerationSnapshot {
+    HeldTopologySnapshot topology;
+    HeldNamespaceSidecarSnapshot sidecar;
+};
+
+struct HeldNamespaceGenerationWitnessAbsence {
+    std::string container_id;
+    pid_t pid = -1;
+    std::uint64_t start = 0;
+    bool container_id_absent = false;
+    bool process_identity_absent = false;
+};
+
+enum class HeldNamespaceGenerationRotationPhase : std::uint8_t {
+    None = 0,
+    OldGenerationValidated = 1,
+    OldGenerationAbsent = 2,
+    NewGenerationCreated = 3,
+    NewGenerationValidated = 4,
+};
+
+struct HeldNamespaceOldGenerationAbsence {
+    HeldNamespaceGenerationWitnessAbsence holder;
+    HeldNamespaceGenerationWitnessAbsence sidecar;
+    std::string holder_name;
+    std::string sidecar_name;
+    bool holder_name_absent = false;
+    bool sidecar_name_absent = false;
+    // This aggregate phase is complete only after all exact ID, process and
+    // name witnesses above are absent, before either stable name is reused.
+    HeldNamespaceGenerationRotationPhase phase = HeldNamespaceGenerationRotationPhase::None;
+};
+
+struct HeldNamespaceGenerationRotationReceipt {
+    HeldNamespaceGenerationSnapshot old_generation;
+    HeldNamespaceGenerationRotationPhase old_generation_phase =
+        HeldNamespaceGenerationRotationPhase::None;
+    HeldNamespaceOldGenerationAbsence old_absence;
+    HeldNamespaceGenerationSnapshot new_generation;
+    HeldNamespaceGenerationRotationPhase new_generation_created_phase =
+        HeldNamespaceGenerationRotationPhase::None;
+    HeldNamespaceGenerationRotationPhase new_generation_validated_phase =
+        HeldNamespaceGenerationRotationPhase::None;
+};
+
 enum class HeldNamespaceSidecarFailurePoint {
     None,
     AfterCreate,
@@ -160,6 +209,8 @@ bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
 bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topology,
                                               const HeldNamespaceSidecarSnapshot& sidecar,
                                               std::string& error);
+bool validate_held_namespace_generation_rotation_receipt(
+    const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error);
 bool validate_held_topology_probe_evidence(const HeldTopologyProbeEvidence& evidence,
                                            HeldTopologyProbePolicy expected_policy,
                                            std::string& error);
