@@ -12,6 +12,8 @@ using rut::test::ipv4_topology::HeldTopologyProbeEvidence;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::HolderOnlyRecreationFailurePoint;
 using rut::test::ipv4_topology::HolderOnlyRecreationState;
+using rut::test::ipv4_topology::RecreatedSidecarFailurePoint;
+using rut::test::ipv4_topology::RecreatedSidecarState;
 using rut::test::ipv4_topology::RunResult;
 
 int main() {
@@ -232,58 +234,58 @@ int main() {
                   << holder_suppressed.error << "\n";
         return 1;
     }
-    struct HolderRecreationCase {
-        HolderOnlyRecreationFailurePoint point;
-        const char* receipt;
-        bool operation_ok_before_cleanup;
+    struct RecreationCase {
+        HolderOnlyRecreationFailurePoint holder_point;
+        RecreatedSidecarFailurePoint sidecar_point;
     };
-    for (const HolderRecreationCase& recreation :
-         {HolderRecreationCase{
-              HolderOnlyRecreationFailurePoint::None,
-              "verified holder-only recreation with incomplete-generation evidence and zero "
-              "residue",
-              true},
-          HolderRecreationCase{
-              HolderOnlyRecreationFailurePoint::CreateReportedTimeout,
-              "verified holder-only create reported-timeout exact recovery and zero residue",
-              false},
-          HolderRecreationCase{
-              HolderOnlyRecreationFailurePoint::StartReportedTimeout,
-              "verified holder-only start reported-timeout exact recovery and zero residue",
-              false},
-          HolderRecreationCase{
-              HolderOnlyRecreationFailurePoint::NetworkBConnectReportedTimeout,
-              "verified holder-only B-connect reported-timeout exact recovery and zero residue",
-              false},
-          HolderRecreationCase{
-              HolderOnlyRecreationFailurePoint::CleanupReportedTimeout,
-              "verified holder-only cleanup reported-timeout exact absence and zero residue",
-              true}}) {
-        const RunResult holder_recreated =
-            rut::test::ipv4_topology::run_with_holder_only_recreation(
-                [&](const rut::test::ipv4_topology::HolderOnlyRecreationEvidence& evidence,
-                    std::string& error) {
-                    if (evidence.complete_generation ||
-                        evidence.state != HolderOnlyRecreationState::Validated ||
-                        !evidence.old_authority_frozen || !evidence.exact_network_a ||
-                        !evidence.exact_network_b || !evidence.exact_security ||
-                        !evidence.network_a_membership_proven_after_start ||
-                        evidence.operation_ok != recreation.operation_ok_before_cleanup ||
-                        evidence.create_command_count != 1u || evidence.start_command_count != 1u ||
-                        evidence.connect_b_command_count != 1u ||
-                        evidence.remove_command_count != 0u) {
-                        error = "holder-only recreation callback received incomplete evidence";
-                        return false;
-                    }
-                    return true;
-                },
-                recreation.point);
-        if (holder_recreated.prerequisite_failure || !holder_recreated.success ||
-            !holder_recreated.cleanup_complete || !holder_recreated.residue_free ||
-            holder_recreated.semantic_receipt != recreation.receipt ||
-            holder_recreated.error != recreation.receipt) {
-            std::cerr << "FAIL [#412 holder-only recreation owner]: " << holder_recreated.error
-                      << "\n";
+    for (const RecreationCase& recreation :
+         {RecreationCase{HolderOnlyRecreationFailurePoint::None,
+                         RecreatedSidecarFailurePoint::None},
+          RecreationCase{HolderOnlyRecreationFailurePoint::CreateReportedTimeout,
+                         RecreatedSidecarFailurePoint::CreateReportedTimeout},
+          RecreationCase{HolderOnlyRecreationFailurePoint::StartReportedTimeout,
+                         RecreatedSidecarFailurePoint::CleanupReportedTimeout},
+          RecreationCase{HolderOnlyRecreationFailurePoint::NetworkBConnectReportedTimeout,
+                         RecreatedSidecarFailurePoint::SuppressFirstRemoval},
+          RecreationCase{HolderOnlyRecreationFailurePoint::CleanupReportedTimeout,
+                         RecreatedSidecarFailurePoint::UnexpectedDeath},
+          RecreationCase{HolderOnlyRecreationFailurePoint::None,
+                         RecreatedSidecarFailurePoint::CreateSuppressedNoObject},
+          RecreationCase{HolderOnlyRecreationFailurePoint::None,
+                         RecreatedSidecarFailurePoint::PreCreateNameCollision},
+          RecreationCase{HolderOnlyRecreationFailurePoint::None,
+                         RecreatedSidecarFailurePoint::CleanupIdentityMutation}}) {
+        const RunResult sidecar_recreated = rut::test::ipv4_topology::run_with_recreated_sidecar(
+            [&](const rut::test::ipv4_topology::RecreatedSidecarEvidence& evidence,
+                std::string& error) {
+                const bool no_object = recreation.sidecar_point ==
+                                       RecreatedSidecarFailurePoint::CreateSuppressedNoObject;
+                const bool stopped =
+                    recreation.sidecar_point == RecreatedSidecarFailurePoint::UnexpectedDeath;
+                if (evidence.complete_generation ||
+                    evidence.holder.state != HolderOnlyRecreationState::Validated ||
+                    evidence.holder.complete_generation || !evidence.fresh_probe_pid_start_scoped ||
+                    (!no_object &&
+                     (!evidence.shared_non_host_netns || evidence.sidecar.id.empty())) ||
+                    (no_object && evidence.state != RecreatedSidecarState::Settled) ||
+                    (stopped && evidence.state != RecreatedSidecarState::StoppedExactCleanupOnly) ||
+                    (!no_object && !stopped &&
+                     evidence.state != RecreatedSidecarState::Validated)) {
+                    error = "fresh-sidecar callback received incomplete or composed evidence";
+                    return false;
+                }
+                return true;
+            },
+            recreation.holder_point,
+            recreation.sidecar_point);
+        const std::string receipt =
+            "verified fresh inert sidecar ownership with complete_generation=false and zero "
+            "residue";
+        if (sidecar_recreated.prerequisite_failure || !sidecar_recreated.success ||
+            !sidecar_recreated.cleanup_complete || !sidecar_recreated.residue_free ||
+            sidecar_recreated.semantic_receipt != receipt || sidecar_recreated.error != receipt) {
+            std::cerr << "FAIL [#412 fresh inert sidecar recreation owner]: "
+                      << sidecar_recreated.error << "\n";
             return 1;
         }
     }

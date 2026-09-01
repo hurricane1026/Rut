@@ -202,6 +202,46 @@ enum class HolderOnlyRecreationFailurePoint : std::uint8_t {
     CleanupReportedTimeout,
 };
 
+enum class RecreatedSidecarState : std::uint8_t {
+    Ready = 0,
+    CreateMayHaveMutated,
+    CreatedExactCleanupOnly,
+    Validated,
+    StoppedExactCleanupOnly,
+    RemovalMayHaveMutated,
+    Settled,
+    Unresolved,
+};
+
+enum class RecreatedSidecarFailurePoint : std::uint8_t {
+    None,
+    CreateReportedTimeout,
+    CleanupReportedTimeout,
+    CreateSuppressedNoObject,
+    PreCreateNameCollision,
+    UnexpectedDeath,
+    CleanupIdentityMutation,
+    SuppressFirstRemoval,
+};
+
+// Evidence for one fresh inert sibling sharing the recreated holder's network
+// namespace. Receipt composition remains a later, separate increment.
+struct RecreatedSidecarEvidence {
+    bool complete_generation = false;
+    RecreatedSidecarState state = RecreatedSidecarState::Ready;
+    HeldNamespaceOldGenerationAbsence old_absence;
+    HolderOnlyRecreationEvidence holder;
+    HeldTopologySnapshot fresh_topology;
+    HeldNamespaceSidecarSnapshot sidecar;
+    bool fresh_probe_pid_start_scoped = false;
+    bool shared_non_host_netns = false;
+    bool operation_ok = true;
+    std::uint32_t state_visit_mask = 0;
+    std::uint32_t create_command_count = 0;
+    std::uint32_t remove_command_count = 0;
+    std::uint32_t remove_suppression_count = 0;
+};
+
 enum class HeldNamespaceSidecarFailurePoint {
     None,
     CreateSuppressedNoObject,
@@ -253,6 +293,8 @@ using HeldTopologyAndSidecarCallback =
                        std::string& error)>;
 using HolderOnlyRecreationCallback =
     std::function<bool(const HolderOnlyRecreationEvidence& evidence, std::string& error)>;
+using RecreatedSidecarCallback =
+    std::function<bool(const RecreatedSidecarEvidence& evidence, std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);
@@ -268,6 +310,10 @@ RunResult run_with_held_topology_and_sidecar(
 RunResult run_with_holder_only_recreation(
     const HolderOnlyRecreationCallback& callback,
     HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None);
+RunResult run_with_recreated_sidecar(
+    const RecreatedSidecarCallback& callback,
+    HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
+    RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,
