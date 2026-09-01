@@ -4650,9 +4650,10 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
         if (!run_command({"docker",
                           "inspect",
                           "-f",
-                          "{{range $name,$v := .NetworkSettings.Networks}}{{$name}}|{{"
-                          "$v.NetworkID}}|{{if $v.IPAMConfig}}{{$v.IPAMConfig.IPv4Address}}{{end}} "
-                          "{{end}}",
+                          "{{.HostConfig.NetworkMode}} {{range $name,$v := "
+                          ".NetworkSettings.Networks}}{{$name}}|{{$v.NetworkID}}|{{if "
+                          "$v.IPAMConfig}}{{$v.IPAMConfig.IPv4Address}}{{end}}|{{$v.EndpointID}}|{{"
+                          "$v.IPAddress}}|{{$v.Gateway}} {{end}}",
                           fresh.id},
                          inspect) ||
             !exited_zero(inspect)) {
@@ -4660,11 +4661,16 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
             return false;
         }
         std::istringstream fields(trim(inspect.output));
+        std::string network_mode;
         std::string network;
         std::string extra;
         std::vector<std::string> parts;
-        if (!(fields >> network) || (fields >> extra) || !split_exact(network, '|', 3, parts) ||
-            parts[0] != network_a_.name || parts[1] != network_a_.id || parts[2] != positive_ip_) {
+        // A stopped container has exact configured network/IPAM authority but
+        // deliberately no active endpoint identity or assigned wire address.
+        if (!(fields >> network_mode >> network) || (fields >> extra) ||
+            network_mode != network_a_.id || !split_exact(network, '|', 6, parts) ||
+            parts[0] != network_a_.name || !parts[1].empty() || parts[2] != positive_ip_ ||
+            !parts[3].empty() || !parts[4].empty() || !parts[5].empty()) {
             error = "recreated stopped holder exact network-A/static-IP config was not exact";
             return false;
         }
