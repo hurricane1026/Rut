@@ -75,6 +75,7 @@ enum class ExactInputMountFailurePoint : std::uint8_t {
     CredentialBoundarySidecarDeath,
     RejectSidecarRevalidationOnce,
     DisconnectNetworkBeforeInputCleanup,
+    RejectNetworkASettlementOnce,
 };
 
 struct ExactInputMountOptions {
@@ -145,6 +146,17 @@ struct ExactInputMountRecoveryReceipt {
     bool final_zero_residue = false;
     bool settlement_complete = false;
     bool terminal_frozen = false;
+    std::uint32_t network_a_create_count = 0;
+    std::uint32_t network_a_verify_count = 0;
+    std::uint32_t network_b_create_count = 0;
+    std::uint32_t network_b_verify_count = 0;
+    std::uint32_t both_ipam_verify_count = 0;
+    std::uint32_t holder_create_count = 0;
+    std::uint32_t holder_attach_a_verify_count = 0;
+    std::uint32_t holder_attach_b_count = 0;
+    std::uint32_t holder_remove_command_count = 0;
+    std::uint32_t network_b_remove_command_count = 0;
+    std::uint32_t network_a_remove_command_count = 0;
     std::uint32_t sidecar_order = 0;
     std::uint32_t input_order = 0;
     std::uint32_t directory_order = 0;
@@ -153,6 +165,11 @@ struct ExactInputMountRecoveryReceipt {
     std::uint32_t network_a_order = 0;
     ExactInputMountDiagnostic diagnostic;
 };
+
+// Tests-only observation of the shared argv-only command runner.  It does not
+// mutate fixture state and exists to prove that a never-started controller and
+// a frozen terminal replay issue no external commands.
+std::uint64_t exact_input_mount_test_command_count();
 
 class ExactInputMountRecoveryController;
 

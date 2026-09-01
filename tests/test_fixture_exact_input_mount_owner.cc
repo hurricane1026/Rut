@@ -88,6 +88,17 @@ bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
            left.final_zero_residue == right.final_zero_residue &&
            left.settlement_complete == right.settlement_complete &&
            left.terminal_frozen == right.terminal_frozen &&
+           left.network_a_create_count == right.network_a_create_count &&
+           left.network_a_verify_count == right.network_a_verify_count &&
+           left.network_b_create_count == right.network_b_create_count &&
+           left.network_b_verify_count == right.network_b_verify_count &&
+           left.both_ipam_verify_count == right.both_ipam_verify_count &&
+           left.holder_create_count == right.holder_create_count &&
+           left.holder_attach_a_verify_count == right.holder_attach_a_verify_count &&
+           left.holder_attach_b_count == right.holder_attach_b_count &&
+           left.holder_remove_command_count == right.holder_remove_command_count &&
+           left.network_b_remove_command_count == right.network_b_remove_command_count &&
+           left.network_a_remove_command_count == right.network_a_remove_command_count &&
            left.sidecar_order == right.sidecar_order && left.input_order == right.input_order &&
            left.directory_order == right.directory_order &&
            left.holder_order == right.holder_order &&
@@ -154,6 +165,37 @@ bool recover_injected_setup(ExactInputMountFailurePoint point, std::string& erro
         receipt.network_b_acquired != expect_network_b ||
         receipt.holder_acquired != expect_holder || receipt.sidecar_acquired != expect_sidecar) {
         error = "injected setup receipt did not identify exactly the acquired resource prefix";
+        return false;
+    }
+    const bool after_a_create = point != ExactInputMountFailurePoint::AfterDirectory &&
+                                point != ExactInputMountFailurePoint::AfterInputFile;
+    const bool after_a_verify =
+        after_a_create && point != ExactInputMountFailurePoint::AfterNetworkACreated;
+    const bool after_b_create =
+        after_a_verify && point != ExactInputMountFailurePoint::AfterNetworkAVerified;
+    const bool after_b_verify =
+        after_b_create && point != ExactInputMountFailurePoint::AfterNetworkBCreated;
+    const bool after_ipam =
+        after_b_verify && point != ExactInputMountFailurePoint::AfterNetworkBVerified;
+    const bool after_holder_create = after_ipam &&
+                                     point != ExactInputMountFailurePoint::AfterBothIpamVerified &&
+                                     point != ExactInputMountFailurePoint::AfterNetworks;
+    const bool after_attach_a =
+        after_holder_create && point != ExactInputMountFailurePoint::AfterHolderCreated;
+    const bool after_attach_b =
+        after_attach_a && point != ExactInputMountFailurePoint::AfterHolderAttachedA;
+    const auto exact_count = [](std::uint32_t actual, bool expected) {
+        return actual == (expected ? 1u : 0u);
+    };
+    if (!exact_count(receipt.network_a_create_count, after_a_create) ||
+        !exact_count(receipt.network_a_verify_count, after_a_verify) ||
+        !exact_count(receipt.network_b_create_count, after_b_create) ||
+        !exact_count(receipt.network_b_verify_count, after_b_verify) ||
+        !exact_count(receipt.both_ipam_verify_count, after_ipam) ||
+        !exact_count(receipt.holder_create_count, after_holder_create) ||
+        !exact_count(receipt.holder_attach_a_verify_count, after_attach_a) ||
+        !exact_count(receipt.holder_attach_b_count, after_attach_b)) {
+        error = "setup fault was not bracketed by exact preceding/following event counts";
         return false;
     }
     return true;
@@ -349,6 +391,35 @@ int main() {
         }
     }
 
+    // A controller that never started owns no graph. Recovery freezes a
+    // truthful N/A receipt without consulting Docker or the host filesystem.
+    {
+        ExactInputMountRecoveryController never_started;
+        const std::uint64_t commands_before = exact_input_mount_test_command_count();
+        ExactInputMountRecoveryReceipt never_started_receipt;
+        if (!never_started.recover_all(never_started_receipt, diagnostic) ||
+            never_started_receipt.state != ExactInputMountState::Settled ||
+            never_started_receipt.terminal_result !=
+                ExactInputMountTerminalResult::SettledCleanly ||
+            !never_started_receipt.attempted || never_started_receipt.graph_mutated ||
+            !never_started_receipt.cleanup_not_applicable ||
+            !never_started_receipt.manifest_not_applicable ||
+            !never_started_receipt.final_zero_residue ||
+            !never_started_receipt.settlement_complete || !never_started_receipt.terminal_frozen ||
+            exact_input_mount_test_command_count() != commands_before) {
+            std::cerr << "FAIL [#358 exact input mount never-started recovery]\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen_never_started = never_started_receipt;
+        ExactInputMountRecoveryReceipt never_started_replay;
+        if (!never_started.recover_all(never_started_replay, diagnostic) ||
+            !receipt_equal(never_started_replay, frozen_never_started) ||
+            exact_input_mount_test_command_count() != commands_before) {
+            std::cerr << "FAIL [#358 exact input mount never-started replay]\n";
+            return 1;
+        }
+    }
+
     // A pre-mutation failure is truthfully settled as not applicable and is
     // safe both for explicit recovery and ordinary controller destruction.
     {
@@ -431,6 +502,50 @@ int main() {
             !disconnected.recover_all(receipt, diagnostic) || !exact_terminal(receipt)) {
             std::cerr << "FAIL [#358 exact input mount disconnected topology retry]: "
                       << diagnostic.message << "\n";
+            return 1;
+        }
+    }
+
+    // Topology settlement evidence is committed per resource. A failure after
+    // holder and B removal retains their exact ordinals; retry removes A only.
+    {
+        ExactInputMountRecoveryController partial_topology;
+        ExactInputMountHandle partial_handle;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::RejectNetworkASettlementOnce;
+        if (!partial_topology.start(
+                kConfig.data(), kConfig.size(), partial_handle, diagnostic, options) ||
+            partial_topology.finish(partial_handle, receipt, diagnostic) ||
+            diagnostic.phase != ExactInputMountPhase::NetworkSettlement ||
+            !receipt.holder_settled || !receipt.network_b_settled || receipt.network_a_settled ||
+            receipt.holder_order == 0u || receipt.network_b_order <= receipt.holder_order ||
+            receipt.network_a_order != 0u || receipt.holder_remove_command_count != 1u ||
+            receipt.network_b_remove_command_count != 1u ||
+            receipt.network_a_remove_command_count != 0u || receipt.final_zero_residue ||
+            receipt.settlement_complete || receipt.terminal_frozen) {
+            std::cerr << "FAIL [#358 exact input mount partial topology custody]: "
+                      << diagnostic.message << "\n";
+            return 1;
+        }
+        const std::uint32_t holder_order = receipt.holder_order;
+        const std::uint32_t network_b_order = receipt.network_b_order;
+        if (!partial_topology.recover_all(receipt, diagnostic) || !exact_terminal(receipt) ||
+            receipt.holder_order != holder_order || receipt.network_b_order != network_b_order ||
+            receipt.network_a_order <= network_b_order ||
+            receipt.holder_remove_command_count != 1u ||
+            receipt.network_b_remove_command_count != 1u ||
+            receipt.network_a_remove_command_count != 1u) {
+            std::cerr << "FAIL [#358 exact input mount topology retry]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen_partial = receipt;
+        const std::uint64_t commands_before_replay = exact_input_mount_test_command_count();
+        ExactInputMountRecoveryReceipt partial_replay;
+        if (!partial_topology.recover_all(partial_replay, diagnostic) ||
+            !receipt_equal(partial_replay, frozen_partial) ||
+            exact_input_mount_test_command_count() != commands_before_replay) {
+            std::cerr << "FAIL [#358 exact input mount partial topology replay]\n";
             return 1;
         }
     }
