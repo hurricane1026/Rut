@@ -30,6 +30,9 @@ target_include_directories(fixture_bounded_http_exchange PUBLIC
 target_include_directories(test_fixture_bounded_http_exchange PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE fixture_bounded_http_exchange)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_bounded_http_exchange PRIVATE -fexceptions)
+endif()
 add_test(NAME test_fixture_bounded_http_exchange
     COMMAND test_fixture_bounded_http_exchange)
 set_tests_properties(test_fixture_bounded_http_exchange PROPERTIES
