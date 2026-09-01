@@ -104,8 +104,11 @@ enum class HeldNamespaceSidecarFailurePoint {
     AfterVerification,
     AfterCallbackEntry,
     CreateReportedTimeout,
+    CreateReportedTimeoutRecoveryUnavailable,
     CleanupReportedTimeout,
     UnexpectedDeath,
+    DisappearBeforeCleanup,
+    PauseAfterSidecarSettlement,
 };
 
 // A bounded test-only seam.  Each value corrupts one field of the raw Docker

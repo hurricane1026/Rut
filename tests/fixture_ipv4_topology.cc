@@ -150,6 +150,10 @@ static void require_group_gone(pid_t pgid, const char* reason) {
     if (!terminate_group_bounded(pgid) || !process_group_gone(pgid)) runner_fail_stop(pgid, reason);
 }
 
+// Translation-unit-private evidence used only to prove that terminal cleanup
+// replay does not issue another external command.
+static u64 command_invocation_count = 0;
+
 static bool run_command(const std::vector<std::string>& arguments,
                         CommandResult& result,
                         int timeout_ms = 15000,
@@ -157,6 +161,7 @@ static bool run_command(const std::vector<std::string>& arguments,
                         bool inject_descendant = false,
                         DescendantProbe* descendant_probe = nullptr,
                         size_t output_limit = 65536) {
+    ++command_invocation_count;
     result = {};
     if (arguments.empty()) return false;
     int pipe_fds[2] = {-1, -1};
@@ -1307,6 +1312,40 @@ static bool container_netns_inode(const std::string& holder, ino_t& inode) {
     return true;
 }
 
+enum class CleanupProgress : std::uint8_t {
+    Active,
+    SidecarSettled,
+    TopologySettled,
+};
+
+struct CleanupPhaseResult {
+    bool settled = false;
+    bool operation_ok = false;
+};
+
+struct CleanupEvidence {
+    CleanupProgress progress = CleanupProgress::Active;
+    bool sidecar_exists = false;
+    bool holder_exists = false;
+    bool network_a_exists = false;
+    bool network_b_exists = false;
+    bool sidecar_operation_ok = true;
+    bool topology_operation_ok = true;
+    bool cleanup_reported_timeout_observed = false;
+    bool sidecar_creation_may_have_mutated = false;
+};
+
+static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvidence& right) {
+    return left.progress == right.progress && left.sidecar_exists == right.sidecar_exists &&
+           left.holder_exists == right.holder_exists &&
+           left.network_a_exists == right.network_a_exists &&
+           left.network_b_exists == right.network_b_exists &&
+           left.sidecar_operation_ok == right.sidecar_operation_ok &&
+           left.topology_operation_ok == right.topology_operation_ok &&
+           left.cleanup_reported_timeout_observed == right.cleanup_reported_timeout_observed &&
+           left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated;
+}
+
 class Fixture {
 public:
     explicit Fixture(std::string token) : token_(std::move(token)) {
@@ -1337,8 +1376,22 @@ public:
     void set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault fault) {
         sidecar_revalidation_fault_ = fault;
     }
+    void clear_uncertain_sidecar_inspection_fault() {
+        uncertain_sidecar_inspection_failure_ = false;
+    }
     bool sidecar_exists() const { return sidecar_exists_; }
     bool cleanup_reported_timeout_observed() const { return cleanup_reported_timeout_observed_; }
+    CleanupEvidence cleanup_evidence() const {
+        return {cleanup_progress_,
+                sidecar_exists_,
+                holder_exists_,
+                network_a_.exists,
+                network_b_.exists,
+                sidecar_settlement_operation_ok_,
+                topology_settlement_operation_ok_,
+                cleanup_reported_timeout_observed_,
+                sidecar_creation_may_have_mutated_};
+    }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -1647,41 +1700,46 @@ public:
     bool create_sidecar(HeldNamespaceSidecarFailurePoint point, std::string& error) {
         CommandResult result;
         const bool reported_timeout =
-            point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout;
-        if (!run_command({"docker",
-                          "run",
-                          "--pull=never",
-                          "--detach",
-                          "--name",
-                          sidecar_name_,
-                          "--network",
-                          "container:" + holder_id_,
-                          "--cap-drop",
-                          "ALL",
-                          "--security-opt",
-                          "no-new-privileges",
-                          "--read-only",
-                          "--tmpfs",
-                          "/tmp:rw,noexec,nosuid,size=1m",
-                          "--entrypoint",
-                          "/bin/sleep",
-                          "--label",
-                          std::string("rut.stage=") + kSidecarStage,
-                          "--label",
-                          "rut.token=" + token_,
-                          "--label",
-                          std::string("rut.role=") + kSidecarRole,
-                          RUT_PINNED_NGINX_IMAGE,
-                          "infinity"},
-                         result,
-                         15000,
-                         reported_timeout) ||
+            point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout ||
+            point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable;
+        if (point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable)
+            uncertain_sidecar_inspection_failure_ = true;
+        const std::vector<std::string> create_arguments = {
+            "docker",
+            "run",
+            "--pull=never",
+            "--detach",
+            "--name",
+            sidecar_name_,
+            "--network",
+            "container:" + holder_id_,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=1m",
+            "--entrypoint",
+            "/bin/sleep",
+            "--label",
+            std::string("rut.stage=") + kSidecarStage,
+            "--label",
+            "rut.token=" + token_,
+            "--label",
+            std::string("rut.role=") + kSidecarRole,
+            RUT_PINNED_NGINX_IMAGE,
+            "infinity"};
+        // From this boundary onward Docker may have accepted the unique-name
+        // create even when command/recovery evidence is incomplete.
+        sidecar_creation_may_have_mutated_ = true;
+        if (!run_command(create_arguments, result, 15000, reported_timeout) ||
             !exited_zero(result)) {
             if (reported_timeout && result.timed_out && WIFEXITED(result.status) &&
                 WEXITSTATUS(result.status) == 0) {
                 HeldNamespaceSidecarSnapshot recovered;
                 std::string recovery_error;
-                if (inspect_sidecar(sidecar_name_, recovered, recovery_error)) {
+                if (inspect_uncertain_sidecar(sidecar_name_, recovered, recovery_error)) {
                     sidecar_exists_ = true;
                     sidecar_id_ = recovered.id;
                     sidecar_snapshot_ = recovered;
@@ -1698,12 +1756,13 @@ public:
             }
             return false;
         }
-        sidecar_exists_ = true;
         sidecar_id_ = trim(result.output);
         if (!full_container_id(sidecar_id_)) {
+            sidecar_id_.clear();
             error = "sidecar creation did not return one full container ID";
             return false;
         }
+        sidecar_exists_ = true;
         if (point == HeldNamespaceSidecarFailurePoint::AfterCreate)
             return injected_sidecar("after create", error);
         HeldNamespaceSidecarSnapshot discovered;
@@ -1752,30 +1811,77 @@ public:
         return true;
     }
 
-    bool cleanup(std::string& error) {
-        bool success = true;
+    bool disappear_sidecar_before_cleanup(std::string& error) {
+        if (!sidecar_exists_ || sidecar_id_.empty()) {
+            error = "cannot inject sidecar disappearance without exact identity";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command({"docker", "rm", "-f", sidecar_id_}, result) || !exited_zero(result)) {
+            error = "sidecar disappearance injection failed: " + trim(result.output);
+            return false;
+        }
+        std::string absent_error;
+        if (!prove_sidecar_absent(absent_error)) {
+            error = "sidecar disappearance injection lacked exact absence proof: " + absent_error;
+            return false;
+        }
+        return true;
+    }
+
+    CleanupPhaseResult cleanup_sidecar_phase(std::string& error) {
+        if (cleanup_progress_ >= CleanupProgress::SidecarSettled) return {true, true};
+
+        bool operation_ok = true;
+        if (!sidecar_exists_ && sidecar_creation_may_have_mutated_) {
+            std::string recovery_error;
+            if (!recover_uncertain_sidecar_or_prove_absence(recovery_error)) {
+                sidecar_settlement_operation_ok_ = false;
+                if (!error.empty()) error += "; ";
+                error += recovery_error;
+                return {false, false};
+            }
+        }
         if (sidecar_exists_) {
             std::string sidecar_error;
             if (!cleanup_sidecar(sidecar_error)) {
-                success = false;
+                operation_ok = false;
                 if (!sidecar_error.empty()) {
                     if (!error.empty()) error += "; ";
                     error += sidecar_error;
                 }
                 // A holder must never be released while a sibling container
                 // might still be attached to its network namespace.
-                if (sidecar_exists_) return false;
+                if (sidecar_exists_) {
+                    sidecar_settlement_operation_ok_ = false;
+                    return {false, false};
+                }
             }
         }
+        cleanup_progress_ = CleanupProgress::SidecarSettled;
+        sidecar_settlement_operation_ok_ = sidecar_settlement_operation_ok_ && operation_ok;
+        return {true, operation_ok};
+    }
+
+    CleanupPhaseResult cleanup_topology_phase(std::string& error) {
+        if (cleanup_progress_ == CleanupProgress::TopologySettled) return {true, true};
+        if (cleanup_progress_ < CleanupProgress::SidecarSettled || sidecar_exists_ ||
+            sidecar_creation_may_have_mutated_) {
+            if (!error.empty()) error += "; ";
+            error += "refusing holder/network cleanup before exact sidecar settlement";
+            return {false, false};
+        }
+
+        bool operation_ok = true;
         if (holder_exists_) {
             if (!validate_holder(error))
-                success = false;
+                operation_ok = false;
             else {
                 CommandResult result;
                 if (!run_command({"docker", "rm", "-f", holder_name_}, result) ||
                     !exited_zero(result)) {
                     error = "holder cleanup failed: " + trim(result.output);
-                    success = false;
+                    operation_ok = false;
                 } else {
                     holder_exists_ = false;
                 }
@@ -1785,27 +1891,37 @@ public:
             if (network_b_.id.empty()) {
                 if (!timeout_recovery_ || !discover_network(network_b_)) {
                     error = "refusing network B cleanup without recorded identity";
-                    success = false;
+                    operation_ok = false;
                 }
             }
             if (!verify_network(network_b_, error))
-                success = false;
+                operation_ok = false;
             else if (!remove_network(network_b_, error))
-                success = false;
+                operation_ok = false;
         }
         if (network_a_.exists) {
             if (network_a_.id.empty()) {
                 if (!timeout_recovery_ || !discover_network(network_a_)) {
                     error = "refusing network A cleanup without recorded identity";
-                    success = false;
+                    operation_ok = false;
                 }
             }
             if (!verify_network(network_a_, error))
-                success = false;
+                operation_ok = false;
             else if (!remove_network(network_a_, error))
-                success = false;
+                operation_ok = false;
         }
-        return success;
+        topology_settlement_operation_ok_ = topology_settlement_operation_ok_ && operation_ok;
+        const bool settled = !holder_exists_ && !network_b_.exists && !network_a_.exists;
+        if (settled) cleanup_progress_ = CleanupProgress::TopologySettled;
+        return {settled, operation_ok};
+    }
+
+    bool cleanup(std::string& error) {
+        const CleanupPhaseResult sidecar = cleanup_sidecar_phase(error);
+        if (!sidecar.settled) return false;
+        const CleanupPhaseResult topology = cleanup_topology_phase(error);
+        return sidecar.operation_ok && topology.settled && topology.operation_ok;
     }
 
 private:
@@ -1941,6 +2057,58 @@ private:
         return true;
     }
 
+    bool inspect_uncertain_sidecar(const std::string& reference,
+                                   HeldNamespaceSidecarSnapshot& snapshot,
+                                   std::string& error) {
+        if (uncertain_sidecar_inspection_failure_) {
+            error = "injected sidecar recovery inspection failure";
+            return false;
+        }
+        return inspect_sidecar(reference, snapshot, error);
+    }
+
+    bool recover_uncertain_sidecar_or_prove_absence(std::string& error) {
+        HeldNamespaceSidecarSnapshot discovered;
+        std::string inspect_error;
+        if (inspect_uncertain_sidecar(sidecar_name_, discovered, inspect_error)) {
+            std::string semantic_error;
+            const bool ownership_exact =
+                discovered.name == sidecar_name_ && discovered.token == token_ &&
+                discovered.stage == kSidecarStage && discovered.role == kSidecarRole &&
+                discovered.pinned_image_reference == RUT_PINNED_NGINX_IMAGE &&
+                discovered.expected_image_id == expected_sidecar_image_id_ &&
+                discovered.image_id == expected_sidecar_image_id_;
+            if (!ownership_exact || !validate_held_namespace_sidecar_snapshot(
+                                        topology_snapshot(), discovered, semantic_error)) {
+                error =
+                    "refusing uncertain sidecar recovery because exact ownership/identity "
+                    "was not established";
+                if (!semantic_error.empty()) error += ": " + semantic_error;
+                return false;
+            }
+            sidecar_id_ = discovered.id;
+            sidecar_snapshot_ = discovered;
+            sidecar_exists_ = true;
+            if (!verify_sidecar_uniqueness(error)) {
+                sidecar_exists_ = false;
+                sidecar_id_.clear();
+                sidecar_snapshot_ = {};
+                return false;
+            }
+            return true;
+        }
+
+        std::string absent_error;
+        if (prove_sidecar_absent(absent_error)) {
+            sidecar_creation_may_have_mutated_ = false;
+            return true;
+        }
+        error = "sidecar creation state remains unresolved after failed recovery inspection: " +
+                inspect_error;
+        if (!absent_error.empty()) error += "; " + absent_error;
+        return false;
+    }
+
     void discover_sidecar_after_failed_create() {
         HeldNamespaceSidecarSnapshot discovered;
         std::string ignored;
@@ -1970,11 +2138,16 @@ private:
 
     bool prove_sidecar_absent(std::string& error) {
         CommandResult result;
-        if (!run_command({"docker", "inspect", sidecar_id_}, result) || exited_zero(result)) {
-            error = "exact sidecar ID did not provably disappear";
-            return false;
+        if (!sidecar_id_.empty()) {
+            if (!run_command({"docker", "inspect", sidecar_id_}, result) || exited_zero(result)) {
+                error = "exact sidecar ID did not provably disappear";
+                return false;
+            }
         }
-        if (!run_command({"docker", "inspect", sidecar_name_}, result) || exited_zero(result)) {
+        if (!run_command(
+                {"docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + sidecar_name_ + "$"},
+                result) ||
+            !exited_zero(result) || !trim(result.output).empty()) {
             error = "exact sidecar name did not provably disappear";
             return false;
         }
@@ -2005,6 +2178,7 @@ private:
                 return false;
             }
             sidecar_exists_ = false;
+            sidecar_creation_may_have_mutated_ = false;
             error = "sidecar disappeared before identity-safe cleanup";
             return false;
         }
@@ -2055,6 +2229,7 @@ private:
             return false;
         }
         sidecar_exists_ = false;
+        sidecar_creation_may_have_mutated_ = false;
         cleanup_reported_timeout_ = false;
         return true;
     }
@@ -2256,9 +2431,14 @@ private:
     std::string expected_sidecar_image_id_;
     HeldNamespaceSidecarSnapshot sidecar_snapshot_;
     bool sidecar_exists_ = false;
+    bool sidecar_creation_may_have_mutated_ = false;
+    bool uncertain_sidecar_inspection_failure_ = false;
     bool cleanup_reported_timeout_ = false;
     bool cleanup_reported_timeout_observed_ = false;
     bool unexpected_sidecar_death_verified_ = false;
+    CleanupProgress cleanup_progress_ = CleanupProgress::Active;
+    bool sidecar_settlement_operation_ok_ = true;
+    bool topology_settlement_operation_ok_ = true;
     HeldNamespaceSidecarRevalidationFault sidecar_revalidation_fault_ =
         HeldNamespaceSidecarRevalidationFault::None;
 };
@@ -3198,6 +3378,64 @@ RunResult run_with_held_topology_and_sidecar(
     topology.probe_evidence = probe_evidence;
 
     if (!fixture.create_sidecar(failure_point, result.error)) {
+        if (failure_point ==
+            HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable) {
+            if (result.error !=
+                "sidecar creation reported timeout and exact recovery failed: injected "
+                "sidecar recovery inspection failure") {
+                result.error = "uncertain-create injection did not fail at initial recovery";
+                return finish_after_cleanup(false);
+            }
+
+            const CleanupEvidence before_cleanup = fixture.cleanup_evidence();
+            std::string first_cleanup_error;
+            const bool first_cleanup_ok = fixture.cleanup(first_cleanup_error);
+            const CleanupEvidence after_cleanup = fixture.cleanup_evidence();
+            // Keep every test-failure epilogue able to perform authoritative
+            // recovery; only the first cleanup is intentionally blinded.
+            fixture.clear_uncertain_sidecar_inspection_fault();
+            if (first_cleanup_ok ||
+                first_cleanup_error.find("sidecar creation state remains unresolved") != 0 ||
+                before_cleanup.progress != CleanupProgress::Active ||
+                !before_cleanup.sidecar_creation_may_have_mutated ||
+                after_cleanup.progress != CleanupProgress::Active || after_cleanup.sidecar_exists ||
+                !after_cleanup.sidecar_creation_may_have_mutated || !after_cleanup.holder_exists ||
+                !after_cleanup.network_a_exists || !after_cleanup.network_b_exists ||
+                after_cleanup.sidecar_operation_ok ||
+                before_cleanup.holder_exists != after_cleanup.holder_exists ||
+                before_cleanup.network_a_exists != after_cleanup.network_a_exists ||
+                before_cleanup.network_b_exists != after_cleanup.network_b_exists) {
+                result.error =
+                    "uncertain sidecar creation did not fail closed before topology mutation";
+                if (!first_cleanup_error.empty()) result.error += ": " + first_cleanup_error;
+                return finish_after_cleanup(false);
+            }
+            std::string topology_error;
+            if (!fixture.verify_topology(FailurePoint::None, topology_error)) {
+                result.error =
+                    "holder/networks changed under uncertain sidecar creation: " + topology_error;
+                return finish_after_cleanup(false);
+            }
+
+            std::string retry_error;
+            if (!fixture.cleanup(retry_error)) {
+                result.error =
+                    "authoritative sidecar recovery/removal retry failed: " + retry_error;
+                return finish_after_cleanup(false);
+            }
+            const CleanupEvidence terminal = fixture.cleanup_evidence();
+            if (terminal.progress != CleanupProgress::TopologySettled || terminal.sidecar_exists ||
+                terminal.sidecar_creation_may_have_mutated || terminal.holder_exists ||
+                terminal.network_a_exists || terminal.network_b_exists ||
+                terminal.sidecar_operation_ok || !terminal.topology_operation_ok) {
+                result.error = "uncertain sidecar recovery retry lacked exact terminal evidence";
+                return finish_after_cleanup(false);
+            }
+            result.semantic_receipt =
+                "verified uncertain sidecar create fail-closed recovery and zero residue";
+            result.error = result.semantic_receipt;
+            return finish_after_cleanup(true);
+        }
         const bool expected =
             failure_point == HeldNamespaceSidecarFailurePoint::AfterCreate ||
             failure_point == HeldNamespaceSidecarFailurePoint::AfterDiscovery ||
@@ -3221,15 +3459,114 @@ RunResult run_with_held_topology_and_sidecar(
         result.semantic_receipt = result.error;
         return finish_after_cleanup(true);
     }
+    if (failure_point == HeldNamespaceSidecarFailurePoint::DisappearBeforeCleanup) {
+        if (!fixture.disappear_sidecar_before_cleanup(result.error))
+            return finish_after_cleanup(false);
+        std::string first_cleanup_error;
+        if (fixture.cleanup(first_cleanup_error) ||
+            first_cleanup_error != "sidecar disappeared before identity-safe cleanup") {
+            result.error =
+                "already-disappeared sidecar did not retain truthful cleanup failure evidence";
+            return finish_after_cleanup(false);
+        }
+        const CleanupEvidence terminal = fixture.cleanup_evidence();
+        if (terminal.progress != CleanupProgress::TopologySettled || terminal.sidecar_exists ||
+            terminal.holder_exists || terminal.network_a_exists || terminal.network_b_exists ||
+            terminal.sidecar_operation_ok || !terminal.topology_operation_ok) {
+            result.error =
+                "already-disappeared sidecar did not permit safe topology residue cleanup";
+            return finish_after_cleanup(false);
+        }
+        const u64 command_count_before_replay = command_invocation_count;
+        std::string replay_error;
+        if (!fixture.cleanup(replay_error) || !replay_error.empty() ||
+            command_invocation_count != command_count_before_replay ||
+            !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+            result.error = "already-disappeared terminal cleanup replay was not inert";
+            return finish_after_cleanup(false);
+        }
+        result.semantic_receipt =
+            "verified already-disappeared sidecar settlement and safe topology cleanup";
+        result.error = result.semantic_receipt;
+        return finish_after_cleanup(true);
+    }
+    if (failure_point == HeldNamespaceSidecarFailurePoint::PauseAfterSidecarSettlement) {
+        const CleanupPhaseResult sidecar_settlement = fixture.cleanup_sidecar_phase(result.error);
+        const CleanupEvidence paused = fixture.cleanup_evidence();
+        if (!sidecar_settlement.settled || !sidecar_settlement.operation_ok ||
+            paused.progress != CleanupProgress::SidecarSettled || paused.sidecar_exists ||
+            !paused.holder_exists || !paused.network_a_exists || !paused.network_b_exists ||
+            !paused.sidecar_operation_ok) {
+            if (result.error.empty())
+                result.error = "sidecar settlement pause did not retain exact topology custody";
+            return finish_after_cleanup(false);
+        }
+        std::string topology_error;
+        if (!fixture.verify_topology(FailurePoint::None, topology_error)) {
+            result.error =
+                "holder/networks changed during sidecar settlement pause: " + topology_error;
+            return finish_after_cleanup(false);
+        }
+
+        std::string retry_error;
+        if (!fixture.cleanup(retry_error)) {
+            result.error = "topology cleanup retry after sidecar settlement failed: " + retry_error;
+            return finish_after_cleanup(false);
+        }
+        const CleanupEvidence terminal = fixture.cleanup_evidence();
+        if (terminal.progress != CleanupProgress::TopologySettled || terminal.sidecar_exists ||
+            terminal.holder_exists || terminal.network_a_exists || terminal.network_b_exists ||
+            !terminal.sidecar_operation_ok || !terminal.topology_operation_ok) {
+            result.error = "topology cleanup retry did not reach exact terminal settlement";
+            return finish_after_cleanup(false);
+        }
+
+        const u64 command_count_before_replay = command_invocation_count;
+        std::string first_replay_error;
+        std::string second_replay_error;
+        if (!fixture.cleanup(first_replay_error) || !fixture.cleanup(second_replay_error) ||
+            !first_replay_error.empty() || !second_replay_error.empty() ||
+            command_invocation_count != command_count_before_replay ||
+            !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+            result.error = "terminal topology cleanup replay was not inert and idempotent";
+            return finish_after_cleanup(false);
+        }
+        result.semantic_receipt =
+            "verified sidecar-settled pause, guarded topology retry, and inert terminal replay";
+        result.error = result.semantic_receipt;
+        return finish_after_cleanup(true);
+    }
     if (revalidation_fault != HeldNamespaceSidecarRevalidationFault::None) {
         fixture.set_sidecar_revalidation_fault(revalidation_fault);
         std::string rejection_error;
         const bool unexpectedly_removed = fixture.cleanup(rejection_error);
-        fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
         if (unexpectedly_removed || !fixture.sidecar_exists() ||
             rejection_error.find("refusing sidecar deletion") == std::string::npos) {
+            fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
             result.error = "injected sidecar revalidation fault was not rejected before removal";
             if (!rejection_error.empty()) result.error += ": " + rejection_error;
+            return finish_after_cleanup(false);
+        }
+        const CleanupEvidence before_guarded_topology = fixture.cleanup_evidence();
+        const u64 commands_before_guarded_topology = command_invocation_count;
+        std::string guarded_topology_error;
+        const CleanupPhaseResult guarded_topology =
+            fixture.cleanup_topology_phase(guarded_topology_error);
+        if (guarded_topology.settled || guarded_topology.operation_ok ||
+            guarded_topology_error !=
+                "refusing holder/network cleanup before exact sidecar settlement" ||
+            command_invocation_count != commands_before_guarded_topology ||
+            !cleanup_evidence_equal(before_guarded_topology, fixture.cleanup_evidence())) {
+            fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
+            result.error =
+                "holder/network phase did not fail closed before exact sidecar settlement";
+            return finish_after_cleanup(false);
+        }
+        fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
+        std::string topology_error;
+        if (!fixture.verify_topology(FailurePoint::None, topology_error)) {
+            result.error =
+                "holder/networks changed before rejected sidecar could settle: " + topology_error;
             return finish_after_cleanup(false);
         }
         result.semantic_receipt =
