@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <vector>
 
 #include <sys/types.h>
 
@@ -115,27 +114,36 @@ struct HeldNamespaceGenerationWitnessAbsence {
     bool process_identity_absent = false;
 };
 
+enum class HeldNamespaceGenerationRotationPhase : std::uint8_t {
+    None = 0,
+    OldGenerationValidated = 1,
+    OldGenerationAbsent = 2,
+    NewGenerationCreated = 3,
+    NewGenerationValidated = 4,
+};
+
 struct HeldNamespaceOldGenerationAbsence {
     HeldNamespaceGenerationWitnessAbsence holder;
     HeldNamespaceGenerationWitnessAbsence sidecar;
-};
-
-enum class HeldNamespaceGenerationRotationPhase : std::uint8_t {
-    OldGenerationValidated,
-    OldSidecarWitnessAbsent,
-    OldHolderWitnessAbsent,
-    OldGenerationAbsenceRecorded,
-    NewHolderNameReused,
-    NewTopologyValidated,
-    NewSidecarNameReused,
-    NewGenerationValidated,
+    std::string holder_name;
+    std::string sidecar_name;
+    bool holder_name_absent = false;
+    bool sidecar_name_absent = false;
+    // This aggregate phase is complete only after all exact ID, process and
+    // name witnesses above are absent, before either stable name is reused.
+    HeldNamespaceGenerationRotationPhase phase = HeldNamespaceGenerationRotationPhase::None;
 };
 
 struct HeldNamespaceGenerationRotationReceipt {
     HeldNamespaceGenerationSnapshot old_generation;
+    HeldNamespaceGenerationRotationPhase old_generation_phase =
+        HeldNamespaceGenerationRotationPhase::None;
     HeldNamespaceOldGenerationAbsence old_absence;
     HeldNamespaceGenerationSnapshot new_generation;
-    std::vector<HeldNamespaceGenerationRotationPhase> transitions;
+    HeldNamespaceGenerationRotationPhase new_generation_created_phase =
+        HeldNamespaceGenerationRotationPhase::None;
+    HeldNamespaceGenerationRotationPhase new_generation_validated_phase =
+        HeldNamespaceGenerationRotationPhase::None;
 };
 
 enum class HeldNamespaceSidecarFailurePoint {

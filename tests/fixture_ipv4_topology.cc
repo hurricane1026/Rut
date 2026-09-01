@@ -8568,6 +8568,10 @@ static bool valid_rotation_topology(const HeldTopologySnapshot& topology, std::s
         return condition;
     };
     std::string probe_error;
+    const SubnetPlan retained_plan{{topology.network_a_subnet, topology.network_a_gateway},
+                                   {topology.network_b_subnet, topology.network_b_gateway}};
+    std::string expected_positive;
+    std::string expected_guard;
     if (!require(lowercase_hex(topology.token, 48u), "token") ||
         !require(topology.network_a_name == "rut358-a-" + topology.token, "network A name") ||
         !require(topology.network_b_name == "rut358-b-" + topology.token, "network B name") ||
@@ -8575,14 +8579,16 @@ static bool valid_rotation_topology(const HeldTopologySnapshot& topology, std::s
         !require(full_container_id(topology.network_a_id), "network A ID") ||
         !require(full_container_id(topology.network_b_id), "network B ID") ||
         !require(topology.network_a_id != topology.network_b_id, "distinct network IDs") ||
-        !require(!topology.network_a_subnet.empty(), "network A subnet") ||
-        !require(!topology.network_a_gateway.empty(), "network A gateway") ||
-        !require(!topology.network_b_subnet.empty(), "network B subnet") ||
-        !require(!topology.network_b_gateway.empty(), "network B gateway") ||
+        !require(valid_subnet_plan(retained_plan), "canonical retained network/IPAM plan") ||
         !require(full_container_id(topology.holder_id), "holder ID") ||
-        !require(!topology.positive_ip.empty(), "positive IP") ||
-        !require(!topology.guard_ip.empty(), "guard IP") ||
-        !require(topology.positive_ip != topology.guard_ip, "distinct fixture IPs") ||
+        !require(choose_address(
+                     topology.network_a_subnet, topology.network_a_gateway, expected_positive) &&
+                     topology.positive_ip == expected_positive,
+                 "canonical positive IP") ||
+        !require(
+            choose_address(topology.network_b_subnet, topology.network_b_gateway, expected_guard) &&
+                topology.guard_ip == expected_guard,
+            "canonical guard IP") ||
         !require(topology.holder_pid > 1, "holder PID") ||
         !require(topology.holder_start != 0u, "holder start") ||
         !require(topology.holder_netns != 0u, "holder netns") ||
@@ -8631,22 +8637,21 @@ static bool stable_rotation_sidecar_equal(const HeldNamespaceSidecarSnapshot& ol
 bool validate_held_namespace_generation_rotation_receipt(
     const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error) {
     error.clear();
-    static const std::vector<HeldNamespaceGenerationRotationPhase> kExactTransitions{
-        HeldNamespaceGenerationRotationPhase::OldGenerationValidated,
-        HeldNamespaceGenerationRotationPhase::OldSidecarWitnessAbsent,
-        HeldNamespaceGenerationRotationPhase::OldHolderWitnessAbsent,
-        HeldNamespaceGenerationRotationPhase::OldGenerationAbsenceRecorded,
-        HeldNamespaceGenerationRotationPhase::NewHolderNameReused,
-        HeldNamespaceGenerationRotationPhase::NewTopologyValidated,
-        HeldNamespaceGenerationRotationPhase::NewSidecarNameReused,
-        HeldNamespaceGenerationRotationPhase::NewGenerationValidated,
-    };
     const auto require = [&](bool condition, const char* field) {
         if (!condition)
             error = std::string("held-namespace generation rotation mismatch: ") + field;
         return condition;
     };
-    if (!require(receipt.transitions == kExactTransitions, "transition order")) return false;
+    if (!require(receipt.old_generation_phase ==
+                         HeldNamespaceGenerationRotationPhase::OldGenerationValidated &&
+                     receipt.old_absence.phase ==
+                         HeldNamespaceGenerationRotationPhase::OldGenerationAbsent &&
+                     receipt.new_generation_created_phase ==
+                         HeldNamespaceGenerationRotationPhase::NewGenerationCreated &&
+                     receipt.new_generation_validated_phase ==
+                         HeldNamespaceGenerationRotationPhase::NewGenerationValidated,
+                 "strict fixed phase order"))
+        return false;
 
     const HeldTopologySnapshot& old_topology = receipt.old_generation.topology;
     const HeldNamespaceSidecarSnapshot& old_sidecar = receipt.old_generation.sidecar;
@@ -8657,15 +8662,18 @@ bool validate_held_namespace_generation_rotation_receipt(
         !valid_rotation_topology(new_topology, error) ||
         !validate_held_namespace_sidecar_snapshot(new_topology, new_sidecar, error))
         return false;
+    const std::array<std::string, 4> container_ids{
+        old_topology.holder_id, old_sidecar.id, new_topology.holder_id, new_sidecar.id};
+    bool pairwise_distinct_ids = true;
+    for (size_t left = 0; left < container_ids.size(); ++left)
+        for (size_t right = left + 1; right < container_ids.size(); ++right)
+            pairwise_distinct_ids =
+                pairwise_distinct_ids && container_ids[left] != container_ids[right];
     if (!require(retained_rotation_topology_equal(old_topology, new_topology),
                  "retained network/IPAM/probe evidence") ||
         !require(stable_rotation_sidecar_equal(old_sidecar, new_sidecar),
                  "stable sidecar name/labels/configuration") ||
-        !require(old_topology.holder_id != new_topology.holder_id, "distinct holder IDs") ||
-        !require(old_sidecar.id != new_sidecar.id, "distinct sidecar IDs") ||
-        !require(
-            old_topology.holder_id != old_sidecar.id && new_topology.holder_id != new_sidecar.id,
-            "same-generation distinct container IDs") ||
+        !require(pairwise_distinct_ids, "pairwise distinct generation container IDs") ||
         !require(old_topology.holder_pid != new_topology.holder_pid ||
                      old_topology.holder_start != new_topology.holder_start,
                  "distinct holder process identity") ||
@@ -8683,17 +8691,17 @@ bool validate_held_namespace_generation_rotation_receipt(
         sidecar.container_id == old_sidecar.id && sidecar.pid == old_sidecar.pid &&
         sidecar.start == old_sidecar.start && sidecar.container_id_absent &&
         sidecar.process_identity_absent;
+    const bool exact_name_absence = receipt.old_absence.holder_name == old_topology.holder_name &&
+                                    receipt.old_absence.sidecar_name == old_sidecar.name &&
+                                    receipt.old_absence.holder_name_absent &&
+                                    receipt.old_absence.sidecar_name_absent;
     if (!require(exact_holder_absence, "exact old holder witness absence") ||
-        !require(exact_sidecar_absence, "exact old sidecar witness absence"))
+        !require(exact_sidecar_absence, "exact old sidecar witness absence") ||
+        !require(exact_name_absence, "exact old stable-name absence before reuse"))
         return false;
-    // Linux may reuse a namespace inode.  Equality is legal only because the
-    // receipt independently proves both exact old container/process witnesses
-    // absent before either stable name is reused.
-    if ((old_topology.holder_netns == new_topology.holder_netns ||
-         old_sidecar.netns == new_sidecar.netns) &&
-        !require(exact_holder_absence && exact_sidecar_absence,
-                 "reused netns without exact old witness absence"))
-        return false;
+    // Linux may reuse a namespace inode.  Equality is permitted: this receipt
+    // proves only operational absence of exact old container/name/process
+    // witnesses, never destruction of a kernel namespace object.
     return true;
 }
 
@@ -8754,16 +8762,15 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
     seed.old_absence.holder = {
         old_topology.holder_id, old_topology.holder_pid, old_topology.holder_start, true, true};
     seed.old_absence.sidecar = {old_sidecar.id, old_sidecar.pid, old_sidecar.start, true, true};
-    seed.transitions = {
-        HeldNamespaceGenerationRotationPhase::OldGenerationValidated,
-        HeldNamespaceGenerationRotationPhase::OldSidecarWitnessAbsent,
-        HeldNamespaceGenerationRotationPhase::OldHolderWitnessAbsent,
-        HeldNamespaceGenerationRotationPhase::OldGenerationAbsenceRecorded,
-        HeldNamespaceGenerationRotationPhase::NewHolderNameReused,
-        HeldNamespaceGenerationRotationPhase::NewTopologyValidated,
-        HeldNamespaceGenerationRotationPhase::NewSidecarNameReused,
-        HeldNamespaceGenerationRotationPhase::NewGenerationValidated,
-    };
+    seed.old_absence.holder_name = old_topology.holder_name;
+    seed.old_absence.sidecar_name = old_sidecar.name;
+    seed.old_absence.holder_name_absent = true;
+    seed.old_absence.sidecar_name_absent = true;
+    seed.old_generation_phase = HeldNamespaceGenerationRotationPhase::OldGenerationValidated;
+    seed.old_absence.phase = HeldNamespaceGenerationRotationPhase::OldGenerationAbsent;
+    seed.new_generation_created_phase = HeldNamespaceGenerationRotationPhase::NewGenerationCreated;
+    seed.new_generation_validated_phase =
+        HeldNamespaceGenerationRotationPhase::NewGenerationValidated;
 
     std::string first_error = "stale";
     std::string second_error = "different stale value";
@@ -8774,7 +8781,6 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
         return false;
     }
 
-    std::uint32_t rejections = 0;
     const auto reject = [&](const HeldNamespaceGenerationRotationReceipt& mutation,
                             const char* field) {
         std::string diagnostic;
@@ -8784,7 +8790,6 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
                 std::string("held-namespace generation rotation mutation was accepted: ") + field;
             return false;
         }
-        ++rejections;
         return true;
     };
     const auto mutate =
@@ -8794,6 +8799,59 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
             change(mutation);
             return reject(mutation, field);
         };
+
+    // Matching old/new corruption must fail topology validation itself rather
+    // than being hidden by the retained-field comparator.
+    if (!mutate("matching malformed subnet",
+                [](auto& value) {
+                    value.old_generation.topology.network_a_subnet = "not-a-cidr";
+                    value.new_generation.topology.network_a_subnet = "not-a-cidr";
+                }) ||
+        !mutate("matching noncanonical subnet",
+                [](auto& value) {
+                    value.old_generation.topology.network_a_subnet = "10.253.240.1/28";
+                    value.new_generation.topology.network_a_subnet = "10.253.240.1/28";
+                }) ||
+        !mutate("matching malformed gateway",
+                [](auto& value) {
+                    value.old_generation.topology.network_a_gateway = "not-an-ip";
+                    value.new_generation.topology.network_a_gateway = "not-an-ip";
+                }) ||
+        !mutate("matching noncanonical gateway",
+                [](auto& value) {
+                    value.old_generation.topology.network_a_gateway = "10.253.240.01";
+                    value.new_generation.topology.network_a_gateway = "10.253.240.01";
+                }) ||
+        !mutate("matching malformed positive IP",
+                [](auto& value) {
+                    value.old_generation.topology.positive_ip = "not-an-ip";
+                    value.new_generation.topology.positive_ip = "not-an-ip";
+                }) ||
+        !mutate("matching noncanonical positive IP",
+                [](auto& value) {
+                    value.old_generation.topology.positive_ip = "10.253.240.002";
+                    value.new_generation.topology.positive_ip = "10.253.240.002";
+                }) ||
+        !mutate("matching wrong positive address",
+                [](auto& value) {
+                    value.old_generation.topology.positive_ip = "10.253.240.3";
+                    value.new_generation.topology.positive_ip = "10.253.240.3";
+                }) ||
+        !mutate("matching malformed guard IP",
+                [](auto& value) {
+                    value.old_generation.topology.guard_ip = "not-an-ip";
+                    value.new_generation.topology.guard_ip = "not-an-ip";
+                }) ||
+        !mutate("matching noncanonical guard IP",
+                [](auto& value) {
+                    value.old_generation.topology.guard_ip = "10.253.241.002";
+                    value.new_generation.topology.guard_ip = "10.253.241.002";
+                }) ||
+        !mutate("matching wrong guard address", [](auto& value) {
+            value.old_generation.topology.guard_ip = "10.253.241.3";
+            value.new_generation.topology.guard_ip = "10.253.241.3";
+        }))
+        return false;
 
     // Every retained topology/IPAM/probe field participates in the comparison.
     if (!mutate("token", [](auto& value) { value.new_generation.topology.token[0] = '2'; }) ||
@@ -8867,6 +8925,16 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
                 [](auto& value) {
                     value.new_generation.sidecar.id = value.old_generation.sidecar.id;
                 }) ||
+        !mutate("new holder/old sidecar cross-role ID collision",
+                [](auto& value) {
+                    value.new_generation.topology.holder_id = value.old_generation.sidecar.id;
+                    value.new_generation.sidecar.network_mode =
+                        "container:" + value.new_generation.topology.holder_id;
+                }) ||
+        !mutate("new sidecar/old holder cross-role ID collision",
+                [](auto& value) {
+                    value.new_generation.sidecar.id = value.old_generation.topology.holder_id;
+                }) ||
         !mutate("sidecar process identity reuse",
                 [](auto& value) {
                     value.new_generation.sidecar.start = value.old_generation.sidecar.start;
@@ -8915,8 +8983,8 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
                 [](auto& value) { value.new_generation.sidecar.no_published_ports = false; }))
         return false;
 
-    // Exact old witness fields are bound to the old generation; missing proof
-    // also rejects the otherwise-legal reused netns inode in the seed.
+    // Exact old witness fields and stable names are bound to the old generation.
+    // The valid seed separately demonstrates that a netns inode may be reused.
     if (!mutate(
             "holder absence ID",
             [](auto& value) { value.old_absence.holder.container_id = std::string(64, '9'); }) ||
@@ -8934,19 +9002,40 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
         !mutate("sidecar ID absence missing",
                 [](auto& value) { value.old_absence.sidecar.container_id_absent = false; }) ||
         !mutate("sidecar process absence missing",
-                [](auto& value) { value.old_absence.sidecar.process_identity_absent = false; }))
+                [](auto& value) { value.old_absence.sidecar.process_identity_absent = false; }) ||
+        !mutate("wrong holder absence name",
+                [](auto& value) { value.old_absence.holder_name += "-wrong"; }) ||
+        !mutate("missing holder name absence",
+                [](auto& value) { value.old_absence.holder_name_absent = false; }) ||
+        !mutate("wrong sidecar absence name",
+                [](auto& value) { value.old_absence.sidecar_name += "-wrong"; }) ||
+        !mutate("missing sidecar name absence",
+                [](auto& value) { value.old_absence.sidecar_name_absent = false; }))
         return false;
 
-    if (!mutate("transition skip",
-                [](auto& value) { value.transitions.erase(value.transitions.begin() + 2); }) ||
-        !mutate("transition duplicate",
+    if (!mutate("missing old validation phase",
                 [](auto& value) {
-                    value.transitions.insert(value.transitions.begin() + 2, value.transitions[1]);
+                    value.old_generation_phase = HeldNamespaceGenerationRotationPhase::None;
                 }) ||
-        !mutate("transition regression",
-                [](auto& value) { std::swap(value.transitions[1], value.transitions[2]); }) ||
-        !mutate("absence recorded after holder name reuse",
-                [](auto& value) { std::swap(value.transitions[3], value.transitions[4]); }))
+        !mutate("duplicate old absence phase",
+                [](auto& value) {
+                    value.old_absence.phase =
+                        HeldNamespaceGenerationRotationPhase::OldGenerationValidated;
+                }) ||
+        !mutate("absence phase after new generation creation",
+                [](auto& value) {
+                    value.old_absence.phase =
+                        HeldNamespaceGenerationRotationPhase::NewGenerationCreated;
+                }) ||
+        !mutate("new generation creation phase skipped",
+                [](auto& value) {
+                    value.new_generation_created_phase =
+                        HeldNamespaceGenerationRotationPhase::NewGenerationValidated;
+                }) ||
+        !mutate("new validation phase regressed", [](auto& value) {
+            value.new_generation_validated_phase =
+                HeldNamespaceGenerationRotationPhase::OldGenerationAbsent;
+        }))
         return false;
 
     HeldNamespaceGenerationRotationReceipt deterministic_failure = seed;
@@ -8955,8 +9044,8 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
     second_error.clear();
     if (validate_held_namespace_generation_rotation_receipt(deterministic_failure, first_error) ||
         validate_held_namespace_generation_rotation_receipt(deterministic_failure, second_error) ||
-        first_error.empty() || first_error != second_error || rejections != 53u) {
-        error = "held-namespace generation rotation validation was not deterministic/exhaustive";
+        first_error.empty() || first_error != second_error) {
+        error = "held-namespace generation rotation validation was not deterministic";
         return false;
     }
     return true;
