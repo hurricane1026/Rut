@@ -35,6 +35,18 @@ enum class ExactInputReadOutcome : std::uint8_t {
     ByteMismatch,
 };
 
+enum class ExactInputReadLaunchStage : std::uint8_t {
+    None,
+    ProcessGroup,
+    StdoutDuplication,
+    StderrDuplication,
+    DescriptorCustody,
+    Execute,
+    PidfdOpen,
+    PidfdIdentity,
+    ExecStatusProtocol,
+};
+
 enum class ExactInputMountTerminalResult : std::uint8_t {
     None,
     SettledCleanly,
@@ -153,6 +165,16 @@ struct ExactInputReadObservation {
     bool wait_status_valid = false;
     bool process_group_owned = false;
     bool process_group_gone = false;
+    std::uint32_t group_absence_confirmations = 0;
+    bool pidfd_opened = false;
+    bool pidfd_identity_verified = false;
+    bool pidfd_closed_after_group_gone = false;
+    bool final_deadline_recorded = false;
+    bool cleanup_completed_before_final_deadline = false;
+    bool leader_exit_observed_before_group_cleanup = false;
+    bool descendant_group_member_observed = false;
+    bool foreign_process_survived = false;
+    bool foreign_fd_excluded = false;
     bool deadline_exceeded = false;
     bool output_overflow = false;
     bool pre_source_revalidated = false;
@@ -171,6 +193,8 @@ struct ExactInputReadObservation {
     std::size_t expected_size = 0;
     int stdout_read_errno = 0;
     int stderr_read_errno = 0;
+    ExactInputReadLaunchStage launch_failure_stage = ExactInputReadLaunchStage::None;
+    int launch_errno = 0;
     int wait_status = 0;
     std::vector<std::string> command_argv;
     std::string stdout_bytes;
@@ -180,6 +204,8 @@ struct ExactInputReadObservation {
 
 enum class ExactInputReadRunnerTestCase : std::uint8_t {
     CommandStartFailure,
+    LeaderExitWithDescendant,
+    ForeignFdExcluded,
     MaxSizeExact,
     EmbeddedNulExact,
     HeldOpenAfterExactBytes,

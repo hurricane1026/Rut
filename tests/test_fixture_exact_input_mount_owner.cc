@@ -1,12 +1,16 @@
 #include "fixture_exact_input_mount_owner.h"
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -131,7 +135,7 @@ bool write_all(int fd, const std::string& bytes) {
     return true;
 }
 
-int run_exact_read_helper(const std::string& name) {
+int run_exact_read_helper(const std::string& name, const char* argument = nullptr) {
     if (name == "max") {
         std::string bytes(8192, '\0');
         for (size_t index = 0; index < bytes.size(); ++index)
@@ -143,6 +147,28 @@ int run_exact_read_helper(const std::string& name) {
         if (!write_all(STDOUT_FILENO, "held")) return 126;
         (void)usleep(3000000);
         return 0;
+    }
+    if (name == "leader-descendant") {
+        const pid_t descendant = fork();
+        if (descendant < 0) return 126;
+        if (descendant == 0) {
+            if (!write_all(STDOUT_FILENO, "held")) _exit(126);
+            (void)poll(nullptr, 0, 3000);
+            _exit(0);
+        }
+        return 0;
+    }
+    if (name == "fd-excluded") {
+        if (argument == nullptr) return 126;
+        char* end = nullptr;
+        errno = 0;
+        const long raw_fd = strtol(argument, &end, 10);
+        if (errno != 0 || end == argument || *end != '\0' || raw_fd < 3 ||
+            raw_fd > std::numeric_limits<int>::max())
+            return 126;
+        errno = 0;
+        if (fcntl(static_cast<int>(raw_fd), F_GETFD) >= 0 || errno != EBADF) return 125;
+        return write_all(STDOUT_FILENO, "fd-ok") ? 0 : 126;
     }
     if (name == "extra") return write_all(STDOUT_FILENO, "abcX") ? 0 : 126;
     if (name == "overflow") return write_all(STDOUT_FILENO, "abcXY") ? 0 : 126;
@@ -168,6 +194,18 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.wait_status_valid == right.wait_status_valid &&
            left.process_group_owned == right.process_group_owned &&
            left.process_group_gone == right.process_group_gone &&
+           left.group_absence_confirmations == right.group_absence_confirmations &&
+           left.pidfd_opened == right.pidfd_opened &&
+           left.pidfd_identity_verified == right.pidfd_identity_verified &&
+           left.pidfd_closed_after_group_gone == right.pidfd_closed_after_group_gone &&
+           left.final_deadline_recorded == right.final_deadline_recorded &&
+           left.cleanup_completed_before_final_deadline ==
+               right.cleanup_completed_before_final_deadline &&
+           left.leader_exit_observed_before_group_cleanup ==
+               right.leader_exit_observed_before_group_cleanup &&
+           left.descendant_group_member_observed == right.descendant_group_member_observed &&
+           left.foreign_process_survived == right.foreign_process_survived &&
+           left.foreign_fd_excluded == right.foreign_fd_excluded &&
            left.deadline_exceeded == right.deadline_exceeded &&
            left.output_overflow == right.output_overflow &&
            left.pre_source_revalidated == right.pre_source_revalidated &&
@@ -183,8 +221,10 @@ bool read_observation_equal(const ExactInputReadObservation& left,
            left.expected_size == right.expected_size &&
            left.stdout_read_errno == right.stdout_read_errno &&
            left.stderr_read_errno == right.stderr_read_errno &&
-           left.wait_status == right.wait_status && left.command_argv == right.command_argv &&
-           left.stdout_bytes == right.stdout_bytes && left.stderr_bytes == right.stderr_bytes &&
+           left.launch_failure_stage == right.launch_failure_stage &&
+           left.launch_errno == right.launch_errno && left.wait_status == right.wait_status &&
+           left.command_argv == right.command_argv && left.stdout_bytes == right.stdout_bytes &&
+           left.stderr_bytes == right.stderr_bytes &&
            left.diagnostic.phase == right.diagnostic.phase &&
            left.diagnostic.error_number == right.diagnostic.error_number &&
            left.diagnostic.message == right.diagnostic.message;
@@ -194,6 +234,9 @@ bool exact_read_runner_self_checks(std::string& error) {
     const std::vector<std::pair<ExactInputReadRunnerTestCase, ExactInputReadOutcome>> cases = {
         {ExactInputReadRunnerTestCase::CommandStartFailure,
          ExactInputReadOutcome::CommandStartFailed},
+        {ExactInputReadRunnerTestCase::LeaderExitWithDescendant,
+         ExactInputReadOutcome::DeadlineExceeded},
+        {ExactInputReadRunnerTestCase::ForeignFdExcluded, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::MaxSizeExact, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::EmbeddedNulExact, ExactInputReadOutcome::Complete},
         {ExactInputReadRunnerTestCase::HeldOpenAfterExactBytes,
@@ -215,12 +258,32 @@ bool exact_read_runner_self_checks(std::string& error) {
             return false;
         }
         const bool start_failure = test_case == ExactInputReadRunnerTestCase::CommandStartFailure;
-        if (observation.command_started == start_failure ||
-            observation.child_reaped == start_failure ||
-            observation.wait_status_valid == start_failure ||
-            observation.process_group_owned == start_failure ||
-            observation.process_group_gone == start_failure) {
+        if (observation.command_started == start_failure || !observation.child_reaped ||
+            !observation.wait_status_valid || !observation.process_group_owned ||
+            !observation.process_group_gone || !observation.pidfd_opened ||
+            !observation.pidfd_identity_verified || !observation.pidfd_closed_after_group_gone ||
+            observation.group_absence_confirmations < 2u || !observation.final_deadline_recorded ||
+            !observation.cleanup_completed_before_final_deadline) {
             error = "exact-read start/child/PGID evidence was not causal";
+            return false;
+        }
+        if (start_failure &&
+            (observation.launch_failure_stage != ExactInputReadLaunchStage::Execute ||
+             observation.launch_errno != ENOENT)) {
+            error = "real exec failure did not preserve exact stage and errno";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::LeaderExitWithDescendant &&
+            (!observation.leader_exit_observed_before_group_cleanup ||
+             !observation.descendant_group_member_observed ||
+             !observation.foreign_process_survived)) {
+            error = "leader-exit cleanup lost descendant or foreign-process evidence";
+            return false;
+        }
+        if (test_case == ExactInputReadRunnerTestCase::ForeignFdExcluded &&
+            (!observation.foreign_fd_excluded || observation.stdout_bytes != "fd-ok" ||
+             !observation.stdout_eof || !observation.stderr_eof)) {
+            error = "execed helper inherited the sentinel foreign descriptor";
             return false;
         }
         if (test_case == ExactInputReadRunnerTestCase::MaxSizeExact &&
@@ -366,8 +429,8 @@ bool wait_for_abort(pid_t child, std::string& error) {
 
 int main(int argc, char** argv) {
     using namespace rut::test::ipv4_topology;
-    if (argc == 3 && std::string(argv[1]) == "--exact-input-read-helper")
-        return run_exact_read_helper(argv[2]);
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--exact-input-read-helper")
+        return run_exact_read_helper(argv[2], argc == 4 ? argv[3] : nullptr);
     std::string runner_error;
     if (!exact_read_runner_self_checks(runner_error)) {
         std::cerr << "FAIL [#358 exact input read runner]: " << runner_error << "\n";

@@ -20,11 +20,13 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -382,8 +384,18 @@ struct ExactReadCommandResult {
     bool wait_status_valid = false;
     bool process_group_owned = false;
     bool process_group_gone = false;
+    std::uint32_t group_absence_confirmations = 0;
+    bool pidfd_opened = false;
+    bool pidfd_identity_verified = false;
+    bool pidfd_closed_after_group_gone = false;
+    bool final_deadline_recorded = false;
+    bool cleanup_completed_before_final_deadline = false;
+    bool leader_exit_observed_before_group_cleanup = false;
+    bool descendant_group_member_observed = false;
     int stdout_read_errno = 0;
     int stderr_read_errno = 0;
+    ExactInputReadLaunchStage launch_failure_stage = ExactInputReadLaunchStage::None;
+    int launch_errno = 0;
     int wait_status = 0;
     std::string stdout_bytes;
     std::string stderr_bytes;
@@ -391,23 +403,233 @@ struct ExactReadCommandResult {
 
 enum class ExactReadRunnerFault : std::uint8_t {
     None,
-    Start,
     StdoutReadAfterBytes,
 };
 
-static void reap_exact_read_child(pid_t child, ExactReadCommandResult& result) {
-    while (!result.child_reaped) {
-        const pid_t waited = waitpid(child, &result.wait_status, 0);
-        if (waited == child) {
-            result.child_reaped = true;
-            result.wait_status_valid = true;
-        } else if (waited < 0 && errno == EINTR) {
+struct ExactReadExecFailureRecord {
+    std::uint32_t magic;
+    std::uint8_t stage;
+    std::uint8_t reserved[3];
+    std::int32_t error_number;
+};
+
+constexpr std::uint32_t kExactReadExecFailureMagic = 0x45585246u;
+
+static bool make_cloexec_pipe(int descriptors[2]) {
+#ifdef SYS_pipe2
+    return syscall(SYS_pipe2, descriptors, O_CLOEXEC) == 0;
+#else
+    (void)descriptors;
+    errno = ENOSYS;
+    return false;
+#endif
+}
+
+[[noreturn]] static void report_exact_read_exec_failure(int status_fd,
+                                                        ExactInputReadLaunchStage stage,
+                                                        int error_number) {
+    const ExactReadExecFailureRecord record{kExactReadExecFailureMagic,
+                                            static_cast<std::uint8_t>(stage),
+                                            {0u, 0u, 0u},
+                                            static_cast<std::int32_t>(error_number)};
+    ssize_t written;
+    do {
+        written = write(status_fd, &record, sizeof(record));
+    } while (written < 0 && errno == EINTR);
+    _exit(126);
+}
+
+static bool mark_child_descriptors_cloexec(int open_max) {
+#if defined(SYS_close_range)
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
+    if (syscall(SYS_close_range, 3u, UINT_MAX, CLOSE_RANGE_CLOEXEC) == 0) return true;
+    if (errno != ENOSYS && errno != EINVAL) return false;
+#endif
+    if (open_max < 3) return false;
+    for (int fd = 3; fd < open_max; ++fd) {
+        const int flags = fcntl(fd, F_GETFD);
+        if (flags < 0) {
+            if (errno == EBADF) continue;
+            return false;
+        }
+        if ((flags & FD_CLOEXEC) == 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) return false;
+    }
+    return true;
+}
+
+static bool pidfd_targets_exact_pid(int pidfd, pid_t pid) {
+    char path[64];
+    const int path_length = snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", pidfd);
+    if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) return false;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char bytes[512];
+    const ssize_t count = read(fd, bytes, sizeof(bytes) - 1u);
+    const int read_error = errno;
+    close(fd);
+    if (count < 0) {
+        errno = read_error;
+        return false;
+    }
+    bytes[count] = '\0';
+    const char* marker = strstr(bytes, "Pid:\t");
+    if (marker == nullptr) return false;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = strtol(marker + 5, &end, 10);
+    return errno == 0 && end != marker + 5 && parsed == static_cast<long>(pid);
+}
+
+static bool exact_read_leader_exited(int pidfd, pid_t pid, int& wait_status, bool& exited) {
+    siginfo_t info{};
+    if (waitid(static_cast<idtype_t>(3),
+               static_cast<id_t>(pidfd),
+               &info,
+               WEXITED | WNOHANG | WNOWAIT) != 0)
+        return errno == EINTR;
+    if (info.si_pid == 0) return true;
+    if (info.si_pid != pid) {
+        errno = EPROTO;
+        return false;
+    }
+    exited = true;
+    if (info.si_code == CLD_EXITED)
+        wait_status = info.si_status << 8;
+    else
+        wait_status = info.si_status & 0x7f;
+    return true;
+}
+
+static bool exact_read_group_members(pid_t pgid, pid_t leader, bool& has_other_member) {
+    has_other_member = false;
+    DIR* directory = opendir("/proc");
+    if (directory == nullptr) return false;
+    bool ok = true;
+    while (dirent* entry = readdir(directory)) {
+        char* end = nullptr;
+        errno = 0;
+        const long raw_pid = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == entry->d_name || *end != '\0' || raw_pid <= 0 ||
+            raw_pid > std::numeric_limits<pid_t>::max() || raw_pid == leader)
             continue;
-        } else if (waited < 0 && errno == ECHILD) {
-            result.child_reaped = true;
-        } else {
+        char path[64];
+        const int path_length = snprintf(path, sizeof(path), "/proc/%ld/stat", raw_pid);
+        if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) {
+            ok = false;
             break;
         }
+        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            break;
+        }
+        char bytes[1024];
+        const ssize_t count = read(fd, bytes, sizeof(bytes) - 1u);
+        const int read_error = errno;
+        close(fd);
+        if (count < 0) {
+            if (read_error == ENOENT) continue;
+            ok = false;
+            break;
+        }
+        bytes[count] = '\0';
+        char* closing = strrchr(bytes, ')');
+        if (closing == nullptr) {
+            ok = false;
+            break;
+        }
+        char state = '\0';
+        long parent = 0;
+        long process_group = 0;
+        if (sscanf(closing + 1, " %c %ld %ld", &state, &parent, &process_group) != 3) {
+            ok = false;
+            break;
+        }
+        (void)state;
+        (void)parent;
+        if (process_group == static_cast<long>(pgid)) {
+            has_other_member = true;
+            break;
+        }
+    }
+    closedir(directory);
+    return ok;
+}
+
+static bool signal_exact_read_owned_group(pid_t child, int signal_number) {
+    if (kill(-child, signal_number) == 0) return true;
+    return errno == ESRCH;
+}
+
+[[noreturn]] static void exact_read_fail_stop(pid_t child,
+                                              int pidfd,
+                                              bool process_group_owned,
+                                              const char* reason) {
+    dprintf(STDERR_FILENO,
+            "fatal exact-read cleanup failure while retaining pidfd/direct-child authority "
+            "(pid %ld): %s\n",
+            static_cast<long>(child),
+            reason);
+    unsigned empty_group_scans = 0;
+    for (;;) {
+        if (!process_group_owned && getpgid(child) == child) process_group_owned = true;
+        if (process_group_owned) (void)signal_exact_read_owned_group(child, SIGKILL);
+#ifdef SYS_pidfd_send_signal
+        else
+            (void)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0u);
+#endif
+        int ignored_status = 0;
+        bool leader_exited = false;
+        bool other_member = true;
+        const bool scan_ok =
+            !process_group_owned || exact_read_group_members(child, child, other_member);
+        if (process_group_owned && scan_ok)
+            empty_group_scans = other_member ? 0u : empty_group_scans + 1u;
+        if (exact_read_leader_exited(pidfd, child, ignored_status, leader_exited) &&
+            leader_exited && scan_ok && (!process_group_owned || empty_group_scans >= 2u)) {
+            int status = 0;
+            const pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) {
+                close(pidfd);
+                _exit(125);
+            }
+        }
+        pollfd descriptor{pidfd, POLLIN, 0};
+        (void)poll(&descriptor, 1, 10);
+    }
+}
+
+[[noreturn]] static void exact_read_fail_stop_without_pidfd(pid_t child, const char* reason) {
+    bool process_group_owned = getpgid(child) == child;
+    dprintf(STDERR_FILENO,
+            "fatal exact-read pidfd acquisition failure while retaining direct-child custody "
+            "(pid %ld): %s\n",
+            static_cast<long>(child),
+            reason);
+    unsigned empty_group_scans = 0;
+    for (;;) {
+        if (!process_group_owned && getpgid(child) == child) process_group_owned = true;
+        if (process_group_owned)
+            (void)signal_exact_read_owned_group(child, SIGKILL);
+        else
+            (void)kill(child, SIGKILL);
+        siginfo_t info{};
+        const bool leader_exited =
+            waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            info.si_pid == child;
+        bool other_member = true;
+        const bool scan_ok =
+            !process_group_owned || exact_read_group_members(child, child, other_member);
+        if (process_group_owned && scan_ok)
+            empty_group_scans = other_member ? 0u : empty_group_scans + 1u;
+        if (leader_exited && scan_ok && (!process_group_owned || empty_group_scans >= 2u)) {
+            int status = 0;
+            if (waitpid(child, &status, WNOHANG) == child) _exit(125);
+        }
+        (void)poll(nullptr, 0, 10);
     }
 }
 
@@ -418,15 +640,38 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
                                    ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
     ++command_invocation_count;
     result = {};
-    if (arguments.empty() || stdout_limit == 0u || timeout_ms <= 0 ||
-        fault == ExactReadRunnerFault::Start)
+    if (arguments.empty() || stdout_limit == 0u || timeout_ms <= 0) return false;
+    const auto final_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    result.final_deadline_recorded = true;
+    const auto cleanup_reserve =
+        std::chrono::milliseconds(std::min(200, std::max(50, timeout_ms / 2)));
+    const auto begin_cleanup_at = final_deadline - cleanup_reserve;
+    const long raw_open_max = sysconf(_SC_OPEN_MAX);
+    if (raw_open_max < 3 || raw_open_max > std::numeric_limits<int>::max()) {
+        result.launch_failure_stage = ExactInputReadLaunchStage::DescriptorCustody;
+        result.launch_errno = raw_open_max < 0 ? errno : EOVERFLOW;
         return false;
+    }
+    std::vector<char*> child_argv;
+    child_argv.reserve(arguments.size() + 1u);
+    for (const std::string& argument : arguments)
+        child_argv.push_back(const_cast<char*>(argument.c_str()));
+    child_argv.push_back(nullptr);
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
-    if (pipe(stdout_pipe) != 0) return false;
-    if (pipe(stderr_pipe) != 0) {
+    int status_pipe[2] = {-1, -1};
+    if (!make_cloexec_pipe(stdout_pipe)) return false;
+    if (!make_cloexec_pipe(stderr_pipe)) {
         close(stdout_pipe[0]);
         close(stdout_pipe[1]);
+        return false;
+    }
+    if (!make_cloexec_pipe(status_pipe)) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
         return false;
     }
     const pid_t child = fork();
@@ -435,49 +680,68 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
         close(stdout_pipe[1]);
         close(stderr_pipe[0]);
         close(stderr_pipe[1]);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
         return false;
     }
     if (child == 0) {
-        (void)setpgid(0, 0);
+        close(status_pipe[0]);
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
-        if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || dup2(stderr_pipe[1], STDERR_FILENO) < 0)
-            _exit(126);
+        if (setpgid(0, 0) != 0)
+            report_exact_read_exec_failure(
+                status_pipe[1], ExactInputReadLaunchStage::ProcessGroup, errno);
+        if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0)
+            report_exact_read_exec_failure(
+                status_pipe[1], ExactInputReadLaunchStage::StdoutDuplication, errno);
+        if (dup2(stderr_pipe[1], STDERR_FILENO) < 0)
+            report_exact_read_exec_failure(
+                status_pipe[1], ExactInputReadLaunchStage::StderrDuplication, errno);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
-        std::vector<char*> argv;
-        argv.reserve(arguments.size() + 1u);
-        for (const std::string& argument : arguments)
-            argv.push_back(const_cast<char*>(argument.c_str()));
-        argv.push_back(nullptr);
-        execvp(argv[0], argv.data());
-        _exit(127);
+        if (!mark_child_descriptors_cloexec(static_cast<int>(raw_open_max)))
+            report_exact_read_exec_failure(
+                status_pipe[1], ExactInputReadLaunchStage::DescriptorCustody, errno);
+        execvp(child_argv[0], child_argv.data());
+        report_exact_read_exec_failure(status_pipe[1], ExactInputReadLaunchStage::Execute, errno);
     }
-    result.started = true;
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
-    (void)setpgid(child, child);
-    result.process_group_owned = getpgid(child) == child;
-    if (!result.process_group_owned) {
-        result.stdout_read_errno = EPROTO;
-        (void)kill(child, SIGKILL);
-        reap_exact_read_child(child, result);
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
-        result.process_group_gone = process_group_gone(child);
-        return false;
+    close(status_pipe[1]);
+#ifdef SYS_pidfd_open
+    const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, child, 0u));
+#else
+    errno = ENOSYS;
+    const int pidfd = -1;
+#endif
+    if (pidfd < 0) {
+        result.launch_failure_stage = ExactInputReadLaunchStage::PidfdOpen;
+        result.launch_errno = errno;
+        exact_read_fail_stop_without_pidfd(child, "pidfd_open failed");
     }
-    for (const int fd : {stdout_pipe[0], stderr_pipe[0]}) {
+    result.pidfd_opened = true;
+    if (!pidfd_targets_exact_pid(pidfd, child)) {
+        result.launch_failure_stage = ExactInputReadLaunchStage::PidfdIdentity;
+        result.launch_errno = errno == 0 ? EPROTO : errno;
+        exact_read_fail_stop(child, pidfd, getpgid(child) == child, "pidfd identity mismatch");
+    }
+    result.pidfd_identity_verified = true;
+    bool status_channel_nonblocking = true;
+    for (const int fd : {stdout_pipe[0], stderr_pipe[0], status_pipe[0]}) {
         const int flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
             if (fd == stdout_pipe[0])
                 result.stdout_read_errno = errno;
-            else
+            else if (fd == stderr_pipe[0])
                 result.stderr_read_errno = errno;
+            else {
+                result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
+                result.launch_errno = errno;
+                status_channel_nonblocking = false;
+            }
         }
     }
     constexpr size_t kStderrLimit = fixture_exact_input_file_lease::kMaximumInputBytes + 1u;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     bool injected_read_error = false;
     const auto drain = [&](int fd,
                            std::string& bytes,
@@ -519,58 +783,183 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
             return;
         }
     };
-    bool force_cleanup = result.stdout_read_errno != 0 || result.stderr_read_errno != 0;
-    while (!force_cleanup && !(result.child_reaped && result.stdout_eof && result.stderr_eof)) {
-        drain(stdout_pipe[0],
-              result.stdout_bytes,
-              stdout_limit,
-              result.stdout_eof,
-              result.stdout_read_errno,
-              fault == ExactReadRunnerFault::StdoutReadAfterBytes);
-        drain(stderr_pipe[0],
-              result.stderr_bytes,
-              kStderrLimit,
-              result.stderr_eof,
-              result.stderr_read_errno,
-              false);
-        if (result.output_overflow || result.stdout_read_errno != 0 ||
-            result.stderr_read_errno != 0) {
-            force_cleanup = true;
-            break;
+    std::array<unsigned char, sizeof(ExactReadExecFailureRecord)> status_bytes{};
+    size_t status_size = 0;
+    bool status_eof = false;
+    bool launch_resolved = false;
+    bool process_group_not_created = false;
+    bool force_cleanup = result.stdout_read_errno != 0 || result.stderr_read_errno != 0 ||
+                         result.launch_failure_stage != ExactInputReadLaunchStage::None;
+    bool leader_exited = false;
+    bool group_absent = false;
+    std::uint32_t empty_group_scans = 0;
+    bool term_sent = false;
+    bool kill_sent = false;
+    auto cleanup_started = std::chrono::steady_clock::time_point{};
+    while (!result.child_reaped) {
+        if (!result.process_group_owned && getpgid(child) == child)
+            result.process_group_owned = true;
+        if (!force_cleanup) {
+            drain(stdout_pipe[0],
+                  result.stdout_bytes,
+                  stdout_limit,
+                  result.stdout_eof,
+                  result.stdout_read_errno,
+                  fault == ExactReadRunnerFault::StdoutReadAfterBytes);
+            drain(stderr_pipe[0],
+                  result.stderr_bytes,
+                  kStderrLimit,
+                  result.stderr_eof,
+                  result.stderr_read_errno,
+                  false);
         }
-        if (!result.child_reaped) {
-            const pid_t waited = waitpid(child, &result.wait_status, WNOHANG);
-            if (waited == child) {
-                result.child_reaped = true;
-                result.wait_status_valid = true;
-            } else if (waited < 0 && errno != EINTR) {
-                if (errno == ECHILD) result.child_reaped = true;
+        if (!status_eof && status_channel_nonblocking) {
+            for (;;) {
+                unsigned char buffer[sizeof(ExactReadExecFailureRecord)];
+                const ssize_t count = read(status_pipe[0], buffer, sizeof(buffer));
+                if (count > 0) {
+                    const size_t available = static_cast<size_t>(count);
+                    if (status_size + available > status_bytes.size()) {
+                        result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
+                        result.launch_errno = EOVERFLOW;
+                        force_cleanup = true;
+                        break;
+                    }
+                    std::copy(buffer, buffer + available, status_bytes.begin() + status_size);
+                    status_size += available;
+                    continue;
+                }
+                if (count == 0) {
+                    status_eof = true;
+                    break;
+                }
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
+                result.launch_errno = errno;
                 force_cleanup = true;
                 break;
             }
         }
-        if (result.child_reaped && result.stdout_eof && result.stderr_eof) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
+        if (status_eof && !launch_resolved) {
+            launch_resolved = true;
+            if (status_size == 0u) {
+                result.started = true;
+                result.process_group_owned = getpgid(child) == child;
+                if (!result.process_group_owned) {
+                    result.launch_failure_stage = ExactInputReadLaunchStage::ProcessGroup;
+                    result.launch_errno = EPROTO;
+                    force_cleanup = true;
+                }
+            } else if (status_size == sizeof(ExactReadExecFailureRecord)) {
+                ExactReadExecFailureRecord record{};
+                memcpy(&record, status_bytes.data(), sizeof(record));
+                if (record.magic != kExactReadExecFailureMagic ||
+                    record.stage == static_cast<std::uint8_t>(ExactInputReadLaunchStage::None) ||
+                    record.stage >
+                        static_cast<std::uint8_t>(ExactInputReadLaunchStage::ExecStatusProtocol)) {
+                    result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
+                    result.launch_errno = EPROTO;
+                } else {
+                    result.launch_failure_stage =
+                        static_cast<ExactInputReadLaunchStage>(record.stage);
+                    result.launch_errno = record.error_number;
+                    process_group_not_created =
+                        result.launch_failure_stage == ExactInputReadLaunchStage::ProcessGroup;
+                    if (!process_group_not_created && getpgid(child) == child)
+                        result.process_group_owned = true;
+                }
+                force_cleanup = true;
+            } else {
+                result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
+                result.launch_errno = EPROTO;
+                force_cleanup = true;
+            }
+        }
+        if (result.output_overflow || result.stdout_read_errno != 0 ||
+            result.stderr_read_errno != 0) {
+            force_cleanup = true;
+        }
+        if (!exact_read_leader_exited(pidfd, child, result.wait_status, leader_exited)) {
+            force_cleanup = true;
+            if (result.stdout_read_errno == 0) result.stdout_read_errno = errno;
+        }
+        if (launch_resolved && leader_exited && !group_absent) {
+            bool has_other_member = false;
+            if (process_group_not_created) {
+                group_absent = true;
+            } else if (!exact_read_group_members(child, child, has_other_member)) {
+                force_cleanup = true;
+                if (result.stdout_read_errno == 0) result.stdout_read_errno = errno;
+            } else if (has_other_member) {
+                empty_group_scans = 0;
+                result.descendant_group_member_observed = true;
+            } else if (result.process_group_owned && ++empty_group_scans >= 2u) {
+                group_absent = true;
+                result.group_absence_confirmations = empty_group_scans;
+            }
+            if (leader_exited && !group_absent)
+                result.leader_exit_observed_before_group_cleanup = true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!force_cleanup && now >= begin_cleanup_at &&
+            !(launch_resolved && result.started && leader_exited && group_absent &&
+              result.stdout_eof && result.stderr_eof)) {
             result.deadline_exceeded = true;
             force_cleanup = true;
-            break;
         }
-        pollfd descriptors[2] = {{stdout_pipe[0], POLLIN | POLLHUP, 0},
-                                 {stderr_pipe[0], POLLIN | POLLHUP, 0}};
-        (void)poll(descriptors, 2, 25);
+        if (force_cleanup && !term_sent) {
+            cleanup_started = now;
+            if (result.process_group_owned) (void)signal_exact_read_owned_group(child, SIGTERM);
+#ifdef SYS_pidfd_send_signal
+            else
+                (void)syscall(SYS_pidfd_send_signal, pidfd, SIGTERM, nullptr, 0u);
+#endif
+            term_sent = true;
+        }
+        if (force_cleanup && term_sent && !kill_sent &&
+            now - cleanup_started >= std::chrono::milliseconds(50)) {
+            if (result.process_group_owned) (void)signal_exact_read_owned_group(child, SIGKILL);
+#ifdef SYS_pidfd_send_signal
+            else
+                (void)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0u);
+#endif
+            kill_sent = true;
+        }
+        const bool normal_terminal = launch_resolved && result.started && leader_exited &&
+                                     group_absent && result.stdout_eof && result.stderr_eof;
+        const bool cleanup_terminal = force_cleanup && leader_exited && group_absent;
+        if (normal_terminal || cleanup_terminal) {
+            const pid_t waited = waitpid(child, &result.wait_status, WNOHANG);
+            if (waited == child) {
+                result.child_reaped = true;
+                result.wait_status_valid = true;
+                result.process_group_gone = true;
+                close(pidfd);
+                result.pidfd_closed_after_group_gone = true;
+                result.cleanup_completed_before_final_deadline =
+                    std::chrono::steady_clock::now() < final_deadline;
+                break;
+            }
+            if (waited < 0 && errno != EINTR)
+                exact_read_fail_stop(
+                    child, pidfd, result.process_group_owned, "direct-child custody was lost");
+        }
+        if (std::chrono::steady_clock::now() >= final_deadline)
+            exact_read_fail_stop(
+                child, pidfd, result.process_group_owned, "absolute final deadline expired");
+        pollfd descriptors[4] = {{stdout_pipe[0], POLLIN | POLLHUP, 0},
+                                 {stderr_pipe[0], POLLIN | POLLHUP, 0},
+                                 {status_pipe[0], POLLIN | POLLHUP, 0},
+                                 {pidfd, POLLIN, 0}};
+        (void)poll(descriptors, 4, 10);
     }
-    if (force_cleanup && !result.child_reaped) {
-        (void)kill(-child, SIGTERM);
-        (void)usleep(100000);
-        (void)kill(-child, SIGKILL);
-    }
-    reap_exact_read_child(child, result);
     close(stdout_pipe[0]);
     close(stderr_pipe[0]);
-    require_group_gone(child, "exact-read command completion PGID remained alive");
-    result.process_group_gone = true;
+    close(status_pipe[0]);
     return result.started && !result.deadline_exceeded && !result.output_overflow &&
-           result.stdout_read_errno == 0 && result.stderr_read_errno == 0;
+           result.stdout_read_errno == 0 && result.stderr_read_errno == 0 &&
+           result.cleanup_completed_before_final_deadline;
 }
 
 static ExactInputReadOutcome classify_exact_read(const ExactReadCommandResult& result,
@@ -599,10 +988,22 @@ static void copy_exact_read_result(const ExactReadCommandResult& result,
     observation.wait_status_valid = result.wait_status_valid;
     observation.process_group_owned = result.process_group_owned;
     observation.process_group_gone = result.process_group_gone;
+    observation.group_absence_confirmations = result.group_absence_confirmations;
+    observation.pidfd_opened = result.pidfd_opened;
+    observation.pidfd_identity_verified = result.pidfd_identity_verified;
+    observation.pidfd_closed_after_group_gone = result.pidfd_closed_after_group_gone;
+    observation.final_deadline_recorded = result.final_deadline_recorded;
+    observation.cleanup_completed_before_final_deadline =
+        result.cleanup_completed_before_final_deadline;
+    observation.leader_exit_observed_before_group_cleanup =
+        result.leader_exit_observed_before_group_cleanup;
+    observation.descendant_group_member_observed = result.descendant_group_member_observed;
     observation.deadline_exceeded = result.deadline_exceeded;
     observation.output_overflow = result.output_overflow;
     observation.stdout_read_errno = result.stdout_read_errno;
     observation.stderr_read_errno = result.stderr_read_errno;
+    observation.launch_failure_stage = result.launch_failure_stage;
+    observation.launch_errno = result.launch_errno;
     observation.wait_status = result.wait_status;
     observation.stdout_bytes = result.stdout_bytes;
     observation.stderr_bytes = result.stderr_bytes;
@@ -4050,8 +4451,16 @@ bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_c
     ExactReadRunnerFault fault = ExactReadRunnerFault::None;
     switch (test_case) {
         case ExactInputReadRunnerTestCase::CommandStartFailure:
-            name = "start";
-            fault = ExactReadRunnerFault::Start;
+            name = "real-exec-failure";
+            break;
+        case ExactInputReadRunnerTestCase::LeaderExitWithDescendant:
+            name = "leader-descendant";
+            expected = "held";
+            timeout_ms = 400;
+            break;
+        case ExactInputReadRunnerTestCase::ForeignFdExcluded:
+            name = "fd-excluded";
+            expected = "fd-ok";
             break;
         case ExactInputReadRunnerTestCase::MaxSizeExact:
             name = "max";
@@ -4100,16 +4509,79 @@ bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_c
     }
     observation.attempted = true;
     observation.expected_size = expected.size();
-    observation.command_argv = {"/proc/self/exe", "--exact-input-read-helper", name};
+    if (test_case == ExactInputReadRunnerTestCase::CommandStartFailure)
+        observation.command_argv = {"/rut-tests/definitely-not-an-executable"};
+    else
+        observation.command_argv = {"/proc/self/exe", "--exact-input-read-helper", name};
+    int foreign_fd = -1;
+    if (test_case == ExactInputReadRunnerTestCase::ForeignFdExcluded) {
+        foreign_fd = open("/dev/null", O_RDONLY);
+        if (foreign_fd < 3) {
+            if (foreign_fd >= 0) close(foreign_fd);
+            diagnostic = {ExactInputMountPhase::InputObservation,
+                          errno == 0 ? EPROTO : errno,
+                          "could not allocate a real non-stdio sentinel descriptor"};
+            return false;
+        }
+        observation.command_argv.push_back(std::to_string(foreign_fd));
+    }
+    pid_t foreign_process = -1;
+    if (test_case == ExactInputReadRunnerTestCase::LeaderExitWithDescendant) {
+        foreign_process = fork();
+        if (foreign_process == 0) {
+            if (setpgid(0, 0) != 0) _exit(126);
+            (void)poll(nullptr, 0, 5000);
+            _exit(0);
+        }
+        if (foreign_process < 0 ||
+            (setpgid(foreign_process, foreign_process) != 0 && errno != EACCES)) {
+            if (foreign_process > 0) (void)kill(foreign_process, SIGKILL);
+            if (foreign_fd >= 0) close(foreign_fd);
+            diagnostic = {ExactInputMountPhase::InputObservation,
+                          errno,
+                          "could not establish the foreign process-group sentinel"};
+            return false;
+        }
+    }
     ExactReadCommandResult result;
     (void)run_exact_read_command(
         observation.command_argv, expected.size() + 1u, timeout_ms, result, fault);
     copy_exact_read_result(result, observation);
+    if (foreign_fd >= 0) {
+        observation.foreign_fd_excluded =
+            fcntl(foreign_fd, F_GETFD) >= 0 && result.started && result.stdout_bytes == expected;
+        close(foreign_fd);
+    }
+    if (foreign_process > 0) {
+        observation.foreign_process_survived = kill(foreign_process, 0) == 0;
+        (void)kill(foreign_process, SIGKILL);
+        const auto foreign_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        int foreign_status = 0;
+        for (;;) {
+            const pid_t waited = waitpid(foreign_process, &foreign_status, WNOHANG);
+            if (waited == foreign_process) break;
+            if (waited < 0 && errno != EINTR) {
+                diagnostic = {ExactInputMountPhase::InputObservation,
+                              errno,
+                              "foreign process sentinel custody was lost"};
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= foreign_deadline) {
+                diagnostic = {ExactInputMountPhase::InputObservation,
+                              ETIMEDOUT,
+                              "foreign process sentinel did not reap"};
+                return false;
+            }
+            (void)poll(nullptr, 0, 10);
+        }
+    }
     observation.outcome = classify_exact_read(result, expected);
     observation.terminal_frozen = true;
     if (observation.outcome != ExactInputReadOutcome::Complete)
-        observation.diagnostic = {
-            ExactInputMountPhase::InputObservation, 0, "deterministic exact-read runner outcome"};
+        observation.diagnostic = {ExactInputMountPhase::InputObservation,
+                                  result.launch_errno,
+                                  "deterministic exact-read runner outcome"};
     return true;
 }
 
