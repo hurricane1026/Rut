@@ -5550,6 +5550,10 @@ ExactInputMountRecoveryController::~ExactInputMountRecoveryController() {
     owner_cookie_ = 0;
 }
 
+bool exact_input_mount_test_terminal_settlement(const ExactInputMountRecoveryReceipt& receipt) {
+    return exact_mount_terminal_settlement(receipt);
+}
+
 bool ExactInputMountRecoveryController::start(const void* bytes,
                                               std::size_t size,
                                               ExactInputMountHandle& handle,

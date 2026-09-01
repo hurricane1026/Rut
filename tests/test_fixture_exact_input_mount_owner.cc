@@ -1034,31 +1034,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    child = fork();
-    if (child < 0) {
-        std::cerr << "FAIL [#358 incomplete-cleanup destructor setup]: fork failed\n";
-        return 1;
-    }
-    if (child == 0) {
-        {
-            ExactInputMountRecoveryController incomplete;
-            {
-                ExactInputMountHandle incomplete_handle;
-                ExactInputMountOptions options;
-                options.failure_point = ExactInputMountFailurePoint::RejectSidecarRevalidationOnce;
-                ExactInputMountDiagnostic child_diagnostic;
-                if (!incomplete.start(kConfig.data(),
-                                      kConfig.size(),
-                                      incomplete_handle,
-                                      child_diagnostic,
-                                      options))
-                    _exit(125);
-            }
-        }
-        _exit(0);
-    }
-    if (!wait_for_abort(child, death_error)) {
-        std::cerr << "FAIL [#358 incomplete-cleanup destructor fail-stop]: " << death_error << "\n";
+    // The destructor's pure terminal-settlement guard must reject any
+    // incomplete cleanup. Real-resource destructor fail-stop is covered above
+    // by parent-custodied wrong-thread/live-handle cases; do not intentionally
+    // abort a process that alone owns a Docker graph.
+    ExactInputMountRecoveryReceipt settled_failure;
+    settled_failure.state = ExactInputMountState::Settled;
+    settled_failure.terminal_result = ExactInputMountTerminalResult::SettledWithOperationFailure;
+    settled_failure.attempted = true;
+    settled_failure.graph_mutated = true;
+    settled_failure.sidecar_acquired = settled_failure.input_acquired = true;
+    settled_failure.directory_acquired = settled_failure.holder_acquired = true;
+    settled_failure.network_b_acquired = settled_failure.network_a_acquired = true;
+    settled_failure.sidecar_settled = settled_failure.input_settled = true;
+    settled_failure.directory_settled = settled_failure.holder_settled = true;
+    settled_failure.network_b_settled = settled_failure.network_a_settled = true;
+    settled_failure.final_zero_residue = true;
+    settled_failure.settlement_complete = true;
+    settled_failure.terminal_frozen = true;
+    ExactInputMountRecoveryReceipt incomplete_cleanup = settled_failure;
+    incomplete_cleanup.sidecar_settled = false;
+    if (!exact_input_mount_test_terminal_settlement(settled_failure) ||
+        exact_input_mount_test_terminal_settlement(incomplete_cleanup)) {
+        std::cerr << "FAIL [#358 incomplete-cleanup destructor settlement guard]\n";
         return 1;
     }
     const ExactInputMountRecoveryReceipt frozen = receipt;

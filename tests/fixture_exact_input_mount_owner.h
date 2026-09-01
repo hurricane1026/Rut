@@ -360,6 +360,7 @@ struct ExactInputMountRecoveryReceipt {
 // a frozen terminal replay issue no external commands.
 std::uint64_t exact_input_mount_test_command_count();
 std::uint64_t exact_input_mount_test_observation_command_count();
+bool exact_input_mount_test_terminal_settlement(const ExactInputMountRecoveryReceipt& receipt);
 bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_case,
                                              ExactInputReadObservation& observation,
                                              ExactInputMountDiagnostic& diagnostic);
