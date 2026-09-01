@@ -401,12 +401,25 @@ struct ExactInputNginxProcessSample {
     bool pidfile_exact = false;
     bool tcp_exact = false;
     bool tcp6_port_absent = false;
+    bool end_container_identity_verified = false;
+    bool end_source_revalidated = false;
+    bool end_mount_verified = false;
+    bool end_topology_verified = false;
+    bool end_cgroup_exact = false;
+    bool end_pidfile_exact = false;
+    bool end_process_socket_owned = false;
+    std::int64_t bracket_start_nanoseconds = 0;
+    std::int64_t bracket_end_nanoseconds = 0;
     std::int64_t monotonic_nanoseconds = 0;
     std::int64_t master_pid = -1;
     std::int64_t worker_pid = -1;
     std::uint64_t master_start = 0;
     std::uint64_t worker_start = 0;
     std::uint64_t listener_inode = 0;
+    std::int64_t end_master_pid = -1;
+    std::int64_t end_worker_pid = -1;
+    std::uint64_t end_master_start = 0;
+    std::uint64_t end_worker_start = 0;
 };
 
 struct ExactInputNginxLifecycleObservation {
@@ -425,6 +438,10 @@ struct ExactInputNginxLifecycleObservation {
     bool samples_at_least_250ms_apart = false;
     bool quit_attempted = false;
     bool quit_only = false;
+    bool term_attempted = false;
+    bool kill_attempted = false;
+    bool force_remove_attempted = false;
+    bool uncertain_cleanup = false;
     bool stopped_exit_zero = false;
     bool cgroup_empty_after_stop = false;
     bool removed_nonforce = false;

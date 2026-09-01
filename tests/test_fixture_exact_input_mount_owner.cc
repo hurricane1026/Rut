@@ -1067,7 +1067,7 @@ int main(int argc, char** argv) {
     ExactInputMountDiagnostic lifecycle_selfcheck_diagnostic;
     if (!exact_input_mount_test_nginx_lifecycle_self_checks(lifecycle_mutation_rejections,
                                                             lifecycle_selfcheck_diagnostic) ||
-        lifecycle_mutation_rejections != 18u) {
+        lifecycle_mutation_rejections != 33u) {
         std::cerr << "FAIL [#358 nginx lifecycle pure mutation matrix]: "
                   << lifecycle_selfcheck_diagnostic.message << "\n";
         return 1;
@@ -1877,11 +1877,27 @@ int main(int argc, char** argv) {
             !lifecycle.sample_a.topology_verified || !lifecycle.sample_a.cgroup_exact ||
             !lifecycle.sample_a.pidfile_exact || !lifecycle.sample_a.tcp_exact ||
             !lifecycle.sample_a.tcp6_port_absent ||
+            !lifecycle.sample_a.end_container_identity_verified ||
+            !lifecycle.sample_a.end_source_revalidated || !lifecycle.sample_a.end_mount_verified ||
+            !lifecycle.sample_a.end_topology_verified || !lifecycle.sample_a.end_cgroup_exact ||
+            !lifecycle.sample_a.end_pidfile_exact || !lifecycle.sample_a.end_process_socket_owned ||
+            lifecycle.sample_a.bracket_end_nanoseconds <
+                lifecycle.sample_a.bracket_start_nanoseconds ||
             !lifecycle.sample_b.container_identity_verified ||
             !lifecycle.sample_b.source_revalidated || !lifecycle.sample_b.mount_verified ||
             !lifecycle.sample_b.topology_verified || !lifecycle.sample_b.cgroup_exact ||
             !lifecycle.sample_b.pidfile_exact || !lifecycle.sample_b.tcp_exact ||
-            !lifecycle.sample_b.tcp6_port_absent || !lifecycle.samples_at_least_250ms_apart ||
+            !lifecycle.sample_b.tcp6_port_absent ||
+            !lifecycle.sample_b.end_container_identity_verified ||
+            !lifecycle.sample_b.end_source_revalidated || !lifecycle.sample_b.end_mount_verified ||
+            !lifecycle.sample_b.end_topology_verified || !lifecycle.sample_b.end_cgroup_exact ||
+            !lifecycle.sample_b.end_pidfile_exact || !lifecycle.sample_b.end_process_socket_owned ||
+            lifecycle.sample_b.bracket_end_nanoseconds <
+                lifecycle.sample_b.bracket_start_nanoseconds ||
+            !lifecycle.samples_at_least_250ms_apart ||
+            lifecycle.sample_b.bracket_start_nanoseconds -
+                    lifecycle.sample_a.bracket_end_nanoseconds <
+                250000000LL ||
             lifecycle.sample_a.master_pid != lifecycle.sample_b.master_pid ||
             lifecycle.sample_a.worker_pid != lifecycle.sample_b.worker_pid ||
             lifecycle.sample_a.master_start != lifecycle.sample_b.master_start ||
@@ -1889,6 +1905,8 @@ int main(int argc, char** argv) {
             lifecycle.sample_a.listener_inode == 0u ||
             lifecycle.sample_a.listener_inode != lifecycle.sample_b.listener_inode ||
             !lifecycle.quit_attempted || !lifecycle.quit_only || !lifecycle.stopped_exit_zero ||
+            lifecycle.term_attempted || lifecycle.kill_attempted ||
+            lifecycle.force_remove_attempted || lifecycle.uncertain_cleanup ||
             !lifecycle.cgroup_empty_after_stop || !lifecycle.removed_nonforce ||
             !lifecycle.exact_absence || !lifecycle.baseline_restored ||
             lifecycle.operation_failed || lifecycle.container_id.size() != 64u ||

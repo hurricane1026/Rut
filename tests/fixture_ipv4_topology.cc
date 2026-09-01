@@ -116,6 +116,10 @@ static bool exited_zero(const CommandResult& result) {
            WEXITSTATUS(result.status) == 0;
 }
 
+static bool command_outcome_uncertain(const CommandResult& result) {
+    return result.timed_out;
+}
+
 static std::string trim(std::string value) {
     while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
         value.pop_back();
@@ -4312,7 +4316,7 @@ static bool proc_status_scalar(pid_t pid, const char* wanted, std::int64_t& valu
     return matches == 1u;
 }
 
-static bool proc_nspid_ends_one(pid_t pid) {
+static bool proc_nspid_exact(pid_t pid, bool master) {
     std::string status;
     if (!read_file("/proc/" + std::to_string(pid) + "/status", status)) return false;
     std::istringstream lines(status);
@@ -4330,7 +4334,7 @@ static bool proc_nspid_ends_one(pid_t pid) {
             last = value;
             ++count;
         }
-        exact = count >= 2u && last == 1;
+        exact = count >= 2u && (master ? last == 1 : last > 1);
     }
     return matches == 1u && exact;
 }
@@ -4461,19 +4465,72 @@ static bool strict_tcp6_port_absent(const std::string& contents, u16 port) {
         return false;
     std::istringstream lines(contents);
     std::string line;
-    if (!std::getline(lines, line) || line.find("local_address") == std::string::npos ||
-        line.find("inode") == std::string::npos)
-        return false;
+    if (!std::getline(lines, line)) return false;
+    {
+        std::istringstream header_stream(line);
+        std::vector<std::string> header;
+        std::string token;
+        while (header_stream >> token) header.push_back(token);
+        const std::vector<std::string> expected{"sl",
+                                                "local_address",
+                                                "remote_address",
+                                                "st",
+                                                "tx_queue",
+                                                "rx_queue",
+                                                "tr",
+                                                "tm->when",
+                                                "retrnsmt",
+                                                "uid",
+                                                "timeout",
+                                                "inode"};
+        if (header != expected) {
+            auto kernel_variant = expected;
+            kernel_variant[2] = "rem_address";
+            if (header != kernel_variant) return false;
+        }
+    }
+    const auto exact_hex = [](const std::string& value, std::size_t size) {
+        return value.size() == size &&
+               std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+                   return std::isxdigit(byte) != 0;
+               });
+    };
+    const auto exact_pair = [&](const std::string& value, std::size_t left, std::size_t right) {
+        return value.size() == left + right + 1u && value[left] == ':' &&
+               exact_hex(value.substr(0u, left), left) && exact_hex(value.substr(left + 1u), right);
+    };
+    const auto exact_decimal = [](const std::string& value) {
+        if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+                return std::isdigit(byte) != 0;
+            }))
+            return false;
+        char* end = nullptr;
+        errno = 0;
+        (void)strtoull(value.c_str(), &end, 10);
+        return errno == 0 && end != value.c_str() && *end == '\0';
+    };
     std::size_t rows = 0u;
     while (std::getline(lines, line)) {
         std::istringstream fields(line);
-        std::string slot, local;
-        if (!(fields >> slot >> local) || ++rows > fixture_privileged_listener::kMaxProcRows)
+        std::vector<std::string> tokens;
+        std::string token;
+        while (fields >> token) tokens.push_back(token);
+        if (++rows > fixture_privileged_listener::kMaxProcRows || tokens.size() != 17u)
             return false;
-        const size_t colon = local.find(':');
-        if (colon != 32u || local.size() != 37u) return false;
-        for (size_t index = 0u; index < 32u; ++index)
-            if (!std::isxdigit(static_cast<unsigned char>(local[index]))) return false;
+        const std::string& slot = tokens[0];
+        const std::string& local = tokens[1];
+        if (slot.size() < 2u || slot.back() != ':' ||
+            !exact_decimal(slot.substr(0u, slot.size() - 1u)) || local.size() != 37u ||
+            local[32] != ':' || !exact_hex(local.substr(0u, 32u), 32u) ||
+            !exact_hex(local.substr(33u), 4u) || tokens[2].size() != 37u || tokens[2][32] != ':' ||
+            !exact_hex(tokens[2].substr(0u, 32u), 32u) || !exact_hex(tokens[2].substr(33u), 4u) ||
+            !exact_hex(tokens[3], 2u) || !exact_pair(tokens[4], 8u, 8u) ||
+            !exact_pair(tokens[5], 2u, 8u) || !exact_hex(tokens[6], 8u) ||
+            !exact_decimal(tokens[7]) || !exact_decimal(tokens[8]) || !exact_decimal(tokens[9]) ||
+            !exact_decimal(tokens[10]) || !exact_hex(tokens[11], 16u) ||
+            !exact_decimal(tokens[12]) || !exact_decimal(tokens[13]) ||
+            !exact_decimal(tokens[14]) || !exact_decimal(tokens[15]) || !exact_decimal(tokens[16]))
+            return false;
         char* end = nullptr;
         errno = 0;
         const unsigned long selected = strtoul(local.c_str() + 33u, &end, 16);
@@ -4483,19 +4540,69 @@ static bool strict_tcp6_port_absent(const std::string& contents, u16 port) {
     return true;
 }
 
+static bool strict_exact_nginx_listener(const fixture_privileged_listener::ProcTcpTable& table,
+                                        u32 positive,
+                                        u32 guard,
+                                        const std::vector<std::uint64_t>& process_socket_inodes,
+                                        fixture_privileged_listener::ListenerEvidence& listener,
+                                        fixture_privileged_listener::Diagnostic& diagnostic) {
+    std::size_t selected_rows = 0u;
+    std::uint64_t selected_inode = 0u;
+    for (std::size_t index = 0u; index < table.count; ++index) {
+        const auto& row = table.rows[index];
+        if (row.local_port != kExactInputTopologyBuilderPort) continue;
+        ++selected_rows;
+        if (row.local_ipv4 != positive || row.state != 0x0au || row.inode == 0u ||
+            std::find(process_socket_inodes.begin(), process_socket_inodes.end(), row.inode) ==
+                process_socket_inodes.end())
+            return false;
+        selected_inode = row.inode;
+    }
+    if (selected_rows != 1u || selected_inode == 0u) return false;
+    return fixture_privileged_listener::classify_listener_evidence(
+        table,
+        fixture_privileged_listener::ListenerPlan{positive, guard, kExactInputTopologyBuilderPort},
+        std::vector<std::uint64_t>{selected_inode},
+        fixture_privileged_listener::ListenerEvidenceKind::ExactPositive,
+        listener,
+        diagnostic);
+}
+
 static bool nginx_samples_stable(const ExactInputNginxProcessSample& first,
                                  const ExactInputNginxProcessSample& second) {
-    return first.complete && second.complete &&
-           second.monotonic_nanoseconds - first.monotonic_nanoseconds >= 250000000LL &&
-           first.master_pid == second.master_pid && first.worker_pid == second.worker_pid &&
-           first.master_start == second.master_start && first.worker_start == second.worker_start &&
-           first.listener_inode != 0u && first.listener_inode == second.listener_inode;
+    return first.complete && second.complete && first.bracket_start_nanoseconds > 0 &&
+           first.bracket_end_nanoseconds >= first.bracket_start_nanoseconds &&
+           second.bracket_start_nanoseconds - first.bracket_end_nanoseconds >= 250000000LL &&
+           second.bracket_end_nanoseconds >= second.bracket_start_nanoseconds &&
+           first.container_identity_verified && first.source_revalidated && first.mount_verified &&
+           first.topology_verified && first.cgroup_exact && first.pidfile_exact &&
+           first.tcp_exact && first.tcp6_port_absent && first.end_container_identity_verified &&
+           first.end_source_revalidated && first.end_mount_verified &&
+           first.end_topology_verified && first.end_cgroup_exact && first.end_pidfile_exact &&
+           first.end_process_socket_owned && second.container_identity_verified &&
+           second.source_revalidated && second.mount_verified && second.topology_verified &&
+           second.cgroup_exact && second.pidfile_exact && second.tcp_exact &&
+           second.tcp6_port_absent && second.end_container_identity_verified &&
+           second.end_source_revalidated && second.end_mount_verified &&
+           second.end_topology_verified && second.end_cgroup_exact && second.end_pidfile_exact &&
+           second.end_process_socket_owned && first.master_pid == second.master_pid &&
+           first.worker_pid == second.worker_pid && first.master_start == second.master_start &&
+           first.worker_start == second.worker_start && first.master_pid == first.end_master_pid &&
+           first.worker_pid == first.end_worker_pid &&
+           first.master_start == first.end_master_start &&
+           first.worker_start == first.end_worker_start &&
+           second.master_pid == second.end_master_pid &&
+           second.worker_pid == second.end_worker_pid &&
+           second.master_start == second.end_master_start &&
+           second.worker_start == second.end_worker_start && first.listener_inode != 0u &&
+           first.listener_inode == second.listener_inode;
 }
 
 static bool nginx_graceful_cleanup_complete(const ExactInputNginxLifecycleObservation& value) {
     return !value.operation_failed && value.quit_attempted && value.quit_only &&
-           value.stopped_exit_zero && value.cgroup_empty_after_stop && value.removed_nonforce &&
-           value.exact_absence;
+           !value.term_attempted && !value.kill_attempted && !value.force_remove_attempted &&
+           !value.uncertain_cleanup && value.stopped_exit_zero && value.cgroup_empty_after_stop &&
+           value.removed_nonforce && value.exact_absence;
 }
 
 static bool mountinfo_entry(pid_t pid,
@@ -4675,6 +4782,11 @@ static bool contains_exact_json_string(const std::string& json, const std::strin
            json.find(needle, first + needle.size()) == std::string::npos;
 }
 
+static bool nginx_auto_remove_disabled(const std::string& value) {
+    bool auto_remove = true;
+    return parse_exact_bool(value, auto_remove) && !auto_remove;
+}
+
 static bool tmpfs_option_exact_enough(const std::string& options,
                                       const std::string& uid,
                                       const std::string& gid,
@@ -4712,7 +4824,8 @@ static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
         "{{.Type}}#{{.Source}}#{{.Target}}#{{.ReadOnly}}#{{.BindOptions.Propagation}};{{end}}|"
         "{{len .Mounts}}|{{range .Mounts}}{{.Type}}#{{.Source}}#{{.Destination}}#{{.RW}}#"
         "{{.Propagation}};{{end}}|{{.HostConfig.Privileged}}|{{.Config.Tty}}|"
-        "{{.Config.OpenStdin}}|{{.Config.AttachStdin}}|{{json .HostConfig.CapAdd}}";
+        "{{.Config.OpenStdin}}|{{.Config.AttachStdin}}|{{json .HostConfig.CapAdd}}|"
+        "{{.HostConfig.AutoRemove}}";
     CommandResult result;
     if (!run_command_before({"docker", "inspect", "-f", format, target}, deadline_ns, result) ||
         !exited_zero(result)) {
@@ -4720,7 +4833,7 @@ static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
         return false;
     }
     std::vector<std::string> fields;
-    if (!split_exact(trim(result.output), '|', 36u, fields)) {
+    if (!split_exact(trim(result.output), '|', 37u, fields)) {
         error = "nginx sibling inspection record was malformed";
         return false;
     }
@@ -4759,7 +4872,7 @@ static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
         !tmpfs_option_exact_enough(fields[23], uid, gid, "4m") || fields[27] != "1" ||
         fields[28] != requested || fields[29] != "1" || fields[30] != realized_prefix ||
         fields[31] != "false" || fields[32] != "false" || fields[33] != "false" ||
-        fields[34] != "false" || fields[35] != "null") {
+        fields[34] != "false" || fields[35] != "null" || !nginx_auto_remove_disabled(fields[36])) {
         error = "nginx sibling immutable/security/mount/tmpfs identity was not exact";
         return false;
     }
@@ -4833,14 +4946,102 @@ static bool nginx_live_mounts_exact(ExactInputMountOwner& owner,
     return true;
 }
 
+static bool revalidate_nginx_sample_end(ExactInputMountOwner& owner,
+                                        ExactInputNginxProcessSample& sample,
+                                        const std::string& expected_cgroup,
+                                        std::int64_t deadline_ns,
+                                        std::string& error) {
+    fixture_exact_input_file_lease::Diagnostic source_diagnostic;
+    if (!owner.input.revalidate(source_diagnostic)) {
+        error = "exact input source/OFD changed at nginx sample end";
+        return false;
+    }
+    sample.end_source_revalidated = true;
+    if (!owner.fixture.revalidate_sidecar_identity(error) ||
+        !owner.fixture.verify_topology(FailurePoint::None, error) ||
+        !topology_snapshot_equal(owner.builder_baseline,
+                                 owner.fixture.current_topology_snapshot())) {
+        if (error.empty()) error = "sidecar/topology identity changed at nginx sample end";
+        return false;
+    }
+    sample.end_topology_verified = true;
+
+    NginxInspectEvidence inspect;
+    if (!inspect_nginx_sibling(owner, inspect, error, deadline_ns) || !inspect.running ||
+        inspect.id != owner.nginx_sibling.id || inspect.pid != sample.master_pid) {
+        if (error.empty()) error = "container identity changed at nginx sample end";
+        return false;
+    }
+    sample.end_container_identity_verified = true;
+    sample.end_master_pid = inspect.pid;
+
+    ProcIdentity master{};
+    ProcIdentity worker_identity{};
+    pid_t worker = -1;
+    std::string master_cgroup;
+    std::string worker_cgroup;
+    if (!proc_identity(inspect.pid, master) || master.start != sample.master_start ||
+        master.netns != owner.builder_baseline.holder_netns ||
+        !proc_credentials_exact(
+            inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
+        !proc_nspid_exact(inspect.pid, true) || !read_unified_cgroup(inspect.pid, master_cgroup) ||
+        master_cgroup != expected_cgroup ||
+        !exact_cgroup_members(master_cgroup, inspect.pid, worker, error) ||
+        worker != sample.worker_pid || !proc_identity(worker, worker_identity) ||
+        worker_identity.start != sample.worker_start || worker_identity.netns != master.netns ||
+        !proc_credentials_exact(worker, owner.input.identity().uid, owner.input.identity().gid) ||
+        !proc_nspid_exact(worker, false) || !read_unified_cgroup(worker, worker_cgroup) ||
+        worker_cgroup != master_cgroup || !same_proc_namespace(inspect.pid, worker, "pid") ||
+        !same_proc_namespace(inspect.pid, worker, "mnt") ||
+        !same_proc_namespace(inspect.pid, worker, "net") ||
+        !same_proc_executable(inspect.pid, worker) || !proc_executable_is_nginx(inspect.pid) ||
+        !pidfd_targets_exact_pid(owner.nginx_sibling.master_pidfd, inspect.pid) ||
+        !pidfd_targets_exact_pid(owner.nginx_sibling.worker_pidfd, worker)) {
+        if (error.empty())
+            error = "nginx process/pidfd/cgroup/namespace identity changed at sample end";
+        return false;
+    }
+    sample.end_cgroup_exact = true;
+    sample.end_worker_pid = worker;
+    sample.end_master_start = master.start;
+    sample.end_worker_start = worker_identity.start;
+
+    bool same_mount = true;
+    if (!nginx_live_mounts_exact(owner, inspect.pid, same_mount, error)) return false;
+    sample.end_mount_verified = true;
+    const std::string pidfile = "/proc/" + std::to_string(inspect.pid) + "/root/tmp/rut-" +
+                                owner.fixture.token() + "-nginx.pid";
+    std::string pid_bytes;
+    if (!read_file(pidfile, pid_bytes) || pid_bytes != "1\n") {
+        error = "nginx pidfile changed at sample end";
+        return false;
+    }
+    sample.end_pidfile_exact = true;
+    std::vector<std::uint64_t> sockets;
+    if (!proc_socket_inodes(inspect.pid, sockets) || !proc_socket_inodes(worker, sockets) ||
+        std::find(sockets.begin(), sockets.end(), sample.listener_inode) == sockets.end()) {
+        error = "nginx listener ownership changed at sample end";
+        return false;
+    }
+    sample.end_process_socket_owned = true;
+    sample.bracket_end_nanoseconds = exact_read_monotonic_ns();
+    sample.monotonic_nanoseconds = sample.bracket_end_nanoseconds;
+    if (sample.bracket_end_nanoseconds < sample.bracket_start_nanoseconds ||
+        sample.bracket_end_nanoseconds >= deadline_ns) {
+        error = "nginx sample end bracket exceeded its phase deadline";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_nginx_sample(ExactInputMountOwner& owner,
                                  ExactInputNginxProcessSample& sample,
                                  std::int64_t deadline_ns,
                                  bool first,
                                  std::string& error) {
     sample = {};
-    sample.monotonic_nanoseconds = exact_read_monotonic_ns();
-    if (sample.monotonic_nanoseconds <= 0 || sample.monotonic_nanoseconds >= deadline_ns) {
+    sample.bracket_start_nanoseconds = exact_read_monotonic_ns();
+    if (sample.bracket_start_nanoseconds <= 0 || sample.bracket_start_nanoseconds >= deadline_ns) {
         error = "nginx process sample exceeded its phase deadline";
         return false;
     }
@@ -4867,7 +5068,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
         master.netns != owner.builder_baseline.holder_netns ||
         !proc_credentials_exact(
             inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
-        !proc_nspid_ends_one(inspect.pid)) {
+        !proc_nspid_exact(inspect.pid, true)) {
         error = "nginx master PID/start/credentials/netns/NSpid evidence was not exact";
         return false;
     }
@@ -4886,8 +5087,8 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     std::string worker_cgroup;
     if (!proc_identity(worker, worker_identity) || worker_identity.netns != master.netns ||
         !proc_credentials_exact(worker, owner.input.identity().uid, owner.input.identity().gid) ||
-        !read_unified_cgroup(worker, worker_cgroup) || worker_cgroup != cgroup ||
-        !same_proc_namespace(inspect.pid, worker, "pid") ||
+        !proc_nspid_exact(worker, false) || !read_unified_cgroup(worker, worker_cgroup) ||
+        worker_cgroup != cgroup || !same_proc_namespace(inspect.pid, worker, "pid") ||
         !same_proc_namespace(inspect.pid, worker, "mnt") ||
         !same_proc_namespace(inspect.pid, worker, "net") ||
         !same_proc_executable(inspect.pid, worker) || !proc_executable_is_nginx(inspect.pid)) {
@@ -4953,23 +5154,8 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
         error = "nginx TCP table or listener plan was rejected";
         return false;
     }
-    std::vector<std::uint64_t> selected_owned;
-    for (std::size_t index = 0u; index < table.count; ++index) {
-        const auto& row = table.rows[index];
-        if (row.local_port == kExactInputTopologyBuilderPort && row.state == 0x0au &&
-            std::find(sockets.begin(), sockets.end(), row.inode) != sockets.end() &&
-            std::find(selected_owned.begin(), selected_owned.end(), row.inode) ==
-                selected_owned.end())
-            selected_owned.push_back(row.inode);
-    }
-    if (!fixture_privileged_listener::classify_listener_evidence(
-            table,
-            fixture_privileged_listener::ListenerPlan{
-                positive, guard, kExactInputTopologyBuilderPort},
-            selected_owned,
-            fixture_privileged_listener::ListenerEvidenceKind::ExactPositive,
-            listener,
-            parser_diagnostic) ||
+    if (!strict_exact_nginx_listener(
+            table, positive, guard, sockets, listener, parser_diagnostic) ||
         listener.child_owned_inode == 0u ||
         !strict_tcp6_port_absent(tcp6, kExactInputTopologyBuilderPort)) {
         error = "nginx exact IPv4 listener/TCP6 absence evidence was rejected";
@@ -4978,6 +5164,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     sample.tcp_exact = true;
     sample.tcp6_port_absent = true;
     sample.listener_inode = listener.child_owned_inode;
+    if (!revalidate_nginx_sample_end(owner, sample, cgroup, deadline_ns, error)) return false;
     sample.complete = true;
     return true;
 }
@@ -6290,13 +6477,18 @@ static bool settle_nginx_sibling(ExactInputMountOwner& owner,
                 {"docker", "kill", "--signal=SIGQUIT", lease.id}, quit_deadline, signal) ||
             !exited_zero(signal) || !wait_nginx_stopped(owner, quit_deadline, exit_code, error)) {
             operation_ok = false;
+            observation.uncertain_cleanup = observation.uncertain_cleanup || signal.timed_out;
             CommandResult term;
+            observation.term_attempted = true;
             (void)run_command_before(
                 {"docker", "kill", "--signal=SIGTERM", lease.id}, term_deadline, term);
+            observation.uncertain_cleanup = observation.uncertain_cleanup || term.timed_out;
             if (!wait_nginx_stopped(owner, term_deadline, exit_code, inspect_error)) {
                 CommandResult killed;
+                observation.kill_attempted = true;
                 (void)run_command_before(
                     {"docker", "kill", "--signal=SIGKILL", lease.id}, kill_deadline, killed);
+                observation.uncertain_cleanup = observation.uncertain_cleanup || killed.timed_out;
                 if (!wait_nginx_stopped(owner, kill_deadline, exit_code, inspect_error)) {
                     error = "nginx sibling remained live after QUIT/TERM/KILL escalation";
                     return false;
@@ -6341,11 +6533,16 @@ static bool settle_nginx_sibling(ExactInputMountOwner& owner,
         owner.options.failure_point == ExactInputMountFailurePoint::NginxRemoveReportedTimeout;
     const bool removal_ok =
         run_command_before({"docker", "rm", lease.id}, final_deadline_ns, removal, report_timeout);
-    if (report_timeout && removal.timed_out) operation_ok = false;
+    if (removal.timed_out) {
+        operation_ok = false;
+        observation.uncertain_cleanup = true;
+    }
     if ((!removal_ok || !exited_zero(removal)) && !removal.timed_out) {
         CommandResult forced;
         operation_ok = false;
+        observation.force_remove_attempted = true;
         (void)run_command_before({"docker", "rm", "-f", lease.id}, final_deadline_ns, forced);
+        observation.uncertain_cleanup = observation.uncertain_cleanup || forced.timed_out;
     } else if (!removal.timed_out) {
         observation.removed_nonforce = true;
     }
@@ -6668,15 +6865,28 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     mutation_rejections = 0u;
     diagnostic = {};
     ExactInputNginxProcessSample first;
-    first.complete = true;
-    first.monotonic_nanoseconds = 1000000000LL;
+    first.complete = first.container_identity_verified = first.source_revalidated = true;
+    first.mount_verified = first.topology_verified = first.cgroup_exact = true;
+    first.pidfile_exact = first.tcp_exact = first.tcp6_port_absent = true;
+    first.end_container_identity_verified = first.end_source_revalidated = true;
+    first.end_mount_verified = first.end_topology_verified = first.end_cgroup_exact = true;
+    first.end_pidfile_exact = first.end_process_socket_owned = true;
+    first.bracket_start_nanoseconds = 1000000000LL;
+    first.bracket_end_nanoseconds = 1010000000LL;
+    first.monotonic_nanoseconds = first.bracket_end_nanoseconds;
     first.master_pid = 101;
     first.worker_pid = 102;
     first.master_start = 201u;
     first.worker_start = 202u;
     first.listener_inode = 301u;
+    first.end_master_pid = first.master_pid;
+    first.end_worker_pid = first.worker_pid;
+    first.end_master_start = first.master_start;
+    first.end_worker_start = first.worker_start;
     ExactInputNginxProcessSample second = first;
-    second.monotonic_nanoseconds += 250000000LL;
+    second.bracket_start_nanoseconds = first.bracket_end_nanoseconds + 250000000LL;
+    second.bracket_end_nanoseconds = second.bracket_start_nanoseconds + 10000000LL;
+    second.monotonic_nanoseconds = second.bracket_end_nanoseconds;
     if (!nginx_samples_stable(first, second)) {
         diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid nginx sample seed was rejected"};
         return false;
@@ -6690,7 +6900,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     mutation.complete = false;
     if (!reject_sample(mutation)) return false;
     mutation = second;
-    mutation.monotonic_nanoseconds = first.monotonic_nanoseconds + 249999999LL;
+    mutation.bracket_start_nanoseconds = first.bracket_end_nanoseconds + 249999999LL;
     if (!reject_sample(mutation)) return false;
     mutation = second;
     ++mutation.master_pid;
@@ -6711,6 +6921,12 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     zero_listener.listener_inode = 0u;
     if (nginx_samples_stable(zero_listener, second)) return false;
     ++mutation_rejections;
+    mutation = second;
+    ++mutation.end_worker_start;
+    if (!reject_sample(mutation)) return false;
+    mutation = second;
+    mutation.end_topology_verified = false;
+    if (!reject_sample(mutation)) return false;
 
     ExactInputNginxLifecycleObservation cleanup;
     cleanup.quit_attempted = true;
@@ -6734,28 +6950,91 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     RUT_REJECT_NGINX_CLEANUP(operation_failed, true);
     RUT_REJECT_NGINX_CLEANUP(quit_attempted, false);
     RUT_REJECT_NGINX_CLEANUP(quit_only, false);
+    RUT_REJECT_NGINX_CLEANUP(term_attempted, true);
+    RUT_REJECT_NGINX_CLEANUP(kill_attempted, true);
+    RUT_REJECT_NGINX_CLEANUP(force_remove_attempted, true);
+    RUT_REJECT_NGINX_CLEANUP(uncertain_cleanup, true);
     RUT_REJECT_NGINX_CLEANUP(stopped_exit_zero, false);
     RUT_REJECT_NGINX_CLEANUP(cgroup_empty_after_stop, false);
     RUT_REJECT_NGINX_CLEANUP(removed_nonforce, false);
     RUT_REJECT_NGINX_CLEANUP(exact_absence, false);
 #undef RUT_REJECT_NGINX_CLEANUP
 
-    const std::string header =
-        "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout "
-        "inode\n";
-    const std::string absent =
-        header +
-        " 0: 00000000000000000000000000000000:A380 00000000000000000000000000000000:0000 0A\n";
-    const std::string present =
-        header +
-        " 0: 00000000000000000000000000000000:A381 00000000000000000000000000000000:0000 0A\n";
+    const std::string tcp_header =
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  "
+        "timeout inode\n";
+    const auto tcp_row = [](const std::string& local,
+                            const std::string& state,
+                            const std::string& inode,
+                            unsigned slot) {
+        return " " + std::to_string(slot) + ": " + local + " 00000000:0000 " + state +
+               " 00000000:00000000 00:00000000 00000000 1000 0 " + inode +
+               " 1 0000000000000000 100 0 0 10 0\n";
+    };
+    const auto exact_listener = [&](const std::string& contents) {
+        fixture_privileged_listener::ProcTcpTable table;
+        fixture_privileged_listener::Diagnostic parser;
+        fixture_privileged_listener::ListenerEvidence listener;
+        return fixture_privileged_listener::parse_proc_net_tcp(contents, table, parser) &&
+               strict_exact_nginx_listener(
+                   table, 0x0a010203u, 0x0a010204u, {301u}, listener, parser) &&
+               listener.child_owned_inode == 301u;
+    };
+    const std::string valid_tcp = tcp_header + tcp_row("0302010A:A381", "0A", "301", 0u) +
+                                  tcp_row("00000000:A380", "07", "999", 1u);
+    if (!exact_listener(valid_tcp)) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid strict nginx TCP seed failed"};
+        return false;
+    }
+    for (const std::string& rejected :
+         std::array<std::string, 3>{tcp_header + tcp_row("0302010A:A381", "07", "301", 0u),
+                                    valid_tcp + tcp_row("00000000:A381", "0A", "302", 2u),
+                                    valid_tcp + tcp_row("0402010A:A381", "0A", "303", 2u)}) {
+        if (exact_listener(rejected)) return false;
+        ++mutation_rejections;
+    }
+    fixture_privileged_listener::ProcTcpTable malformed_table;
+    fixture_privileged_listener::Diagnostic malformed_diagnostic;
+    if (fixture_privileged_listener::parse_proc_net_tcp(
+            tcp_header + " 0: 0302010A:A381 00000000:0000 0A\n",
+            malformed_table,
+            malformed_diagnostic))
+        return false;
+    ++mutation_rejections;
+
+    const std::string tcp6_header =
+        "  sl  local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid "
+        "timeout inode\n";
+    const auto tcp6_row = [](const char* port, const char* state, const char* inode) {
+        return std::string(" 0: 00000000000000000000000000000000:") + port +
+               " 00000000000000000000000000000000:0000 " + state +
+               " 00000000:00000000 00:00000000 00000000 1000 0 " + inode +
+               " 1 0000000000000000 100 0 0 10 0\n";
+    };
+    const std::string absent = tcp6_header + tcp6_row("A380", "0A", "401");
+    const std::string present = absent + tcp6_row("A381", "07", "402");
+    const std::string malformed_tcp6 = tcp6_header + tcp6_row("A380", "0A", "not-an-inode");
+    const std::string truncated_tcp6 = tcp6_header +
+                                       " 0: 00000000000000000000000000000000:A380 "
+                                       "00000000000000000000000000000000:0000 0A\n";
     if (!strict_tcp6_port_absent(absent, kExactInputTopologyBuilderPort) ||
-        strict_tcp6_port_absent(present, kExactInputTopologyBuilderPort)) {
+        strict_tcp6_port_absent(present, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(malformed_tcp6, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(truncated_tcp6, kExactInputTopologyBuilderPort)) {
         diagnostic = {
             ExactInputMountPhase::Lifecycle, 0, "strict nginx TCP6 parser self-check failed"};
         return false;
     }
-    mutation_rejections += 2u;
+    mutation_rejections += 3u;
+    if (!nginx_auto_remove_disabled("false") || nginx_auto_remove_disabled("true") ||
+        nginx_auto_remove_disabled("False") || nginx_auto_remove_disabled("false "))
+        return false;
+    mutation_rejections += 3u;
+    CommandResult generic_timeout;
+    generic_timeout.timed_out = true;
+    if (!command_outcome_uncertain(generic_timeout) || command_outcome_uncertain(CommandResult{}))
+        return false;
+    ++mutation_rejections;
     const std::int64_t final = 30000000000LL;
     if (!(final - 15000000000LL < final - 12000000000LL &&
           final - 12000000000LL < final - 8000000000LL &&
@@ -6765,7 +7044,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         return false;
     }
     ++mutation_rejections;
-    return mutation_rejections == 18u;
+    return mutation_rejections == 33u;
 }
 
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,
@@ -7937,9 +8216,9 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     owner->receipt.graph_mutated = true;
     current.created = true;
     current.container_id = created.id;
-    if (create_reported_timeout)
+    if (command_outcome_uncertain(create))
         return freeze_failure(ExactInputNginxLifecycleOutcome::CreateFailed,
-                              "nginx create actual-success/reported-timeout operation failure",
+                              "nginx create outcome was uncertain after timeout",
                               ETIMEDOUT);
     if (owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectPostCreateIdentity)
         return freeze_failure(ExactInputNginxLifecycleOutcome::IdentityFailed,
@@ -7960,9 +8239,9 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
                               "nginx sibling start failed: " + trim(start.output));
     owner->nginx_sibling.running = true;
     current.started = true;
-    if (start_reported_timeout)
+    if (command_outcome_uncertain(start))
         return freeze_failure(ExactInputNginxLifecycleOutcome::StartFailed,
-                              "nginx start actual-success/reported-timeout operation failure",
+                              "nginx start outcome was uncertain after timeout",
                               ETIMEDOUT);
 
     bool sample_a_ok = false;
@@ -7990,7 +8269,7 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     current.sibling_mount_independently_verified = true;
 
     command_deadline.set(sample_b_deadline);
-    const std::int64_t earliest_b = current.sample_a.monotonic_nanoseconds + 250000000LL;
+    const std::int64_t earliest_b = current.sample_a.bracket_end_nanoseconds + 250000000LL;
     while (exact_read_monotonic_ns() < earliest_b && remaining_command_ms(sample_b_deadline) > 0)
         (void)poll(nullptr, 0, 10);
     if (!capture_nginx_sample(*owner, current.sample_b, sample_b_deadline, false, error) ||
@@ -8000,7 +8279,7 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     if (owner->options.failure_point == ExactInputMountFailurePoint::NginxDriftSampleB)
         ++current.sample_b.worker_start;
     current.samples_at_least_250ms_apart =
-        current.sample_b.monotonic_nanoseconds - current.sample_a.monotonic_nanoseconds >=
+        current.sample_b.bracket_start_nanoseconds - current.sample_a.bracket_end_nanoseconds >=
         250000000LL;
     const bool stable = current.samples_at_least_250ms_apart &&
                         nginx_samples_stable(current.sample_a, current.sample_b);
