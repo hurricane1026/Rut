@@ -1,5 +1,8 @@
 #include "fixture_ipv4_topology.h"
 
+#include "fixture_exact_input_file_lease.h"
+#include "fixture_exact_input_mount_owner.h"
+#include "fixture_private_directory_lease.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -11,11 +14,14 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/random.h>
@@ -1321,6 +1327,12 @@ enum class CleanupProgress : std::uint8_t {
 struct CleanupPhaseResult {
     bool settled = false;
     bool operation_ok = false;
+    bool holder_settled = false;
+    bool holder_removed = false;
+    bool network_b_settled = false;
+    bool network_b_removed = false;
+    bool network_a_settled = false;
+    bool network_a_removed = false;
 };
 
 struct CleanupEvidence {
@@ -1334,6 +1346,25 @@ struct CleanupEvidence {
     bool cleanup_reported_timeout_observed = false;
     bool sidecar_creation_may_have_mutated = false;
 };
+
+struct SetupEventEvidence {
+    u32 network_a_create_count = 0;
+    u32 network_a_verify_count = 0;
+    u32 network_b_create_count = 0;
+    u32 network_b_verify_count = 0;
+    u32 both_ipam_verify_count = 0;
+    u32 holder_create_count = 0;
+    u32 holder_attach_a_verify_count = 0;
+    u32 holder_attach_b_count = 0;
+};
+
+enum class TopologySettlementEvent : std::uint8_t {
+    Holder,
+    NetworkB,
+    NetworkA,
+};
+
+using TopologySettlementCallback = bool (*)(void*, TopologySettlementEvent, bool, std::string&);
 
 static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvidence& right) {
     return left.progress == right.progress && left.sidecar_exists == right.sidecar_exists &&
@@ -1392,6 +1423,7 @@ public:
                 cleanup_reported_timeout_observed_,
                 sidecar_creation_may_have_mutated_};
     }
+    const SetupEventEvidence& setup_event_evidence() const { return setup_event_evidence_; }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
         if (!valid_subnet_plan(plan)) return false;
@@ -1406,10 +1438,12 @@ public:
         if (!create_network(network_a_, point, error)) return false;
         if (point == FailurePoint::AfterNetworkACreated) return injected(error);
         if (!verify_network(network_a_, error)) return false;
+        ++setup_event_evidence_.network_a_verify_count;
         if (point == FailurePoint::AfterNetworkAVerified) return injected(error);
         if (!create_network(network_b_, point, error)) return false;
         if (point == FailurePoint::AfterNetworkBCreated) return injected(error);
         if (!verify_network(network_b_, error)) return false;
+        ++setup_event_evidence_.network_b_verify_count;
         if (point == FailurePoint::AfterNetworkBVerified) return injected(error);
         u32 low_a = 0, high_a = 0, low_b = 0, high_b = 0;
         if (!parse_cidr(network_a_.subnet, low_a, high_a) ||
@@ -1420,6 +1454,7 @@ public:
             error = "Docker-managed IPAM was overlapping or did not provide valid addresses";
             return false;
         }
+        ++setup_event_evidence_.both_ipam_verify_count;
         if (point == FailurePoint::AfterBothIpamVerified) return injected(error);
         return true;
     }
@@ -1462,11 +1497,17 @@ public:
             error = "holder was created but exact ID/PID discovery failed";
             return false;
         }
+        ++setup_event_evidence_.holder_create_count;
         if (point == FailurePoint::AfterHolderCreated) return injected(error);
         return true;
     }
 
     bool attach_holder(FailurePoint point, std::string& error) {
+        if (!verify_membership(network_a_, error)) {
+            error = "holder attachment to bridge A was not exact: " + error;
+            return false;
+        }
+        ++setup_event_evidence_.holder_attach_a_verify_count;
         if (point == FailurePoint::AfterHolderAttachedA) return injected(error);
         CommandResult result;
         if (!run_command(
@@ -1476,6 +1517,7 @@ public:
             error = "holder attachment to bridge B failed: " + trim(result.output);
             return false;
         }
+        ++setup_event_evidence_.holder_attach_b_count;
         if (point == FailurePoint::AfterHolderAttachedB) return injected(error);
         return true;
     }
@@ -1698,38 +1740,112 @@ public:
     }
 
     bool create_sidecar(HeldNamespaceSidecarFailurePoint point, std::string& error) {
+        return create_sidecar_impl(point, {}, nullptr, error);
+    }
+
+    bool create_exact_input_mount_sidecar(const std::string& source,
+                                          const fixture_exact_input_file_lease::Identity& identity,
+                                          std::vector<std::string>& argv_evidence,
+                                          HeldNamespaceSidecarFailurePoint point,
+                                          std::string& error) {
+        const std::string destination = kExactInputMountDestination;
+        const auto forbidden = [](const std::string& value) {
+            return value.empty() || value.find_first_of(",|#;\n\r\t ") != std::string::npos;
+        };
+        char canonical[PATH_MAX]{};
+        if (forbidden(source) || forbidden(destination) || source[0] != '/' ||
+            destination[0] != '/' || realpath(source.c_str(), canonical) == nullptr ||
+            source != canonical || identity.inode == 0u || identity.device == 0u) {
+            error = "exact input mount source/destination was not canonical and delimiter-safe";
+            return false;
+        }
+        const std::string user = std::to_string(identity.uid) + ":" + std::to_string(identity.gid);
+        const std::string mount = "type=bind,src=" + source + ",dst=" + destination +
+                                  ",readonly,bind-propagation=rprivate";
+        return create_sidecar_impl(
+            point, {"--user", user, "--mount", mount}, &argv_evidence, error);
+    }
+
+    bool disconnect_network_b_for_mount_test(std::string& error) {
+        if (!sidecar_exists_ || cleanup_progress_ != CleanupProgress::Active ||
+            !verify_network(network_b_, error) || !validate_holder(error)) {
+            if (error.empty()) error = "test disconnect lacked exact holder/network authority";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command({"docker", "network", "disconnect", network_b_.id, holder_id_}, result) ||
+            !exited_zero(result)) {
+            error = "test disconnect of exact network B failed: " + trim(result.output);
+            return false;
+        }
+        network_b_test_disconnected_ = true;
+        return true;
+    }
+
+    bool restore_network_b_for_mount_test(std::string& error) {
+        if (!network_b_test_disconnected_) return true;
+        if (cleanup_progress_ != CleanupProgress::SidecarSettled || sidecar_exists_ ||
+            sidecar_creation_may_have_mutated_ || !validate_holder(error) ||
+            !verify_network(network_b_, error)) {
+            if (error.empty())
+                error = "test reconnect lacked exact sidecar absence/holder/network authority";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command(
+                {"docker", "network", "connect", "--ip", guard_ip_, network_b_.id, holder_id_},
+                result) ||
+            !exited_zero(result)) {
+            error = "test reconnect of exact network B failed: " + trim(result.output);
+            return false;
+        }
+        network_b_test_disconnected_ = false;
+        if (!verify_topology(FailurePoint::None, error)) {
+            error = "test reconnect did not restore exact topology: " + error;
+            return false;
+        }
+        return true;
+    }
+
+private:
+    bool create_sidecar_impl(HeldNamespaceSidecarFailurePoint point,
+                             const std::vector<std::string>& extra_arguments,
+                             std::vector<std::string>* argv_evidence,
+                             std::string& error) {
         CommandResult result;
         const bool reported_timeout =
             point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeout ||
             point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable;
         if (point == HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable)
             uncertain_sidecar_inspection_failure_ = true;
-        const std::vector<std::string> create_arguments = {
-            "docker",
-            "run",
-            "--pull=never",
-            "--detach",
-            "--name",
-            sidecar_name_,
-            "--network",
-            "container:" + holder_id_,
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--read-only",
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=1m",
-            "--entrypoint",
-            "/bin/sleep",
-            "--label",
-            std::string("rut.stage=") + kSidecarStage,
-            "--label",
-            "rut.token=" + token_,
-            "--label",
-            std::string("rut.role=") + kSidecarRole,
-            RUT_PINNED_NGINX_IMAGE,
-            "infinity"};
+        std::vector<std::string> create_arguments = {"docker",
+                                                     "run",
+                                                     "--pull=never",
+                                                     "--detach",
+                                                     "--name",
+                                                     sidecar_name_,
+                                                     "--network",
+                                                     "container:" + holder_id_,
+                                                     "--cap-drop",
+                                                     "ALL",
+                                                     "--security-opt",
+                                                     "no-new-privileges",
+                                                     "--read-only",
+                                                     "--tmpfs",
+                                                     "/tmp:rw,noexec,nosuid,size=1m",
+                                                     "--entrypoint",
+                                                     "/bin/sleep",
+                                                     "--label",
+                                                     std::string("rut.stage=") + kSidecarStage,
+                                                     "--label",
+                                                     "rut.token=" + token_,
+                                                     "--label",
+                                                     std::string("rut.role=") + kSidecarRole,
+                                                     RUT_PINNED_NGINX_IMAGE,
+                                                     "infinity"};
+        create_arguments.insert(
+            create_arguments.end() - 2, extra_arguments.begin(), extra_arguments.end());
+        if (argv_evidence != nullptr) *argv_evidence = create_arguments;
         // From this boundary onward Docker may have accepted the unique-name
         // create even when command/recovery evidence is incomplete.
         sidecar_creation_may_have_mutated_ = true;
@@ -1781,6 +1897,18 @@ public:
         return true;
     }
 
+public:
+    bool revalidate_sidecar_identity(std::string& error) {
+        HeldNamespaceSidecarSnapshot current;
+        if (!inspect_sidecar(sidecar_id_, current, error) ||
+            !validate_held_namespace_sidecar_snapshot(topology_snapshot(), current, error) ||
+            !sidecar_snapshot_equal(current, sidecar_snapshot_)) {
+            if (error.empty()) error = "sidecar immutable identity/security changed";
+            return false;
+        }
+        return true;
+    }
+
     bool terminate_sidecar_unexpectedly(std::string& error) {
         if (!sidecar_exists_ || sidecar_id_.empty()) {
             error = "cannot inject unexpected sidecar death without exact identity";
@@ -1829,6 +1957,35 @@ public:
         return true;
     }
 
+    bool disappear_holder_before_cleanup(std::string& error) {
+        if (cleanup_progress_ != CleanupProgress::SidecarSettled || sidecar_exists_ ||
+            sidecar_creation_may_have_mutated_ || !holder_exists_ || holder_id_.empty() ||
+            !validate_holder(error)) {
+            if (error.empty())
+                error = "cannot inject holder disappearance without settled sidecar/exact identity";
+            return false;
+        }
+        CommandResult result;
+        if (!run_command({"docker", "rm", "-f", holder_id_}, result) || !exited_zero(result)) {
+            error = "holder disappearance injection failed: " + trim(result.output);
+            return false;
+        }
+        if (!run_command({"docker", "inspect", holder_id_}, result) || exited_zero(result)) {
+            error = "holder disappearance lacked exact ID absence proof";
+            return false;
+        }
+        if (!run_command(
+                {"docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + holder_name_ + "$"},
+                result) ||
+            !exited_zero(result) || !trim(result.output).empty()) {
+            error = "holder disappearance lacked exact name absence proof";
+            return false;
+        }
+        holder_exists_ = false;
+        holder_disappearance_operation_failure_ = true;
+        return true;
+    }
+
     CleanupPhaseResult cleanup_sidecar_phase(std::string& error) {
         if (cleanup_progress_ >= CleanupProgress::SidecarSettled) return {true, true};
 
@@ -1863,8 +2020,11 @@ public:
         return {true, operation_ok};
     }
 
-    CleanupPhaseResult cleanup_topology_phase(std::string& error) {
-        if (cleanup_progress_ == CleanupProgress::TopologySettled) return {true, true};
+    CleanupPhaseResult cleanup_topology_phase(std::string& error,
+                                              TopologySettlementCallback callback = nullptr,
+                                              void* callback_context = nullptr) {
+        if (cleanup_progress_ == CleanupProgress::TopologySettled)
+            return {true, topology_settlement_operation_ok_, true, false, true, false, true, false};
         if (cleanup_progress_ < CleanupProgress::SidecarSettled || sidecar_exists_ ||
             sidecar_creation_may_have_mutated_) {
             if (!error.empty()) error += "; ";
@@ -1872,7 +2032,18 @@ public:
             return {false, false};
         }
 
-        bool operation_ok = true;
+        CleanupPhaseResult phase_result;
+        bool operation_ok = !holder_disappearance_operation_failure_;
+        const auto notify = [&](TopologySettlementEvent event, bool removed) {
+            if (callback == nullptr) return true;
+            if (callback(callback_context, event, removed, error)) return true;
+            phase_result.operation_ok = operation_ok;
+            return false;
+        };
+        if (holder_disappearance_operation_failure_) {
+            if (!error.empty()) error += "; ";
+            error += "holder disappeared before identity-safe cleanup";
+        }
         if (holder_exists_) {
             if (!validate_holder(error))
                 operation_ok = false;
@@ -1884,9 +2055,14 @@ public:
                     operation_ok = false;
                 } else {
                     holder_exists_ = false;
+                    phase_result.holder_removed = true;
                 }
             }
         }
+        phase_result.holder_settled = !holder_exists_;
+        if (phase_result.holder_settled &&
+            !notify(TopologySettlementEvent::Holder, phase_result.holder_removed))
+            return phase_result;
         if (network_b_.exists) {
             if (network_b_.id.empty()) {
                 if (!timeout_recovery_ || !discover_network(network_b_)) {
@@ -1898,7 +2074,13 @@ public:
                 operation_ok = false;
             else if (!remove_network(network_b_, error))
                 operation_ok = false;
+            else
+                phase_result.network_b_removed = true;
         }
+        phase_result.network_b_settled = !network_b_.exists;
+        if (phase_result.network_b_settled &&
+            !notify(TopologySettlementEvent::NetworkB, phase_result.network_b_removed))
+            return phase_result;
         if (network_a_.exists) {
             if (network_a_.id.empty()) {
                 if (!timeout_recovery_ || !discover_network(network_a_)) {
@@ -1910,11 +2092,19 @@ public:
                 operation_ok = false;
             else if (!remove_network(network_a_, error))
                 operation_ok = false;
+            else
+                phase_result.network_a_removed = true;
         }
+        phase_result.network_a_settled = !network_a_.exists;
+        if (phase_result.network_a_settled &&
+            !notify(TopologySettlementEvent::NetworkA, phase_result.network_a_removed))
+            return phase_result;
         topology_settlement_operation_ok_ = topology_settlement_operation_ok_ && operation_ok;
         const bool settled = !holder_exists_ && !network_b_.exists && !network_a_.exists;
         if (settled) cleanup_progress_ = CleanupProgress::TopologySettled;
-        return {settled, operation_ok};
+        phase_result.settled = settled;
+        phase_result.operation_ok = operation_ok;
+        return phase_result;
     }
 
     bool cleanup(std::string& error) {
@@ -2260,6 +2450,10 @@ private:
             error = "network creation returned no exact ID";
             return false;
         }
+        if (&network == &network_a_)
+            ++setup_event_evidence_.network_a_create_count;
+        else if (&network == &network_b_)
+            ++setup_event_evidence_.network_b_create_count;
         if (point == FailurePoint::AfterNetworkACreated && &network == &network_a_) {
             return injected(error);
         }
@@ -2436,6 +2630,9 @@ private:
     bool cleanup_reported_timeout_ = false;
     bool cleanup_reported_timeout_observed_ = false;
     bool unexpected_sidecar_death_verified_ = false;
+    bool holder_disappearance_operation_failure_ = false;
+    SetupEventEvidence setup_event_evidence_;
+    bool network_b_test_disconnected_ = false;
     CleanupProgress cleanup_progress_ = CleanupProgress::Active;
     bool sidecar_settlement_operation_ok_ = true;
     bool topology_settlement_operation_ok_ = true;
@@ -2522,7 +2719,1258 @@ static bool preflight(Fixture& fixture, std::string& error) {
 #endif
 }
 
+struct ParsedMount {
+    std::string type;
+    std::string source;
+    std::string destination;
+    std::string mode;
+    std::string propagation;
+    bool read_only = false;
+};
+
+struct ParsedMountInspect {
+    std::string id;
+    std::string name;
+    std::string user;
+    std::string network_mode;
+    std::vector<ParsedMount> requested;
+    std::vector<ParsedMount> realized;
+};
+
+static bool decimal_size(const std::string& text, size_t& value) {
+    if (text.empty() || (text.size() > 1 && text[0] == '0') ||
+        !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = strtoull(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' ||
+        parsed > std::numeric_limits<size_t>::max())
+        return false;
+    value = static_cast<size_t>(parsed);
+    return true;
+}
+
+static bool split_mount_list(const std::string& text,
+                             bool requested,
+                             std::vector<ParsedMount>& mounts,
+                             std::string& error) {
+    mounts.clear();
+    if (text.empty()) return true;
+    size_t begin = 0;
+    while (begin < text.size()) {
+        const size_t end = text.find(';', begin);
+        if (end == std::string::npos || end == begin) {
+            error = "mount inspection list lacked exact record terminator";
+            return false;
+        }
+        std::vector<std::string> fields;
+        if (!split_exact(text.substr(begin, end - begin), '|', requested ? 5u : 6u, fields)) {
+            error = "mount inspection record field count was not exact";
+            return false;
+        }
+        bool boolean = false;
+        const size_t bool_index = requested ? 3u : 4u;
+        if (!parse_exact_bool(fields[bool_index], boolean)) {
+            error = "mount inspection read-only field was malformed";
+            return false;
+        }
+        ParsedMount mount;
+        mount.type = fields[0];
+        mount.source = fields[1];
+        mount.destination = fields[2];
+        mount.mode = requested ? std::string{} : fields[3];
+        mount.read_only = requested ? boolean : !boolean;
+        mount.propagation = fields[requested ? 4u : 5u];
+        mounts.push_back(std::move(mount));
+        begin = end + 1;
+    }
+    return true;
+}
+
+static bool path_shadows(const std::string& candidate, const std::string& target) {
+    if (candidate == target) return true;
+    if (candidate == "/") return true;
+    const auto ancestor = [](const std::string& left, const std::string& right) {
+        return left.size() < right.size() && right.compare(0, left.size(), left) == 0 &&
+               left.back() != '/' && right[left.size()] == '/';
+    };
+    return ancestor(candidate, target) || ancestor(target, candidate);
+}
+
+static bool canonical_absolute_mount_destination(const std::string& path) {
+    if (path.empty() || path[0] != '/' || (path.size() > 1u && path.back() == '/')) return false;
+    size_t begin = 1u;
+    while (begin < path.size()) {
+        const size_t end = path.find('/', begin);
+        const size_t length = (end == std::string::npos ? path.size() : end) - begin;
+        if (length == 0u || (length == 1u && path[begin] == '.') ||
+            (length == 2u && path[begin] == '.' && path[begin + 1u] == '.'))
+            return false;
+        if (end == std::string::npos) break;
+        begin = end + 1u;
+    }
+    return true;
+}
+
+static bool validate_mount_inspect_record(const std::string& record,
+                                          const std::string& expected_id,
+                                          const std::string& expected_name,
+                                          const std::string& expected_user,
+                                          const std::string& expected_network_mode,
+                                          const std::string& expected_source,
+                                          ParsedMountInspect& parsed,
+                                          std::string& error) {
+    const size_t first = record.find('#');
+    const size_t second = first == std::string::npos ? first : record.find('#', first + 1);
+    if (first == std::string::npos || second == std::string::npos ||
+        record.find('#', second + 1) != std::string::npos) {
+        error = "mount inspect envelope was malformed";
+        return false;
+    }
+    std::vector<std::string> prefix;
+    if (!split_exact(record.substr(0, first), '|', 5, prefix)) {
+        error = "mount inspect identity prefix was malformed";
+        return false;
+    }
+    size_t requested_count = 0;
+    if (!decimal_size(prefix[4], requested_count) || requested_count != 1u) {
+        error = "HostConfig requested mount cardinality was not exactly one";
+        return false;
+    }
+    parsed = {};
+    parsed.id = prefix[0];
+    parsed.name = prefix[1].size() > 1 && prefix[1][0] == '/' ? prefix[1].substr(1) : prefix[1];
+    parsed.user = prefix[2];
+    parsed.network_mode = prefix[3];
+    if (parsed.id != expected_id || parsed.name != expected_name || parsed.user != expected_user ||
+        parsed.network_mode != expected_network_mode) {
+        error = "mount inspect container identity/user/network mode changed";
+        return false;
+    }
+    if (!split_mount_list(
+            record.substr(first + 1, second - first - 1), true, parsed.requested, error) ||
+        !split_mount_list(record.substr(second + 1), false, parsed.realized, error) ||
+        parsed.requested.size() != requested_count) {
+        if (error.empty()) error = "requested mount record cardinality differed from typed count";
+        return false;
+    }
+    const ParsedMount& requested = parsed.requested.front();
+    if (requested.type != "bind" || requested.source != expected_source ||
+        requested.destination != kExactInputMountDestination || !requested.read_only ||
+        requested.propagation != "rprivate") {
+        error = "requested HostConfig bind mount semantics were not exact";
+        return false;
+    }
+    size_t exact_target_count = 0;
+    for (const ParsedMount& mount : parsed.realized) {
+        if (!canonical_absolute_mount_destination(mount.destination)) {
+            error = "realized mount destination was not canonical and absolute";
+            return false;
+        }
+        if (mount.destination == kExactInputMountDestination) {
+            ++exact_target_count;
+            if (mount.type != "bind" || mount.source != expected_source || mount.mode != "" ||
+                !mount.read_only || mount.propagation != "rprivate") {
+                error = "realized exact-target bind mount semantics were not exact";
+                return false;
+            }
+        } else if (path_shadows(mount.destination, kExactInputMountDestination)) {
+            error = "realized mount shadowed the exact nginx.conf target";
+            return false;
+        }
+    }
+    if (exact_target_count != 1u) {
+        error = "realized exact nginx.conf target cardinality was not one";
+        return false;
+    }
+    return true;
+}
+
+static std::string mount_record(const std::string& id,
+                                const std::string& name,
+                                const std::string& user,
+                                const std::string& network,
+                                const std::string& source,
+                                const std::string& realized_extra = {}) {
+    return id + "|/" + name + "|" + user + "|" + network + "|1#bind|" + source + "|" +
+           kExactInputMountDestination + "|true|rprivate;#bind|" + source + "|" +
+           kExactInputMountDestination + "||false|rprivate;" + realized_extra;
+}
+
+static bool mount_parser_self_checks(std::uint32_t& rejections, std::string& error) {
+    const std::string id(64, 'a');
+    const std::string name = "rut358-sidecar-test";
+    const std::string user = "1000:1000";
+    const std::string network = "container:" + std::string(64, 'b');
+    const std::string source = "/tmp/rut358-test/nginx.conf";
+    ParsedMountInspect parsed;
+    const std::string valid =
+        mount_record(id, name, user, network, source, "volume|cache|/var/cache/nginx|z|true|;");
+    if (!validate_mount_inspect_record(valid, id, name, user, network, source, parsed, error) ||
+        parsed.realized.size() != 2u) {
+        error = "valid mount parser/unrelated-image-mount evidence was rejected: " + error;
+        return false;
+    }
+    std::vector<std::string> mutations;
+    const auto replace_once = [&](const std::string& from, const std::string& to) {
+        std::string changed = valid;
+        const size_t at = changed.find(from);
+        if (at == std::string::npos) return std::string{};
+        changed.replace(at, from.size(), to);
+        return changed;
+    };
+    mutations.push_back(replace_once(id, std::string(64, 'c')));
+    mutations.push_back(replace_once("/" + name, "/wrong"));
+    mutations.push_back(replace_once(user, "0:0"));
+    mutations.push_back(replace_once(network, "bridge"));
+    mutations.push_back(replace_once("|1#", "|2#"));
+    mutations.push_back(replace_once("#bind|", "#volume|"));
+    mutations.push_back(replace_once("#bind|" + source, "#bind|/tmp/wrong"));
+    mutations.push_back(
+        replace_once("|" + std::string(kExactInputMountDestination) + "|true|rprivate;#",
+                     "|/etc/nginx/wrong|true|rprivate;#"));
+    mutations.push_back(replace_once("|true|rprivate;#", "|false|rprivate;#"));
+    mutations.push_back(replace_once("|true|rprivate;#", "|true|shared;#"));
+    mutations.push_back(replace_once(
+        "|1#bind|",
+        "|2#bind|" + source + "|" + kExactInputMountDestination + "|true|rprivate;bind|"));
+    const size_t realized = valid.find("#bind|", valid.find('#') + 1);
+    if (realized == std::string::npos) {
+        error = "valid mount mutation seed lacked realized record";
+        return false;
+    }
+    const auto mutate_realized = [&](const std::string& from, const std::string& to) {
+        std::string changed = valid;
+        const size_t at = changed.find(from, realized);
+        if (at == std::string::npos) return std::string{};
+        changed.replace(at, from.size(), to);
+        return changed;
+    };
+    mutations.push_back(mutate_realized("bind|", "volume|"));
+    mutations.push_back(mutate_realized(source, "/tmp/wrong"));
+    mutations.push_back(mutate_realized(kExactInputMountDestination, "/etc/nginx/wrong"));
+    mutations.push_back(mutate_realized("||false|", "|ro|false|"));
+    mutations.push_back(mutate_realized("|false|rprivate;", "|true|rprivate;"));
+    mutations.push_back(mutate_realized("|rprivate;", "|shared;"));
+    mutations.push_back(valid + "bind|other|/etc/nginx|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx/nginx.conf/child|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx//nginx.conf|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx/./|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx/../nginx|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx/nginx.conf/../other|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|other|/etc/nginx/|ro|false|rprivate;");
+    mutations.push_back(valid + "bind|" + source + "|" + kExactInputMountDestination +
+                        "||false|rprivate;");
+    mutations.push_back(valid.substr(0, valid.size() - 1));
+    mutations.push_back("malformed");
+    rejections = 0;
+    for (const std::string& mutation : mutations) {
+        ParsedMountInspect ignored;
+        std::string rejected;
+        if (mutation.empty() || validate_mount_inspect_record(
+                                    mutation, id, name, user, network, source, ignored, rejected)) {
+            error = "mount parser field/duplicate/shadow mutation was accepted";
+            return false;
+        }
+        ++rejections;
+    }
+    return true;
+}
+
+static bool docker_user_namespace_preflight(std::string& error) {
+    CommandResult result;
+    if (!run_command({"docker", "info", "-f", "{{json .SecurityOptions}}"}, result) ||
+        !exited_zero(result)) {
+        error = "Docker security-mode preflight failed: " + trim(result.output);
+        return false;
+    }
+    const std::string security = trim(result.output);
+    JsonValue parsed;
+    if (!parse_json(security, parsed) || !string_array(parsed, false)) {
+        error = "Docker security-mode preflight was malformed";
+        return false;
+    }
+    if (security.find("rootless") != std::string::npos ||
+        security.find("userns") != std::string::npos) {
+        error = "rootless or userns-remapped Docker is unsupported for exact credential proof";
+        return false;
+    }
+    return true;
+}
+
+static bool proc_credentials_exact(pid_t pid, std::uint64_t uid, std::uint64_t gid) {
+    std::string status;
+    if (!read_file("/proc/" + std::to_string(pid) + "/status", status)) return false;
+    std::istringstream lines(status);
+    std::string line;
+    bool uid_ok = false;
+    bool gid_ok = false;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string label;
+        unsigned long long a = 0, b = 0, c = 0, d = 0;
+        if (!(fields >> label >> a >> b >> c >> d)) continue;
+        if (label == "Uid:") uid_ok = a == uid && b == uid && c == uid && d == uid;
+        if (label == "Gid:") gid_ok = a == gid && b == gid && c == gid && d == gid;
+    }
+    return uid_ok && gid_ok;
+}
+
+static bool bracketed_proc_credentials_exact(Fixture& fixture,
+                                             std::uint64_t uid,
+                                             std::uint64_t gid,
+                                             bool inject_boundary_death,
+                                             std::string& error) {
+    if (!fixture.revalidate_sidecar_identity(error)) {
+        error = "pre-read exact sidecar identity proof failed: " + error;
+        return false;
+    }
+    const HeldNamespaceSidecarSnapshot before = fixture.sidecar_snapshot();
+    const bool credentials_ok = proc_credentials_exact(before.pid, uid, gid);
+    if (inject_boundary_death) {
+        std::string death_error;
+        if (!fixture.terminate_sidecar_unexpectedly(death_error)) {
+            error = "credential-boundary death injection failed: " + death_error;
+            return false;
+        }
+    }
+    if (!fixture.revalidate_sidecar_identity(error)) {
+        error = "post-read exact sidecar identity proof failed: " + error;
+        return false;
+    }
+    const HeldNamespaceSidecarSnapshot after = fixture.sidecar_snapshot();
+    if (!sidecar_snapshot_equal(before, after)) {
+        error = "sidecar identity changed across /proc credential observation";
+        return false;
+    }
+    if (!credentials_ok) {
+        error = "actual sidecar /proc credentials did not equal exact file UID:GID";
+        return false;
+    }
+    return true;
+}
+
+static bool exact_input_mount_argv(const std::vector<std::string>& argv,
+                                   const std::string& source,
+                                   const fixture_exact_input_file_lease::Identity& identity) {
+    const std::string user = std::to_string(identity.uid) + ":" + std::to_string(identity.gid);
+    const std::string mount = "type=bind,src=" + source + ",dst=" + kExactInputMountDestination +
+                              ",readonly,bind-propagation=rprivate";
+    const auto exact_pair = [&](const std::string& option, const std::string& value) {
+        size_t count = 0;
+        for (size_t index = 0; index + 1 < argv.size(); ++index)
+            if (argv[index] == option && argv[index + 1] == value) ++count;
+        return count == 1u;
+    };
+    return argv.size() >= 4u && argv[0] == "docker" && argv[1] == "run" &&
+           argv[argv.size() - 2] == RUT_PINNED_NGINX_IMAGE && argv.back() == "infinity" &&
+           exact_pair("--user", user) && exact_pair("--mount", mount) &&
+           std::count(argv.begin(), argv.end(), "--user") == 1 &&
+           std::count(argv.begin(), argv.end(), "--mount") == 1 &&
+           std::find(argv.begin(), argv.end(), "-v") == argv.end() &&
+           std::find(argv.begin(), argv.end(), "--volume") == argv.end();
+}
+
+static bool inspect_exact_mount(Fixture& fixture,
+                                const std::string& source,
+                                const fixture_exact_input_file_lease::Identity& identity,
+                                ParsedMountInspect& parsed,
+                                std::string& error) {
+    CommandResult result;
+    const std::string format =
+        "{{.Id}}|{{.Name}}|{{.Config.User}}|{{.HostConfig.NetworkMode}}|{{len "
+        ".HostConfig.Mounts}}#{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|"
+        "{{.ReadOnly}}|{{.BindOptions.Propagation}};{{end}}#{{range .Mounts}}{{.Type}}|"
+        "{{.Source}}|{{.Destination}}|{{.Mode}}|{{.RW}}|{{.Propagation}};{{end}}";
+    if (!run_command({"docker", "inspect", "-f", format, fixture.sidecar_snapshot().id}, result) ||
+        !exited_zero(result)) {
+        error = "exact input mount inspection command failed: " + trim(result.output);
+        return false;
+    }
+    const std::string user = std::to_string(identity.uid) + ":" + std::to_string(identity.gid);
+    return validate_mount_inspect_record(trim(result.output),
+                                         fixture.sidecar_snapshot().id,
+                                         fixture.sidecar_name(),
+                                         user,
+                                         "container:" + fixture.holder_id(),
+                                         source,
+                                         parsed,
+                                         error);
+}
+
+struct ExactInputMountOwner {
+    explicit ExactInputMountOwner(std::string token_value, std::string bytes_value)
+        : bytes(std::move(bytes_value)), fixture(std::move(token_value)) {
+        receipt.manifest_not_applicable = true;
+    }
+
+    ~ExactInputMountOwner() {
+        if (mutated && !settled) {
+            dprintf(STDERR_FILENO,
+                    "fatal exact-input mount owner destruction before settlement: phase=%u "
+                    "error=%s\n",
+                    static_cast<unsigned>(receipt.diagnostic.phase),
+                    receipt.diagnostic.message.c_str());
+            abort();
+        }
+    }
+
+    std::string bytes;
+    Fixture fixture;
+    fixture_private_directory_lease::PrivateDirectoryLease directory;
+    fixture_exact_input_file_lease::ExactInputFileLease input;
+    ExactInputMountOptions options;
+    ExactInputMountState state = ExactInputMountState::Empty;
+    ExactInputMountSnapshot snapshot;
+    ExactInputMountRecoveryReceipt receipt;
+    std::vector<std::string> sidecar_argv;
+    bool mutated = false;
+    bool settled = false;
+    bool topology_complete = false;
+    bool disconnect_injected = false;
+    bool restore_consumed = false;
+    bool sidecar_fault_consumed = false;
+    bool sidecar_disappearance_consumed = false;
+    bool holder_disappearance_consumed = false;
+    bool topology_settlement_fault_consumed = false;
+    bool operation_failed = false;
+};
+
+static void sync_setup_event_evidence(ExactInputMountOwner& owner) {
+    const SetupEventEvidence& evidence = owner.fixture.setup_event_evidence();
+    owner.receipt.network_a_create_count = evidence.network_a_create_count;
+    owner.receipt.network_a_verify_count = evidence.network_a_verify_count;
+    owner.receipt.network_b_create_count = evidence.network_b_create_count;
+    owner.receipt.network_b_verify_count = evidence.network_b_verify_count;
+    owner.receipt.both_ipam_verify_count = evidence.both_ipam_verify_count;
+    owner.receipt.holder_create_count = evidence.holder_create_count;
+    owner.receipt.holder_attach_a_verify_count = evidence.holder_attach_a_verify_count;
+    owner.receipt.holder_attach_b_count = evidence.holder_attach_b_count;
+}
+
+struct ExactMountTopologySettlementContext {
+    ExactInputMountOwner* owner = nullptr;
+    std::uint32_t* order = nullptr;
+};
+
+static bool record_exact_mount_topology_settlement(void* opaque,
+                                                   TopologySettlementEvent event,
+                                                   bool removed,
+                                                   std::string& error) {
+    auto& context = *static_cast<ExactMountTopologySettlementContext*>(opaque);
+    ExactInputMountOwner& owner = *context.owner;
+    const auto settle =
+        [&](bool acquired, bool& settled, std::uint32_t& event_order, std::uint32_t& remove_count) {
+            if (settled) return;
+            settled = true;
+            if (acquired) event_order = ++*context.order;
+            if (removed) ++remove_count;
+        };
+    switch (event) {
+        case TopologySettlementEvent::Holder:
+            settle(owner.receipt.holder_acquired,
+                   owner.receipt.holder_settled,
+                   owner.receipt.holder_order,
+                   owner.receipt.holder_remove_command_count);
+            break;
+        case TopologySettlementEvent::NetworkB:
+            settle(owner.receipt.network_b_acquired,
+                   owner.receipt.network_b_settled,
+                   owner.receipt.network_b_order,
+                   owner.receipt.network_b_remove_command_count);
+            if (owner.options.failure_point ==
+                    ExactInputMountFailurePoint::RejectNetworkASettlementOnce &&
+                !owner.topology_settlement_fault_consumed) {
+                owner.topology_settlement_fault_consumed = true;
+                error = "injected exact-input mount topology failure before network A settlement";
+                return false;
+            }
+            break;
+        case TopologySettlementEvent::NetworkA:
+            settle(owner.receipt.network_a_acquired,
+                   owner.receipt.network_a_settled,
+                   owner.receipt.network_a_order,
+                   owner.receipt.network_a_remove_command_count);
+            break;
+    }
+    return true;
+}
+
+static void owner_failure(ExactInputMountOwner& owner,
+                          ExactInputMountDiagnostic& diagnostic,
+                          ExactInputMountPhase phase,
+                          const std::string& message,
+                          int error_number = 0) {
+    diagnostic = {phase, error_number, message};
+    if (owner.receipt.diagnostic.phase == ExactInputMountPhase::None)
+        owner.receipt.diagnostic = diagnostic;
+    if (owner.state != ExactInputMountState::Settled)
+        owner.state = ExactInputMountState::Unresolved;
+    owner.snapshot.state = owner.state;
+    owner.receipt.state = owner.state;
+}
+
+static void owner_operation_failure(ExactInputMountOwner& owner,
+                                    ExactInputMountPhase phase,
+                                    const std::string& message,
+                                    int error_number = 0) {
+    owner.operation_failed = true;
+    if (owner.receipt.diagnostic.phase == ExactInputMountPhase::None)
+        owner.receipt.diagnostic = {phase, error_number, message};
+}
+
+static bool injected_setup_failure(ExactInputMountOwner& owner,
+                                   ExactInputMountDiagnostic& diagnostic,
+                                   ExactInputMountFailurePoint actual,
+                                   ExactInputMountFailurePoint expected,
+                                   ExactInputMountPhase phase,
+                                   const char* boundary) {
+    if (actual != expected) return false;
+    owner_failure(owner,
+                  diagnostic,
+                  phase,
+                  std::string("injected exact-input mount setup failure after ") + boundary);
+    return true;
+}
+
+static bool setup_exact_input_mount(ExactInputMountOwner& owner,
+                                    ExactInputMountDiagnostic& diagnostic) {
+    owner.state = ExactInputMountState::SettingUp;
+    owner.snapshot.state = owner.state;
+    std::string error;
+    std::uint32_t parser_rejections = 0;
+    if (!mount_parser_self_checks(parser_rejections, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::MountInspect, error);
+        return false;
+    }
+    if (owner.options.failure_point == ExactInputMountFailurePoint::PreflightBeforeMutation) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Preflight,
+                      "injected exact-input mount preflight failure before mutation");
+        return false;
+    }
+    if (!docker_user_namespace_preflight(error) || !preflight(owner.fixture, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Preflight, error);
+        return false;
+    }
+    fixture_private_directory_lease::Diagnostic directory_diagnostic;
+    if (!fixture_private_directory_lease::PrivateDirectoryLease::create(owner.directory,
+                                                                        directory_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Directory,
+                      "exact input private directory creation failed",
+                      directory_diagnostic.error_number);
+        return false;
+    }
+    owner.mutated = true;
+    owner.receipt.graph_mutated = true;
+    owner.receipt.directory_acquired = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterDirectory,
+                               ExactInputMountPhase::Directory,
+                               "directory"))
+        return false;
+
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
+    if (!fixture_exact_input_file_lease::ExactInputFileLease::create(owner.directory,
+                                                                     owner.bytes.data(),
+                                                                     owner.bytes.size(),
+                                                                     owner.input,
+                                                                     file_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input file creation failed",
+                      file_diagnostic.error_number);
+        return false;
+    }
+    owner.receipt.input_acquired = true;
+    char canonical[PATH_MAX]{};
+    if (realpath(owner.input.path().c_str(), canonical) == nullptr ||
+        owner.input.path() != canonical ||
+        owner.input.path().find_first_of(",|#;\n\r\t ") != std::string::npos) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input file path was not canonical and delimiter-safe",
+                      errno);
+        return false;
+    }
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterInputFile,
+                               ExactInputMountPhase::InputFile,
+                               "input file"))
+        return false;
+
+    FailurePoint network_point = FailurePoint::None;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkACreated)
+        network_point = FailurePoint::AfterNetworkACreated;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkAVerified)
+        network_point = FailurePoint::AfterNetworkAVerified;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkBCreated)
+        network_point = FailurePoint::AfterNetworkBCreated;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterNetworkBVerified)
+        network_point = FailurePoint::AfterNetworkBVerified;
+    else if (owner.options.failure_point == ExactInputMountFailurePoint::AfterBothIpamVerified)
+        network_point = FailurePoint::AfterBothIpamVerified;
+    const bool networks_created = owner.fixture.create_networks(network_point, error);
+    sync_setup_event_evidence(owner);
+    if (!networks_created) {
+        const CleanupEvidence acquired = owner.fixture.cleanup_evidence();
+        owner.receipt.network_a_acquired = acquired.network_a_exists;
+        owner.receipt.network_b_acquired = acquired.network_b_exists;
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Networks, error);
+        return false;
+    }
+    owner.receipt.network_a_acquired = true;
+    owner.receipt.network_b_acquired = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterNetworks,
+                               ExactInputMountPhase::Networks,
+                               "networks"))
+        return false;
+    const FailurePoint holder_point =
+        owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderCreated
+            ? FailurePoint::AfterHolderCreated
+            : FailurePoint::None;
+    const bool holder_created = owner.fixture.create_holder(holder_point, error);
+    sync_setup_event_evidence(owner);
+    if (!holder_created) {
+        owner.receipt.holder_acquired = owner.fixture.cleanup_evidence().holder_exists;
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Holder, error);
+        return false;
+    }
+    owner.receipt.holder_acquired = true;
+    FailurePoint attach_point = FailurePoint::None;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderAttachedA)
+        attach_point = FailurePoint::AfterHolderAttachedA;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterHolderAttachedB)
+        attach_point = FailurePoint::AfterHolderAttachedB;
+    const bool holder_attached = owner.fixture.attach_holder(attach_point, error);
+    sync_setup_event_evidence(owner);
+    if (!holder_attached) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Holder, error);
+        return false;
+    }
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterHolder,
+                               ExactInputMountPhase::Holder,
+                               "holder"))
+        return false;
+    if (!owner.fixture.verify_topology(FailurePoint::None, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Topology, error);
+        return false;
+    }
+    owner.topology_complete = true;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterTopology,
+                               ExactInputMountPhase::Topology,
+                               "topology"))
+        return false;
+    if (!owner.input.revalidate(file_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::FileRevalidation,
+                      "exact input changed immediately before Docker create",
+                      file_diagnostic.error_number);
+        return false;
+    }
+
+    HeldNamespaceSidecarFailurePoint sidecar_point = HeldNamespaceSidecarFailurePoint::None;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::AfterSidecarCreate)
+        sidecar_point = HeldNamespaceSidecarFailurePoint::AfterCreate;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::SidecarCreateReportedTimeout)
+        sidecar_point = HeldNamespaceSidecarFailurePoint::CreateReportedTimeout;
+    if (owner.options.failure_point == ExactInputMountFailurePoint::SidecarCleanupReportedTimeout)
+        sidecar_point = HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout;
+    if (!owner.fixture.create_exact_input_mount_sidecar(
+            owner.input.path(), owner.input.identity(), owner.sidecar_argv, sidecar_point, error)) {
+        owner.receipt.sidecar_acquired = owner.fixture.cleanup_evidence().sidecar_exists;
+        owner_failure(owner, diagnostic, ExactInputMountPhase::Sidecar, error);
+        return false;
+    }
+    owner.receipt.sidecar_acquired = true;
+    if (!exact_input_mount_argv(owner.sidecar_argv, owner.input.path(), owner.input.identity())) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Sidecar,
+                      "sidecar creation argv was not the exact argv-only mount dialect");
+        return false;
+    }
+    ParsedMountInspect parsed;
+    if (!owner.fixture.revalidate_sidecar_identity(error) ||
+        !inspect_exact_mount(
+            owner.fixture, owner.input.path(), owner.input.identity(), parsed, error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::MountInspect, error);
+        return false;
+    }
+    if (!owner.input.revalidate(file_diagnostic)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::FileRevalidation,
+                      "exact input changed after Docker create/inspect",
+                      file_diagnostic.error_number);
+        return false;
+    }
+    const HeldNamespaceSidecarSnapshot& sidecar = owner.fixture.sidecar_snapshot();
+    const auto& identity = owner.input.identity();
+    if (!bracketed_proc_credentials_exact(
+            owner.fixture,
+            identity.uid,
+            identity.gid,
+            owner.options.failure_point ==
+                ExactInputMountFailurePoint::CredentialBoundarySidecarDeath,
+            error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::MountInspect, error);
+        return false;
+    }
+    owner.snapshot.token = owner.fixture.token();
+    owner.snapshot.source_path = owner.input.path();
+    owner.snapshot.destination = kExactInputMountDestination;
+    owner.snapshot.source_device = identity.device;
+    owner.snapshot.source_inode = identity.inode;
+    owner.snapshot.source_uid = identity.uid;
+    owner.snapshot.source_gid = identity.gid;
+    owner.snapshot.source_size = identity.size;
+    owner.snapshot.holder_id = owner.fixture.holder_id();
+    owner.snapshot.sidecar_id = sidecar.id;
+    owner.snapshot.config_user = parsed.user;
+    owner.snapshot.network_mode = parsed.network_mode;
+    owner.snapshot.sidecar_argv = owner.sidecar_argv;
+    const ParsedMount& requested = parsed.requested.front();
+    owner.snapshot.requested_type = requested.type;
+    owner.snapshot.requested_source = requested.source;
+    owner.snapshot.requested_destination = requested.destination;
+    owner.snapshot.requested_propagation = requested.propagation;
+    owner.snapshot.requested_read_only = requested.read_only;
+    const auto realized =
+        std::find_if(parsed.realized.begin(), parsed.realized.end(), [](const ParsedMount& mount) {
+            return mount.destination == kExactInputMountDestination;
+        });
+    owner.snapshot.realized_type = realized->type;
+    owner.snapshot.realized_source = realized->source;
+    owner.snapshot.realized_destination = realized->destination;
+    owner.snapshot.realized_mode = realized->mode;
+    owner.snapshot.realized_propagation = realized->propagation;
+    owner.snapshot.realized_read_only = realized->read_only;
+    owner.snapshot.exact_container_identity = true;
+    owner.snapshot.exact_proc_credentials = true;
+    owner.snapshot.parser_mutation_matrix_passed = true;
+    owner.snapshot.parser_rejections = parser_rejections;
+    owner.state = ExactInputMountState::ReadyForObservation;
+    owner.snapshot.state = owner.state;
+    owner.receipt.state = owner.state;
+    if (injected_setup_failure(owner,
+                               diagnostic,
+                               owner.options.failure_point,
+                               ExactInputMountFailurePoint::AfterMountInspect,
+                               ExactInputMountPhase::MountInspect,
+                               "mount inspect"))
+        return false;
+    diagnostic = {};
+    return true;
+}
+
+static bool recover_exact_input_mount(ExactInputMountOwner& owner,
+                                      ExactInputMountDiagnostic& diagnostic) {
+    if (owner.settled) {
+        diagnostic = owner.receipt.diagnostic;
+        return owner.receipt.terminal_result == ExactInputMountTerminalResult::SettledCleanly;
+    }
+    if (owner.state == ExactInputMountState::Recovering) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::Lifecycle,
+                      "exact input mount recovery re-entry was rejected");
+        return false;
+    }
+    owner.state = ExactInputMountState::Recovering;
+    owner.snapshot.state = owner.state;
+    owner.receipt.state = owner.state;
+    owner.receipt.attempted = true;
+    if (!owner.mutated) {
+        owner.receipt.cleanup_not_applicable = true;
+        owner.receipt.final_zero_residue = true;
+        owner.receipt.settlement_complete = true;
+        owner.receipt.terminal_frozen = true;
+        owner.receipt.terminal_result = ExactInputMountTerminalResult::SettledCleanly;
+        owner.settled = true;
+        owner.state = ExactInputMountState::Settled;
+        owner.snapshot.state = owner.state;
+        owner.receipt.state = owner.state;
+        diagnostic = {};
+        return true;
+    }
+    std::string error;
+    std::uint32_t order = std::max({owner.receipt.sidecar_order,
+                                    owner.receipt.input_order,
+                                    owner.receipt.directory_order,
+                                    owner.receipt.holder_order,
+                                    owner.receipt.network_b_order,
+                                    owner.receipt.network_a_order});
+    bool just_disconnected = false;
+
+    if (owner.options.failure_point ==
+            ExactInputMountFailurePoint::DisconnectNetworkBeforeInputCleanup &&
+        !owner.disconnect_injected && owner.fixture.sidecar_exists()) {
+        if (!owner.fixture.disconnect_network_b_for_mount_test(error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::TopologyRevalidation, error);
+            return false;
+        }
+        owner.disconnect_injected = true;
+        just_disconnected = true;
+    }
+    if (owner.options.failure_point == ExactInputMountFailurePoint::RejectSidecarRevalidationOnce &&
+        !owner.sidecar_fault_consumed) {
+        owner.fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::Token);
+    }
+    if (owner.options.failure_point == ExactInputMountFailurePoint::SidecarDisappearBeforeCleanup &&
+        !owner.sidecar_disappearance_consumed && owner.fixture.sidecar_exists()) {
+        if (!owner.fixture.disappear_sidecar_before_cleanup(error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::SidecarSettlement, error);
+            return false;
+        }
+        owner.sidecar_disappearance_consumed = true;
+    }
+    const CleanupPhaseResult sidecar = owner.fixture.cleanup_sidecar_phase(error);
+    if (owner.options.failure_point == ExactInputMountFailurePoint::RejectSidecarRevalidationOnce &&
+        !owner.sidecar_fault_consumed) {
+        owner.fixture.set_sidecar_revalidation_fault(HeldNamespaceSidecarRevalidationFault::None);
+        owner.sidecar_fault_consumed = true;
+    }
+    if (!sidecar.settled) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::SidecarSettlement, error);
+        return false;
+    }
+    if (!sidecar.operation_ok)
+        owner_operation_failure(
+            owner,
+            ExactInputMountPhase::SidecarSettlement,
+            error.empty() ? "sidecar settlement reported an operation failure" : error);
+    if (!owner.receipt.sidecar_settled) {
+        owner.receipt.sidecar_settled = true;
+        if (owner.receipt.sidecar_acquired) owner.receipt.sidecar_order = ++order;
+    }
+
+    const bool topology_cleanup_already_started = owner.receipt.holder_settled ||
+                                                  owner.receipt.network_b_settled ||
+                                                  owner.receipt.network_a_settled;
+    if (owner.topology_complete && !topology_cleanup_already_started) {
+        if (just_disconnected) {
+            owner_failure(owner,
+                          diagnostic,
+                          ExactInputMountPhase::TopologyRevalidation,
+                          "injected network disconnect retained exact input graph");
+            return false;
+        }
+        if (owner.disconnect_injected && !owner.restore_consumed) {
+            if (!owner.options.restore_test_disconnect_on_retry) {
+                owner_failure(owner,
+                              diagnostic,
+                              ExactInputMountPhase::TopologyRevalidation,
+                              "injected network disconnect retained exact input graph");
+                return false;
+            }
+            if (!owner.fixture.restore_network_b_for_mount_test(error)) {
+                owner_failure(owner, diagnostic, ExactInputMountPhase::TopologyRevalidation, error);
+                return false;
+            }
+            owner.restore_consumed = true;
+        }
+        if (!owner.fixture.verify_topology(FailurePoint::None, error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::TopologyRevalidation, error);
+            return false;
+        }
+        owner.receipt.first_topology_revalidated = true;
+    }
+
+    fixture_exact_input_file_lease::Diagnostic file_diagnostic;
+    if (owner.input.state() != fixture_exact_input_file_lease::State::Empty &&
+        owner.input.state() != fixture_exact_input_file_lease::State::Settled) {
+        if (owner.input.active() && !owner.input.revalidate(file_diagnostic)) {
+            owner_failure(owner,
+                          diagnostic,
+                          ExactInputMountPhase::FileRevalidation,
+                          "exact input revalidation failed before settlement",
+                          file_diagnostic.error_number);
+            return false;
+        }
+        if (!owner.input.cleanup(file_diagnostic)) {
+            owner_failure(owner,
+                          diagnostic,
+                          ExactInputMountPhase::InputSettlement,
+                          "exact input settlement failed",
+                          file_diagnostic.error_number);
+            return false;
+        }
+    }
+    if (!owner.receipt.input_settled) {
+        owner.receipt.input_settled = true;
+        if (owner.receipt.input_acquired) owner.receipt.input_order = ++order;
+    }
+
+    fixture_private_directory_lease::Diagnostic directory_diagnostic;
+    if (owner.directory.state() != fixture_private_directory_lease::State::Empty &&
+        owner.directory.state() != fixture_private_directory_lease::State::Removed) {
+        if (!owner.directory.settle(directory_diagnostic)) {
+            owner_failure(owner,
+                          diagnostic,
+                          ExactInputMountPhase::DirectorySettlement,
+                          "exact input directory settlement failed",
+                          directory_diagnostic.error_number);
+            return false;
+        }
+    }
+    if (!owner.receipt.directory_settled) {
+        owner.receipt.directory_settled = true;
+        if (owner.receipt.directory_acquired) owner.receipt.directory_order = ++order;
+    }
+
+    if (owner.topology_complete && !topology_cleanup_already_started) {
+        error.clear();
+        if (!owner.fixture.verify_topology(FailurePoint::None, error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::TopologyRevalidation, error);
+            return false;
+        }
+        owner.receipt.second_topology_revalidated = true;
+    }
+    if (owner.options.failure_point == ExactInputMountFailurePoint::HolderDisappearBeforeCleanup &&
+        !owner.holder_disappearance_consumed && owner.receipt.holder_acquired) {
+        error.clear();
+        if (!owner.fixture.disappear_holder_before_cleanup(error)) {
+            owner_failure(owner, diagnostic, ExactInputMountPhase::HolderSettlement, error);
+            return false;
+        }
+        owner.holder_disappearance_consumed = true;
+        owner.receipt.holder_settled = true;
+        owner.receipt.holder_order = ++order;
+    }
+    error.clear();
+    ExactMountTopologySettlementContext settlement_context{&owner, &order};
+    const CleanupPhaseResult topology = owner.fixture.cleanup_topology_phase(
+        error, record_exact_mount_topology_settlement, &settlement_context);
+    if (!topology.settled) {
+        const ExactInputMountPhase phase =
+            owner.options.failure_point ==
+                        ExactInputMountFailurePoint::RejectNetworkASettlementOnce &&
+                    owner.topology_settlement_fault_consumed && owner.receipt.network_b_settled &&
+                    !owner.receipt.network_a_settled
+                ? ExactInputMountPhase::NetworkSettlement
+                : ExactInputMountPhase::HolderSettlement;
+        owner_failure(owner, diagnostic, phase, error);
+        return false;
+    }
+    if (!topology.operation_ok)
+        owner_operation_failure(
+            owner,
+            ExactInputMountPhase::HolderSettlement,
+            error.empty() ? "topology settlement reported an operation failure" : error);
+    error.clear();
+    if (!audit_zero_residue(owner.fixture.token(),
+                            owner.fixture.network_a().name,
+                            owner.fixture.network_b().name,
+                            owner.fixture.holder_name(),
+                            error)) {
+        owner_failure(owner, diagnostic, ExactInputMountPhase::FinalAudit, error);
+        return false;
+    }
+    owner.receipt.final_zero_residue = true;
+    owner.receipt.settlement_complete = true;
+    owner.receipt.terminal_frozen = true;
+    owner.receipt.terminal_result = owner.operation_failed
+                                        ? ExactInputMountTerminalResult::SettledWithOperationFailure
+                                        : ExactInputMountTerminalResult::SettledCleanly;
+    owner.settled = true;
+    owner.state = ExactInputMountState::Settled;
+    owner.snapshot.state = owner.state;
+    owner.receipt.state = owner.state;
+    diagnostic = owner.operation_failed ? owner.receipt.diagnostic : ExactInputMountDiagnostic{};
+    return !owner.operation_failed;
+}
+
 }  // namespace
+
+std::uint64_t exact_input_mount_test_command_count() {
+    return command_invocation_count;
+}
+
+static std::int64_t exact_mount_thread_id() {
+#ifdef SYS_gettid
+    return static_cast<std::int64_t>(syscall(SYS_gettid));
+#else
+    return static_cast<std::int64_t>(getpid());
+#endif
+}
+
+static ExactInputMountOwner* exact_mount_owner(std::uintptr_t cookie) {
+    return reinterpret_cast<ExactInputMountOwner*>(cookie);
+}
+
+static void exact_mount_fatal(const char* reason, const ExactInputMountRecoveryReceipt* receipt) {
+    if (receipt == nullptr) {
+        dprintf(STDERR_FILENO, "fatal exact-input mount controller: %s; no owner\n", reason);
+    } else {
+        dprintf(STDERR_FILENO,
+                "fatal exact-input mount controller: %s; state=%u attempted=%d sidecar=%d "
+                "input=%d directory=%d holder=%d network-b=%d network-a=%d settled=%d "
+                "phase=%u error=%s\n",
+                reason,
+                static_cast<unsigned>(receipt->state),
+                receipt->attempted,
+                receipt->sidecar_settled,
+                receipt->input_settled,
+                receipt->directory_settled,
+                receipt->holder_settled,
+                receipt->network_b_settled,
+                receipt->network_a_settled,
+                receipt->settlement_complete,
+                static_cast<unsigned>(receipt->diagnostic.phase),
+                receipt->diagnostic.message.c_str());
+    }
+    abort();
+}
+
+ExactInputMountHandle::~ExactInputMountHandle() {
+    if (!borrowed_) return;
+    auto* controller = reinterpret_cast<ExactInputMountRecoveryController*>(controller_address_);
+    controller->return_handle(*this);
+}
+
+ExactInputMountHandle::ExactInputMountHandle(ExactInputMountHandle&& other) noexcept
+    : controller_address_(other.controller_address_),
+      controller_cookie_(other.controller_cookie_),
+      generation_(other.generation_),
+      slot_(other.slot_),
+      borrowed_(other.borrowed_) {
+    other.controller_address_ = 0;
+    other.controller_cookie_ = 0;
+    other.generation_ = 0;
+    other.slot_ = 0;
+    other.borrowed_ = false;
+}
+
+ExactInputMountHandle& ExactInputMountHandle::operator=(ExactInputMountHandle&& other) noexcept {
+    if (this == &other) return *this;
+    if (borrowed_) {
+        auto* controller =
+            reinterpret_cast<ExactInputMountRecoveryController*>(controller_address_);
+        controller->return_handle(*this);
+    }
+    controller_address_ = other.controller_address_;
+    controller_cookie_ = other.controller_cookie_;
+    generation_ = other.generation_;
+    slot_ = other.slot_;
+    borrowed_ = other.borrowed_;
+    other.controller_address_ = 0;
+    other.controller_cookie_ = 0;
+    other.generation_ = 0;
+    other.slot_ = 0;
+    other.borrowed_ = false;
+    return *this;
+}
+
+ExactInputMountRecoveryController::ExactInputMountRecoveryController()
+    : construction_thread_(exact_mount_thread_id()) {
+    if (getrandom(&cookie_, sizeof(cookie_), 0) != static_cast<ssize_t>(sizeof(cookie_)) ||
+        cookie_ == 0u)
+        cookie_ =
+            static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(this)) ^
+            static_cast<std::uint64_t>(construction_thread_) ^
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (cookie_ == 0u) cookie_ = 1u;
+}
+
+ExactInputMountRecoveryController::~ExactInputMountRecoveryController() {
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    const ExactInputMountRecoveryReceipt* receipt = owner == nullptr ? nullptr : &owner->receipt;
+    if (borrowed_) exact_mount_fatal("destroyed with a live borrowed handle", receipt);
+    if (exact_mount_thread_id() != construction_thread_)
+        exact_mount_fatal("destroyed on a foreign thread", receipt);
+    if (owner != nullptr && !owner->settled) {
+        ExactInputMountRecoveryReceipt recovered;
+        ExactInputMountDiagnostic diagnostic;
+        if (!recover_impl(recovered, diagnostic))
+            exact_mount_fatal("bounded destructor recovery did not settle the graph",
+                              &owner->receipt);
+    }
+    delete owner;
+    owner_cookie_ = 0;
+}
+
+bool ExactInputMountRecoveryController::start(const void* bytes,
+                                              std::size_t size,
+                                              ExactInputMountHandle& handle,
+                                              ExactInputMountDiagnostic& diagnostic,
+                                              const ExactInputMountOptions& options) {
+    diagnostic = {};
+    if (exact_mount_thread_id() != construction_thread_) {
+        diagnostic = {ExactInputMountPhase::Thread, 0, "start called from a foreign thread"};
+        return false;
+    }
+    if (bytes == nullptr || size == 0u ||
+        size > fixture_exact_input_file_lease::kMaximumInputBytes || handle.borrowed_ ||
+        handle.controller_address_ != 0u || handle.controller_cookie_ != 0u ||
+        handle.generation_ != 0u) {
+        diagnostic = {ExactInputMountPhase::Argument, EINVAL, "invalid exact-input start argument"};
+        return false;
+    }
+    ExactInputMountOwner* prior = exact_mount_owner(owner_cookie_);
+    if (borrowed_ || (prior != nullptr && !prior->settled)) {
+        diagnostic = {ExactInputMountPhase::Capacity, EBUSY, "the fixed exact-input slot is busy"};
+        return false;
+    }
+    if (prior != nullptr) {
+        delete prior;
+        owner_cookie_ = 0;
+    }
+    if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EOVERFLOW,
+                      "exact-input handle generation cannot wrap"};
+        return false;
+    }
+    std::string token;
+    if (!high_entropy_token(token)) {
+        diagnostic = {ExactInputMountPhase::Preflight,
+                      errno,
+                      "high-entropy exact-input owner token generation failed"};
+        return false;
+    }
+    std::string exact_bytes(static_cast<const char*>(bytes), size);
+    ExactInputMountOwner* owner =
+        new (std::nothrow) ExactInputMountOwner(std::move(token), std::move(exact_bytes));
+    if (owner == nullptr) {
+        diagnostic = {
+            ExactInputMountPhase::Capacity, ENOMEM, "exact-input owner allocation failed"};
+        return false;
+    }
+    owner->options = options;
+    owner_cookie_ = reinterpret_cast<std::uintptr_t>(owner);
+    ++generation_;
+    owner->snapshot.generation = generation_;
+    if (!setup_exact_input_mount(*owner, diagnostic)) return false;
+    handle.controller_address_ = reinterpret_cast<std::uintptr_t>(this);
+    handle.controller_cookie_ = cookie_;
+    handle.generation_ = generation_;
+    handle.slot_ = 0;
+    handle.borrowed_ = true;
+    borrowed_ = true;
+    return true;
+}
+
+bool ExactInputMountRecoveryController::validate_handle(
+    const ExactInputMountHandle& handle, ExactInputMountDiagnostic& diagnostic) const {
+    if (exact_mount_thread_id() != construction_thread_) {
+        diagnostic = {ExactInputMountPhase::Thread, 0, "handle operation called on foreign thread"};
+        return false;
+    }
+    if (!borrowed_ || !handle.borrowed_ ||
+        handle.controller_address_ != reinterpret_cast<std::uintptr_t>(this) ||
+        handle.controller_cookie_ != cookie_ || handle.slot_ != 0u ||
+        handle.generation_ != generation_) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "moved-from, stale, foreign, or already-finished handle"};
+        return false;
+    }
+    return true;
+}
+
+bool ExactInputMountRecoveryController::snapshot(const ExactInputMountHandle& handle,
+                                                 ExactInputMountSnapshot& snapshot_value,
+                                                 ExactInputMountDiagnostic& diagnostic) const {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    const ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr || owner->state != ExactInputMountState::ReadyForObservation) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "exact-input mount is not ReadyForObservation"};
+        return false;
+    }
+    snapshot_value = owner->snapshot;
+    return true;
+}
+
+void ExactInputMountRecoveryController::return_handle(ExactInputMountHandle& handle) noexcept {
+    if (exact_mount_thread_id() != construction_thread_) {
+        ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+        exact_mount_fatal("handle custody returned on a foreign thread",
+                          owner == nullptr ? nullptr : &owner->receipt);
+    }
+    if (handle.borrowed_ && handle.controller_address_ == reinterpret_cast<std::uintptr_t>(this) &&
+        handle.controller_cookie_ == cookie_ && handle.generation_ == generation_ &&
+        handle.slot_ == 0u) {
+        borrowed_ = false;
+    }
+    handle.borrowed_ = false;
+}
+
+bool ExactInputMountRecoveryController::recover_impl(ExactInputMountRecoveryReceipt& receipt,
+                                                     ExactInputMountDiagnostic& diagnostic) {
+    if (recovering_) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, EDEADLK, "controller recovery re-entry"};
+        return false;
+    }
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr) {
+        receipt = {};
+        receipt.state = ExactInputMountState::Settled;
+        receipt.terminal_result = ExactInputMountTerminalResult::SettledCleanly;
+        receipt.attempted = true;
+        receipt.cleanup_not_applicable = true;
+        receipt.manifest_not_applicable = true;
+        receipt.final_zero_residue = true;
+        receipt.settlement_complete = true;
+        receipt.terminal_frozen = true;
+        diagnostic = {};
+        return true;
+    }
+    recovering_ = true;
+    const bool ok = recover_exact_input_mount(*owner, diagnostic);
+    recovering_ = false;
+    receipt = owner->receipt;
+    return ok;
+}
+
+bool ExactInputMountRecoveryController::finish(ExactInputMountHandle& handle,
+                                               ExactInputMountRecoveryReceipt& receipt,
+                                               ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    return_handle(handle);
+    return recover_impl(receipt, diagnostic);
+}
+
+bool ExactInputMountRecoveryController::recover_all(ExactInputMountRecoveryReceipt& receipt,
+                                                    ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (exact_mount_thread_id() != construction_thread_) {
+        diagnostic = {ExactInputMountPhase::Thread, 0, "recover_all called on a foreign thread"};
+        return false;
+    }
+    if (borrowed_) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EBUSY,
+                      "recover_all refused while a handle retains custody"};
+        return false;
+    }
+    return recover_impl(receipt, diagnostic);
+}
 
 bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
                                                  HeldNamespaceSidecarSnapshot& snapshot,

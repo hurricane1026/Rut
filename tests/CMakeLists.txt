@@ -831,6 +831,10 @@ if(RUT_ENABLE_JIT)
         test_ipv4_fixture_topology.cc
         fixture_ipv4_topology.cc
     )
+    target_link_libraries(test_ipv4_fixture_topology PRIVATE
+        fixture_exact_input_file_lease
+        fixture_private_directory_lease
+    )
     target_compile_definitions(test_ipv4_fixture_topology PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
@@ -853,6 +857,7 @@ if(RUT_ENABLE_JIT)
         fixture_collision_release_protocol
         fixture_direct_launch
         fixture_exact_tcp_reservation_lease
+        fixture_exact_input_file_lease
         fixture_executable_exec_handoff
         fixture_executable_lease
         fixture_identity_bundle
@@ -873,6 +878,28 @@ if(RUT_ENABLE_JIT)
     add_dependencies(test_fixture_privileged_broker rut)
     add_test(NAME test_fixture_privileged_broker
              COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+
+    add_executable(test_fixture_exact_input_mount_owner
+        test_fixture_exact_input_mount_owner.cc
+        fixture_ipv4_topology.cc
+    )
+    target_link_libraries(test_fixture_exact_input_mount_owner PRIVATE
+        fixture_exact_input_file_lease
+        fixture_private_directory_lease
+        Threads::Threads
+    )
+    target_compile_definitions(test_fixture_exact_input_mount_owner PRIVATE
+        "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
+    )
+    add_test(NAME test_fixture_exact_input_mount_owner
+             COMMAND test_fixture_exact_input_mount_owner)
+    set_tests_properties(test_fixture_exact_input_mount_owner PROPERTIES
+        LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 360
+        SKIP_RETURN_CODE 77
+    )
     set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
