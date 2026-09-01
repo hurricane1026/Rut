@@ -4959,7 +4959,8 @@ bool Fixture::cleanup_recreated_holder(std::string& error) {
         identity.read_only_root &&
         no_published_ports(identity.port_bindings_json, identity.network_ports_json) &&
         identity.capability_drop_json == "[\"ALL\"]" &&
-        identity.security_options_json == "[\"no-new-privileges\"]";
+        identity.security_options_json == "[\"no-new-privileges\"]" &&
+        identity.exposed_ports_json != "null";
     if (!present && fresh.removal_may_have_mutated) {
         CommandResult name;
         if (!run_command(
