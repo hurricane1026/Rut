@@ -104,6 +104,7 @@ enum class HeldNamespaceSidecarFailurePoint {
     AfterVerification,
     AfterCallbackEntry,
     CreateReportedTimeout,
+    CreateReportedTimeoutRecoveryUnavailable,
     CleanupReportedTimeout,
     UnexpectedDeath,
     DisappearBeforeCleanup,

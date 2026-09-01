@@ -186,6 +186,9 @@ int main() {
           std::pair{HeldNamespaceSidecarFailurePoint::CreateReportedTimeout,
                     std::string("injected sidecar actual-success/reported-timeout; recovered exact "
                                 "identity")},
+          std::pair{HeldNamespaceSidecarFailurePoint::CreateReportedTimeoutRecoveryUnavailable,
+                    std::string("verified uncertain sidecar create fail-closed recovery and zero "
+                                "residue")},
           std::pair{HeldNamespaceSidecarFailurePoint::CleanupReportedTimeout,
                     std::string("verified sidecar cleanup actual-success/reported-timeout "
                                 "recovery")},
