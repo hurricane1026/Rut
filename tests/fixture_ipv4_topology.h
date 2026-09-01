@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <sys/types.h>
 
@@ -97,6 +98,46 @@ struct HeldNamespaceSidecarSnapshot {
     bool no_published_ports = false;
 };
 
+// Pure value evidence for replacing only the holder/sidecar generation while
+// retaining the exact Docker networks and addressing plan.  It deliberately
+// records process identity as (pid,start): a numeric PID may be reused by a
+// later generation when its start time differs.
+struct HeldNamespaceGenerationSnapshot {
+    HeldTopologySnapshot topology;
+    HeldNamespaceSidecarSnapshot sidecar;
+};
+
+struct HeldNamespaceGenerationWitnessAbsence {
+    std::string container_id;
+    pid_t pid = -1;
+    std::uint64_t start = 0;
+    bool container_id_absent = false;
+    bool process_identity_absent = false;
+};
+
+struct HeldNamespaceOldGenerationAbsence {
+    HeldNamespaceGenerationWitnessAbsence holder;
+    HeldNamespaceGenerationWitnessAbsence sidecar;
+};
+
+enum class HeldNamespaceGenerationRotationPhase : std::uint8_t {
+    OldGenerationValidated,
+    OldSidecarWitnessAbsent,
+    OldHolderWitnessAbsent,
+    OldGenerationAbsenceRecorded,
+    NewHolderNameReused,
+    NewTopologyValidated,
+    NewSidecarNameReused,
+    NewGenerationValidated,
+};
+
+struct HeldNamespaceGenerationRotationReceipt {
+    HeldNamespaceGenerationSnapshot old_generation;
+    HeldNamespaceOldGenerationAbsence old_absence;
+    HeldNamespaceGenerationSnapshot new_generation;
+    std::vector<HeldNamespaceGenerationRotationPhase> transitions;
+};
+
 enum class HeldNamespaceSidecarFailurePoint {
     None,
     AfterCreate,
@@ -160,6 +201,8 @@ bool parse_held_namespace_sidecar_inspect_record(const std::string& record,
 bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topology,
                                               const HeldNamespaceSidecarSnapshot& sidecar,
                                               std::string& error);
+bool validate_held_namespace_generation_rotation_receipt(
+    const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error);
 bool validate_held_topology_probe_evidence(const HeldTopologyProbeEvidence& evidence,
                                            HeldTopologyProbePolicy expected_policy,
                                            std::string& error);
