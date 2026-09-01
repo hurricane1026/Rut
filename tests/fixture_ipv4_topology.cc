@@ -4915,9 +4915,6 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
         owner_failure(owner, diagnostic, ExactInputMountPhase::Preflight, error);
         return false;
     }
-    owner.recovery_required = true;
-    owner.receipt.recovery_required = true;
-    owner.receipt.mutation_may_have_occurred = true;
     fixture_private_directory_lease::Diagnostic directory_diagnostic;
     if (!fixture_private_directory_lease::PrivateDirectoryLease::create(owner.directory,
                                                                         directory_diagnostic)) {

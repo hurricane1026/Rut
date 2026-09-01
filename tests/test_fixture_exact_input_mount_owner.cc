@@ -836,6 +836,115 @@ bool recover_injected_write_refusal(ExactInputMountFailurePoint point,
     return true;
 }
 
+struct BuilderRecoveryCase {
+    const char* name;
+    BuilderMode mode;
+    ExactInputMountFailurePoint failure_point;
+    ExactInputMountPhase failure_phase;
+    int failure_errno;
+    const char* failure_message;
+    bool returned_normally;
+    bool threw_exception;
+    bool callback_reported_success;
+    bool sink_overflow;
+    bool output_accepted;
+    bool directory_acquired;
+    bool prove_fresh_generation;
+};
+
+bool recover_topology_builder_failure(const BuilderRecoveryCase& test, std::string& error) {
+    ExactInputMountRecoveryController controller;
+    BuilderContext context;
+    context.mode = test.mode;
+    context.controller = &controller;
+    ExactInputMountHandle never_borrowed;
+    ExactInputMountDiagnostic diagnostic;
+    ExactInputMountOptions options;
+    options.failure_point = test.failure_point;
+    if (controller.start_with_topology_builder(
+            topology_config_builder, &context, never_borrowed, diagnostic, options) ||
+        diagnostic.phase != test.failure_phase || diagnostic.error_number != test.failure_errno ||
+        diagnostic.message != test.failure_message || context.calls != 1u) {
+        error = std::string(test.name) + " did not freeze its exact initial failure";
+        return false;
+    }
+    const ExactInputMountDiagnostic frozen_failure = diagnostic;
+    const std::uint64_t failed_commands = exact_input_mount_test_command_count();
+    BuilderContext blocked_context;
+    blocked_context.controller = &controller;
+    if (controller.start_with_topology_builder(
+            topology_config_builder, &blocked_context, never_borrowed, diagnostic) ||
+        diagnostic.phase != ExactInputMountPhase::Capacity || blocked_context.calls != 0u ||
+        context.calls != 1u || exact_input_mount_test_command_count() != failed_commands) {
+        error = std::string(test.name) + " did not retain the busy failed generation";
+        return false;
+    }
+
+    ExactInputMountRecoveryReceipt receipt;
+    if (!controller.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt) ||
+        !receipt.mutation_may_have_occurred || !receipt.recovery_required ||
+        receipt.cleanup_not_applicable || !receipt.builder.applicable ||
+        !receipt.builder.request_validated || receipt.builder.invocation_count != 1u ||
+        receipt.builder.returned_normally != test.returned_normally ||
+        receipt.builder.threw_exception != test.threw_exception ||
+        receipt.builder.callback_reported_success != test.callback_reported_success ||
+        receipt.builder.reentry_attempted || receipt.builder.sink_overflow != test.sink_overflow ||
+        receipt.builder.output_accepted != test.output_accepted ||
+        receipt.builder.directory_acquired_after_builder != test.directory_acquired ||
+        receipt.builder.input_acquired_after_builder ||
+        receipt.directory_acquired != test.directory_acquired || receipt.input_acquired ||
+        receipt.sidecar_acquired || !receipt.holder_acquired || !receipt.network_b_acquired ||
+        !receipt.network_a_acquired || !complete_builder_bracket(receipt.builder.bracket_a) ||
+        !complete_builder_bracket(receipt.builder.bracket_b) ||
+        receipt.builder.bracket_d.topology_verified ||
+        receipt.diagnostic.phase != frozen_failure.phase ||
+        receipt.diagnostic.error_number != frozen_failure.error_number ||
+        receipt.diagnostic.message != frozen_failure.message ||
+        !receipt.first_topology_revalidated || !receipt.second_topology_revalidated ||
+        receipt.sidecar_order != 0u || receipt.input_order != 0u ||
+        receipt.directory_order != (test.directory_acquired ? 1u : 0u) ||
+        receipt.holder_order != (test.directory_acquired ? 2u : 1u) ||
+        receipt.network_b_order != (test.directory_acquired ? 3u : 2u) ||
+        receipt.network_a_order != (test.directory_acquired ? 4u : 3u) ||
+        receipt.holder_remove_command_count != 1u || receipt.network_b_remove_command_count != 1u ||
+        receipt.network_a_remove_command_count != 1u ||
+        receipt.builder.bracket_c.topology_verified != test.directory_acquired) {
+        error = std::string(test.name) +
+                " did not produce truthful bracketed ordered zero-residue recovery";
+        return false;
+    }
+    const std::size_t expected_sink_size =
+        test.sink_overflow ? kExactInputBuilderCapacity
+                           : (test.output_accepted ? context.expected_bytes.size() : 0u);
+    if (receipt.builder.sink_size != expected_sink_size) {
+        error = std::string(test.name) + " froze an unexpected builder sink size";
+        return false;
+    }
+
+    const ExactInputMountRecoveryReceipt frozen_receipt = receipt;
+    const std::uint64_t terminal_commands = exact_input_mount_test_command_count();
+    ExactInputMountRecoveryReceipt replay;
+    if (!controller.recover_all(replay, diagnostic) || !receipt_equal(replay, frozen_receipt) ||
+        exact_input_mount_test_command_count() != terminal_commands || context.calls != 1u) {
+        error = std::string(test.name) + " terminal replay changed evidence or ran work";
+        return false;
+    }
+
+    if (test.prove_fresh_generation) {
+        BuilderContext fresh_context;
+        fresh_context.controller = &controller;
+        ExactInputMountHandle fresh_handle;
+        if (!controller.start_with_topology_builder(
+                topology_config_builder, &fresh_context, fresh_handle, diagnostic) ||
+            fresh_context.calls != 1u || !controller.finish(fresh_handle, receipt, diagnostic) ||
+            !exact_terminal(receipt) || receipt.builder.invocation_count != 1u) {
+            error = std::string(test.name) + " did not permit one clean fresh generation";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool wait_for_abort(pid_t child, std::string& error) {
     int status = 0;
     while (waitpid(child, &status, 0) < 0) {
@@ -1163,7 +1272,7 @@ int main(int argc, char** argv) {
         !receipt.first_topology_revalidated || !receipt.second_topology_revalidated ||
         receipt.builder.applicable || receipt.builder.request_validated ||
         receipt.builder.invocation_count != 0u || receipt.builder.output_accepted ||
-        !receipt.mutation_may_have_occurred || !receipt.recovery_required) {
+        receipt.mutation_may_have_occurred || receipt.recovery_required) {
         std::cerr << "FAIL [#358 exact input mount recovery]: " << diagnostic.message << "\n";
         return 1;
     }
@@ -1738,6 +1847,109 @@ int main(int argc, char** argv) {
             !exact_terminal(receipt) || receipt.builder.invocation_count != 1u) {
             std::cerr << "FAIL [#408 topology builder fresh generation]: " << diagnostic.message
                       << "\n";
+            return 1;
+        }
+    }
+    // These are real controller generations, not classifier-only cases. Each
+    // callback/output boundary retains the failed slot through authoritative B,
+    // then proves ordered explicit cleanup and inert terminal replay. Only the
+    // deepest uncertain-input prefix repeats with a fresh successful generation.
+    for (const BuilderRecoveryCase& test : std::array<BuilderRecoveryCase, 7>{{
+             {"callback false",
+              BuilderMode::False,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder reported failure",
+              true,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"callback standard exception",
+              BuilderMode::ThrowStandard,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder threw an exception",
+              false,
+              true,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"callback non-standard exception",
+              BuilderMode::ThrowNonstandard,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              0,
+              "topology input builder threw an exception",
+              false,
+              true,
+              false,
+              false,
+              false,
+              false,
+              false},
+             {"empty successful sink",
+              BuilderMode::Empty,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              EINVAL,
+              "topology input builder produced empty output",
+              true,
+              false,
+              true,
+              false,
+              false,
+              false,
+              false},
+             {"sticky sink overflow",
+              BuilderMode::Overflow,
+              ExactInputMountFailurePoint::None,
+              ExactInputMountPhase::InputBuilder,
+              EOVERFLOW,
+              "topology input builder output exceeded 8192 bytes",
+              true,
+              false,
+              true,
+              true,
+              false,
+              false,
+              false},
+             {"directory may have mutated",
+              BuilderMode::Success,
+              ExactInputMountFailurePoint::BuilderDirectoryMayHaveMutated,
+              ExactInputMountPhase::Directory,
+              0,
+              "injected uncertain directory creation result",
+              true,
+              false,
+              true,
+              false,
+              true,
+              false,
+              false},
+             {"input may have mutated",
+              BuilderMode::Success,
+              ExactInputMountFailurePoint::BuilderInputMayHaveMutated,
+              ExactInputMountPhase::InputFile,
+              0,
+              "injected uncertain exact input creation result",
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              true},
+         }}) {
+        std::string error;
+        if (!recover_topology_builder_failure(test, error)) {
+            std::cerr << "FAIL [#408 topology builder real failure recovery]: " << error << "\n";
             return 1;
         }
     }
