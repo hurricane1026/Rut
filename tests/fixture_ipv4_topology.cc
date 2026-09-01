@@ -4651,27 +4651,34 @@ bool Fixture::recreate_holder_only(HolderOnlyRecreationFailurePoint failure_poin
                           "inspect",
                           "-f",
                           "{{.HostConfig.NetworkMode}} {{range $name,$v := "
-                          ".NetworkSettings.Networks}}{{$name}}|{{$v.NetworkID}}|{{if "
-                          "$v.IPAMConfig}}{{$v.IPAMConfig.IPv4Address}}{{end}}|{{$v.EndpointID}}|{{"
-                          "$v.IPAddress}}|{{$v.Gateway}} {{end}}",
+                          ".NetworkSettings.Networks}}{{$name}}|{{json $v.NetworkID}}|{{json "
+                          "$v.IPAMConfig.IPv4Address}}|{{json $v.EndpointID}}|{{json "
+                          "$v.IPAddress}}|{{json $v.Gateway}} {{end}}",
                           fresh.id},
                          inspect) ||
             !exited_zero(inspect)) {
             error = "recreated stopped holder network configuration inspection failed";
             return false;
         }
-        std::istringstream fields(trim(inspect.output));
+        const std::string inspect_record = trim(inspect.output);
+        std::istringstream fields(inspect_record);
         std::string network_mode;
         std::string network;
         std::string extra;
         std::vector<std::string> parts;
         // A stopped container has exact configured network/IPAM authority but
         // deliberately no active endpoint identity or assigned wire address.
+        const std::string quoted_positive_ip = "\"" + positive_ip_ + "\"";
         if (!(fields >> network_mode >> network) || (fields >> extra) ||
             network_mode != network_a_.id || !split_exact(network, '|', 6, parts) ||
-            parts[0] != network_a_.name || !parts[1].empty() || parts[2] != positive_ip_ ||
-            !parts[3].empty() || !parts[4].empty() || !parts[5].empty()) {
-            error = "recreated stopped holder exact network-A/static-IP config was not exact";
+            parts[0] != network_a_.name || parts[1] != "\"\"" || parts[2] != quoted_positive_ip ||
+            parts[3] != "\"\"" || parts[4] != "\"\"" || parts[5] != "\"\"") {
+            constexpr std::size_t kMaxDiagnosticRecord = 512u;
+            const std::string bounded_record =
+                inspect_record.substr(0u, std::min(inspect_record.size(), kMaxDiagnosticRecord));
+            error = "recreated stopped holder exact network-A/static-IP config was not exact: " +
+                    bounded_record;
+            if (inspect_record.size() > kMaxDiagnosticRecord) error += "...";
             return false;
         }
         return true;
