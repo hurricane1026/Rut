@@ -1,5 +1,7 @@
 #include "fixture_exact_input_mount_owner.h"
+#include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -19,14 +21,89 @@ const std::string kConfig =
 
 bool exact_terminal(const ExactInputMountRecoveryReceipt& receipt) {
     return receipt.state == ExactInputMountState::Settled && receipt.settlement_complete &&
-           receipt.terminal_frozen && receipt.sidecar_settled && receipt.input_settled &&
-           receipt.directory_settled && receipt.holder_settled && receipt.network_b_settled &&
-           receipt.network_a_settled && receipt.manifest_settled && receipt.final_zero_residue &&
+           receipt.terminal_result == ExactInputMountTerminalResult::SettledCleanly &&
+           receipt.graph_mutated && !receipt.cleanup_not_applicable && receipt.sidecar_acquired &&
+           receipt.input_acquired && receipt.directory_acquired && receipt.holder_acquired &&
+           receipt.network_b_acquired && receipt.network_a_acquired && receipt.terminal_frozen &&
+           receipt.sidecar_settled && receipt.input_settled && receipt.directory_settled &&
+           receipt.holder_settled && receipt.network_b_settled && receipt.network_a_settled &&
+           receipt.manifest_not_applicable && receipt.final_zero_residue &&
            receipt.sidecar_order < receipt.input_order &&
            receipt.input_order < receipt.directory_order &&
            receipt.directory_order < receipt.holder_order &&
            receipt.holder_order < receipt.network_b_order &&
            receipt.network_b_order < receipt.network_a_order;
+}
+
+bool truthful_partial_terminal(const ExactInputMountRecoveryReceipt& receipt) {
+    const auto exact_event = [](bool acquired, bool settled, std::uint32_t order) {
+        return settled && (acquired ? order != 0u : order == 0u);
+    };
+    std::vector<std::uint32_t> events;
+    for (const std::uint32_t order : {receipt.sidecar_order,
+                                      receipt.input_order,
+                                      receipt.directory_order,
+                                      receipt.holder_order,
+                                      receipt.network_b_order,
+                                      receipt.network_a_order})
+        if (order != 0u) events.push_back(order);
+    const bool strict_event_order =
+        std::adjacent_find(events.begin(), events.end(), std::greater_equal<>()) == events.end();
+    return receipt.state == ExactInputMountState::Settled && receipt.settlement_complete &&
+           receipt.terminal_frozen &&
+           receipt.terminal_result == ExactInputMountTerminalResult::SettledCleanly &&
+           receipt.graph_mutated && receipt.manifest_not_applicable && receipt.final_zero_residue &&
+           exact_event(receipt.sidecar_acquired, receipt.sidecar_settled, receipt.sidecar_order) &&
+           exact_event(receipt.input_acquired, receipt.input_settled, receipt.input_order) &&
+           exact_event(
+               receipt.directory_acquired, receipt.directory_settled, receipt.directory_order) &&
+           exact_event(receipt.holder_acquired, receipt.holder_settled, receipt.holder_order) &&
+           exact_event(
+               receipt.network_b_acquired, receipt.network_b_settled, receipt.network_b_order) &&
+           exact_event(
+               receipt.network_a_acquired, receipt.network_a_settled, receipt.network_a_order) &&
+           strict_event_order;
+}
+
+bool receipt_equal(const ExactInputMountRecoveryReceipt& left,
+                   const ExactInputMountRecoveryReceipt& right) {
+    return left.state == right.state && left.terminal_result == right.terminal_result &&
+           left.attempted == right.attempted && left.graph_mutated == right.graph_mutated &&
+           left.cleanup_not_applicable == right.cleanup_not_applicable &&
+           left.sidecar_acquired == right.sidecar_acquired &&
+           left.input_acquired == right.input_acquired &&
+           left.directory_acquired == right.directory_acquired &&
+           left.holder_acquired == right.holder_acquired &&
+           left.network_b_acquired == right.network_b_acquired &&
+           left.network_a_acquired == right.network_a_acquired &&
+           left.sidecar_settled == right.sidecar_settled &&
+           left.first_topology_revalidated == right.first_topology_revalidated &&
+           left.input_settled == right.input_settled &&
+           left.directory_settled == right.directory_settled &&
+           left.second_topology_revalidated == right.second_topology_revalidated &&
+           left.holder_settled == right.holder_settled &&
+           left.network_b_settled == right.network_b_settled &&
+           left.network_a_settled == right.network_a_settled &&
+           left.manifest_not_applicable == right.manifest_not_applicable &&
+           left.final_zero_residue == right.final_zero_residue &&
+           left.settlement_complete == right.settlement_complete &&
+           left.terminal_frozen == right.terminal_frozen &&
+           left.sidecar_order == right.sidecar_order && left.input_order == right.input_order &&
+           left.directory_order == right.directory_order &&
+           left.holder_order == right.holder_order &&
+           left.network_b_order == right.network_b_order &&
+           left.network_a_order == right.network_a_order &&
+           left.diagnostic.phase == right.diagnostic.phase &&
+           left.diagnostic.error_number == right.diagnostic.error_number &&
+           left.diagnostic.message == right.diagnostic.message;
+}
+
+bool operation_failure_terminal(const ExactInputMountRecoveryReceipt& receipt,
+                                ExactInputMountPhase phase) {
+    return receipt.state == ExactInputMountState::Settled && receipt.settlement_complete &&
+           receipt.terminal_frozen && receipt.final_zero_residue &&
+           receipt.terminal_result == ExactInputMountTerminalResult::SettledWithOperationFailure &&
+           receipt.diagnostic.phase == phase;
 }
 
 bool recover_injected_setup(ExactInputMountFailurePoint point, std::string& error) {
@@ -51,8 +128,32 @@ bool recover_injected_setup(ExactInputMountFailurePoint point, std::string& erro
         return false;
     }
     ExactInputMountRecoveryReceipt receipt;
-    if (!controller.recover_all(receipt, diagnostic) || !exact_terminal(receipt)) {
+    if (!controller.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt)) {
         error = "injected setup graph did not recover exactly: " + diagnostic.message;
+        return false;
+    }
+    const bool expect_input = point != ExactInputMountFailurePoint::AfterDirectory;
+    const bool expect_network_a = point != ExactInputMountFailurePoint::AfterDirectory &&
+                                  point != ExactInputMountFailurePoint::AfterInputFile;
+    const bool expect_network_b = expect_network_a &&
+                                  point != ExactInputMountFailurePoint::AfterNetworkACreated &&
+                                  point != ExactInputMountFailurePoint::AfterNetworkAVerified;
+    const bool expect_holder = point == ExactInputMountFailurePoint::AfterHolderCreated ||
+                               point == ExactInputMountFailurePoint::AfterHolderAttachedA ||
+                               point == ExactInputMountFailurePoint::AfterHolderAttachedB ||
+                               point == ExactInputMountFailurePoint::AfterHolder ||
+                               point == ExactInputMountFailurePoint::AfterTopology ||
+                               point == ExactInputMountFailurePoint::AfterSidecarCreate ||
+                               point == ExactInputMountFailurePoint::AfterMountInspect ||
+                               point == ExactInputMountFailurePoint::SidecarCreateReportedTimeout;
+    const bool expect_sidecar = point == ExactInputMountFailurePoint::AfterSidecarCreate ||
+                                point == ExactInputMountFailurePoint::AfterMountInspect ||
+                                point == ExactInputMountFailurePoint::SidecarCreateReportedTimeout;
+    if (!receipt.directory_acquired || receipt.input_acquired != expect_input ||
+        receipt.network_a_acquired != expect_network_a ||
+        receipt.network_b_acquired != expect_network_b ||
+        receipt.holder_acquired != expect_holder || receipt.sidecar_acquired != expect_sidecar) {
+        error = "injected setup receipt did not identify exactly the acquired resource prefix";
         return false;
     }
     return true;
@@ -198,14 +299,7 @@ int main() {
     ExactInputMountRecoveryReceipt replay;
     if (controller->finish(moved, replay, diagnostic) ||
         diagnostic.phase != ExactInputMountPhase::Lifecycle ||
-        !controller->recover_all(replay, diagnostic) ||
-        replay.sidecar_order != frozen.sidecar_order || replay.input_order != frozen.input_order ||
-        replay.directory_order != frozen.directory_order ||
-        replay.holder_order != frozen.holder_order ||
-        replay.network_b_order != frozen.network_b_order ||
-        replay.network_a_order != frozen.network_a_order ||
-        replay.diagnostic.phase != frozen.diagnostic.phase ||
-        replay.diagnostic.message != frozen.diagnostic.message) {
+        !controller->recover_all(replay, diagnostic) || !receipt_equal(replay, frozen)) {
         std::cerr << "FAIL [#358 exact input mount frozen replay]: " << diagnostic.message << "\n";
         return 1;
     }
@@ -231,10 +325,17 @@ int main() {
     }
 
     for (const ExactInputMountFailurePoint point : {
-             ExactInputMountFailurePoint::AfterManifest,
              ExactInputMountFailurePoint::AfterDirectory,
              ExactInputMountFailurePoint::AfterInputFile,
+             ExactInputMountFailurePoint::AfterNetworkACreated,
+             ExactInputMountFailurePoint::AfterNetworkAVerified,
+             ExactInputMountFailurePoint::AfterNetworkBCreated,
+             ExactInputMountFailurePoint::AfterNetworkBVerified,
+             ExactInputMountFailurePoint::AfterBothIpamVerified,
              ExactInputMountFailurePoint::AfterNetworks,
+             ExactInputMountFailurePoint::AfterHolderCreated,
+             ExactInputMountFailurePoint::AfterHolderAttachedA,
+             ExactInputMountFailurePoint::AfterHolderAttachedB,
              ExactInputMountFailurePoint::AfterHolder,
              ExactInputMountFailurePoint::AfterTopology,
              ExactInputMountFailurePoint::AfterSidecarCreate,
@@ -246,6 +347,57 @@ int main() {
             std::cerr << "FAIL [#358 exact input mount failure boundary]: " << error << "\n";
             return 1;
         }
+    }
+
+    // A pre-mutation failure is truthfully settled as not applicable and is
+    // safe both for explicit recovery and ordinary controller destruction.
+    {
+        ExactInputMountRecoveryController pre_mutation;
+        ExactInputMountHandle unused;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::PreflightBeforeMutation;
+        if (pre_mutation.start(kConfig.data(), kConfig.size(), unused, diagnostic, options) ||
+            diagnostic.phase != ExactInputMountPhase::Preflight ||
+            !pre_mutation.recover_all(receipt, diagnostic) || !receipt.cleanup_not_applicable ||
+            receipt.graph_mutated || !receipt.settlement_complete || !receipt.terminal_frozen ||
+            receipt.terminal_result != ExactInputMountTerminalResult::SettledCleanly ||
+            receipt.sidecar_settled || receipt.input_settled || receipt.directory_settled ||
+            receipt.holder_settled || receipt.network_b_settled || receipt.network_a_settled ||
+            !receipt.manifest_not_applicable || !receipt.final_zero_residue) {
+            std::cerr << "FAIL [#358 exact input mount pre-mutation settlement]: "
+                      << diagnostic.message << "\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen_not_applicable = receipt;
+        ExactInputMountRecoveryReceipt not_applicable_replay;
+        if (!pre_mutation.recover_all(not_applicable_replay, diagnostic) ||
+            !receipt_equal(not_applicable_replay, frozen_not_applicable)) {
+            std::cerr << "FAIL [#358 exact input mount pre-mutation replay]\n";
+            return 1;
+        }
+    }
+    child = fork();
+    if (child < 0) {
+        std::cerr << "FAIL [#358 exact input mount pre-mutation death setup]: fork failed\n";
+        return 1;
+    }
+    if (child == 0) {
+        {
+            ExactInputMountRecoveryController pre_mutation;
+            ExactInputMountHandle unused;
+            ExactInputMountDiagnostic child_diagnostic;
+            ExactInputMountOptions options;
+            options.failure_point = ExactInputMountFailurePoint::PreflightBeforeMutation;
+            (void)pre_mutation.start(
+                kConfig.data(), kConfig.size(), unused, child_diagnostic, options);
+        }
+        _exit(0);
+    }
+    int pre_mutation_status = 0;
+    if (waitpid(child, &pre_mutation_status, 0) != child || !WIFEXITED(pre_mutation_status) ||
+        WEXITSTATUS(pre_mutation_status) != 0) {
+        std::cerr << "FAIL [#358 exact input mount pre-mutation death]: unsafe destruction\n";
+        return 1;
     }
 
     // Revalidation rejection retains the complete graph; retry performs no replayed setup.
@@ -292,6 +444,51 @@ int main() {
         if (!timed.start(kConfig.data(), kConfig.size(), timed_handle, diagnostic, options) ||
             !timed.finish(timed_handle, receipt, diagnostic) || !exact_terminal(receipt)) {
             std::cerr << "FAIL [#358 exact input mount timeout recovery]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+    }
+    // Exact, externally caused disappearance settles the whole graph but can
+    // never be rewritten into a successful operation result.
+    for (const auto& anomaly : {
+             std::pair{ExactInputMountFailurePoint::SidecarDisappearBeforeCleanup,
+                       ExactInputMountPhase::SidecarSettlement},
+             std::pair{ExactInputMountFailurePoint::HolderDisappearBeforeCleanup,
+                       ExactInputMountPhase::HolderSettlement},
+         }) {
+        ExactInputMountRecoveryController anomalous;
+        ExactInputMountHandle anomalous_handle;
+        ExactInputMountOptions options;
+        options.failure_point = anomaly.first;
+        if (!anomalous.start(
+                kConfig.data(), kConfig.size(), anomalous_handle, diagnostic, options) ||
+            anomalous.finish(anomalous_handle, receipt, diagnostic) ||
+            !operation_failure_terminal(receipt, anomaly.second)) {
+            std::cerr << "FAIL [#358 exact input mount operation anomaly]: " << diagnostic.message
+                      << "\n";
+            return 1;
+        }
+        const ExactInputMountRecoveryReceipt frozen_failure = receipt;
+        ExactInputMountRecoveryReceipt failure_replay;
+        if (anomalous.recover_all(failure_replay, diagnostic) ||
+            !receipt_equal(failure_replay, frozen_failure)) {
+            std::cerr << "FAIL [#358 exact input mount operation anomaly replay]\n";
+            return 1;
+        }
+    }
+    // A real sidecar death between the two identity brackets rejects stale
+    // /proc credential evidence and still permits exact recovery.
+    {
+        ExactInputMountRecoveryController bracketed;
+        ExactInputMountHandle never_borrowed;
+        ExactInputMountOptions options;
+        options.failure_point = ExactInputMountFailurePoint::CredentialBoundarySidecarDeath;
+        if (bracketed.start(kConfig.data(), kConfig.size(), never_borrowed, diagnostic, options) ||
+            diagnostic.phase != ExactInputMountPhase::MountInspect ||
+            diagnostic.message.find("post-read exact sidecar identity proof failed") ==
+                std::string::npos ||
+            !bracketed.recover_all(receipt, diagnostic) || !truthful_partial_terminal(receipt)) {
+            std::cerr << "FAIL [#358 exact input mount credential bracket]: " << diagnostic.message
                       << "\n";
             return 1;
         }

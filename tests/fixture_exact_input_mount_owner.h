@@ -18,6 +18,12 @@ enum class ExactInputMountState : std::uint8_t {
     Unresolved,
 };
 
+enum class ExactInputMountTerminalResult : std::uint8_t {
+    None,
+    SettledCleanly,
+    SettledWithOperationFailure,
+};
+
 enum class ExactInputMountPhase : std::uint8_t {
     None,
     Argument,
@@ -46,16 +52,27 @@ enum class ExactInputMountPhase : std::uint8_t {
 // Every fault is a tests-only boundary. Production callers use None.
 enum class ExactInputMountFailurePoint : std::uint8_t {
     None,
-    AfterManifest,
+    PreflightBeforeMutation,
     AfterDirectory,
     AfterInputFile,
+    AfterNetworkACreated,
+    AfterNetworkAVerified,
+    AfterNetworkBCreated,
+    AfterNetworkBVerified,
+    AfterBothIpamVerified,
     AfterNetworks,
+    AfterHolderCreated,
+    AfterHolderAttachedA,
+    AfterHolderAttachedB,
     AfterHolder,
     AfterTopology,
     AfterSidecarCreate,
     AfterMountInspect,
     SidecarCreateReportedTimeout,
     SidecarCleanupReportedTimeout,
+    SidecarDisappearBeforeCleanup,
+    HolderDisappearBeforeCleanup,
+    CredentialBoundarySidecarDeath,
     RejectSidecarRevalidationOnce,
     DisconnectNetworkBeforeInputCleanup,
 };
@@ -106,7 +123,16 @@ struct ExactInputMountSnapshot {
 
 struct ExactInputMountRecoveryReceipt {
     ExactInputMountState state = ExactInputMountState::Empty;
+    ExactInputMountTerminalResult terminal_result = ExactInputMountTerminalResult::None;
     bool attempted = false;
+    bool graph_mutated = false;
+    bool cleanup_not_applicable = false;
+    bool sidecar_acquired = false;
+    bool input_acquired = false;
+    bool directory_acquired = false;
+    bool holder_acquired = false;
+    bool network_b_acquired = false;
+    bool network_a_acquired = false;
     bool sidecar_settled = false;
     bool first_topology_revalidated = false;
     bool input_settled = false;
@@ -115,7 +141,7 @@ struct ExactInputMountRecoveryReceipt {
     bool holder_settled = false;
     bool network_b_settled = false;
     bool network_a_settled = false;
-    bool manifest_settled = false;
+    bool manifest_not_applicable = false;
     bool final_zero_residue = false;
     bool settlement_complete = false;
     bool terminal_frozen = false;
