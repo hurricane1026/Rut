@@ -10746,7 +10746,9 @@ RunResult run_with_held_topology_and_sidecar(
 
         const u64 commands_before_holder_replay = command_invocation_count;
         const CleanupEvidence before_holder_replay = holder_settled;
-        std::string holder_replay_error = "stale";
+        // Phase APIs append diagnostics and never clear caller-owned history.
+        // Use a fresh accumulator when proving an inert replay adds none.
+        std::string holder_replay_error;
         const CleanupPhaseResult holder_replay = fixture.cleanup_holder_phase(holder_replay_error);
         if (!cleanup_phase_result_equal(retry, holder_replay) || !holder_replay_error.empty() ||
             command_invocation_count != commands_before_holder_replay ||
