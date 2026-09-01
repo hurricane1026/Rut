@@ -113,6 +113,14 @@ add_test(NAME test_fixture_private_directory_lease COMMAND test_fixture_private_
 set_tests_properties(test_fixture_private_directory_lease PROPERTIES
     LABELS "unit" RUN_SERIAL TRUE TIMEOUT 30)
 
+add_library(fixture_exact_input_file_lease STATIC fixture_exact_input_file_lease.cc)
+target_include_directories(fixture_exact_input_file_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fixture_exact_input_file_lease PUBLIC fixture_private_directory_lease)
+add_executable(test_fixture_exact_input_file_lease test_fixture_exact_input_file_lease.cc)
+target_link_libraries(test_fixture_exact_input_file_lease PRIVATE fixture_exact_input_file_lease)
+add_test(NAME test_fixture_exact_input_file_lease COMMAND test_fixture_exact_input_file_lease)
+set_tests_properties(test_fixture_exact_input_file_lease PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # Pure #377 paused direct-child lease. This owns only a forked readiness/release
 # barrier and pidfd authority; source, log, listener and runtime state remain
 # in separately reviewed fixtures.
