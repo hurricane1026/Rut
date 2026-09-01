@@ -11,7 +11,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -1315,8 +1317,88 @@ static bool container_netns_inode(const std::string& holder, ino_t& inode) {
 enum class CleanupProgress : std::uint8_t {
     Active,
     SidecarSettled,
+    ActionSettled,
     TopologySettled,
 };
+
+struct InterphaseActionDiagnostic {
+    u32 code = 0;
+    int error_number = 0;
+};
+
+struct InterphaseActionResult {
+    bool settled = false;
+    bool operation_ok = false;
+    bool retryable = false;
+    InterphaseActionDiagnostic diagnostic;
+};
+
+class InterphaseSettlementAction {
+public:
+    virtual ~InterphaseSettlementAction() noexcept = default;
+    virtual InterphaseActionResult settle() noexcept = 0;
+};
+
+enum class InterphaseActionState : std::uint8_t {
+    None,
+    Pending,
+    Invoking,
+    Retryable,
+    Settled,
+    Unresolved,
+};
+
+constexpr u32 kInterphaseDiagnosticIllegalResult = 1;
+constexpr u32 kInterphaseDiagnosticReentry = 2;
+constexpr u32 kInterphaseDiagnosticTopologyNotLive = 3;
+
+struct InterphaseInvocationView {
+    bool sidecar_absent = false;
+    bool create_authority_cleared = false;
+    bool holder_live = false;
+    bool network_b_live = false;
+    bool network_a_live = false;
+};
+
+class Fixture;
+static thread_local Fixture* invoking_interphase_fixture = nullptr;
+static thread_local InterphaseInvocationView invoking_interphase_view;
+
+struct RetainedInterphaseAction {
+    std::unique_ptr<InterphaseSettlementAction> action;
+    RetainedInterphaseAction* next = nullptr;
+};
+
+// Unsettled actions may own file/directory leases whose destructors must not
+// run while a sibling bind mount may still exist.  Each action-bearing Fixture
+// preallocates one retention node, so its destructor can transfer the complete
+// graph into this TU-private process-lifetime list without allocating.  Causal
+// tests unlink their fake actions and destroy them explicitly.
+static RetainedInterphaseAction* retained_interphase_actions = nullptr;
+
+static void retain_interphase_action(
+    std::unique_ptr<InterphaseSettlementAction>& action,
+    std::unique_ptr<RetainedInterphaseAction>& retention) noexcept {
+    if (action == nullptr || retention == nullptr) return;
+    retention->action = std::move(action);
+    retention->next = retained_interphase_actions;
+    retained_interphase_actions = retention.release();
+}
+
+static std::unique_ptr<InterphaseSettlementAction> take_retained_interphase_action(
+    const InterphaseSettlementAction* expected) noexcept {
+    RetainedInterphaseAction** link = &retained_interphase_actions;
+    while (*link != nullptr) {
+        RetainedInterphaseAction* node = *link;
+        if (node->action.get() == expected) {
+            *link = node->next;
+            std::unique_ptr<RetainedInterphaseAction> owned_node(node);
+            return std::move(owned_node->action);
+        }
+        link = &node->next;
+    }
+    return {};
+}
 
 struct CleanupPhaseResult {
     bool settled = false;
@@ -1333,6 +1415,12 @@ struct CleanupEvidence {
     bool topology_operation_ok = true;
     bool cleanup_reported_timeout_observed = false;
     bool sidecar_creation_may_have_mutated = false;
+    InterphaseActionState action_state = InterphaseActionState::None;
+    std::uintptr_t action_address = 0;
+    u64 action_attempt_count = 0;
+    bool action_operation_ok = true;
+    bool action_diagnostic_recorded = false;
+    InterphaseActionDiagnostic first_action_diagnostic;
 };
 
 static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvidence& right) {
@@ -1343,20 +1431,48 @@ static bool cleanup_evidence_equal(const CleanupEvidence& left, const CleanupEvi
            left.sidecar_operation_ok == right.sidecar_operation_ok &&
            left.topology_operation_ok == right.topology_operation_ok &&
            left.cleanup_reported_timeout_observed == right.cleanup_reported_timeout_observed &&
-           left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated;
+           left.sidecar_creation_may_have_mutated == right.sidecar_creation_may_have_mutated &&
+           left.action_state == right.action_state && left.action_address == right.action_address &&
+           left.action_attempt_count == right.action_attempt_count &&
+           left.action_operation_ok == right.action_operation_ok &&
+           left.action_diagnostic_recorded == right.action_diagnostic_recorded &&
+           left.first_action_diagnostic.code == right.first_action_diagnostic.code &&
+           left.first_action_diagnostic.error_number == right.first_action_diagnostic.error_number;
 }
+
+struct InterphaseSelfCheckTrace {
+    std::array<u32, 16> events{};
+    size_t event_count = 0;
+    u64 action_calls = 0;
+    u64 action_destructions = 0;
+    InterphaseInvocationView observed_view;
+
+    void record(u32 event) noexcept {
+        if (event_count < events.size()) events[event_count++] = event;
+    }
+};
 
 class Fixture {
 public:
-    explicit Fixture(std::string token) : token_(std::move(token)) {
+    explicit Fixture(std::string token) : Fixture(std::move(token), nullptr) {}
+    Fixture(std::string token, std::unique_ptr<InterphaseSettlementAction> action)
+        : token_(std::move(token)),
+          interphase_action_(std::move(action)),
+          retained_interphase_action_(
+              interphase_action_ ? std::make_unique<RetainedInterphaseAction>() : nullptr),
+          interphase_action_state_(interphase_action_ ? InterphaseActionState::Pending
+                                                      : InterphaseActionState::None),
+          interphase_action_address_(reinterpret_cast<std::uintptr_t>(interphase_action_.get())) {
         network_a_.name = "rut358-a-" + token_;
         network_b_.name = "rut358-b-" + token_;
         holder_name_ = "rut358-holder-" + token_;
         sidecar_name_ = "rut358-sidecar-" + token_;
     }
-    ~Fixture() {
+    ~Fixture() noexcept {
         std::string ignored;
         (void)cleanup(ignored);
+        if (interphase_action_ != nullptr)
+            retain_interphase_action(interphase_action_, retained_interphase_action_);
     }
 
     const std::string& token() const { return token_; }
@@ -1390,7 +1506,25 @@ public:
                 sidecar_settlement_operation_ok_,
                 topology_settlement_operation_ok_,
                 cleanup_reported_timeout_observed_,
-                sidecar_creation_may_have_mutated_};
+                sidecar_creation_may_have_mutated_,
+                interphase_action_state_,
+                interphase_action_address_,
+                interphase_action_attempt_count_,
+                interphase_action_operation_ok_,
+                interphase_action_diagnostic_recorded_,
+                first_interphase_action_diagnostic_};
+    }
+
+    void prepare_interphase_self_check(std::shared_ptr<InterphaseSelfCheckTrace> trace,
+                                       bool authoritative_sidecar_absence = true) {
+        interphase_self_check_trace_ = std::move(trace);
+        cleanup_progress_ = authoritative_sidecar_absence ? CleanupProgress::SidecarSettled
+                                                          : CleanupProgress::Active;
+        sidecar_exists_ = false;
+        sidecar_creation_may_have_mutated_ = !authoritative_sidecar_absence;
+        holder_exists_ = true;
+        network_a_.exists = true;
+        network_b_.exists = true;
     }
 
     bool set_subnet_plan(const SubnetPlan& plan) {
@@ -1833,6 +1967,13 @@ public:
         if (cleanup_progress_ >= CleanupProgress::SidecarSettled) return {true, true};
 
         bool operation_ok = true;
+        if (interphase_self_check_trace_ != nullptr && !sidecar_exists_ &&
+            sidecar_creation_may_have_mutated_) {
+            sidecar_settlement_operation_ok_ = false;
+            if (!error.empty()) error += "; ";
+            error += "sidecar creation state remains unresolved in inter-phase self-check";
+            return {false, false};
+        }
         if (!sidecar_exists_ && sidecar_creation_may_have_mutated_) {
             std::string recovery_error;
             if (!recover_uncertain_sidecar_or_prove_absence(recovery_error)) {
@@ -1863,9 +2004,114 @@ public:
         return {true, operation_ok};
     }
 
+    CleanupPhaseResult cleanup_interphase_action(std::string& error) {
+        if (cleanup_progress_ >= CleanupProgress::ActionSettled) {
+            append_recorded_interphase_error(error);
+            return {true, interphase_action_operation_ok_};
+        }
+        if (cleanup_progress_ != CleanupProgress::SidecarSettled || sidecar_exists_ ||
+            sidecar_creation_may_have_mutated_) {
+            append_interphase_error(error,
+                                    {kInterphaseDiagnosticTopologyNotLive, EBUSY},
+                                    "refusing inter-phase action before exact sidecar settlement");
+            return {false, false};
+        }
+        if (interphase_action_ == nullptr) {
+            interphase_action_state_ = InterphaseActionState::None;
+            cleanup_progress_ = CleanupProgress::ActionSettled;
+            return {true, true};
+        }
+        if (interphase_action_state_ == InterphaseActionState::Unresolved) {
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+        if (interphase_action_state_ == InterphaseActionState::Invoking) {
+            remember_interphase_diagnostic({kInterphaseDiagnosticReentry, EDEADLK});
+            interphase_action_operation_ok_ = false;
+            interphase_action_state_ = InterphaseActionState::Unresolved;
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+        if (interphase_action_state_ == InterphaseActionState::Settled) {
+            cleanup_progress_ = CleanupProgress::ActionSettled;
+            append_recorded_interphase_error(error);
+            return {true, interphase_action_operation_ok_};
+        }
+        if (interphase_action_state_ != InterphaseActionState::Pending &&
+            interphase_action_state_ != InterphaseActionState::Retryable) {
+            remember_interphase_diagnostic({kInterphaseDiagnosticIllegalResult, EPROTO});
+            interphase_action_operation_ok_ = false;
+            interphase_action_state_ = InterphaseActionState::Unresolved;
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+
+        if (!holder_exists_ || !network_b_.exists || !network_a_.exists) {
+            remember_interphase_diagnostic({kInterphaseDiagnosticTopologyNotLive, ENOENT});
+            interphase_action_operation_ok_ = false;
+            interphase_action_state_ = InterphaseActionState::Unresolved;
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+        if (interphase_action_attempt_count_ == 0 && interphase_self_check_trace_ == nullptr) {
+            std::string validation_error;
+            if (!verify_topology(FailurePoint::None, validation_error)) {
+                if (!error.empty()) error += "; ";
+                error += "inter-phase topology revalidation failed";
+                if (!validation_error.empty()) error += ": " + validation_error;
+                return {false, false};
+            }
+        }
+
+        invoking_interphase_view = {true, true, true, true, true};
+        invoking_interphase_fixture = this;
+        interphase_action_state_ = InterphaseActionState::Invoking;
+        ++interphase_action_attempt_count_;
+        const InterphaseActionResult result = interphase_action_->settle();
+        invoking_interphase_fixture = nullptr;
+        invoking_interphase_view = {};
+
+        // A recursive cleanup permanently changes Invoking to Unresolved.  An
+        // apparently successful outer return must never overwrite that state.
+        if (interphase_action_state_ != InterphaseActionState::Invoking) {
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+
+        const bool legal =
+            !(result.settled && result.retryable) && !(!result.settled && result.operation_ok);
+        if (!legal) {
+            remember_interphase_diagnostic({kInterphaseDiagnosticIllegalResult, EPROTO});
+            interphase_action_operation_ok_ = false;
+            interphase_action_state_ = InterphaseActionState::Unresolved;
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+
+        interphase_action_operation_ok_ = interphase_action_operation_ok_ && result.operation_ok;
+        if (!result.operation_ok || result.diagnostic.code != 0 ||
+            result.diagnostic.error_number != 0)
+            remember_interphase_diagnostic(result.diagnostic);
+        if (!result.settled) {
+            interphase_action_state_ = result.retryable ? InterphaseActionState::Retryable
+                                                        : InterphaseActionState::Unresolved;
+            append_recorded_interphase_error(error);
+            return {false, false};
+        }
+
+        interphase_action_state_ = InterphaseActionState::Settled;
+        cleanup_progress_ = CleanupProgress::ActionSettled;
+        // The action has proved its resource settlement.  Destroy it before
+        // releasing the holder/networks so future action-owned lease receipts
+        // finish while topology custody is still live.
+        interphase_action_.reset();
+        append_recorded_interphase_error(error);
+        return {true, interphase_action_operation_ok_};
+    }
+
     CleanupPhaseResult cleanup_topology_phase(std::string& error) {
         if (cleanup_progress_ == CleanupProgress::TopologySettled) return {true, true};
-        if (cleanup_progress_ < CleanupProgress::SidecarSettled || sidecar_exists_ ||
+        if (cleanup_progress_ < CleanupProgress::ActionSettled || sidecar_exists_ ||
             sidecar_creation_may_have_mutated_) {
             if (!error.empty()) error += "; ";
             error += "refusing holder/network cleanup before exact sidecar settlement";
@@ -1873,6 +2119,22 @@ public:
         }
 
         bool operation_ok = true;
+        if (interphase_self_check_trace_ != nullptr) {
+            if (holder_exists_) {
+                interphase_self_check_trace_->record(3);
+                holder_exists_ = false;
+            }
+            if (network_b_.exists) {
+                interphase_self_check_trace_->record(4);
+                network_b_.exists = false;
+            }
+            if (network_a_.exists) {
+                interphase_self_check_trace_->record(5);
+                network_a_.exists = false;
+            }
+            cleanup_progress_ = CleanupProgress::TopologySettled;
+            return {true, true};
+        }
         if (holder_exists_) {
             if (!validate_holder(error))
                 operation_ok = false;
@@ -1920,11 +2182,35 @@ public:
     bool cleanup(std::string& error) {
         const CleanupPhaseResult sidecar = cleanup_sidecar_phase(error);
         if (!sidecar.settled) return false;
+        const CleanupPhaseResult action = cleanup_interphase_action(error);
+        if (!action.settled) return false;
         const CleanupPhaseResult topology = cleanup_topology_phase(error);
-        return sidecar.operation_ok && topology.settled && topology.operation_ok;
+        return sidecar.operation_ok && action.operation_ok && topology.settled &&
+               topology.operation_ok;
     }
 
 private:
+    void remember_interphase_diagnostic(InterphaseActionDiagnostic diagnostic) noexcept {
+        if (interphase_action_diagnostic_recorded_) return;
+        interphase_action_diagnostic_recorded_ = true;
+        first_interphase_action_diagnostic_ = diagnostic;
+    }
+
+    void append_recorded_interphase_error(std::string& error) const {
+        if (!interphase_action_diagnostic_recorded_) return;
+        append_interphase_error(
+            error, first_interphase_action_diagnostic_, "inter-phase settlement action failed");
+    }
+
+    static void append_interphase_error(std::string& error,
+                                        InterphaseActionDiagnostic diagnostic,
+                                        const char* prefix) {
+        if (!error.empty()) error += "; ";
+        error += prefix;
+        error += " (code=" + std::to_string(diagnostic.code) +
+                 ", errno=" + std::to_string(diagnostic.error_number) + ")";
+    }
+
     bool injected(std::string& error) {
         error = "injected boundary failure";
         return false;
@@ -2439,9 +2725,317 @@ private:
     CleanupProgress cleanup_progress_ = CleanupProgress::Active;
     bool sidecar_settlement_operation_ok_ = true;
     bool topology_settlement_operation_ok_ = true;
+    std::unique_ptr<InterphaseSettlementAction> interphase_action_;
+    std::unique_ptr<RetainedInterphaseAction> retained_interphase_action_;
+    InterphaseActionState interphase_action_state_ = InterphaseActionState::None;
+    std::uintptr_t interphase_action_address_ = 0;
+    u64 interphase_action_attempt_count_ = 0;
+    bool interphase_action_operation_ok_ = true;
+    bool interphase_action_diagnostic_recorded_ = false;
+    InterphaseActionDiagnostic first_interphase_action_diagnostic_;
+    std::shared_ptr<InterphaseSelfCheckTrace> interphase_self_check_trace_;
     HeldNamespaceSidecarRevalidationFault sidecar_revalidation_fault_ =
         HeldNamespaceSidecarRevalidationFault::None;
 };
+
+class FakeInterphaseAction final : public InterphaseSettlementAction {
+public:
+    FakeInterphaseAction(std::shared_ptr<InterphaseSelfCheckTrace> trace,
+                         std::array<InterphaseActionResult, 3> results,
+                         size_t result_count,
+                         bool reenter = false) noexcept
+        : trace_(std::move(trace)),
+          results_(results),
+          result_count_(result_count),
+          reenter_(reenter) {}
+
+    ~FakeInterphaseAction() noexcept override {
+        ++trace_->action_destructions;
+        trace_->record(2);
+    }
+
+    InterphaseActionResult settle() noexcept override {
+        ++trace_->action_calls;
+        trace_->record(1);
+        trace_->observed_view = invoking_interphase_view;
+        if (reenter_ && invoking_interphase_fixture != nullptr) {
+            std::string ignored;
+            (void)invoking_interphase_fixture->cleanup(ignored);
+        }
+        if (result_count_ == 0) return {};
+        const size_t index = std::min(next_result_, result_count_ - 1);
+        ++next_result_;
+        return results_[index];
+    }
+
+private:
+    std::shared_ptr<InterphaseSelfCheckTrace> trace_;
+    std::array<InterphaseActionResult, 3> results_{};
+    size_t result_count_ = 0;
+    size_t next_result_ = 0;
+    bool reenter_ = false;
+};
+
+static std::unique_ptr<InterphaseSettlementAction> fake_interphase_action(
+    const std::shared_ptr<InterphaseSelfCheckTrace>& trace,
+    std::initializer_list<InterphaseActionResult> results,
+    bool reenter = false) {
+    std::array<InterphaseActionResult, 3> bounded{};
+    size_t count = 0;
+    for (const InterphaseActionResult& result : results) {
+        if (count < bounded.size()) bounded[count++] = result;
+    }
+    return std::make_unique<FakeInterphaseAction>(trace, bounded, count, reenter);
+}
+
+static bool exact_interphase_events(const InterphaseSelfCheckTrace& trace,
+                                    std::initializer_list<u32> expected) {
+    if (trace.event_count != expected.size()) return false;
+    size_t index = 0;
+    for (u32 event : expected) {
+        if (trace.events[index++] != event) return false;
+    }
+    return true;
+}
+
+static bool interphase_action_self_checks(std::string& error) {
+    const u64 commands_before = command_invocation_count;
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        Fixture fixture("interphase-legacy");
+        fixture.prepare_interphase_self_check(trace);
+        std::string cleanup_error;
+        if (!fixture.cleanup(cleanup_error) || !cleanup_error.empty() || trace->action_calls != 0 ||
+            trace->action_destructions != 0 || !exact_interphase_events(*trace, {3, 4, 5}) ||
+            command_invocation_count != commands_before) {
+            error = "legacy no-action inter-phase path changed commands or cleanup ordering";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        auto action = fake_interphase_action(trace, {{true, true, false, {0, 0}}});
+        const auto* address = action.get();
+        Fixture fixture("interphase-happy", std::move(action));
+        fixture.prepare_interphase_self_check(trace);
+        std::string cleanup_error;
+        if (!fixture.cleanup(cleanup_error) || !cleanup_error.empty() || trace->action_calls != 1 ||
+            trace->action_destructions != 1 || !trace->observed_view.sidecar_absent ||
+            !trace->observed_view.create_authority_cleared || !trace->observed_view.holder_live ||
+            !trace->observed_view.network_b_live || !trace->observed_view.network_a_live ||
+            !exact_interphase_events(*trace, {1, 2, 3, 4, 5})) {
+            error = "happy inter-phase action lacked exact invocation/destruction order";
+            return false;
+        }
+        const CleanupEvidence terminal = fixture.cleanup_evidence();
+        if (terminal.progress != CleanupProgress::TopologySettled ||
+            terminal.action_state != InterphaseActionState::Settled ||
+            terminal.action_address != reinterpret_cast<std::uintptr_t>(address) ||
+            terminal.action_attempt_count != 1 || !terminal.action_operation_ok ||
+            terminal.action_diagnostic_recorded) {
+            error = "happy inter-phase terminal evidence was incomplete";
+            return false;
+        }
+        const u64 replay_commands = command_invocation_count;
+        std::string replay_error;
+        if (!fixture.cleanup(replay_error) || !replay_error.empty() || trace->action_calls != 1 ||
+            command_invocation_count != replay_commands ||
+            !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+            error = "happy inter-phase terminal replay was not inert";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        auto action = fake_interphase_action(
+            trace, {{false, false, true, {11, EAGAIN}}, {true, true, false, {0, 0}}});
+        const auto* address = action.get();
+        Fixture fixture("interphase-retry", std::move(action));
+        fixture.prepare_interphase_self_check(trace);
+        std::string first_error;
+        if (fixture.cleanup(first_error) || trace->action_calls != 1 ||
+            trace->action_destructions != 0 ||
+            fixture.cleanup_evidence().action_state != InterphaseActionState::Retryable ||
+            fixture.cleanup_evidence().action_address !=
+                reinterpret_cast<std::uintptr_t>(address) ||
+            !fixture.cleanup_evidence().holder_exists ||
+            !fixture.cleanup_evidence().network_b_exists ||
+            !fixture.cleanup_evidence().network_a_exists) {
+            error = "retryable inter-phase failure did not retain exact topology/action custody";
+            return false;
+        }
+        std::string second_error;
+        if (fixture.cleanup(second_error) || first_error != second_error ||
+            trace->action_calls != 2 || trace->action_destructions != 1 ||
+            !exact_interphase_events(*trace, {1, 1, 2, 3, 4, 5}) ||
+            fixture.cleanup_evidence().progress != CleanupProgress::TopologySettled ||
+            fixture.cleanup_evidence().action_attempt_count != 2 ||
+            fixture.cleanup_evidence().action_operation_ok ||
+            fixture.cleanup_evidence().first_action_diagnostic.code != 11) {
+            error = "retryable inter-phase action did not retry once then settle truthfully";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        Fixture fixture("interphase-settled-failure",
+                        fake_interphase_action(trace, {{true, false, false, {12, EIO}}}));
+        fixture.prepare_interphase_self_check(trace);
+        std::string first_error;
+        if (fixture.cleanup(first_error) || trace->action_calls != 1 ||
+            trace->action_destructions != 1 ||
+            fixture.cleanup_evidence().progress != CleanupProgress::TopologySettled ||
+            !exact_interphase_events(*trace, {1, 2, 3, 4, 5})) {
+            error = "settled failed inter-phase action did not permit topology settlement";
+            return false;
+        }
+        const CleanupEvidence terminal = fixture.cleanup_evidence();
+        std::string replay_error;
+        if (fixture.cleanup(replay_error) || replay_error != first_error ||
+            trace->action_calls != 1 ||
+            !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+            error = "settled failed inter-phase action did not replay stable failure evidence";
+            return false;
+        }
+    }
+
+    for (const bool illegal : {false, true}) {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        const InterphaseActionResult result =
+            illegal ? InterphaseActionResult{true, true, true, {99, 0}}
+                    : InterphaseActionResult{false, false, false, {13, EPERM}};
+        auto action = fake_interphase_action(trace, {result});
+        const auto* address = action.get();
+        {
+            Fixture fixture(illegal ? "interphase-illegal" : "interphase-unresolved",
+                            std::move(action));
+            fixture.prepare_interphase_self_check(trace);
+            std::string first_error;
+            if (fixture.cleanup(first_error) || trace->action_calls != 1 ||
+                trace->action_destructions != 0 ||
+                fixture.cleanup_evidence().action_state != InterphaseActionState::Unresolved ||
+                !fixture.cleanup_evidence().holder_exists ||
+                !fixture.cleanup_evidence().network_b_exists ||
+                !fixture.cleanup_evidence().network_a_exists) {
+                error = "permanent/illegal inter-phase result did not fail closed";
+                return false;
+            }
+        }
+        if (trace->action_destructions != 0) {
+            error = "unresolved action was destroyed by Fixture destructor";
+            return false;
+        }
+        std::unique_ptr<InterphaseSettlementAction> recovered =
+            take_retained_interphase_action(address);
+        if (!recovered) {
+            error = "unresolved fake action could not be recovered from retention custody";
+            return false;
+        }
+        recovered.reset();
+        if (trace->action_destructions != 1) {
+            error = "recovered unresolved fake action did not destroy exactly once";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        auto action = fake_interphase_action(trace, {{true, true, false, {0, 0}}});
+        const auto* address = action.get();
+        {
+            Fixture fixture("interphase-sidecar-unresolved", std::move(action));
+            fixture.prepare_interphase_self_check(trace, false);
+        }
+        if (trace->action_calls != 0 || trace->action_destructions != 0 ||
+            trace->event_count != 0) {
+            error = "unresolved sidecar authority invoked/destroyed the action or topology";
+            return false;
+        }
+        auto recovered = take_retained_interphase_action(address);
+        if (!recovered) {
+            error = "sidecar-blocked fake action was not retained by destructor fallback";
+            return false;
+        }
+        recovered.reset();
+        if (trace->action_destructions != 1 || !exact_interphase_events(*trace, {2})) {
+            error = "sidecar-blocked fake action recovery evidence was not exact";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        auto action = fake_interphase_action(trace, {{false, false, true, {14, EAGAIN}}});
+        const auto* address = action.get();
+        {
+            Fixture fixture("interphase-destructor-retry", std::move(action));
+            fixture.prepare_interphase_self_check(trace);
+        }
+        if (trace->action_calls != 1 || trace->action_destructions != 0 ||
+            trace->event_count != 1) {
+            error = "retryable destructor path mutated topology or destroyed the action";
+            return false;
+        }
+        auto recovered = take_retained_interphase_action(address);
+        if (!recovered) {
+            error = "retryable fake action was not retained by destructor fallback";
+            return false;
+        }
+        recovered.reset();
+        if (trace->action_destructions != 1 || !exact_interphase_events(*trace, {1, 2})) {
+            error = "retryable fake action recovery/destruction evidence was not exact";
+            return false;
+        }
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        auto action = fake_interphase_action(trace, {{true, true, false, {0, 0}}}, true);
+        const auto* address = action.get();
+        {
+            Fixture fixture("interphase-reentry", std::move(action));
+            fixture.prepare_interphase_self_check(trace);
+            std::string first_error;
+            if (fixture.cleanup(first_error) || trace->action_calls != 1 ||
+                fixture.cleanup_evidence().action_state != InterphaseActionState::Unresolved ||
+                fixture.cleanup_evidence().first_action_diagnostic.code !=
+                    kInterphaseDiagnosticReentry ||
+                trace->event_count != 1) {
+                error = "recursive inter-phase settlement was not bounded and failed closed";
+                return false;
+            }
+        }
+        auto recovered = take_retained_interphase_action(address);
+        if (!recovered) {
+            error = "re-entrant fake action did not remain in retention custody";
+            return false;
+        }
+        recovered.reset();
+    }
+
+    {
+        auto trace = std::make_shared<InterphaseSelfCheckTrace>();
+        {
+            Fixture fixture("interphase-destructor-happy",
+                            fake_interphase_action(trace, {{true, true, false, {0, 0}}}));
+            fixture.prepare_interphase_self_check(trace);
+        }
+        if (trace->action_calls != 1 || trace->action_destructions != 1 ||
+            !exact_interphase_events(*trace, {1, 2, 3, 4, 5})) {
+            error = "happy destructor did not settle/destroy action before topology release";
+            return false;
+        }
+    }
+
+    if (command_invocation_count != commands_before) {
+        error = "pure inter-phase action self-check issued an external command";
+        return false;
+    }
+    return true;
+}
 
 static bool write_manifest(const TempDir& temp, const Fixture& fixture) {
     const int fd = open(temp.manifest.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -2597,6 +3191,7 @@ bool audit_zero_residue(const std::string& token,
 }
 
 bool pure_validation_self_checks(std::string& error) {
+    if (!interphase_action_self_checks(error)) return false;
     u32 low = 0, high = 0;
     if (parse_cidr("10.0.0.1/24", low, high) || parse_cidr("10.0.0.0/31", low, high) ||
         parse_cidr("10.0.0.0/nope", low, high) || parse_cidr("10.0.0.0/", low, high)) {
