@@ -1947,6 +1947,22 @@ static bool parse_exact_bool(const std::string& text, bool& value) {
     return false;
 }
 
+static bool parse_exact_pid(const std::string& text, pid_t& value) {
+    if (text.empty() || !std::all_of(text.begin(), text.end(), [](char character) {
+            return character >= '0' && character <= '9';
+        }))
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = strtol(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' || parsed < 0 ||
+        static_cast<std::uintmax_t>(parsed) >
+            static_cast<std::uintmax_t>(std::numeric_limits<pid_t>::max()))
+        return false;
+    value = static_cast<pid_t>(parsed);
+    return static_cast<long>(value) == parsed;
+}
+
 static bool parse_sidecar_inspect_record(const std::string& record,
                                          HeldNamespaceSidecarSnapshot& snapshot,
                                          std::string& error) {
@@ -2489,6 +2505,25 @@ struct CleanupEvidence {
     bool holder_removal_may_have_mutated = false;
 };
 
+struct HolderCleanupIdentity {
+    std::string id;
+    std::string name;
+    std::string image_reference;
+    std::string image_id;
+    std::string stage;
+    std::string token;
+    bool running = false;
+    pid_t pid = -1;
+    std::string path;
+    std::string arguments_json;
+    bool read_only_root = false;
+    std::string port_bindings_json;
+    std::string network_ports_json;
+    std::string capability_drop_json;
+    std::string security_options_json;
+    std::string exposed_ports_json;
+};
+
 struct SetupEventEvidence {
     u32 network_a_create_count = 0;
     u32 network_a_verify_count = 0;
@@ -2510,8 +2545,10 @@ enum class PureHolderRetirementFault : std::uint8_t {
     NetworkIpam,
     PreRemovalMembership,
     RemovalTimeoutHolderPresent,
+    RemovalTimeoutHolderStoppedPresent,
     RemovalTimeoutHolderAbsent,
     RemovalRecoveryUncertain,
+    StoppedRecoveryIdentityMutation,
     HolderIdAbsence,
     HolderNameAbsence,
     ProcessAbsence,
@@ -2526,6 +2563,7 @@ struct PureHolderRetirementState {
     bool sidecar_mutation_uncertain = false;
     bool holder_exists = true;
     bool holder_removal_uncertain = false;
+    bool holder_stopped = false;
     bool operation_ok = true;
     u32 observation_count = 0;
     u32 holder_remove_count = 0;
@@ -2552,6 +2590,12 @@ static CleanupPhaseResult pure_holder_retirement_transition(PureHolderRetirement
             state.operation_ok = false;
             return {false, false};
         }
+        if (state.holder_stopped &&
+            fault == PureHolderRetirementFault::StoppedRecoveryIdentityMutation) {
+            error = "pure stopped holder immutable identity mutation was rejected";
+            state.operation_ok = false;
+            return {false, false};
+        }
         if (!state.holder_exists) state.holder_removal_uncertain = false;
     }
 
@@ -2572,8 +2616,11 @@ static CleanupPhaseResult pure_holder_retirement_transition(PureHolderRetirement
     CleanupPhaseResult result;
     if (state.holder_exists) {
         ++state.holder_remove_count;
-        if (fault == PureHolderRetirementFault::RemovalTimeoutHolderPresent) {
+        if (fault == PureHolderRetirementFault::RemovalTimeoutHolderPresent ||
+            fault == PureHolderRetirementFault::RemovalTimeoutHolderStoppedPresent) {
             state.holder_removal_uncertain = true;
+            state.holder_stopped =
+                fault == PureHolderRetirementFault::RemovalTimeoutHolderStoppedPresent;
             state.operation_ok = false;
             error = "pure holder retirement outcome was uncertain with exact holder retained";
             return {false, false};
@@ -2709,6 +2756,34 @@ static bool pure_holder_retirement_self_checks(std::string& error) {
             timeout_absent.holder_remove_count != frozen.holder_remove_count ||
             timeout_absent.network_remove_count != 0u) {
             error = "pure holder retirement replay was not frozen/inert";
+            return false;
+        }
+    }
+    {
+        PureHolderRetirementState stopped;
+        CleanupPhaseResult result = pure_holder_retirement_transition(
+            stopped, PureHolderRetirementFault::RemovalTimeoutHolderStoppedPresent, error);
+        if (result.settled || result.operation_ok || !stopped.holder_exists ||
+            !stopped.holder_stopped || !stopped.holder_removal_uncertain ||
+            stopped.holder_remove_count != 1u) {
+            error = "pure stopped holder timeout did not preserve exact recovery authority";
+            return false;
+        }
+        PureHolderRetirementState mutated = stopped;
+        result = pure_holder_retirement_transition(
+            mutated, PureHolderRetirementFault::StoppedRecoveryIdentityMutation, error);
+        if (result.settled || result.operation_ok || !mutated.holder_exists ||
+            mutated.holder_remove_count != 1u || mutated.network_remove_count != 0u) {
+            error = "pure stopped holder identity mutation was not fail-closed";
+            return false;
+        }
+        result = pure_holder_retirement_transition(stopped, PureHolderRetirementFault::None, error);
+        if (!result.settled || result.operation_ok || stopped.holder_exists ||
+            stopped.holder_remove_count != 2u || stopped.network_remove_count != 0u ||
+            !stopped.absence.holder.container_id_absent ||
+            !stopped.absence.holder.process_identity_absent ||
+            !stopped.absence.holder_name_absent) {
+            error = "pure exact stopped holder retry did not settle with retained networks";
             return false;
         }
     }
@@ -3449,6 +3524,8 @@ private:
             error += "holder disappeared before identity-safe cleanup";
         }
 
+        bool recovery_identity_validated = false;
+        bool stopped_recovery = false;
         if (holder_exists_ && holder_removal_may_have_mutated_) {
             bool exact_id_present = false;
             std::string recovery_error;
@@ -3461,16 +3538,25 @@ private:
                 error += "uncertain holder retirement recovery failed closed: " + recovery_error;
                 holder_settlement_operation_ok_ = false;
                 return {false, false};
+            } else if (!validate_holder(recovery_error, &stopped_recovery)) {
+                if (!error.empty()) error += "; ";
+                error +=
+                    "uncertain holder immutable identity recovery failed closed: " + recovery_error;
+                holder_settlement_operation_ok_ = false;
+                return {false, false};
+            } else {
+                recovery_identity_validated = true;
             }
         }
 
         if (holder_exists_) {
             std::string validation_error;
-            bool validation_ok = validate_holder(validation_error);
+            bool validation_ok = recovery_identity_validated || validate_holder(validation_error);
             if (require_retained_topology)
-                validation_ok = validation_ok && verify_network(network_a_, validation_error) &&
-                                verify_network(network_b_, validation_error) &&
-                                verify_topology(FailurePoint::None, validation_error);
+                validation_ok =
+                    validation_ok && verify_network(network_a_, validation_error) &&
+                    verify_network(network_b_, validation_error) &&
+                    (stopped_recovery || verify_topology(FailurePoint::None, validation_error));
             if (!validation_ok) {
                 if (!error.empty()) error += "; ";
                 error += validation_error.empty()
@@ -3997,56 +4083,122 @@ private:
         return network.exists;
     }
 
-    bool discover_holder() {
-        CommandResult result;
-        if (!run_command({"docker", "inspect", "-f", "{{.Id}} {{.State.Pid}}", holder_name_},
-                         result) ||
-            !exited_zero(result))
-            return false;
-        std::istringstream fields(trim(result.output));
-        std::string id;
-        if (!(fields >> id >> holder_pid_) || id.empty()) return false;
-        holder_id_ = id;
-        holder_exists_ = true;
-        if (holder_pid_ <= 0) return true;
-        ProcIdentity identity{};
-        if (proc_identity(holder_pid_, identity, false)) holder_start_ = identity.start;
-        return true;
-    }
-
-    bool validate_holder(std::string& error) {
+    bool inspect_holder_cleanup_identity(const std::string& reference,
+                                         HolderCleanupIdentity& identity,
+                                         std::string& error) {
         CommandResult result;
         if (!run_command({"docker",
                           "inspect",
                           "-f",
-                          "{{.Id}} {{.Name}} {{index .Config.Labels \"rut.stage\"}} {{index "
-                          ".Config.Labels \"rut.token\"}} {{.State.Running}} {{.State.Pid}}",
-                          holder_name_},
+                          "{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.Image}}|{{index .Config.Labels "
+                          "\"rut.stage\"}}|{{index .Config.Labels \"rut.token\"}}|{{.State."
+                          "Running}}|{{.State.Pid}}|{{.Path}}|{{json .Args}}|{{.HostConfig."
+                          "ReadonlyRootfs}}|{{json .HostConfig.PortBindings}}|{{json "
+                          ".NetworkSettings.Ports}}|{{json .HostConfig.CapDrop}}|{{json "
+                          ".HostConfig.SecurityOpt}}|{{json .Config.ExposedPorts}}",
+                          reference},
                          result) ||
             !exited_zero(result)) {
-            error = "holder disappeared before verified cleanup";
+            error = "holder immutable identity inspection failed: " + trim(result.output);
             return false;
         }
-        std::istringstream fields(trim(result.output));
-        std::string id, name, stage, token, running;
-        pid_t pid = -1;
-        if (!(fields >> id >> name >> stage >> token >> running >> pid)) {
-            error = "holder identity inspection was malformed";
+        std::vector<std::string> fields;
+        if (!split_exact(trim(result.output), '|', 16, fields) ||
+            !parse_exact_bool(fields[6], identity.running) ||
+            !parse_exact_pid(fields[7], identity.pid) ||
+            !parse_exact_bool(fields[10], identity.read_only_root)) {
+            error = "holder immutable identity inspection was malformed";
             return false;
         }
-        if (holder_id_.empty() && timeout_recovery_) holder_id_ = id;
+        identity.id = fields[0];
+        identity.name =
+            fields[1].size() > 1u && fields[1][0] == '/' ? fields[1].substr(1u) : std::string();
+        identity.image_reference = fields[2];
+        identity.image_id = fields[3];
+        identity.stage = fields[4];
+        identity.token = fields[5];
+        identity.path = fields[8];
+        identity.arguments_json = fields[9];
+        identity.port_bindings_json = fields[11];
+        identity.network_ports_json = fields[12];
+        identity.capability_drop_json = fields[13];
+        identity.security_options_json = fields[14];
+        identity.exposed_ports_json = fields[15];
+        return true;
+    }
+
+    bool holder_immutable_identity_exact(const HolderCleanupIdentity& identity,
+                                         std::string& error) const {
+        const bool exact =
+            full_container_id(identity.id) && identity.id == holder_id_ &&
+            identity.name == holder_name_ && identity.stage == "358-stage2a2" &&
+            identity.token == token_ && identity.image_reference == RUT_PINNED_NGINX_IMAGE &&
+            sha256_identity(identity.image_id) && identity.image_id == holder_image_id_ &&
+            identity.path == "/bin/sleep" && identity.arguments_json == "[\"infinity\"]" &&
+            identity.read_only_root &&
+            no_published_ports(identity.port_bindings_json, identity.network_ports_json) &&
+            identity.capability_drop_json == "[\"ALL\"]" &&
+            identity.security_options_json == "[\"no-new-privileges\"]" &&
+            identity.exposed_ports_json != "null";
+        if (!exact)
+            error = "refusing holder deletion because exact immutable identity/config changed";
+        return exact;
+    }
+
+    bool discover_holder() {
+        HolderCleanupIdentity identity;
+        std::string error;
+        if (!inspect_holder_cleanup_identity(holder_name_, identity, error) ||
+            !full_container_id(identity.id) || identity.name != holder_name_ ||
+            identity.stage != "358-stage2a2" || identity.token != token_ ||
+            identity.image_reference != RUT_PINNED_NGINX_IMAGE ||
+            !sha256_identity(identity.image_id))
+            return false;
+        holder_id_ = identity.id;
+        holder_image_id_ = identity.image_id;
+        holder_pid_ = identity.pid;
+        holder_exists_ = true;
+        if (holder_pid_ <= 0) return true;
+        ProcIdentity process_identity{};
+        if (proc_identity(holder_pid_, process_identity, false))
+            holder_start_ = process_identity.start;
+        return true;
+    }
+
+    bool validate_holder(std::string& error, bool* stopped = nullptr) {
+        if (stopped != nullptr) *stopped = false;
+        HolderCleanupIdentity identity;
+        const std::string reference = holder_id_.empty() ? holder_name_ : holder_id_;
+        if (!inspect_holder_cleanup_identity(reference, identity, error)) return false;
+        if (holder_id_.empty() && timeout_recovery_) {
+            holder_id_ = identity.id;
+            holder_image_id_ = identity.image_id;
+        }
         if (holder_id_.empty()) {
             error = "refusing holder deletion without recorded identity";
             return false;
         }
-        if (id != holder_id_ || name != "/" + holder_name_ || stage != "358-stage2a2" ||
-            token != token_ || running != "true" || pid != holder_pid_) {
-            error = "refusing holder deletion because exact identity/labels changed";
+        if (!holder_immutable_identity_exact(identity, error)) return false;
+        if (!identity.running) {
+            if (identity.pid != 0) {
+                error = "refusing stopped holder recovery with nonzero Docker PID";
+                return false;
+            }
+            if (stopped != nullptr) {
+                *stopped = true;
+                return true;
+            }
+            error = "refusing normal holder deletion without a live exact process identity";
             return false;
         }
-        ProcIdentity identity{};
+        if (identity.pid != holder_pid_) {
+            error = "refusing holder deletion because exact running PID changed";
+            return false;
+        }
+        ProcIdentity process_identity{};
         if (holder_pid_ <= 1 || holder_start_ == 0u ||
-            !proc_identity(holder_pid_, identity, false) || identity.start != holder_start_) {
+            !proc_identity(holder_pid_, process_identity, false) ||
+            process_identity.start != holder_start_) {
             error = "refusing holder deletion because exact PID/start identity changed";
             return false;
         }
@@ -4218,6 +4370,7 @@ private:
     std::string positive_ip_;
     std::string guard_ip_;
     std::string holder_id_;
+    std::string holder_image_id_;
     pid_t holder_pid_ = -1;
     u64 holder_start_ = 0;
     bool holder_exists_ = false;
