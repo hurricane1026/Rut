@@ -7038,7 +7038,15 @@ static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObser
         "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
         "<center><h1>502 Bad Gateway</h1></center>\r\n"
         "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
-    observation.http.request = request;
+    if (observation.http.request != request) {
+        error = "bounded nginx HTTP request bytes were not exact";
+        return false;
+    }
+    if (!observation.sample_a.upstream_port_9000_absent ||
+        !observation.sample_b.upstream_port_9000_absent) {
+        error = "nginx TCP/TCP6 upstream absence evidence was incomplete";
+        return false;
+    }
     if (!observation.http.attempted || observation.http.outcome != Outcome::Complete ||
         !observation.http.eof_observed || observation.http.raw_response.empty()) {
         error = "bounded nginx HTTP exchange did not complete with EOF";
@@ -7084,27 +7092,32 @@ static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObser
         error = "pinned nginx 502 raw response wire mismatch";
         return false;
     }
-    const std::size_t expected_log_records = [&] {
-        std::size_t count = 0u;
-        std::size_t offset = 0u;
-        while ((offset = observation.nginx_logs.find("connect() failed", offset)) !=
-               std::string::npos) {
-            ++count;
-            offset += 15u;
+    std::size_t refusal_lines = 0u;
+    bool scoped = false;
+    std::size_t offset = 0u;
+    while (offset <= observation.nginx_logs.size()) {
+        const std::size_t newline = observation.nginx_logs.find('\n', offset);
+        const std::size_t end = newline == std::string::npos ? observation.nginx_logs.size() : newline;
+        const std::string_view line(observation.nginx_logs.data() + offset, end - offset);
+        const std::size_t marker = line.find("connect() failed");
+        if (marker != std::string_view::npos) {
+            ++refusal_lines;
+            if (line.find("connect() failed", marker + sizeof("connect() failed") - 1u) !=
+                std::string_view::npos)
+                ++refusal_lines;
+            scoped = line.find("127.0.0.1:9000") != std::string_view::npos &&
+                     line.find("request: \"GET / HTTP/1.1\"") != std::string_view::npos &&
+                     line.find("upstream: \"http://127.0.0.1:9000/\"") != std::string_view::npos &&
+                     line.find("host: \"client.example\"") != std::string_view::npos;
         }
-        return count;
-    }();
-    const bool scoped =
-        expected_log_records == 1u &&
-        observation.nginx_logs.find("127.0.0.1:9000") != std::string::npos &&
-        observation.nginx_logs.find("request: \"GET / HTTP/1.1\"") != std::string::npos &&
-        observation.nginx_logs.find("upstream: \"http://127.0.0.1:9000/\"") != std::string::npos &&
-        observation.nginx_logs.find("host: \"client.example\"") != std::string::npos;
-    observation.scoped_refusal_log_exact = scoped;
-    observation.http.request = request;
+        if (newline == std::string::npos) break;
+        offset = newline + 1u;
+    }
+    const bool scoped_log = observation.logs_captured && refusal_lines == 1u && scoped;
+    observation.scoped_refusal_log_exact = scoped_log;
     observation.upstream_absence_before = observation.sample_a.upstream_port_9000_absent;
     observation.upstream_absence_after = observation.sample_b.upstream_port_9000_absent;
-    if (!scoped) {
+    if (!scoped_log) {
         error = "nginx logs did not contain exactly one scoped upstream refusal";
         return false;
     }
@@ -7654,19 +7667,21 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     }
     u32 positive = 0u, guard = 0u;
     NginxProcTcpTable table;
+    NginxProcTcpTable table6;
     fixture_privileged_listener::Diagnostic parser_diagnostic;
     fixture_privileged_listener::ListenerEvidence listener;
     if (!parse_ipv4(owner.builder_baseline.positive_ip, positive) ||
         !parse_ipv4(owner.builder_baseline.guard_ip, guard) ||
-        !parse_nginx_proc_net_tcp(tcp, 8u, table)) {
+        !parse_nginx_proc_net_tcp(tcp, 8u, table) ||
+        !parse_nginx_proc_net_tcp(tcp6, 32u, table6)) {
         error = "nginx TCP table or listener plan was rejected";
         return false;
     }
     if (!strict_exact_nginx_listener(
             table, positive, guard, sockets, listener, parser_diagnostic) ||
         listener.child_owned_inode == 0u ||
-        !strict_tcp6_port_absent(tcp6, kExactInputTopologyBuilderPort) ||
-        !strict_tcp_port_absent(table, 9000u)) {
+        !strict_tcp_port_absent(table6, kExactInputTopologyBuilderPort) ||
+        !strict_tcp_port_absent(table, 9000u) || !strict_tcp_port_absent(table6, 9000u)) {
         error = "nginx exact IPv4 listener/TCP6 absence evidence was rejected";
         return false;
     }
@@ -9378,6 +9393,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
                                                         ExactInputMountDiagnostic& diagnostic) {
     mutation_rejections = 0u;
     diagnostic = {};
+    std::string error;
     ExactInputNginxProcessSample first;
     first.complete = first.container_identity_verified = first.source_revalidated = true;
     first.mount_verified = first.topology_verified = first.cgroup_exact = true;
@@ -9475,6 +9491,91 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     RUT_REJECT_NGINX_CLEANUP(exact_absence, false);
 #undef RUT_REJECT_NGINX_CLEANUP
 
+    using namespace bounded_http_exchange;
+    constexpr char http_body[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    constexpr char http_request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    const std::string http_date = "Tue, 01 Jan 2030 00:00:00 GMT";
+    const std::string http_wire =
+        std::string("HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ") +
+        http_date + "\r\nContent-Type: text/html\r\nContent-Length: 157\r\n"
+        "Connection: close\r\n\r\n" + http_body;
+    ExactInputNginxLifecycleObservation valid_http;
+    valid_http.logs_captured = true;
+    valid_http.nginx_logs =
+        "2026/01/01 [error] 1#1: connect() failed (111: Connection refused) while "
+        "connecting to upstream, client: 127.0.0.1, server: _, request: \"GET / HTTP/1.1\", "
+        "upstream: \"http://127.0.0.1:9000/\", host: \"client.example\"\n";
+    valid_http.sample_a.upstream_port_9000_absent = true;
+    valid_http.sample_b.upstream_port_9000_absent = true;
+    valid_http.http.attempted = true;
+    valid_http.http.outcome = Outcome::Complete;
+    valid_http.http.terminal_frozen = true;
+    valid_http.http.eof_observed = true;
+    valid_http.http.request = http_request;
+    valid_http.http.raw_response = http_wire;
+    if (!parse_response(http_wire, valid_http.http.parsed, error)) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid HTTP observation seed failed"};
+        return false;
+    }
+    const auto reject_http = [&](ExactInputNginxLifecycleObservation mutation) {
+        std::string mutation_error;
+        if (validate_pinned_nginx_http_observation(mutation, "127.0.0.1", mutation_error))
+            return false;
+        ++mutation_rejections;
+        return true;
+    };
+    if (!validate_pinned_nginx_http_observation(valid_http, "127.0.0.1", error)) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid HTTP observation was rejected: " + error};
+        return false;
+    }
+    auto http_mutation = valid_http;
+    http_mutation.http.parsed.status = 503u;
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers[0].name = "X-Server";
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers[2].value = "application/json";
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    std::swap(http_mutation.http.parsed.headers[0], http_mutation.http.parsed.headers[1]);
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers.push_back({"Content-Length", "157"});
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers[1].value = "not-a-date";
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers.push_back({"Date", http_date});
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.body[0] = 'X';
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.raw_response.pop_back();
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.raw_response.push_back('x');
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers[2].value = "bad\x01value";
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.parsed.headers[2].value = std::string("bad\0value", 9u);
+    if (!reject_http(http_mutation)) return false;
+    http_mutation = valid_http;
+    http_mutation.http.request = "GET /private HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    if (!reject_http(http_mutation)) return false;
+    ParsedResponse limited;
+    std::string parse_error;
+    if (parse_response(http_wire, limited, parse_error, http_wire.size() - 1u)) return false;
+    ++mutation_rejections;
+
     const std::string tcp_header =
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  "
         "timeout inode\n";
@@ -9515,6 +9616,12 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         if (exact_listener(rejected)) return false;
         ++mutation_rejections;
     }
+    NginxProcTcpTable upstream_tcp;
+    if (!parse_nginx_proc_net_tcp(
+            valid_tcp + tcp_row("00000000:2328", "07", "998", 3u), 8u, upstream_tcp) ||
+        strict_tcp_port_absent(upstream_tcp, 9000u))
+        return false;
+    ++mutation_rejections;
     const auto reject_tcp = [&](std::string contents) {
         NginxProcTcpTable ignored;
         if (parse_nginx_proc_net_tcp(contents, 8u, ignored)) return false;
@@ -9561,6 +9668,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         tcp6_header + tcp6_row("A380", "0A", "401", "-1") + tcp6_time_wait_row("C001");
     const std::string present_standard = absent + tcp6_row("A381", "07", "402");
     const std::string present_time_wait = absent + tcp6_time_wait_row("A381");
+    const std::string present_upstream = absent + tcp6_row("2328", "07", "403");
     const std::string malformed_tcp6 = tcp6_header + tcp6_row("A380", "0A", "not-an-inode");
     const std::string malformed_unrelated_tcp6 =
         tcp6_header +
@@ -9570,13 +9678,14 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     if (!strict_tcp6_port_absent(absent, kExactInputTopologyBuilderPort) ||
         strict_tcp6_port_absent(present_standard, kExactInputTopologyBuilderPort) ||
         strict_tcp6_port_absent(present_time_wait, kExactInputTopologyBuilderPort) ||
+        strict_tcp6_port_absent(present_upstream, 9000u) ||
         strict_tcp6_port_absent(malformed_tcp6, kExactInputTopologyBuilderPort) ||
         strict_tcp6_port_absent(malformed_unrelated_tcp6, kExactInputTopologyBuilderPort)) {
         diagnostic = {
             ExactInputMountPhase::Lifecycle, 0, "strict nginx TCP6 parser self-check failed"};
         return false;
     }
-    mutation_rejections += 4u;
+    mutation_rejections += 5u;
     if (!nginx_auto_remove_disabled("false") || nginx_auto_remove_disabled("true") ||
         nginx_auto_remove_disabled("False") || nginx_auto_remove_disabled("false "))
         return false;
@@ -9595,7 +9704,7 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         return false;
     }
     ++mutation_rejections;
-    return mutation_rejections == 39u;
+    return mutation_rejections == 55u;
 }
 
 bool exact_input_mount_test_builder_self_checks(std::uint32_t& mutation_rejections,

@@ -23,10 +23,13 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
 # Pure bounded IPv4 HTTP exchange/parser self-check. No Docker, nginx, RUT,
 # converter, or runtime behavior is involved.
 add_executable(test_fixture_bounded_http_exchange
-    test_fixture_bounded_http_exchange.cc
-    fixture_bounded_http_exchange.cc)
+    test_fixture_bounded_http_exchange.cc)
+add_library(fixture_bounded_http_exchange STATIC fixture_bounded_http_exchange.cc)
+target_include_directories(fixture_bounded_http_exchange PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(test_fixture_bounded_http_exchange PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fixture_bounded_http_exchange PRIVATE fixture_bounded_http_exchange)
 add_test(NAME test_fixture_bounded_http_exchange
     COMMAND test_fixture_bounded_http_exchange)
 set_tests_properties(test_fixture_bounded_http_exchange PROPERTIES
@@ -847,6 +850,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_ipv4_fixture_topology PRIVATE
+        fixture_bounded_http_exchange
         fixture_exact_input_file_lease
         fixture_private_directory_lease
         fixture_privileged_listener
@@ -867,6 +871,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
+        fixture_bounded_http_exchange
         fixture_ancestry_bundle
         fixture_collision_release_evidence_protocol
         fixture_collision_release_evidence_transport
@@ -897,10 +902,10 @@ if(RUT_ENABLE_JIT)
 
     add_executable(test_fixture_exact_input_mount_owner
         test_fixture_exact_input_mount_owner.cc
-        fixture_bounded_http_exchange.cc
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_fixture_exact_input_mount_owner PRIVATE
+        fixture_bounded_http_exchange
         fixture_exact_input_file_lease
         fixture_private_directory_lease
         fixture_privileged_listener

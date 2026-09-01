@@ -1068,7 +1068,7 @@ int main(int argc, char** argv) {
     ExactInputMountDiagnostic lifecycle_selfcheck_diagnostic;
     if (!exact_input_mount_test_nginx_lifecycle_self_checks(lifecycle_mutation_rejections,
                                                             lifecycle_selfcheck_diagnostic) ||
-        lifecycle_mutation_rejections != 39u) {
+        lifecycle_mutation_rejections != 55u) {
         std::cerr << "FAIL [#358 nginx lifecycle pure mutation matrix]: "
                   << lifecycle_selfcheck_diagnostic.message << "\n";
         return 1;

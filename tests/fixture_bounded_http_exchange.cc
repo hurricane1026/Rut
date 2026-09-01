@@ -23,23 +23,30 @@ std::int64_t now_ns() {
         .count();
 }
 
-int wait_for(int fd, short events, std::int64_t deadline) {
+struct WaitResult {
+    int revents = 0;
+    int error_number = 0;
+};
+
+WaitResult wait_for(int fd, short events, std::int64_t deadline) {
     for (;;) {
         const std::int64_t left = deadline - now_ns();
-        if (left <= 0) return 0;
+        if (left <= 0) return {};
         const int ms = static_cast<int>(std::min<std::int64_t>((left + 999999) / 1000000, 30000));
         pollfd p{fd, events, 0};
         const int result = poll(&p, 1, ms);
         if (result < 0 && errno == EINTR) continue;
-        if (result <= 0) return result;
-        if (p.revents & (events | POLLERR | POLLHUP | POLLNVAL)) return p.revents;
+        if (result < 0) return {-1, errno};
+        if (result == 0) return {};
+        if (p.revents & (events | POLLERR | POLLHUP | POLLNVAL)) return {p.revents, 0};
     }
 }
 
 bool token(std::string_view value, bool name) {
     if (value.empty()) return false;
     for (unsigned char c : value) {
-        if (name ? !(std::isalnum(c) || c == '-' || c == '_') : (c == '\r' || c == '\n'))
+        if (name ? !(std::isalnum(c) || c == '-' || c == '_')
+                 : (c < 0x20u || c == 0x7fu || c == '\r' || c == '\n'))
             return false;
     }
     return true;
@@ -154,17 +161,20 @@ bool exchange(const std::string& ipv4,
     observation.attempted = true;
     observation.request = request;
     observation.start_nanoseconds = now_ns();
-    const auto fail = [&](Outcome outcome, const char* message) {
+    const auto fail = [&](Outcome outcome, const char* message, int error_number = 0) {
         observation.outcome = outcome;
         observation.terminal_frozen = true;
         observation.diagnostic = message;
+        observation.error_number = error_number;
         observation.completion_nanoseconds = now_ns();
         return false;
     };
     in_addr address{};
     if (inet_pton(AF_INET, ipv4.c_str(), &address) != 1 || port == 0 || request.empty() ||
-        request.size() > limit || deadline_ns <= observation.start_nanoseconds)
+        request.size() > limit)
         return fail(Outcome::InvalidArgument, "invalid bounded exchange argument");
+    if (deadline_ns <= observation.start_nanoseconds)
+        return fail(Outcome::DeadlineExceeded, "exchange deadline exceeded");
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return fail(Outcome::SocketCreateFailed, "IPv4 socket creation failed");
     struct FdGuard {
@@ -179,14 +189,20 @@ bool exchange(const std::string& ipv4,
     target.sin_addr = address;
     observation.connect_started = true;
     int result = connect(fd, reinterpret_cast<sockaddr*>(&target), sizeof(target));
-    if (result != 0 && errno != EINPROGRESS) return fail(Outcome::ConnectFailed, "connect failed");
+    const int connect_error = result == 0 ? 0 : errno;
+    if (result != 0 && connect_error != EINPROGRESS && connect_error != EALREADY &&
+        connect_error != EINTR)
+        return fail(Outcome::ConnectFailed, "connect failed", connect_error);
     if (result != 0) {
-        const int events = wait_for(fd, POLLOUT, deadline_ns);
-        if (events <= 0) return fail(Outcome::DeadlineExceeded, "connect deadline exceeded");
+        const WaitResult wait = wait_for(fd, POLLOUT, deadline_ns);
+        if (wait.error_number != 0)
+            return fail(Outcome::ConnectFailed, "connect poll failed", wait.error_number);
+        if (wait.revents == 0) return fail(Outcome::DeadlineExceeded, "connect deadline exceeded");
         int status = 0;
         socklen_t length = sizeof(status);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &status, &length) != 0 || status != 0)
-            return fail(Outcome::ConnectFailed, "connect failed");
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &status, &length) != 0)
+            return fail(Outcome::ConnectFailed, "connect status failed", errno);
+        if (status != 0) return fail(Outcome::ConnectFailed, "connect failed", status);
     }
     if (now_ns() >= deadline_ns)
         return fail(Outcome::DeadlineExceeded, "connect deadline exceeded");
@@ -204,11 +220,23 @@ bool exchange(const std::string& ipv4,
         }
         if (count < 0 && errno == EINTR) continue;
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (wait_for(fd, POLLOUT, deadline_ns) <= 0)
+            const WaitResult wait = wait_for(fd, POLLOUT, deadline_ns);
+            if (wait.error_number != 0)
+                return fail(Outcome::SendFailed, "send poll failed", wait.error_number);
+            if (wait.revents == 0)
                 return fail(Outcome::DeadlineExceeded, "send deadline exceeded");
+            if (wait.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                const ssize_t settled = send(fd, request.data() + sent, request.size() - sent,
+                                             MSG_NOSIGNAL);
+                if (settled > 0) {
+                    sent += static_cast<std::size_t>(settled);
+                    continue;
+                }
+                return fail(Outcome::SendFailed, "send readiness error", settled < 0 ? errno : 0);
+            }
             continue;
         }
-        return fail(Outcome::SendFailed, "send failed");
+        return fail(Outcome::SendFailed, "send failed", errno);
     }
     observation.send_completed = true;
     observation.send_completed_nanoseconds = now_ns();
@@ -230,11 +258,30 @@ bool exchange(const std::string& ipv4,
         }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            const int events = wait_for(fd, POLLIN, deadline_ns);
-            if (events <= 0) return fail(Outcome::DeadlineExceeded, "read deadline exceeded");
+            const WaitResult wait = wait_for(fd, POLLIN, deadline_ns);
+            if (wait.error_number != 0)
+                return fail(Outcome::ReadFailed, "read poll failed", wait.error_number);
+            if (wait.revents == 0) return fail(Outcome::DeadlineExceeded, "read deadline exceeded");
+            if (wait.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                const ssize_t settled = recv(fd, buffer.data(), buffer.size(), 0);
+                if (settled == 0) {
+                    observation.eof_observed = true;
+                    break;
+                }
+                if (settled > 0) {
+                    if (observation.raw_response.size() + static_cast<std::size_t>(settled) > limit)
+                        return fail(Outcome::ResponseLimitExceeded, "response exceeds bounded byte limit");
+                    observation.raw_response.append(buffer.data(), static_cast<std::size_t>(settled));
+                    continue;
+                }
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                    return fail(Outcome::ReadFailed, "read readiness error", errno);
+                if (errno == EINTR) continue;
+                return fail(Outcome::ReadFailed, "read readiness error", errno);
+            }
             continue;
         }
-        return fail(Outcome::ReadFailed, "read failed");
+        return fail(Outcome::ReadFailed, "read failed", errno);
     }
     std::string error;
     if (!parse_response(observation.raw_response, observation.parsed, error, limit)) {

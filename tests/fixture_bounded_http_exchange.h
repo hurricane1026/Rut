@@ -49,6 +49,7 @@ struct Observation {
     std::int64_t connect_completed_nanoseconds = 0;
     std::int64_t send_completed_nanoseconds = 0;
     std::int64_t completion_nanoseconds = 0;
+    int error_number = 0;
     std::string request;
     std::string raw_response;
     ParsedResponse parsed;
