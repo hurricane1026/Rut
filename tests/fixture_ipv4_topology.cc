@@ -14630,35 +14630,54 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     mounted.removal_suppression_armed =
         failure_point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval;
     if (mounted.removal_suppression_armed) {
-        const std::uint64_t before = command_invocation_count;
+        const std::uint64_t before_observation = command_invocation_count;
         std::string suppressed;
         if (remove_rotation_mounted(mounted, false, true, suppressed) || suppressed.empty() ||
-            mounted.fresh_remove_count != 0u || command_invocation_count != before) {
-            result.error = "fresh mounted removal suppression was not command-free and truthful";
+            mounted.fresh_remove_count != 0u || mounted.fresh_remove_suppression_count != 1u ||
+            command_invocation_count != before_observation + 2u ||
+            mounted.state != ExactInputRotationState::FreshRemovalMayHaveMutated ||
+            !mounted.fresh_exists || mounted.fresh_absence.id_absent ||
+            mounted.fresh_absence.name_absent) {
+            result.error =
+                "fresh mounted removal suppression did not retain exact observed custody";
             return finish_failure(false);
         }
-        const std::uint64_t gated = command_invocation_count;
         std::string inert_gate;
         std::string source_gate;
         std::string holder_gate;
         std::string topology_gate;
+        const std::uint64_t before_inert_gate = command_invocation_count;
         const bool inert_blocked = !cleanup_inert_after_mounted(inert_gate);
+        const bool inert_command_free = command_invocation_count == before_inert_gate;
+        const std::uint64_t before_source_gate = command_invocation_count;
         const bool source_blocked = !cleanup_source_after_mounted(source_gate);
+        const bool source_command_free = command_invocation_count == before_source_gate;
+        const std::uint64_t before_holder_gate = command_invocation_count;
         const bool holder_blocked = !cleanup_holder_after_mounted(holder_gate);
+        const bool holder_command_free = command_invocation_count == before_holder_gate;
+        const std::uint64_t before_topology_gate = command_invocation_count;
         const bool topology_blocked = !cleanup_topology_after_mounted(topology_gate).settled;
+        const bool topology_command_free = command_invocation_count == before_topology_gate;
         terminal_receipt.downstream_gates_command_free =
             inert_blocked && source_blocked && holder_blocked && topology_blocked &&
-            root.input.active() &&
+            inert_command_free && source_command_free && holder_command_free &&
+            topology_command_free && root.input.active() &&
             inert_gate == "fresh mounted-sidecar unsettled; blocked fresh inert cleanup" &&
             source_gate == "fresh mounted-sidecar unsettled; blocked source cleanup" &&
             holder_gate == "fresh mounted-sidecar unsettled; blocked fresh holder cleanup" &&
-            topology_gate == "fresh mounted-sidecar unsettled; blocked retained topology cleanup" &&
-            command_invocation_count == gated;
+            topology_gate == "fresh mounted-sidecar unsettled; blocked retained topology cleanup";
     } else {
         terminal_receipt.downstream_gates_command_free = true;
     }
     error.clear();
-    if (!remove_rotation_mounted(mounted, false, false, error)) {
+    const std::uint32_t expected_suppression_count =
+        failure_point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval ? 1u : 0u;
+    if (!remove_rotation_mounted(mounted, false, false, error) ||
+        mounted.fresh_remove_count != 1u ||
+        mounted.fresh_remove_suppression_count != expected_suppression_count ||
+        mounted.state != ExactInputRotationState::Settled || mounted.fresh_exists ||
+        !exact_input_mounted_absence_matches(mounted.fresh_absence, mounted.fresh_mounted)) {
+        if (error.empty()) error = "fresh mounted exact-ID retry did not settle exact custody";
         result.error = error;
         return finish_failure(false);
     }
