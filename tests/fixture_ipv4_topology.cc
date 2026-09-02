@@ -13778,7 +13778,7 @@ struct MountedSidecarRotationOwner {
 struct ExactInputRotationNetworkOrder {
     ExactInputRotationTerminalReceipt* receipt = nullptr;
     std::uint32_t* order = nullptr;
-    bool already_settled_holder_observed = false;
+    bool frozen_old_holder_removal_observed = false;
 };
 
 static bool record_exact_input_rotation_network_order(void* opaque,
@@ -13791,16 +13791,19 @@ static bool record_exact_input_rotation_network_order(void* opaque,
         return false;
     }
     if (event == TopologySettlementEvent::Holder) {
-        if (removed || context.already_settled_holder_observed ||
+        // The fresh holder was already removed at order 5.  This is the
+        // cleanup phase's frozen confirmation that the distinct old holder was
+        // removed; validate it without assigning a second holder order.
+        if (!removed || context.frozen_old_holder_removal_observed ||
             context.receipt->network_b_order != 0u || context.receipt->network_a_order != 0u) {
-            error = "exact-input rotation did not observe one already-settled holder event";
+            error = "exact-input rotation did not observe one frozen old-holder removal";
             return false;
         }
-        context.already_settled_holder_observed = true;
+        context.frozen_old_holder_removal_observed = true;
         return true;
     }
-    if (!context.already_settled_holder_observed || !removed) {
-        error = "exact-input rotation network settlement preceded holder settlement";
+    if (!context.frozen_old_holder_removal_observed || !removed) {
+        error = "exact-input rotation network settlement preceded old-holder removal evidence";
         return false;
     }
     if (event == TopologySettlementEvent::NetworkB) {
@@ -14689,7 +14692,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         topology = root.fixture.cleanup_topology_phase(
             cleanup_error, record_exact_input_rotation_network_order, &network_order);
     if (!topology.settled || !topology.operation_ok || terminal_receipt.network_b_order != 6u ||
-        terminal_receipt.network_a_order != 7u || !network_order.already_settled_holder_observed) {
+        terminal_receipt.network_a_order != 7u ||
+        !network_order.frozen_old_holder_removal_observed) {
         result.error = cleanup_error;
         return finish_failure(false);
     }
@@ -14958,14 +14962,26 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
     ExactInputRotationNetworkOrder order_context{&order_receipt, &cleanup_order, false};
     std::string order_error;
     if (!record_exact_input_rotation_network_order(
-            &order_context, TopologySettlementEvent::Holder, false, order_error) ||
+            &order_context, TopologySettlementEvent::Holder, true, order_error) ||
         !record_exact_input_rotation_network_order(
             &order_context, TopologySettlementEvent::NetworkB, true, order_error) ||
         !record_exact_input_rotation_network_order(
             &order_context, TopologySettlementEvent::NetworkA, true, order_error) ||
-        !order_error.empty() || !order_context.already_settled_holder_observed ||
+        !order_error.empty() || !order_context.frozen_old_holder_removal_observed ||
         order_receipt.network_b_order != 6u || order_receipt.network_a_order != 7u) {
-        error = "already-settled holder and B/A network order was rejected";
+        error = "frozen old-holder removal and B/A network order was rejected";
+        return false;
+    }
+    ExactInputRotationTerminalReceipt missing_removal_receipt;
+    cleanup_order = 5u;
+    ExactInputRotationNetworkOrder missing_removal_context{
+        &missing_removal_receipt, &cleanup_order, false};
+    order_error.clear();
+    if (record_exact_input_rotation_network_order(
+            &missing_removal_context, TopologySettlementEvent::Holder, false, order_error) ||
+        order_error.empty() || cleanup_order != 5u ||
+        missing_removal_context.frozen_old_holder_removal_observed) {
+        error = "holder event without frozen old-holder removal was accepted";
         return false;
     }
     ExactInputRotationTerminalReceipt rejected_order_receipt;
@@ -14977,7 +14993,7 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
             &rejected_order_context, TopologySettlementEvent::NetworkB, true, order_error) ||
         order_error.empty() || cleanup_order != 5u ||
         rejected_order_receipt.network_b_order != 0u) {
-        error = "network settlement before the already-settled holder was accepted";
+        error = "network settlement before frozen old-holder removal was accepted";
         return false;
     }
     return true;
