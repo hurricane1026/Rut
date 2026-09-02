@@ -13850,14 +13850,18 @@ static bool validate_stopped_mount_record(const std::string& record,
         !decimal_size(prefix[4], count) || count != 1u ||
         !split_mount_list(record.substr(first + 1u, second - first - 1u), true, requested, error) ||
         !split_mount_list(record.substr(second + 1u), false, realized, error) ||
-        requested.size() != 1u || !realized.empty()) {
+        requested.size() != 1u || realized.size() != 1u) {
         if (error.empty()) error = "stopped mounted-sidecar mount envelope was not exact";
         return false;
     }
-    const ParsedMount& mount = requested.front();
-    return mount.type == "bind" && mount.source == source &&
-           mount.destination == kExactInputMountDestination && mount.read_only &&
-           mount.propagation == "rprivate";
+    const ParsedMount& requested_mount = requested.front();
+    const ParsedMount& realized_mount = realized.front();
+    return requested_mount.type == "bind" && requested_mount.source == source &&
+           requested_mount.destination == kExactInputMountDestination &&
+           requested_mount.read_only && requested_mount.propagation == "rprivate" &&
+           realized_mount.type == "bind" && realized_mount.source == source &&
+           realized_mount.destination == kExactInputMountDestination && realized_mount.read_only &&
+           realized_mount.propagation == "rprivate";
 }
 
 static bool inspect_rotation_mounted(const std::string& id,
@@ -13957,8 +13961,10 @@ static bool inspect_rotation_mounted(const std::string& id,
     evidence.restart_no = true;
     evidence.no_published_ports = true;
     evidence.requested_mount_exact = true;
-    evidence.realized_mount_exact = running;
-    evidence.no_mount_shadowing = running;
+    // Docker materializes the configured bind in `.Mounts` before start.  This is
+    // stopped cleanup authority, not evidence of a live process or namespace.
+    evidence.realized_mount_exact = true;
+    evidence.no_mount_shadowing = true;
     if (running) {
         evidence.pid = static_cast<pid_t>(pid_value);
         ProcIdentity process{};
@@ -14045,6 +14051,24 @@ static bool create_rotation_mounted(const std::string& token,
         error = "mounted-sidecar create did not return one exact full ID";
         return false;
     }
+    // Publish exact-ID custody before any fallible inspection.  A create that
+    // returned this full ID may have mutated Docker even when stopped validation
+    // subsequently fails, so failure cleanup must never fall back to name-only
+    // discovery or forget the object.
+    mounted = {};
+    mounted.token = token;
+    mounted.stage = kMountedRotationStage;
+    mounted.role = kMountedRotationRole;
+    mounted.generation = generation;
+    mounted.name = name;
+    mounted.id = id;
+    mounted.image_reference = RUT_PINNED_NGINX_IMAGE;
+    mounted.network_mode = "container:" + holder_id;
+    mounted.user = credentials;
+    mounted.path = "/bin/sleep";
+    mounted.arguments_json = "[\"infinity\"]";
+    mounted.source_path = source.path;
+    mounted.pid = -1;
     ExactInputMountedSidecarEvidence stopped;
     if (!inspect_rotation_mounted(id,
                                   token,
@@ -14080,6 +14104,24 @@ static bool create_rotation_mounted(const std::string& token,
                                   error))
         return false;
     return true;
+}
+
+static bool mounted_cleanup_identity_matches(const ExactInputMountedSidecarEvidence& current,
+                                             const ExactInputMountedSidecarEvidence& recorded) {
+    const bool immutable_exact =
+        current.token == recorded.token && current.stage == recorded.stage &&
+        current.role == recorded.role && current.generation == recorded.generation &&
+        current.name == recorded.name && current.id == recorded.id &&
+        current.image_reference == recorded.image_reference &&
+        current.network_mode == recorded.network_mode && current.user == recorded.user &&
+        current.path == recorded.path && current.arguments_json == recorded.arguments_json &&
+        current.source_path == recorded.source_path && current.read_only_root &&
+        current.capability_drop_all && current.no_new_privileges && current.restart_no &&
+        current.no_published_ports && current.requested_mount_exact &&
+        current.realized_mount_exact && current.no_mount_shadowing;
+    if (!immutable_exact || (!recorded.image_id.empty() && current.image_id != recorded.image_id))
+        return false;
+    return !recorded.running || exact_input_mounted_equal(current, recorded);
 }
 
 static bool prove_rotation_mounted_absent(const ExactInputMountedSidecarEvidence& mounted,
@@ -14122,18 +14164,38 @@ static bool remove_rotation_mounted(MountedSidecarRotationOwner& owner,
         strtoull(mounted.user.substr(0, credential_separator).c_str(), nullptr, 10);
     cleanup_source.gid =
         strtoull(mounted.user.substr(credential_separator + 1u).c_str(), nullptr, 10);
-    if (!inspect_rotation_mounted(mounted.id,
-                                  mounted.token,
-                                  mounted.name,
-                                  mounted.generation,
-                                  mounted.network_mode.substr(std::string("container:").size()),
-                                  cleanup_source,
-                                  true,
-                                  false,
-                                  current,
-                                  &parsed,
-                                  error) ||
-        !exact_input_mounted_equal(current, mounted)) {
+    const std::string holder_id = mounted.network_mode.substr(std::string("container:").size());
+    std::string running_error;
+    bool inspected = inspect_rotation_mounted(mounted.id,
+                                              mounted.token,
+                                              mounted.name,
+                                              mounted.generation,
+                                              holder_id,
+                                              cleanup_source,
+                                              true,
+                                              false,
+                                              current,
+                                              &parsed,
+                                              running_error);
+    if (!inspected) {
+        std::string stopped_error;
+        inspected = inspect_rotation_mounted(mounted.id,
+                                             mounted.token,
+                                             mounted.name,
+                                             mounted.generation,
+                                             holder_id,
+                                             cleanup_source,
+                                             false,
+                                             false,
+                                             current,
+                                             &parsed,
+                                             stopped_error);
+        if (!inspected)
+            error =
+                "mounted-sidecar cleanup exact-ID inspection failed (running: " + running_error +
+                "; stopped: " + stopped_error + ")";
+    }
+    if (!inspected || !mounted_cleanup_identity_matches(current, mounted)) {
         if (error.empty()) error = "mounted-sidecar cleanup authority changed";
         owner.state = ExactInputRotationState::Unresolved;
         return false;
@@ -14206,7 +14268,7 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     const auto finish_failure = [&](bool semantic_success) {
         std::string cleanup_error;
         bool cleanup_ok = true;
-        if (mounted.fresh_exists) {
+        if (!mounted.fresh_mounted.id.empty() && !mounted.fresh_absence.id_absent) {
             mounted.removal_suppression_armed = false;
             cleanup_ok =
                 remove_rotation_mounted(mounted, false, false, cleanup_error) && cleanup_ok;
