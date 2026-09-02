@@ -35,11 +35,11 @@ inline bool response_read_deadline_non_head_method_admitted(u8 method) {
 
 inline bool response_read_deadline_fixed_upload_method_admitted(u8 method) {
     switch (static_cast<LogHttpMethod>(method)) {
+        case LogHttpMethod::Get:
         case LogHttpMethod::Post:
         case LogHttpMethod::Put:
         case LogHttpMethod::Patch:
             return true;
-        case LogHttpMethod::Get:
         case LogHttpMethod::Head:
         case LogHttpMethod::Delete:
         case LogHttpMethod::Options:
