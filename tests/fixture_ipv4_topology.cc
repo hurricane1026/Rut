@@ -185,7 +185,7 @@ thread_local std::int64_t command_deadline_cap_ns = 0;
 class CommandDeadlineScope {
 public:
     explicit CommandDeadlineScope(std::int64_t deadline_ns) : previous_(command_deadline_cap_ns) {
-        command_deadline_cap_ns = deadline_ns;
+        command_deadline_cap_ns = previous_ > 0 ? std::min(previous_, deadline_ns) : deadline_ns;
     }
     CommandDeadlineScope(const CommandDeadlineScope&) = delete;
     CommandDeadlineScope& operator=(const CommandDeadlineScope&) = delete;
@@ -308,7 +308,7 @@ static bool run_command(const std::vector<std::string>& arguments,
             return false;
         }
         pollfd marker_descriptor{marker_fds[0], POLLIN, 0};
-        if (poll(&marker_descriptor, 1, marker_timeout_ms) <= 0) {
+        if (poll(&marker_descriptor, 1, std::min(marker_timeout_ms, 1000)) <= 0) {
             close(marker_fds[0]);
             if (!terminate_group_bounded(child))
                 runner_fail_stop(child, "descendant marker PGID remained alive");
