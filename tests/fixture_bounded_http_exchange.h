@@ -74,7 +74,8 @@ bool exchange(const std::string& ipv4,
               const std::string& request,
               std::int64_t deadline_ns,
               Observation& observation,
-              std::size_t limit = kResponseByteLimit);
+              std::size_t limit = kResponseByteLimit,
+              bool shutdown_write_after_send = true);
 
 #ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
 namespace test_seam {

@@ -476,8 +476,12 @@ using RecreatedSidecarCallback =
     std::function<bool(const RecreatedSidecarEvidence& evidence, std::string& error)>;
 using HeldNamespaceGenerationReceiptCallback =
     std::function<bool(const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error)>;
-using ExactInputRotationCallback =
-    std::function<bool(const ExactInputRotationLiveEvidence& evidence, std::string& error)>;
+using ExactInputRotationNginxCallback =
+    std::function<bool(ExactInputNginxLifecycleObservation& observation, std::string& error)>;
+using ExactInputRotationCallback = std::function<bool(
+    const ExactInputRotationLiveEvidence& evidence,
+    const ExactInputRotationNginxCallback& nginx_callback,
+    std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);

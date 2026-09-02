@@ -2259,16 +2259,23 @@ int main(int argc, char** argv) {
           ExactInputRotationFailurePoint::SuppressFirstFreshRemoval,
           ExactInputRotationFailurePoint::FreshReadTimeout,
           ExactInputRotationFailurePoint::FreshWriteInitialBracketMutation,
-          ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess,
+         ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess,
           ExactInputRotationFailurePoint::FreshWriteTimeout}) {
         std::size_t callback_count = 0;
+        ExactInputNginxLifecycleObservation nginx_lifecycle;
         ExactInputRotationTerminalReceipt rotation_receipt;
         const RunResult rotation = run_with_exact_input_rotation(
             kConfig,
             point,
-            [&](const ExactInputRotationLiveEvidence& evidence, std::string& error) {
+            [&](const ExactInputRotationLiveEvidence& evidence,
+                const ExactInputRotationNginxCallback& nginx_callback,
+                std::string& error) {
                 ++callback_count;
-                return validate_exact_input_rotation_live_evidence(evidence, error);
+                if (!validate_exact_input_rotation_live_evidence(evidence, error)) return false;
+                if (!nginx_callback(nginx_lifecycle, error)) return false;
+                return nginx_lifecycle.outcome == ExactInputNginxLifecycleOutcome::Complete &&
+                       !nginx_lifecycle.http.write_shutdown_started &&
+                       !nginx_lifecycle.http.write_shutdown_completed;
             },
             rotation_receipt);
         const bool mutation =
@@ -2283,6 +2290,14 @@ int main(int argc, char** argv) {
         if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
             !rotation.residue_free || callback_count != (expected_publication ? 1u : 0u) ||
             rotation_receipt.live_published != expected_publication ||
+            (expected_publication &&
+             (nginx_lifecycle.outcome != ExactInputNginxLifecycleOutcome::Complete ||
+              !nginx_lifecycle.http.attempted || !nginx_lifecycle.http.eof_observed ||
+              nginx_lifecycle.http.write_shutdown_started ||
+              nginx_lifecycle.http.write_shutdown_completed || !nginx_lifecycle.http_response_exact ||
+              !nginx_lifecycle.upstream_absence_before ||
+              !nginx_lifecycle.upstream_absence_after ||
+              !nginx_lifecycle.scoped_refusal_log_exact)) ||
             rotation_receipt.operation_ok != operation_ok ||
             (read_timeout &&
              (rotation_receipt.live.fresh_read.outcome == ExactInputReadOutcome::Complete ||

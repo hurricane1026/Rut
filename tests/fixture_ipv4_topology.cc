@@ -7030,7 +7030,8 @@ static bool pinned_nginx_date(const std::string& value) {
 
 static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObservation& observation,
                                                    const std::string& positive_ip,
-                                                   std::string& error) {
+                                                   std::string& error,
+                                                   bool require_write_shutdown = true) {
     using namespace bounded_http_exchange;
     constexpr char request[] =
         "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -7050,12 +7051,13 @@ static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObser
     if (!observation.http.attempted || observation.http.outcome != Outcome::Complete ||
         !observation.http.eof_observed || observation.http.raw_response.empty() ||
         !observation.http.send_started || !observation.http.send_completed ||
-        !observation.http.write_shutdown_started || !observation.http.write_shutdown_completed ||
         observation.http.send_completed_nanoseconds <= 0 ||
-        observation.http.write_shutdown_completed_nanoseconds <=
-            observation.http.send_completed_nanoseconds ||
-        observation.http.write_shutdown_completed_nanoseconds >=
-            observation.http.completion_nanoseconds) {
+        (require_write_shutdown &&
+         (!observation.http.write_shutdown_started || !observation.http.write_shutdown_completed ||
+          observation.http.write_shutdown_completed_nanoseconds <=
+              observation.http.send_completed_nanoseconds ||
+          observation.http.write_shutdown_completed_nanoseconds >=
+              observation.http.completion_nanoseconds))) {
         error = "bounded nginx HTTP exchange did not complete with EOF";
         return false;
     }
@@ -7290,6 +7292,15 @@ struct ExactInputMountOwner {
     bool write_refusal_attempted = false;
     bool nginx_lifecycle_attempted = false;
     bool nginx_unresolved_fault_consumed = false;
+    // During the generation-rotation callback nginx must be checked against
+    // the fresh mounted sibling, not the legacy registered sidecar.  These
+    // fields are callback-scoped authority and are never used by legacy
+    // exact-input observations.
+    bool rotated_lifecycle_authority = false;
+    ExactInputRotationSourceEvidence lifecycle_source;
+    ExactInputMountedSidecarEvidence lifecycle_target;
+    HeldNamespaceSidecarSnapshot lifecycle_sidecar;
+    HeldTopologySnapshot lifecycle_topology;
     HeldTopologySnapshot builder_baseline;
 };
 
@@ -7299,6 +7310,70 @@ struct NginxInspectEvidence {
     int exit_code = -1;
     bool running = false;
 };
+
+static bool inspect_rotation_mounted(const std::string& id,
+                                     const std::string& token,
+                                     const std::string& name,
+                                     const std::string& generation,
+                                     const std::string& holder_id,
+                                     const ExactInputRotationSourceEvidence& source,
+                                     bool running,
+                                     bool mutate_mount_observation,
+                                     ExactInputMountedSidecarEvidence& evidence,
+                                     ParsedMountInspect* parsed_mount,
+                                     std::string& error);
+
+static const HeldTopologySnapshot& nginx_topology(const ExactInputMountOwner& owner) {
+    return owner.rotated_lifecycle_authority ? owner.lifecycle_topology : owner.builder_baseline;
+}
+
+static const HeldNamespaceSidecarSnapshot& nginx_sidecar(const ExactInputMountOwner& owner) {
+    return owner.rotated_lifecycle_authority ? owner.lifecycle_sidecar : owner.registered_sidecar;
+}
+
+static bool nginx_sidecar_equal(const ExactInputMountedSidecarEvidence& left,
+                                const ExactInputMountedSidecarEvidence& right) {
+    return left.token == right.token && left.stage == right.stage && left.role == right.role &&
+           left.generation == right.generation && left.name == right.name && left.id == right.id &&
+           left.image_reference == right.image_reference && left.image_id == right.image_id &&
+           left.network_mode == right.network_mode && left.user == right.user &&
+           left.path == right.path && left.arguments_json == right.arguments_json &&
+           left.source_path == right.source_path && left.pid == right.pid &&
+           left.start == right.start && left.network_netns == right.network_netns &&
+           left.mount_netns == right.mount_netns && left.running == right.running &&
+           left.read_only_root == right.read_only_root &&
+           left.capability_drop_all == right.capability_drop_all &&
+           left.no_new_privileges == right.no_new_privileges && left.restart_no == right.restart_no &&
+           left.no_published_ports == right.no_published_ports &&
+           left.requested_mount_exact == right.requested_mount_exact &&
+           left.realized_mount_exact == right.realized_mount_exact &&
+           left.no_mount_shadowing == right.no_mount_shadowing &&
+           left.nonhost_mount_netns == right.nonhost_mount_netns;
+}
+
+static bool revalidate_nginx_sidecar(ExactInputMountOwner& owner, std::string& error) {
+    if (!owner.rotated_lifecycle_authority) {
+        return owner.fixture.revalidate_sidecar_identity(error) &&
+               sidecar_snapshot_equal(owner.fixture.sidecar_snapshot(), owner.registered_sidecar);
+    }
+    ExactInputMountedSidecarEvidence current;
+    if (!inspect_rotation_mounted(owner.lifecycle_target.id,
+                                  owner.lifecycle_target.token,
+                                  owner.lifecycle_target.name,
+                                  owner.lifecycle_target.generation,
+                                  owner.lifecycle_topology.holder_id,
+                                  owner.lifecycle_source,
+                                  true,
+                                  false,
+                                  current,
+                                  nullptr,
+                                  error) ||
+        !nginx_sidecar_equal(current, owner.lifecycle_target)) {
+        if (error.empty()) error = "fresh mounted-sidecar authority changed";
+        return false;
+    }
+    return true;
+}
 
 static bool topology_snapshot_equal(const HeldTopologySnapshot& left,
                                     const HeldTopologySnapshot& right);
@@ -7371,6 +7446,8 @@ static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
     errno = 0;
     const long exit_code = strtol(fields[26].c_str(), &exit_end, 10);
     const auto& identity = owner.input.identity();
+    const auto& authority_sidecar = nginx_sidecar(owner);
+    const auto& authority_topology = nginx_topology(owner);
     const std::string uid = std::to_string(identity.uid);
     const std::string gid = std::to_string(identity.gid);
     const std::string credentials = uid + ":" + gid;
@@ -7388,9 +7465,9 @@ static bool inspect_nginx_sibling(ExactInputMountOwner& owner,
         fields[0].size() != 64u || !full_container_id(fields[0]) ||
         fields[1] != "/" + owner.nginx_sibling.name ||
         (!owner.nginx_sibling.id.empty() && fields[0] != owner.nginx_sibling.id) ||
-        fields[2] != RUT_PINNED_NGINX_IMAGE || fields[3] != owner.registered_sidecar.image_id ||
+        fields[2] != RUT_PINNED_NGINX_IMAGE || fields[3] != authority_sidecar.image_id ||
         fields[4] != kNginxStage || fields[5] != owner.fixture.token() || fields[6] != kNginxRole ||
-        fields[7] != "container:" + owner.fixture.holder_id() || fields[8] != credentials ||
+        fields[7] != "container:" + authority_topology.holder_id || fields[8] != credentials ||
         fields[9] != "/" || !contains_exact_json_string(fields[10], "LC_ALL=C") ||
         fields[11] != "/usr/sbin/nginx" || fields[12] != expected_args || fields[13] != "true" ||
         fields[14] != "[\"ALL\"]" || fields[15] != "[\"no-new-privileges\"]" ||
@@ -7431,7 +7508,7 @@ static bool nginx_live_mounts_exact(ExactInputMountOwner& owner,
     bool nginx_ro = false, sidecar_ro = false, nginx_tmp = false, sidecar_tmp = false;
     const bool nginx_mount =
         mountinfo_entry(master, kExactInputMountDestination, nginx_mount_id, nginx_ro, nginx_tmp);
-    const bool sidecar_mount = mountinfo_entry(owner.registered_sidecar.pid,
+    const bool sidecar_mount = mountinfo_entry(nginx_sidecar(owner).pid,
                                                kExactInputMountDestination,
                                                sidecar_mount_id,
                                                sidecar_ro,
@@ -7447,7 +7524,7 @@ static bool nginx_live_mounts_exact(ExactInputMountOwner& owner,
     }
     // Mount IDs are scoped to a mount namespace and can numerically collide.
     // A shared instance requires both the same namespace and the same local ID.
-    if (!distinct_proc_namespace(master, owner.registered_sidecar.pid, "mnt")) {
+    if (!distinct_proc_namespace(master, nginx_sidecar(owner).pid, "mnt")) {
         error = "nginx sibling did not own an independently verified mount namespace";
         return false;
     }
@@ -7485,9 +7562,9 @@ static bool revalidate_nginx_sample_end(ExactInputMountOwner& owner,
         return false;
     }
     sample.end_source_revalidated = true;
-    if (!owner.fixture.revalidate_sidecar_identity(error) ||
+    if (!revalidate_nginx_sidecar(owner, error) ||
         !owner.fixture.verify_topology(FailurePoint::None, error) ||
-        !topology_snapshot_equal(owner.builder_baseline,
+        !topology_snapshot_equal(nginx_topology(owner),
                                  owner.fixture.current_topology_snapshot())) {
         if (error.empty()) error = "sidecar/topology identity changed at nginx sample end";
         return false;
@@ -7509,7 +7586,7 @@ static bool revalidate_nginx_sample_end(ExactInputMountOwner& owner,
     std::string master_cgroup;
     std::string worker_cgroup;
     if (!proc_identity(inspect.pid, master) || master.start != sample.master_start ||
-        master.netns != owner.builder_baseline.holder_netns ||
+        master.netns != nginx_topology(owner).holder_netns ||
         !proc_credentials_exact(
             inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
         !proc_nspid_exact(inspect.pid, true) || !read_unified_cgroup(inspect.pid, master_cgroup) ||
@@ -7580,7 +7657,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     }
     sample.source_revalidated = true;
     if (!owner.fixture.verify_topology(FailurePoint::None, error) ||
-        !topology_snapshot_equal(owner.builder_baseline,
+        !topology_snapshot_equal(nginx_topology(owner),
                                  owner.fixture.current_topology_snapshot())) {
         if (error.empty()) error = "nginx sample topology changed";
         return false;
@@ -7593,7 +7670,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     sample.master_pid = inspect.pid;
     ProcIdentity master{};
     if (!proc_identity(inspect.pid, master) ||
-        master.netns != owner.builder_baseline.holder_netns ||
+        master.netns != nginx_topology(owner).holder_netns ||
         !proc_credentials_exact(
             inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
         !proc_nspid_exact(inspect.pid, true)) {
@@ -7677,8 +7754,8 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     NginxProcTcpTable table6;
     fixture_privileged_listener::Diagnostic parser_diagnostic;
     fixture_privileged_listener::ListenerEvidence listener;
-    if (!parse_ipv4(owner.builder_baseline.positive_ip, positive) ||
-        !parse_ipv4(owner.builder_baseline.guard_ip, guard) ||
+    if (!parse_ipv4(nginx_topology(owner).positive_ip, positive) ||
+        !parse_ipv4(nginx_topology(owner).guard_ip, guard) ||
         !parse_nginx_proc_net_tcp(tcp, 8u, table) ||
         !parse_nginx_proc_net_tcp(tcp6, 32u, table6)) {
         error = "nginx TCP table or listener plan was rejected";
@@ -9102,6 +9179,19 @@ static bool settle_nginx_sibling(ExactInputMountOwner& owner,
 
 static bool revalidate_nginx_baseline(ExactInputMountOwner& owner, std::string& error) {
     fixture_exact_input_file_lease::Diagnostic source_diagnostic;
+    if (owner.rotated_lifecycle_authority) {
+        if (!owner.input.revalidate(source_diagnostic) ||
+            !revalidate_nginx_sidecar(owner, error) ||
+            !owner.fixture.verify_topology(FailurePoint::None, error) ||
+            !topology_snapshot_equal(nginx_topology(owner),
+                                     owner.fixture.current_topology_snapshot()) ||
+            !owner.fixture.probe_port_absent(kExactInputTopologyBuilderPort, error) ||
+            !owner.fixture.probe_tcp6_port_absent(kExactInputTopologyBuilderPort, error)) {
+            if (error.empty()) error = "post-nginx fresh source/mount/topology/listener baseline drifted";
+            return false;
+        }
+        return true;
+    }
     if (!owner.input.revalidate(source_diagnostic) ||
         !owner.fixture.revalidate_sidecar_identity(error) ||
         !sidecar_snapshot_equal(owner.fixture.sidecar_snapshot(), owner.registered_sidecar)) {
@@ -10710,36 +10800,11 @@ bool ExactInputMountRecoveryController::observe_input_write_refusal(
     return true;
 }
 
-bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
-    const ExactInputMountHandle& handle,
+static bool observe_nginx_lifecycle_impl(
+    ExactInputMountOwner* owner,
     ExactInputNginxLifecycleObservation& observation,
     ExactInputMountDiagnostic& diagnostic) {
     diagnostic = {};
-    if (!validate_handle(handle, diagnostic)) return false;
-    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
-    if (owner == nullptr) {
-        diagnostic = {ExactInputMountPhase::Lifecycle, EINVAL, "exact-input owner is absent"};
-        return false;
-    }
-    if (owner->nginx_lifecycle_attempted) {
-        observation = owner->nginx_lifecycle_observation;
-        diagnostic = owner->nginx_lifecycle_diagnostic;
-        return observation.outcome == ExactInputNginxLifecycleOutcome::Complete;
-    }
-    if (owner->state != ExactInputMountState::WriteRefusalObserved ||
-        !owner->write_refusal_attempted ||
-        owner->write_refusal_observation.outcome != ExactInputWriteRefusalOutcome::Complete ||
-        !owner->receipt.builder.applicable || !owner->receipt.builder.output_accepted) {
-        diagnostic = {ExactInputMountPhase::Lifecycle,
-                      EINVAL,
-                      "nginx lifecycle requires topology-built input and successful write refusal"};
-        return false;
-    }
-
-    owner->nginx_lifecycle_attempted = true;
-    owner->state = ExactInputMountState::ObservingNginxLifecycle;
-    owner->snapshot.state = owner->state;
-    owner->receipt.state = owner->state;
     ExactInputNginxLifecycleObservation current;
     current.attempted = true;
     current.container_name = "rut358-nginx-" + owner->fixture.token();
@@ -10800,9 +10865,9 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     fixture_exact_input_file_lease::Diagnostic source_diagnostic;
     std::string error;
     if (!owner->input.revalidate(source_diagnostic) ||
-        !owner->fixture.revalidate_sidecar_identity(error) ||
+        !revalidate_nginx_sidecar(*owner, error) ||
         !owner->fixture.verify_topology(FailurePoint::None, error) ||
-        !topology_snapshot_equal(owner->builder_baseline,
+        !topology_snapshot_equal(nginx_topology(*owner),
                                  owner->fixture.current_topology_snapshot()))
         return freeze_failure(ExactInputNginxLifecycleOutcome::SourceRevalidationFailed,
                               "pre-create source/sidecar/topology bracket failed: " + error,
@@ -10831,7 +10896,7 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
         "--label",
         std::string("rut.role=") + kNginxRole,
         "--network",
-        "container:" + owner->fixture.holder_id(),
+        "container:" + nginx_topology(*owner).holder_id,
         "--user",
         credentials,
         "--workdir",
@@ -10867,7 +10932,7 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     if (!exact_nginx_create_argv(current.create_argv,
                                  current.container_name,
                                  owner->fixture.token(),
-                                 owner->fixture.holder_id(),
+                                 nginx_topology(*owner).holder_id,
                                  owner->input.path(),
                                  credentials))
         return freeze_failure(ExactInputNginxLifecycleOutcome::IdentityFailed,
@@ -10958,11 +11023,13 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     command_deadline.set(http_deadline);
     static constexpr char kPinnedRequest[] =
         "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
-    if (!bounded_http_exchange::exchange(owner->builder_baseline.positive_ip,
+    if (!bounded_http_exchange::exchange(nginx_topology(*owner).positive_ip,
                                          kExactInputTopologyBuilderPort,
                                          kPinnedRequest,
                                          http_deadline,
-                                         current.http))
+                                         current.http,
+                                         bounded_http_exchange::kResponseByteLimit,
+                                         owner->rotated_lifecycle_authority ? false : true))
         return freeze_failure(ExactInputNginxLifecycleOutcome::SampleFailed,
                               "bounded nginx HTTP exchange failed: " + current.http.diagnostic);
     if (owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectHttpObservation)
@@ -11006,8 +11073,10 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
                 << " detail=" << error;
         return freeze_failure(ExactInputNginxLifecycleOutcome::GracefulStopFailed, failure.str());
     }
-    if (!validate_pinned_nginx_http_observation(
-            current, owner->builder_baseline.positive_ip, error))
+    if (!validate_pinned_nginx_http_observation(current,
+                                                nginx_topology(*owner).positive_ip,
+                                                error,
+                                                !owner->rotated_lifecycle_authority))
         return freeze_failure(ExactInputNginxLifecycleOutcome::SampleFailed,
                               "pinned nginx HTTP/log observation mismatch: " + error);
     if (owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectBaseline ||
@@ -11026,6 +11095,38 @@ bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
     observation = current;
     diagnostic = {};
     return true;
+}
+
+bool ExactInputMountRecoveryController::observe_nginx_lifecycle(
+    const ExactInputMountHandle& handle,
+    ExactInputNginxLifecycleObservation& observation,
+    ExactInputMountDiagnostic& diagnostic) {
+    diagnostic = {};
+    if (!validate_handle(handle, diagnostic)) return false;
+    ExactInputMountOwner* owner = exact_mount_owner(owner_cookie_);
+    if (owner == nullptr) {
+        diagnostic = {ExactInputMountPhase::Lifecycle, EINVAL, "exact-input owner is absent"};
+        return false;
+    }
+    if (owner->nginx_lifecycle_attempted) {
+        observation = owner->nginx_lifecycle_observation;
+        diagnostic = owner->nginx_lifecycle_diagnostic;
+        return observation.outcome == ExactInputNginxLifecycleOutcome::Complete;
+    }
+    if (owner->state != ExactInputMountState::WriteRefusalObserved ||
+        !owner->write_refusal_attempted ||
+        owner->write_refusal_observation.outcome != ExactInputWriteRefusalOutcome::Complete ||
+        !owner->receipt.builder.applicable || !owner->receipt.builder.output_accepted) {
+        diagnostic = {ExactInputMountPhase::Lifecycle,
+                      EINVAL,
+                      "nginx lifecycle requires topology-built input and successful write refusal"};
+        return false;
+    }
+    owner->nginx_lifecycle_attempted = true;
+    owner->state = ExactInputMountState::ObservingNginxLifecycle;
+    owner->snapshot.state = owner->state;
+    owner->receipt.state = owner->state;
+    return observe_nginx_lifecycle_impl(owner, observation, diagnostic);
 }
 
 void ExactInputMountRecoveryController::return_handle(ExactInputMountHandle& handle) noexcept {
@@ -15656,8 +15757,30 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
                 return finish_failure(false);
             } else {
                 live.state = ExactInputRotationState::LivePublished;
+                root.rotated_lifecycle_authority = true;
+                root.lifecycle_source = live.fresh_source;
+                root.lifecycle_target = mounted.fresh_mounted;
+                root.lifecycle_topology = live.generation_receipt.new_generation.topology;
+                root.lifecycle_sidecar.id = mounted.fresh_mounted.id;
+                root.lifecycle_sidecar.image_id = mounted.fresh_mounted.image_id;
+                root.lifecycle_sidecar.pid = mounted.fresh_mounted.pid;
+                bool nginx_callback_ran = false;
+                const ExactInputRotationNginxCallback nginx_callback =
+                    [&](ExactInputNginxLifecycleObservation& nginx, std::string& nginx_error) {
+                        if (nginx_callback_ran) {
+                            nginx = root.nginx_lifecycle_observation;
+                            nginx_error = root.nginx_lifecycle_diagnostic.message;
+                            return nginx.outcome == ExactInputNginxLifecycleOutcome::Complete;
+                        }
+                        nginx_callback_ran = true;
+                        root.nginx_lifecycle_attempted = true;
+                        root.state = ExactInputMountState::ObservingNginxLifecycle;
+                        root.snapshot.state = root.state;
+                        root.receipt.state = root.state;
+                        return observe_nginx_lifecycle_impl(&root, nginx, root.nginx_lifecycle_diagnostic);
+                    };
                 if (!validate_exact_input_rotation_live_evidence(live, error) ||
-                    !callback(live, error)) {
+                    !callback(live, nginx_callback, error)) {
                     result.error = error;
                     return finish_failure(false);
                 }

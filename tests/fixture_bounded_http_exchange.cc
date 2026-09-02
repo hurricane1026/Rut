@@ -86,7 +86,11 @@ bool parse_response(const std::string& raw,
                     std::size_t limit) {
     parsed = {};
     error.clear();
-    if (raw.empty() || raw.size() > limit) {
+    if (raw.empty()) {
+        error = "response was empty";
+        return false;
+    }
+    if (raw.size() > limit) {
         error = "response exceeds bounded byte limit";
         return false;
     }
@@ -171,7 +175,8 @@ bool exchange(const std::string& ipv4,
               const std::string& request,
               std::int64_t deadline_ns,
               Observation& observation,
-              std::size_t limit) {
+              std::size_t limit,
+              bool shutdown_write_after_send) {
     observation = {};
     observation.attempted = true;
     observation.request = request;
@@ -255,17 +260,19 @@ bool exchange(const std::string& ipv4,
     }
     observation.send_completed = true;
     observation.send_completed_nanoseconds = now_ns();
-    for (;;) {
-        if (now_ns() >= deadline_ns)
-            return fail(Outcome::DeadlineExceeded, "write shutdown deadline exceeded");
-        observation.write_shutdown_started = true;
-        if (shutdown_write(fd) == 0) {
-            observation.write_shutdown_completed = true;
-            observation.write_shutdown_completed_nanoseconds = now_ns();
-            break;
+    if (shutdown_write_after_send) {
+        for (;;) {
+            if (now_ns() >= deadline_ns)
+                return fail(Outcome::DeadlineExceeded, "write shutdown deadline exceeded");
+            observation.write_shutdown_started = true;
+            if (shutdown_write(fd) == 0) {
+                observation.write_shutdown_completed = true;
+                observation.write_shutdown_completed_nanoseconds = now_ns();
+                break;
+            }
+            if (errno == EINTR) continue;
+            return fail(Outcome::WriteShutdownFailed, "write shutdown failed", errno);
         }
-        if (errno == EINTR) continue;
-        return fail(Outcome::WriteShutdownFailed, "write shutdown failed", errno);
     }
     observation.read_started = true;
     std::array<char, 1024> buffer{};

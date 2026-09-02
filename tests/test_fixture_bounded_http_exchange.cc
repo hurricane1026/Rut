@@ -100,6 +100,7 @@ struct ServerState {
     const char* diagnostic = nullptr;
     bool allow_send_failure = false;
     bool allow_empty_request = false;
+    bool wait_for_request_eof = true;
 };
 
 static void server_failure(ServerState& state, const char* diagnostic) {
@@ -154,7 +155,8 @@ static void serve_response(int listener, const std::string& response, ServerStat
                 const std::size_t available = std::min(received_total, sizeof(request));
                 const ssize_t received =
                     recv(client, request + available, sizeof(request) - available, 0);
-                if (received == 0) break;
+                if (received == 0)
+                    break;
                 if (received < 0 && errno == EINTR) continue;
                 if (received < 0) {
                     server_failure(state, "server recv failed");
@@ -165,6 +167,9 @@ static void serve_response(int listener, const std::string& response, ServerStat
                     break;
                 }
                 received_total += static_cast<std::size_t>(received);
+                if (!state.wait_for_request_eof && received_total >= 4u &&
+                    std::string(request, received_total).find("\r\n\r\n") != std::string::npos)
+                    break;
             }
             if (state.failed) break;
             if (received_total == 0 && state.allow_empty_request) break;
@@ -195,7 +200,8 @@ static bool exchange_server(const std::string& response,
                             Observation* result_observation = nullptr,
                             bool allow_send_failure = false,
                             std::int64_t deadline_ns_override = 0,
-                            bool allow_empty_request = false) {
+                            bool allow_empty_request = false,
+                            bool shutdown_write_after_send = true) {
     bool ok = true;
     std::uint16_t port = 0;
     const int listener = open_listener(port);
@@ -203,6 +209,7 @@ static bool exchange_server(const std::string& response,
     ServerState state;
     state.allow_send_failure = allow_send_failure;
     state.allow_empty_request = allow_empty_request;
+    state.wait_for_request_eof = shutdown_write_after_send;
     std::thread server;
     try {
         server = std::thread(serve_response, listener, std::cref(response), std::ref(state));
@@ -218,7 +225,8 @@ static bool exchange_server(const std::string& response,
             : std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
                   .count();
     const bool complete =
-        exchange("127.0.0.1", port, "GET / HTTP/1.1\r\n\r\n", deadline_ns, observation);
+        exchange("127.0.0.1", port, "GET / HTTP/1.1\r\n\r\n", deadline_ns, observation,
+                 kResponseByteLimit, shutdown_write_after_send);
     if (result_observation != nullptr) *result_observation = observation;
     if (!check(observation.outcome == expected, "bounded exchange outcome")) ok = false;
     if (!check(complete == (expected == Outcome::Complete), "bounded exchange completion result"))
@@ -318,6 +326,16 @@ int main() {
 
     const int descriptors_before = open_fd_count();
     if (!exchange_server(valid_response(), Outcome::Complete)) ok = false;
+    {
+        Observation observation;
+        if (!exchange_server(valid_response(), Outcome::Complete, &observation, false, 0, false,
+                             false) ||
+            !check(observation.send_completed && !observation.write_shutdown_started &&
+                       !observation.write_shutdown_completed && observation.read_started &&
+                       observation.eof_observed,
+                   "normal client exchange reads without write shutdown"))
+            ok = false;
+    }
 #ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
     {
         Observation observation;
