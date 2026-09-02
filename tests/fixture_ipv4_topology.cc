@@ -14304,6 +14304,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         return result;
     }
     ExactInputMountOwner root(token, bytes);
+    const HeldNamespaceSidecarSnapshot preserved_registered_sidecar = root.registered_sidecar;
+    const ParsedMountInspect preserved_registered_mount = root.registered_mount;
     MountedSidecarRotationOwner mounted;
     GenerationReceiptCompositionOwner composer;
     ExactInputRotationLiveEvidence live;
@@ -14427,28 +14429,6 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         result.error = "old mounted owner transition was rejected";
         return finish_failure(false);
     }
-    root.registered_sidecar.token = mounted.old_mounted.token;
-    root.registered_sidecar.stage = mounted.old_mounted.stage;
-    root.registered_sidecar.role = mounted.old_mounted.role;
-    root.registered_sidecar.name = mounted.old_mounted.name;
-    root.registered_sidecar.id = mounted.old_mounted.id;
-    root.registered_sidecar.pinned_image_reference = mounted.old_mounted.image_reference;
-    root.registered_sidecar.expected_image_id = mounted.old_mounted.image_id;
-    root.registered_sidecar.image_id = mounted.old_mounted.image_id;
-    root.registered_sidecar.network_mode = mounted.old_mounted.network_mode;
-    root.registered_sidecar.path = mounted.old_mounted.path;
-    root.registered_sidecar.arguments_json = mounted.old_mounted.arguments_json;
-    root.registered_sidecar.pid = mounted.old_mounted.pid;
-    root.registered_sidecar.start = mounted.old_mounted.start;
-    root.registered_sidecar.netns = mounted.old_mounted.network_netns;
-    root.registered_sidecar.running = true;
-    root.registered_sidecar.read_only_root = true;
-    root.registered_sidecar.capability_drop_all = true;
-    root.registered_sidecar.no_new_privileges = true;
-    root.registered_sidecar.no_published_ports = true;
-    root.registered_mount = old_mount;
-    const HeldNamespaceSidecarSnapshot frozen_registered_sidecar = root.registered_sidecar;
-    const ParsedMountInspect frozen_registered_mount = root.registered_mount;
     const ExactInputMountedSidecarAbsence expected_old_absence{mounted.old_mounted.id,
                                                                mounted.old_mounted.name,
                                                                mounted.old_mounted.pid,
@@ -14467,8 +14447,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         !remove_rotation_mounted(mounted, true, false, error) ||
         !exact_input_mounted_absence_matches(mounted.old_absence, mounted.old_mounted) ||
         !exact_input_mounted_absence_equal(mounted.old_absence, expected_old_absence) ||
-        !sidecar_snapshot_equal(root.registered_sidecar, frozen_registered_sidecar) ||
-        !mount_inspect_equal(root.registered_mount, frozen_registered_mount)) {
+        !sidecar_snapshot_equal(root.registered_sidecar, preserved_registered_sidecar) ||
+        !mount_inspect_equal(root.registered_mount, preserved_registered_mount)) {
         if (error.empty()) error = "old mounted-sibling authority/history was not exact";
         result.error = error;
         return finish_failure(false);
@@ -14739,6 +14719,11 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     }
     if (!frozen_replay) {
         result.error = "terminal exact-input rotation receipt changed during replay";
+        return result;
+    }
+    if (!sidecar_snapshot_equal(root.registered_sidecar, preserved_registered_sidecar) ||
+        !mount_inspect_equal(root.registered_mount, preserved_registered_mount)) {
+        result.error = "legacy exact-input mount history changed during mounted rotation";
         return result;
     }
     result.cleanup_complete = true;
