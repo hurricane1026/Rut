@@ -13775,6 +13775,51 @@ struct MountedSidecarRotationOwner {
     std::uint32_t fresh_remove_suppression_count = 0;
 };
 
+struct ExactInputRotationNetworkOrder {
+    ExactInputRotationTerminalReceipt* receipt = nullptr;
+    std::uint32_t* order = nullptr;
+    bool already_settled_holder_observed = false;
+};
+
+static bool record_exact_input_rotation_network_order(void* opaque,
+                                                      TopologySettlementEvent event,
+                                                      bool removed,
+                                                      std::string& error) {
+    auto& context = *static_cast<ExactInputRotationNetworkOrder*>(opaque);
+    if (context.receipt == nullptr || context.order == nullptr) {
+        error = "exact-input rotation network-order context was incomplete";
+        return false;
+    }
+    if (event == TopologySettlementEvent::Holder) {
+        if (removed || context.already_settled_holder_observed ||
+            context.receipt->network_b_order != 0u || context.receipt->network_a_order != 0u) {
+            error = "exact-input rotation did not observe one already-settled holder event";
+            return false;
+        }
+        context.already_settled_holder_observed = true;
+        return true;
+    }
+    if (!context.already_settled_holder_observed || !removed) {
+        error = "exact-input rotation network settlement preceded holder settlement";
+        return false;
+    }
+    if (event == TopologySettlementEvent::NetworkB) {
+        if (context.receipt->network_b_order != 0u || context.receipt->network_a_order != 0u) {
+            error = "exact-input rotation network B settlement order was not unique";
+            return false;
+        }
+        context.receipt->network_b_order = ++*context.order;
+        return true;
+    }
+    if (event == TopologySettlementEvent::NetworkA && context.receipt->network_b_order != 0u &&
+        context.receipt->network_a_order == 0u) {
+        context.receipt->network_a_order = ++*context.order;
+        return true;
+    }
+    error = "exact-input rotation network A settlement order was not exact";
+    return false;
+}
+
 static bool mounted_rotation_transition(MountedSidecarRotationOwner& owner,
                                         ExactInputRotationState next) {
     bool allowed = false;
@@ -14638,29 +14683,13 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         return finish_failure(false);
     }
     terminal_receipt.holder_order = ++order;
-    struct NetworkOrder {
-        ExactInputRotationTerminalReceipt* receipt;
-        std::uint32_t* order;
-    } network_order{&terminal_receipt, &order};
-    const auto record_network =
-        [](void* opaque, TopologySettlementEvent event, bool removed, std::string& callback_error) {
-            auto& context = *static_cast<NetworkOrder*>(opaque);
-            if (!removed || event == TopologySettlementEvent::Holder) {
-                callback_error = "unexpected retained-topology settlement event";
-                return false;
-            }
-            if (event == TopologySettlementEvent::NetworkB)
-                context.receipt->network_b_order = ++*context.order;
-            else if (event == TopologySettlementEvent::NetworkA)
-                context.receipt->network_a_order = ++*context.order;
-            return true;
-        };
+    ExactInputRotationNetworkOrder network_order{&terminal_receipt, &order, false};
     CleanupPhaseResult topology;
     if (require_mounted_settled("retained topology cleanup", cleanup_error))
-        topology =
-            root.fixture.cleanup_topology_phase(cleanup_error, record_network, &network_order);
+        topology = root.fixture.cleanup_topology_phase(
+            cleanup_error, record_exact_input_rotation_network_order, &network_order);
     if (!topology.settled || !topology.operation_ok || terminal_receipt.network_b_order != 6u ||
-        terminal_receipt.network_a_order != 7u) {
+        terminal_receipt.network_a_order != 7u || !network_order.already_settled_holder_observed) {
         result.error = cleanup_error;
         return finish_failure(false);
     }
@@ -14922,6 +14951,33 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         }
     if (mounted_rotation_transition(transitions, ExactInputRotationState::Ready)) {
         error = "terminal mounted-sidecar transition replay was accepted";
+        return false;
+    }
+    ExactInputRotationTerminalReceipt order_receipt;
+    std::uint32_t cleanup_order = 5u;
+    ExactInputRotationNetworkOrder order_context{&order_receipt, &cleanup_order, false};
+    std::string order_error;
+    if (!record_exact_input_rotation_network_order(
+            &order_context, TopologySettlementEvent::Holder, false, order_error) ||
+        !record_exact_input_rotation_network_order(
+            &order_context, TopologySettlementEvent::NetworkB, true, order_error) ||
+        !record_exact_input_rotation_network_order(
+            &order_context, TopologySettlementEvent::NetworkA, true, order_error) ||
+        !order_error.empty() || !order_context.already_settled_holder_observed ||
+        order_receipt.network_b_order != 6u || order_receipt.network_a_order != 7u) {
+        error = "already-settled holder and B/A network order was rejected";
+        return false;
+    }
+    ExactInputRotationTerminalReceipt rejected_order_receipt;
+    cleanup_order = 5u;
+    ExactInputRotationNetworkOrder rejected_order_context{
+        &rejected_order_receipt, &cleanup_order, false};
+    order_error.clear();
+    if (record_exact_input_rotation_network_order(
+            &rejected_order_context, TopologySettlementEvent::NetworkB, true, order_error) ||
+        order_error.empty() || cleanup_order != 5u ||
+        rejected_order_receipt.network_b_order != 0u) {
+        error = "network settlement before the already-settled holder was accepted";
         return false;
     }
     return true;
