@@ -350,16 +350,32 @@ u32 pipeline_leftover(const Connection& conn) {
     return kBufLen - kReqEnd;
 }
 
-bool pipeline_shift(Connection& conn) {
+PipelineTransitionResult pipeline_transition_status(const Connection& conn) {
+    if (conn.pipeline_depth >= Connection::kMaxPipelineDepth)
+        return PipelineTransitionResult::LimitExceeded;
+    return PipelineTransitionResult::Advanced;
+}
+
+PipelineTransitionResult pipeline_advance(Connection& conn) {
+    const PipelineTransitionResult kTransition = pipeline_transition_status(conn);
+    if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
+    conn.pipeline_depth++;
+    return PipelineTransitionResult::Advanced;
+}
+
+PipelineTransitionResult pipeline_shift(Connection& conn) {
     const u32 kLeftover = pipeline_leftover(conn);
-    if (kLeftover == 0) return false;
+    if (kLeftover == 0) return PipelineTransitionResult::NoSuccessor;
+    const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+    if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
+    const PipelineTransitionResult kTransition = pipeline_advance(conn);
+    if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
     const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
     conn.reset_request_receive_buffer();
     u8* dst = conn.recv_buf.write_ptr();
     __builtin_memmove(dst, src, kLeftover);
     conn.recv_buf.commit(kLeftover);
-    conn.pipeline_depth++;
-    return true;
+    return PipelineTransitionResult::Advanced;
 }
 
 bool pipeline_stash(Connection& conn) {
@@ -380,14 +396,24 @@ bool pipeline_stash(Connection& conn) {
     return true;
 }
 
-bool pipeline_recover(Connection& conn) {
+PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition) {
     const u16 kStashLen = conn.pipeline_stash_len;
-    conn.pipeline_stash_len = 0;
-    if (kStashLen == 0) return false;
+    if (kStashLen == 0) return PipelineTransitionResult::NoSuccessor;
+    if (count_transition) {
+        const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+        if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
+    }
     const u32 kStashOff = conn.retry_req_send_len;
     const u8* src = conn.send_buf.data() + kStashOff;
-    conn.retry_req_send_len = 0;
     const u32 kExisting = conn.recv_buf.len();
+    if (static_cast<u32>(kStashLen) + kExisting > conn.recv_buf.capacity())
+        return PipelineTransitionResult::LimitExceeded;
+    if (count_transition) {
+        const PipelineTransitionResult kTransition = pipeline_advance(conn);
+        if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
+    }
+    conn.pipeline_stash_len = 0;
+    conn.retry_req_send_len = 0;
     if (kExisting == 0) {
         // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just
         // restore the stash.
@@ -400,9 +426,6 @@ bool pipeline_recover(Connection& conn) {
         // tunnel install while an io_uring multishot recv stayed armed) came
         // AFTER the stash, so they must follow it — not be dropped. Shift them up
         // by kStashLen and prepend the stash. base == recv_buf.data().
-        if (static_cast<u32>(kStashLen) + kExisting > conn.recv_buf.capacity())
-            return false;  // can't hold both — signal failure so the caller closes
-                           // rather than forwarding a truncated (corrupt) stream
         u8* base = conn.recv_buf.write_ptr() - kExisting;
         conn.clear_raw_request_target_witness();
         __builtin_memmove(base + kStashLen, base, kExisting);
@@ -410,8 +433,7 @@ bool pipeline_recover(Connection& conn) {
         conn.recv_buf.set_len(kStashLen + kExisting);
     }
     conn.send_buf.reset();
-    conn.pipeline_depth++;
-    return true;
+    return PipelineTransitionResult::Advanced;
 }
 
 extern const char kResponse200[] =

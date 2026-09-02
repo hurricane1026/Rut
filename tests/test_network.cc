@@ -5337,7 +5337,7 @@ TEST(websocket, pipeline_recover_preserves_raced_recv_bytes) {
     conn->recv_buf.reset();
     REQUIRE_EQ(conn->recv_buf.write(raced, sizeof(raced)), sizeof(raced));
 
-    REQUIRE(pipeline_recover(*conn));
+    REQUIRE(pipeline_recover(*conn) == PipelineTransitionResult::Advanced);
     REQUIRE_EQ(conn->recv_buf.len(), 5u);
     CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), "ABCDE", 5), 0);  // stash then raced
     CHECK_EQ(conn->pipeline_stash_len, 0u);
@@ -7695,7 +7695,7 @@ TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
     CHECK_EQ(c->recv_buf.len(), 0u);
 
     CHECK(rut::request_fully_resendable(*c));
-    REQUIRE(rut::pipeline_recover(*c));
+    REQUIRE(rut::pipeline_recover(*c) == rut::PipelineTransitionResult::Advanced);
     CHECK_EQ(c->recv_buf.len(), len2);
     CHECK(__builtin_memcmp(c->recv_buf.data(), get2, len2) == 0);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
@@ -7780,7 +7780,7 @@ TEST(upstream_reuse, response_preserves_stash_offset_until_pipeline_recover) {
         make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
 
     CHECK_EQ(c->retry_req_send_len, len1);
-    REQUIRE(rut::pipeline_recover(*c));
+    REQUIRE(rut::pipeline_recover(*c) == rut::PipelineTransitionResult::Advanced);
     CHECK_EQ(c->retry_req_send_len, 0u);
     CHECK_EQ(c->recv_buf.len(), len2);
     CHECK(__builtin_memcmp(c->recv_buf.data(), get2, len2) == 0);
@@ -14729,6 +14729,37 @@ TEST(pipeline, post_cl_then_get) {
     CHECK_EQ(conn->pipeline_depth, 0u);
 }
 
+struct PipelineCausalSmallLoop : SmallLoop {
+    u32 close_count = 0;
+    u32 close_handler_gen = 0;
+    u32 close_completed_requests = 0;
+    u16 close_pipeline_depth = 0;
+    u32 close_recv_len = 0;
+    u32 close_req_initial_send_len = 0;
+    u16 close_pipeline_stash_len = 0;
+    u32 close_upstream_attempts = 0;
+    u32 close_upstream_episode = 0;
+    i32 close_upstream_fd = -1;
+    u32 close_metadata_episode = 0;
+    bool close_deadline_neutral = false;
+
+    void close_conn(Connection& conn) {
+        close_count++;
+        close_handler_gen = conn.handler_gen;
+        close_completed_requests = conn.downstream_completed_request_count;
+        close_pipeline_depth = conn.pipeline_depth;
+        close_recv_len = conn.recv_buf.len();
+        close_req_initial_send_len = conn.req_initial_send_len;
+        close_pipeline_stash_len = conn.pipeline_stash_len;
+        close_upstream_attempts = conn.upstream_attempts;
+        close_upstream_episode = conn.upstream_episode;
+        close_upstream_fd = conn.upstream_fd;
+        close_metadata_episode = conn.req_metadata_episode;
+        close_deadline_neutral = conn.response_read_deadline_owner_is_neutral();
+        SmallLoop::close_conn_impl(conn);
+    }
+};
+
 // 17 GETs pipelined. First 16 processed via recursion, 17th falls through to normal recv.
 TEST(pipeline, depth_limit_respected) {
     SmallLoop loop;
@@ -14781,6 +14812,131 @@ TEST(pipeline, depth_limit_respected) {
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
     CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
+}
+
+TEST(pipeline, typed_transition_limit_rejects_without_mutating_or_dispatching) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->pipeline_depth = 0;
+    for (u16 i = 0; i < Connection::kMaxPipelineDepth; i++)
+        CHECK(pipeline_advance(*conn) == PipelineTransitionResult::Advanced);
+    CHECK_EQ(conn->pipeline_depth, Connection::kMaxPipelineDepth);
+    CHECK(pipeline_advance(*conn) == PipelineTransitionResult::LimitExceeded);
+
+    static constexpr char kFirst[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kNext[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kFirst), sizeof(kFirst) - 1),
+               sizeof(kFirst) - 1);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kNext), sizeof(kNext) - 1),
+               sizeof(kNext) - 1);
+    conn->req_initial_send_len = sizeof(kFirst) - 1;
+    conn->pipeline_depth = Connection::kMaxPipelineDepth;
+    const u32 recv_len_before = conn->recv_buf.len();
+    const u16 depth_before = conn->pipeline_depth;
+    CHECK(pipeline_shift(*conn) == PipelineTransitionResult::LimitExceeded);
+    CHECK_EQ(conn->pipeline_depth, depth_before);
+    CHECK_EQ(conn->recv_buf.len(), recv_len_before);
+    CHECK_EQ(__builtin_memcmp(
+                 conn->recv_buf.data() + conn->req_initial_send_len, kNext, sizeof(kNext) - 1),
+             0);
+
+    conn->send_buf.reset();
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kNext), sizeof(kNext) - 1),
+               sizeof(kNext) - 1);
+    conn->pipeline_stash_len = sizeof(kNext) - 1;
+    conn->retry_req_send_len = 0;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>("late"), 4), 4u);
+    const u32 stash_recv_len_before = conn->recv_buf.len();
+    const u32 stash_send_len_before = conn->send_buf.len();
+    CHECK(pipeline_recover(*conn) == PipelineTransitionResult::LimitExceeded);
+    CHECK_EQ(conn->pipeline_depth, depth_before);
+    CHECK_EQ(conn->pipeline_stash_len, sizeof(kNext) - 1);
+    CHECK_EQ(conn->recv_buf.len(), stash_recv_len_before);
+    CHECK_EQ(conn->send_buf.len(), stash_send_len_before);
+
+    // WebSocket post-upgrade bytes share the stash storage but do not allocate
+    // another HTTP/1 successor, even when the prior pipeline depth is full.
+    CHECK(pipeline_recover(*conn, /*count_transition=*/false) ==
+          PipelineTransitionResult::Advanced);
+    CHECK_EQ(conn->pipeline_depth, depth_before);
+    CHECK_EQ(conn->pipeline_stash_len, 0u);
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kNext) - 1 + 4u);
+}
+
+TEST(pipeline, seventeenth_successor_closes_before_dispatch) {
+    PipelineCausalSmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+    const RouteConfig* active = nullptr;
+    loop.config_ptr = &active;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->on_recv = &on_header_received<PipelineCausalSmallLoop>;
+
+    static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    constexpr u32 kGetLen = sizeof(kGet) - 1;
+    constexpr u32 kRequestCount = Connection::kMaxPipelineDepth + 2;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet), kGetLen), kGetLen);
+    for (u32 i = 1; i < kRequestCount; i++)
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet), kGetLen), kGetLen);
+    const u32 total_len = kGetLen * kRequestCount;
+    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total_len));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    REQUIRE_EQ(conn->on_send, &on_response_sent<PipelineCausalSmallLoop>);
+
+    for (u32 i = 0; i < Connection::kMaxPipelineDepth; i++) {
+        const u32 send_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+    }
+    CHECK_EQ(conn->pipeline_depth, Connection::kMaxPipelineDepth);
+    CHECK_EQ(metrics.requests_total, Connection::kMaxPipelineDepth);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), Connection::kMaxPipelineDepth);
+    CHECK_EQ(capture.available(), Connection::kMaxPipelineDepth);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 33u);
+    const u32 handler_before_overflow = conn->handler_gen;
+    const u32 metadata_before_overflow = conn->req_metadata_episode;
+    const u32 recv_len_before_overflow = conn->recv_buf.len();
+    const u32 seventeenth_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(seventeenth_send_len)));
+    CHECK_EQ(loop.close_count, 1u);
+    CHECK_EQ(loop.close_handler_gen, handler_before_overflow);
+    CHECK_EQ(loop.close_completed_requests, Connection::kMaxPipelineDepth + 1u);
+    CHECK_EQ(metrics.requests_total, Connection::kMaxPipelineDepth + 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(access.available(), Connection::kMaxPipelineDepth + 1u);
+    CHECK_EQ(capture.available(), Connection::kMaxPipelineDepth + 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 34u);
+    CHECK_EQ(loop.close_pipeline_depth, Connection::kMaxPipelineDepth);
+    CHECK_EQ(loop.close_recv_len, recv_len_before_overflow);
+    CHECK_EQ(loop.close_req_initial_send_len, kGetLen);
+    CHECK_EQ(loop.close_pipeline_stash_len, 0u);
+    CHECK_EQ(loop.close_metadata_episode, metadata_before_overflow);
+    CHECK_EQ(loop.close_upstream_attempts, 0u);
+    CHECK_EQ(loop.close_upstream_episode, 1u);
+    CHECK_EQ(loop.close_upstream_fd, -1);
+    CHECK(loop.close_deadline_neutral);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
 // Complete GET + leftover bytes. First processes via pipeline, leftover is shifted
@@ -14910,8 +15066,8 @@ TEST(pipeline, proxy_stash_and_recover) {
 
     // Simulate: recv_buf was reset for upstream response, now recover.
     conn->recv_buf.reset();
-    bool recovered = pipeline_recover(*conn);
-    CHECK(recovered);
+    const auto recovered = pipeline_recover(*conn);
+    CHECK(recovered == PipelineTransitionResult::Advanced);
     CHECK_EQ(conn->recv_buf.len(), second_len);
     CHECK_EQ(conn->pipeline_stash_len, 0u);
     CHECK_EQ(conn->pipeline_depth, 1u);
@@ -15433,7 +15589,7 @@ TEST(pipeline, content_length_count_is_reparsed_for_successor) {
     CHECK_EQ(conn->req_client_content_length_count, 2u);
     CHECK_EQ(conn->req_content_length, 0u);
 
-    REQUIRE(pipeline_shift(*conn));
+    REQUIRE(pipeline_shift(*conn) == PipelineTransitionResult::Advanced);
     REQUIRE_EQ(conn->pipeline_depth, 1u);
     capture_request_metadata(*conn);
     CHECK_FALSE(conn->req_client_has_content_length);
@@ -18424,7 +18580,7 @@ TEST(raw_request_target_witness, reset_shift_recover_and_successor_episodes_do_n
     REQUIRE(c.checked_raw_request_target().target.eq({"/first?x=1", 10}));
     const u32 first_episode = c.req_raw_target_episode;
 
-    REQUIRE(pipeline_shift(c));
+    REQUIRE(pipeline_shift(c) == PipelineTransitionResult::Advanced);
     CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
     capture_request_metadata(c);
     REQUIRE(c.checked_raw_request_target().target.eq({"/second//path?y=%2F", 19}));
@@ -18435,7 +18591,7 @@ TEST(raw_request_target_witness, reset_shift_recover_and_successor_episodes_do_n
     REQUIRE(pipeline_stash(c));
     c.reset_request_receive_buffer();
     CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
-    REQUIRE(pipeline_recover(c));
+    REQUIRE(pipeline_recover(c) == PipelineTransitionResult::Advanced);
     CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
     capture_request_metadata(c);
     REQUIRE(c.checked_raw_request_target().target.eq({"/third", 6}));
@@ -18448,7 +18604,7 @@ TEST(raw_request_target_witness, reset_shift_recover_and_successor_episodes_do_n
     REQUIRE_EQ(
         c.recv_buf.write(reinterpret_cast<const u8*>(kFourthSuffix), sizeof(kFourthSuffix) - 1u),
         sizeof(kFourthSuffix) - 1u);
-    REQUIRE(pipeline_recover(c));
+    REQUIRE(pipeline_recover(c) == PipelineTransitionResult::Advanced);
     CHECK_EQ(c.checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
     capture_request_metadata(c);
     REQUIRE(c.checked_raw_request_target().target.eq({"/late//fourth?z=%2f", 19}));
@@ -27779,6 +27935,15 @@ struct RawDownstreamRecvBatch {
         __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
     }
 
+    void append_send(Connection& conn, i32 result) {
+        u32 cursor = tail();
+        auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Send, 0});
+        cqe.res = result;
+        cqe.flags = 0;
+        __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+    }
+
     void append_close_cancel(Connection& conn, i32 result) {
         u32 cursor = tail();
         auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
@@ -27924,6 +28089,100 @@ TEST(iouring_downstream_recv_barrier, different_connections_and_terminals_do_not
     CHECK_EQ(b.recv_buf.len(), 2u);
     CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
     CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_downstream_recv_barrier, pipeline_overflow_closes_live_and_terminal_recv_once) {
+    static constexpr u8 kFirst[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr u8 kSuccessor[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    for (const bool terminal_recv : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            // A terminal-consumed Recv has no close cancel to drain; the
+            // cancel_first dimension is meaningful only for the live owner.
+            if (terminal_recv && cancel_first) continue;
+            RawDownstreamRecvBatch fixture;
+            if (!fixture.init()) SKIP("io_uring unavailable");
+            auto* loop = fixture.guard.loop;
+            ShardMetrics metrics{};
+            metrics.init();
+            ShardEpoch epoch{};
+            epoch.epoch.store(1, std::memory_order_relaxed);
+            loop->metrics = &metrics;
+            loop->epoch = &epoch;
+            Connection& conn = *fixture.conns[0];
+            const u32 id = conn.id;
+            REQUIRE_EQ(conn.recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
+            conn.req_initial_send_len = sizeof(kFirst) - 1u;
+            conn.pipeline_depth = Connection::kMaxPipelineDepth;
+            conn.keep_alive = true;
+            conn.req_client_keep_alive = true;
+            conn.req_start_us = monotonic_us();
+            conn.resp_status = 200;
+            conn.state = ConnState::Sending;
+            REQUIRE_EQ(conn.send_buf.write(kResponse, sizeof(kResponse) - 1u),
+                       sizeof(kResponse) - 1u);
+            conn.send_armed = true;
+            conn.pending_ops = 2;  // downstream Recv + response Send
+            conn.on_recv = nullptr;
+            conn.on_send = &on_response_sent<IoUringEventLoop>;
+            fixture.guard.loop->backend.send_state[id] = {
+                conn.send_buf.data(), conn.fd, 0, conn.send_buf.len(), IoEventType::Send, 0, 0};
+
+            REQUIRE(fixture.append_recv(conn, kSuccessor, sizeof(kSuccessor) - 1u, !terminal_recv));
+            fixture.append_send(conn, static_cast<i32>(conn.send_buf.len()));
+            IoEvent events[4]{};
+            REQUIRE_EQ(fixture.wait(events, 4), 2u);
+            const u32 sq_tail_before_close =
+                __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+            loop->dispatch(events[0]);
+            loop->dispatch(events[1]);
+
+            CHECK_EQ(metrics.requests_total, 1u);
+            CHECK_EQ(metrics.requests_active, 0u);
+            CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+            CHECK_EQ(loop->backend.failure_code(), 0);
+            if (terminal_recv) {
+                CHECK_EQ(loop->backend.pending, 0u);
+                CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         sq_tail_before_close);
+                CHECK_EQ(loop->pending_free_count, 0u);
+                CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+            } else {
+                // The only newly submitted operation is the close cancel for
+                // the still-live multishot Recv. No rearm or second cancel is
+                // allowed while the slot waits for both terminal records.
+                CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         sq_tail_before_close + 1u);
+                CHECK_EQ(loop->pending_free_count, 1u);
+                CHECK_EQ(loop->conns[id].pending_ops, 2u);
+                const u32 close_sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                __atomic_store_n(loop->backend.sq_tail, sq_tail_before_close, __ATOMIC_RELEASE);
+                loop->backend.pending = 0;
+                if (cancel_first) {
+                    fixture.append_close_cancel(conn, 1);
+                    fixture.append_terminal(conn, -ECANCELED);
+                } else {
+                    fixture.append_terminal(conn, -ECANCELED);
+                    fixture.append_close_cancel(conn, 1);
+                }
+                REQUIRE_EQ(fixture.wait(events, 4), 2u);
+                loop->dispatch(events[0]);
+                loop->dispatch(events[1]);
+                CHECK_EQ(loop->backend.failure_code(), 0);
+                CHECK_EQ(loop->pending_free_count, 0u);
+                CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+                CHECK_EQ(loop->conns[id].pending_ops, 0u);
+                CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         sq_tail_before_close);
+                CHECK_EQ(close_sq_tail, sq_tail_before_close + 1u);
+            }
+            CHECK_EQ(fixture.head(), fixture.tail());
+            const u32 free_top_after_close = loop->free_top;
+            loop->reclaim_slot(id);  // no-op: the close ledger already reclaimed once
+            CHECK_EQ(loop->free_top, free_top_after_close);
+        }
+    }
 }
 
 TEST(iouring_downstream_recv_barrier, close_cancel_count_is_not_payload_and_accounts_both_orders) {
