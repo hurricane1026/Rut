@@ -146,6 +146,125 @@ struct HeldNamespaceGenerationRotationReceipt {
         HeldNamespaceGenerationRotationPhase::None;
 };
 
+enum class ExactInputRotationState : std::uint8_t {
+    Ready = 0,
+    OldMountedValidated,
+    OldMountedSettled,
+    GenerationValidated,
+    FreshCreateMayHaveMutated,
+    FreshMountedValidated,
+    LivePublished,
+    FreshRemovalMayHaveMutated,
+    Settled,
+    Unresolved,
+};
+
+enum class ExactInputRotationFailurePoint : std::uint8_t {
+    None = 0,
+    FreshCreateReportedTimeout,
+    FreshMountObservationMutation,
+    SuppressFirstFreshRemoval,
+};
+
+struct ExactInputRotationSourceEvidence {
+    std::string path;
+    std::string bytes;
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    std::uint64_t mode = 0;
+    std::uint64_t uid = 0;
+    std::uint64_t gid = 0;
+    std::uint64_t size = 0;
+    std::uint64_t links = 0;
+    std::int64_t mtime_seconds = 0;
+    std::int64_t mtime_nanoseconds = 0;
+    std::int64_t ctime_seconds = 0;
+    std::int64_t ctime_nanoseconds = 0;
+    bool regular_0600 = false;
+    bool exact_bytes_revalidated = false;
+    bool retained_ofd_revalidated = false;
+};
+
+struct ExactInputMountedSidecarEvidence {
+    std::string token;
+    std::string stage;
+    std::string role;
+    std::string generation;
+    std::string name;
+    std::string id;
+    std::string image_reference;
+    std::string image_id;
+    std::string network_mode;
+    std::string user;
+    std::string path;
+    std::string arguments_json;
+    std::string source_path;
+    pid_t pid = -1;
+    std::uint64_t start = 0;
+    std::uint64_t network_netns = 0;
+    std::uint64_t mount_netns = 0;
+    bool running = false;
+    bool read_only_root = false;
+    bool capability_drop_all = false;
+    bool no_new_privileges = false;
+    bool restart_no = false;
+    bool no_published_ports = false;
+    bool requested_mount_exact = false;
+    bool realized_mount_exact = false;
+    bool no_mount_shadowing = false;
+    bool nonhost_mount_netns = false;
+};
+
+struct ExactInputMountedSidecarAbsence {
+    std::string id;
+    std::string name;
+    pid_t pid = -1;
+    std::uint64_t start = 0;
+    bool id_absent = false;
+    bool name_absent = false;
+    bool token_role_generation_absent = false;
+    bool process_absent = false;
+};
+
+struct ExactInputRotationLiveEvidence {
+    ExactInputRotationState state = ExactInputRotationState::Ready;
+    ExactInputRotationSourceEvidence initial_source;
+    ExactInputRotationSourceEvidence fresh_source;
+    ExactInputMountedSidecarEvidence old_mounted;
+    ExactInputMountedSidecarAbsence old_absence;
+    HeldNamespaceGenerationRotationReceipt generation_receipt;
+    ExactInputMountedSidecarEvidence fresh_mounted;
+    bool source_continuity = false;
+    bool generation_receipt_validated_twice = false;
+    bool old_and_fresh_authorities_separate = false;
+    bool operation_ok = true;
+    std::uint32_t old_create_count = 0;
+    std::uint32_t old_remove_count = 0;
+    std::uint32_t fresh_create_count = 0;
+    std::uint32_t fresh_start_count = 0;
+    std::uint32_t fresh_remove_count = 0;
+};
+
+struct ExactInputRotationTerminalReceipt {
+    ExactInputRotationState state = ExactInputRotationState::Ready;
+    ExactInputRotationLiveEvidence live;
+    ExactInputMountedSidecarAbsence fresh_absence;
+    bool operation_ok = true;
+    bool cleanup_complete = false;
+    bool zero_residue = false;
+    bool terminal_frozen = false;
+    bool replay_command_free = false;
+    bool downstream_gates_command_free = false;
+    std::uint32_t fresh_remove_suppression_count = 0;
+    std::uint32_t fresh_mounted_order = 0;
+    std::uint32_t fresh_inert_order = 0;
+    std::uint32_t input_order = 0;
+    std::uint32_t directory_order = 0;
+    std::uint32_t holder_order = 0;
+    std::uint32_t network_b_order = 0;
+    std::uint32_t network_a_order = 0;
+};
+
 enum class HolderOnlyRecreationState : std::uint8_t {
     Ready = 0,
     CreateMayHaveMutated,
@@ -297,6 +416,8 @@ using RecreatedSidecarCallback =
     std::function<bool(const RecreatedSidecarEvidence& evidence, std::string& error)>;
 using HeldNamespaceGenerationReceiptCallback =
     std::function<bool(const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error)>;
+using ExactInputRotationCallback =
+    std::function<bool(const ExactInputRotationLiveEvidence& evidence, std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);
@@ -321,6 +442,10 @@ RunResult run_with_complete_generation_rotation(
     const HeldNamespaceGenerationReceiptCallback& callback,
     HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
     RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
+RunResult run_with_exact_input_rotation(const std::string& bytes,
+                                        ExactInputRotationFailurePoint failure_point,
+                                        const ExactInputRotationCallback& callback,
+                                        ExactInputRotationTerminalReceipt& terminal_receipt);
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,
@@ -337,6 +462,11 @@ bool validate_held_namespace_sidecar_snapshot(const HeldTopologySnapshot& topolo
                                               std::string& error);
 bool validate_held_namespace_generation_rotation_receipt(
     const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error);
+bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvidence& evidence,
+                                                 std::string& error);
+bool validate_exact_input_rotation_terminal_receipt(
+    const ExactInputRotationTerminalReceipt& receipt, std::string& error);
+bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, std::string& error);
 bool validate_held_topology_probe_evidence(const HeldTopologyProbeEvidence& evidence,
                                            HeldTopologyProbePolicy expected_policy,
                                            std::string& error);

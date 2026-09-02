@@ -10967,6 +10967,173 @@ bool validate_held_namespace_generation_rotation_receipt(
     return true;
 }
 
+static bool exact_input_rotation_source_equal(const ExactInputRotationSourceEvidence& left,
+                                              const ExactInputRotationSourceEvidence& right) {
+    return left.path == right.path && left.bytes == right.bytes && left.device == right.device &&
+           left.inode == right.inode && left.mode == right.mode && left.uid == right.uid &&
+           left.gid == right.gid && left.size == right.size && left.links == right.links &&
+           left.mtime_seconds == right.mtime_seconds &&
+           left.mtime_nanoseconds == right.mtime_nanoseconds &&
+           left.ctime_seconds == right.ctime_seconds &&
+           left.ctime_nanoseconds == right.ctime_nanoseconds &&
+           left.regular_0600 == right.regular_0600 &&
+           left.exact_bytes_revalidated == right.exact_bytes_revalidated &&
+           left.retained_ofd_revalidated == right.retained_ofd_revalidated;
+}
+
+static bool exact_input_mounted_equal(const ExactInputMountedSidecarEvidence& left,
+                                      const ExactInputMountedSidecarEvidence& right) {
+    return left.token == right.token && left.stage == right.stage && left.role == right.role &&
+           left.generation == right.generation && left.name == right.name && left.id == right.id &&
+           left.image_reference == right.image_reference && left.image_id == right.image_id &&
+           left.network_mode == right.network_mode && left.user == right.user &&
+           left.path == right.path && left.arguments_json == right.arguments_json &&
+           left.source_path == right.source_path && left.pid == right.pid &&
+           left.start == right.start && left.network_netns == right.network_netns &&
+           left.mount_netns == right.mount_netns && left.running == right.running &&
+           left.read_only_root == right.read_only_root &&
+           left.capability_drop_all == right.capability_drop_all &&
+           left.no_new_privileges == right.no_new_privileges &&
+           left.restart_no == right.restart_no &&
+           left.no_published_ports == right.no_published_ports &&
+           left.requested_mount_exact == right.requested_mount_exact &&
+           left.realized_mount_exact == right.realized_mount_exact &&
+           left.no_mount_shadowing == right.no_mount_shadowing &&
+           left.nonhost_mount_netns == right.nonhost_mount_netns;
+}
+
+static bool exact_input_mounted_absence_equal(const ExactInputMountedSidecarAbsence& left,
+                                              const ExactInputMountedSidecarAbsence& right) {
+    return left.id == right.id && left.name == right.name && left.pid == right.pid &&
+           left.start == right.start && left.id_absent == right.id_absent &&
+           left.name_absent == right.name_absent &&
+           left.token_role_generation_absent == right.token_role_generation_absent &&
+           left.process_absent == right.process_absent;
+}
+
+bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvidence& evidence,
+                                                 std::string& error) {
+    error.clear();
+    const auto reject = [&](const char* field) {
+        error = std::string("exact-input rotation live evidence mismatch: ") + field;
+        return false;
+    };
+    std::string generation_error;
+    if (evidence.state != ExactInputRotationState::LivePublished) return reject("state");
+    if (evidence.initial_source.path.empty() || evidence.initial_source.bytes.empty() ||
+        evidence.initial_source.size != evidence.initial_source.bytes.size() ||
+        !evidence.initial_source.regular_0600 || !evidence.initial_source.exact_bytes_revalidated ||
+        !evidence.initial_source.retained_ofd_revalidated ||
+        !exact_input_rotation_source_equal(evidence.initial_source, evidence.fresh_source) ||
+        !evidence.source_continuity)
+        return reject("canonical source continuity");
+    if (!validate_held_namespace_generation_rotation_receipt(evidence.generation_receipt,
+                                                             generation_error) ||
+        !evidence.generation_receipt_validated_twice)
+        return reject("complete generation receipt");
+    const auto mounted_exact = [](const ExactInputMountedSidecarEvidence& mounted,
+                                  const std::string& generation,
+                                  const std::string& holder_id,
+                                  std::uint64_t holder_netns) {
+        return mounted.stage == "358-input-rotation" &&
+               mounted.role == "exact-input-mounted-sidecar" && mounted.generation == generation &&
+               mounted.name == "rut358-input-" + mounted.token && full_container_id(mounted.id) &&
+               mounted.image_reference == RUT_PINNED_NGINX_IMAGE &&
+               sha256_identity(mounted.image_id) &&
+               mounted.network_mode == "container:" + holder_id && !mounted.user.empty() &&
+               mounted.path == "/bin/sleep" && mounted.arguments_json == "[\"infinity\"]" &&
+               mounted.pid > 1 && mounted.start != 0u && mounted.running &&
+               mounted.network_netns == holder_netns && mounted.mount_netns != 0u &&
+               mounted.nonhost_mount_netns && mounted.read_only_root &&
+               mounted.capability_drop_all && mounted.no_new_privileges && mounted.restart_no &&
+               mounted.no_published_ports && mounted.requested_mount_exact &&
+               mounted.realized_mount_exact && mounted.no_mount_shadowing;
+    };
+    const auto& generation = evidence.generation_receipt;
+    if (!mounted_exact(evidence.old_mounted,
+                       "0",
+                       generation.old_generation.topology.holder_id,
+                       generation.old_generation.topology.holder_netns) ||
+        !mounted_exact(evidence.fresh_mounted,
+                       "1",
+                       generation.new_generation.topology.holder_id,
+                       generation.new_generation.topology.holder_netns) ||
+        evidence.old_mounted.token != generation.old_generation.topology.token ||
+        evidence.fresh_mounted.token != generation.new_generation.topology.token ||
+        evidence.old_mounted.name != evidence.fresh_mounted.name ||
+        evidence.old_mounted.source_path != evidence.initial_source.path ||
+        evidence.fresh_mounted.source_path != evidence.fresh_source.path)
+        return reject("old/fresh mounted configuration");
+    const std::array<std::string, 6> ids{generation.old_generation.topology.holder_id,
+                                         generation.old_generation.sidecar.id,
+                                         generation.new_generation.topology.holder_id,
+                                         generation.new_generation.sidecar.id,
+                                         evidence.old_mounted.id,
+                                         evidence.fresh_mounted.id};
+    for (std::size_t left = 0; left < ids.size(); ++left)
+        for (std::size_t right = left + 1; right < ids.size(); ++right)
+            if (ids[left] == ids[right]) return reject("pairwise distinct container IDs");
+    const auto tuple_distinct =
+        [](pid_t left_pid, std::uint64_t left_start, pid_t right_pid, std::uint64_t right_start) {
+            return left_pid != right_pid || left_start != right_start;
+        };
+    if (!tuple_distinct(evidence.old_mounted.pid,
+                        evidence.old_mounted.start,
+                        generation.old_generation.topology.holder_pid,
+                        generation.old_generation.topology.holder_start) ||
+        !tuple_distinct(evidence.old_mounted.pid,
+                        evidence.old_mounted.start,
+                        generation.old_generation.sidecar.pid,
+                        generation.old_generation.sidecar.start) ||
+        !tuple_distinct(evidence.fresh_mounted.pid,
+                        evidence.fresh_mounted.start,
+                        generation.new_generation.topology.holder_pid,
+                        generation.new_generation.topology.holder_start) ||
+        !tuple_distinct(evidence.fresh_mounted.pid,
+                        evidence.fresh_mounted.start,
+                        generation.new_generation.sidecar.pid,
+                        generation.new_generation.sidecar.start) ||
+        !tuple_distinct(evidence.old_mounted.pid,
+                        evidence.old_mounted.start,
+                        evidence.fresh_mounted.pid,
+                        evidence.fresh_mounted.start) ||
+        !evidence.old_and_fresh_authorities_separate)
+        return reject("pairwise distinct process witnesses");
+    const auto& absence = evidence.old_absence;
+    if (absence.id != evidence.old_mounted.id || absence.name != evidence.old_mounted.name ||
+        absence.pid != evidence.old_mounted.pid || absence.start != evidence.old_mounted.start ||
+        !absence.id_absent || !absence.name_absent || !absence.token_role_generation_absent ||
+        !absence.process_absent)
+        return reject("old mounted exact absence");
+    if (evidence.old_create_count != 1u || evidence.old_remove_count != 1u ||
+        evidence.fresh_create_count != 1u || evidence.fresh_start_count != 1u ||
+        evidence.fresh_remove_count != 0u)
+        return reject("live command counts");
+    return true;
+}
+
+bool validate_exact_input_rotation_terminal_receipt(
+    const ExactInputRotationTerminalReceipt& receipt, std::string& error) {
+    if (!validate_exact_input_rotation_live_evidence(receipt.live, error)) return false;
+    const auto& absence = receipt.fresh_absence;
+    if (receipt.state != ExactInputRotationState::Settled ||
+        absence.id != receipt.live.fresh_mounted.id ||
+        absence.name != receipt.live.fresh_mounted.name ||
+        absence.pid != receipt.live.fresh_mounted.pid ||
+        absence.start != receipt.live.fresh_mounted.start || !absence.id_absent ||
+        !absence.name_absent || !absence.token_role_generation_absent || !absence.process_absent ||
+        !receipt.cleanup_complete || !receipt.zero_residue || !receipt.terminal_frozen ||
+        !receipt.replay_command_free || !receipt.downstream_gates_command_free ||
+        receipt.live.fresh_remove_count != 1u || receipt.fresh_mounted_order != 1u ||
+        receipt.fresh_inert_order != 2u || receipt.input_order != 3u ||
+        receipt.directory_order != 4u || receipt.holder_order != 5u ||
+        receipt.network_b_order != 6u || receipt.network_a_order != 7u) {
+        error = "exact-input rotation terminal receipt was not exact and ordered";
+        return false;
+    }
+    return true;
+}
+
 static bool held_namespace_generation_rotation_self_checks(std::string& error) {
     HeldNamespaceGenerationRotationReceipt seed;
     HeldTopologySnapshot& old_topology = seed.old_generation.topology;
