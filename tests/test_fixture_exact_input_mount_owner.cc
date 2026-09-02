@@ -1077,7 +1077,7 @@ int main(int argc, char** argv) {
     std::string rotation_selfcheck_error;
     if (!exact_input_rotation_pure_self_checks(rotation_mutation_rejections,
                                                rotation_selfcheck_error) ||
-        rotation_mutation_rejections != 6u) {
+        rotation_mutation_rejections != 21u) {
         std::cerr << "FAIL [#412 exact-input rotation pure checks]: " << rotation_selfcheck_error
                   << "\n";
         return 1;

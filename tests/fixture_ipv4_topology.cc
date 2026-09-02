@@ -11037,14 +11037,35 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
                a.actual_exec_observed == b.actual_exec_observed &&
                a.subtree_confinement_installed == b.subtree_confinement_installed &&
                a.group_echild_observed == b.group_echild_observed &&
+               a.control_eof_cleanup == b.control_eof_cleanup &&
+               a.leader_exit_observed_before_group_cleanup ==
+                   b.leader_exit_observed_before_group_cleanup &&
+               a.descendant_group_member_observed == b.descendant_group_member_observed &&
+               a.setpgid_denied == b.setpgid_denied && a.setsid_denied == b.setsid_denied &&
+               a.clone_parent_observed == b.clone_parent_observed &&
                a.adopted_reap_count == b.adopted_reap_count &&
+               a.foreign_process_survived == b.foreign_process_survived &&
+               a.foreign_fd_excluded == b.foreign_fd_excluded &&
                a.deadline_exceeded == b.deadline_exceeded && a.output_overflow == b.output_overflow &&
+               a.pre_source_revalidated == b.pre_source_revalidated &&
+               a.pre_container_identity == b.pre_container_identity &&
+               a.pre_mount_inspected == b.pre_mount_inspected &&
+               a.pre_proc_credentials == b.pre_proc_credentials &&
+               a.post_source_revalidated == b.post_source_revalidated &&
+               a.post_container_identity == b.post_container_identity &&
+               a.post_mount_inspected == b.post_mount_inspected &&
+               a.post_proc_credentials == b.post_proc_credentials &&
+               a.registered_identity_matched == b.registered_identity_matched &&
+               a.registered_mount_matched == b.registered_mount_matched &&
                a.expected_size == b.expected_size && a.stdout_read_errno == b.stdout_read_errno &&
                a.stderr_read_errno == b.stderr_read_errno &&
                a.launch_failure_stage == b.launch_failure_stage && a.launch_errno == b.launch_errno &&
                a.wait_status == b.wait_status && a.command_argv == b.command_argv &&
                a.resolved_executable == b.resolved_executable && a.stdout_bytes == b.stdout_bytes &&
-               a.stderr_bytes == b.stderr_bytes;
+               a.stderr_bytes == b.stderr_bytes &&
+               a.diagnostic.phase == b.diagnostic.phase &&
+               a.diagnostic.error_number == b.diagnostic.error_number &&
+               a.diagnostic.message == b.diagnostic.message;
     };
     return left.outcome == right.outcome && left.attempted == right.attempted &&
            left.terminal_frozen == right.terminal_frozen &&
@@ -11057,6 +11078,44 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
            command_equal(left.command, right.command) &&
            left.source_brackets_equal == right.source_brackets_equal &&
            left.target_brackets_equal == right.target_brackets_equal;
+}
+
+static bool exact_input_rotation_read_complete_contract(
+    const ExactInputRotationReadEvidence& read,
+    const ExactInputRotationSourceEvidence& source,
+    const ExactInputMountedSidecarEvidence& target) {
+    const auto& command = read.command;
+    const std::vector<std::string> expected_argv = {"docker",
+                                                    "exec",
+                                                    "--user",
+                                                    target.user,
+                                                    target.id,
+                                                    "/bin/cat",
+                                                    kExactInputMountDestination};
+    return read.attempted && read.terminal_frozen && read.caller_deadline_recorded &&
+           read.final_deadline_nanoseconds > 0 && read.source_brackets_equal &&
+           read.target_brackets_equal &&
+           exact_input_rotation_source_equal(read.source_before, source) &&
+           exact_input_rotation_source_equal(read.source_after, source) &&
+           exact_input_mounted_equal(read.target_before, target) &&
+           exact_input_mounted_equal(read.target_after, target) &&
+           read.outcome == ExactInputReadOutcome::Complete && command.attempted &&
+           command.terminal_frozen && command.command_started && command.actual_exec_observed &&
+           command.stdout_eof && command.stderr_eof && command.child_reaped &&
+           command.wait_status_valid && WIFEXITED(command.wait_status) &&
+           WEXITSTATUS(command.wait_status) == 0 && command.process_group_owned &&
+           command.process_group_gone && command.group_echild_observed && command.pidfd_opened &&
+           command.pidfd_identity_verified && command.pidfd_closed_after_group_gone &&
+           command.supervisor_session_verified && command.supervisor_subreaper_verified &&
+           command.subtree_confinement_installed && command.final_deadline_recorded &&
+           command.cleanup_completed_before_final_deadline && !command.deadline_exceeded &&
+           !command.output_overflow && command.stdout_read_errno == 0 &&
+           command.stderr_read_errno == 0 &&
+           command.launch_failure_stage == ExactInputReadLaunchStage::None &&
+           command.launch_errno == 0 && command.expected_size == source.bytes.size() &&
+           command.stdout_bytes == source.bytes && command.stderr_bytes.empty() &&
+           command.command_argv == expected_argv &&
+           command.resolved_executable == resolve_exact_read_executable("docker");
 }
 
 static bool exact_input_rotation_live_equal(const ExactInputRotationLiveEvidence& left,
@@ -11201,31 +11260,8 @@ bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvi
         evidence.fresh_remove_count != 0u)
         return reject("live command counts");
     if (evidence.state == ExactInputRotationState::LivePublished) {
-        if (!evidence.fresh_read.attempted || !evidence.fresh_read.terminal_frozen ||
-            evidence.fresh_read.outcome != ExactInputReadOutcome::Complete ||
-            !evidence.fresh_read.caller_deadline_recorded ||
-            !evidence.fresh_read.source_brackets_equal ||
-            !evidence.fresh_read.target_brackets_equal ||
-            !evidence.fresh_read.command.actual_exec_observed ||
-            !evidence.fresh_read.command.group_echild_observed ||
-            !evidence.fresh_read.command.process_group_gone ||
-            !evidence.fresh_read.command.stdout_eof || !evidence.fresh_read.command.stderr_eof ||
-            evidence.fresh_read.command.stdout_bytes != evidence.initial_source.bytes ||
-            evidence.fresh_read.source_before.path != evidence.initial_source.path ||
-            !exact_input_rotation_source_equal(evidence.fresh_read.source_before,
-                                               evidence.fresh_read.source_after) ||
-            !exact_input_mounted_equal(evidence.fresh_read.target_before,
-                                       evidence.fresh_mounted) ||
-            !exact_input_mounted_equal(evidence.fresh_read.target_after,
-                                       evidence.fresh_mounted) ||
-            evidence.fresh_read.command.command_argv !=
-                std::vector<std::string>{"docker",
-                                         "exec",
-                                         "--user",
-                                         evidence.fresh_mounted.user,
-                                         evidence.fresh_mounted.id,
-                                         "/bin/cat",
-                                         kExactInputMountDestination}) {
+        if (!exact_input_rotation_read_complete_contract(
+                evidence.fresh_read, evidence.initial_source, evidence.fresh_mounted)) {
             return reject("fresh generation exact read evidence");
         }
     } else if (evidence.fresh_read.attempted &&
@@ -11247,10 +11283,10 @@ bool validate_exact_input_rotation_terminal_receipt(
             error = "unpublished exact-input rotation did not remain explicitly unresolved";
             return false;
         }
-        // A read failure is itself frozen evidence.  Keep the unresolved
-        // state while validating it; only the older mount-observation failure
-        // needs the structural live-state projection below.
-        if (!retained.fresh_read.attempted) retained.state = ExactInputRotationState::LivePublished;
+        // Keep every unpublished unresolved state intact.  In particular, a
+        // pre-command mount-observation mutation has no read attempt at all;
+        // projecting it to LivePublished would falsely require successful
+        // fresh-generation read evidence.
         if (!validate_exact_input_rotation_live_evidence(retained, error)) {
             error = "unpublished exact-input rotation lost retained authority: " + error;
             return false;
@@ -14310,19 +14346,24 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
     }
     read.caller_deadline_recorded = true;
     read.final_deadline_nanoseconds = now + kReadBudgetNs;
+    // This scope caps every run_command issued by both source and target
+    // brackets.  It ends before rotation cleanup starts, so an expired read
+    // deadline cannot prevent authoritative resource settlement.
+    CommandDeadlineScope read_deadline_scope(read.final_deadline_nanoseconds);
     const auto before_deadline = [&]() {
         return exact_read_monotonic_ns() > 0 &&
                exact_read_monotonic_ns() < read.final_deadline_nanoseconds;
     };
-    const auto freeze = [&](ExactInputReadOutcome outcome, const char* message) {
+    const auto freeze = [&](ExactInputReadOutcome outcome, std::string message) {
         read.outcome = outcome;
         read.terminal_frozen = true;
-        error = message;
+        error = std::move(message);
         return false;
     };
     if (!before_deadline() || !capture_rotation_source(root, read.source_before, error))
         return freeze(ExactInputReadOutcome::SourceRevalidationFailed,
-                      error.empty() ? "fresh read source-before bracket failed" : error.c_str());
+                      error.empty() ? std::string("fresh read source-before bracket failed")
+                                    : error);
 
     const std::string prefix = "container:";
     if (mounted.network_mode.rfind(prefix, 0) != 0 || !full_container_id(mounted.id))
@@ -14342,7 +14383,8 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
                                   &before_mount,
                                   error))
         return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
-                      error.empty() ? "fresh read target-before bracket failed" : error.c_str());
+                      error.empty() ? std::string("fresh read target-before bracket failed")
+                                    : error);
 
     const std::string credentials = std::to_string(read.source_before.uid) + ":" +
                                     std::to_string(read.source_before.gid);
@@ -14395,8 +14437,8 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
                                       read.target_after,
                                       &after_mount,
                                       error))
-            return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
-                          error.empty() ? "fresh read after bracket failed" : error.c_str());
+        return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
+                      error.empty() ? std::string("fresh read after bracket failed") : error);
         read.source_brackets_equal =
             exact_input_rotation_source_equal(read.source_before, read.source_after);
         read.target_brackets_equal =
@@ -15188,7 +15230,24 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         !reject([](auto& value) { value.old_absence.process_absent = false; }) ||
         !reject([](auto& value) { value.fresh_mounted.id = value.old_mounted.id; }) ||
         !reject([](auto& value) { value.fresh_mounted.network_netns = 0; }) ||
-        !reject([](auto& value) { value.generation_receipt_validated_twice = false; })) {
+        !reject([](auto& value) { value.generation_receipt_validated_twice = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.command_started = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.actual_exec_observed = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.stdout_eof = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.child_reaped = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.process_group_gone = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.pidfd_identity_verified = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.supervisor_session_verified = false; }) ||
+        !reject([](auto& value) { value.fresh_read.command.subtree_confinement_installed = false; }) ||
+        !reject([](auto& value) {
+            value.fresh_read.command.cleanup_completed_before_final_deadline = false;
+        }) ||
+        !reject([](auto& value) { value.fresh_read.command.launch_errno = EPERM; }) ||
+        !reject([](auto& value) { ++value.fresh_read.command.expected_size; }) ||
+        !reject([](auto& value) { value.fresh_read.command.stdout_bytes.push_back('x'); }) ||
+        !reject([](auto& value) { value.fresh_read.command.stderr_bytes = "unexpected"; }) ||
+        !reject([](auto& value) { value.fresh_read.command.command_argv.back() = "/tmp/other"; }) ||
+        !reject([](auto& value) { value.fresh_read.command.resolved_executable = "/tmp/docker"; })) {
         error = "exact-input rotation live mutation was accepted";
         return false;
     }
