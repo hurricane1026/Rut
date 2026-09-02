@@ -144,8 +144,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   execution slice after a preserved successor is dispatched at depth one; its
   separate bounded `SUPPORTED` row claims only the causal late-arrival GET
   vector. The earlier sequential `SUPPORTED` GET row claims none of these cases.
-  Separately, #285 tracks enforcement of RUT's declared maximum HTTP/1 pipeline
-  depth; it does not block #278's exact depth-one design.
+  Closed #285 now enforces RUT's declared maximum HTTP/1 pipeline depth: exactly
+  16 successor transitions are admitted and the attempted 17th fails closed
+  before dispatch or request-side effects. This generic runtime invariant does
+  not broaden #278's exact depth-one compatibility claim.
 - The #277 E3 raw-CQ gate failed closed once with an unclassified `ERROR_CQ`
   before its stricter RUT side was scheduled first on the freshly allocated
   ports. No response mismatch or false positive occurred; the final focused
