@@ -295,6 +295,8 @@ using HolderOnlyRecreationCallback =
     std::function<bool(const HolderOnlyRecreationEvidence& evidence, std::string& error)>;
 using RecreatedSidecarCallback =
     std::function<bool(const RecreatedSidecarEvidence& evidence, std::string& error)>;
+using HeldNamespaceGenerationReceiptCallback =
+    std::function<bool(const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);
@@ -312,6 +314,11 @@ RunResult run_with_holder_only_recreation(
     HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None);
 RunResult run_with_recreated_sidecar(
     const RecreatedSidecarCallback& callback,
+    HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
+    RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None,
+    const HeldNamespaceGenerationReceiptCallback& receipt_callback = {});
+RunResult run_with_complete_generation_rotation(
+    const HeldNamespaceGenerationReceiptCallback& callback,
     HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
     RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
 RunResult run_with_held_topology_and_sidecar(

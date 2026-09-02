@@ -2581,6 +2581,133 @@ struct RecreatedSidecarOwner {
     RecreatedSidecarEvidence frozen_evidence;
 };
 
+static bool topology_snapshot_equal(const HeldTopologySnapshot& left,
+                                    const HeldTopologySnapshot& right);
+static bool sidecar_snapshot_equal(const HeldNamespaceSidecarSnapshot& left,
+                                   const HeldNamespaceSidecarSnapshot& right);
+
+enum class GenerationReceiptCompositionState : std::uint8_t {
+    Ready = 0,
+    OldGenerationValidated,
+    OldGenerationAbsent,
+    NewGenerationCreated,
+    NewGenerationValidated,
+    Published,
+    Unresolved,
+};
+
+struct GenerationReceiptCompositionOwner {
+    GenerationReceiptCompositionState state = GenerationReceiptCompositionState::Ready;
+    HeldNamespaceGenerationRotationReceipt receipt;
+    HeldNamespaceGenerationRotationReceipt frozen_receipt;
+    u32 state_visit_mask = 1u << static_cast<unsigned>(GenerationReceiptCompositionState::Ready);
+};
+
+static bool generation_receipt_composition_transition(GenerationReceiptCompositionOwner& owner,
+                                                      GenerationReceiptCompositionState next) {
+    const auto current = owner.state;
+    bool allowed = false;
+    switch (current) {
+        case GenerationReceiptCompositionState::Ready:
+            allowed = next == GenerationReceiptCompositionState::OldGenerationValidated;
+            break;
+        case GenerationReceiptCompositionState::OldGenerationValidated:
+            allowed = next == GenerationReceiptCompositionState::OldGenerationAbsent;
+            break;
+        case GenerationReceiptCompositionState::OldGenerationAbsent:
+            allowed = next == GenerationReceiptCompositionState::NewGenerationCreated;
+            break;
+        case GenerationReceiptCompositionState::NewGenerationCreated:
+            allowed = next == GenerationReceiptCompositionState::NewGenerationValidated;
+            break;
+        case GenerationReceiptCompositionState::NewGenerationValidated:
+            allowed = next == GenerationReceiptCompositionState::Published;
+            break;
+        case GenerationReceiptCompositionState::Published:
+        case GenerationReceiptCompositionState::Unresolved:
+            break;
+    }
+    if (!allowed) {
+        if (current == GenerationReceiptCompositionState::Published ||
+            current == GenerationReceiptCompositionState::Unresolved)
+            return false;
+        owner.state = GenerationReceiptCompositionState::Unresolved;
+        owner.state_visit_mask |=
+            1u << static_cast<unsigned>(GenerationReceiptCompositionState::Unresolved);
+        return false;
+    }
+    owner.state = next;
+    owner.state_visit_mask |= 1u << static_cast<unsigned>(next);
+    return true;
+}
+
+static bool generation_receipt_composition_fail(GenerationReceiptCompositionOwner& owner) {
+    if (owner.state == GenerationReceiptCompositionState::Published ||
+        owner.state == GenerationReceiptCompositionState::Unresolved)
+        return false;
+    owner.state = GenerationReceiptCompositionState::Unresolved;
+    owner.state_visit_mask |=
+        1u << static_cast<unsigned>(GenerationReceiptCompositionState::Unresolved);
+    return true;
+}
+
+static bool complete_rotation_topology_equal(const HeldTopologySnapshot& left,
+                                             const HeldTopologySnapshot& right) {
+    const auto& left_probe = left.probe_evidence;
+    const auto& right_probe = right.probe_evidence;
+    return topology_snapshot_equal(left, right) && left_probe.policy == right_probe.policy &&
+           left_probe.selected_port_absence_checks == right_probe.selected_port_absence_checks &&
+           left_probe.host_parent_af_inet_socket_calls ==
+               right_probe.host_parent_af_inet_socket_calls &&
+           left_probe.successful_refusal_probes == right_probe.successful_refusal_probes;
+}
+
+static bool generation_witness_absence_equal(const HeldNamespaceGenerationWitnessAbsence& left,
+                                             const HeldNamespaceGenerationWitnessAbsence& right) {
+    return left.container_id == right.container_id && left.pid == right.pid &&
+           left.start == right.start && left.container_id_absent == right.container_id_absent &&
+           left.process_identity_absent == right.process_identity_absent;
+}
+
+static bool generation_absence_equal(const HeldNamespaceOldGenerationAbsence& left,
+                                     const HeldNamespaceOldGenerationAbsence& right) {
+    return generation_witness_absence_equal(left.holder, right.holder) &&
+           generation_witness_absence_equal(left.sidecar, right.sidecar) &&
+           left.holder_name == right.holder_name && left.sidecar_name == right.sidecar_name &&
+           left.holder_name_absent == right.holder_name_absent &&
+           left.sidecar_name_absent == right.sidecar_name_absent && left.phase == right.phase;
+}
+
+static bool generation_receipt_equal(const HeldNamespaceGenerationRotationReceipt& left,
+                                     const HeldNamespaceGenerationRotationReceipt& right) {
+    return complete_rotation_topology_equal(left.old_generation.topology,
+                                            right.old_generation.topology) &&
+           sidecar_snapshot_equal(left.old_generation.sidecar, right.old_generation.sidecar) &&
+           left.old_generation_phase == right.old_generation_phase &&
+           generation_absence_equal(left.old_absence, right.old_absence) &&
+           complete_rotation_topology_equal(left.new_generation.topology,
+                                            right.new_generation.topology) &&
+           sidecar_snapshot_equal(left.new_generation.sidecar, right.new_generation.sidecar) &&
+           left.new_generation_created_phase == right.new_generation_created_phase &&
+           left.new_generation_validated_phase == right.new_generation_validated_phase;
+}
+
+static bool generation_receipt_unpublished(const GenerationReceiptCompositionOwner& owner,
+                                           bool phase3_recorded) {
+    return owner.state == GenerationReceiptCompositionState::Unresolved &&
+           owner.receipt.new_generation_created_phase ==
+               (phase3_recorded ? HeldNamespaceGenerationRotationPhase::NewGenerationCreated
+                                : HeldNamespaceGenerationRotationPhase::None) &&
+           owner.receipt.new_generation_validated_phase ==
+               HeldNamespaceGenerationRotationPhase::None &&
+           owner.frozen_receipt.old_generation_phase ==
+               HeldNamespaceGenerationRotationPhase::None &&
+           owner.frozen_receipt.new_generation_created_phase ==
+               HeldNamespaceGenerationRotationPhase::None &&
+           owner.frozen_receipt.new_generation_validated_phase ==
+               HeldNamespaceGenerationRotationPhase::None;
+}
+
 static bool recreated_sidecar_transition(RecreatedSidecarOwner& owner, RecreatedSidecarState next) {
     const RecreatedSidecarState current = owner.state;
     bool allowed = false;
@@ -2672,6 +2799,58 @@ static bool recreated_sidecar_transition_self_checks(std::string& error) {
         !recreated_sidecar_transition(no_object, RecreatedSidecarState::Settled) ||
         no_object.state != RecreatedSidecarState::Settled) {
         error = "fresh-sidecar production transition rejected no-object settlement";
+        return false;
+    }
+    return true;
+}
+
+static bool generation_receipt_composition_self_checks(std::string& error) {
+    GenerationReceiptCompositionOwner normal;
+    const std::array<GenerationReceiptCompositionState, 5> path{
+        GenerationReceiptCompositionState::OldGenerationValidated,
+        GenerationReceiptCompositionState::OldGenerationAbsent,
+        GenerationReceiptCompositionState::NewGenerationCreated,
+        GenerationReceiptCompositionState::NewGenerationValidated,
+        GenerationReceiptCompositionState::Published};
+    for (const auto state : path) {
+        if (!generation_receipt_composition_transition(normal, state)) {
+            error = "complete-generation receipt production transition rejected the normal path";
+            return false;
+        }
+    }
+    normal.frozen_receipt = normal.receipt;
+    const u32 frozen_mask = normal.state_visit_mask;
+    HeldNamespaceGenerationRotationReceipt probe_mutation = normal.frozen_receipt;
+    ++probe_mutation.old_generation.topology.probe_evidence.selected_port_absence_checks;
+    if (generation_receipt_composition_transition(
+            normal, GenerationReceiptCompositionState::NewGenerationCreated) ||
+        normal.state != GenerationReceiptCompositionState::Published ||
+        normal.state_visit_mask != frozen_mask ||
+        normal.frozen_receipt.old_generation_phase != HeldNamespaceGenerationRotationPhase::None ||
+        generation_receipt_equal(normal.frozen_receipt, probe_mutation)) {
+        error = "complete-generation receipt terminal transition was not frozen";
+        return false;
+    }
+    GenerationReceiptCompositionOwner backward;
+    if (!generation_receipt_composition_transition(
+            backward, GenerationReceiptCompositionState::OldGenerationValidated) ||
+        generation_receipt_composition_transition(backward,
+                                                  GenerationReceiptCompositionState::Ready) ||
+        backward.state != GenerationReceiptCompositionState::Unresolved) {
+        error = "complete-generation receipt backward transition did not fail closed";
+        return false;
+    }
+    GenerationReceiptCompositionOwner unresolved;
+    if (!generation_receipt_composition_transition(
+            unresolved, GenerationReceiptCompositionState::OldGenerationValidated) ||
+        !generation_receipt_composition_transition(
+            unresolved, GenerationReceiptCompositionState::OldGenerationAbsent) ||
+        generation_receipt_composition_transition(
+            unresolved, GenerationReceiptCompositionState::NewGenerationValidated) ||
+        unresolved.state != GenerationReceiptCompositionState::Unresolved ||
+        generation_receipt_composition_transition(unresolved,
+                                                  GenerationReceiptCompositionState::Published)) {
+        error = "complete-generation receipt unresolved state was not terminal";
         return false;
     }
     return true;
@@ -3108,12 +3287,16 @@ public:
     void transition_recreated_holder(HolderOnlyRecreationState state);
     bool recreate_sidecar(RecreatedSidecarFailurePoint failure_point, std::string& error);
     bool cleanup_recreated_sidecar(std::string& error);
+    bool revalidate_recreated_sidecar_for_rotation(HeldNamespaceSidecarSnapshot& snapshot,
+                                                   bool inject_mutation,
+                                                   std::string& error);
     bool terminate_recreated_sidecar_unexpectedly(std::string& error);
     void clear_recreated_sidecar_cleanup_fault() {
         recreated_sidecar_.cleanup_identity_fault = false;
     }
     RecreatedSidecarEvidence recreated_sidecar_evidence() const;
     void transition_recreated_sidecar(RecreatedSidecarState state);
+    bool build_current_generation_topology(HeldTopologySnapshot& topology, std::string& error);
     bool build_recreated_holder_topology(HeldTopologySnapshot& topology, std::string& error);
 
     bool set_subnet_plan(const SubnetPlan& plan) {
@@ -5221,6 +5404,92 @@ void Fixture::transition_recreated_sidecar(RecreatedSidecarState state) {
     (void)recreated_sidecar_transition(recreated_sidecar_, state);
 }
 
+bool Fixture::build_current_generation_topology(HeldTopologySnapshot& topology,
+                                                std::string& error) {
+    if (!holder_exists_ || cleanup_progress_ != CleanupProgress::Active ||
+        !full_container_id(holder_id_) || holder_pid_ <= 1 || holder_start_ == 0u ||
+        !validate_holder(error) || !verify_topology(FailurePoint::None, error) ||
+        !verify_network(network_a_, error) || !verify_network(network_b_, error)) {
+        if (error.empty())
+            error = "old-generation topology lacked validated holder/network authority";
+        return false;
+    }
+
+    ProcIdentity before{};
+    ProcIdentity host{};
+    ino_t before_container_netns = 0;
+    const bool before_ok = proc_identity(holder_pid_, before, false);
+    const bool container_netns_ok = container_netns_inode(holder_id_, before_container_netns);
+    // Host netns visibility is optional. Exact-container readlink is the
+    // authoritative namespace witness; compare the host inode when visible.
+    const bool host_ok = proc_identity(getpid(), host, false);
+    if (!before_ok || before.start != holder_start_ || !container_netns_ok ||
+        before_container_netns == 0u || !host_ok ||
+        (host.netns != 0u && before_container_netns == host.netns) ||
+        (before.netns != 0u && before.netns != before_container_netns)) {
+        error = "old-generation PID/start/netns authority mismatch";
+        return false;
+    }
+
+    static constexpr u16 kProbePort = 41857;
+    std::string tcp;
+    std::string tcp6;
+    if (!read_file("/proc/" + std::to_string(holder_pid_) + "/net/tcp", tcp) ||
+        !read_file("/proc/" + std::to_string(holder_pid_) + "/net/tcp6", tcp6) ||
+        !proc_tcp_port_absent(tcp, kProbePort) || !proc_tcp_port_absent(tcp6, kProbePort)) {
+        error = "old-generation PID-scoped tcp/tcp6 selected-port absence probe failed";
+        return false;
+    }
+    HeldTopologyProbeEvidence probe;
+    probe.policy = HeldTopologyProbePolicy::RequireHostRefusalProbes;
+    ++probe.selected_port_absence_checks;
+    for (const std::string* address : {&positive_ip_, &guard_ip_}) {
+        ++probe.host_parent_af_inet_socket_calls;
+        if (!probe_refused(*address, kProbePort, error)) return false;
+        ++probe.successful_refusal_probes;
+    }
+
+    ProcIdentity after{};
+    ProcIdentity after_host{};
+    ino_t after_container_netns = 0;
+    const bool after_ok = proc_identity(holder_pid_, after, false);
+    const bool after_container_netns_ok = container_netns_inode(holder_id_, after_container_netns);
+    const bool after_host_ok = proc_identity(getpid(), after_host, false);
+    if (!after_ok || after.start != holder_start_ || !after_container_netns_ok ||
+        after_container_netns != before_container_netns || !after_host_ok ||
+        (after_host.netns != 0u && after_container_netns == after_host.netns) ||
+        (after.netns != 0u && after.netns != after_container_netns)) {
+        error = "old-generation PID/start/netns changed across read-only topology probes";
+        return false;
+    }
+    std::string probe_error;
+    if (!validate_held_topology_probe_evidence(
+            probe, HeldTopologyProbePolicy::RequireHostRefusalProbes, probe_error)) {
+        error = probe_error;
+        return false;
+    }
+
+    topology = {};
+    topology.token = token_;
+    topology.network_a_name = network_a_.name;
+    topology.network_a_id = network_a_.id;
+    topology.network_a_subnet = network_a_.subnet;
+    topology.network_a_gateway = network_a_.gateway;
+    topology.network_b_name = network_b_.name;
+    topology.network_b_id = network_b_.id;
+    topology.network_b_subnet = network_b_.subnet;
+    topology.network_b_gateway = network_b_.gateway;
+    topology.holder_name = holder_name_;
+    topology.holder_id = holder_id_;
+    topology.positive_ip = positive_ip_;
+    topology.guard_ip = guard_ip_;
+    topology.holder_pid = holder_pid_;
+    topology.holder_start = holder_start_;
+    topology.holder_netns = before_container_netns;
+    topology.probe_evidence = probe;
+    return true;
+}
+
 bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, std::string& error) {
     const RecreatedHolderOwner& holder = recreated_holder_;
     if (!recreated_holder_started_ || holder.state != HolderOnlyRecreationState::Validated ||
@@ -5599,6 +5868,42 @@ bool Fixture::recreate_sidecar(RecreatedSidecarFailurePoint failure_point, std::
         fresh.removal_suppression_armed = true;
     if (failure_point == RecreatedSidecarFailurePoint::UnexpectedDeath)
         return terminate_recreated_sidecar_unexpectedly(error);
+    return true;
+}
+
+bool Fixture::revalidate_recreated_sidecar_for_rotation(HeldNamespaceSidecarSnapshot& snapshot,
+                                                        bool inject_mutation,
+                                                        std::string& error) {
+    if (!recreated_sidecar_started_ ||
+        recreated_sidecar_.state != RecreatedSidecarState::Validated ||
+        !full_container_id(recreated_sidecar_.snapshot.id)) {
+        error = "fresh sidecar lacked exact validated authority for the second receipt bracket";
+        return false;
+    }
+    HeldNamespaceSidecarSnapshot current;
+    const HeldNamespaceSidecarRevalidationFault previous_fault = sidecar_revalidation_fault_;
+    sidecar_revalidation_fault_ = inject_mutation
+                                      ? HeldNamespaceSidecarRevalidationFault::NetworkMode
+                                      : HeldNamespaceSidecarRevalidationFault::None;
+    const bool inspected = inspect_sidecar(recreated_sidecar_.snapshot.id, current, error);
+    sidecar_revalidation_fault_ = previous_fault;
+    if (!inspected) return false;
+    ino_t exact_netns = 0;
+    if (!container_netns_inode(recreated_sidecar_.snapshot.id, exact_netns) || exact_netns == 0u ||
+        exact_netns != current.netns) {
+        error = "fresh sidecar second bracket lacked exact full-ID netns authority";
+        return false;
+    }
+    current.netns = exact_netns;
+    std::string semantic_error;
+    if (!validate_held_namespace_sidecar_snapshot(
+            recreated_sidecar_.topology, current, semantic_error) ||
+        !sidecar_snapshot_equal(current, recreated_sidecar_.snapshot)) {
+        error = "fresh sidecar second receipt bracket differed from exact authority";
+        if (!semantic_error.empty()) error += ": " + semantic_error;
+        return false;
+    }
+    snapshot = current;
     return true;
 }
 
@@ -11039,6 +11344,7 @@ bool audit_zero_residue(const std::string& token,
 bool pure_validation_self_checks(std::string& error) {
     if (!pure_holder_retirement_self_checks(error)) return false;
     if (!recreated_sidecar_transition_self_checks(error)) return false;
+    if (!generation_receipt_composition_self_checks(error)) return false;
     if (!held_namespace_generation_rotation_self_checks(error)) return false;
     u32 low = 0, high = 0;
     if (parse_cidr("10.0.0.1/24", low, high) || parse_cidr("10.0.0.0/31", low, high) ||
@@ -12424,9 +12730,150 @@ RunResult run_with_holder_only_recreation(const HolderOnlyRecreationCallback& ca
     return result;
 }
 
-RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
-                                     HolderOnlyRecreationFailurePoint holder_failure_point,
-                                     RecreatedSidecarFailurePoint sidecar_failure_point) {
+static bool capture_old_generation_for_receipt(Fixture& fixture,
+                                               GenerationReceiptCompositionOwner& composer,
+                                               std::string& error) {
+    HeldTopologySnapshot old_topology;
+    if (!fixture.build_current_generation_topology(old_topology, error) ||
+        !fixture.revalidate_sidecar_identity(error)) {
+        if (error.empty()) error = "old generation phase-1 revalidation failed";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    composer.receipt.old_generation.topology = old_topology;
+    composer.receipt.old_generation.sidecar = fixture.sidecar_snapshot();
+    if (!validate_held_namespace_sidecar_snapshot(composer.receipt.old_generation.topology,
+                                                  composer.receipt.old_generation.sidecar,
+                                                  error) ||
+        !generation_receipt_composition_transition(
+            composer, GenerationReceiptCompositionState::OldGenerationValidated)) {
+        if (error.empty()) error = "old generation phase-1 evidence was not exact";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    composer.receipt.old_generation_phase =
+        HeldNamespaceGenerationRotationPhase::OldGenerationValidated;
+    return true;
+}
+
+static bool capture_old_absence_for_receipt(Fixture& fixture,
+                                            GenerationReceiptCompositionOwner& composer,
+                                            std::string& error) {
+    composer.receipt.old_absence = fixture.holder_retirement_absence();
+    const auto witness_matches = [](const HeldNamespaceGenerationWitnessAbsence& witness,
+                                    const std::string& id,
+                                    pid_t pid,
+                                    u64 start) {
+        return witness.container_id == id && witness.pid == pid && witness.start == start &&
+               witness.container_id_absent && witness.process_identity_absent;
+    };
+    if (composer.receipt.old_absence.phase !=
+            HeldNamespaceGenerationRotationPhase::OldGenerationAbsent ||
+        !witness_matches(composer.receipt.old_absence.holder,
+                         composer.receipt.old_generation.topology.holder_id,
+                         composer.receipt.old_generation.topology.holder_pid,
+                         composer.receipt.old_generation.topology.holder_start) ||
+        !witness_matches(composer.receipt.old_absence.sidecar,
+                         composer.receipt.old_generation.sidecar.id,
+                         composer.receipt.old_generation.sidecar.pid,
+                         composer.receipt.old_generation.sidecar.start) ||
+        composer.receipt.old_absence.holder_name !=
+            composer.receipt.old_generation.topology.holder_name ||
+        composer.receipt.old_absence.sidecar_name != composer.receipt.old_generation.sidecar.name ||
+        !composer.receipt.old_absence.holder_name_absent ||
+        !composer.receipt.old_absence.sidecar_name_absent ||
+        !generation_receipt_composition_transition(
+            composer, GenerationReceiptCompositionState::OldGenerationAbsent)) {
+        error = "old generation phase-2 exact absence did not match frozen phase-1";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    return true;
+}
+
+static bool publish_complete_generation_receipt(Fixture& fixture,
+                                                const RecreatedSidecarEvidence& sidecar,
+                                                bool inject_second_sidecar_observation_mutation,
+                                                GenerationReceiptCompositionOwner& composer,
+                                                std::string& error) {
+    composer.receipt.new_generation.topology = sidecar.fresh_topology;
+    composer.receipt.new_generation.sidecar = sidecar.sidecar;
+    if (!generation_receipt_composition_transition(
+            composer, GenerationReceiptCompositionState::NewGenerationCreated)) {
+        error = "new generation phase-3 transition was rejected";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    composer.receipt.new_generation_created_phase =
+        HeldNamespaceGenerationRotationPhase::NewGenerationCreated;
+
+    HeldNamespaceSidecarSnapshot sidecar_observation_a;
+    HeldTopologySnapshot holder_observation;
+    HeldNamespaceSidecarSnapshot sidecar_observation_b;
+    if (!fixture.revalidate_recreated_sidecar_for_rotation(sidecar_observation_a, false, error) ||
+        !fixture.build_recreated_holder_topology(holder_observation, error) ||
+        !fixture.revalidate_recreated_sidecar_for_rotation(
+            sidecar_observation_b, inject_second_sidecar_observation_mutation, error) ||
+        !complete_rotation_topology_equal(holder_observation,
+                                          composer.receipt.new_generation.topology) ||
+        !sidecar_snapshot_equal(sidecar_observation_a, sidecar_observation_b) ||
+        !sidecar_snapshot_equal(sidecar_observation_a, composer.receipt.new_generation.sidecar)) {
+        if (error.empty())
+            error = "fresh phase-4 sidecar A/holder/sidecar B bracket differed from phase 3";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+
+    CommandResult cardinality;
+    if (!run_command({"docker",
+                      "ps",
+                      "-aq",
+                      "--no-trunc",
+                      "--filter",
+                      "label=rut.token=" + fixture.token(),
+                      "--filter",
+                      std::string("label=rut.role=") + kSidecarRole},
+                     cardinality) ||
+        !exited_zero(cardinality) || trim(cardinality.output) != sidecar_observation_b.id) {
+        error = "fresh sidecar phase-4 cardinality was not exactly one";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    if (!generation_receipt_composition_transition(
+            composer, GenerationReceiptCompositionState::NewGenerationValidated)) {
+        error = "new generation phase-4 transition was rejected";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    composer.receipt.new_generation_validated_phase =
+        HeldNamespaceGenerationRotationPhase::NewGenerationValidated;
+    std::string first_validation_error;
+    std::string second_validation_error;
+    if (!validate_held_namespace_generation_rotation_receipt(composer.receipt,
+                                                             first_validation_error) ||
+        !validate_held_namespace_generation_rotation_receipt(composer.receipt,
+                                                             second_validation_error) ||
+        !first_validation_error.empty() || !second_validation_error.empty()) {
+        error = "complete generation receipt failed its two independent validations";
+        if (!first_validation_error.empty()) error += ": " + first_validation_error;
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    if (!generation_receipt_composition_transition(composer,
+                                                   GenerationReceiptCompositionState::Published)) {
+        error = "complete generation receipt publication transition was rejected";
+        generation_receipt_composition_fail(composer);
+        return false;
+    }
+    composer.frozen_receipt = composer.receipt;
+    return true;
+}
+
+RunResult run_with_recreated_sidecar(
+    const RecreatedSidecarCallback& callback,
+    HolderOnlyRecreationFailurePoint holder_failure_point,
+    RecreatedSidecarFailurePoint sidecar_failure_point,
+    const HeldNamespaceGenerationReceiptCallback& receipt_callback) {
     RunResult result;
     std::string token;
     if (!callback || !high_entropy_token(token)) {
@@ -12438,6 +12885,9 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
     }
     Fixture fixture(token);
     TempDir temp;
+    const bool compose_receipt = static_cast<bool>(receipt_callback);
+    GenerationReceiptCompositionOwner composer;
+    bool receipt_published = false;
     const auto audit = [&](std::string& error) {
         if (!audit_zero_residue(token,
                                 fixture.network_a().name,
@@ -12456,6 +12906,11 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
     const auto finish = [&](bool semantic_success) {
         std::string cleanup_error;
         const bool cleanup_ok = fixture.cleanup(cleanup_error);
+        if (receipt_published &&
+            !generation_receipt_equal(composer.frozen_receipt, composer.receipt)) {
+            if (!cleanup_error.empty()) cleanup_error += "; ";
+            cleanup_error += "published generation receipt changed during cleanup";
+        }
         result.cleanup_complete = cleanup_ok;
         if (!cleanup_error.empty()) {
             if (!result.error.empty()) result.error += "; ";
@@ -12484,8 +12939,20 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
         !fixture.create_sidecar(HeldNamespaceSidecarFailurePoint::None, result.error))
         return finish(false);
 
-    const HeldTopologySnapshot old_topology = fixture.current_topology_snapshot();
-    const HeldNamespaceSidecarSnapshot old_sidecar = fixture.sidecar_snapshot();
+    HeldTopologySnapshot old_topology;
+    HeldNamespaceSidecarSnapshot old_sidecar;
+    if (compose_receipt) {
+        std::string composition_error;
+        if (!capture_old_generation_for_receipt(fixture, composer, composition_error)) {
+            result.error = composition_error;
+            return finish(false);
+        }
+        old_topology = composer.receipt.old_generation.topology;
+        old_sidecar = composer.receipt.old_generation.sidecar;
+    } else {
+        old_topology = fixture.current_topology_snapshot();
+        old_sidecar = fixture.sidecar_snapshot();
+    }
     std::string phase_error;
     const CleanupPhaseResult old_sidecar_settled = fixture.cleanup_sidecar_phase(phase_error);
     if (!old_sidecar_settled.settled || !old_sidecar_settled.operation_ok || !phase_error.empty()) {
@@ -12513,6 +12980,13 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
         !old_absence.sidecar_name_absent) {
         result.error = "old generation exact frozen absence was incomplete";
         return finish(false);
+    }
+    if (compose_receipt) {
+        std::string composition_error;
+        if (!capture_old_absence_for_receipt(fixture, composer, composition_error)) {
+            result.error = composition_error;
+            return finish(false);
+        }
     }
     if (!fixture.recreate_holder_only(holder_failure_point, result.error)) return finish(false);
     const HolderOnlyRecreationEvidence holder = fixture.holder_only_recreation_evidence();
@@ -12582,6 +13056,12 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
             result.error = "foreign collision fixture exact-ID cleanup failed";
             return finish(false);
         }
+        if (compose_receipt && (!generation_receipt_composition_fail(composer) ||
+                                !generation_receipt_unpublished(composer, false))) {
+            result.error =
+                "foreign collision incorrectly advanced or published generation receipt phases";
+            return finish(false);
+        }
         sidecar_error.clear();
     } else {
         const bool expected_created =
@@ -12641,6 +13121,39 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
             return finish(false);
         }
         if (!callback(evidence, result.error)) return finish(false);
+
+        if (compose_receipt) {
+            if (no_object || stopped) {
+                if (!generation_receipt_composition_fail(composer) ||
+                    !generation_receipt_unpublished(composer, false)) {
+                    result.error =
+                        "failed fresh sidecar incorrectly advanced or published receipt phases";
+                    return finish(false);
+                }
+            } else {
+                const bool inject_phase4_mutation =
+                    sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation;
+                std::string composition_error;
+                const bool published = publish_complete_generation_receipt(
+                    fixture, evidence, inject_phase4_mutation, composer, composition_error);
+                if (inject_phase4_mutation) {
+                    if (published || composition_error.empty() ||
+                        !generation_receipt_unpublished(composer, true)) {
+                        result.error =
+                            "phase-4 sidecar-B mutation did not fail receipt publication closed";
+                        return finish(false);
+                    }
+                } else {
+                    if (!published) {
+                        result.error = composition_error;
+                        return finish(false);
+                    }
+                    receipt_published = true;
+                    if (!receipt_callback(composer.frozen_receipt, result.error))
+                        return finish(false);
+                }
+            }
+        }
 
         if (sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation) {
             const u64 before_rejection = command_invocation_count;
@@ -12768,7 +13281,9 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
     std::string caller_history = "preserve-fresh-owner-history";
     if (!fixture.cleanup(caller_history) || caller_history != "preserve-fresh-owner-history" ||
         command_invocation_count != replay_commands ||
-        !cleanup_evidence_equal(terminal, fixture.cleanup_evidence())) {
+        !cleanup_evidence_equal(terminal, fixture.cleanup_evidence()) ||
+        (receipt_published &&
+         !generation_receipt_equal(composer.frozen_receipt, composer.receipt))) {
         result.error = "fresh sidecar->holder->B->A terminal replay was not inert";
         return finish(false);
     }
@@ -12784,6 +13299,229 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
     result.error = result.semantic_receipt;
     result.success = true;
     return result;
+}
+
+RunResult run_with_complete_generation_rotation(
+    const HeldNamespaceGenerationReceiptCallback& callback,
+    HolderOnlyRecreationFailurePoint holder_failure_point,
+    RecreatedSidecarFailurePoint sidecar_failure_point) {
+    RunResult result;
+    std::string token;
+    if (!callback || !high_entropy_token(token)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        result.error = callback ? "high-entropy token generation unavailable"
+                                : "complete-generation receipt callback was empty";
+        return result;
+    }
+    Fixture fixture(token);
+    TempDir temp;
+    GenerationReceiptCompositionOwner composer;
+    bool receipt_published = false;
+    HeldNamespaceGenerationRotationReceipt published_receipt;
+    const bool expected_no_publication =
+        sidecar_failure_point == RecreatedSidecarFailurePoint::CreateSuppressedNoObject ||
+        sidecar_failure_point == RecreatedSidecarFailurePoint::PreCreateNameCollision ||
+        sidecar_failure_point == RecreatedSidecarFailurePoint::UnexpectedDeath ||
+        sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation;
+    const auto audit = [&](std::string& error) {
+        if (!audit_zero_residue(token,
+                                fixture.network_a().name,
+                                fixture.network_b().name,
+                                fixture.holder_name(),
+                                error))
+            return false;
+        CommandResult sidecar;
+        if (!run_command({"docker", "inspect", fixture.sidecar_name()}, sidecar) ||
+            exited_zero(sidecar)) {
+            error = "complete receipt sidecar stable name remains after cleanup";
+            return false;
+        }
+        return true;
+    };
+    const auto finish = [&](bool semantic_success) {
+        std::string cleanup_error;
+        const bool cleanup_ok = fixture.cleanup(cleanup_error);
+        if (receipt_published &&
+            !generation_receipt_equal(composer.frozen_receipt, published_receipt)) {
+            if (!cleanup_error.empty()) cleanup_error += "; ";
+            cleanup_error += "published generation receipt changed during cleanup";
+        }
+        result.cleanup_complete = cleanup_ok;
+        if (!cleanup_error.empty()) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += cleanup_error;
+        }
+        std::string audit_error;
+        result.residue_free = audit(audit_error);
+        if (!audit_error.empty()) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += audit_error;
+        }
+        result.success = semantic_success && cleanup_ok && result.residue_free;
+        if (result.success && receipt_published) {
+            const u64 replay_commands = command_invocation_count;
+            std::string replay_error;
+            if (!fixture.cleanup(replay_error) || !replay_error.empty() ||
+                command_invocation_count != replay_commands ||
+                !generation_receipt_equal(composer.frozen_receipt, published_receipt)) {
+                result.success = false;
+                if (!result.error.empty()) result.error += "; ";
+                result.error += "published receipt terminal replay was not command-free/frozen";
+            }
+        }
+        return result;
+    };
+    if (!temp.create() || !write_manifest(temp, fixture) || !preflight(fixture, result.error)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        if (result.error.empty()) result.error = "complete-generation receipt preflight failed";
+        return result;
+    }
+    if (!fixture.create_networks(FailurePoint::None, result.error) ||
+        !fixture.create_holder(FailurePoint::None, result.error) ||
+        !fixture.attach_holder(FailurePoint::None, result.error) ||
+        !fixture.verify_topology(FailurePoint::None, result.error) ||
+        !fixture.create_sidecar(HeldNamespaceSidecarFailurePoint::None, result.error))
+        return finish(false);
+
+    std::string phase_error;
+    if (!capture_old_generation_for_receipt(fixture, composer, phase_error)) {
+        result.error = phase_error;
+        return finish(false);
+    }
+
+    phase_error.clear();
+    const CleanupPhaseResult old_sidecar = fixture.cleanup_sidecar_phase(phase_error);
+    if (!old_sidecar.settled || !old_sidecar.operation_ok || !phase_error.empty()) {
+        result.error = "old sidecar did not settle for complete receipt: " + phase_error;
+        return finish(false);
+    }
+    phase_error.clear();
+    const CleanupPhaseResult old_holder = fixture.cleanup_holder_phase(phase_error);
+    if (!old_holder.settled || !old_holder.operation_ok || !old_holder.holder_removed ||
+        !phase_error.empty()) {
+        result.error = "old holder did not settle for complete receipt: " + phase_error;
+        return finish(false);
+    }
+    phase_error.clear();
+    if (!capture_old_absence_for_receipt(fixture, composer, phase_error)) {
+        result.error = phase_error;
+        return finish(false);
+    }
+
+    if (!fixture.recreate_holder_only(holder_failure_point, result.error)) return finish(false);
+    const HolderOnlyRecreationEvidence holder = fixture.holder_only_recreation_evidence();
+    const char* holder_evidence_gap =
+        holder.complete_generation
+            ? "holder-only evidence incorrectly claimed a complete generation"
+        : holder.state != HolderOnlyRecreationState::Validated
+            ? "holder-only owner was not Validated"
+        : !holder.old_authority_frozen ? "old holder/sidecar absence authority was not frozen"
+        : !holder.exact_network_a      ? "fresh holder lacked exact network-A authority"
+        : !holder.exact_network_b      ? "fresh holder lacked exact network-B authority"
+        : !holder.exact_security       ? "fresh holder lacked exact immutable security authority"
+        : !holder.network_a_membership_proven_after_start
+            ? "fresh holder network-A membership was not proven after start"
+            : nullptr;
+    if (holder_evidence_gap != nullptr) {
+        result.error =
+            std::string("complete receipt holder evidence was incomplete: ") + holder_evidence_gap;
+        return finish(false);
+    }
+
+    std::string foreign_id;
+    if (sidecar_failure_point == RecreatedSidecarFailurePoint::PreCreateNameCollision) {
+        CommandResult foreign;
+        if (!run_command({"docker",
+                          "create",
+                          "--pull=never",
+                          "--name",
+                          fixture.sidecar_name(),
+                          "--label",
+                          "rut.role=foreign-owner",
+                          RUT_PINNED_NGINX_IMAGE,
+                          "/bin/true"},
+                         foreign) ||
+            !exited_zero(foreign) || !full_container_id(trim(foreign.output))) {
+            result.error = "complete receipt collision fixture could not be created";
+            return finish(false);
+        }
+        foreign_id = trim(foreign.output);
+    }
+    std::string sidecar_error;
+    const bool sidecar_created = fixture.recreate_sidecar(sidecar_failure_point, sidecar_error);
+    if (sidecar_failure_point == RecreatedSidecarFailurePoint::PreCreateNameCollision) {
+        CommandResult present;
+        if (sidecar_created ||
+            sidecar_error != "fresh sidecar stable-name collision was rejected before create" ||
+            !run_command({"docker", "inspect", foreign_id}, present) || !exited_zero(present)) {
+            result.error = "complete receipt collision was not rejected without adoption";
+            return finish(false);
+        }
+        CommandResult remove;
+        if (!run_command({"docker", "rm", "-f", foreign_id}, remove) || !exited_zero(remove)) {
+            result.error = "complete receipt collision fixture cleanup failed";
+            return finish(false);
+        }
+        if (!generation_receipt_composition_fail(composer) ||
+            !generation_receipt_unpublished(composer, false)) {
+            result.error =
+                "complete receipt collision incorrectly advanced or published receipt phases";
+            return finish(false);
+        }
+        result.semantic_receipt =
+            "verified complete-generation receipt was not published after sidecar failure";
+        result.error = result.semantic_receipt;
+        return finish(true);
+    }
+    if (!sidecar_created) {
+        if (expected_no_publication &&
+            (sidecar_failure_point == RecreatedSidecarFailurePoint::CreateSuppressedNoObject ||
+             sidecar_failure_point == RecreatedSidecarFailurePoint::UnexpectedDeath)) {
+            if (!generation_receipt_composition_fail(composer) ||
+                !generation_receipt_unpublished(composer, false)) {
+                result.error =
+                    "failed sidecar incorrectly advanced or published generation receipt phases";
+                return finish(false);
+            }
+            result.semantic_receipt =
+                "verified complete-generation receipt was not published after sidecar failure";
+            result.error = result.semantic_receipt;
+            return finish(true);
+        }
+        result.error = "complete receipt sidecar creation failed: " + sidecar_error;
+        return finish(false);
+    }
+    const RecreatedSidecarEvidence sidecar = fixture.recreated_sidecar_evidence();
+    if (sidecar.complete_generation || sidecar.state != RecreatedSidecarState::Validated ||
+        !sidecar.fresh_probe_pid_start_scoped || !sidecar.shared_non_host_netns ||
+        !full_container_id(sidecar.sidecar.id)) {
+        result.error = "fresh sidecar phase-3 evidence was incomplete";
+        return finish(false);
+    }
+    const bool inject_second_bracket_mutation =
+        sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation;
+    std::string bracket_error;
+    if (!publish_complete_generation_receipt(
+            fixture, sidecar, inject_second_bracket_mutation, composer, bracket_error)) {
+        if (inject_second_bracket_mutation) fixture.clear_recreated_sidecar_cleanup_fault();
+        if (inject_second_bracket_mutation && !generation_receipt_unpublished(composer, true)) {
+            result.error = "phase-4 mutation did not leave the complete receipt unpublished";
+            return finish(false);
+        }
+        result.error = bracket_error;
+        return finish(expected_no_publication);
+    }
+    published_receipt = composer.frozen_receipt;
+    receipt_published = true;
+    if (!callback(composer.frozen_receipt, result.error)) return finish(false);
+    if (sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation)
+        fixture.clear_recreated_sidecar_cleanup_fault();
+    result.semantic_receipt =
+        "verified complete holder-sidecar generation receipt and zero residue";
+    result.error = result.semantic_receipt;
+    return finish(true);
 }
 
 }  // namespace rut::test::ipv4_topology
