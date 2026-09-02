@@ -315,7 +315,8 @@ RunResult run_with_holder_only_recreation(
 RunResult run_with_recreated_sidecar(
     const RecreatedSidecarCallback& callback,
     HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
-    RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
+    RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None,
+    const HeldNamespaceGenerationReceiptCallback& receipt_callback = {});
 RunResult run_with_complete_generation_rotation(
     const HeldNamespaceGenerationReceiptCallback& callback,
     HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
