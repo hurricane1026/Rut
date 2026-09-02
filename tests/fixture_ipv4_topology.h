@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fixture_exact_input_mount_owner.h"
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -164,6 +165,7 @@ enum class ExactInputRotationFailurePoint : std::uint8_t {
     FreshCreateReportedTimeout,
     FreshMountObservationMutation,
     SuppressFirstFreshRemoval,
+    FreshReadTimeout,
 };
 
 struct ExactInputRotationSourceEvidence {
@@ -215,6 +217,24 @@ struct ExactInputMountedSidecarEvidence {
     bool nonhost_mount_netns = false;
 };
 
+// Rotation-owned read evidence.  The source and target brackets deliberately
+// use separate fields from the legacy exact-input owner so a successful read
+// cannot accidentally publish stale registered-sidecar authority.
+struct ExactInputRotationReadEvidence {
+    ExactInputReadOutcome outcome = ExactInputReadOutcome::None;
+    bool attempted = false;
+    bool terminal_frozen = false;
+    bool caller_deadline_recorded = false;
+    std::int64_t final_deadline_nanoseconds = 0;
+    ExactInputRotationSourceEvidence source_before;
+    ExactInputRotationSourceEvidence source_after;
+    ExactInputMountedSidecarEvidence target_before;
+    ExactInputMountedSidecarEvidence target_after;
+    ExactInputReadObservation command;
+    bool source_brackets_equal = false;
+    bool target_brackets_equal = false;
+};
+
 struct ExactInputMountedSidecarAbsence {
     std::string id;
     std::string name;
@@ -234,6 +254,7 @@ struct ExactInputRotationLiveEvidence {
     ExactInputMountedSidecarAbsence old_absence;
     HeldNamespaceGenerationRotationReceipt generation_receipt;
     ExactInputMountedSidecarEvidence fresh_mounted;
+    ExactInputRotationReadEvidence fresh_read;
     bool source_continuity = false;
     bool generation_receipt_validated_twice = false;
     bool old_and_fresh_authorities_separate = false;

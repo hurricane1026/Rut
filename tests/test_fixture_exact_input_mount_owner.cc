@@ -1077,7 +1077,7 @@ int main(int argc, char** argv) {
     std::string rotation_selfcheck_error;
     if (!exact_input_rotation_pure_self_checks(rotation_mutation_rejections,
                                                rotation_selfcheck_error) ||
-        rotation_mutation_rejections != 6u) {
+        rotation_mutation_rejections != 21u) {
         std::cerr << "FAIL [#412 exact-input rotation pure checks]: " << rotation_selfcheck_error
                   << "\n";
         return 1;
@@ -2234,7 +2234,8 @@ int main(int argc, char** argv) {
          {ExactInputRotationFailurePoint::None,
           ExactInputRotationFailurePoint::FreshCreateReportedTimeout,
           ExactInputRotationFailurePoint::FreshMountObservationMutation,
-          ExactInputRotationFailurePoint::SuppressFirstFreshRemoval}) {
+          ExactInputRotationFailurePoint::SuppressFirstFreshRemoval,
+          ExactInputRotationFailurePoint::FreshReadTimeout}) {
         std::size_t callback_count = 0;
         ExactInputRotationTerminalReceipt rotation_receipt;
         const RunResult rotation = run_with_exact_input_rotation(
@@ -2247,11 +2248,16 @@ int main(int argc, char** argv) {
             rotation_receipt);
         const bool mutation =
             point == ExactInputRotationFailurePoint::FreshMountObservationMutation;
+        const bool read_timeout = point == ExactInputRotationFailurePoint::FreshReadTimeout;
         const bool operation_ok = point == ExactInputRotationFailurePoint::None || mutation;
         if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
-            !rotation.residue_free || callback_count != (mutation ? 0u : 1u) ||
-            rotation_receipt.live_published != !mutation ||
+            !rotation.residue_free || callback_count != ((mutation || read_timeout) ? 0u : 1u) ||
+            rotation_receipt.live_published != !(mutation || read_timeout) ||
             rotation_receipt.operation_ok != operation_ok ||
+            (read_timeout &&
+             (rotation_receipt.live.fresh_read.outcome == ExactInputReadOutcome::Complete ||
+              !rotation_receipt.live.fresh_read.terminal_frozen ||
+              !rotation_receipt.live.fresh_read.command.attempted)) ||
             rotation_receipt.fresh_remove_suppression_count !=
                 (point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval ? 1u : 0u) ||
             !validate_exact_input_rotation_terminal_receipt(rotation_receipt,
