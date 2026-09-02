@@ -5252,9 +5252,10 @@ bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, st
     // and cross-check the host inode whenever proc_identity could observe it.
     const bool before_ok = proc_identity(holder.pid, before, false);
     const bool container_netns_ok = container_netns_inode(holder.id, before_container_netns);
-    const bool host_ok = proc_identity(getpid(), host);
+    const bool host_ok = proc_identity(getpid(), host, false);
     if (!before_ok || before.start != holder.start || !container_netns_ok || !host_ok ||
-        before_container_netns == 0u || before_container_netns == host.netns ||
+        before_container_netns == 0u ||
+        (host.netns != 0u && before_container_netns == host.netns) ||
         (before.netns != 0u && before.netns != before_container_netns)) {
         error = "fresh holder initial PID/start/netns authority mismatch: pid=" +
                 std::to_string(holder.pid) + " expected-start=" + std::to_string(holder.start) +
@@ -5264,7 +5265,8 @@ bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, st
                 " host-netns=" + std::to_string(host.netns) +
                 " before-ok=" + std::to_string(before_ok ? 1 : 0) +
                 " container-netns-ok=" + std::to_string(container_netns_ok ? 1 : 0) +
-                " host-ok=" + std::to_string(host_ok ? 1 : 0);
+                " host-ok=" + std::to_string(host_ok ? 1 : 0) +
+                " host-netns-visible=" + std::to_string(host.netns != 0u ? 1 : 0);
         return false;
     }
 
