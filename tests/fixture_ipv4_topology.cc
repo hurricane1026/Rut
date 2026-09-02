@@ -12611,11 +12611,20 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
 
         if (sidecar_failure_point == RecreatedSidecarFailurePoint::CleanupIdentityMutation) {
             const u64 before_rejection = command_invocation_count;
-            std::string rejected;
-            if (fixture.cleanup_recreated_sidecar(rejected) ||
-                rejected != "fresh sidecar cleanup identity/config/netns mutation was rejected" ||
-                fixture.cleanup_recreated_holder(rejected) ||
+            std::string sidecar_rejection_error;
+            if (fixture.cleanup_recreated_sidecar(sidecar_rejection_error) ||
+                sidecar_rejection_error !=
+                    "fresh sidecar cleanup identity/config/netns mutation was rejected" ||
                 command_invocation_count <= before_rejection) {
+                result.error = "fresh-sidecar mutation rejection was not causally inspected";
+                return finish(false);
+            }
+            const u64 after_sidecar_rejection = command_invocation_count;
+            std::string holder_gate_error;
+            if (fixture.cleanup_recreated_holder(holder_gate_error) ||
+                holder_gate_error !=
+                    "refusing recreated holder cleanup before recreated sidecar settlement" ||
+                command_invocation_count != after_sidecar_rejection) {
                 result.error = "fresh-sidecar mutation did not independently block holder cleanup";
                 return finish(false);
             }
