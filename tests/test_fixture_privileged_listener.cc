@@ -362,7 +362,8 @@ bool evidence_tests() {
             "guard LISTEN record was accepted as complete port absence");
 
     listener::ProcTcpTable ambiguous = exact;
-    ambiguous.rows[ambiguous.count++] = {0u, kPlan.port, 0x0au, 888u};
+    ambiguous.rows[ambiguous.count++] = {
+        .local_ipv4 = 0u, .local_port = kPlan.port, .state = 0x0au, .inode = 888u};
     rejects(ambiguous,
             {111u},
             listener::ListenerEvidenceKind::ExactPositive,
