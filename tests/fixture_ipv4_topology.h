@@ -176,6 +176,17 @@ enum class ExactInputRotationFailurePoint : std::uint8_t {
     FreshWriteTimeout,
 };
 
+enum class ExactInputRotationNginxMode : std::uint8_t {
+    Disabled = 0,
+    Required,
+};
+
+struct ExactInputRotationOptions {
+    ExactInputRotationNginxMode nginx_mode = ExactInputRotationNginxMode::Disabled;
+    ExactInputTopologyBuilder nginx_config_builder = nullptr;
+    void* nginx_config_builder_context = nullptr;
+};
+
 struct ExactInputRotationSourceEvidence {
     std::string path;
     std::string bytes;
@@ -271,6 +282,16 @@ struct ExactInputRotationWriteRefusalEvidence {
     ExactInputMountDiagnostic diagnostic;
 };
 
+struct ExactInputRotationTerminalTcpEvidence {
+    bool attempted = false;
+    bool complete = false;
+    std::uint32_t local_ipv4 = 0;
+    std::uint16_t local_port = 0;
+    std::uint8_t state = 0;
+    std::uint32_t remote_ipv4 = 0;
+    std::uint16_t remote_port = 0;
+};
+
 struct ExactInputMountedSidecarAbsence {
     std::string id;
     std::string name;
@@ -292,6 +313,10 @@ struct ExactInputRotationLiveEvidence {
     ExactInputMountedSidecarEvidence fresh_mounted;
     ExactInputRotationReadEvidence fresh_read;
     ExactInputRotationWriteRefusalEvidence fresh_write;
+    ExactInputNginxLifecycleObservation old_nginx;
+    ExactInputRotationTerminalTcpEvidence old_terminal_tcp;
+    bool fresh_clean_baseline = false;
+    bool nginx_required = false;
     bool source_continuity = false;
     bool generation_receipt_validated_twice = false;
     bool old_and_fresh_authorities_separate = false;
@@ -314,6 +339,7 @@ struct ExactInputRotationTerminalReceipt {
     bool terminal_frozen = false;
     bool replay_command_free = false;
     bool downstream_gates_command_free = false;
+    bool nginx_required = false;
     std::uint32_t fresh_remove_count = 0;
     std::uint32_t fresh_remove_suppression_count = 0;
     std::uint32_t fresh_mounted_order = 0;
@@ -505,7 +531,8 @@ RunResult run_with_complete_generation_rotation(
 RunResult run_with_exact_input_rotation(const std::string& bytes,
                                         ExactInputRotationFailurePoint failure_point,
                                         const ExactInputRotationCallback& callback,
-                                        ExactInputRotationTerminalReceipt& terminal_receipt);
+                                        ExactInputRotationTerminalReceipt& terminal_receipt,
+                                        ExactInputRotationOptions options = {});
 RunResult run_with_held_topology_and_sidecar(
     HeldTopologyProbePolicy policy,
     const HeldTopologyAndSidecarCallback& callback,

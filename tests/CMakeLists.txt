@@ -20,6 +20,30 @@ set_tests_properties(test_fixture_worker_protocol PROPERTIES
     TIMEOUT 30
 )
 
+# Pure bounded IPv4 HTTP exchange/parser self-check. No Docker, nginx, RUT,
+# converter, or runtime behavior is involved.
+add_executable(test_fixture_bounded_http_exchange
+    test_fixture_bounded_http_exchange.cc)
+add_library(fixture_bounded_http_exchange STATIC fixture_bounded_http_exchange.cc)
+target_compile_definitions(fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
+target_compile_definitions(test_fixture_bounded_http_exchange PRIVATE
+    RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM)
+target_include_directories(fixture_bounded_http_exchange PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(test_fixture_bounded_http_exchange PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fixture_bounded_http_exchange PRIVATE fixture_bounded_http_exchange)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_fixture_bounded_http_exchange PRIVATE -fexceptions)
+endif()
+add_test(NAME test_fixture_bounded_http_exchange
+    COMMAND test_fixture_bounded_http_exchange)
+set_tests_properties(test_fixture_bounded_http_exchange PROPERTIES
+    LABELS "unit"
+    RUN_SERIAL TRUE
+    TIMEOUT 30)
+
 # Pure #377 CollisionRelease v2 authenticated codec/state machine. The library
 # reuses common worker framing but owns no process, listener or runtime state.
 add_library(fixture_collision_release_protocol STATIC
@@ -406,6 +430,7 @@ add_test(NAME test_redirect_policy COMMAND test_redirect_policy)
 set_tests_properties(test_redirect_policy PROPERTIES LABELS "unit")
 
 find_package(Threads REQUIRED)
+target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
@@ -832,6 +857,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_ipv4_fixture_topology PRIVATE
+        fixture_bounded_http_exchange
         fixture_exact_input_file_lease
         fixture_private_directory_lease
         fixture_privileged_listener
@@ -852,6 +878,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
+        fixture_bounded_http_exchange
         fixture_ancestry_bundle
         fixture_collision_release_evidence_protocol
         fixture_collision_release_evidence_transport
@@ -885,6 +912,7 @@ if(RUT_ENABLE_JIT)
         fixture_ipv4_topology.cc
     )
     target_link_libraries(test_fixture_exact_input_mount_owner PRIVATE
+        fixture_bounded_http_exchange
         fixture_exact_input_file_lease
         fixture_private_directory_lease
         fixture_privileged_listener
