@@ -326,6 +326,17 @@ int main() {
     if (!check(!parse_response(valid_response(), parsed, error, valid_response().size() - 1u),
                "response limit is enforced"))
         ok = false;
+    const std::string oversized_response_error = error;
+    if (!check(oversized_response_error == "response exceeds bounded byte limit",
+               "oversized response diagnostic"))
+        ok = false;
+    if (!check(!parse_response("", parsed, error), "empty response is rejected")) ok = false;
+    const std::string empty_response_error = error;
+    if (!check(empty_response_error == "response was empty", "empty response diagnostic"))
+        ok = false;
+    if (!check(empty_response_error != oversized_response_error,
+               "empty and oversized response diagnostics differ"))
+        ok = false;
 
     const int descriptors_before = open_fd_count();
     if (!exchange_server(valid_response(), Outcome::Complete)) ok = false;
