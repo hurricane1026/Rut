@@ -1,12 +1,11 @@
 #pragma once
 
+#include "fixture_exact_input_mount_owner.h"
 #include <cstdint>
 #include <functional>
 #include <string>
 
 #include <sys/types.h>
-
-#include "fixture_exact_input_mount_owner.h"
 
 namespace rut::test::ipv4_topology {
 

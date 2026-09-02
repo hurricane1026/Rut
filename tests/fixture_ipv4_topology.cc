@@ -209,7 +209,7 @@ static bool run_command(const std::vector<std::string>& arguments,
     const std::int64_t invocation_now = exact_read_monotonic_ns();
     if (invocation_now <= 0 || timeout_ms <= 0 ||
         invocation_now > std::numeric_limits<std::int64_t>::max() -
-                              static_cast<std::int64_t>(timeout_ms) * 1000000LL) {
+                             static_cast<std::int64_t>(timeout_ms) * 1000000LL) {
         result = {};
         result.timed_out = true;
         return false;
@@ -11073,7 +11073,8 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
                a.pidfd_identity_verified == b.pidfd_identity_verified &&
                a.pidfd_closed_after_group_gone == b.pidfd_closed_after_group_gone &&
                a.final_deadline_recorded == b.final_deadline_recorded &&
-               a.cleanup_completed_before_final_deadline == b.cleanup_completed_before_final_deadline &&
+               a.cleanup_completed_before_final_deadline ==
+                   b.cleanup_completed_before_final_deadline &&
                a.supervisor_session_verified == b.supervisor_session_verified &&
                a.supervisor_subreaper_verified == b.supervisor_subreaper_verified &&
                a.actual_exec_observed == b.actual_exec_observed &&
@@ -11088,7 +11089,8 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
                a.adopted_reap_count == b.adopted_reap_count &&
                a.foreign_process_survived == b.foreign_process_survived &&
                a.foreign_fd_excluded == b.foreign_fd_excluded &&
-               a.deadline_exceeded == b.deadline_exceeded && a.output_overflow == b.output_overflow &&
+               a.deadline_exceeded == b.deadline_exceeded &&
+               a.output_overflow == b.output_overflow &&
                a.pre_source_revalidated == b.pre_source_revalidated &&
                a.pre_container_identity == b.pre_container_identity &&
                a.pre_mount_inspected == b.pre_mount_inspected &&
@@ -11101,10 +11103,10 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
                a.registered_mount_matched == b.registered_mount_matched &&
                a.expected_size == b.expected_size && a.stdout_read_errno == b.stdout_read_errno &&
                a.stderr_read_errno == b.stderr_read_errno &&
-               a.launch_failure_stage == b.launch_failure_stage && a.launch_errno == b.launch_errno &&
-               a.wait_status == b.wait_status && a.command_argv == b.command_argv &&
-               a.resolved_executable == b.resolved_executable && a.stdout_bytes == b.stdout_bytes &&
-               a.stderr_bytes == b.stderr_bytes &&
+               a.launch_failure_stage == b.launch_failure_stage &&
+               a.launch_errno == b.launch_errno && a.wait_status == b.wait_status &&
+               a.command_argv == b.command_argv && a.resolved_executable == b.resolved_executable &&
+               a.stdout_bytes == b.stdout_bytes && a.stderr_bytes == b.stderr_bytes &&
                a.diagnostic.phase == b.diagnostic.phase &&
                a.diagnostic.error_number == b.diagnostic.error_number &&
                a.diagnostic.message == b.diagnostic.message;
@@ -14409,33 +14411,32 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
         return false;
     };
     if (!before_deadline() || !capture_rotation_source(root, read.source_before, error))
-        return freeze(ExactInputReadOutcome::SourceRevalidationFailed,
-                      error.empty() ? std::string("fresh read source-before bracket failed")
-                                    : error);
+        return freeze(
+            ExactInputReadOutcome::SourceRevalidationFailed,
+            error.empty() ? std::string("fresh read source-before bracket failed") : error);
 
     const std::string prefix = "container:";
     if (mounted.network_mode.rfind(prefix, 0) != 0 || !full_container_id(mounted.id))
         return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
                       "fresh read target authority was not an exact full-ID container tuple");
     ParsedMountInspect before_mount;
-    if (!before_deadline() ||
-        !inspect_rotation_mounted(mounted.id,
-                                  mounted.token,
-                                  mounted.name,
-                                  mounted.generation,
-                                  mounted.network_mode.substr(prefix.size()),
-                                  read.source_before,
-                                  true,
-                                  false,
-                                  read.target_before,
-                                  &before_mount,
-                                  error))
-        return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
-                      error.empty() ? std::string("fresh read target-before bracket failed")
-                                    : error);
+    if (!before_deadline() || !inspect_rotation_mounted(mounted.id,
+                                                        mounted.token,
+                                                        mounted.name,
+                                                        mounted.generation,
+                                                        mounted.network_mode.substr(prefix.size()),
+                                                        read.source_before,
+                                                        true,
+                                                        false,
+                                                        read.target_before,
+                                                        &before_mount,
+                                                        error))
+        return freeze(
+            ExactInputReadOutcome::ContainerIdentityFailed,
+            error.empty() ? std::string("fresh read target-before bracket failed") : error);
 
-    const std::string credentials = std::to_string(read.source_before.uid) + ":" +
-                                    std::to_string(read.source_before.gid);
+    const std::string credentials =
+        std::to_string(read.source_before.uid) + ":" + std::to_string(read.source_before.gid);
     if (credentials != mounted.user)
         return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
                       "fresh read target credentials differed from the mounted authority");
@@ -14465,10 +14466,8 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
     command.attempted = true;
     const std::size_t stdout_limit = root.bytes.size() + 1u;
     ExactReadCommandResult command_result;
-    (void)run_exact_read_command_until(command.command_argv,
-                                       stdout_limit,
-                                       read.final_deadline_nanoseconds,
-                                       command_result);
+    (void)run_exact_read_command_until(
+        command.command_argv, stdout_limit, read.final_deadline_nanoseconds, command_result);
     copy_exact_read_result(command_result, command);
     finalize_rotation_read_command(command, root.bytes.size());
     read.command = command;
@@ -14486,8 +14485,8 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
                                       read.target_after,
                                       &after_mount,
                                       error))
-        return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
-                      error.empty() ? std::string("fresh read after bracket failed") : error);
+            return freeze(ExactInputReadOutcome::ContainerIdentityFailed,
+                          error.empty() ? std::string("fresh read after bracket failed") : error);
         read.source_brackets_equal =
             exact_input_rotation_source_equal(read.source_before, read.source_after);
         read.target_brackets_equal =
@@ -14897,11 +14896,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         live.state = ExactInputRotationState::Unresolved;
     } else {
         std::string read_error;
-        const bool read_ok = capture_rotation_read(root,
-                                                   mounted.fresh_mounted,
-                                                   failure_point,
-                                                   live.fresh_read,
-                                                   read_error);
+        const bool read_ok = capture_rotation_read(
+            root, mounted.fresh_mounted, failure_point, live.fresh_read, read_error);
         if (!read_ok) {
             mounted.operation_ok = false;
             (void)mounted_rotation_transition(mounted, ExactInputRotationState::Unresolved);
@@ -15286,8 +15282,10 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         !reject([](auto& value) { value.fresh_read.command.child_reaped = false; }) ||
         !reject([](auto& value) { value.fresh_read.command.process_group_gone = false; }) ||
         !reject([](auto& value) { value.fresh_read.command.pidfd_identity_verified = false; }) ||
-        !reject([](auto& value) { value.fresh_read.command.supervisor_session_verified = false; }) ||
-        !reject([](auto& value) { value.fresh_read.command.subtree_confinement_installed = false; }) ||
+        !reject(
+            [](auto& value) { value.fresh_read.command.supervisor_session_verified = false; }) ||
+        !reject(
+            [](auto& value) { value.fresh_read.command.subtree_confinement_installed = false; }) ||
         !reject([](auto& value) {
             value.fresh_read.command.cleanup_completed_before_final_deadline = false;
         }) ||
@@ -15296,7 +15294,8 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         !reject([](auto& value) { value.fresh_read.command.stdout_bytes.push_back('x'); }) ||
         !reject([](auto& value) { value.fresh_read.command.stderr_bytes = "unexpected"; }) ||
         !reject([](auto& value) { value.fresh_read.command.command_argv.back() = "/tmp/other"; }) ||
-        !reject([](auto& value) { value.fresh_read.command.resolved_executable = "/tmp/docker"; })) {
+        !reject(
+            [](auto& value) { value.fresh_read.command.resolved_executable = "/tmp/docker"; })) {
         error = "exact-input rotation live mutation was accepted";
         return false;
     }
