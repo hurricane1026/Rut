@@ -876,8 +876,10 @@ if(RUT_ENABLE_JIT)
     add_executable(test_fixture_privileged_broker
         test_fixture_privileged_broker.cc
         fixture_ipv4_topology.cc
+        ${PROJECT_SOURCE_DIR}/src/placement_new.cc
     )
     target_link_libraries(test_fixture_privileged_broker PRIVATE
+        rut_nginx
         fixture_bounded_http_exchange
         fixture_ancestry_bundle
         fixture_collision_release_evidence_protocol
@@ -899,6 +901,7 @@ if(RUT_ENABLE_JIT)
     )
     target_include_directories(test_fixture_privileged_broker PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/include
     )
     target_compile_definitions(test_fixture_privileged_broker PRIVATE
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
