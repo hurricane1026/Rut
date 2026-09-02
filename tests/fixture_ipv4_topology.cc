@@ -5246,10 +5246,25 @@ bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, st
     }
     ProcIdentity before{};
     ProcIdentity host{};
-    if (!proc_identity(holder.pid, before, false) || before.start != holder.start ||
-        !container_netns_inode(holder.id, before.netns) || !proc_identity(getpid(), host) ||
-        before.netns == host.netns) {
-        error = "fresh holder PID/start/non-host netns authority was not exact";
+    ino_t before_container_netns = 0;
+    // The host may expose /proc/<pid>/stat while denying its ns/net symlink.
+    // Bracket netns with the same exact-container readlink source on both sides,
+    // and cross-check the host inode whenever proc_identity could observe it.
+    const bool before_ok = proc_identity(holder.pid, before, false);
+    const bool container_netns_ok = container_netns_inode(holder.id, before_container_netns);
+    const bool host_ok = proc_identity(getpid(), host);
+    if (!before_ok || before.start != holder.start || !container_netns_ok || !host_ok ||
+        before_container_netns == 0u || before_container_netns == host.netns ||
+        (before.netns != 0u && before.netns != before_container_netns)) {
+        error = "fresh holder initial PID/start/netns authority mismatch: pid=" +
+                std::to_string(holder.pid) + " expected-start=" + std::to_string(holder.start) +
+                " observed-start=" + std::to_string(before.start) +
+                " proc-netns=" + std::to_string(before.netns) +
+                " container-netns=" + std::to_string(before_container_netns) +
+                " host-netns=" + std::to_string(host.netns) +
+                " before-ok=" + std::to_string(before_ok ? 1 : 0) +
+                " container-netns-ok=" + std::to_string(container_netns_ok ? 1 : 0) +
+                " host-ok=" + std::to_string(host_ok ? 1 : 0);
         return false;
     }
 
@@ -5351,9 +5366,22 @@ bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, st
         ++probe.successful_refusal_probes;
     }
     ProcIdentity after{};
-    if (!proc_identity(holder.pid, after, false) || after.start != holder.start ||
-        after.netns != before.netns) {
-        error = "fresh holder PID/start changed across read-only topology probes";
+    const bool after_ok = proc_identity(holder.pid, after, false);
+    ino_t after_container_netns = 0;
+    const bool after_container_netns_ok = container_netns_inode(holder.id, after_container_netns);
+    if (!after_ok || after.start != holder.start || !after_container_netns_ok ||
+        after_container_netns != before_container_netns ||
+        (after.netns != 0u && after.netns != after_container_netns)) {
+        error = "fresh holder PID/start/netns changed across read-only topology probes: pid=" +
+                std::to_string(holder.pid) + " expected-start=" + std::to_string(holder.start) +
+                " before-start=" + std::to_string(before.start) +
+                " after-start=" + std::to_string(after.start) +
+                " before-netns=" + std::to_string(before_container_netns) +
+                " after-netns=" + std::to_string(after_container_netns) +
+                " before-proc-netns=" + std::to_string(before.netns) +
+                " after-proc-netns=" + std::to_string(after.netns) +
+                " after-ok=" + std::to_string(after_ok ? 1 : 0) +
+                " after-container-netns-ok=" + std::to_string(after_container_netns_ok ? 1 : 0);
         return false;
     }
     std::string probe_error;
@@ -5378,7 +5406,7 @@ bool Fixture::build_recreated_holder_topology(HeldTopologySnapshot& topology, st
     topology.guard_ip = guard_ip_;
     topology.holder_pid = holder.pid;
     topology.holder_start = holder.start;
-    topology.holder_netns = before.netns;
+    topology.holder_netns = before_container_netns;
     topology.probe_evidence = probe;
     return true;
 }
@@ -12559,8 +12587,11 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
             sidecar_failure_point != RecreatedSidecarFailurePoint::UnexpectedDeath;
         if (created != expected_created) {
             result.error =
-                "fresh-sidecar production path returned an unexpected creation result: " +
-                sidecar_error;
+                "fresh-sidecar production path returned an unexpected creation result "
+                "(holder-case=" +
+                std::to_string(static_cast<unsigned>(holder_failure_point)) +
+                ", sidecar-case=" + std::to_string(static_cast<unsigned>(sidecar_failure_point)) +
+                "): " + sidecar_error;
             return finish(false);
         }
         const RecreatedSidecarEvidence evidence = fixture.recreated_sidecar_evidence();
@@ -12719,8 +12750,7 @@ RunResult run_with_recreated_sidecar(const RecreatedSidecarCallback& callback,
             const TopologySettlementEvent expected[] = {TopologySettlementEvent::Holder,
                                                         TopologySettlementEvent::NetworkB,
                                                         TopologySettlementEvent::NetworkA};
-            if (index >= 3u || event != expected[index] ||
-                (event == TopologySettlementEvent::Holder ? removed : !removed)) {
+            if (index >= 3u || event != expected[index] || !removed) {
                 error = "fresh cleanup order/removal evidence was not sidecar->holder->B->A";
                 return false;
             }
