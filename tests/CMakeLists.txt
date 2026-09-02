@@ -5,6 +5,8 @@ target_include_directories(test_framework PRIVATE
 )
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
+add_test(NAME test_framework_sharding COMMAND test_framework --sharding-self-test)
+set_tests_properties(test_framework_sharding PROPERTIES LABELS "unit" TIMEOUT 30)
 
 # Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
 # has no Docker/network label and runs in ordinary CI on an unprivileged host.
@@ -478,8 +480,19 @@ else()
     target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=0)
 endif()
 add_dependencies(test_integration test_tls_fixtures)
-add_test(NAME test_integration COMMAND test_integration)
-set_tests_properties(test_integration PROPERTIES LABELS "integration;network" TIMEOUT 300)
+add_test(
+    NAME test_integration.shard_0_of_2
+    COMMAND test_integration --shard-index=0 --shard-count=2)
+add_test(
+    NAME test_integration.shard_1_of_2
+    COMMAND test_integration --shard-index=1 --shard-count=2)
+set_tests_properties(
+    test_integration.shard_0_of_2
+    test_integration.shard_1_of_2
+    PROPERTIES
+        LABELS "integration;network"
+        RESOURCE_LOCK rut_integration
+        TIMEOUT 300)
 
 add_executable(test_arena
     test_arena.cc
