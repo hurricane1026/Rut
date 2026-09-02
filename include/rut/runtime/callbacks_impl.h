@@ -465,7 +465,9 @@ bool handle_configured_strict_local_response(Loop* loop,
                                              const RouteConfig* config,
                                              u16 policy_id);
 u32 pipeline_leftover(const Connection& conn);
-bool pipeline_shift(Connection& conn);
+PipelineTransitionResult pipeline_transition_status(const Connection& conn);
+PipelineTransitionResult pipeline_advance(Connection& conn);
+PipelineTransitionResult pipeline_shift(Connection& conn);
 
 // Prove that recv_buf contains one complete, strictly parsed HTTP/1 request at
 // [0, req_initial_send_len), optionally followed by successor bytes.  This is
@@ -854,7 +856,9 @@ inline bool exact_strict_local_response_request_is_admitted(const Connection& co
     return exact_strict_local_response_patch_request_is_admitted(conn);
 }
 bool pipeline_stash(Connection& conn);
-bool pipeline_recover(Connection& conn);
+// Recover bytes stashed for a successor request. WebSocket post-upgrade bytes
+// use the same storage recovery but are not an HTTP/1 pipeline transition.
+PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transition = true);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
@@ -2602,8 +2606,13 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    if (pipeline_shift(conn)) {
+    const PipelineTransitionResult kTransition = pipeline_shift(conn);
+    if (kTransition == PipelineTransitionResult::Advanced) {
         pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (kTransition == PipelineTransitionResult::LimitExceeded) {
+        loop->close_conn(conn);
         return;
     }
     conn.pipeline_depth = 0;
@@ -6454,9 +6463,19 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;
         const u32 kLateLen = conn.recv_buf.len();
+        const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+        if (kStatus != PipelineTransitionResult::Advanced) {
+            loop->close_conn(conn);
+            return;
+        }
         if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        const PipelineTransitionResult kTransition = pipeline_advance(conn);
+        if (kTransition == PipelineTransitionResult::LimitExceeded) {
             loop->close_conn(conn);
             return;
         }
@@ -6469,16 +6488,24 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
-        conn.pipeline_depth++;
         pipeline_dispatch<Loop>(loop, conn);
         return;
     }
-    if (pipeline_recover(conn)) {
+    const PipelineTransitionResult kTransition = pipeline_recover(conn);
+    if (kTransition == PipelineTransitionResult::Advanced) {
         pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (kTransition == PipelineTransitionResult::LimitExceeded) {
+        loop->close_conn(conn);
         return;
     }
     if (conn.recv_buf.len() > 0) {
-        conn.pipeline_depth++;
+        const PipelineTransitionResult kBufferedTransition = pipeline_advance(conn);
+        if (kBufferedTransition == PipelineTransitionResult::LimitExceeded) {
+            loop->close_conn(conn);
+            return;
+        }
         pipeline_dispatch<Loop>(loop, conn);
         return;
     }
@@ -7471,7 +7498,8 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
         // bytes already read) don't fit, fail closed rather than truncate the
         // tunnel stream.
-        if (!pipeline_recover(conn)) {
+        if (pipeline_recover(conn, /*count_transition=*/false) !=
+            PipelineTransitionResult::Advanced) {
             loop->close_conn(conn);
             return;
         }
@@ -8512,8 +8540,13 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
         loop->close_conn(conn);
         return;
     }
-    if (pipeline_shift(conn)) {
+    const PipelineTransitionResult kTransition = pipeline_shift(conn);
+    if (kTransition == PipelineTransitionResult::Advanced) {
         pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (kTransition == PipelineTransitionResult::LimitExceeded) {
+        loop->close_conn(conn);
         return;
     }
     conn.pipeline_depth = 0;
@@ -9959,9 +9992,19 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;
         const u32 kLateLen = conn.recv_buf.len();
+        const PipelineTransitionResult kStatus = pipeline_transition_status(conn);
+        if (kStatus != PipelineTransitionResult::Advanced) {
+            loop->close_conn(conn);
+            return;
+        }
         if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        const PipelineTransitionResult kTransition = pipeline_advance(conn);
+        if (kTransition == PipelineTransitionResult::LimitExceeded) {
             loop->close_conn(conn);
             return;
         }
@@ -9974,16 +10017,24 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
-        conn.pipeline_depth++;
         pipeline_dispatch<Loop>(loop, conn);
         return;
     }
-    if (pipeline_recover(conn)) {
+    const PipelineTransitionResult kTransition = pipeline_recover(conn);
+    if (kTransition == PipelineTransitionResult::Advanced) {
         pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (kTransition == PipelineTransitionResult::LimitExceeded) {
+        loop->close_conn(conn);
         return;
     }
     if (conn.recv_buf.len() > 0) {
-        conn.pipeline_depth++;
+        const PipelineTransitionResult kBufferedTransition = pipeline_advance(conn);
+        if (kBufferedTransition == PipelineTransitionResult::LimitExceeded) {
+            loop->close_conn(conn);
+            return;
+        }
         pipeline_dispatch<Loop>(loop, conn);
         return;
     }

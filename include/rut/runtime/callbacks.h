@@ -31,6 +31,15 @@ static constexpr u32 kConnCloseLen = 19;
 // Length of the header terminator "\r\n\r\n".
 static constexpr u32 kHeaderEndLen = 4;
 
+// Result of attempting to admit one successor in the HTTP/1 pipeline.  The
+// limit case must remain distinct from an ordinary response with no leftover
+// bytes: callers close through the normal connection ledger on LimitExceeded.
+enum class PipelineTransitionResult : u8 {
+    NoSuccessor,
+    Advanced,
+    LimitExceeded,
+};
+
 static constexpr u32 kResponse200Len = sizeof(
                                            "HTTP/1.1 200 OK\r\n"
                                            "Content-Length: 2\r\n"
