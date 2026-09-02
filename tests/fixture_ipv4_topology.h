@@ -249,12 +249,14 @@ struct ExactInputRotationTerminalReceipt {
     ExactInputRotationState state = ExactInputRotationState::Ready;
     ExactInputRotationLiveEvidence live;
     ExactInputMountedSidecarAbsence fresh_absence;
+    bool live_published = false;
     bool operation_ok = true;
     bool cleanup_complete = false;
     bool zero_residue = false;
     bool terminal_frozen = false;
     bool replay_command_free = false;
     bool downstream_gates_command_free = false;
+    std::uint32_t fresh_remove_count = 0;
     std::uint32_t fresh_remove_suppression_count = 0;
     std::uint32_t fresh_mounted_order = 0;
     std::uint32_t fresh_inert_order = 0;

@@ -11114,7 +11114,12 @@ bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvi
 
 bool validate_exact_input_rotation_terminal_receipt(
     const ExactInputRotationTerminalReceipt& receipt, std::string& error) {
-    if (!validate_exact_input_rotation_live_evidence(receipt.live, error)) return false;
+    if (receipt.live_published) {
+        if (!validate_exact_input_rotation_live_evidence(receipt.live, error)) return false;
+    } else if (receipt.live.state != ExactInputRotationState::Unresolved) {
+        error = "unpublished exact-input rotation did not remain explicitly unresolved";
+        return false;
+    }
     const auto& absence = receipt.fresh_absence;
     if (receipt.state != ExactInputRotationState::Settled ||
         absence.id != receipt.live.fresh_mounted.id ||
@@ -11124,7 +11129,7 @@ bool validate_exact_input_rotation_terminal_receipt(
         !absence.name_absent || !absence.token_role_generation_absent || !absence.process_absent ||
         !receipt.cleanup_complete || !receipt.zero_residue || !receipt.terminal_frozen ||
         !receipt.replay_command_free || !receipt.downstream_gates_command_free ||
-        receipt.live.fresh_remove_count != 1u || receipt.fresh_mounted_order != 1u ||
+        receipt.fresh_remove_count != 1u || receipt.fresh_mounted_order != 1u ||
         receipt.fresh_inert_order != 2u || receipt.input_order != 3u ||
         receipt.directory_order != 4u || receipt.holder_order != 5u ||
         receipt.network_b_order != 6u || receipt.network_a_order != 7u) {
@@ -13689,6 +13694,1060 @@ RunResult run_with_complete_generation_rotation(
         "verified complete holder-sidecar generation receipt and zero residue";
     result.error = result.semantic_receipt;
     return finish(true);
+}
+
+namespace {
+
+constexpr const char* kMountedRotationStage = "358-input-rotation";
+constexpr const char* kMountedRotationRole = "exact-input-mounted-sidecar";
+
+struct MountedSidecarRotationOwner {
+    ExactInputRotationState state = ExactInputRotationState::Ready;
+    ExactInputMountedSidecarEvidence old_mounted;
+    ExactInputMountedSidecarEvidence fresh_mounted;
+    ExactInputMountedSidecarAbsence old_absence;
+    ExactInputMountedSidecarAbsence fresh_absence;
+    bool fresh_exists = false;
+    bool fresh_removal_may_have_mutated = false;
+    bool removal_suppression_armed = false;
+    bool removal_suppression_consumed = false;
+    bool operation_ok = true;
+    std::uint32_t old_create_count = 0;
+    std::uint32_t old_remove_count = 0;
+    std::uint32_t fresh_create_count = 0;
+    std::uint32_t fresh_start_count = 0;
+    std::uint32_t fresh_remove_count = 0;
+    std::uint32_t fresh_remove_suppression_count = 0;
+};
+
+static bool mounted_rotation_transition(MountedSidecarRotationOwner& owner,
+                                        ExactInputRotationState next) {
+    bool allowed = false;
+    switch (owner.state) {
+        case ExactInputRotationState::Ready:
+            allowed = next == ExactInputRotationState::OldMountedValidated;
+            break;
+        case ExactInputRotationState::OldMountedValidated:
+            allowed = next == ExactInputRotationState::OldMountedSettled;
+            break;
+        case ExactInputRotationState::OldMountedSettled:
+            allowed = next == ExactInputRotationState::GenerationValidated;
+            break;
+        case ExactInputRotationState::GenerationValidated:
+            allowed = next == ExactInputRotationState::FreshCreateMayHaveMutated;
+            break;
+        case ExactInputRotationState::FreshCreateMayHaveMutated:
+            allowed = next == ExactInputRotationState::FreshMountedValidated ||
+                      next == ExactInputRotationState::Unresolved;
+            break;
+        case ExactInputRotationState::FreshMountedValidated:
+            allowed = next == ExactInputRotationState::LivePublished ||
+                      next == ExactInputRotationState::Unresolved;
+            break;
+        case ExactInputRotationState::LivePublished:
+            allowed = next == ExactInputRotationState::FreshRemovalMayHaveMutated ||
+                      next == ExactInputRotationState::Settled;
+            break;
+        case ExactInputRotationState::Unresolved:
+            allowed = next == ExactInputRotationState::FreshRemovalMayHaveMutated ||
+                      next == ExactInputRotationState::Settled;
+            break;
+        case ExactInputRotationState::FreshRemovalMayHaveMutated:
+            allowed = next == ExactInputRotationState::Settled;
+            break;
+        case ExactInputRotationState::Settled:
+            break;
+    }
+    if (!allowed) {
+        owner.state = ExactInputRotationState::Unresolved;
+        return false;
+    }
+    owner.state = next;
+    return true;
+}
+
+static bool capture_rotation_source(ExactInputMountOwner& owner,
+                                    ExactInputRotationSourceEvidence& evidence,
+                                    std::string& error) {
+    fixture_exact_input_file_lease::Diagnostic input_error;
+    fixture_private_directory_lease::Diagnostic directory_error;
+    struct stat named{};
+    struct stat retained{};
+    if (!owner.directory.revalidate(directory_error) || !owner.input.revalidate(input_error) ||
+        stat(owner.input.path().c_str(), &named) != 0 ||
+        fstat(owner.input.descriptor(), &retained) != 0 || named.st_dev != retained.st_dev ||
+        named.st_ino != retained.st_ino || named.st_dev != owner.input.identity().device ||
+        named.st_ino != owner.input.identity().inode ||
+        named.st_uid != owner.input.identity().uid || named.st_gid != owner.input.identity().gid ||
+        static_cast<std::uint64_t>(named.st_size) != owner.input.identity().size ||
+        static_cast<std::uint64_t>(named.st_nlink) != owner.input.identity().links ||
+        !S_ISREG(named.st_mode) || (named.st_mode & 07777) != 0600) {
+        error = "canonical exact source lease revalidation failed";
+        return false;
+    }
+    evidence = {};
+    evidence.path = owner.input.path();
+    evidence.bytes = owner.bytes;
+    evidence.device = named.st_dev;
+    evidence.inode = named.st_ino;
+    evidence.mode = named.st_mode;
+    evidence.uid = named.st_uid;
+    evidence.gid = named.st_gid;
+    evidence.size = named.st_size;
+    evidence.links = named.st_nlink;
+    evidence.mtime_seconds = named.st_mtim.tv_sec;
+    evidence.mtime_nanoseconds = named.st_mtim.tv_nsec;
+    evidence.ctime_seconds = named.st_ctim.tv_sec;
+    evidence.ctime_nanoseconds = named.st_ctim.tv_nsec;
+    evidence.regular_0600 = true;
+    evidence.exact_bytes_revalidated = true;
+    evidence.retained_ofd_revalidated = true;
+    return true;
+}
+
+static bool mounted_name_and_labels_absent(const std::string& token,
+                                           const std::string& name,
+                                           const std::string& generation,
+                                           std::string& error) {
+    CommandResult result;
+    if (!run_command({"docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + name + "$"},
+                     result) ||
+        !exited_zero(result) || !trim(result.output).empty() ||
+        !run_command({"docker",
+                      "ps",
+                      "-aq",
+                      "--no-trunc",
+                      "--filter",
+                      "label=rut.token=" + token,
+                      "--filter",
+                      std::string("label=rut.role=") + kMountedRotationRole,
+                      "--filter",
+                      "label=rut.generation=" + generation},
+                     result) ||
+        !exited_zero(result) || !trim(result.output).empty()) {
+        error = "mounted sidecar stable name or token/role/generation was not empty";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_stopped_mount_record(const std::string& record,
+                                          const std::string& id,
+                                          const std::string& name,
+                                          const std::string& user,
+                                          const std::string& network_mode,
+                                          const std::string& source,
+                                          std::string& error) {
+    const size_t first = record.find('#');
+    const size_t second = first == std::string::npos ? first : record.find('#', first + 1u);
+    std::vector<std::string> prefix;
+    std::vector<ParsedMount> requested;
+    std::vector<ParsedMount> realized;
+    size_t count = 0;
+    if (first == std::string::npos || second == std::string::npos ||
+        !split_exact(record.substr(0, first), '|', 5u, prefix) || prefix[0] != id ||
+        prefix[1] != "/" + name || prefix[2] != user || prefix[3] != network_mode ||
+        !decimal_size(prefix[4], count) || count != 1u ||
+        !split_mount_list(record.substr(first + 1u, second - first - 1u), true, requested, error) ||
+        !split_mount_list(record.substr(second + 1u), false, realized, error) ||
+        requested.size() != 1u || !realized.empty()) {
+        if (error.empty()) error = "stopped mounted-sidecar mount envelope was not exact";
+        return false;
+    }
+    const ParsedMount& mount = requested.front();
+    return mount.type == "bind" && mount.source == source &&
+           mount.destination == kExactInputMountDestination && mount.read_only &&
+           mount.propagation == "rprivate";
+}
+
+static bool inspect_rotation_mounted(const std::string& id,
+                                     const std::string& token,
+                                     const std::string& name,
+                                     const std::string& generation,
+                                     const std::string& holder_id,
+                                     const ExactInputRotationSourceEvidence& source,
+                                     bool running,
+                                     bool mutate_mount_observation,
+                                     ExactInputMountedSidecarEvidence& evidence,
+                                     ParsedMountInspect* parsed_mount,
+                                     std::string& error) {
+    const std::string format =
+        "{{.Id}}|{{.Name}}|{{index .Config.Labels \"rut.stage\"}}|{{index .Config.Labels "
+        "\"rut.token\"}}|{{index .Config.Labels \"rut.role\"}}|{{index .Config.Labels "
+        "\"rut.generation\"}}|{{.Config.Image}}|{{.Image}}|{{.HostConfig.NetworkMode}}|"
+        "{{.Config.User}}|{{.Path}}|{{json .Args}}|{{.State.Running}}|{{.State.Pid}}|"
+        "{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|"
+        "{{json .HostConfig.SecurityOpt}}|{{.HostConfig.RestartPolicy.Name}}|"
+        "{{json .HostConfig.PortBindings}}|{{json .Config.ExposedPorts}}|"
+        "{{json .NetworkSettings.Ports}}";
+    CommandResult identity_result;
+    if (!run_command({"docker", "inspect", "-f", format, id}, identity_result) ||
+        !exited_zero(identity_result)) {
+        error = "mounted-sidecar exact full-ID identity inspection failed";
+        return false;
+    }
+    std::vector<std::string> fields;
+    if (!split_exact(trim(identity_result.output), '|', 21u, fields)) {
+        error = "mounted-sidecar identity record was malformed";
+        return false;
+    }
+    size_t pid_value = 0;
+    if (!decimal_size(fields[13], pid_value) || fields[0] != id || fields[1] != "/" + name ||
+        fields[2] != kMountedRotationStage || fields[3] != token ||
+        fields[4] != kMountedRotationRole || fields[5] != generation ||
+        fields[6] != RUT_PINNED_NGINX_IMAGE || !sha256_identity(fields[7]) ||
+        fields[8] != "container:" + holder_id ||
+        fields[9] != std::to_string(source.uid) + ":" + std::to_string(source.gid) ||
+        fields[10] != "/bin/sleep" || fields[11] != "[\"infinity\"]" ||
+        fields[12] != (running ? "true" : "false") ||
+        (running ? pid_value <= 1u : pid_value != 0u) || fields[14] != "true" ||
+        fields[15] != "[\"ALL\"]" || fields[16] != "[\"no-new-privileges\"]" ||
+        fields[17] != "no" || !no_published_ports(fields[18], fields[20])) {
+        error = "mounted-sidecar immutable labels/config/security were not exact";
+        return false;
+    }
+    const std::string mount_format =
+        "{{.Id}}|{{.Name}}|{{.Config.User}}|{{.HostConfig.NetworkMode}}|{{len "
+        ".HostConfig.Mounts}}#{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|"
+        "{{.ReadOnly}}|{{.BindOptions.Propagation}};{{end}}#{{range .Mounts}}{{.Type}}|"
+        "{{.Source}}|{{.Destination}}|{{.Mode}}|{{.RW}}|{{.Propagation}};{{end}}";
+    CommandResult mount_result;
+    if (!run_command({"docker", "inspect", "-f", mount_format, id}, mount_result) ||
+        !exited_zero(mount_result)) {
+        error = "mounted-sidecar exact mount inspection failed";
+        return false;
+    }
+    std::string record = trim(mount_result.output);
+    if (mutate_mount_observation) {
+        const size_t at = record.find(source.path);
+        if (at == std::string::npos) {
+            error = "mounted-sidecar mutation seam lacked observed source";
+            return false;
+        }
+        record.replace(at, source.path.size(), "/tmp/rut358-mutated-source");
+    }
+    ParsedMountInspect parsed;
+    const std::string user = std::to_string(source.uid) + ":" + std::to_string(source.gid);
+    if (running) {
+        if (!validate_mount_inspect_record(
+                record, id, name, user, "container:" + holder_id, source.path, parsed, error))
+            return false;
+    } else if (!validate_stopped_mount_record(
+                   record, id, name, user, "container:" + holder_id, source.path, error)) {
+        return false;
+    }
+    evidence = {};
+    evidence.token = token;
+    evidence.stage = kMountedRotationStage;
+    evidence.role = kMountedRotationRole;
+    evidence.generation = generation;
+    evidence.name = name;
+    evidence.id = id;
+    evidence.image_reference = fields[6];
+    evidence.image_id = fields[7];
+    evidence.network_mode = fields[8];
+    evidence.user = fields[9];
+    evidence.path = fields[10];
+    evidence.arguments_json = fields[11];
+    evidence.source_path = source.path;
+    evidence.running = running;
+    evidence.read_only_root = true;
+    evidence.capability_drop_all = true;
+    evidence.no_new_privileges = true;
+    evidence.restart_no = true;
+    evidence.no_published_ports = true;
+    evidence.requested_mount_exact = true;
+    evidence.realized_mount_exact = running;
+    evidence.no_mount_shadowing = running;
+    if (running) {
+        evidence.pid = static_cast<pid_t>(pid_value);
+        ProcIdentity process{};
+        struct stat mount_namespace{};
+        struct stat host_mount_namespace{};
+        if (!proc_identity(evidence.pid, process, false) || process.start == 0u ||
+            !container_netns_inode(id, evidence.network_netns) || evidence.network_netns == 0u ||
+            stat(("/proc/" + std::to_string(evidence.pid) + "/ns/mnt").c_str(), &mount_namespace) !=
+                0 ||
+            mount_namespace.st_ino == 0u ||
+            !proc_credentials_exact(evidence.pid, source.uid, source.gid)) {
+            error = "mounted-sidecar PID/start/network/mount/credential authority was not exact";
+            return false;
+        }
+        evidence.start = process.start;
+        evidence.mount_netns = mount_namespace.st_ino;
+        const bool host_visible = stat("/proc/self/ns/mnt", &host_mount_namespace) == 0;
+        evidence.nonhost_mount_netns =
+            !host_visible || host_mount_namespace.st_ino != mount_namespace.st_ino;
+        if (!evidence.nonhost_mount_netns) {
+            error = "mounted-sidecar mount namespace was the host namespace";
+            return false;
+        }
+    }
+    if (parsed_mount != nullptr) *parsed_mount = parsed;
+    return true;
+}
+
+static bool create_rotation_mounted(const std::string& token,
+                                    const std::string& generation,
+                                    const std::string& holder_id,
+                                    const ExactInputRotationSourceEvidence& source,
+                                    bool reported_timeout,
+                                    ExactInputMountedSidecarEvidence& mounted,
+                                    ParsedMountInspect& parsed_mount,
+                                    std::uint32_t& create_count,
+                                    std::uint32_t& start_count,
+                                    std::string& error) {
+    const std::string name = "rut358-input-" + token;
+    if (!mounted_name_and_labels_absent(token, name, generation, error)) return false;
+    const std::string credentials = std::to_string(source.uid) + ":" + std::to_string(source.gid);
+    const std::string mount = "type=bind,src=" + source.path +
+                              ",dst=" + kExactInputMountDestination +
+                              ",readonly,bind-propagation=rprivate";
+    const std::vector<std::string> create_argv = {"docker",
+                                                  "create",
+                                                  "--pull=never",
+                                                  "--name",
+                                                  name,
+                                                  "--label",
+                                                  std::string("rut.stage=") + kMountedRotationStage,
+                                                  "--label",
+                                                  "rut.token=" + token,
+                                                  "--label",
+                                                  std::string("rut.role=") + kMountedRotationRole,
+                                                  "--label",
+                                                  "rut.generation=" + generation,
+                                                  "--network",
+                                                  "container:" + holder_id,
+                                                  "--user",
+                                                  credentials,
+                                                  "--read-only",
+                                                  "--cap-drop",
+                                                  "ALL",
+                                                  "--security-opt",
+                                                  "no-new-privileges",
+                                                  "--restart",
+                                                  "no",
+                                                  "--mount",
+                                                  mount,
+                                                  "--entrypoint",
+                                                  "/bin/sleep",
+                                                  RUT_PINNED_NGINX_IMAGE,
+                                                  "infinity"};
+    CommandResult created;
+    ++create_count;
+    const bool create_ok = run_command(create_argv, created, 30000, reported_timeout);
+    if ((!create_ok || !exited_zero(created)) && !created.timed_out) {
+        error = "mounted-sidecar exact create failed";
+        return false;
+    }
+    const std::string id = trim(created.output);
+    if (!full_container_id(id)) {
+        error = "mounted-sidecar create did not return one exact full ID";
+        return false;
+    }
+    ExactInputMountedSidecarEvidence stopped;
+    if (!inspect_rotation_mounted(id,
+                                  token,
+                                  name,
+                                  generation,
+                                  holder_id,
+                                  source,
+                                  false,
+                                  false,
+                                  stopped,
+                                  nullptr,
+                                  error)) {
+        error = "mounted-sidecar stopped create authority failed: " + error;
+        return false;
+    }
+    CommandResult started;
+    ++start_count;
+    if (!run_command({"docker", "start", id}, started) || !exited_zero(started) ||
+        trim(started.output) != id) {
+        error = "mounted-sidecar exact full-ID start failed";
+        return false;
+    }
+    if (!inspect_rotation_mounted(id,
+                                  token,
+                                  name,
+                                  generation,
+                                  holder_id,
+                                  source,
+                                  true,
+                                  false,
+                                  mounted,
+                                  &parsed_mount,
+                                  error))
+        return false;
+    return true;
+}
+
+static bool prove_rotation_mounted_absent(const ExactInputMountedSidecarEvidence& mounted,
+                                          ExactInputMountedSidecarAbsence& absence,
+                                          std::string& error) {
+    CommandResult result;
+    if (!run_command({"docker", "inspect", mounted.id}, result) || exited_zero(result) ||
+        !mounted_name_and_labels_absent(mounted.token, mounted.name, mounted.generation, error)) {
+        if (error.empty()) error = "mounted-sidecar ID/name/labels remained after removal";
+        return false;
+    }
+    ProcIdentity process{};
+    if (proc_identity(mounted.pid, process, false) && process.start == mounted.start) {
+        error = "mounted-sidecar PID/start remained after removal";
+        return false;
+    }
+    absence = {mounted.id, mounted.name, mounted.pid, mounted.start, true, true, true, true};
+    return true;
+}
+
+static bool remove_rotation_mounted(MountedSidecarRotationOwner& owner,
+                                    bool old_generation,
+                                    bool allow_suppression,
+                                    std::string& error) {
+    ExactInputMountedSidecarEvidence& mounted =
+        old_generation ? owner.old_mounted : owner.fresh_mounted;
+    ExactInputMountedSidecarAbsence& absence =
+        old_generation ? owner.old_absence : owner.fresh_absence;
+    if (!old_generation && owner.state == ExactInputRotationState::Settled) return true;
+    ExactInputMountedSidecarEvidence current;
+    ParsedMountInspect parsed;
+    ExactInputRotationSourceEvidence cleanup_source;
+    cleanup_source.path = mounted.source_path;
+    const size_t credential_separator = mounted.user.find(':');
+    if (credential_separator == std::string::npos) {
+        error = "mounted-sidecar cleanup credentials were malformed";
+        return false;
+    }
+    cleanup_source.uid =
+        strtoull(mounted.user.substr(0, credential_separator).c_str(), nullptr, 10);
+    cleanup_source.gid =
+        strtoull(mounted.user.substr(credential_separator + 1u).c_str(), nullptr, 10);
+    if (!inspect_rotation_mounted(mounted.id,
+                                  mounted.token,
+                                  mounted.name,
+                                  mounted.generation,
+                                  mounted.network_mode.substr(std::string("container:").size()),
+                                  cleanup_source,
+                                  true,
+                                  false,
+                                  current,
+                                  &parsed,
+                                  error) ||
+        !exact_input_mounted_equal(current, mounted)) {
+        if (error.empty()) error = "mounted-sidecar cleanup authority changed";
+        owner.state = ExactInputRotationState::Unresolved;
+        return false;
+    }
+    if (!old_generation && allow_suppression && owner.removal_suppression_armed &&
+        !owner.removal_suppression_consumed) {
+        owner.removal_suppression_armed = false;
+        owner.removal_suppression_consumed = true;
+        owner.fresh_removal_may_have_mutated = true;
+        owner.operation_ok = false;
+        ++owner.fresh_remove_suppression_count;
+        (void)mounted_rotation_transition(owner,
+                                          ExactInputRotationState::FreshRemovalMayHaveMutated);
+        error = "injected fresh mounted-sidecar removal suppression";
+        return false;
+    }
+    CommandResult removed;
+    if (!run_command({"docker", "rm", "-f", mounted.id}, removed) || !exited_zero(removed)) {
+        error = "mounted-sidecar exact full-ID removal failed";
+        return false;
+    }
+    if (old_generation)
+        ++owner.old_remove_count;
+    else
+        ++owner.fresh_remove_count;
+    if (!prove_rotation_mounted_absent(mounted, absence, error)) return false;
+    if (old_generation)
+        (void)mounted_rotation_transition(owner, ExactInputRotationState::OldMountedSettled);
+    else {
+        owner.fresh_exists = false;
+        owner.fresh_removal_may_have_mutated = false;
+    }
+    return true;
+}
+
+}  // namespace
+
+RunResult run_with_exact_input_rotation(const std::string& bytes,
+                                        ExactInputRotationFailurePoint failure_point,
+                                        const ExactInputRotationCallback& callback,
+                                        ExactInputRotationTerminalReceipt& terminal_receipt) {
+    RunResult result;
+    terminal_receipt = {};
+    std::string token;
+    if (bytes.empty() || bytes.size() > fixture_exact_input_file_lease::kMaximumInputBytes ||
+        !callback || !high_entropy_token(token)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        result.error = "exact-input rotation arguments or entropy were unavailable";
+        return result;
+    }
+    ExactInputMountOwner root(token, bytes);
+    MountedSidecarRotationOwner mounted;
+    GenerationReceiptCompositionOwner composer;
+    ExactInputRotationLiveEvidence live;
+    bool directory_acquired = false;
+    bool input_acquired = false;
+    bool callback_ran = false;
+    std::uint32_t order = 0;
+    const auto settle_source = [&]() {
+        bool ok = true;
+        fixture_exact_input_file_lease::Diagnostic input_error;
+        fixture_private_directory_lease::Diagnostic directory_error;
+        if (input_acquired && root.input.active()) ok = root.input.cleanup(input_error) && ok;
+        if (directory_acquired &&
+            root.directory.state() != fixture_private_directory_lease::State::Removed)
+            ok = root.directory.settle(directory_error) && ok;
+        return ok;
+    };
+    const auto finish_failure = [&](bool semantic_success) {
+        std::string cleanup_error;
+        bool cleanup_ok = true;
+        if (mounted.fresh_exists) {
+            mounted.removal_suppression_armed = false;
+            cleanup_ok =
+                remove_rotation_mounted(mounted, false, false, cleanup_error) && cleanup_ok;
+        }
+        if (!mounted.old_mounted.id.empty() && !mounted.old_absence.id_absent)
+            cleanup_ok = remove_rotation_mounted(mounted, true, false, cleanup_error) && cleanup_ok;
+        std::string sidecar_error;
+        cleanup_ok = root.fixture.cleanup_recreated_sidecar(sidecar_error) && cleanup_ok;
+        const CleanupPhaseResult old_sidecar = root.fixture.cleanup_sidecar_phase(sidecar_error);
+        cleanup_ok = old_sidecar.settled && cleanup_ok;
+        cleanup_ok = settle_source() && cleanup_ok;
+        cleanup_ok = root.fixture.cleanup(cleanup_error) && cleanup_ok;
+        std::string audit_error;
+        const bool residue_free = audit_zero_residue(token,
+                                                     root.fixture.network_a().name,
+                                                     root.fixture.network_b().name,
+                                                     root.fixture.holder_name(),
+                                                     audit_error);
+        root.settled = cleanup_ok && residue_free;
+        result.cleanup_complete = cleanup_ok;
+        result.residue_free = residue_free;
+        if (!cleanup_error.empty()) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += cleanup_error;
+        }
+        if (!audit_error.empty()) {
+            if (!result.error.empty()) result.error += "; ";
+            result.error += audit_error;
+        }
+        result.success = semantic_success && cleanup_ok && residue_free;
+        return result;
+    };
+
+    std::string error;
+    if (!docker_user_namespace_preflight(error) || !preflight(root.fixture, error) ||
+        !mounted_name_and_labels_absent(token, "rut358-input-" + token, "0", error)) {
+        result.prerequisite_failure = true;
+        result.optional_skip_safe = true;
+        result.error = error;
+        root.settled = true;
+        return result;
+    }
+    fixture_private_directory_lease::Diagnostic directory_error;
+    if (!fixture_private_directory_lease::PrivateDirectoryLease::create(root.directory,
+                                                                        directory_error)) {
+        result.error = "exact-input rotation directory creation failed";
+        root.settled = true;
+        return result;
+    }
+    directory_acquired = true;
+    root.mutated = true;
+    fixture_exact_input_file_lease::Diagnostic input_error;
+    if (!fixture_exact_input_file_lease::ExactInputFileLease::create(
+            root.directory, bytes.data(), bytes.size(), root.input, input_error)) {
+        result.error = "exact-input rotation source creation failed";
+        return finish_failure(false);
+    }
+    input_acquired = true;
+    if (!capture_rotation_source(root, live.initial_source, error) ||
+        !root.fixture.create_networks(FailurePoint::None, error) ||
+        !root.fixture.create_holder(FailurePoint::None, error) ||
+        !root.fixture.attach_holder(FailurePoint::None, error) ||
+        !root.fixture.verify_topology(FailurePoint::None, error) ||
+        !root.fixture.create_sidecar(HeldNamespaceSidecarFailurePoint::None, error)) {
+        result.error = error;
+        return finish_failure(false);
+    }
+
+    ParsedMountInspect old_mount;
+    std::uint32_t old_start_count = 0;
+    if (!create_rotation_mounted(token,
+                                 "0",
+                                 root.fixture.holder_id(),
+                                 live.initial_source,
+                                 false,
+                                 mounted.old_mounted,
+                                 old_mount,
+                                 mounted.old_create_count,
+                                 old_start_count,
+                                 error)) {
+        result.error = error;
+        return finish_failure(false);
+    }
+    if (!mounted_rotation_transition(mounted, ExactInputRotationState::OldMountedValidated)) {
+        result.error = "old mounted owner transition was rejected";
+        return finish_failure(false);
+    }
+    root.registered_sidecar.token = mounted.old_mounted.token;
+    root.registered_sidecar.stage = mounted.old_mounted.stage;
+    root.registered_sidecar.role = mounted.old_mounted.role;
+    root.registered_sidecar.name = mounted.old_mounted.name;
+    root.registered_sidecar.id = mounted.old_mounted.id;
+    root.registered_sidecar.pinned_image_reference = mounted.old_mounted.image_reference;
+    root.registered_sidecar.expected_image_id = mounted.old_mounted.image_id;
+    root.registered_sidecar.image_id = mounted.old_mounted.image_id;
+    root.registered_sidecar.network_mode = mounted.old_mounted.network_mode;
+    root.registered_sidecar.path = mounted.old_mounted.path;
+    root.registered_sidecar.arguments_json = mounted.old_mounted.arguments_json;
+    root.registered_sidecar.pid = mounted.old_mounted.pid;
+    root.registered_sidecar.start = mounted.old_mounted.start;
+    root.registered_sidecar.netns = mounted.old_mounted.network_netns;
+    root.registered_sidecar.running = true;
+    root.registered_sidecar.read_only_root = true;
+    root.registered_sidecar.capability_drop_all = true;
+    root.registered_sidecar.no_new_privileges = true;
+    root.registered_sidecar.no_published_ports = true;
+    root.registered_mount = old_mount;
+    const HeldNamespaceSidecarSnapshot frozen_registered_sidecar = root.registered_sidecar;
+    const ParsedMountInspect frozen_registered_mount = root.registered_mount;
+
+    if (!capture_old_generation_for_receipt(root.fixture, composer, error) ||
+        mounted.old_mounted.id == composer.receipt.old_generation.sidecar.id ||
+        (mounted.old_mounted.pid == composer.receipt.old_generation.sidecar.pid &&
+         mounted.old_mounted.start == composer.receipt.old_generation.sidecar.start) ||
+        mounted.old_mounted.network_netns !=
+            composer.receipt.old_generation.topology.holder_netns ||
+        !remove_rotation_mounted(mounted, true, false, error) ||
+        !exact_input_mounted_absence_equal(mounted.old_absence, mounted.old_absence) ||
+        !sidecar_snapshot_equal(root.registered_sidecar, frozen_registered_sidecar) ||
+        !mount_inspect_equal(root.registered_mount, frozen_registered_mount)) {
+        if (error.empty()) error = "old mounted-sibling authority/history was not exact";
+        result.error = error;
+        return finish_failure(false);
+    }
+    std::string phase_error;
+    const CleanupPhaseResult old_inert = root.fixture.cleanup_sidecar_phase(phase_error);
+    const CleanupPhaseResult old_holder = root.fixture.cleanup_holder_phase(phase_error);
+    if (!old_inert.settled || !old_inert.operation_ok || !old_holder.settled ||
+        !old_holder.operation_ok || !old_holder.holder_removed ||
+        !capture_old_absence_for_receipt(root.fixture, composer, phase_error) ||
+        !root.fixture.recreate_holder_only(HolderOnlyRecreationFailurePoint::None, phase_error) ||
+        !root.fixture.recreate_sidecar(RecreatedSidecarFailurePoint::None, phase_error)) {
+        result.error = phase_error;
+        return finish_failure(false);
+    }
+    const RecreatedSidecarEvidence fresh_inert = root.fixture.recreated_sidecar_evidence();
+    if (!publish_complete_generation_receipt(
+            root.fixture, fresh_inert, false, composer, phase_error)) {
+        result.error = phase_error;
+        return finish_failure(false);
+    }
+    if (!mounted_rotation_transition(mounted, ExactInputRotationState::GenerationValidated)) {
+        result.error = "generation-validated owner transition was rejected";
+        return finish_failure(false);
+    }
+    std::string receipt_error_a;
+    std::string receipt_error_b;
+    if (!validate_held_namespace_generation_rotation_receipt(composer.frozen_receipt,
+                                                             receipt_error_a) ||
+        !validate_held_namespace_generation_rotation_receipt(composer.frozen_receipt,
+                                                             receipt_error_b) ||
+        !receipt_error_a.empty() || !receipt_error_b.empty() ||
+        !capture_rotation_source(root, live.fresh_source, error) ||
+        !exact_input_rotation_source_equal(live.initial_source, live.fresh_source) ||
+        !mounted_name_and_labels_absent(token, "rut358-input-" + token, "1", error)) {
+        result.error = error.empty() ? "source/phase4 revalidation failed" : error;
+        return finish_failure(false);
+    }
+
+    ParsedMountInspect fresh_mount;
+    const bool reported_timeout =
+        failure_point == ExactInputRotationFailurePoint::FreshCreateReportedTimeout;
+    if (!mounted_rotation_transition(mounted, ExactInputRotationState::FreshCreateMayHaveMutated) ||
+        !create_rotation_mounted(token,
+                                 "1",
+                                 composer.frozen_receipt.new_generation.topology.holder_id,
+                                 live.fresh_source,
+                                 reported_timeout,
+                                 mounted.fresh_mounted,
+                                 fresh_mount,
+                                 mounted.fresh_create_count,
+                                 mounted.fresh_start_count,
+                                 error)) {
+        result.error = error;
+        return finish_failure(false);
+    }
+    mounted.fresh_exists = true;
+    if (reported_timeout) mounted.operation_ok = false;
+    if (!mounted_rotation_transition(mounted, ExactInputRotationState::FreshMountedValidated)) {
+        result.error = "fresh mounted owner transition was rejected";
+        return finish_failure(false);
+    }
+    live.old_mounted = mounted.old_mounted;
+    live.old_absence = mounted.old_absence;
+    live.generation_receipt = composer.frozen_receipt;
+    live.fresh_mounted = mounted.fresh_mounted;
+    live.source_continuity = true;
+    live.generation_receipt_validated_twice = true;
+    live.old_and_fresh_authorities_separate = true;
+    live.operation_ok = mounted.operation_ok;
+    live.old_create_count = mounted.old_create_count;
+    live.old_remove_count = mounted.old_remove_count;
+    live.fresh_create_count = mounted.fresh_create_count;
+    live.fresh_start_count = mounted.fresh_start_count;
+    live.fresh_remove_count = 0;
+    if (failure_point == ExactInputRotationFailurePoint::FreshMountObservationMutation) {
+        ExactInputMountedSidecarEvidence rejected;
+        ParsedMountInspect rejected_mount;
+        std::string mutation_error;
+        if (inspect_rotation_mounted(mounted.fresh_mounted.id,
+                                     token,
+                                     mounted.fresh_mounted.name,
+                                     "1",
+                                     composer.frozen_receipt.new_generation.topology.holder_id,
+                                     live.fresh_source,
+                                     true,
+                                     true,
+                                     rejected,
+                                     &rejected_mount,
+                                     mutation_error) ||
+            mutation_error.empty()) {
+            result.error = "fresh mount observation mutation was accepted";
+            return finish_failure(false);
+        }
+        (void)mounted_rotation_transition(mounted, ExactInputRotationState::Unresolved);
+        live.state = ExactInputRotationState::Unresolved;
+    } else {
+        live.state = ExactInputRotationState::LivePublished;
+        if (!validate_exact_input_rotation_live_evidence(live, error) || !callback(live, error)) {
+            result.error = error;
+            return finish_failure(false);
+        }
+        callback_ran = true;
+        if (!mounted_rotation_transition(mounted, ExactInputRotationState::LivePublished)) {
+            result.error = "live publication owner transition was rejected";
+            return finish_failure(false);
+        }
+    }
+
+    mounted.removal_suppression_armed =
+        failure_point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval;
+    if (mounted.removal_suppression_armed) {
+        const std::uint64_t before = command_invocation_count;
+        std::string suppressed;
+        if (remove_rotation_mounted(mounted, false, true, suppressed) || suppressed.empty() ||
+            mounted.fresh_remove_count != 0u || command_invocation_count != before) {
+            result.error = "fresh mounted removal suppression was not command-free and truthful";
+            return finish_failure(false);
+        }
+        const std::uint64_t gated = command_invocation_count;
+        const bool inert_blocked = mounted.state != ExactInputRotationState::Settled;
+        const bool source_blocked = mounted.state != ExactInputRotationState::Settled;
+        const bool topology_blocked = mounted.state != ExactInputRotationState::Settled;
+        terminal_receipt.downstream_gates_command_free = inert_blocked && source_blocked &&
+                                                         topology_blocked &&
+                                                         command_invocation_count == gated;
+    } else {
+        terminal_receipt.downstream_gates_command_free = true;
+    }
+    error.clear();
+    if (!remove_rotation_mounted(mounted, false, false, error)) {
+        result.error = error;
+        return finish_failure(false);
+    }
+    terminal_receipt.fresh_mounted_order = ++order;
+    std::string cleanup_error;
+    if (!root.fixture.cleanup_recreated_sidecar(cleanup_error)) {
+        result.error = cleanup_error;
+        return finish_failure(false);
+    }
+    terminal_receipt.fresh_inert_order = ++order;
+    if (!root.input.cleanup(input_error)) {
+        result.error = "exact source cleanup failed";
+        return finish_failure(false);
+    }
+    terminal_receipt.input_order = ++order;
+    if (!root.directory.settle(directory_error)) {
+        result.error = "exact source directory cleanup failed";
+        return finish_failure(false);
+    }
+    terminal_receipt.directory_order = ++order;
+    input_acquired = false;
+    directory_acquired = false;
+    if (!root.fixture.cleanup_recreated_holder(cleanup_error)) {
+        result.error = cleanup_error;
+        return finish_failure(false);
+    }
+    terminal_receipt.holder_order = ++order;
+    struct NetworkOrder {
+        ExactInputRotationTerminalReceipt* receipt;
+        std::uint32_t* order;
+    } network_order{&terminal_receipt, &order};
+    const auto record_network =
+        [](void* opaque, TopologySettlementEvent event, bool removed, std::string& callback_error) {
+            auto& context = *static_cast<NetworkOrder*>(opaque);
+            if (!removed || event == TopologySettlementEvent::Holder) {
+                callback_error = "unexpected retained-topology settlement event";
+                return false;
+            }
+            if (event == TopologySettlementEvent::NetworkB)
+                context.receipt->network_b_order = ++*context.order;
+            else if (event == TopologySettlementEvent::NetworkA)
+                context.receipt->network_a_order = ++*context.order;
+            return true;
+        };
+    const CleanupPhaseResult topology =
+        root.fixture.cleanup_topology_phase(cleanup_error, record_network, &network_order);
+    if (!topology.settled || !topology.operation_ok || terminal_receipt.network_b_order != 6u ||
+        terminal_receipt.network_a_order != 7u) {
+        result.error = cleanup_error;
+        return finish_failure(false);
+    }
+    std::string audit_error;
+    if (!audit_zero_residue(token,
+                            root.fixture.network_a().name,
+                            root.fixture.network_b().name,
+                            root.fixture.holder_name(),
+                            audit_error)) {
+        result.error = audit_error;
+        return finish_failure(false);
+    }
+    if (!mounted_rotation_transition(mounted, ExactInputRotationState::Settled)) {
+        result.error = "terminal mounted owner transition was rejected";
+        return result;
+    }
+    terminal_receipt.state = ExactInputRotationState::Settled;
+    terminal_receipt.live = live;
+    terminal_receipt.live_published = callback_ran;
+    terminal_receipt.fresh_absence = mounted.fresh_absence;
+    terminal_receipt.operation_ok = mounted.operation_ok;
+    terminal_receipt.cleanup_complete = true;
+    terminal_receipt.zero_residue = true;
+    terminal_receipt.terminal_frozen = true;
+    terminal_receipt.fresh_remove_count = mounted.fresh_remove_count;
+    terminal_receipt.fresh_remove_suppression_count = mounted.fresh_remove_suppression_count;
+    const std::uint64_t replay_commands = command_invocation_count;
+    const ExactInputRotationTerminalReceipt frozen = terminal_receipt;
+    std::string caller_history = "preserve-input-rotation-history";
+    const bool replay_ok = root.fixture.cleanup(caller_history) &&
+                           caller_history == "preserve-input-rotation-history" &&
+                           command_invocation_count == replay_commands;
+    terminal_receipt.replay_command_free = replay_ok;
+    root.settled = true;
+    std::string terminal_error;
+    if (!validate_exact_input_rotation_terminal_receipt(terminal_receipt, terminal_error)) {
+        result.error = terminal_error;
+        return result;
+    }
+    if (!exact_input_mounted_absence_equal(terminal_receipt.fresh_absence, frozen.fresh_absence)) {
+        result.error = "terminal fresh absence changed during replay";
+        return result;
+    }
+    result.cleanup_complete = true;
+    result.residue_free = true;
+    result.success = true;
+    result.semantic_receipt = callback_ran
+                                  ? "verified exact input mount authority across one rotation"
+                                  : "verified mutated fresh mount observation stayed unpublished";
+    result.error = result.semantic_receipt;
+    return result;
+}
+
+bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, std::string& error) {
+    mutation_rejections = 0;
+    ExactInputRotationLiveEvidence seed;
+    seed.state = ExactInputRotationState::LivePublished;
+    seed.initial_source.path = "/tmp/rut358-source/nginx.conf";
+    seed.initial_source.bytes = "events {}\n";
+    seed.initial_source.device = 10;
+    seed.initial_source.inode = 20;
+    seed.initial_source.mode = S_IFREG | 0600;
+    seed.initial_source.uid = 1000;
+    seed.initial_source.gid = 1000;
+    seed.initial_source.size = seed.initial_source.bytes.size();
+    seed.initial_source.links = 1;
+    seed.initial_source.mtime_seconds = 30;
+    seed.initial_source.mtime_nanoseconds = 40;
+    seed.initial_source.ctime_seconds = 50;
+    seed.initial_source.ctime_nanoseconds = 60;
+    seed.initial_source.regular_0600 = true;
+    seed.initial_source.exact_bytes_revalidated = true;
+    seed.initial_source.retained_ofd_revalidated = true;
+    seed.fresh_source = seed.initial_source;
+    const std::string token(48, '1');
+    auto& old_topology = seed.generation_receipt.old_generation.topology;
+    old_topology.token = token;
+    old_topology.network_a_name = "rut358-a-" + token;
+    old_topology.network_a_id = std::string(64, 'a');
+    old_topology.network_a_subnet = "10.253.240.0/28";
+    old_topology.network_a_gateway = "10.253.240.1";
+    old_topology.network_b_name = "rut358-b-" + token;
+    old_topology.network_b_id = std::string(64, 'b');
+    old_topology.network_b_subnet = "10.253.241.0/28";
+    old_topology.network_b_gateway = "10.253.241.1";
+    old_topology.holder_name = "rut358-holder-" + token;
+    old_topology.holder_id = std::string(64, 'c');
+    old_topology.positive_ip = "10.253.240.2";
+    old_topology.guard_ip = "10.253.241.2";
+    old_topology.holder_pid = 100;
+    old_topology.holder_start = 1000;
+    old_topology.holder_netns = 2000;
+    old_topology.probe_evidence = {HeldTopologyProbePolicy::SocketlessHostParent, 1, 0, 0};
+    auto& old_inert = seed.generation_receipt.old_generation.sidecar;
+    old_inert.token = token;
+    old_inert.stage = kSidecarStage;
+    old_inert.role = kSidecarRole;
+    old_inert.name = "rut358-sidecar-" + token;
+    old_inert.id = std::string(64, 'd');
+    old_inert.pinned_image_reference = RUT_PINNED_NGINX_IMAGE;
+    old_inert.expected_image_id = "sha256:" + std::string(64, 'e');
+    old_inert.image_id = old_inert.expected_image_id;
+    old_inert.network_mode = "container:" + old_topology.holder_id;
+    old_inert.path = "/bin/sleep";
+    old_inert.arguments_json = "[\"infinity\"]";
+    old_inert.pid = 101;
+    old_inert.start = 1001;
+    old_inert.netns = 2000;
+    old_inert.host_netns = 3000;
+    old_inert.running = old_inert.read_only_root = old_inert.capability_drop_all = true;
+    old_inert.no_new_privileges = old_inert.no_published_ports = true;
+    seed.generation_receipt.new_generation = seed.generation_receipt.old_generation;
+    auto& fresh_topology = seed.generation_receipt.new_generation.topology;
+    auto& fresh_inert = seed.generation_receipt.new_generation.sidecar;
+    fresh_topology.holder_id = std::string(64, 'f');
+    fresh_topology.holder_start = 2000;
+    fresh_inert.id = std::string(64, '4');
+    fresh_inert.network_mode = "container:" + fresh_topology.holder_id;
+    fresh_inert.start = 2001;
+    auto& old_absence = seed.generation_receipt.old_absence;
+    old_absence.holder = {old_topology.holder_id, 100, 1000, true, true};
+    old_absence.sidecar = {old_inert.id, 101, 1001, true, true};
+    old_absence.holder_name = old_topology.holder_name;
+    old_absence.sidecar_name = old_inert.name;
+    old_absence.holder_name_absent = old_absence.sidecar_name_absent = true;
+    seed.generation_receipt.old_generation_phase =
+        HeldNamespaceGenerationRotationPhase::OldGenerationValidated;
+    old_absence.phase = HeldNamespaceGenerationRotationPhase::OldGenerationAbsent;
+    seed.generation_receipt.new_generation_created_phase =
+        HeldNamespaceGenerationRotationPhase::NewGenerationCreated;
+    seed.generation_receipt.new_generation_validated_phase =
+        HeldNamespaceGenerationRotationPhase::NewGenerationValidated;
+    const auto fill_mounted = [&](ExactInputMountedSidecarEvidence& mounted,
+                                  const char generation,
+                                  const char id,
+                                  pid_t pid,
+                                  std::uint64_t start,
+                                  const std::string& holder_id,
+                                  std::uint64_t netns,
+                                  std::uint64_t mount_netns) {
+        mounted.token = token;
+        mounted.stage = kMountedRotationStage;
+        mounted.role = kMountedRotationRole;
+        mounted.generation = std::string(1, generation);
+        mounted.name = "rut358-input-" + token;
+        mounted.id = std::string(64, id);
+        mounted.image_reference = RUT_PINNED_NGINX_IMAGE;
+        mounted.image_id = "sha256:" + std::string(64, 'e');
+        mounted.network_mode = "container:" + holder_id;
+        mounted.user = "1000:1000";
+        mounted.path = "/bin/sleep";
+        mounted.arguments_json = "[\"infinity\"]";
+        mounted.source_path = seed.initial_source.path;
+        mounted.pid = pid;
+        mounted.start = start;
+        mounted.network_netns = netns;
+        mounted.mount_netns = mount_netns;
+        mounted.running = mounted.read_only_root = mounted.capability_drop_all = true;
+        mounted.no_new_privileges = mounted.restart_no = mounted.no_published_ports = true;
+        mounted.requested_mount_exact = mounted.realized_mount_exact = true;
+        mounted.no_mount_shadowing = mounted.nonhost_mount_netns = true;
+    };
+    fill_mounted(seed.old_mounted, '0', '5', 102, 1002, old_topology.holder_id, 2000, 4000);
+    fill_mounted(seed.fresh_mounted, '1', '6', 102, 2002, fresh_topology.holder_id, 2000, 5000);
+    seed.old_absence = {seed.old_mounted.id,
+                        seed.old_mounted.name,
+                        seed.old_mounted.pid,
+                        seed.old_mounted.start,
+                        true,
+                        true,
+                        true,
+                        true};
+    seed.source_continuity = seed.generation_receipt_validated_twice = true;
+    seed.old_and_fresh_authorities_separate = seed.operation_ok = true;
+    seed.old_create_count = seed.old_remove_count = seed.fresh_create_count =
+        seed.fresh_start_count = 1;
+    std::string diagnostic;
+    if (!validate_exact_input_rotation_live_evidence(seed, diagnostic)) {
+        error = "valid exact-input rotation seed was rejected: " + diagnostic;
+        return false;
+    }
+    const auto reject = [&](const std::function<void(ExactInputRotationLiveEvidence&)>& mutate) {
+        ExactInputRotationLiveEvidence changed = seed;
+        mutate(changed);
+        std::string rejected;
+        if (validate_exact_input_rotation_live_evidence(changed, rejected) || rejected.empty())
+            return false;
+        ++mutation_rejections;
+        return true;
+    };
+    if (!reject([](auto& value) { ++value.fresh_source.inode; }) ||
+        !reject([](auto& value) { value.fresh_mounted.generation = "0"; }) ||
+        !reject([](auto& value) { value.old_absence.process_absent = false; }) ||
+        !reject([](auto& value) { value.fresh_mounted.id = value.old_mounted.id; }) ||
+        !reject([](auto& value) { value.fresh_mounted.network_netns = 0; }) ||
+        !reject([](auto& value) { value.generation_receipt_validated_twice = false; })) {
+        error = "exact-input rotation live mutation was accepted";
+        return false;
+    }
+    ExactInputRotationTerminalReceipt terminal;
+    terminal.state = ExactInputRotationState::Settled;
+    terminal.live = seed;
+    terminal.live_published = true;
+    terminal.fresh_absence = {seed.fresh_mounted.id,
+                              seed.fresh_mounted.name,
+                              seed.fresh_mounted.pid,
+                              seed.fresh_mounted.start,
+                              true,
+                              true,
+                              true,
+                              true};
+    terminal.cleanup_complete = terminal.zero_residue = terminal.terminal_frozen = true;
+    terminal.replay_command_free = terminal.downstream_gates_command_free = true;
+    terminal.fresh_remove_count = 1;
+    terminal.fresh_mounted_order = 1;
+    terminal.fresh_inert_order = 2;
+    terminal.input_order = 3;
+    terminal.directory_order = 4;
+    terminal.holder_order = 5;
+    terminal.network_b_order = 6;
+    terminal.network_a_order = 7;
+    if (!validate_exact_input_rotation_terminal_receipt(terminal, diagnostic)) {
+        error = "valid exact-input terminal seed was rejected: " + diagnostic;
+        return false;
+    }
+    MountedSidecarRotationOwner transitions;
+    for (ExactInputRotationState next : {ExactInputRotationState::OldMountedValidated,
+                                         ExactInputRotationState::OldMountedSettled,
+                                         ExactInputRotationState::GenerationValidated,
+                                         ExactInputRotationState::FreshCreateMayHaveMutated,
+                                         ExactInputRotationState::FreshMountedValidated,
+                                         ExactInputRotationState::LivePublished,
+                                         ExactInputRotationState::Settled})
+        if (!mounted_rotation_transition(transitions, next)) {
+            error = "valid mounted-sidecar transition path was rejected";
+            return false;
+        }
+    if (mounted_rotation_transition(transitions, ExactInputRotationState::Ready)) {
+        error = "terminal mounted-sidecar transition replay was accepted";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace rut::test::ipv4_topology

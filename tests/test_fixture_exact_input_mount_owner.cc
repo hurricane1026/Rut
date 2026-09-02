@@ -1,4 +1,5 @@
 #include "fixture_exact_input_mount_owner.h"
+#include "fixture_ipv4_topology.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
@@ -1070,6 +1071,15 @@ int main(int argc, char** argv) {
         lifecycle_mutation_rejections != 39u) {
         std::cerr << "FAIL [#358 nginx lifecycle pure mutation matrix]: "
                   << lifecycle_selfcheck_diagnostic.message << "\n";
+        return 1;
+    }
+    std::uint32_t rotation_mutation_rejections = 0u;
+    std::string rotation_selfcheck_error;
+    if (!exact_input_rotation_pure_self_checks(rotation_mutation_rejections,
+                                               rotation_selfcheck_error) ||
+        rotation_mutation_rejections != 6u) {
+        std::cerr << "FAIL [#412 exact-input rotation pure checks]: " << rotation_selfcheck_error
+                  << "\n";
         return 1;
     }
     {
@@ -2220,6 +2230,38 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    std::cerr << "PASS: #358 exact read-only input mount owner and ordered recovery\n";
+    for (ExactInputRotationFailurePoint point :
+         {ExactInputRotationFailurePoint::None,
+          ExactInputRotationFailurePoint::FreshCreateReportedTimeout,
+          ExactInputRotationFailurePoint::FreshMountObservationMutation,
+          ExactInputRotationFailurePoint::SuppressFirstFreshRemoval}) {
+        std::size_t callback_count = 0;
+        ExactInputRotationTerminalReceipt rotation_receipt;
+        const RunResult rotation = run_with_exact_input_rotation(
+            kConfig,
+            point,
+            [&](const ExactInputRotationLiveEvidence& evidence, std::string& error) {
+                ++callback_count;
+                return validate_exact_input_rotation_live_evidence(evidence, error);
+            },
+            rotation_receipt);
+        const bool mutation =
+            point == ExactInputRotationFailurePoint::FreshMountObservationMutation;
+        const bool operation_ok = point == ExactInputRotationFailurePoint::None || mutation;
+        if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
+            !rotation.residue_free || callback_count != (mutation ? 0u : 1u) ||
+            rotation_receipt.live_published != !mutation ||
+            rotation_receipt.operation_ok != operation_ok ||
+            rotation_receipt.fresh_remove_suppression_count !=
+                (point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval ? 1u : 0u) ||
+            !validate_exact_input_rotation_terminal_receipt(rotation_receipt,
+                                                            rotation_selfcheck_error)) {
+            std::cerr << "FAIL [#412 exact-input structural rotation case "
+                      << static_cast<unsigned>(point) << "]: " << rotation.error << " "
+                      << rotation_selfcheck_error << "\n";
+            return 1;
+        }
+    }
+    std::cerr << "PASS: #358 exact read-only input mount owner and #412 structural rotation\n";
     return 0;
 }
