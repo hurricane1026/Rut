@@ -13755,6 +13755,9 @@ namespace {
 
 constexpr const char* kMountedRotationStage = "358-input-rotation";
 constexpr const char* kMountedRotationRole = "exact-input-mounted-sidecar";
+// A valid running cleanup observation is exactly: immutable identity inspect,
+// mount inspect, and exact-container `/proc/1/ns/net` readlink.
+constexpr std::uint64_t kRunningMountedCleanupObservationCommands = 3u;
 
 struct MountedSidecarRotationOwner {
     ExactInputRotationState state = ExactInputRotationState::Ready;
@@ -14634,7 +14637,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         std::string suppressed;
         if (remove_rotation_mounted(mounted, false, true, suppressed) || suppressed.empty() ||
             mounted.fresh_remove_count != 0u || mounted.fresh_remove_suppression_count != 1u ||
-            command_invocation_count != before_observation + 2u ||
+            command_invocation_count !=
+                before_observation + kRunningMountedCleanupObservationCommands ||
             mounted.state != ExactInputRotationState::FreshRemovalMayHaveMutated ||
             !mounted.fresh_exists || mounted.fresh_absence.id_absent ||
             mounted.fresh_absence.name_absent) {
