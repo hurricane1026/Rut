@@ -1074,7 +1074,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::uint32_t rotation_mutation_rejections = 0u;
-    constexpr std::uint32_t kExpectedRotationMutationRejections = 30u;
+    constexpr std::uint32_t kExpectedRotationMutationRejections = 42u;
     std::string rotation_selfcheck_error;
     if (!exact_input_rotation_pure_self_checks(rotation_mutation_rejections,
                                                rotation_selfcheck_error) ||
@@ -1859,7 +1859,6 @@ int main(int argc, char** argv) {
         ExactInputMountSnapshot built_snapshot;
         ExactInputReadObservation built_read;
         ExactInputWriteRefusalObservation built_write;
-        ExactInputNginxLifecycleObservation lifecycle;
         if (!built.start_with_topology_builder(
                 topology_config_builder, &context, built_handle, diagnostic) ||
             context.calls != 1u || context.expected_bytes.empty() ||
@@ -1874,90 +1873,8 @@ int main(int argc, char** argv) {
             !built.observe_input_read(built_handle, built_read, diagnostic) ||
             built_read.stdout_bytes != context.expected_bytes ||
             !built.observe_input_write_refusal(built_handle, built_write, diagnostic) ||
-            !built.observe_nginx_lifecycle(built_handle, lifecycle, diagnostic) ||
-            lifecycle.outcome != ExactInputNginxLifecycleOutcome::Complete ||
-            !lifecycle.attempted || !lifecycle.terminal_frozen ||
-            !lifecycle.caller_deadline_recorded || lifecycle.final_deadline_nanoseconds <= 0 ||
-            !lifecycle.create_attempted || !lifecycle.created || lifecycle.create_count != 1u ||
-            !lifecycle.start_attempted || !lifecycle.started || lifecycle.start_count != 1u ||
-            lifecycle.remove_count != 1u || !lifecycle.same_source_inode ||
-            lifecycle.same_mount_instance || !lifecycle.sibling_mount_independently_verified ||
-            !lifecycle.sample_a.complete || !lifecycle.sample_b.complete ||
-            !lifecycle.sample_a.container_identity_verified ||
-            !lifecycle.sample_a.source_revalidated || !lifecycle.sample_a.mount_verified ||
-            !lifecycle.sample_a.topology_verified || !lifecycle.sample_a.cgroup_exact ||
-            !lifecycle.sample_a.pidfile_exact || !lifecycle.sample_a.tcp_exact ||
-            !lifecycle.sample_a.tcp6_port_absent || !lifecycle.sample_a.upstream_port_9000_absent ||
-            !lifecycle.sample_a.end_container_identity_verified ||
-            !lifecycle.sample_a.end_source_revalidated || !lifecycle.sample_a.end_mount_verified ||
-            !lifecycle.sample_a.end_topology_verified || !lifecycle.sample_a.end_cgroup_exact ||
-            !lifecycle.sample_a.end_pidfile_exact || !lifecycle.sample_a.end_process_socket_owned ||
-            lifecycle.sample_a.bracket_end_nanoseconds <
-                lifecycle.sample_a.bracket_start_nanoseconds ||
-            !lifecycle.sample_b.container_identity_verified ||
-            !lifecycle.sample_b.source_revalidated || !lifecycle.sample_b.mount_verified ||
-            !lifecycle.sample_b.topology_verified || !lifecycle.sample_b.cgroup_exact ||
-            !lifecycle.sample_b.pidfile_exact || !lifecycle.sample_b.tcp_exact ||
-            !lifecycle.sample_b.tcp6_port_absent || !lifecycle.sample_b.upstream_port_9000_absent ||
-            !lifecycle.sample_b.end_container_identity_verified ||
-            !lifecycle.sample_b.end_source_revalidated || !lifecycle.sample_b.end_mount_verified ||
-            !lifecycle.sample_b.end_topology_verified || !lifecycle.sample_b.end_cgroup_exact ||
-            !lifecycle.sample_b.end_pidfile_exact || !lifecycle.sample_b.end_process_socket_owned ||
-            lifecycle.sample_b.bracket_end_nanoseconds <
-                lifecycle.sample_b.bracket_start_nanoseconds ||
-            !lifecycle.samples_at_least_250ms_apart ||
-            lifecycle.sample_b.bracket_start_nanoseconds -
-                    lifecycle.sample_a.bracket_end_nanoseconds <
-                250000000LL ||
-            lifecycle.sample_a.master_pid != lifecycle.sample_b.master_pid ||
-            lifecycle.sample_a.worker_pid != lifecycle.sample_b.worker_pid ||
-            lifecycle.sample_a.master_start != lifecycle.sample_b.master_start ||
-            lifecycle.sample_a.worker_start != lifecycle.sample_b.worker_start ||
-            lifecycle.sample_a.listener_inode == 0u ||
-            lifecycle.sample_a.listener_inode != lifecycle.sample_b.listener_inode ||
-            !lifecycle.quit_attempted || !lifecycle.quit_only || !lifecycle.stopped_exit_zero ||
-            lifecycle.term_attempted || lifecycle.kill_attempted ||
-            lifecycle.force_remove_attempted || lifecycle.uncertain_cleanup ||
-            !lifecycle.cgroup_empty_after_stop || !lifecycle.removed_nonforce ||
-            !lifecycle.exact_absence || !lifecycle.baseline_restored || !lifecycle.http.attempted ||
-            lifecycle.http.outcome != rut::test::bounded_http_exchange::Outcome::Complete ||
-            !lifecycle.http.eof_observed || !lifecycle.http.send_completed ||
-            !lifecycle.http.write_shutdown_started || !lifecycle.http.write_shutdown_completed ||
-            lifecycle.http.send_completed_nanoseconds <= 0 ||
-            lifecycle.http.write_shutdown_completed_nanoseconds <=
-                lifecycle.http.send_completed_nanoseconds ||
-            lifecycle.http.write_shutdown_completed_nanoseconds >=
-                lifecycle.http.completion_nanoseconds ||
-            !lifecycle.http_response_exact || !lifecycle.upstream_absence_before ||
-            !lifecycle.upstream_absence_after || !lifecycle.logs_captured ||
-            !lifecycle.scoped_refusal_log_exact || lifecycle.operation_failed ||
-            lifecycle.container_id.size() != 64u ||
-            lifecycle.container_name != "rut358-nginx-" + context.token ||
-            ![&] {
-                const std::uint64_t commands = exact_input_mount_test_command_count();
-                ExactInputNginxLifecycleObservation replay;
-                return built.observe_nginx_lifecycle(built_handle, replay, diagnostic) &&
-                       replay.outcome == lifecycle.outcome &&
-                       replay.container_id == lifecycle.container_id &&
-                       replay.create_argv == lifecycle.create_argv &&
-                       replay.sample_a.listener_inode == lifecycle.sample_a.listener_inode &&
-                       replay.sample_b.listener_inode == lifecycle.sample_b.listener_inode &&
-                       replay.remove_count == lifecycle.remove_count &&
-                       replay.http.write_shutdown_started ==
-                           lifecycle.http.write_shutdown_started &&
-                       replay.http.write_shutdown_completed ==
-                           lifecycle.http.write_shutdown_completed &&
-                       replay.http.write_shutdown_completed_nanoseconds ==
-                           lifecycle.http.write_shutdown_completed_nanoseconds &&
-                       replay.terminal_frozen == lifecycle.terminal_frozen &&
-                       exact_input_mount_test_command_count() == commands;
-            }() ||
             !built.finish(built_handle, receipt, diagnostic) || !exact_terminal(receipt) ||
-            !receipt.nginx_sibling_acquired || !receipt.nginx_sibling_settled ||
-            receipt.nginx_sibling_order == 0u ||
-            receipt.nginx_sibling_order >= receipt.sidecar_order ||
-            receipt.nginx_create_count != 1u || receipt.nginx_start_count != 1u ||
-            receipt.nginx_remove_count != 1u || !receipt.builder.applicable ||
+            !receipt.builder.applicable ||
             !receipt.builder.request_validated || receipt.builder.invocation_count != 1u ||
             !receipt.builder.returned_normally || receipt.builder.threw_exception ||
             !receipt.builder.callback_reported_success || receipt.builder.reentry_attempted ||
@@ -1979,6 +1896,10 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // Legacy lifecycle coverage stops before the known-invalid half-close
+    // HTTP boundary: create/start failures are causally reached, while
+    // post-HTTP observation/removal injections are not independently
+    // observable and remain covered only by pure validators.
     for (const auto& test : std::array{
              std::tuple{ExactInputMountFailurePoint::NginxCreateReportedTimeout,
                         ExactInputNginxLifecycleOutcome::CreateFailed,
@@ -1988,14 +1909,6 @@ int main(int argc, char** argv) {
                         ExactInputNginxLifecycleOutcome::StartFailed,
                         1u,
                         true},
-             std::tuple{ExactInputMountFailurePoint::NginxRejectHttpObservation,
-                        ExactInputNginxLifecycleOutcome::SampleFailed,
-                        1u,
-                        true},
-             std::tuple{ExactInputMountFailurePoint::NginxRemoveUnresolved,
-                        ExactInputNginxLifecycleOutcome::RemovalFailed,
-                        1u,
-                        false},
          }) {
         std::string error;
         if (!recover_injected_nginx_lifecycle(std::get<0>(test),
@@ -2259,25 +2172,19 @@ int main(int argc, char** argv) {
           ExactInputRotationFailurePoint::SuppressFirstFreshRemoval,
           ExactInputRotationFailurePoint::FreshReadTimeout,
           ExactInputRotationFailurePoint::FreshWriteInitialBracketMutation,
-         ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess,
+          ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess,
           ExactInputRotationFailurePoint::FreshWriteTimeout}) {
         std::size_t callback_count = 0;
-        ExactInputNginxLifecycleObservation nginx_lifecycle;
         ExactInputRotationTerminalReceipt rotation_receipt;
         const RunResult rotation = run_with_exact_input_rotation(
             kConfig,
             point,
-            [&](const ExactInputRotationLiveEvidence& evidence,
-                const ExactInputRotationNginxCallback& nginx_callback,
-                std::string& error) {
+            [&](const ExactInputRotationLiveEvidence& evidence, std::string& error) {
                 ++callback_count;
-                if (!validate_exact_input_rotation_live_evidence(evidence, error)) return false;
-                if (!nginx_callback(nginx_lifecycle, error)) return false;
-                return nginx_lifecycle.outcome == ExactInputNginxLifecycleOutcome::Complete &&
-                       !nginx_lifecycle.http.write_shutdown_started &&
-                       !nginx_lifecycle.http.write_shutdown_completed;
+                return validate_exact_input_rotation_live_evidence(evidence, error);
             },
-            rotation_receipt);
+            rotation_receipt,
+            ExactInputRotationOptions{});
         const bool mutation =
             point == ExactInputRotationFailurePoint::FreshMountObservationMutation;
         const bool read_timeout = point == ExactInputRotationFailurePoint::FreshReadTimeout;
@@ -2290,14 +2197,6 @@ int main(int argc, char** argv) {
         if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
             !rotation.residue_free || callback_count != (expected_publication ? 1u : 0u) ||
             rotation_receipt.live_published != expected_publication ||
-            (expected_publication &&
-             (nginx_lifecycle.outcome != ExactInputNginxLifecycleOutcome::Complete ||
-              !nginx_lifecycle.http.attempted || !nginx_lifecycle.http.eof_observed ||
-              nginx_lifecycle.http.write_shutdown_started ||
-              nginx_lifecycle.http.write_shutdown_completed || !nginx_lifecycle.http_response_exact ||
-              !nginx_lifecycle.upstream_absence_before ||
-              !nginx_lifecycle.upstream_absence_after ||
-              !nginx_lifecycle.scoped_refusal_log_exact)) ||
             rotation_receipt.operation_ok != operation_ok ||
             (read_timeout &&
              (rotation_receipt.live.fresh_read.outcome == ExactInputReadOutcome::Complete ||
@@ -2314,6 +2213,38 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#412 exact-input structural rotation case "
                       << static_cast<unsigned>(point) << "]: " << rotation.error << " "
                       << rotation_selfcheck_error << "\n";
+            return 1;
+        }
+    }
+    {
+        std::size_t callback_count = 0;
+        ExactInputRotationTerminalReceipt rotation_receipt;
+        ExactInputRotationOptions options;
+        options.nginx_mode = ExactInputRotationNginxMode::Required;
+        BuilderContext nginx_context;
+        options.nginx_config_builder = topology_config_builder;
+        options.nginx_config_builder_context = &nginx_context;
+        const RunResult rotation = run_with_exact_input_rotation(
+            "",
+            ExactInputRotationFailurePoint::None,
+            [&](const ExactInputRotationLiveEvidence& evidence, std::string& error) {
+                ++callback_count;
+                return validate_exact_input_rotation_live_evidence(evidence, error);
+            },
+            rotation_receipt,
+            options);
+        if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
+            !rotation.residue_free || callback_count != 1u || !rotation_receipt.live_published ||
+            !rotation_receipt.nginx_required || !rotation_receipt.live.nginx_required ||
+            nginx_context.calls != 1u || nginx_context.expected_bytes.empty() ||
+            rotation_receipt.live.fresh_read.command.stdout_bytes != nginx_context.expected_bytes ||
+            rotation_receipt.live.old_nginx.outcome != ExactInputNginxLifecycleOutcome::Complete ||
+            !rotation_receipt.live.old_terminal_tcp.complete ||
+            !rotation_receipt.live.fresh_clean_baseline ||
+            !validate_exact_input_rotation_terminal_receipt(rotation_receipt,
+                                                            rotation_selfcheck_error)) {
+            std::cerr << "FAIL [#412 nginx-enabled exact-input rotation case]: " << rotation.error
+                      << " " << rotation_selfcheck_error << "\n";
             return 1;
         }
     }

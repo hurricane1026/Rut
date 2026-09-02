@@ -62,6 +62,8 @@ bool build_listener_source(const ListenerPlan& plan,
 struct ProcTcpRecord {
     std::uint32_t local_ipv4 = 0u;
     std::uint16_t local_port = 0u;
+    std::uint32_t remote_ipv4 = 0u;
+    std::uint16_t remote_port = 0u;
     std::uint8_t state = 0u;
     std::uint64_t inode = 0u;
 };
