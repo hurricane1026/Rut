@@ -32948,6 +32948,386 @@ TEST(
 
 TEST(
     route,
+    public_ordinary_source_fixed_upload_get_complete_content_length_buffering_fragmented_request_and_response_reuses_downstream_iouring) {
+    // This wire claims downstream keep-alive reuse with fresh origin episodes;
+    // upstream connection reuse and retry behavior remain unclaimed.
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kOriginOne[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin-one\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 36\r\n\r\n"
+        "abcdefghijklmnopqrstuvwxyz0123456789";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 36\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "abcdefghijklmnopqrstuvwxyz0123456789";
+    static constexpr char kOriginTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin-two\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 9\r\n\r\n"
+        "second-ok";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 9\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "second-ok";
+    static constexpr u8 kRequestBodyOne[] = {
+        0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 'x', 0x00, 'U', 'P', '1', '!'};
+    static constexpr u8 kRequestBodyTwo[] = {0x80, 0x00, 'o', 'k', '2'};
+    static constexpr u32 kInitialRequestBody = 5;
+    static constexpr u32 kFragmentSize = 35;
+    static constexpr u32 kFragmentDelayUs = 400000;
+    static constexpr u32 kExpectedFragments =
+        (sizeof(kOriginOne) - 1u + kFragmentSize - 1u) / kFragmentSize;
+    static_assert(sizeof(kRequestBodyOne) == 12u);
+    static_assert(sizeof(kRequestBodyTwo) == 5u);
+    static_assert(kInitialRequestBody < sizeof(kRequestBodyOne));
+    static_assert(sizeof(kOriginOne) - 1u < SlicePool::kSliceSize);
+    static_assert(sizeof(kOriginTwo) - 1u < SlicePool::kSliceSize);
+    static_assert(kExpectedFragments == 4u);
+
+    RecordingUpstream backend;
+    backend.response = kOriginOne;
+    backend.response_len = sizeof(kOriginOne) - 1u;
+    backend.response_after_first = kOriginTwo;
+    backend.response_after_first_len = sizeof(kOriginTwo) - 1u;
+    backend.response_chunk_size = kFragmentSize;
+    backend.response_chunk_delay_us = kFragmentDelayUs;
+    backend.gate_first_response_fragments = true;
+    backend.allowed_first_response_fragments.store(1u, std::memory_order_release);
+    backend.wait_first_response_for_peer_close = true;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    const auto& function = resources.rir.module.functions[0];
+    CHECK_EQ(function.http_method, kRouteMethodGet);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_policy_id, 1u);
+    CHECK_EQ(rir_bundle.failure_policy_id, 1u);
+    CHECK_EQ(rir_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& cfg_bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(cfg_bundle.response_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.failure_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(cfg_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(cfg_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].method, kRouteMethodGet);
+    CHECK_EQ(resources.cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_NE(resources.cfg.routes[0].fn, nullptr);
+    CHECK_EQ(resources.cfg.routes[0].preflight_forward_policy_bundle_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequestHeadOne[] =
+        "GET /buffered?fixed-upload=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "X-Test: binary-one\r\n"
+        "Content-Length: 12\r\n\r\n";
+    static constexpr char kRequestHeadTwo[] =
+        "GET /buffered?fixed-upload=two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "X-Test: binary-two\r\n"
+        "Content-Length: 5\r\n\r\n";
+    u8 request_one_prefix[sizeof(kRequestHeadOne) - 1u + kInitialRequestBody]{};
+    __builtin_memcpy(request_one_prefix, kRequestHeadOne, sizeof(kRequestHeadOne) - 1u);
+    __builtin_memcpy(
+        request_one_prefix + sizeof(kRequestHeadOne) - 1u, kRequestBodyOne, kInitialRequestBody);
+
+    auto monotonic_ns = []() -> u64 {
+        struct timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+        return static_cast<u64>(now.tv_sec) * 1000000000ull + static_cast<u64>(now.tv_nsec);
+    };
+    REQUIRE(send_all(client.fd,
+                     reinterpret_cast<const char*>(request_one_prefix),
+                     static_cast<u32>(sizeof(request_one_prefix))));
+    const u64 upload_wait_started_ns = monotonic_ns();
+    REQUIRE_NE(upload_wait_started_ns, 0u);
+
+    // A response-read timer and upstream episode do not exist until the exact
+    // request-body boundary has been received, rewritten, and uploaded.
+    u64 upload_wait_finished_ns = upload_wait_started_ns;
+    while (upload_wait_finished_ns - upload_wait_started_ns < 1200000000ull &&
+           backend.accepted_count.load(std::memory_order_acquire) == 0 &&
+           backend.request_count.load(std::memory_order_acquire) == 0) {
+        usleep(5000);
+        upload_wait_finished_ns = monotonic_ns();
+        REQUIRE_NE(upload_wait_finished_ns, 0u);
+    }
+    REQUIRE_GE(upload_wait_finished_ns - upload_wait_started_ns, 1200000000ull);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+    char quiet[32];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+
+    const u64 final_request_body_release_ns = monotonic_ns();
+    REQUIRE_NE(final_request_body_release_ns, 0u);
+    REQUIRE(send_all(client.fd,
+                     reinterpret_cast<const char*>(kRequestBodyOne + kInitialRequestBody),
+                     static_cast<u32>(sizeof(kRequestBodyOne) - kInitialRequestBody)));
+
+    for (u32 waited = 0; waited < 1200 && backend.request_count.load(std::memory_order_acquire) < 1;
+         waited++)
+        usleep(1000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    const u64 request_one_recorded_ns =
+        backend.request_recorded_ns[0].load(std::memory_order_acquire);
+    REQUIRE_GE(request_one_recorded_ns, final_request_body_release_ns);
+    char expected_request_one_head[256]{};
+    const int expected_request_one_head_len = snprintf(expected_request_one_head,
+                                                       sizeof(expected_request_one_head),
+                                                       "GET /buffered?fixed-upload=one HTTP/1.1\r\n"
+                                                       "Host: 127.0.0.1:%u\r\n"
+                                                       "X-Test: binary-one\r\n"
+                                                       "Content-Length: 12\r\n\r\n",
+                                                       backend.port);
+    REQUIRE_GT(expected_request_one_head_len, 0);
+    REQUIRE_LT(expected_request_one_head_len, static_cast<int>(sizeof(expected_request_one_head)));
+    REQUIRE_EQ(backend.request_history_header_len[0],
+               static_cast<u32>(expected_request_one_head_len));
+    REQUIRE_EQ(backend.request_history_len[0],
+               static_cast<u32>(expected_request_one_head_len) +
+                   static_cast<u32>(sizeof(kRequestBodyOne)));
+    CHECK_EQ(
+        memcmp(
+            backend.request_history[0], expected_request_one_head, expected_request_one_head_len),
+        0);
+    CHECK_EQ(memcmp(backend.request_history[0] + expected_request_one_head_len,
+                    kRequestBodyOne,
+                    sizeof(kRequestBodyOne)),
+             0);
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "client.example",
+                             sizeof("client.example") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "Keep-Alive",
+                             sizeof("Keep-Alive") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "Connection",
+                             sizeof("Connection") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "TE",
+                             sizeof("TE") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "Expect",
+                             sizeof("Expect") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[0],
+                             backend.request_history_header_len[0],
+                             "Upgrade",
+                             sizeof("Upgrade") - 1u));
+    CHECK_EQ(backend.request_body_len, static_cast<u32>(sizeof(kRequestBodyOne)));
+
+    // Every permit follows one attributable application send and an independent
+    // downstream open/zero-byte observation. Fragment four completes CL36.
+    for (u32 fragment = 1; fragment < kExpectedFragments; fragment++) {
+        for (u32 waited = 0; waited < 1200 && backend.first_response_fragment_count.load(
+                                                  std::memory_order_acquire) < fragment;
+             waited++)
+            usleep(1000);
+        REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), fragment);
+        REQUIRE_NE(
+            backend.first_response_fragment_sent_ns[fragment - 1u].load(std::memory_order_acquire),
+            0u);
+        REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+        backend.allowed_first_response_fragments.store(fragment + 1u, std::memory_order_release);
+    }
+
+    char response[sizeof(kExpectedOne) + 64]{};
+    u32 response_len = 0;
+    const u32 expected_one_len = sizeof(kExpectedOne) - 1u;
+    while (response_len < expected_one_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 6000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_one_len);
+    }
+    const u64 request_one_response_complete_ns = monotonic_ns();
+    REQUIRE_NE(request_one_response_complete_ns, 0u);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_one_len);
+    CHECK_EQ(memcmp(response, kExpectedOne, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "502", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "504", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "Origin Failed", 13));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+
+    const u32 fragment_count =
+        backend.first_response_fragment_count.load(std::memory_order_acquire);
+    REQUIRE_EQ(fragment_count, kExpectedFragments);
+    u64 fragment_times[RecordingUpstream::kMaxFirstResponseFragments]{};
+    for (u32 i = 0; i < fragment_count; i++) {
+        fragment_times[i] =
+            backend.first_response_fragment_sent_ns[i].load(std::memory_order_acquire);
+        REQUIRE_NE(fragment_times[i], 0u);
+        if (i == 0) continue;
+        REQUIRE_GT(fragment_times[i], fragment_times[i - 1u]);
+        const double gap = static_cast<double>(fragment_times[i] - fragment_times[i - 1u]) / 1e9;
+        CHECK_GE(gap, 0.35);
+        CHECK_LT(gap, 0.65);
+    }
+    const double first_to_final =
+        static_cast<double>(fragment_times[fragment_count - 1u] - fragment_times[0]) / 1e9;
+    CHECK_GT(first_to_final, 1.0);
+    CHECK_LT(first_to_final, 2.0);
+    REQUIRE_GE(request_one_response_complete_ns, fragment_times[fragment_count - 1u]);
+
+    for (u32 waited = 0;
+         waited < 1200 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    REQUIRE_GT(backend.first_peer_closed_ns.load(std::memory_order_acquire),
+               fragment_times[fragment_count - 1u]);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    // Request 2 begins only after origin 1 retirement was observed. Its positive
+    // body must create a new upload proof and a fresh origin episode.
+    u8 request_two[sizeof(kRequestHeadTwo) - 1u + sizeof(kRequestBodyTwo)]{};
+    __builtin_memcpy(request_two, kRequestHeadTwo, sizeof(kRequestHeadTwo) - 1u);
+    __builtin_memcpy(
+        request_two + sizeof(kRequestHeadTwo) - 1u, kRequestBodyTwo, sizeof(kRequestBodyTwo));
+    REQUIRE(send_all(client.fd,
+                     reinterpret_cast<const char*>(request_two),
+                     static_cast<u32>(sizeof(request_two))));
+
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const u32 expected_two_len = sizeof(kExpectedTwo) - 1u;
+    while (response_len < expected_two_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 6000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_two_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_two_len);
+    CHECK_EQ(memcmp(response, kExpectedTwo, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "502", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "504", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "Origin Failed", 13));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+
+    for (u32 waited = 0; waited < 1200 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    char expected_request_two_head[256]{};
+    const int expected_request_two_head_len = snprintf(expected_request_two_head,
+                                                       sizeof(expected_request_two_head),
+                                                       "GET /buffered?fixed-upload=two HTTP/1.1\r\n"
+                                                       "Host: 127.0.0.1:%u\r\n"
+                                                       "X-Test: binary-two\r\n"
+                                                       "Content-Length: 5\r\n\r\n",
+                                                       backend.port);
+    REQUIRE_GT(expected_request_two_head_len, 0);
+    REQUIRE_LT(expected_request_two_head_len, static_cast<int>(sizeof(expected_request_two_head)));
+    REQUIRE_EQ(backend.request_history_header_len[1],
+               static_cast<u32>(expected_request_two_head_len));
+    REQUIRE_EQ(backend.request_history_len[1],
+               static_cast<u32>(expected_request_two_head_len) +
+                   static_cast<u32>(sizeof(kRequestBodyTwo)));
+    CHECK_EQ(
+        memcmp(
+            backend.request_history[1], expected_request_two_head, expected_request_two_head_len),
+        0);
+    CHECK_EQ(memcmp(backend.request_history[1] + expected_request_two_head_len,
+                    kRequestBodyTwo,
+                    sizeof(kRequestBodyTwo)),
+             0);
+    CHECK_EQ(backend.request_body_len, static_cast<u32>(sizeof(kRequestBodyTwo)));
+    CHECK_FALSE(buf_contains(backend.request_history[1],
+                             backend.request_history_header_len[1],
+                             "client.example",
+                             sizeof("client.example") - 1u));
+    CHECK_FALSE(buf_contains(backend.request_history[1],
+                             backend.request_history_header_len[1],
+                             "Keep-Alive",
+                             sizeof("Keep-Alive") - 1u));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
+        for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
+            zero = backend.request_history[slot][i] == '\0';
+        CHECK(zero);
+    }
+}
+
+TEST(
+    route,
     public_ordinary_source_fixed_upload_post_complete_content_length_buffering_fragmented_request_inactivity_emits_pinned_header_only_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
