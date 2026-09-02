@@ -18,6 +18,8 @@
 #include "fixture_public_rut_session_attempt.h"
 #include "fixture_wildcard_source_lease.h"
 #include "fixture_worker_protocol.h"
+#include "rut/nginx/converter.h"
+#include "rut/nginx/parser.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -27,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -228,11 +231,17 @@ static ExactLiveness observe_exact_liveness(const ProcIdentity& expected);
 static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
 static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
+static bool generated_proxy_scenario(const char* scenario);
 
 static bool listener_scenario_name(const char* scenario) {
     return strcmp(scenario, "listener-guard-reservation") == 0 ||
            strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
-           strcmp(scenario, "listener-canonical-collision-release") == 0;
+           strcmp(scenario, "listener-canonical-collision-release") == 0 ||
+           generated_proxy_scenario(scenario);
+}
+
+static bool generated_proxy_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-generated-proxy-502") == 0;
 }
 
 static bool canonical_collision_scenario(const char* scenario) {
@@ -243,7 +252,8 @@ enum class TargetWaitStrategy { OwnedWait, ListenerCustody };
 
 static TargetWaitStrategy target_wait_strategy(const char* scenario) {
     if (strcmp(scenario, "listener-guard-reservation") == 0 ||
-        strcmp(scenario, "listener-cleanup-observation-failure") == 0)
+        strcmp(scenario, "listener-cleanup-observation-failure") == 0 ||
+        generated_proxy_scenario(scenario))
         return TargetWaitStrategy::ListenerCustody;
     return TargetWaitStrategy::OwnedWait;
 }
@@ -287,10 +297,13 @@ static bool listener_failure_bound_self_check(std::string& error) {
             kListenerDeadlineMs * 2 ||
         launcher_broker_wait_ms("listener-guard-reservation") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("listener-generated-proxy-502") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
         launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("normal") != kListenerDeadlineMs ||
         scenario_aggregate_wait_ms("normal") != kBrokerDeadlineMs ||
         scenario_aggregate_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
         scenario_aggregate_wait_ms("listener-cleanup-observation-failure") !=
             kListenerFailureLauncherWaitMs ||
         scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
@@ -310,11 +323,14 @@ static bool listener_failure_bound_self_check(std::string& error) {
         target_wait_strategy("broker-lease-loss") != TargetWaitStrategy::OwnedWait ||
         target_wait_strategy("listener-wildcard-attempt") != TargetWaitStrategy::OwnedWait ||
         target_wait_strategy("listener-guard-reservation") != TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-generated-proxy-502") !=
+            TargetWaitStrategy::ListenerCustody ||
         target_wait_strategy("listener-cleanup-observation-failure") !=
             TargetWaitStrategy::ListenerCustody ||
         target_wait_requires_custody("listener-canonical-collision-release") ||
         target_wait_requires_custody("normal") ||
         !target_wait_requires_custody("listener-guard-reservation") ||
+        !target_wait_requires_custody("listener-generated-proxy-502") ||
         !target_wait_requires_custody("listener-cleanup-observation-failure") ||
         !(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs) ||
         !(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
@@ -1197,8 +1213,10 @@ struct ExecutableLease {
     }
 };
 
-constexpr u64 kExactProtocolVersion = 1u;
-constexpr std::size_t kExactReportFields = 25u;
+constexpr u64 kExactProtocolVersion = 2u;
+constexpr std::size_t kExactReportFields = 32u;
+constexpr std::size_t kExactMaxRequestBytes = 128u;
+constexpr std::size_t kExactMaxResponseBytes = 4096u;
 struct ExactRutReport {
     u64 version = kExactProtocolVersion;
     u64 child_pid = 0u;
@@ -1225,6 +1243,36 @@ struct ExactRutReport {
     u64 guard_connect_error = 0u;
     u64 stable = 0u;
     u64 backend = 0u;
+    // Request/response observations are populated for every exact child.  The
+    // generated proxy slice additionally proves the unavailable-upstream
+    // refusal and its normalized 502 body/header contract.
+    u64 request_bytes = 0u;
+    u64 completed_send = 0u;
+    u64 upstream_absence_probe_refused = 0u;
+    u64 response_body_bytes = 0u;
+    u64 response_status = 0u;
+    u64 response_headers_exact = 0u;
+    u64 guard_before_connect_error = 0u;
+    std::string request_wire;
+    std::string response_wire;
+};
+
+struct GeneratedProxyObservation {
+    // The separate refusal probe proves endpoint absence only; RUT upstream
+    // connect-attempt count is intentionally unobserved in this fixture.
+    std::string request_wire;
+    std::string response_wire;
+    u64 upstream_absence_probe_refused = 0u;
+    u64 guard_before_connect_error = 0u;
+    u64 guard_after_connect_error = 0u;
+    u64 status = 0u;
+    u64 headers_exact = 0u;
+    u64 body_bytes = 0u;
+    u64 child_pid = 0u;
+    u64 child_start = 0u;
+    u64 listener_inode = 0u;
+    u64 eof = 0u;
+    u64 cleanup_complete = 0u;
 };
 
 constexpr std::size_t kExactCleanedFields = 11u;
@@ -1536,7 +1584,6 @@ static bool decode_wildcard_fields(const std::vector<unsigned char>& payload,
 template <std::size_t Size>
 static std::vector<unsigned char> encode_wildcard_fields(const std::array<u64, Size>& fields) {
     std::vector<unsigned char> payload;
-    payload.reserve(fields.size() * sizeof(u64));
     for (u64 field : fields) append_u64(payload, field);
     return payload;
 }
@@ -2013,16 +2060,31 @@ static std::vector<unsigned char> encode_exact_report(const ExactRutReport& repo
         report.guard_connect_error,
         report.stable,
         report.backend,
+        report.request_bytes,
+        report.completed_send,
+        report.upstream_absence_probe_refused,
+        report.response_body_bytes,
+        report.response_status,
+        report.response_headers_exact,
+        report.guard_before_connect_error,
     };
     std::vector<unsigned char> payload;
-    payload.reserve(fields.size() * sizeof(u64));
+    payload.reserve(fields.size() * sizeof(u64) + 2u * sizeof(u64) + report.request_wire.size() +
+                    report.response_wire.size());
     for (u64 field : fields) append_u64(payload, field);
+    append_u64(payload, report.request_wire.size());
+    payload.insert(payload.end(), report.request_wire.begin(), report.request_wire.end());
+    append_u64(payload, report.response_wire.size());
+    payload.insert(payload.end(), report.response_wire.begin(), report.response_wire.end());
     return payload;
 }
 
 static bool decode_exact_report(const std::vector<unsigned char>& payload, ExactRutReport& report) {
     report = {};
-    if (payload.size() != kExactReportFields * sizeof(u64)) return false;
+    if (payload.size() < kExactReportFields * sizeof(u64) + 2u * sizeof(u64) ||
+        payload.size() > kExactReportFields * sizeof(u64) + 2u * sizeof(u64) +
+                             kExactMaxRequestBytes + kExactMaxResponseBytes)
+        return false;
     std::array<u64, kExactReportFields> fields{};
     for (std::size_t i = 0u; i < kExactReportFields; ++i)
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
@@ -2030,7 +2092,23 @@ static bool decode_exact_report(const std::vector<unsigned char>& payload, Exact
     report = {fields[0],  fields[1],  fields[2],  fields[3],  fields[4],  fields[5],  fields[6],
               fields[7],  fields[8],  fields[9],  fields[10], fields[11], fields[12], fields[13],
               fields[14], fields[15], fields[16], fields[17], fields[18], fields[19], fields[20],
-              fields[21], fields[22], fields[23], fields[24]};
+              fields[21], fields[22], fields[23], fields[24], fields[25], fields[26], fields[27],
+              fields[28], fields[29], fields[30], fields[31]};
+    std::size_t offset = kExactReportFields * sizeof(u64);
+    const u64 request_size = read_u64(payload.data() + offset);
+    offset += sizeof(u64);
+    if (request_size > kExactMaxRequestBytes || request_size > payload.size() - offset)
+        return false;
+    report.request_wire.assign(reinterpret_cast<const char*>(payload.data() + offset),
+                               request_size);
+    offset += request_size;
+    if (offset + sizeof(u64) > payload.size()) return false;
+    const u64 response_size = read_u64(payload.data() + offset);
+    offset += sizeof(u64);
+    if (response_size > kExactMaxResponseBytes || response_size != payload.size() - offset)
+        return false;
+    report.response_wire.assign(reinterpret_cast<const char*>(payload.data() + offset),
+                                response_size);
     return report.version == kExactProtocolVersion;
 }
 
@@ -5410,11 +5488,114 @@ static bool exact_log_ready(const std::string& log,
     return true;
 }
 
+static bool build_generated_proxy_source(const privileged_listener::ListenerPlan& plan,
+                                         std::string& source,
+                                         std::string& diagnostic) {
+    source.clear();
+    diagnostic.clear();
+    if (plan.port == 0u || plan.port > 65535u || plan.positive_ipv4 == 0u) {
+        diagnostic = "invalid generated listener plan";
+        return false;
+    }
+    const std::string fragment =
+        "server {\n  listen " + std::to_string((plan.positive_ipv4 >> 24u) & 0xffu) + "." +
+        std::to_string((plan.positive_ipv4 >> 16u) & 0xffu) + "." +
+        std::to_string((plan.positive_ipv4 >> 8u) & 0xffu) + "." +
+        std::to_string(plan.positive_ipv4 & 0xffu) + ":" + std::to_string(plan.port) +
+        ";\n  location / { proxy_pass http://127.0.0.1:9000; }\n}";
+    const auto parsed =
+        rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
+    if (!parsed) {
+        diagnostic = "topology-derived fragment was rejected by nginx parser";
+        return false;
+    }
+    const rut::nginx::Server& server = parsed.value();
+    const rut::nginx::ProxyPass& proxy = server.location.proxy_pass;
+    if (server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        server.listen.ipv4_host != plan.positive_ipv4 || server.listen.port != plan.port ||
+        !server.location.path.eq(rut::lit_str("/")) || proxy.has_uri || proxy.uri.ptr != nullptr ||
+        proxy.uri.len != 0u || proxy.address[0] != 127u || proxy.address[1] != 0u ||
+        proxy.address[2] != 0u || proxy.address[3] != 1u || proxy.port != 9000u ||
+        server.exact_local_return.present || server.exact_no_content_return.present ||
+        server.exact_absolute_redirect.present || server.span.start != 0u ||
+        server.span.end != fragment.size() || server.listen.value.ptr == nullptr ||
+        server.listen.value.len == 0u || server.location.path.ptr == nullptr ||
+        server.location.proxy_pass.span.start <= server.location.path_span.end) {
+        diagnostic = "parsed generated proxy model lost assigned-listener/root/proxy provenance";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(server);
+    if (!lowered) {
+        diagnostic = "converter rejected topology-derived proxy model";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    if (generated.ptr == nullptr || generated.len == 0u ||
+        generated.len >= rut::nginx::RutSource::kCapacity ||
+        std::string(generated.ptr, generated.len)
+                .find("failure_policy: {\n            version: \"HTTP/1.1\",\n            status: "
+                      "502,") == std::string::npos) {
+        diagnostic = "converter output was not the ordinary generated 502 proxy program";
+        return false;
+    }
+    source.assign(generated.ptr, generated.len);
+    return !source.empty();
+}
+
+static bool valid_http_date(const std::string& value) {
+    if (value.size() != 29u) return false;
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto token_is_one_of =
+        [](const char* text, const char* const* tokens, std::size_t count) {
+            for (std::size_t i = 0u; i < count; ++i)
+                if (memcmp(text, tokens[i], 3u) == 0) return true;
+            return false;
+        };
+    static constexpr const char* weekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static constexpr const char* months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const char* date = value.data();
+    const auto two_digits = [&](std::size_t offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1u])
+                   ? static_cast<unsigned>(date[offset] - '0') * 10u +
+                         static_cast<unsigned>(date[offset + 1u] - '0')
+                   : 100u;
+    };
+    if (!token_is_one_of(date, weekdays, 7u) || date[3] != ',' || date[4] != ' ' ||
+        date[7] != ' ' || !token_is_one_of(date + 8u, months, 12u) || date[11] != ' ' ||
+        date[16] != ' ' || date[19] != ':' || date[22] != ':' || date[25] != ' ' ||
+        memcmp(date + 26u, "GMT", 3u) != 0)
+        return false;
+    for (std::size_t i = 12u; i < 16u; ++i)
+        if (!is_digit(date[i])) return false;
+    return two_digits(5u) >= 1u && two_digits(5u) <= 31u && two_digits(17u) <= 23u &&
+           two_digits(20u) <= 59u && two_digits(23u) <= 59u;
+}
+
+static bool generated_response_wire_valid(const std::string& response) {
+    static constexpr char body[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    static constexpr char prefix[] = "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ";
+    static constexpr char suffix[] =
+        "\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n";
+    const std::size_t date_start = sizeof(prefix) - 1u;
+    const std::size_t date_end = response.find("\r\n", date_start);
+    return date_end != std::string::npos &&
+           valid_http_date(response.substr(date_start, date_end - date_start)) &&
+           response == std::string(prefix) + response.substr(date_start, date_end - date_start) +
+                           std::string(suffix) + std::string(body);
+}
+
 static bool exact_http_exchange(u32 ipv4,
                                 u16 port,
                                 std::chrono::steady_clock::time_point deadline,
-                                ExactRutReport& report) {
-    static constexpr char request[] =
+                                ExactRutReport& report,
+                                bool generated_proxy) {
+    static constexpr char generated_request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr char exact_request[] =
         "GET / HTTP/1.1\r\nHost: exact-listener.invalid\r\nConnection: close\r\n\r\n";
     static constexpr char expected[] =
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -5442,14 +5623,16 @@ static bool exact_http_exchange(u32 ipv4,
         close(client);
         return false;
     }
+    const char* request = generated_proxy ? generated_request : exact_request;
+    const std::size_t request_size =
+        generated_proxy ? sizeof(generated_request) - 1u : sizeof(exact_request) - 1u;
     std::size_t sent = 0u;
-    while (sent < sizeof(request) - 1u) {
+    while (sent < request_size) {
         if (!wait_fd(client, POLLOUT, deadline)) {
             close(client);
             return false;
         }
-        const ssize_t count =
-            send(client, request + sent, sizeof(request) - 1u - sent, MSG_NOSIGNAL);
+        const ssize_t count = send(client, request + sent, request_size - sent, MSG_NOSIGNAL);
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count <= 0) {
             close(client);
@@ -5457,20 +5640,29 @@ static bool exact_http_exchange(u32 ipv4,
         }
         sent += static_cast<std::size_t>(count);
     }
+    report.request_bytes = request_size;
+    report.completed_send = 1u;
+    if (generated_proxy) report.request_wire.assign(request, request_size);
     std::string response;
-    response.reserve(sizeof(expected));
+    response.reserve(512u);
     bool eof = false;
-    while (response.size() <= sizeof(expected) - 1u) {
+    bool overflow = false;
+    while (response.size() <= 4096u) {
         if (!wait_fd(client, POLLIN | POLLHUP, deadline)) break;
         std::array<char, 128> bytes{};
-        const ssize_t count = recv(client, bytes.data(), bytes.size(), 0);
+        const std::size_t remaining = kExactMaxResponseBytes - response.size();
+        const std::size_t read_size = std::min(bytes.size(), remaining + 1u);
+        const ssize_t count = recv(client, bytes.data(), read_size, 0);
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count < 0) break;
         if (count == 0) {
             eof = true;
             break;
         }
-        response.append(bytes.data(), static_cast<std::size_t>(count));
+        const std::size_t received = static_cast<std::size_t>(count);
+        if (received > remaining) overflow = true;
+        response.append(bytes.data(), std::min(received, remaining));
+        if (overflow) break;
     }
     linger reset_after_eof{1, 0};
     const bool reset_configured =
@@ -5478,9 +5670,35 @@ static bool exact_http_exchange(u32 ipv4,
         setsockopt(client, SOL_SOCKET, SO_LINGER, &reset_after_eof, sizeof(reset_after_eof)) == 0;
     close(client);
     report.response_bytes = response.size();
-    report.response_exact = response == std::string(expected, sizeof(expected) - 1u) ? 1u : 0u;
+    if (generated_proxy) report.response_wire = response;
+    if (!generated_proxy) {
+        report.response_exact = response == std::string(expected, sizeof(expected) - 1u) ? 1u : 0u;
+    } else {
+        static constexpr char body[] =
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+            "</body>\r\n</html>\r\n";
+        static_assert(sizeof(body) - 1u == 157u);
+        const std::string prefix = "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ";
+        const std::string suffix =
+            "\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n";
+        const std::size_t date_start = prefix.size();
+        const std::size_t date_end = response.find("\r\n", date_start);
+        const bool date_ok = date_end != std::string::npos &&
+                             valid_http_date(response.substr(date_start, date_end - date_start));
+        const std::string date = date_end == std::string::npos
+                                     ? std::string()
+                                     : response.substr(date_start, date_end - date_start);
+        const std::string expected_response = prefix + date + suffix + body;
+        const bool headers_ok =
+            date_ok && date_end != std::string::npos && response == expected_response;
+        report.response_body_bytes = headers_ok ? sizeof(body) - 1u : 0u;
+        report.response_status = 502u;
+        report.response_headers_exact = headers_ok ? 1u : 0u;
+        report.response_exact = headers_ok ? 1u : 0u;
+    }
     report.prompt_eof = eof ? 1u : 0u;
-    return report.response_exact == 1u && report.prompt_eof == 1u && reset_configured;
+    return !overflow && report.response_exact == 1u && report.prompt_eof == 1u && reset_configured;
 }
 
 static bool connect_refused_until(u32 ipv4,
@@ -6170,6 +6388,7 @@ static bool cleanup_exact_child(ExactChildState& child,
 
 static bool start_exact_child(const Frame& command,
                               const char* control_path,
+                              const char* scenario,
                               int guard_fd,
                               const GuardReport& held,
                               ExactChildState& child,
@@ -6228,8 +6447,18 @@ static bool start_exact_child(const Frame& command,
     failure.phase = ExactFailurePhase::Temp;
     std::string source;
     privileged_listener::Diagnostic source_diagnostic;
-    if (!privileged_listener::build_listener_source(
-            held.plan, privileged_listener::ListenerSourceKind::Exact, source, source_diagnostic)) {
+    if (generated_proxy_scenario(scenario)) {
+        std::string generated_diagnostic;
+        if (!build_generated_proxy_source(held.plan, source, generated_diagnostic)) {
+            close(directory_fd);
+            close(executable_fd);
+            return false;
+        }
+    } else if (!privileged_listener::build_listener_source(
+                   held.plan,
+                   privileged_listener::ListenerSourceKind::Exact,
+                   source,
+                   source_diagnostic)) {
         close(directory_fd);
         close(executable_fd);
         return false;
@@ -6377,13 +6606,42 @@ static bool start_exact_child(const Frame& command,
         if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    bool upstream_absence_probe_refused = false;
+    if (generated_proxy_scenario(scenario)) {
+        int guard_before_error = 0;
+        if (!connect_refused_until(held.plan.guard_ipv4,
+                                   static_cast<u16>(held.plan.port),
+                                   deadline,
+                                   guard_before_error)) {
+            failure.phase = ExactFailurePhase::GuardRefusal;
+            failure.error_number =
+                guard_before_error > 0 ? static_cast<u64>(guard_before_error) : 0u;
+            if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
+            return false;
+        }
+        report.guard_before_connect_error = ECONNREFUSED;
+        int upstream_error = 0;
+        upstream_absence_probe_refused =
+            connect_refused_until(0x7f000001u, 9000u, deadline, upstream_error);
+        if (!upstream_absence_probe_refused) {
+            failure.phase = ExactFailurePhase::HttpEof;
+            failure.error_number = upstream_error > 0 ? static_cast<u64>(upstream_error) : 0u;
+            if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
+            return false;
+        }
+    }
     failure.phase = ExactFailurePhase::HttpEof;
-    if (!exact_http_exchange(
-            held.plan.positive_ipv4, static_cast<u16>(held.plan.port), deadline, report)) {
+    if (!exact_http_exchange(held.plan.positive_ipv4,
+                             static_cast<u16>(held.plan.port),
+                             deadline,
+                             report,
+                             generated_proxy_scenario(scenario))) {
         failure.count = report.response_bytes;
         if (!cleanup_after_failure()) failure.phase = ExactFailurePhase::Cleanup;
         return false;
     }
+    if (generated_proxy_scenario(scenario))
+        report.upstream_absence_probe_refused = upstream_absence_probe_refused ? 1u : 0u;
     failure.phase = ExactFailurePhase::GuardRefusal;
     int guard_error = 0;
     if (!connect_refused_until(
@@ -6590,6 +6848,7 @@ static int secured_target_main(const char* control_path,
                                      token_equal(exact_run.token, token);
             const bool started = run_request && start_exact_child(exact_run,
                                                                   control_path,
+                                                                  scenario,
                                                                   guard_fd,
                                                                   held,
                                                                   exact_child,
@@ -11359,7 +11618,8 @@ static bool validate_exact_witness(const ExactRutReport& report,
                                    const ProcIdentity& target,
                                    const GuardReport& held,
                                    ProcIdentity& child_identity,
-                                   std::string& error) {
+                                   std::string& error,
+                                   bool generated_proxy = false) {
     const std::string source_path = endpoint.directory + "/exact-listener.rut";
     const std::string log_path = endpoint.directory + "/exact-listener.log";
     const std::string expected_argv = exact_argv(
@@ -11373,8 +11633,9 @@ static bool validate_exact_witness(const ExactRutReport& report,
         report.child_exe_ino != lease.status.st_ino ||
         report.pidfd > static_cast<u64>(std::numeric_limits<int>::max()) ||
         report.pidfd_cloexec != 1u || report.listener_inode == 0u ||
-        report.target_fd_count != held.current_fd_count + 1u || report.response_bytes != 65u ||
-        report.response_exact != 1u || report.prompt_eof != 1u ||
+        report.target_fd_count != held.current_fd_count + 1u ||
+        (!generated_proxy && (report.response_bytes != 65u || report.response_exact != 1u ||
+                              report.prompt_eof != 1u)) ||
         report.guard_connect_error != ECONNREFUSED || report.stable != 1u ||
         (report.backend != 1u && report.backend != 2u) || !executable_lease_unchanged(lease)) {
         error = "exact RUT witness scalar/executable evidence was invalid";
@@ -11415,19 +11676,54 @@ static bool validate_exact_witness(const ExactRutReport& report,
     privileged_listener::Diagnostic source_diagnostic;
     std::string expected_source;
     u64 target_fds = 0u;
+    std::string expected_generated_source;
+    std::string generated_diagnostic;
     if (!regular_temp_identity(source_path, report.source_dev, report.source_ino) ||
         !regular_temp_identity(log_path, report.log_dev, report.log_ino) ||
-        !read_file(source_path, source, 4096u) ||
-        !privileged_listener::build_listener_source(held.plan,
-                                                    privileged_listener::ListenerSourceKind::Exact,
-                                                    expected_source,
-                                                    source_diagnostic) ||
-        source != expected_source ||
-        !read_file(log_path, log, privileged_listener::kMaxCollisionLogBytes) ||
+        !read_file(source_path, source, 8192u)) {
+        error = generated_proxy ? "parent generated source/temp identity failed"
+                                : "parent exact source/temp identity failed";
+        return false;
+    }
+    const bool source_matches =
+        generated_proxy ? build_generated_proxy_source(
+                              held.plan, expected_generated_source, generated_diagnostic) &&
+                              source == expected_generated_source
+                        : privileged_listener::build_listener_source(
+                              held.plan,
+                              privileged_listener::ListenerSourceKind::Exact,
+                              expected_source,
+                              source_diagnostic) &&
+                              source == expected_source;
+    if (!source_matches || !read_file(log_path, log, privileged_listener::kMaxCollisionLogBytes) ||
         !exact_log_ready(log, source_path, static_cast<u16>(held.plan.port), backend) ||
         backend != report.backend || !count_target_fds(target.pid, target_fds) ||
         target_fds != report.target_fd_count) {
-        error = "parent exact source/log/backend/temp/FD evidence failed";
+        error = generated_proxy ? "parent generated source/log/backend/temp/FD evidence failed"
+                                : "parent exact source/log/backend/temp/FD evidence failed";
+        return false;
+    }
+    if (generated_proxy &&
+        (report.request_bytes != report.request_wire.size() || report.request_bytes != 59u ||
+         report.completed_send != 1u || report.upstream_absence_probe_refused != 1u ||
+         report.response_body_bytes != 157u || report.response_status != 502u ||
+         report.response_headers_exact != 1u || report.guard_before_connect_error != ECONNREFUSED ||
+         report.response_bytes != report.response_wire.size() || report.response_bytes == 0u ||
+         report.response_exact != 1u || report.prompt_eof != 1u ||
+         report.request_wire !=
+             "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n" ||
+         report.response_wire.size() > kExactMaxResponseBytes ||
+         !generated_response_wire_valid(report.response_wire))) {
+        error = "generated proxy 502 request/upstream/response observation was invalid";
+        return false;
+    }
+    if (!generated_proxy &&
+        (report.request_bytes != 67u || !report.request_wire.empty() ||
+         report.response_bytes != 65u || !report.response_wire.empty() ||
+         report.upstream_absence_probe_refused != 0u || report.guard_before_connect_error != 0u ||
+         report.response_body_bytes != 0u || report.response_status != 0u ||
+         report.response_headers_exact != 0u || report.completed_send != 1u)) {
+        error = "legacy exact 204 report carried generated-only observation fields";
         return false;
     }
     return true;
@@ -11475,12 +11771,19 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
                                               const ExecutableLease& lease,
                                               const ParentEndpoint& endpoint,
                                               const ProcIdentity& target,
-                                              const GuardReport& held) {
+                                              const GuardReport& held,
+                                              bool generated_proxy = false) {
     const auto rejects = [&](ExactRutReport mutation) {
         ProcIdentity ignored_identity;
         std::string ignored_error;
-        return !validate_exact_witness(
-            mutation, lease, endpoint, target, held, ignored_identity, ignored_error);
+        return !validate_exact_witness(mutation,
+                                       lease,
+                                       endpoint,
+                                       target,
+                                       held,
+                                       ignored_identity,
+                                       ignored_error,
+                                       generated_proxy);
     };
     ExactRutReport mutation = canonical;
     mutation.version++;
@@ -11510,7 +11813,7 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
     mutation.log_ino++;
     if (!rejects(mutation)) return false;
     mutation = canonical;
-    mutation.response_bytes--;
+    mutation.response_bytes = generated_proxy ? 0u : mutation.response_bytes - 1u;
     if (!rejects(mutation)) return false;
     mutation = canonical;
     mutation.response_exact = 0u;
@@ -11526,7 +11829,59 @@ static bool exact_witness_mutation_self_check(const ExactRutReport& canonical,
     if (!rejects(mutation)) return false;
     mutation = canonical;
     mutation.backend = 0u;
-    return rejects(mutation);
+    if (!rejects(mutation)) return false;
+    if (generated_proxy) {
+        mutation = canonical;
+        mutation.request_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.request_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.completed_send++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.upstream_absence_probe_refused = 0u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_body_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_status = 503u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_headers_exact = 0u;
+        if (!rejects(mutation)) return false;
+    } else {
+        mutation = canonical;
+        mutation.request_bytes++;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.request_bytes--;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_status = 502u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.completed_send = 0u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.upstream_absence_probe_refused = 1u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_body_bytes = 157u;
+        if (!rejects(mutation)) return false;
+        mutation = canonical;
+        mutation.response_headers_exact = 1u;
+        if (!rejects(mutation)) return false;
+    }
+    return true;
 }
 
 static bool exact_cleaned_mutation_self_check(const ExactRutCleanedReport& canonical,
@@ -12457,7 +12812,8 @@ static bool guard_protocol_self_check(std::string& error) {
     if (!decode_exact_report(live_payload, live_decoded) ||
         live_decoded.child_pid != live.child_pid ||
         live_decoded.listener_inode != live.listener_inode || live_decoded.response_bytes != 65u ||
-        live_decoded.backend != 2u) {
+        live_decoded.backend != 2u || !live_decoded.request_wire.empty() ||
+        !live_decoded.response_wire.empty() || live_decoded.response_status != 0u) {
         error = "canonical exact witness codec failed";
         return false;
     }
@@ -12467,9 +12823,54 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     live_payload = encode_exact_report(live);
-    live_payload[0] = 2u;
+    live_payload[0] = 3u;
     if (decode_exact_report(live_payload, live_decoded)) {
         error = "unknown exact witness version was accepted";
+        return false;
+    }
+    ExactRutReport generated = live;
+    generated.request_bytes = 59u;
+    generated.completed_send = 1u;
+    generated.upstream_absence_probe_refused = 1u;
+    generated.response_body_bytes = 157u;
+    generated.response_status = 502u;
+    generated.response_headers_exact = 1u;
+    generated.guard_before_connect_error = ECONNREFUSED;
+    generated.request_wire = "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    generated.response_wire =
+        "HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Type: text/html\r\n"
+        "Content-Length: 157\r\nConnection: close\r\n\r\n"
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    const std::vector<unsigned char> generated_payload = encode_exact_report(generated);
+    ExactRutReport generated_decoded;
+    if (!decode_exact_report(generated_payload, generated_decoded) ||
+        generated_decoded.request_wire != generated.request_wire ||
+        generated_decoded.response_wire != generated.response_wire ||
+        !generated_response_wire_valid(generated_decoded.response_wire)) {
+        error = "fully populated generated witness observation codec failed";
+        return false;
+    }
+    const ExactRutReport generated_canonical = generated_decoded;
+    for (std::vector<unsigned char> mutation :
+         {std::vector<unsigned char>(generated_payload.begin(), generated_payload.end() - 1u)}) {
+        if (decode_exact_report(mutation, generated_decoded)) {
+            error = "truncated generated witness observation was accepted";
+            return false;
+        }
+    }
+    std::vector<unsigned char> generated_oversize = generated_payload;
+    generated_oversize.push_back(0u);
+    if (decode_exact_report(generated_oversize, generated_decoded)) {
+        error = "oversized generated witness observation was accepted";
+        return false;
+    }
+    ExactRutReport changed = generated_canonical;
+    changed.response_wire.replace(changed.response_wire.find("502"), 3u, "503");
+    if (generated_response_wire_valid(changed.response_wire)) {
+        error = "mutated generated response observation was accepted";
         return false;
     }
     ExactRutCleanedReport cleaned;
@@ -12494,7 +12895,7 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     cleaned_payload = encode_exact_cleaned(cleaned);
-    cleaned_payload[0] = 2u;
+    cleaned_payload[0] = 3u;
     if (decode_exact_cleaned(cleaned_payload, cleaned_decoded)) {
         error = "unknown exact cleaned version was accepted";
         return false;
@@ -12511,7 +12912,7 @@ static bool guard_protocol_self_check(std::string& error) {
         return false;
     }
     cleanup.payload = exact_cleanup_payload();
-    cleanup.payload[0] = 2u;
+    cleanup.payload[0] = 3u;
     if (exact_cleanup_request(cleanup, exact_token)) {
         error = "unknown exact cleanup version was accepted";
         return false;
@@ -12798,7 +13199,9 @@ static bool run_session(const std::string& sudo_path,
                         const ExecutableLease& rut_executable,
                         const HeldTopologySnapshot& topology,
                         const char* scenario,
-                        std::string& error) {
+                        std::string& error,
+                        GeneratedProxyObservation* generated_observation = nullptr) {
+    if (generated_observation != nullptr) *generated_observation = {};
     ParentEndpoint endpoint;
     Token token;
     if (!new_token(token) || !create_parent_endpoint(endpoint, error)) return false;
@@ -12846,6 +13249,7 @@ static bool run_session(const std::string& sudo_path,
     ancestry_bundle::AncestryBundle final_ancestry;
     bool success = false;
     bool broker_lifecycle_complete = false;
+    GeneratedProxyObservation generated_observation_candidate;
     do {
         const bool root_hello_ok = await_root_hello(endpoint,
                                                     sudo_child,
@@ -13304,9 +13708,14 @@ static bool run_session(const std::string& sudo_path,
                                         target_proc,
                                         held,
                                         exact_child,
-                                        error) ||
-                !exact_witness_mutation_self_check(
-                    exact_report, rut_executable, endpoint, target_proc, held)) {
+                                        error,
+                                        generated_proxy_scenario(scenario)) ||
+                !exact_witness_mutation_self_check(exact_report,
+                                                   rut_executable,
+                                                   endpoint,
+                                                   target_proc,
+                                                   held,
+                                                   generated_proxy_scenario(scenario))) {
                 if (error.empty()) error = "exact public-RUT run/witness evidence failed";
                 break;
             }
@@ -13403,6 +13812,25 @@ static bool run_session(const std::string& sudo_path,
                     if (error.empty())
                         error = "exact public-RUT cleanup/guard-held evidence failed";
                     break;
+                }
+                if (generated_proxy_scenario(scenario)) {
+                    generated_observation_candidate = {
+                        exact_report.request_wire,
+                        exact_report.response_wire,
+                        exact_report.upstream_absence_probe_refused,
+                        exact_report.guard_before_connect_error,
+                        exact_report.guard_connect_error,
+                        exact_report.response_status,
+                        exact_report.response_headers_exact,
+                        exact_report.response_body_bytes,
+                        exact_report.child_pid,
+                        exact_report.child_start,
+                        exact_report.listener_inode,
+                        exact_report.prompt_eof,
+                        exact_cleaned.clean_exit && exact_cleaned.child_absent &&
+                                exact_cleaned.listener_absent && exact_cleaned.temps_absent
+                            ? 1u
+                            : 0u};
                 }
                 Frame released_frame;
                 GuardReport released;
@@ -13580,6 +14008,9 @@ static bool run_session(const std::string& sudo_path,
         if (!error.empty()) error += "; ";
         error += endpoint_cleanup_error;
     }
+    if (success && generated_proxy_scenario(scenario) && generated_observation != nullptr) {
+        *generated_observation = std::move(generated_observation_candidate);
+    }
     return success;
 }
 
@@ -13718,7 +14149,8 @@ static bool run_positive(const std::string& sudo_path,
                          const ExecutableLease& rut_executable,
                          const HeldTopologySnapshot& topology,
                          bool required,
-                         std::string& error) {
+                         std::string& error,
+                         GeneratedProxyObservation& generated_observation) {
     ProcIdentity host;
     if (!read_proc(getpid(), host) || topology.holder_pid <= 1 || topology.holder_start == 0 ||
         topology.holder_netns == 0 || !process_alive(topology.holder_pid) ||
@@ -13731,6 +14163,7 @@ static bool run_positive(const std::string& sudo_path,
         error = "required ancestry access probe: " + error;
         return false;
     }
+    generated_observation = {};
     for (const char* scenario : {"normal",
                                  "ready-loss",
                                  "no-ready",
@@ -13758,6 +14191,17 @@ static bool run_positive(const std::string& sudo_path,
                      executable,
                      rut_executable,
                      topology,
+                     "listener-generated-proxy-502",
+                     error,
+                     &generated_observation)) {
+        error = "listener-generated-proxy-502: " + error;
+        return false;
+    }
+    if (!run_session(sudo_path,
+                     nsenter_path,
+                     executable,
+                     rut_executable,
+                     topology,
                      "listener-cleanup-observation-failure",
                      error)) {
         error = "listener-cleanup-observation-failure: " + error;
@@ -13771,6 +14215,17 @@ static bool run_positive(const std::string& sudo_path,
                      "listener-canonical-collision-release",
                      error)) {
         error = "listener-canonical-collision-release: " + error;
+        return false;
+    }
+    if (generated_observation.request_wire.empty() || generated_observation.response_wire.empty() ||
+        generated_observation.status != 502u || generated_observation.headers_exact != 1u ||
+        generated_observation.body_bytes != 157u || generated_observation.eof != 1u ||
+        generated_observation.cleanup_complete != 1u || generated_observation.child_pid <= 1u ||
+        generated_observation.child_start == 0u || generated_observation.listener_inode == 0u ||
+        generated_observation.upstream_absence_probe_refused != 1u ||
+        generated_observation.guard_before_connect_error != ECONNREFUSED ||
+        generated_observation.guard_after_connect_error != ECONNREFUSED) {
+        error = "generated proxy observation was not published after complete session cleanup";
         return false;
     }
     return true;
@@ -13856,6 +14311,7 @@ int main(int argc, char** argv) {
                   << "\n";
         return required ? 1 : 77;
     }
+    GeneratedProxyObservation generated_observation;
     const auto result = rut::test::ipv4_topology::run_with_held_topology(
         HeldTopologyProbePolicy::SocketlessHostParent,
         [&](const HeldTopologySnapshot& topology, std::string& callback_error) {
@@ -13870,7 +14326,8 @@ int main(int argc, char** argv) {
                                 rut_executable,
                                 topology,
                                 required,
-                                callback_error);
+                                callback_error,
+                                generated_observation);
         });
     if (result.prerequisite_failure) {
         std::cerr << (required ? "FAIL" : "SKIP") << " [#358 Stage 2a3b topology]: " << result.error
@@ -13881,6 +14338,22 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [#358 Stage 2a3b broker]: " << result.error << "\n";
         return 1;
     }
+    std::cerr << "RUT-GENERATED-PROXY-OBSERVATION-v1 request_bytes="
+              << generated_observation.request_wire.size()
+              << " response_bytes=" << generated_observation.response_wire.size()
+              << " upstream_attempt_count=unobserved"
+              << " status=" << generated_observation.status
+              << " headers_exact=" << generated_observation.headers_exact
+              << " body_bytes=" << generated_observation.body_bytes
+              << " eof=" << generated_observation.eof << " upstream_absence_probe_refused="
+              << generated_observation.upstream_absence_probe_refused
+              << " guard_before_connect_error=" << generated_observation.guard_before_connect_error
+              << " guard_after_connect_error=" << generated_observation.guard_after_connect_error
+              << " child_pid=" << generated_observation.child_pid
+              << " child_start=" << generated_observation.child_start
+              << " listener_inode=" << generated_observation.listener_inode
+              << " cleanup_complete=" << generated_observation.cleanup_complete << "\n"
+              << generated_observation.request_wire << generated_observation.response_wire;
     std::cerr << "PASS: #358 Stage 2a3b authenticated sudo/nsenter broker lifecycle\n";
     return 0;
 }
