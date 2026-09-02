@@ -177,15 +177,20 @@ static void require_group_gone(pid_t pgid, const char* reason) {
 
 // Translation-unit-private evidence used only to prove that terminal cleanup
 // replay does not issue another external command.
+static std::int64_t exact_read_monotonic_ns();
 static u64 command_invocation_count = 0;
 static u64 observation_command_invocation_count = 0;
-static std::int64_t command_deadline_cap_ns = 0;
+thread_local std::int64_t command_deadline_cap_ns = 0;
 
 class CommandDeadlineScope {
 public:
     explicit CommandDeadlineScope(std::int64_t deadline_ns) : previous_(command_deadline_cap_ns) {
         command_deadline_cap_ns = deadline_ns;
     }
+    CommandDeadlineScope(const CommandDeadlineScope&) = delete;
+    CommandDeadlineScope& operator=(const CommandDeadlineScope&) = delete;
+    CommandDeadlineScope(CommandDeadlineScope&&) = delete;
+    CommandDeadlineScope& operator=(CommandDeadlineScope&&) = delete;
     ~CommandDeadlineScope() { command_deadline_cap_ns = previous_; }
     void set(std::int64_t deadline_ns) { command_deadline_cap_ns = deadline_ns; }
 
@@ -201,18 +206,31 @@ static bool run_command(const std::vector<std::string>& arguments,
                         DescendantProbe* descendant_probe = nullptr,
                         size_t output_limit = 65536) {
     ++command_invocation_count;
-    if (command_deadline_cap_ns > 0) {
-        const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch())
-                                     .count();
-        if (now >= command_deadline_cap_ns) {
-            result = {};
-            result.timed_out = true;
-            return false;
-        }
-        const std::int64_t remaining_ms = (command_deadline_cap_ns - now + 999999LL) / 1000000LL;
-        timeout_ms = static_cast<int>(std::min<std::int64_t>(timeout_ms, remaining_ms));
+    const std::int64_t invocation_now = exact_read_monotonic_ns();
+    if (invocation_now <= 0 || timeout_ms <= 0 ||
+        invocation_now > std::numeric_limits<std::int64_t>::max() -
+                              static_cast<std::int64_t>(timeout_ms) * 1000000LL) {
+        result = {};
+        result.timed_out = true;
+        return false;
     }
+    const std::int64_t relative_deadline_ns =
+        invocation_now + static_cast<std::int64_t>(timeout_ms) * 1000000LL;
+    const std::int64_t deadline_ns = command_deadline_cap_ns > 0
+                                         ? std::min(relative_deadline_ns, command_deadline_cap_ns)
+                                         : relative_deadline_ns;
+    if (invocation_now >= deadline_ns) {
+        result = {};
+        result.timed_out = true;
+        return false;
+    }
+    const auto remaining_timeout_ms = [&]() {
+        const std::int64_t now = exact_read_monotonic_ns();
+        if (now <= 0 || now >= deadline_ns) return 0;
+        const std::int64_t remaining_ns = deadline_ns - now;
+        const std::int64_t remaining_ms = (remaining_ns + 999999LL) / 1000000LL;
+        return static_cast<int>(std::min<std::int64_t>(remaining_ms, INT_MAX));
+    };
     result = {};
     if (arguments.empty()) return false;
     int pipe_fds[2] = {-1, -1};
@@ -280,11 +298,29 @@ static bool run_command(const std::vector<std::string>& arguments,
     (void)fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
     result.started = true;
     if (inject_descendant) {
+        const int marker_timeout_ms = remaining_timeout_ms();
+        if (marker_timeout_ms <= 0) {
+            close(marker_fds[0]);
+            if (!terminate_group_bounded(child))
+                runner_fail_stop(child, "deadline marker PGID remained alive");
+            close(pipe_fds[0]);
+            result.timed_out = true;
+            return false;
+        }
         pollfd marker_descriptor{marker_fds[0], POLLIN, 0};
-        if (poll(&marker_descriptor, 1, 1000) <= 0) {
+        if (poll(&marker_descriptor, 1, marker_timeout_ms) <= 0) {
             close(marker_fds[0]);
             if (!terminate_group_bounded(child))
                 runner_fail_stop(child, "descendant marker PGID remained alive");
+            close(pipe_fds[0]);
+            result.timed_out = exact_read_monotonic_ns() >= deadline_ns;
+            return false;
+        }
+        const int marker_flags = fcntl(marker_fds[0], F_GETFL, 0);
+        if (marker_flags < 0 || fcntl(marker_fds[0], F_SETFL, marker_flags | O_NONBLOCK) != 0) {
+            close(marker_fds[0]);
+            if (!terminate_group_bounded(child))
+                runner_fail_stop(child, "marker descriptor setup PGID remained alive");
             close(pipe_fds[0]);
             return false;
         }
@@ -301,6 +337,8 @@ static bool run_command(const std::vector<std::string>& arguments,
                 received += static_cast<size_t>(count);
             else if (count < 0 && errno == EINTR)
                 continue;
+            else if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
             else
                 break;
         }
@@ -319,7 +357,6 @@ static bool run_command(const std::vector<std::string>& arguments,
             descendant_probe->same_pgid = true;
         }
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     bool reaped = false;
     bool pipe_closed = false;
     while (!reaped || !pipe_closed) {
@@ -376,8 +413,11 @@ static bool run_command(const std::vector<std::string>& arguments,
                 return false;
             }
         }
-        if (reaped && pipe_closed) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
+        if (reaped && pipe_closed) {
+            if (exact_read_monotonic_ns() >= deadline_ns) result.timed_out = true;
+            break;
+        }
+        if (exact_read_monotonic_ns() >= deadline_ns) {
             (void)kill(-child, SIGTERM);
             (void)usleep(100000);
             if (!reaped) (void)kill(-child, SIGKILL);
@@ -398,8 +438,10 @@ static bool run_command(const std::vector<std::string>& arguments,
             result.timed_out = true;
             break;
         }
+        const int poll_timeout_ms = remaining_timeout_ms();
+        if (poll_timeout_ms <= 0) continue;
         pollfd descriptor{pipe_fds[0], POLLIN, 0};
-        (void)poll(&descriptor, 1, 25);
+        (void)poll(&descriptor, 1, std::min(poll_timeout_ms, 25));
     }
     if (descendant_probe != nullptr && descendant_probe->marker_received) {
         descendant_probe->alive_before_cleanup = kill(descendant_probe->pid, 0) == 0;
@@ -11080,6 +11122,12 @@ static bool exact_input_rotation_read_equal(const ExactInputRotationReadEvidence
            left.target_brackets_equal == right.target_brackets_equal;
 }
 
+static void finalize_rotation_read_command(ExactInputReadObservation& command,
+                                           std::size_t expected_size) {
+    command.expected_size = expected_size;
+    command.terminal_frozen = true;
+}
+
 static bool exact_input_rotation_read_complete_contract(
     const ExactInputRotationReadEvidence& read,
     const ExactInputRotationSourceEvidence& source,
@@ -14422,6 +14470,7 @@ static bool capture_rotation_read(ExactInputMountOwner& root,
                                        read.final_deadline_nanoseconds,
                                        command_result);
     copy_exact_read_result(command_result, command);
+    finalize_rotation_read_command(command, root.bytes.size());
     read.command = command;
     if (before_deadline()) {
         ParsedMountInspect after_mount;
@@ -15189,7 +15238,6 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
     read_command.actual_exec_observed = read_command.subtree_confinement_installed = true;
     read_command.group_echild_observed = true;
     read_command.adopted_reap_count = 1u;
-    read_command.expected_size = seed.initial_source.bytes.size();
     read_command.resolved_executable = "/usr/bin/docker";
     read_command.command_argv = {"docker",
                                  "exec",
@@ -15199,6 +15247,7 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
                                  "/bin/cat",
                                  kExactInputMountDestination};
     read_command.stdout_bytes = seed.initial_source.bytes;
+    finalize_rotation_read_command(read_command, seed.initial_source.bytes.size());
     seed.old_absence = {seed.old_mounted.id,
                         seed.old_mounted.name,
                         seed.old_mounted.pid,
