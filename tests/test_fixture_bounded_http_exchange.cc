@@ -155,8 +155,7 @@ static void serve_response(int listener, const std::string& response, ServerStat
                 const std::size_t available = std::min(received_total, sizeof(request));
                 const ssize_t received =
                     recv(client, request + available, sizeof(request) - available, 0);
-                if (received == 0)
-                    break;
+                if (received == 0) break;
                 if (received < 0 && errno == EINTR) continue;
                 if (received < 0) {
                     server_failure(state, "server recv failed");
@@ -224,9 +223,13 @@ static bool exchange_server(const std::string& response,
             ? deadline_ns_override
             : std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
                   .count();
-    const bool complete =
-        exchange("127.0.0.1", port, "GET / HTTP/1.1\r\n\r\n", deadline_ns, observation,
-                 kResponseByteLimit, shutdown_write_after_send);
+    const bool complete = exchange("127.0.0.1",
+                                   port,
+                                   "GET / HTTP/1.1\r\n\r\n",
+                                   deadline_ns,
+                                   observation,
+                                   kResponseByteLimit,
+                                   shutdown_write_after_send);
     if (result_observation != nullptr) *result_observation = observation;
     if (!check(observation.outcome == expected, "bounded exchange outcome")) ok = false;
     if (!check(complete == (expected == Outcome::Complete), "bounded exchange completion result"))
@@ -328,8 +331,8 @@ int main() {
     if (!exchange_server(valid_response(), Outcome::Complete)) ok = false;
     {
         Observation observation;
-        if (!exchange_server(valid_response(), Outcome::Complete, &observation, false, 0, false,
-                             false) ||
+        if (!exchange_server(
+                valid_response(), Outcome::Complete, &observation, false, 0, false, false) ||
             !check(observation.send_completed && !observation.write_shutdown_started &&
                        !observation.write_shutdown_completed && observation.read_started &&
                        observation.eof_observed,

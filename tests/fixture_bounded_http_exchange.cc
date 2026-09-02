@@ -243,11 +243,10 @@ bool exchange(const std::string& ipv4,
             const WaitResult wait = wait_for(fd, POLLOUT, deadline_ns);
             if (wait.error_number != 0)
                 return fail(Outcome::SendFailed, "send poll failed", wait.error_number);
-            if (wait.revents == 0)
-                return fail(Outcome::DeadlineExceeded, "send deadline exceeded");
+            if (wait.revents == 0) return fail(Outcome::DeadlineExceeded, "send deadline exceeded");
             if (wait.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                const ssize_t settled = send(fd, request.data() + sent, request.size() - sent,
-                                             MSG_NOSIGNAL);
+                const ssize_t settled =
+                    send(fd, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
                 if (settled > 0) {
                     sent += static_cast<std::size_t>(settled);
                     continue;
@@ -304,8 +303,10 @@ bool exchange(const std::string& ipv4,
                 }
                 if (settled > 0) {
                     if (observation.raw_response.size() + static_cast<std::size_t>(settled) > limit)
-                        return fail(Outcome::ResponseLimitExceeded, "response exceeds bounded byte limit");
-                    observation.raw_response.append(buffer.data(), static_cast<std::size_t>(settled));
+                        return fail(Outcome::ResponseLimitExceeded,
+                                    "response exceeds bounded byte limit");
+                    observation.raw_response.append(buffer.data(),
+                                                    static_cast<std::size_t>(settled));
                     continue;
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)

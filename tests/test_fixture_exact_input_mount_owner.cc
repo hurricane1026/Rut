@@ -1874,11 +1874,10 @@ int main(int argc, char** argv) {
             built_read.stdout_bytes != context.expected_bytes ||
             !built.observe_input_write_refusal(built_handle, built_write, diagnostic) ||
             !built.finish(built_handle, receipt, diagnostic) || !exact_terminal(receipt) ||
-            !receipt.builder.applicable ||
-            !receipt.builder.request_validated || receipt.builder.invocation_count != 1u ||
-            !receipt.builder.returned_normally || receipt.builder.threw_exception ||
-            !receipt.builder.callback_reported_success || receipt.builder.reentry_attempted ||
-            receipt.builder.sink_overflow ||
+            !receipt.builder.applicable || !receipt.builder.request_validated ||
+            receipt.builder.invocation_count != 1u || !receipt.builder.returned_normally ||
+            receipt.builder.threw_exception || !receipt.builder.callback_reported_success ||
+            receipt.builder.reentry_attempted || receipt.builder.sink_overflow ||
             receipt.builder.sink_size != context.expected_bytes.size() ||
             !receipt.builder.output_accepted || !receipt.builder.directory_acquired_after_builder ||
             !receipt.builder.input_acquired_after_builder ||

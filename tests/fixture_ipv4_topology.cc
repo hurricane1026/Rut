@@ -7115,7 +7115,8 @@ static bool validate_pinned_nginx_http_observation(ExactInputNginxLifecycleObser
     std::size_t offset = 0u;
     while (offset <= observation.nginx_logs.size()) {
         const std::size_t newline = observation.nginx_logs.find('\n', offset);
-        const std::size_t end = newline == std::string::npos ? observation.nginx_logs.size() : newline;
+        const std::size_t end =
+            newline == std::string::npos ? observation.nginx_logs.size() : newline;
         const std::string_view line(observation.nginx_logs.data() + offset, end - offset);
         const std::size_t marker = line.find("connect() failed");
         if (marker != std::string_view::npos) {
@@ -7408,7 +7409,8 @@ static bool nginx_sidecar_equal(const ExactInputMountedSidecarEvidence& left,
            left.mount_netns == right.mount_netns && left.running == right.running &&
            left.read_only_root == right.read_only_root &&
            left.capability_drop_all == right.capability_drop_all &&
-           left.no_new_privileges == right.no_new_privileges && left.restart_no == right.restart_no &&
+           left.no_new_privileges == right.no_new_privileges &&
+           left.restart_no == right.restart_no &&
            left.no_published_ports == right.no_published_ports &&
            left.requested_mount_exact == right.requested_mount_exact &&
            left.realized_mount_exact == right.realized_mount_exact &&
@@ -7734,8 +7736,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     sample.container_identity_verified = true;
     sample.master_pid = inspect.pid;
     ProcIdentity master{};
-    if (!proc_identity(inspect.pid, master) ||
-        master.netns != nginx_topology(owner).holder_netns ||
+    if (!proc_identity(inspect.pid, master) || master.netns != nginx_topology(owner).holder_netns ||
         !proc_credentials_exact(
             inspect.pid, owner.input.identity().uid, owner.input.identity().gid) ||
         !proc_nspid_exact(inspect.pid, true)) {
@@ -7821,8 +7822,7 @@ static bool capture_nginx_sample(ExactInputMountOwner& owner,
     fixture_privileged_listener::ListenerEvidence listener;
     if (!parse_ipv4(nginx_topology(owner).positive_ip, positive) ||
         !parse_ipv4(nginx_topology(owner).guard_ip, guard) ||
-        !parse_nginx_proc_net_tcp(tcp, 8u, table) ||
-        !parse_nginx_proc_net_tcp(tcp6, 32u, table6)) {
+        !parse_nginx_proc_net_tcp(tcp, 8u, table) || !parse_nginx_proc_net_tcp(tcp6, 32u, table6)) {
         error = "nginx TCP table or listener plan was rejected";
         return false;
     }
@@ -9251,8 +9251,7 @@ static bool settle_nginx_sibling(ExactInputMountOwner& owner,
 static bool revalidate_nginx_baseline(ExactInputMountOwner& owner, std::string& error) {
     fixture_exact_input_file_lease::Diagnostic source_diagnostic;
     if (owner.rotated_lifecycle_authority) {
-        if (!owner.input.revalidate(source_diagnostic) ||
-            !revalidate_nginx_sidecar(owner, error) ||
+        if (!owner.input.revalidate(source_diagnostic) || !revalidate_nginx_sidecar(owner, error) ||
             !owner.fixture.verify_topology(FailurePoint::None, error) ||
             !topology_snapshot_equal(nginx_topology(owner),
                                      owner.fixture.current_topology_snapshot())) {
@@ -9666,9 +9665,10 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     const std::string http_date = "Tue, 01 Jan 2030 00:00:00 GMT";
     const std::string http_wire =
-        std::string("HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ") +
-        http_date + "\r\nContent-Type: text/html\r\nContent-Length: 157\r\n"
-        "Connection: close\r\n\r\n" + http_body;
+        std::string("HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: ") + http_date +
+        "\r\nContent-Type: text/html\r\nContent-Length: 157\r\n"
+        "Connection: close\r\n\r\n" +
+        http_body;
     ExactInputNginxLifecycleObservation valid_http;
     valid_http.logs_captured = true;
     valid_http.nginx_logs =
@@ -9702,7 +9702,8 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
         return true;
     };
     if (!validate_pinned_nginx_http_observation(valid_http, "127.0.0.1", error)) {
-        diagnostic = {ExactInputMountPhase::Lifecycle, 0, "valid HTTP observation was rejected: " + error};
+        diagnostic = {
+            ExactInputMountPhase::Lifecycle, 0, "valid HTTP observation was rejected: " + error};
         return false;
     }
     auto http_mutation = valid_http;
@@ -10869,10 +10870,9 @@ bool ExactInputMountRecoveryController::observe_input_write_refusal(
     return true;
 }
 
-static bool observe_nginx_lifecycle_impl(
-    ExactInputMountOwner* owner,
-    ExactInputNginxLifecycleObservation& observation,
-    ExactInputMountDiagnostic& diagnostic) {
+static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
+                                         ExactInputNginxLifecycleObservation& observation,
+                                         ExactInputMountDiagnostic& diagnostic) {
     diagnostic = {};
     ExactInputNginxLifecycleObservation current;
     current.attempted = true;
@@ -10933,8 +10933,7 @@ static bool observe_nginx_lifecycle_impl(
     CommandDeadlineScope command_deadline(sample_a_deadline);
     fixture_exact_input_file_lease::Diagnostic source_diagnostic;
     std::string error;
-    if (!owner->input.revalidate(source_diagnostic) ||
-        !revalidate_nginx_sidecar(*owner, error) ||
+    if (!owner->input.revalidate(source_diagnostic) || !revalidate_nginx_sidecar(*owner, error) ||
         !owner->fixture.verify_topology(FailurePoint::None, error) ||
         !topology_snapshot_equal(nginx_topology(*owner),
                                  owner->fixture.current_topology_snapshot()))
@@ -11092,13 +11091,13 @@ static bool observe_nginx_lifecycle_impl(
     if (owner->rotated_lifecycle_authority) {
         command_deadline.set(sample_b_deadline);
         const std::int64_t earliest_b = current.sample_a.bracket_end_nanoseconds + 250000000LL;
-        while (exact_read_monotonic_ns() < earliest_b && remaining_command_ms(sample_b_deadline) > 0)
+        while (exact_read_monotonic_ns() < earliest_b &&
+               remaining_command_ms(sample_b_deadline) > 0)
             (void)poll(nullptr, 0, 10);
         if (!capture_nginx_sample(*owner, current.sample_b, sample_b_deadline, false, error) ||
             owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectSampleB)
-            return freeze_failure(
-                ExactInputNginxLifecycleOutcome::SampleFailed,
-                error.empty() ? "injected/rejected nginx sample B" : error);
+            return freeze_failure(ExactInputNginxLifecycleOutcome::SampleFailed,
+                                  error.empty() ? "injected/rejected nginx sample B" : error);
         current.samples_at_least_250ms_apart =
             current.sample_b.bracket_start_nanoseconds - current.sample_a.bracket_end_nanoseconds >=
             250000000LL;
@@ -11111,9 +11110,8 @@ static bool observe_nginx_lifecycle_impl(
     // The transport phase has its own cutoff inside the single lifecycle
     // deadline, leaving the final twelve seconds for sample B and cleanup.
     const std::int64_t http_deadline =
-        current.final_deadline_nanoseconds - (owner->rotated_lifecycle_authority
-                                                  ? 10000000000LL
-                                                  : 13000000000LL);
+        current.final_deadline_nanoseconds -
+        (owner->rotated_lifecycle_authority ? 10000000000LL : 13000000000LL);
     command_deadline.set(http_deadline);
     static constexpr char kPinnedRequest[] =
         "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -11133,7 +11131,8 @@ static bool observe_nginx_lifecycle_impl(
     if (!owner->rotated_lifecycle_authority) {
         command_deadline.set(sample_b_deadline);
         const std::int64_t earliest_b = current.sample_a.bracket_end_nanoseconds + 250000000LL;
-        while (exact_read_monotonic_ns() < earliest_b && remaining_command_ms(sample_b_deadline) > 0)
+        while (exact_read_monotonic_ns() < earliest_b &&
+               remaining_command_ms(sample_b_deadline) > 0)
             (void)poll(nullptr, 0, 10);
         if (!capture_nginx_sample(*owner, current.sample_b, sample_b_deadline, false, error) ||
             owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectSampleB)
@@ -11152,14 +11151,15 @@ static bool observe_nginx_lifecycle_impl(
         const bool stable = current.samples_at_least_250ms_apart &&
                             nginx_samples_stable(current.sample_a, current.sample_b);
         if (!stable)
-            return freeze_failure(
-                ExactInputNginxLifecycleOutcome::SampleDrift,
-                "nginx process/listener evidence drifted between stable samples");
+            return freeze_failure(ExactInputNginxLifecycleOutcome::SampleDrift,
+                                  "nginx process/listener evidence drifted between stable samples");
     }
 
     if (owner->rotated_lifecycle_authority &&
-        !capture_rotation_terminal_tcp(*owner, owner->lifecycle_terminal_tcp,
-                                       current.final_deadline_nanoseconds - 9000000000LL, error))
+        !capture_rotation_terminal_tcp(*owner,
+                                       owner->lifecycle_terminal_tcp,
+                                       current.final_deadline_nanoseconds - 9000000000LL,
+                                       error))
         return freeze_failure(ExactInputNginxLifecycleOutcome::SampleDrift,
                               "terminal nginx TIME_WAIT evidence failed: " + error);
 
@@ -11818,8 +11818,7 @@ static bool nginx_process_sample_equal(const ExactInputNginxProcessSample& left,
            left.mount_verified == right.mount_verified &&
            left.topology_verified == right.topology_verified &&
            left.cgroup_exact == right.cgroup_exact && left.pidfile_exact == right.pidfile_exact &&
-           left.tcp_exact == right.tcp_exact &&
-           left.tcp6_port_absent == right.tcp6_port_absent &&
+           left.tcp_exact == right.tcp_exact && left.tcp6_port_absent == right.tcp6_port_absent &&
            left.upstream_port_9000_absent == right.upstream_port_9000_absent &&
            left.end_container_identity_verified == right.end_container_identity_verified &&
            left.end_source_revalidated == right.end_source_revalidated &&
@@ -11866,15 +11865,16 @@ static bool nginx_observation_empty(const ExactInputNginxLifecycleObservation& v
            value.same_mount_instance && !value.sibling_mount_independently_verified &&
            !value.samples_at_least_250ms_apart && !value.quit_attempted && !value.quit_only &&
            !value.term_attempted && !value.kill_attempted && !value.force_remove_attempted &&
-           !value.uncertain_cleanup && !value.stopped_exit_zero &&
-           !value.cgroup_empty_after_stop && !value.removed_nonforce && !value.exact_absence &&
-           !value.baseline_restored && !value.operation_failed && value.create_count == 0u &&
-           value.start_count == 0u && value.remove_count == 0u && value.container_name.empty() &&
-           value.container_id.empty() && value.create_argv.empty() &&
-           bounded_http_observation_empty(value.http) && !value.http_response_exact &&
-           !value.upstream_absence_before && !value.upstream_absence_after &&
-           !value.logs_captured && !value.scoped_refusal_log_exact && value.nginx_logs.empty() &&
-           nginx_process_sample_empty(value.sample_a) && nginx_process_sample_empty(value.sample_b) &&
+           !value.uncertain_cleanup && !value.stopped_exit_zero && !value.cgroup_empty_after_stop &&
+           !value.removed_nonforce && !value.exact_absence && !value.baseline_restored &&
+           !value.operation_failed && value.create_count == 0u && value.start_count == 0u &&
+           value.remove_count == 0u && value.container_name.empty() && value.container_id.empty() &&
+           value.create_argv.empty() && bounded_http_observation_empty(value.http) &&
+           !value.http_response_exact && !value.upstream_absence_before &&
+           !value.upstream_absence_after && !value.logs_captured &&
+           !value.scoped_refusal_log_exact && value.nginx_logs.empty() &&
+           nginx_process_sample_empty(value.sample_a) &&
+           nginx_process_sample_empty(value.sample_b) &&
            value.diagnostic.phase == ExactInputMountPhase::None &&
            value.diagnostic.error_number == 0 && value.diagnostic.message.empty();
 }
@@ -12001,8 +12001,7 @@ bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvi
         return reject("state");
     if (!evidence.nginx_required &&
         (!nginx_observation_empty(evidence.old_nginx) ||
-         !rotation_terminal_tcp_empty(evidence.old_terminal_tcp) ||
-         evidence.fresh_clean_baseline))
+         !rotation_terminal_tcp_empty(evidence.old_terminal_tcp) || evidence.fresh_clean_baseline))
         return reject("disabled nginx mode carried lifecycle evidence");
     if (evidence.initial_source.path.empty() || evidence.initial_source.bytes.empty() ||
         evidence.initial_source.size != evidence.initial_source.bytes.size() ||
@@ -12112,24 +12111,27 @@ bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvi
             !nginx_samples_stable(old_nginx.sample_a, old_nginx.sample_b) ||
             old_nginx.sample_b.bracket_end_nanoseconds > old_nginx.http.start_nanoseconds ||
             !validate_pinned_nginx_http_observation(
-                old_nginx, evidence.generation_receipt.old_generation.topology.positive_ip,
-                nginx_error, false) ||
+                old_nginx,
+                evidence.generation_receipt.old_generation.topology.positive_ip,
+                nginx_error,
+                false) ||
             !evidence.old_terminal_tcp.attempted || !evidence.old_terminal_tcp.complete ||
             evidence.old_terminal_tcp.local_port != kExactInputTopologyBuilderPort ||
             evidence.old_terminal_tcp.state != 0x06u ||
             evidence.old_terminal_tcp.local_ipv4 !=
                 [&] {
                     u32 positive = 0u;
-                    return parse_ipv4(evidence.generation_receipt.old_generation.topology.positive_ip,
-                                      positive)
+                    return parse_ipv4(
+                               evidence.generation_receipt.old_generation.topology.positive_ip,
+                               positive)
                                ? positive
                                : 0u;
                 }() ||
             evidence.old_terminal_tcp.remote_ipv4 == 0u ||
             evidence.old_terminal_tcp.remote_port == 0u ||
             evidence.old_terminal_tcp.remote_port == kExactInputTopologyBuilderPort) {
-            return reject(nginx_error.empty() ? "old nginx HTTP/TIME_WAIT evidence" :
-                                                 nginx_error.c_str());
+            return reject(nginx_error.empty() ? "old nginx HTTP/TIME_WAIT evidence"
+                                              : nginx_error.c_str());
         }
     } else {
         const auto reject_unresolved = [&](const char* field) {
@@ -16593,8 +16595,7 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
     seed.old_and_fresh_authorities_separate = seed.operation_ok = true;
     seed.old_create_count = seed.old_remove_count = seed.fresh_create_count =
         seed.fresh_start_count = 1;
-    const auto valid_nginx_sample = [](std::int64_t bracket_start,
-                                       std::int64_t bracket_end) {
+    const auto valid_nginx_sample = [](std::int64_t bracket_start, std::int64_t bracket_end) {
         ExactInputNginxProcessSample sample;
         sample.complete = sample.container_identity_verified = sample.source_revalidated = true;
         sample.mount_verified = sample.topology_verified = sample.cgroup_exact = true;
@@ -16641,9 +16642,8 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         "<center><h1>502 Bad Gateway</h1></center>\r\n"
         "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
     std::string old_http_error;
-    (void)bounded_http_exchange::parse_response(seed.old_nginx.http.raw_response,
-                                                seed.old_nginx.http.parsed,
-                                                old_http_error);
+    (void)bounded_http_exchange::parse_response(
+        seed.old_nginx.http.raw_response, seed.old_nginx.http.parsed, old_http_error);
     seed.old_nginx.sample_a.upstream_port_9000_absent =
         seed.old_nginx.sample_b.upstream_port_9000_absent = true;
     seed.old_nginx.logs_captured = true;
@@ -16656,8 +16656,8 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
     seed.old_nginx.quit_attempted = seed.old_nginx.quit_only = true;
     seed.old_nginx.stopped_exit_zero = seed.old_nginx.cgroup_empty_after_stop = true;
     seed.old_nginx.removed_nonforce = seed.old_nginx.exact_absence = true;
-    seed.old_terminal_tcp = {true, true, 0x0afdf002u, kExactInputTopologyBuilderPort,
-                             0x06u, 0x7f000001u, 50000u};
+    seed.old_terminal_tcp = {
+        true, true, 0x0afdf002u, kExactInputTopologyBuilderPort, 0x06u, 0x7f000001u, 50000u};
     std::string diagnostic;
     if (!validate_exact_input_rotation_live_evidence(seed, diagnostic)) {
         error = "valid exact-input rotation seed was rejected: " + diagnostic;
@@ -16721,9 +16721,8 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
                 value.old_nginx.http.start_nanoseconds + 1;
         }) ||
         !reject([](auto& value) { value.old_nginx.http.write_shutdown_started = true; }) ||
-        !reject([](auto& value) {
-            value.old_nginx.http.write_shutdown_completed_nanoseconds = 1;
-        }) ||
+        !reject(
+            [](auto& value) { value.old_nginx.http.write_shutdown_completed_nanoseconds = 1; }) ||
         !reject([](auto& value) { value.old_nginx.http.write_shutdown_completed = true; }) ||
         !reject([](auto& value) { value.old_nginx.http.error_number = EPIPE; }) ||
         !reject([](auto& value) {
