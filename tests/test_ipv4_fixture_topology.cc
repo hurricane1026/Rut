@@ -289,6 +289,63 @@ int main() {
             return 1;
         }
     }
+    bool complete_receipt_callback_ran = false;
+    const RunResult complete_receipt =
+        rut::test::ipv4_topology::run_with_complete_generation_rotation(
+            [&](const rut::test::ipv4_topology::HeldNamespaceGenerationRotationReceipt& receipt,
+                std::string& error) {
+                complete_receipt_callback_ran = true;
+                return rut::test::ipv4_topology::
+                    validate_held_namespace_generation_rotation_receipt(receipt, error);
+            });
+    if (complete_receipt.prerequisite_failure || !complete_receipt.success ||
+        !complete_receipt.cleanup_complete || !complete_receipt.residue_free ||
+        !complete_receipt_callback_ran ||
+        complete_receipt.semantic_receipt !=
+            "verified complete holder-sidecar generation receipt and zero residue" ||
+        complete_receipt.error != complete_receipt.semantic_receipt) {
+        std::cerr << "FAIL [#412 complete generation receipt]: " << complete_receipt.error << "\n";
+        return 1;
+    }
+    bool timeout_receipt_callback_ran = false;
+    const RunResult timeout_receipt =
+        rut::test::ipv4_topology::run_with_complete_generation_rotation(
+            [&](const rut::test::ipv4_topology::HeldNamespaceGenerationRotationReceipt& receipt,
+                std::string& error) {
+                timeout_receipt_callback_ran = true;
+                return rut::test::ipv4_topology::
+                    validate_held_namespace_generation_rotation_receipt(receipt, error);
+            },
+            HolderOnlyRecreationFailurePoint::CreateReportedTimeout,
+            RecreatedSidecarFailurePoint::CleanupReportedTimeout);
+    if (timeout_receipt.prerequisite_failure || !timeout_receipt.success ||
+        !timeout_receipt.cleanup_complete || !timeout_receipt.residue_free ||
+        !timeout_receipt_callback_ran ||
+        timeout_receipt.semantic_receipt !=
+            "verified complete holder-sidecar generation receipt and zero residue" ||
+        timeout_receipt.error != timeout_receipt.semantic_receipt) {
+        std::cerr << "FAIL [#412 complete generation timeout receipt]: " << timeout_receipt.error
+                  << "\n";
+        return 1;
+    }
+    bool mutated_complete_receipt_callback_ran = false;
+    const RunResult mutated_complete_receipt =
+        rut::test::ipv4_topology::run_with_complete_generation_rotation(
+            [&](const rut::test::ipv4_topology::HeldNamespaceGenerationRotationReceipt&,
+                std::string&) {
+                mutated_complete_receipt_callback_ran = true;
+                return true;
+            },
+            HolderOnlyRecreationFailurePoint::None,
+            RecreatedSidecarFailurePoint::CleanupIdentityMutation);
+    if (mutated_complete_receipt.prerequisite_failure || !mutated_complete_receipt.success ||
+        !mutated_complete_receipt.cleanup_complete || !mutated_complete_receipt.residue_free ||
+        mutated_complete_receipt_callback_ran ||
+        !mutated_complete_receipt.semantic_receipt.empty()) {
+        std::cerr << "FAIL [#412 complete receipt second-bracket mutation]: "
+                  << mutated_complete_receipt.error << "\n";
+        return 1;
+    }
     bool failing_callback_ran = false;
     const RunResult callback_failure = rut::test::ipv4_topology::run_with_held_topology_and_sidecar(
         [&](const rut::test::ipv4_topology::HeldTopologySnapshot&,

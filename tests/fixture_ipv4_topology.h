@@ -146,6 +146,19 @@ struct HeldNamespaceGenerationRotationReceipt {
         HeldNamespaceGenerationRotationPhase::None;
 };
 
+// Private composition is published only after both independent new-generation
+// brackets validate.  The receipt itself remains a value copy owned by the
+// caller; no Fixture owner is aliased into it.
+enum class HeldNamespaceGenerationReceiptCompositionState : std::uint8_t {
+    Ready = 0,
+    OldGenerationValidated,
+    OldGenerationAbsent,
+    NewGenerationCreated,
+    NewGenerationValidated,
+    Published,
+    Unresolved,
+};
+
 enum class HolderOnlyRecreationState : std::uint8_t {
     Ready = 0,
     CreateMayHaveMutated,
@@ -295,6 +308,8 @@ using HolderOnlyRecreationCallback =
     std::function<bool(const HolderOnlyRecreationEvidence& evidence, std::string& error)>;
 using RecreatedSidecarCallback =
     std::function<bool(const RecreatedSidecarEvidence& evidence, std::string& error)>;
+using HeldNamespaceGenerationReceiptCallback =
+    std::function<bool(const HeldNamespaceGenerationRotationReceipt& receipt, std::string& error)>;
 
 RunResult run(FailurePoint failure_point);
 RunResult run_with_held_topology(const HeldTopologyCallback& callback);
@@ -312,6 +327,10 @@ RunResult run_with_holder_only_recreation(
     HolderOnlyRecreationFailurePoint failure_point = HolderOnlyRecreationFailurePoint::None);
 RunResult run_with_recreated_sidecar(
     const RecreatedSidecarCallback& callback,
+    HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
+    RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
+RunResult run_with_complete_generation_rotation(
+    const HeldNamespaceGenerationReceiptCallback& callback,
     HolderOnlyRecreationFailurePoint holder_failure_point = HolderOnlyRecreationFailurePoint::None,
     RecreatedSidecarFailurePoint sidecar_failure_point = RecreatedSidecarFailurePoint::None);
 RunResult run_with_held_topology_and_sidecar(
