@@ -909,6 +909,10 @@ if(RUT_ENABLE_JIT)
     add_dependencies(test_fixture_privileged_broker rut)
     add_test(NAME test_fixture_privileged_broker
              COMMAND test_fixture_privileged_broker $<TARGET_FILE:rut>)
+    add_test(NAME test_fixture_generated_nginx_differential
+             COMMAND test_fixture_privileged_broker
+                     $<TARGET_FILE:rut>
+                     --generated-nginx-differential)
 
     add_executable(test_fixture_exact_input_mount_owner
         test_fixture_exact_input_mount_owner.cc
@@ -953,6 +957,13 @@ if(RUT_ENABLE_JIT)
     set(_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS 360)
     set_tests_properties(test_fixture_privileged_broker PROPERTIES
         LABELS "integration;docker;network"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}
+        SKIP_RETURN_CODE 77
+    )
+    set_tests_properties(test_fixture_generated_nginx_differential PROPERTIES
+        LABELS "integration;docker;network;differential"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT ${_RUT_PRIVILEGED_BROKER_TIMEOUT_SECONDS}

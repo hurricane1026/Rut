@@ -92,6 +92,8 @@ using rut::test::fixture_direct_launch::validate_launcher_ancestry;
 using rut::test::ipv4_topology::HeldTopologyProbePolicy;
 using rut::test::ipv4_topology::HeldTopologySnapshot;
 
+namespace ipv4_topology = rut::test::ipv4_topology;
+
 constexpr u16 kBrokerRootHello = 20;
 constexpr u16 kCallerCredentials = 21;
 constexpr u16 kBrokerDropped = 22;
@@ -232,6 +234,7 @@ static bool exact_liveness_self_check(std::string& error);
 static int remaining_deadline_ms(std::chrono::steady_clock::time_point deadline);
 static std::chrono::steady_clock::time_point new_exact_cleanup_deadline();
 static bool generated_proxy_scenario(const char* scenario);
+static bool generated_proxy_differential_scenario(const char* scenario);
 
 static bool listener_scenario_name(const char* scenario) {
     return strcmp(scenario, "listener-guard-reservation") == 0 ||
@@ -241,7 +244,12 @@ static bool listener_scenario_name(const char* scenario) {
 }
 
 static bool generated_proxy_scenario(const char* scenario) {
-    return strcmp(scenario, "listener-generated-proxy-502") == 0;
+    return strcmp(scenario, "listener-generated-proxy-502") == 0 ||
+           generated_proxy_differential_scenario(scenario);
+}
+
+static bool generated_proxy_differential_scenario(const char* scenario) {
+    return strcmp(scenario, "listener-generated-proxy-502-differential") == 0;
 }
 
 static bool canonical_collision_scenario(const char* scenario) {
@@ -291,7 +299,11 @@ static int scenario_aggregate_wait_ms(const char* scenario) {
 }
 
 static bool listener_failure_bound_self_check(std::string& error) {
-    if (launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
+    if (generated_proxy_differential_scenario("listener-generated-proxy-502") ||
+        !generated_proxy_differential_scenario("listener-generated-proxy-502-differential") ||
+        generated_proxy_differential_scenario(
+            "listener-generated-proxy-502-differential-mutated") ||
+        launcher_broker_wait_ms("listener-cleanup-observation-failure") !=
             kListenerDeadlineMs * 4 ||
         cleanup_response_wait_ms("listener-cleanup-observation-failure") !=
             kListenerDeadlineMs * 2 ||
@@ -299,11 +311,16 @@ static bool listener_failure_bound_self_check(std::string& error) {
         cleanup_response_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
         launcher_broker_wait_ms("listener-generated-proxy-502") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
+        launcher_broker_wait_ms("listener-generated-proxy-502-differential") != kBrokerDeadlineMs ||
+        cleanup_response_wait_ms("listener-generated-proxy-502-differential") !=
+            kListenerDeadlineMs ||
         launcher_broker_wait_ms("normal") != kBrokerDeadlineMs ||
         cleanup_response_wait_ms("normal") != kListenerDeadlineMs ||
         scenario_aggregate_wait_ms("normal") != kBrokerDeadlineMs ||
         scenario_aggregate_wait_ms("listener-guard-reservation") != kListenerDeadlineMs ||
         scenario_aggregate_wait_ms("listener-generated-proxy-502") != kListenerDeadlineMs ||
+        scenario_aggregate_wait_ms("listener-generated-proxy-502-differential") !=
+            kListenerDeadlineMs ||
         scenario_aggregate_wait_ms("listener-cleanup-observation-failure") !=
             kListenerFailureLauncherWaitMs ||
         scenario_aggregate_wait_ms("listener-wildcard-attempt") !=
@@ -325,12 +342,15 @@ static bool listener_failure_bound_self_check(std::string& error) {
         target_wait_strategy("listener-guard-reservation") != TargetWaitStrategy::ListenerCustody ||
         target_wait_strategy("listener-generated-proxy-502") !=
             TargetWaitStrategy::ListenerCustody ||
+        target_wait_strategy("listener-generated-proxy-502-differential") !=
+            TargetWaitStrategy::ListenerCustody ||
         target_wait_strategy("listener-cleanup-observation-failure") !=
             TargetWaitStrategy::ListenerCustody ||
         target_wait_requires_custody("listener-canonical-collision-release") ||
         target_wait_requires_custody("normal") ||
         !target_wait_requires_custody("listener-guard-reservation") ||
         !target_wait_requires_custody("listener-generated-proxy-502") ||
+        !target_wait_requires_custody("listener-generated-proxy-502-differential") ||
         !target_wait_requires_custody("listener-cleanup-observation-failure") ||
         !(kCanonicalTargetOperationMs < kCanonicalTargetCleanupMs) ||
         !(kCanonicalTargetCleanupMs + kCanonicalParentDispatchSlackMs <
@@ -1271,6 +1291,11 @@ struct GeneratedProxyObservation {
     u64 child_pid = 0u;
     u64 child_start = 0u;
     u64 listener_inode = 0u;
+    u64 positive_ipv4 = 0u;
+    u64 guard_ipv4 = 0u;
+    u64 port = 0u;
+    u64 upstream_ipv4 = 0u;
+    u64 upstream_port = 0u;
     u64 eof = 0u;
     u64 cleanup_complete = 0u;
 };
@@ -5488,6 +5513,37 @@ static bool exact_log_ready(const std::string& log,
     return true;
 }
 
+static std::string assigned_proxy_server_fragment(const privileged_listener::ListenerPlan& plan) {
+    return "server {\n  listen " + std::to_string((plan.positive_ipv4 >> 24u) & 0xffu) + "." +
+           std::to_string((plan.positive_ipv4 >> 16u) & 0xffu) + "." +
+           std::to_string((plan.positive_ipv4 >> 8u) & 0xffu) + "." +
+           std::to_string(plan.positive_ipv4 & 0xffu) + ":" + std::to_string(plan.port) +
+           ";\n  location / { proxy_pass http://127.0.0.1:9000; }\n}";
+}
+
+struct GeneratedDifferentialBuilderContext {
+    std::string expected_bytes;
+    std::uint32_t calls = 0u;
+};
+
+static bool build_generated_differential_nginx_config(
+    const ipv4_topology::ExactInputTopologyBuildRequest& request,
+    ipv4_topology::ExactInputTopologyBuildSink& sink,
+    void* opaque) {
+    auto* context = static_cast<GeneratedDifferentialBuilderContext*>(opaque);
+    if (context == nullptr || request.port != ipv4_topology::kExactInputTopologyBuilderPort)
+        return false;
+    privileged_listener::ListenerPlan plan{};
+    if (!parse_canonical_ipv4(request.positive_ipv4.data(), plan.positive_ipv4) ||
+        !parse_canonical_ipv4(request.guard_ipv4.data(), plan.guard_ipv4))
+        return false;
+    plan.port = request.port;
+    const std::string fragment = assigned_proxy_server_fragment(plan);
+    context->expected_bytes = "events {}\nhttp { " + fragment + " }\n";
+    ++context->calls;
+    return sink.append(context->expected_bytes.data(), context->expected_bytes.size());
+}
+
 static bool build_generated_proxy_source(const privileged_listener::ListenerPlan& plan,
                                          std::string& source,
                                          std::string& diagnostic) {
@@ -5497,12 +5553,7 @@ static bool build_generated_proxy_source(const privileged_listener::ListenerPlan
         diagnostic = "invalid generated listener plan";
         return false;
     }
-    const std::string fragment =
-        "server {\n  listen " + std::to_string((plan.positive_ipv4 >> 24u) & 0xffu) + "." +
-        std::to_string((plan.positive_ipv4 >> 16u) & 0xffu) + "." +
-        std::to_string((plan.positive_ipv4 >> 8u) & 0xffu) + "." +
-        std::to_string(plan.positive_ipv4 & 0xffu) + ":" + std::to_string(plan.port) +
-        ";\n  location / { proxy_pass http://127.0.0.1:9000; }\n}";
+    const std::string fragment = assigned_proxy_server_fragment(plan);
     const auto parsed =
         rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
     if (!parsed) {
@@ -5586,6 +5637,270 @@ static bool generated_response_wire_valid(const std::string& response) {
            valid_http_date(response.substr(date_start, date_end - date_start)) &&
            response == std::string(prefix) + response.substr(date_start, date_end - date_start) +
                            std::string(suffix) + std::string(body);
+}
+
+static bool normalize_http_date_wire(const std::string& wire,
+                                     std::string& normalized,
+                                     rut::test::bounded_http_exchange::ParsedResponse& parsed,
+                                     std::string& error) {
+    if (!rut::test::bounded_http_exchange::parse_response(wire, parsed, error) ||
+        parsed.version != "1.1" || parsed.headers.size() != 5u) {
+        if (error.empty()) error = "HTTP wire did not parse as the bounded response";
+        return false;
+    }
+    std::size_t date_header_count = 0u;
+    for (const auto& header : parsed.headers) {
+        if (header.name == "Date") {
+            ++date_header_count;
+            if (!valid_http_date(header.value)) {
+                error = "HTTP Date header was not a valid 29-byte RFC1123 value";
+                return false;
+            }
+        }
+    }
+    if (date_header_count != 1u) {
+        error = "HTTP response did not contain exactly one Date header";
+        return false;
+    }
+    const std::string marker = "\r\nDate: ";
+    const std::size_t date_start = wire.find(marker);
+    if (date_start == std::string::npos ||
+        wire.find(marker, date_start + 1u) != std::string::npos) {
+        error = "HTTP Date wire framing was not unique";
+        return false;
+    }
+    const std::size_t value_start = date_start + marker.size();
+    const std::size_t value_end = wire.find("\r\n", value_start);
+    if (value_end == std::string::npos || value_end - value_start != 29u) {
+        error = "HTTP Date wire value was not exactly 29 bytes";
+        return false;
+    }
+    normalized = wire;
+    normalized.replace(value_start, 29u, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    return true;
+}
+
+static bool compare_generated_proxy_observation(
+    const ipv4_topology::ExactInputRotationLiveEvidence& evidence,
+    const GeneratedProxyObservation& generated,
+    std::string& error) {
+    static constexpr char request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    const auto& nginx = evidence.old_nginx;
+    u32 expected_positive = 0u;
+    u32 expected_guard = 0u;
+    const std::string expected_listen =
+        "listen " + evidence.generation_receipt.new_generation.topology.positive_ip + ":" +
+        std::to_string(ipv4_topology::kExactInputTopologyBuilderPort);
+    if (!parse_canonical_ipv4(evidence.generation_receipt.new_generation.topology.positive_ip,
+                              expected_positive) ||
+        !parse_canonical_ipv4(evidence.generation_receipt.new_generation.topology.guard_ip,
+                              expected_guard) ||
+        expected_positive == 0u || (expected_positive >> 24u) == 127u ||
+        expected_positive == expected_guard ||
+        evidence.initial_source.bytes.find(expected_listen) == std::string::npos ||
+        evidence.fresh_source.bytes.find(expected_listen) == std::string::npos ||
+        evidence.initial_source.bytes.find("proxy_pass http://127.0.0.1:9000;") ==
+            std::string::npos ||
+        evidence.fresh_source.bytes.find("proxy_pass http://127.0.0.1:9000;") ==
+            std::string::npos ||
+        !evidence.old_terminal_tcp.attempted || !evidence.old_terminal_tcp.complete ||
+        evidence.old_terminal_tcp.local_ipv4 != expected_positive ||
+        evidence.old_terminal_tcp.local_port != ipv4_topology::kExactInputTopologyBuilderPort ||
+        generated.positive_ipv4 != expected_positive || generated.guard_ipv4 != expected_guard ||
+        generated.port != ipv4_topology::kExactInputTopologyBuilderPort ||
+        generated.upstream_ipv4 != 0x7f000001u || generated.upstream_port != 9000u ||
+        generated.cleanup_complete != 1u || generated.child_pid <= 1u ||
+        generated.child_start == 0u || generated.listener_inode == 0u ||
+        nginx.outcome != ipv4_topology::ExactInputNginxLifecycleOutcome::Complete ||
+        !nginx.http.attempted || !nginx.http.eof_observed || nginx.http.request != request ||
+        nginx.http.write_shutdown_started || nginx.http.write_shutdown_completed ||
+        !nginx.upstream_absence_before || !nginx.upstream_absence_after ||
+        generated.request_wire != request || generated.upstream_absence_probe_refused != 1u ||
+        generated.guard_before_connect_error != ECONNREFUSED ||
+        generated.guard_after_connect_error != ECONNREFUSED || generated.eof != 1u) {
+        error = "nginx/RUT request, refusal, EOF, or independent endpoint evidence differed";
+        return false;
+    }
+    rut::test::bounded_http_exchange::ParsedResponse nginx_response, generated_response;
+    std::string nginx_normalized, generated_normalized;
+    std::string parse_error;
+    if (!normalize_http_date_wire(
+            nginx.http.raw_response, nginx_normalized, nginx_response, parse_error) ||
+        !normalize_http_date_wire(
+            generated.response_wire, generated_normalized, generated_response, parse_error)) {
+        error = "nginx/RUT Date-normalized response parsing failed: " + parse_error;
+        return false;
+    }
+    if (nginx_response.version != generated_response.version || nginx_response.status != 502u ||
+        generated_response.status != 502u || nginx_response.reason != generated_response.reason ||
+        nginx_response.body.size() != 157u || generated_response.body.size() != 157u ||
+        nginx_response.body != generated_response.body || nginx_response.headers.size() != 5u ||
+        generated_response.headers.size() != 5u) {
+        error = "nginx/RUT status, reason, body, or header cardinality differed";
+        return false;
+    }
+    for (std::size_t i = 0u; i < nginx_response.headers.size(); ++i) {
+        const auto& left = nginx_response.headers[i];
+        const auto& right = generated_response.headers[i];
+        if (left.name != right.name || (left.name != "Date" && left.value != right.value)) {
+            error = "nginx/RUT ordered response headers differed";
+            return false;
+        }
+    }
+    if (nginx_normalized != generated_normalized || generated.status != 502u ||
+        generated.headers_exact != 1u || generated.body_bytes != generated_response.body.size() ||
+        generated.response_wire.size() != nginx.http.raw_response.size()) {
+        error = "nginx/RUT Date-normalized raw response framing differed";
+        return false;
+    }
+    return true;
+}
+
+static bool generated_differential_comparator_self_check(std::string& error) {
+    static constexpr char request[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr char body[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    const std::string response =
+        std::string("HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\n") +
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Type: text/html\r\n"
+        "Content-Length: 157\r\nConnection: close\r\n\r\n" +
+        body;
+    ipv4_topology::ExactInputNginxLifecycleObservation nginx;
+    nginx.outcome = ipv4_topology::ExactInputNginxLifecycleOutcome::Complete;
+    nginx.attempted = true;
+    nginx.terminal_frozen = true;
+    nginx.create_attempted = true;
+    nginx.created = true;
+    nginx.start_attempted = true;
+    nginx.started = true;
+    nginx.same_source_inode = true;
+    nginx.sibling_mount_independently_verified = true;
+    nginx.samples_at_least_250ms_apart = true;
+    nginx.quit_attempted = true;
+    nginx.quit_only = true;
+    nginx.stopped_exit_zero = true;
+    nginx.cgroup_empty_after_stop = true;
+    nginx.removed_nonforce = true;
+    nginx.exact_absence = true;
+    nginx.baseline_restored = true;
+    nginx.http.attempted = true;
+    nginx.http.terminal_frozen = true;
+    nginx.http.connect_started = true;
+    nginx.http.connect_completed = true;
+    nginx.http.send_started = true;
+    nginx.http.send_completed = true;
+    nginx.http.read_started = true;
+    nginx.http.eof_observed = true;
+    nginx.http.request = request;
+    nginx.http.raw_response = response;
+    nginx.upstream_absence_before = true;
+    nginx.upstream_absence_after = true;
+    ipv4_topology::ExactInputRotationLiveEvidence evidence;
+    evidence.old_nginx = nginx;
+    evidence.generation_receipt.new_generation.topology.positive_ip = "10.1.2.3";
+    evidence.generation_receipt.new_generation.topology.guard_ip = "10.1.2.4";
+    evidence.initial_source.bytes =
+        "events {}\nhttp { server {\n  listen 10.1.2.3:41857;\n  location / { "
+        "proxy_pass http://127.0.0.1:9000; }\n} }\n";
+    evidence.fresh_source.bytes = evidence.initial_source.bytes;
+    evidence.old_terminal_tcp.local_ipv4 = 0x0a010203u;
+    evidence.old_terminal_tcp.local_port = ipv4_topology::kExactInputTopologyBuilderPort;
+    evidence.old_terminal_tcp.attempted = true;
+    evidence.old_terminal_tcp.complete = true;
+    evidence.old_terminal_tcp.state = 0x06u;
+    evidence.old_terminal_tcp.remote_ipv4 = 0x0a010204u;
+    evidence.old_terminal_tcp.remote_port = 50000u;
+    evidence.old_and_fresh_authorities_separate = true;
+    evidence.fresh_clean_baseline = true;
+    GeneratedProxyObservation generated;
+    generated.request_wire = request;
+    generated.response_wire = response;
+    generated.upstream_absence_probe_refused = 1u;
+    generated.guard_before_connect_error = ECONNREFUSED;
+    generated.guard_after_connect_error = ECONNREFUSED;
+    generated.status = 502u;
+    generated.headers_exact = 1u;
+    generated.body_bytes = sizeof(body) - 1u;
+    generated.child_pid = 101u;
+    generated.child_start = 202u;
+    generated.listener_inode = 303u;
+    generated.positive_ipv4 = 0x0a010203u;
+    generated.guard_ipv4 = 0x0a010204u;
+    generated.port = ipv4_topology::kExactInputTopologyBuilderPort;
+    generated.upstream_ipv4 = 0x7f000001u;
+    generated.upstream_port = 9000u;
+    generated.eof = 1u;
+    generated.cleanup_complete = 1u;
+    if (!compare_generated_proxy_observation(evidence, generated, error)) return false;
+    const GeneratedProxyObservation canonical = generated;
+    const auto rejects = [&](const GeneratedProxyObservation& mutation, const char* label) {
+        std::string ignored;
+        if (compare_generated_proxy_observation(evidence, mutation, ignored)) {
+            error = std::string(label) +
+                    " mutation was accepted by the generated differential comparator";
+            return false;
+        }
+        return true;
+    };
+    generated.response_wire.replace(generated.response_wire.find("502"), 3u, "503");
+    if (!rejects(generated, "response")) return false;
+    generated = canonical;
+    generated.eof = 0u;
+    if (!rejects(generated, "EOF")) return false;
+    generated = canonical;
+    generated.request_wire.pop_back();
+    if (!rejects(generated, "request")) return false;
+    generated = canonical;
+    generated.response_wire.replace(
+        generated.response_wire.find("Date: ") + 6u, 29u, "Xxx, 99 Xxx 9999 99:99:99 GMT");
+    if (!rejects(generated, "Date")) return false;
+    generated = canonical;
+    generated.cleanup_complete = 0u;
+    if (!rejects(generated, "cleanup")) return false;
+    generated = canonical;
+    generated.child_start = 0u;
+    if (!rejects(generated, "identity")) return false;
+    generated = canonical;
+    generated.port++;
+    if (!rejects(generated, "endpoint")) return false;
+    generated = canonical;
+    generated.positive_ipv4++;
+    if (!rejects(generated, "positive-listener")) return false;
+    generated = canonical;
+    generated.guard_ipv4 = generated.positive_ipv4;
+    if (!rejects(generated, "guard-listener")) return false;
+    generated = canonical;
+    generated.upstream_port++;
+    if (!rejects(generated, "upstream-endpoint")) return false;
+    generated = canonical;
+    const std::size_t server_start = generated.response_wire.find("Server: ");
+    const std::size_t date_start = generated.response_wire.find("Date: ");
+    const std::size_t date_end = generated.response_wire.find("\r\n", date_start);
+    if (server_start == std::string::npos || date_start == std::string::npos ||
+        date_end == std::string::npos) {
+        error = "comparator self-check response headers were malformed";
+        return false;
+    }
+    const std::string server_line = generated.response_wire.substr(
+        server_start, generated.response_wire.find("\r\n", server_start) + 2u - server_start);
+    const std::string date_line =
+        generated.response_wire.substr(date_start, date_end + 2u - date_start);
+    generated.response_wire = generated.response_wire.substr(0u, server_start) + date_line +
+                              server_line + generated.response_wire.substr(date_end + 2u);
+    if (!rejects(generated, "ordered-header")) return false;
+    generated = canonical;
+    generated.response_wire.replace(
+        generated.response_wire.find("Bad Gateway"), std::strlen("Bad Gateway"), "Bad GateWay");
+    if (!rejects(generated, "body")) return false;
+    generated = canonical;
+    generated.response_wire.push_back('x');
+    if (!rejects(generated, "trailing-wire")) return false;
+    error.clear();
+    return true;
 }
 
 static bool exact_http_exchange(u32 ipv4,
@@ -6816,7 +7131,9 @@ static int secured_target_main(const char* control_path,
             }
             sockaddr_in endpoint{};
             endpoint.sin_family = AF_INET;
-            endpoint.sin_port = 0;
+            endpoint.sin_port = htons(generated_proxy_differential_scenario(scenario)
+                                          ? ipv4_topology::kExactInputTopologyBuilderPort
+                                          : 0u);
             endpoint.sin_addr.s_addr = htonl(guard_ipv4);
             socklen_t endpoint_size = sizeof(endpoint);
             if (bind(guard_fd, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0 ||
@@ -6831,6 +7148,8 @@ static int secured_target_main(const char* control_path,
                 positive_ipv4, guard_ipv4, ntohs(endpoint.sin_port)};
             GuardReport held;
             if (plan.port == 0u || ntohl(endpoint.sin_addr.s_addr) != guard_ipv4 ||
+                (generated_proxy_differential_scenario(scenario) &&
+                 plan.port != ipv4_topology::kExactInputTopologyBuilderPort) ||
                 !fill_guard_socket_report(guard_fd, plan, baseline_fd_count, held) ||
                 !validate_guard_report(held, plan, secured_identity, false) ||
                 !send_frame(
@@ -13814,23 +14133,32 @@ static bool run_session(const std::string& sudo_path,
                     break;
                 }
                 if (generated_proxy_scenario(scenario)) {
-                    generated_observation_candidate = {
-                        exact_report.request_wire,
-                        exact_report.response_wire,
-                        exact_report.upstream_absence_probe_refused,
-                        exact_report.guard_before_connect_error,
-                        exact_report.guard_connect_error,
-                        exact_report.response_status,
-                        exact_report.response_headers_exact,
-                        exact_report.response_body_bytes,
-                        exact_report.child_pid,
-                        exact_report.child_start,
-                        exact_report.listener_inode,
-                        exact_report.prompt_eof,
+                    generated_observation_candidate.request_wire = exact_report.request_wire;
+                    generated_observation_candidate.response_wire = exact_report.response_wire;
+                    generated_observation_candidate.upstream_absence_probe_refused =
+                        exact_report.upstream_absence_probe_refused;
+                    generated_observation_candidate.guard_before_connect_error =
+                        exact_report.guard_before_connect_error;
+                    generated_observation_candidate.guard_after_connect_error =
+                        exact_report.guard_connect_error;
+                    generated_observation_candidate.status = exact_report.response_status;
+                    generated_observation_candidate.headers_exact =
+                        exact_report.response_headers_exact;
+                    generated_observation_candidate.body_bytes = exact_report.response_body_bytes;
+                    generated_observation_candidate.child_pid = exact_report.child_pid;
+                    generated_observation_candidate.child_start = exact_report.child_start;
+                    generated_observation_candidate.listener_inode = exact_report.listener_inode;
+                    generated_observation_candidate.positive_ipv4 = held.plan.positive_ipv4;
+                    generated_observation_candidate.guard_ipv4 = held.plan.guard_ipv4;
+                    generated_observation_candidate.port = held.plan.port;
+                    generated_observation_candidate.upstream_ipv4 = 0x7f000001u;
+                    generated_observation_candidate.upstream_port = 9000u;
+                    generated_observation_candidate.eof = exact_report.prompt_eof;
+                    generated_observation_candidate.cleanup_complete =
                         exact_cleaned.clean_exit && exact_cleaned.child_absent &&
                                 exact_cleaned.listener_absent && exact_cleaned.temps_absent
                             ? 1u
-                            : 0u};
+                            : 0u;
                 }
                 Frame released_frame;
                 GuardReport released;
@@ -14012,6 +14340,59 @@ static bool run_session(const std::string& sudo_path,
         *generated_observation = std::move(generated_observation_candidate);
     }
     return success;
+}
+
+static ipv4_topology::RunResult run_generated_nginx_differential(
+    const std::string& sudo_path,
+    const std::string& nsenter_path,
+    const std::string& executable,
+    const ExecutableLease& rut_executable) {
+    GeneratedDifferentialBuilderContext builder_context;
+    GeneratedProxyObservation generated_observation;
+    bool comparison_published = false;
+    ipv4_topology::ExactInputRotationTerminalReceipt terminal_receipt;
+    ipv4_topology::ExactInputRotationOptions options;
+    options.nginx_mode = ipv4_topology::ExactInputRotationNginxMode::Required;
+    options.nginx_config_builder = build_generated_differential_nginx_config;
+    options.nginx_config_builder_context = &builder_context;
+    auto result = ipv4_topology::run_with_exact_input_rotation(
+        "",
+        ipv4_topology::ExactInputRotationFailurePoint::None,
+        [&](const ipv4_topology::ExactInputRotationLiveEvidence& evidence, std::string& error) {
+            if (!ipv4_topology::validate_exact_input_rotation_live_evidence(evidence, error))
+                return false;
+            if (builder_context.calls != 1u || builder_context.expected_bytes.empty() ||
+                evidence.initial_source.bytes != builder_context.expected_bytes ||
+                evidence.fresh_source.bytes != builder_context.expected_bytes ||
+                !evidence.old_and_fresh_authorities_separate || !evidence.fresh_clean_baseline) {
+                error = "rotation published a source or generation authority different from nginx";
+                return false;
+            }
+            if (!run_session(sudo_path,
+                             nsenter_path,
+                             executable,
+                             rut_executable,
+                             evidence.generation_receipt.new_generation.topology,
+                             "listener-generated-proxy-502-differential",
+                             error,
+                             &generated_observation))
+                return false;
+            if (!compare_generated_proxy_observation(evidence, generated_observation, error))
+                return false;
+            comparison_published = true;
+            return true;
+        },
+        terminal_receipt,
+        options);
+    std::string terminal_error;
+    if (result.success &&
+        (!comparison_published || !ipv4_topology::validate_exact_input_rotation_terminal_receipt(
+                                      terminal_receipt, terminal_error))) {
+        result.success = false;
+        result.error =
+            terminal_error.empty() ? "generated differential was not published" : terminal_error;
+    }
+    return result;
 }
 
 static bool regular_root_owned_executable(const char* path) {
@@ -14280,7 +14661,9 @@ int main(int argc, char** argv) {
         return dropped_broker_main(argv[0], argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 6 && strcmp(argv[1], "--fixture-privileged-target") == 0)
         return secured_target_main(argv[2], argv[3], argv[4], argv[5]);
-    if (argc != 2) {
+    const bool generated_differential =
+        argc == 3 && strcmp(argv[2], "--generated-nginx-differential") == 0;
+    if (argc != 2 && !generated_differential) {
         std::cerr << "usage: test_fixture_privileged_broker /canonical/path/to/rut\n";
         return 2;
     }
@@ -14302,7 +14685,8 @@ int main(int argc, char** argv) {
         !ancestry_probe_validation_self_check(error) ||
         !formal_authorization_policy_self_check(error) || !guard_protocol_self_check(error) ||
         !exact_transaction_self_check(error) || !exact_custody_ancillary_self_check(error) ||
-        !exact_adoption_fault_self_check(error)) {
+        !exact_adoption_fault_self_check(error) ||
+        !generated_differential_comparator_self_check(error)) {
         std::cerr << "FAIL [#358 Stage 2a3b protocol self-check]: " << error << "\n";
         return 1;
     }
@@ -14310,6 +14694,22 @@ int main(int argc, char** argv) {
         std::cerr << (required ? "FAIL" : "SKIP") << " [#358 Stage 2a3b preflight]: " << error
                   << "\n";
         return required ? 1 : 77;
+    }
+    if (generated_differential) {
+        const auto result =
+            run_generated_nginx_differential(sudo_path, nsenter_path, self.data(), rut_executable);
+        if (result.prerequisite_failure) {
+            std::cerr << (required ? "FAIL" : "SKIP")
+                      << " [#358 generated nginx/RUT differential prerequisites]: " << result.error
+                      << "\n";
+            return required ? 1 : 77;
+        }
+        if (!result.success) {
+            std::cerr << "FAIL [#358 generated nginx/RUT differential]: " << result.error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #358 generated nginx/RUT assigned-listener 502 differential\n";
+        return 0;
     }
     GeneratedProxyObservation generated_observation;
     const auto result = rut::test::ipv4_topology::run_with_held_topology(
