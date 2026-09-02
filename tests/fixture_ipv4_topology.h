@@ -146,19 +146,6 @@ struct HeldNamespaceGenerationRotationReceipt {
         HeldNamespaceGenerationRotationPhase::None;
 };
 
-// Private composition is published only after both independent new-generation
-// brackets validate.  The receipt itself remains a value copy owned by the
-// caller; no Fixture owner is aliased into it.
-enum class HeldNamespaceGenerationReceiptCompositionState : std::uint8_t {
-    Ready = 0,
-    OldGenerationValidated,
-    OldGenerationAbsent,
-    NewGenerationCreated,
-    NewGenerationValidated,
-    Published,
-    Unresolved,
-};
-
 enum class HolderOnlyRecreationState : std::uint8_t {
     Ready = 0,
     CreateMayHaveMutated,

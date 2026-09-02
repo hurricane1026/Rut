@@ -2586,48 +2586,54 @@ static bool topology_snapshot_equal(const HeldTopologySnapshot& left,
 static bool sidecar_snapshot_equal(const HeldNamespaceSidecarSnapshot& left,
                                    const HeldNamespaceSidecarSnapshot& right);
 
-struct GenerationReceiptCompositionOwner {
-    HeldNamespaceGenerationReceiptCompositionState state =
-        HeldNamespaceGenerationReceiptCompositionState::Ready;
-    HeldNamespaceGenerationRotationReceipt receipt;
-    HeldNamespaceGenerationRotationReceipt frozen_receipt;
-    u32 state_visit_mask =
-        1u << static_cast<unsigned>(HeldNamespaceGenerationReceiptCompositionState::Ready);
+enum class GenerationReceiptCompositionState : std::uint8_t {
+    Ready = 0,
+    OldGenerationValidated,
+    OldGenerationAbsent,
+    NewGenerationCreated,
+    NewGenerationValidated,
+    Published,
+    Unresolved,
 };
 
-static bool generation_receipt_composition_transition(
-    GenerationReceiptCompositionOwner& owner, HeldNamespaceGenerationReceiptCompositionState next) {
+struct GenerationReceiptCompositionOwner {
+    GenerationReceiptCompositionState state = GenerationReceiptCompositionState::Ready;
+    HeldNamespaceGenerationRotationReceipt receipt;
+    HeldNamespaceGenerationRotationReceipt frozen_receipt;
+    u32 state_visit_mask = 1u << static_cast<unsigned>(GenerationReceiptCompositionState::Ready);
+};
+
+static bool generation_receipt_composition_transition(GenerationReceiptCompositionOwner& owner,
+                                                      GenerationReceiptCompositionState next) {
     const auto current = owner.state;
     bool allowed = false;
     switch (current) {
-        case HeldNamespaceGenerationReceiptCompositionState::Ready:
-            allowed =
-                next == HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated;
+        case GenerationReceiptCompositionState::Ready:
+            allowed = next == GenerationReceiptCompositionState::OldGenerationValidated;
             break;
-        case HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated:
-            allowed = next == HeldNamespaceGenerationReceiptCompositionState::OldGenerationAbsent;
+        case GenerationReceiptCompositionState::OldGenerationValidated:
+            allowed = next == GenerationReceiptCompositionState::OldGenerationAbsent;
             break;
-        case HeldNamespaceGenerationReceiptCompositionState::OldGenerationAbsent:
-            allowed = next == HeldNamespaceGenerationReceiptCompositionState::NewGenerationCreated;
+        case GenerationReceiptCompositionState::OldGenerationAbsent:
+            allowed = next == GenerationReceiptCompositionState::NewGenerationCreated;
             break;
-        case HeldNamespaceGenerationReceiptCompositionState::NewGenerationCreated:
-            allowed =
-                next == HeldNamespaceGenerationReceiptCompositionState::NewGenerationValidated;
+        case GenerationReceiptCompositionState::NewGenerationCreated:
+            allowed = next == GenerationReceiptCompositionState::NewGenerationValidated;
             break;
-        case HeldNamespaceGenerationReceiptCompositionState::NewGenerationValidated:
-            allowed = next == HeldNamespaceGenerationReceiptCompositionState::Published;
+        case GenerationReceiptCompositionState::NewGenerationValidated:
+            allowed = next == GenerationReceiptCompositionState::Published;
             break;
-        case HeldNamespaceGenerationReceiptCompositionState::Published:
-        case HeldNamespaceGenerationReceiptCompositionState::Unresolved:
+        case GenerationReceiptCompositionState::Published:
+        case GenerationReceiptCompositionState::Unresolved:
             break;
     }
     if (!allowed) {
-        if (current == HeldNamespaceGenerationReceiptCompositionState::Published ||
-            current == HeldNamespaceGenerationReceiptCompositionState::Unresolved)
+        if (current == GenerationReceiptCompositionState::Published ||
+            current == GenerationReceiptCompositionState::Unresolved)
             return false;
-        owner.state = HeldNamespaceGenerationReceiptCompositionState::Unresolved;
+        owner.state = GenerationReceiptCompositionState::Unresolved;
         owner.state_visit_mask |=
-            1u << static_cast<unsigned>(HeldNamespaceGenerationReceiptCompositionState::Unresolved);
+            1u << static_cast<unsigned>(GenerationReceiptCompositionState::Unresolved);
         return false;
     }
     owner.state = next;
@@ -2664,11 +2670,13 @@ static bool generation_absence_equal(const HeldNamespaceOldGenerationAbsence& le
 
 static bool generation_receipt_equal(const HeldNamespaceGenerationRotationReceipt& left,
                                      const HeldNamespaceGenerationRotationReceipt& right) {
-    return topology_snapshot_equal(left.old_generation.topology, right.old_generation.topology) &&
+    return complete_rotation_topology_equal(left.old_generation.topology,
+                                            right.old_generation.topology) &&
            sidecar_snapshot_equal(left.old_generation.sidecar, right.old_generation.sidecar) &&
            left.old_generation_phase == right.old_generation_phase &&
            generation_absence_equal(left.old_absence, right.old_absence) &&
-           topology_snapshot_equal(left.new_generation.topology, right.new_generation.topology) &&
+           complete_rotation_topology_equal(left.new_generation.topology,
+                                            right.new_generation.topology) &&
            sidecar_snapshot_equal(left.new_generation.sidecar, right.new_generation.sidecar) &&
            left.new_generation_created_phase == right.new_generation_created_phase &&
            left.new_generation_validated_phase == right.new_generation_validated_phase;
@@ -2772,12 +2780,12 @@ static bool recreated_sidecar_transition_self_checks(std::string& error) {
 
 static bool generation_receipt_composition_self_checks(std::string& error) {
     GenerationReceiptCompositionOwner normal;
-    const std::array<HeldNamespaceGenerationReceiptCompositionState, 5> path{
-        HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated,
-        HeldNamespaceGenerationReceiptCompositionState::OldGenerationAbsent,
-        HeldNamespaceGenerationReceiptCompositionState::NewGenerationCreated,
-        HeldNamespaceGenerationReceiptCompositionState::NewGenerationValidated,
-        HeldNamespaceGenerationReceiptCompositionState::Published};
+    const std::array<GenerationReceiptCompositionState, 5> path{
+        GenerationReceiptCompositionState::OldGenerationValidated,
+        GenerationReceiptCompositionState::OldGenerationAbsent,
+        GenerationReceiptCompositionState::NewGenerationCreated,
+        GenerationReceiptCompositionState::NewGenerationValidated,
+        GenerationReceiptCompositionState::Published};
     for (const auto state : path) {
         if (!generation_receipt_composition_transition(normal, state)) {
             error = "complete-generation receipt production transition rejected the normal path";
@@ -2786,33 +2794,36 @@ static bool generation_receipt_composition_self_checks(std::string& error) {
     }
     normal.frozen_receipt = normal.receipt;
     const u32 frozen_mask = normal.state_visit_mask;
+    HeldNamespaceGenerationRotationReceipt probe_mutation = normal.frozen_receipt;
+    ++probe_mutation.old_generation.topology.probe_evidence.selected_port_absence_checks;
     if (generation_receipt_composition_transition(
-            normal, HeldNamespaceGenerationReceiptCompositionState::NewGenerationCreated) ||
-        normal.state != HeldNamespaceGenerationReceiptCompositionState::Published ||
+            normal, GenerationReceiptCompositionState::NewGenerationCreated) ||
+        normal.state != GenerationReceiptCompositionState::Published ||
         normal.state_visit_mask != frozen_mask ||
-        normal.frozen_receipt.old_generation_phase != HeldNamespaceGenerationRotationPhase::None) {
+        normal.frozen_receipt.old_generation_phase != HeldNamespaceGenerationRotationPhase::None ||
+        generation_receipt_equal(normal.frozen_receipt, probe_mutation)) {
         error = "complete-generation receipt terminal transition was not frozen";
         return false;
     }
     GenerationReceiptCompositionOwner backward;
     if (!generation_receipt_composition_transition(
-            backward, HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated) ||
-        generation_receipt_composition_transition(
-            backward, HeldNamespaceGenerationReceiptCompositionState::Ready) ||
-        backward.state != HeldNamespaceGenerationReceiptCompositionState::Unresolved) {
+            backward, GenerationReceiptCompositionState::OldGenerationValidated) ||
+        generation_receipt_composition_transition(backward,
+                                                  GenerationReceiptCompositionState::Ready) ||
+        backward.state != GenerationReceiptCompositionState::Unresolved) {
         error = "complete-generation receipt backward transition did not fail closed";
         return false;
     }
     GenerationReceiptCompositionOwner unresolved;
     if (!generation_receipt_composition_transition(
-            unresolved, HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated) ||
+            unresolved, GenerationReceiptCompositionState::OldGenerationValidated) ||
         !generation_receipt_composition_transition(
-            unresolved, HeldNamespaceGenerationReceiptCompositionState::OldGenerationAbsent) ||
+            unresolved, GenerationReceiptCompositionState::OldGenerationAbsent) ||
         generation_receipt_composition_transition(
-            unresolved, HeldNamespaceGenerationReceiptCompositionState::NewGenerationValidated) ||
-        unresolved.state != HeldNamespaceGenerationReceiptCompositionState::Unresolved ||
-        generation_receipt_composition_transition(
-            unresolved, HeldNamespaceGenerationReceiptCompositionState::Published)) {
+            unresolved, GenerationReceiptCompositionState::NewGenerationValidated) ||
+        unresolved.state != GenerationReceiptCompositionState::Unresolved ||
+        generation_receipt_composition_transition(unresolved,
+                                                  GenerationReceiptCompositionState::Published)) {
         error = "complete-generation receipt unresolved state was not terminal";
         return false;
     }
@@ -5383,7 +5394,9 @@ bool Fixture::build_current_generation_topology(HeldTopologySnapshot& topology,
     ino_t before_container_netns = 0;
     const bool before_ok = proc_identity(holder_pid_, before, false);
     const bool container_netns_ok = container_netns_inode(holder_id_, before_container_netns);
-    const bool host_ok = proc_identity(getpid(), host);
+    // Host netns visibility is optional. Exact-container readlink is the
+    // authoritative namespace witness; compare the host inode when visible.
+    const bool host_ok = proc_identity(getpid(), host, false);
     if (!before_ok || before.start != holder_start_ || !container_netns_ok ||
         before_container_netns == 0u || !host_ok ||
         (host.netns != 0u && before_container_netns == host.netns) ||
@@ -5415,7 +5428,7 @@ bool Fixture::build_current_generation_topology(HeldTopologySnapshot& topology,
     ino_t after_container_netns = 0;
     const bool after_ok = proc_identity(holder_pid_, after, false);
     const bool after_container_netns_ok = container_netns_inode(holder_id_, after_container_netns);
-    const bool after_host_ok = proc_identity(getpid(), after_host);
+    const bool after_host_ok = proc_identity(getpid(), after_host, false);
     if (!after_ok || after.start != holder_start_ || !after_container_netns_ok ||
         after_container_netns != before_container_netns || !after_host_ok ||
         (after_host.netns != 0u && after_container_netns == after_host.netns) ||
@@ -5850,8 +5863,8 @@ bool Fixture::revalidate_recreated_sidecar_for_rotation(HeldNamespaceSidecarSnap
     sidecar_revalidation_fault_ = previous_fault;
     if (!inspected) return false;
     ino_t exact_netns = 0;
-    if (!container_netns_inode(recreated_sidecar_.snapshot.id, exact_netns) ||
-        exact_netns == 0u || exact_netns != current.netns) {
+    if (!container_netns_inode(recreated_sidecar_.snapshot.id, exact_netns) || exact_netns == 0u ||
+        exact_netns != current.netns) {
         error = "fresh sidecar second bracket lacked exact full-ID netns authority";
         return false;
     }
@@ -13150,7 +13163,7 @@ RunResult run_with_complete_generation_rotation(
                                                   composer.receipt.old_generation.sidecar,
                                                   phase_error) ||
         !generation_receipt_composition_transition(
-            composer, HeldNamespaceGenerationReceiptCompositionState::OldGenerationValidated)) {
+            composer, GenerationReceiptCompositionState::OldGenerationValidated)) {
         result.error = "old generation phase-1 evidence was not exact: " + phase_error;
         return finish(false);
     }
@@ -13194,17 +13207,30 @@ RunResult run_with_complete_generation_rotation(
         !composer.receipt.old_absence.holder_name_absent ||
         !composer.receipt.old_absence.sidecar_name_absent ||
         !generation_receipt_composition_transition(
-            composer, HeldNamespaceGenerationReceiptCompositionState::OldGenerationAbsent)) {
+            composer, GenerationReceiptCompositionState::OldGenerationAbsent)) {
         result.error = "old generation phase-2 exact absence did not match frozen phase-1";
         return finish(false);
     }
 
     if (!fixture.recreate_holder_only(holder_failure_point, result.error)) return finish(false);
     const HolderOnlyRecreationEvidence holder = fixture.holder_only_recreation_evidence();
-    if (holder.complete_generation || holder.state != HolderOnlyRecreationState::Validated ||
-        !holder.old_authority_frozen || !holder.exact_network_a || !holder.exact_network_b ||
-        !holder.exact_security || !holder.network_a_membership_proven_after_start)
+    const char* holder_evidence_gap =
+        holder.complete_generation
+            ? "holder-only evidence incorrectly claimed a complete generation"
+        : holder.state != HolderOnlyRecreationState::Validated
+            ? "holder-only owner was not Validated"
+        : !holder.old_authority_frozen ? "old holder/sidecar absence authority was not frozen"
+        : !holder.exact_network_a      ? "fresh holder lacked exact network-A authority"
+        : !holder.exact_network_b      ? "fresh holder lacked exact network-B authority"
+        : !holder.exact_security       ? "fresh holder lacked exact immutable security authority"
+        : !holder.network_a_membership_proven_after_start
+            ? "fresh holder network-A membership was not proven after start"
+            : nullptr;
+    if (holder_evidence_gap != nullptr) {
+        result.error =
+            std::string("complete receipt holder evidence was incomplete: ") + holder_evidence_gap;
         return finish(false);
+    }
 
     std::string foreign_id;
     if (sidecar_failure_point == RecreatedSidecarFailurePoint::PreCreateNameCollision) {
@@ -13266,7 +13292,7 @@ RunResult run_with_complete_generation_rotation(
     if (!complete_rotation_topology_equal(composer.receipt.new_generation.topology,
                                           sidecar.fresh_topology) ||
         !generation_receipt_composition_transition(
-            composer, HeldNamespaceGenerationReceiptCompositionState::NewGenerationCreated)) {
+            composer, GenerationReceiptCompositionState::NewGenerationCreated)) {
         result.error = "new generation phase-3 topology was not copied exactly";
         return finish(false);
     }
@@ -13304,7 +13330,7 @@ RunResult run_with_complete_generation_rotation(
         return finish(false);
     }
     if (!generation_receipt_composition_transition(
-            composer, HeldNamespaceGenerationReceiptCompositionState::NewGenerationValidated)) {
+            composer, GenerationReceiptCompositionState::NewGenerationValidated)) {
         result.error = "new generation phase-4 transition was rejected";
         return finish(false);
     }
@@ -13321,8 +13347,8 @@ RunResult run_with_complete_generation_rotation(
         if (!first_validation_error.empty()) result.error += ": " + first_validation_error;
         return finish(false);
     }
-    if (!generation_receipt_composition_transition(
-            composer, HeldNamespaceGenerationReceiptCompositionState::Published)) {
+    if (!generation_receipt_composition_transition(composer,
+                                                   GenerationReceiptCompositionState::Published)) {
         result.error = "complete generation receipt publication transition was rejected";
         return finish(false);
     }
