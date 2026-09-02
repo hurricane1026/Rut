@@ -154,6 +154,8 @@ enum class ExactInputRotationState : std::uint8_t {
     GenerationValidated,
     FreshCreateMayHaveMutated,
     FreshMountedValidated,
+    FreshWriteMayHaveMutated,
+    FreshWriteObserved,
     LivePublished,
     FreshRemovalMayHaveMutated,
     Settled,
@@ -166,6 +168,12 @@ enum class ExactInputRotationFailurePoint : std::uint8_t {
     FreshMountObservationMutation,
     SuppressFirstFreshRemoval,
     FreshReadTimeout,
+    FreshWriteInitialBracketMutation,
+    FreshWriteMiddleBracketMutation,
+    FreshWriteFinalBracketMutation,
+    FreshWriteTargetUnexpectedSuccess,
+    FreshWriteTargetWrongStderr,
+    FreshWriteTimeout,
 };
 
 struct ExactInputRotationSourceEvidence {
@@ -235,6 +243,34 @@ struct ExactInputRotationReadEvidence {
     bool target_brackets_equal = false;
 };
 
+struct ExactInputRotationWriteBracket {
+    ExactInputRotationSourceEvidence source;
+    ExactInputMountedSidecarEvidence target;
+    bool source_revalidated = false;
+    bool source_bytes_revalidated = false;
+    bool retained_ofd_revalidated = false;
+    bool target_revalidated = false;
+};
+
+// Rotation-owned write-refusal evidence. This receipt is deliberately
+// independent from the legacy exact-input controller receipt: a successful
+// fresh read is only publishable after this write observation also settles.
+struct ExactInputRotationWriteRefusalEvidence {
+    ExactInputWriteRefusalOutcome outcome = ExactInputWriteRefusalOutcome::None;
+    bool attempted = false;
+    bool terminal_frozen = false;
+    bool caller_deadline_recorded = false;
+    std::int64_t final_deadline_nanoseconds = 0;
+    std::string credentials;
+    std::string expected_target_stderr;
+    ExactInputRotationWriteBracket initial_bracket;
+    ExactInputRotationWriteBracket middle_bracket;
+    ExactInputRotationWriteBracket final_bracket;
+    ExactInputReadObservation control;
+    ExactInputReadObservation target;
+    ExactInputMountDiagnostic diagnostic;
+};
+
 struct ExactInputMountedSidecarAbsence {
     std::string id;
     std::string name;
@@ -255,6 +291,7 @@ struct ExactInputRotationLiveEvidence {
     HeldNamespaceGenerationRotationReceipt generation_receipt;
     ExactInputMountedSidecarEvidence fresh_mounted;
     ExactInputRotationReadEvidence fresh_read;
+    ExactInputRotationWriteRefusalEvidence fresh_write;
     bool source_continuity = false;
     bool generation_receipt_validated_twice = false;
     bool old_and_fresh_authorities_separate = false;

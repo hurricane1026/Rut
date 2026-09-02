@@ -1074,10 +1074,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::uint32_t rotation_mutation_rejections = 0u;
+    constexpr std::uint32_t kExpectedRotationMutationRejections = 30u;
     std::string rotation_selfcheck_error;
     if (!exact_input_rotation_pure_self_checks(rotation_mutation_rejections,
                                                rotation_selfcheck_error) ||
-        rotation_mutation_rejections != 21u) {
+        rotation_mutation_rejections != kExpectedRotationMutationRejections) {
         std::cerr << "FAIL [#412 exact-input rotation pure checks]: " << rotation_selfcheck_error
                   << "\n";
         return 1;
@@ -2235,7 +2236,10 @@ int main(int argc, char** argv) {
           ExactInputRotationFailurePoint::FreshCreateReportedTimeout,
           ExactInputRotationFailurePoint::FreshMountObservationMutation,
           ExactInputRotationFailurePoint::SuppressFirstFreshRemoval,
-          ExactInputRotationFailurePoint::FreshReadTimeout}) {
+          ExactInputRotationFailurePoint::FreshReadTimeout,
+          ExactInputRotationFailurePoint::FreshWriteInitialBracketMutation,
+          ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess,
+          ExactInputRotationFailurePoint::FreshWriteTimeout}) {
         std::size_t callback_count = 0;
         ExactInputRotationTerminalReceipt rotation_receipt;
         const RunResult rotation = run_with_exact_input_rotation(
@@ -2249,15 +2253,24 @@ int main(int argc, char** argv) {
         const bool mutation =
             point == ExactInputRotationFailurePoint::FreshMountObservationMutation;
         const bool read_timeout = point == ExactInputRotationFailurePoint::FreshReadTimeout;
+        const bool write_failure =
+            point == ExactInputRotationFailurePoint::FreshWriteInitialBracketMutation ||
+            point == ExactInputRotationFailurePoint::FreshWriteTargetUnexpectedSuccess ||
+            point == ExactInputRotationFailurePoint::FreshWriteTimeout;
+        const bool expected_publication = !mutation && !read_timeout && !write_failure;
         const bool operation_ok = point == ExactInputRotationFailurePoint::None || mutation;
         if (rotation.prerequisite_failure || !rotation.success || !rotation.cleanup_complete ||
-            !rotation.residue_free || callback_count != ((mutation || read_timeout) ? 0u : 1u) ||
-            rotation_receipt.live_published != !(mutation || read_timeout) ||
+            !rotation.residue_free || callback_count != (expected_publication ? 1u : 0u) ||
+            rotation_receipt.live_published != expected_publication ||
             rotation_receipt.operation_ok != operation_ok ||
             (read_timeout &&
              (rotation_receipt.live.fresh_read.outcome == ExactInputReadOutcome::Complete ||
               !rotation_receipt.live.fresh_read.terminal_frozen ||
               !rotation_receipt.live.fresh_read.command.attempted)) ||
+            (write_failure && (rotation_receipt.live.fresh_write.outcome ==
+                                   ExactInputWriteRefusalOutcome::Complete ||
+                               !rotation_receipt.live.fresh_write.terminal_frozen ||
+                               !rotation_receipt.live.fresh_write.caller_deadline_recorded)) ||
             rotation_receipt.fresh_remove_suppression_count !=
                 (point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval ? 1u : 0u) ||
             !validate_exact_input_rotation_terminal_receipt(rotation_receipt,
