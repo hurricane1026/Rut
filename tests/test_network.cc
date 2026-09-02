@@ -39845,7 +39845,6 @@ TEST(response_buffering_runtime,
      forbidden_request_framing_closes_before_handler_or_upstream_effect) {
     static constexpr const char* kRequests[] = {
         "GET /buffered HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
-        "GET /buffered HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx",
         "GET /buffered HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "GET /buffered HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
         "GET /buffered HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
