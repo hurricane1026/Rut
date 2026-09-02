@@ -11011,6 +11011,53 @@ static bool exact_input_mounted_absence_equal(const ExactInputMountedSidecarAbse
            left.process_absent == right.process_absent;
 }
 
+static bool exact_input_mounted_absence_matches(const ExactInputMountedSidecarAbsence& absence,
+                                                const ExactInputMountedSidecarEvidence& mounted) {
+    return absence.id == mounted.id && absence.name == mounted.name && absence.pid == mounted.pid &&
+           absence.start == mounted.start && absence.id_absent && absence.name_absent &&
+           absence.token_role_generation_absent && absence.process_absent;
+}
+
+static bool exact_input_rotation_live_equal(const ExactInputRotationLiveEvidence& left,
+                                            const ExactInputRotationLiveEvidence& right) {
+    return left.state == right.state &&
+           exact_input_rotation_source_equal(left.initial_source, right.initial_source) &&
+           exact_input_rotation_source_equal(left.fresh_source, right.fresh_source) &&
+           exact_input_mounted_equal(left.old_mounted, right.old_mounted) &&
+           exact_input_mounted_absence_equal(left.old_absence, right.old_absence) &&
+           generation_receipt_equal(left.generation_receipt, right.generation_receipt) &&
+           exact_input_mounted_equal(left.fresh_mounted, right.fresh_mounted) &&
+           left.source_continuity == right.source_continuity &&
+           left.generation_receipt_validated_twice == right.generation_receipt_validated_twice &&
+           left.old_and_fresh_authorities_separate == right.old_and_fresh_authorities_separate &&
+           left.operation_ok == right.operation_ok &&
+           left.old_create_count == right.old_create_count &&
+           left.old_remove_count == right.old_remove_count &&
+           left.fresh_create_count == right.fresh_create_count &&
+           left.fresh_start_count == right.fresh_start_count &&
+           left.fresh_remove_count == right.fresh_remove_count;
+}
+
+static bool exact_input_rotation_terminal_equal(const ExactInputRotationTerminalReceipt& left,
+                                                const ExactInputRotationTerminalReceipt& right) {
+    return left.state == right.state && exact_input_rotation_live_equal(left.live, right.live) &&
+           exact_input_mounted_absence_equal(left.fresh_absence, right.fresh_absence) &&
+           left.live_published == right.live_published && left.operation_ok == right.operation_ok &&
+           left.cleanup_complete == right.cleanup_complete &&
+           left.zero_residue == right.zero_residue &&
+           left.terminal_frozen == right.terminal_frozen &&
+           left.replay_command_free == right.replay_command_free &&
+           left.downstream_gates_command_free == right.downstream_gates_command_free &&
+           left.fresh_remove_count == right.fresh_remove_count &&
+           left.fresh_remove_suppression_count == right.fresh_remove_suppression_count &&
+           left.fresh_mounted_order == right.fresh_mounted_order &&
+           left.fresh_inert_order == right.fresh_inert_order &&
+           left.input_order == right.input_order && left.directory_order == right.directory_order &&
+           left.holder_order == right.holder_order &&
+           left.network_b_order == right.network_b_order &&
+           left.network_a_order == right.network_a_order;
+}
+
 bool validate_exact_input_rotation_live_evidence(const ExactInputRotationLiveEvidence& evidence,
                                                  std::string& error) {
     error.clear();
@@ -11116,9 +11163,17 @@ bool validate_exact_input_rotation_terminal_receipt(
     const ExactInputRotationTerminalReceipt& receipt, std::string& error) {
     if (receipt.live_published) {
         if (!validate_exact_input_rotation_live_evidence(receipt.live, error)) return false;
-    } else if (receipt.live.state != ExactInputRotationState::Unresolved) {
-        error = "unpublished exact-input rotation did not remain explicitly unresolved";
-        return false;
+    } else {
+        ExactInputRotationLiveEvidence retained = receipt.live;
+        if (retained.state != ExactInputRotationState::Unresolved) {
+            error = "unpublished exact-input rotation did not remain explicitly unresolved";
+            return false;
+        }
+        retained.state = ExactInputRotationState::LivePublished;
+        if (!validate_exact_input_rotation_live_evidence(retained, error)) {
+            error = "unpublished exact-input rotation lost retained authority: " + error;
+            return false;
+        }
     }
     const auto& absence = receipt.fresh_absence;
     if (receipt.state != ExactInputRotationState::Settled ||
@@ -14227,6 +14282,7 @@ static bool remove_rotation_mounted(MountedSidecarRotationOwner& owner,
     else {
         owner.fresh_exists = false;
         owner.fresh_removal_may_have_mutated = false;
+        (void)mounted_rotation_transition(owner, ExactInputRotationState::Settled);
     }
     return true;
 }
@@ -14255,6 +14311,15 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     bool input_acquired = false;
     bool callback_ran = false;
     std::uint32_t order = 0;
+    const auto require_mounted_settled = [&](const char* consumer, std::string& gate_error) {
+        if (mounted.state == ExactInputRotationState::Settled && mounted.fresh_absence.id_absent &&
+            mounted.fresh_absence.name_absent &&
+            mounted.fresh_absence.token_role_generation_absent &&
+            mounted.fresh_absence.process_absent)
+            return true;
+        gate_error = std::string("fresh mounted-sidecar unsettled; blocked ") + consumer;
+        return false;
+    };
     const auto settle_source = [&]() {
         bool ok = true;
         fixture_exact_input_file_lease::Diagnostic input_error;
@@ -14275,6 +14340,12 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         }
         if (!mounted.old_mounted.id.empty() && !mounted.old_absence.id_absent)
             cleanup_ok = remove_rotation_mounted(mounted, true, false, cleanup_error) && cleanup_ok;
+        if (!cleanup_ok) {
+            result.error += result.error.empty() ? cleanup_error : "; " + cleanup_error;
+            result.cleanup_complete = false;
+            result.residue_free = false;
+            return result;
+        }
         std::string sidecar_error;
         cleanup_ok = root.fixture.cleanup_recreated_sidecar(sidecar_error) && cleanup_ok;
         const CleanupPhaseResult old_sidecar = root.fixture.cleanup_sidecar_phase(sidecar_error);
@@ -14378,6 +14449,14 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     root.registered_mount = old_mount;
     const HeldNamespaceSidecarSnapshot frozen_registered_sidecar = root.registered_sidecar;
     const ParsedMountInspect frozen_registered_mount = root.registered_mount;
+    const ExactInputMountedSidecarAbsence expected_old_absence{mounted.old_mounted.id,
+                                                               mounted.old_mounted.name,
+                                                               mounted.old_mounted.pid,
+                                                               mounted.old_mounted.start,
+                                                               true,
+                                                               true,
+                                                               true,
+                                                               true};
 
     if (!capture_old_generation_for_receipt(root.fixture, composer, error) ||
         mounted.old_mounted.id == composer.receipt.old_generation.sidecar.id ||
@@ -14386,7 +14465,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         mounted.old_mounted.network_netns !=
             composer.receipt.old_generation.topology.holder_netns ||
         !remove_rotation_mounted(mounted, true, false, error) ||
-        !exact_input_mounted_absence_equal(mounted.old_absence, mounted.old_absence) ||
+        !exact_input_mounted_absence_matches(mounted.old_absence, mounted.old_mounted) ||
+        !exact_input_mounted_absence_equal(mounted.old_absence, expected_old_absence) ||
         !sidecar_snapshot_equal(root.registered_sidecar, frozen_registered_sidecar) ||
         !mount_inspect_equal(root.registered_mount, frozen_registered_mount)) {
         if (error.empty()) error = "old mounted-sibling authority/history was not exact";
@@ -14498,6 +14578,27 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         }
     }
 
+    const auto cleanup_inert_after_mounted = [&](std::string& guarded_error) {
+        if (!require_mounted_settled("fresh inert cleanup", guarded_error)) return false;
+        return root.fixture.cleanup_recreated_sidecar(guarded_error);
+    };
+    const auto cleanup_source_after_mounted = [&](std::string& guarded_error) {
+        if (!require_mounted_settled("source cleanup", guarded_error)) return false;
+        fixture_exact_input_file_lease::Diagnostic guarded_input_error;
+        if (root.input.cleanup(guarded_input_error)) return true;
+        guarded_error = "exact source cleanup failed";
+        return false;
+    };
+    const auto cleanup_holder_after_mounted = [&](std::string& guarded_error) {
+        if (!require_mounted_settled("fresh holder cleanup", guarded_error)) return false;
+        return root.fixture.cleanup_recreated_holder(guarded_error);
+    };
+    const auto cleanup_topology_after_mounted = [&](std::string& guarded_error) {
+        if (!require_mounted_settled("retained topology cleanup", guarded_error))
+            return CleanupPhaseResult{};
+        return root.fixture.cleanup_topology_phase(guarded_error);
+    };
+
     mounted.removal_suppression_armed =
         failure_point == ExactInputRotationFailurePoint::SuppressFirstFreshRemoval;
     if (mounted.removal_suppression_armed) {
@@ -14509,12 +14610,22 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
             return finish_failure(false);
         }
         const std::uint64_t gated = command_invocation_count;
-        const bool inert_blocked = mounted.state != ExactInputRotationState::Settled;
-        const bool source_blocked = mounted.state != ExactInputRotationState::Settled;
-        const bool topology_blocked = mounted.state != ExactInputRotationState::Settled;
-        terminal_receipt.downstream_gates_command_free = inert_blocked && source_blocked &&
-                                                         topology_blocked &&
-                                                         command_invocation_count == gated;
+        std::string inert_gate;
+        std::string source_gate;
+        std::string holder_gate;
+        std::string topology_gate;
+        const bool inert_blocked = !cleanup_inert_after_mounted(inert_gate);
+        const bool source_blocked = !cleanup_source_after_mounted(source_gate);
+        const bool holder_blocked = !cleanup_holder_after_mounted(holder_gate);
+        const bool topology_blocked = !cleanup_topology_after_mounted(topology_gate).settled;
+        terminal_receipt.downstream_gates_command_free =
+            inert_blocked && source_blocked && holder_blocked && topology_blocked &&
+            root.input.active() &&
+            inert_gate == "fresh mounted-sidecar unsettled; blocked fresh inert cleanup" &&
+            source_gate == "fresh mounted-sidecar unsettled; blocked source cleanup" &&
+            holder_gate == "fresh mounted-sidecar unsettled; blocked fresh holder cleanup" &&
+            topology_gate == "fresh mounted-sidecar unsettled; blocked retained topology cleanup" &&
+            command_invocation_count == gated;
     } else {
         terminal_receipt.downstream_gates_command_free = true;
     }
@@ -14525,12 +14636,12 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     }
     terminal_receipt.fresh_mounted_order = ++order;
     std::string cleanup_error;
-    if (!root.fixture.cleanup_recreated_sidecar(cleanup_error)) {
+    if (!cleanup_inert_after_mounted(cleanup_error)) {
         result.error = cleanup_error;
         return finish_failure(false);
     }
     terminal_receipt.fresh_inert_order = ++order;
-    if (!root.input.cleanup(input_error)) {
+    if (!cleanup_source_after_mounted(cleanup_error)) {
         result.error = "exact source cleanup failed";
         return finish_failure(false);
     }
@@ -14542,7 +14653,7 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     terminal_receipt.directory_order = ++order;
     input_acquired = false;
     directory_acquired = false;
-    if (!root.fixture.cleanup_recreated_holder(cleanup_error)) {
+    if (!cleanup_holder_after_mounted(cleanup_error)) {
         result.error = cleanup_error;
         return finish_failure(false);
     }
@@ -14564,8 +14675,10 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
                 context.receipt->network_a_order = ++*context.order;
             return true;
         };
-    const CleanupPhaseResult topology =
-        root.fixture.cleanup_topology_phase(cleanup_error, record_network, &network_order);
+    CleanupPhaseResult topology;
+    if (require_mounted_settled("retained topology cleanup", cleanup_error))
+        topology =
+            root.fixture.cleanup_topology_phase(cleanup_error, record_network, &network_order);
     if (!topology.settled || !topology.operation_ok || terminal_receipt.network_b_order != 6u ||
         terminal_receipt.network_a_order != 7u) {
         result.error = cleanup_error;
@@ -14580,10 +14693,6 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         result.error = audit_error;
         return finish_failure(false);
     }
-    if (!mounted_rotation_transition(mounted, ExactInputRotationState::Settled)) {
-        result.error = "terminal mounted owner transition was rejected";
-        return result;
-    }
     terminal_receipt.state = ExactInputRotationState::Settled;
     terminal_receipt.live = live;
     terminal_receipt.live_published = callback_ran;
@@ -14594,21 +14703,42 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     terminal_receipt.terminal_frozen = true;
     terminal_receipt.fresh_remove_count = mounted.fresh_remove_count;
     terminal_receipt.fresh_remove_suppression_count = mounted.fresh_remove_suppression_count;
+    const auto replay_rotation_cleanup = [&](std::string& history) {
+        if (!remove_rotation_mounted(mounted, false, false, history) ||
+            !cleanup_inert_after_mounted(history))
+            return false;
+        if (root.input.active()) {
+            history = "terminal replay found a live exact source lease";
+            return false;
+        }
+        if (root.directory.state() != fixture_private_directory_lease::State::Removed) {
+            history = "terminal replay found a live exact source directory";
+            return false;
+        }
+        if (!cleanup_holder_after_mounted(history)) return false;
+        const CleanupPhaseResult replay_topology = cleanup_topology_after_mounted(history);
+        return replay_topology.settled && root.fixture.cleanup(history);
+    };
     const std::uint64_t replay_commands = command_invocation_count;
-    const ExactInputRotationTerminalReceipt frozen = terminal_receipt;
     std::string caller_history = "preserve-input-rotation-history";
-    const bool replay_ok = root.fixture.cleanup(caller_history) &&
+    const bool replay_ok = replay_rotation_cleanup(caller_history) &&
                            caller_history == "preserve-input-rotation-history" &&
                            command_invocation_count == replay_commands;
     terminal_receipt.replay_command_free = replay_ok;
+    const ExactInputRotationTerminalReceipt frozen = terminal_receipt;
+    caller_history = "preserve-input-rotation-history-again";
+    const bool frozen_replay = replay_rotation_cleanup(caller_history) &&
+                               caller_history == "preserve-input-rotation-history-again" &&
+                               command_invocation_count == replay_commands &&
+                               exact_input_rotation_terminal_equal(terminal_receipt, frozen);
     root.settled = true;
     std::string terminal_error;
     if (!validate_exact_input_rotation_terminal_receipt(terminal_receipt, terminal_error)) {
         result.error = terminal_error;
         return result;
     }
-    if (!exact_input_mounted_absence_equal(terminal_receipt.fresh_absence, frozen.fresh_absence)) {
-        result.error = "terminal fresh absence changed during replay";
+    if (!frozen_replay) {
+        result.error = "terminal exact-input rotation receipt changed during replay";
         return result;
     }
     result.cleanup_complete = true;
