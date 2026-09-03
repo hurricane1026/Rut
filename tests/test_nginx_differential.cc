@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -1043,6 +1044,617 @@ static bool wait_ready(u16 port, Child& child, std::string& error) {
     }
     error = "readiness timeout";
     return false;
+}
+
+enum class PinnedNginxReadinessDecision { Wait, Ready, CliExited, DeadlineExpired };
+
+static PinnedNginxReadinessDecision pinned_nginx_readiness_decision(bool cli_exited,
+                                                                    bool port_ready,
+                                                                    bool deadline_expired) {
+    if (cli_exited) return PinnedNginxReadinessDecision::CliExited;
+    if (port_ready) return PinnedNginxReadinessDecision::Ready;
+    if (deadline_expired) return PinnedNginxReadinessDecision::DeadlineExpired;
+    return PinnedNginxReadinessDecision::Wait;
+}
+
+struct PinnedNginxContainerState {
+    bool inspected = false;
+    bool parsed = false;
+    std::string raw;
+    std::string status;
+    bool running = false;
+    int exit_code = -1;
+    bool oom_killed = false;
+    std::string state_error;
+};
+
+static bool is_json_string(const std::string& value) {
+    if (value.size() < 2u || value.front() != '"' || value.back() != '"') return false;
+    for (size_t i = 1u; i + 1u < value.size(); i++) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (c < 0x20u || c == '"') return false;
+        if (c != '\\') continue;
+        if (++i + 1u >= value.size()) return false;
+        const char escaped = value[i];
+        if (escaped == '"' || escaped == '\\' || escaped == '/' || escaped == 'b' ||
+            escaped == 'f' || escaped == 'n' || escaped == 'r' || escaped == 't')
+            continue;
+        if (escaped != 'u' || i + 4u >= value.size()) return false;
+        for (size_t digit = 0u; digit < 4u; digit++) {
+            const char hex = value[++i];
+            if (!((hex >= '0' && hex <= '9') || (hex >= 'a' && hex <= 'f') ||
+                  (hex >= 'A' && hex <= 'F')))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_pinned_nginx_container_state(const std::string& raw,
+                                               PinnedNginxContainerState& state) {
+    state.raw = raw;
+    state.parsed = false;
+    if (std::count(raw.begin(), raw.end(), '|') != 4) return false;
+    size_t begin = 0u;
+    std::string fields[5];
+    for (size_t index = 0u; index < 4u; index++) {
+        const size_t end = raw.find('|', begin);
+        if (end == std::string::npos || end == begin) return false;
+        fields[index] = raw.substr(begin, end - begin);
+        begin = end + 1u;
+    }
+    fields[4] = raw.substr(begin);
+    char* end = nullptr;
+    errno = 0;
+    const long exit_code = strtol(fields[2].c_str(), &end, 10);
+    const bool known_status = fields[0] == "created" || fields[0] == "running" ||
+                              fields[0] == "paused" || fields[0] == "restarting" ||
+                              fields[0] == "removing" || fields[0] == "exited" ||
+                              fields[0] == "dead";
+    if (!known_status || errno != 0 || end == fields[2].c_str() || *end != '\0' || exit_code < 0 ||
+        exit_code > 255 || (fields[1] != "true" && fields[1] != "false") ||
+        (fields[3] != "true" && fields[3] != "false") || !is_json_string(fields[4]))
+        return false;
+    state.status = fields[0];
+    state.running = fields[1] == "true";
+    state.exit_code = static_cast<int>(exit_code);
+    state.oom_killed = fields[3] == "true";
+    state.state_error = fields[4];
+    state.parsed = true;
+    return true;
+}
+
+static bool pinned_nginx_container_is_healthy_running(const PinnedNginxContainerState& state) {
+    return state.inspected && state.parsed && state.status == "running" && state.running &&
+           state.exit_code == 0 && !state.oom_killed && state.state_error == "\"\"";
+}
+
+static bool pinned_nginx_child_still_owned(const Child& child) {
+    return child.pid >= 0 && !child.reaped;
+}
+
+static bool pinned_nginx_cleanup_is_complete(bool container_removed,
+                                             const Child& attached_cli,
+                                             size_t pending_command_children) {
+    return container_removed && !pinned_nginx_child_still_owned(attached_cli) &&
+           pending_command_children == 0u;
+}
+
+static bool pinned_nginx_shutdown_evidence_is_accepted(bool term_requested,
+                                                       bool cli_settled,
+                                                       const Child& cli,
+                                                       const PinnedNginxContainerState& state,
+                                                       bool& requires_force_cleanup,
+                                                       std::string& reason) {
+    requires_force_cleanup = !cli_settled || (state.parsed && state.running);
+    if (!term_requested) {
+        reason = "container TERM was not test-owned";
+        return false;
+    }
+    if (!cli_settled) {
+        reason = "attached docker CLI did not settle after container TERM";
+        return false;
+    }
+    if (!cli.status_valid || !WIFEXITED(cli.status) || WEXITSTATUS(cli.status) != 0) {
+        reason = "attached docker CLI terminal status was not exit 0";
+        return false;
+    }
+    if (!state.inspected || !state.parsed) {
+        reason = "stopped container state was unavailable or malformed";
+        return false;
+    }
+    if (state.status != "exited" || state.running) {
+        reason = "container was not in the explicit stopped/exited state";
+        return false;
+    }
+    if (state.exit_code != 0) {
+        reason = "nginx did not report its documented graceful TERM exit 0";
+        return false;
+    }
+    if (state.oom_killed) {
+        reason = "container was OOM-killed";
+        return false;
+    }
+    if (state.state_error != "\"\"") {
+        reason = "container State.Error was non-empty";
+        return false;
+    }
+    requires_force_cleanup = false;
+    return true;
+}
+
+static std::string read_pinned_nginx_diagnostic_file(const std::string& path) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "<unavailable errno=" + std::to_string(errno) + " " + strerror(errno) + ">";
+    std::string contents;
+    char buffer[1024];
+    while (contents.size() < 8192u) {
+        const size_t want = std::min(sizeof(buffer), 8192u - contents.size());
+        const ssize_t n = read(fd, buffer, want);
+        if (n > 0) {
+            contents.append(buffer, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fd);
+    if (contents.empty()) return "<empty>";
+    if (contents.size() == 8192u) contents += "\n<truncated>";
+    return contents;
+}
+
+class PinnedNginxDockerLifecycle {
+public:
+    PinnedNginxDockerLifecycle(std::string name, TempDir& temp, std::string& error)
+        : name_(std::move(name)), temp_(temp), error_(error) {}
+
+    ~PinnedNginxDockerLifecycle() {
+        if (!active_) return;
+        capture_diagnostics("fixture left the pinned nginx container active");
+        cleanup_after_failure(true);
+        if (active_) cleanup_after_failure(true);
+        if (active_)
+            append_error(
+                "pinned nginx lifecycle retained unreaped child/container ownership "
+                "after bounded destructor cleanup");
+    }
+
+    Child& cli() { return cli_; }
+
+    bool start(u16 frontend_port) {
+        started_at_ = std::chrono::steady_clock::now();
+        active_ = true;
+        if (!spawn_child({"docker",
+                          "run",
+                          "--pull=never",
+                          "--network",
+                          "host",
+                          "--name",
+                          name_,
+                          "-v",
+                          temp_.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          "-v",
+                          std::string(temp_.path) + ":" + temp_.path,
+                          kNginxImage,
+                          "nginx",
+                          "-g",
+                          "daemon off;"},
+                         temp_.nginx_log,
+                         cli_)) {
+            capture_diagnostics("failed to spawn attached docker run CLI");
+            cleanup_after_failure(true);
+            return false;
+        }
+
+        const auto deadline = started_at_ + std::chrono::seconds(15);
+        for (;;) {
+            const bool cli_exited = poll_child(cli_);
+            bool port_ready = false;
+            if (!cli_exited) {
+                const int fd = connect_once_with_errno(frontend_port, last_connect_errno_);
+                if (fd >= 0) {
+                    close(fd);
+                    port_ready = true;
+                }
+            }
+            const auto decision = pinned_nginx_readiness_decision(
+                cli_exited, port_ready, std::chrono::steady_clock::now() >= deadline);
+            if (decision == PinnedNginxReadinessDecision::Ready) {
+                PinnedNginxContainerState state;
+                if (!inspect(state) || !pinned_nginx_container_is_healthy_running(state)) {
+                    capture_diagnostics(
+                        "frontend port became ready without a healthy named running container");
+                    cleanup_after_failure(true);
+                    return false;
+                }
+                return true;
+            }
+            if (decision == PinnedNginxReadinessDecision::CliExited) {
+                capture_diagnostics("attached docker run CLI exited before readiness");
+                cleanup_after_failure(true);
+                return false;
+            }
+            if (decision == PinnedNginxReadinessDecision::DeadlineExpired) {
+                capture_diagnostics("15s monotonic pinned nginx readiness deadline expired");
+                cleanup_after_failure(true);
+                return false;
+            }
+            usleep(25'000);
+        }
+    }
+
+    bool shutdown() {
+        if (!active_) {
+            append_error("pinned nginx lifecycle shutdown was invoked after cleanup");
+            return false;
+        }
+        if (poll_child(cli_)) {
+            capture_diagnostics("attached docker run CLI exited before controlled shutdown");
+            cleanup_after_failure(false);
+            return false;
+        }
+        PinnedNginxContainerState running;
+        if (!inspect(running) || !pinned_nginx_container_is_healthy_running(running)) {
+            capture_diagnostics("named container was not live before controlled shutdown");
+            cleanup_after_failure(true);
+            return false;
+        }
+
+        std::string output;
+        term_requested_ =
+            run_command({"docker", "kill", "--signal", "TERM", name_}, 10'000, output);
+        if (!term_requested_) {
+            capture_diagnostics("direct named-container TERM command failed: " + output);
+            cleanup_after_failure(true);
+            return false;
+        }
+
+        const bool cli_settled = wait_child(cli_, 10'000);
+        PinnedNginxContainerState stopped;
+        (void)inspect(stopped);
+        bool force_cleanup = false;
+        std::string reason;
+        if (!pinned_nginx_shutdown_evidence_is_accepted(
+                term_requested_, cli_settled, cli_, stopped, force_cleanup, reason)) {
+            capture_diagnostics("controlled shutdown evidence rejected: " + reason);
+            cleanup_after_failure(force_cleanup);
+            return false;
+        }
+        cli_.pid = -1;
+
+        if (!run_command({"docker", "rm", name_}, 10'000, output)) {
+            capture_diagnostics("stopped named-container removal failed: " + output);
+            cleanup_after_failure(false);
+            return false;
+        }
+        container_removed_ = true;
+        active_ = !pinned_nginx_cleanup_is_complete(
+            container_removed_, cli_, pending_command_children_.size());
+        return true;
+    }
+
+private:
+    static int connect_once_with_errno(u16 port, int& connect_errno) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            connect_errno = errno;
+            return -1;
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            connect_errno = errno;
+            close(fd);
+            return -1;
+        }
+        connect_errno = 0;
+        return fd;
+    }
+
+    bool run_command(const std::vector<std::string>& args, int timeout_ms, std::string& output) {
+        settle_pending_command_children();
+        const std::string path = std::string(temp_.path) + "/nginx-lifecycle-command.log";
+        output.clear();
+        Child command;
+        if (!spawn_child(args, path, command)) {
+            output = "spawn failed errno=" + std::to_string(errno) + " " + strerror(errno);
+            return false;
+        }
+        const bool settled = wait_child(command, timeout_ms);
+        if (!settled) {
+            (void)kill(command.pid, SIGKILL);
+            if (!wait_child(command, 2000)) {
+                pending_command_children_.push_back(std::move(command));
+                command.pid = -1;
+            }
+        }
+        output = read_pinned_nginx_diagnostic_file(path);
+        unlink(path.c_str());
+        if (!settled) {
+            output += "\ncommand timed out";
+            if (command.reaped) output += " (" + child_status_description(command) + ")";
+            if (command.reaped) command.pid = -1;
+            return false;
+        }
+        command.pid = -1;
+        return command.status_valid && WIFEXITED(command.status) &&
+               WEXITSTATUS(command.status) == 0;
+    }
+
+    bool inspect(PinnedNginxContainerState& state) {
+        std::string output;
+        state.inspected = run_command({"docker",
+                                       "inspect",
+                                       "--format",
+                                       "{{.State.Status}}|{{.State.Running}}|{{.State.ExitCode}}|{{"
+                                       ".State.OOMKilled}}|{{json .State.Error}}",
+                                       name_},
+                                      10'000,
+                                      output);
+        state.raw = output;
+        if (!state.inspected) return false;
+        while (!state.raw.empty() && (state.raw.back() == '\n' || state.raw.back() == '\r'))
+            state.raw.pop_back();
+        return parse_pinned_nginx_container_state(state.raw, state);
+    }
+
+    void append_error(const std::string& message) {
+        if (!error_.empty()) error_ += "\n";
+        error_ += message;
+    }
+
+    void settle_pending_command_children() {
+        for (size_t index = 0u; index < pending_command_children_.size();) {
+            Child& child = pending_command_children_[index];
+            if (!poll_child(child)) {
+                (void)kill(child.pid, SIGKILL);
+                (void)wait_child(child, 2000);
+            }
+            if (!child.reaped) {
+                index++;
+                continue;
+            }
+            child.pid = -1;
+            pending_command_children_.erase(pending_command_children_.begin() + index);
+        }
+    }
+
+    void capture_diagnostics(const std::string& reason) {
+        if (diagnostics_captured_) return;
+        diagnostics_captured_ = true;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - started_at_)
+                                 .count();
+        PinnedNginxContainerState state;
+        (void)inspect(state);
+        std::string child_status = "not spawned";
+        if (cli_.pid >= 0 && !cli_.reaped)
+            child_status = "live pid " + std::to_string(cli_.pid);
+        else if (cli_.reaped)
+            child_status = child_status_description(cli_);
+        append_error(reason + "\n[pinned nginx lifecycle diagnostics] container=" + name_ +
+                     " elapsed_readiness_ms=" + std::to_string(elapsed) +
+                     " last_connect_errno=" + std::to_string(last_connect_errno_) + " (" +
+                     (last_connect_errno_ == 0 ? std::string("none")
+                                               : std::string(strerror(last_connect_errno_))) +
+                     ") attached_docker_cli=" + child_status + "\ncontainer_inspect=" + state.raw +
+                     "\nnginx_config:\n" + read_pinned_nginx_diagnostic_file(temp_.nginx_config) +
+                     "\nnginx_error_process_log:\n" +
+                     read_pinned_nginx_diagnostic_file(temp_.nginx_log) + "\nnginx_access_log:\n" +
+                     read_pinned_nginx_diagnostic_file(temp_.nginx_access_log));
+    }
+
+    void cleanup_after_failure(bool force) {
+        if (!active_) return;
+        settle_pending_command_children();
+        std::string output;
+        if (!container_removed_) {
+            PinnedNginxContainerState state;
+            (void)inspect(state);
+            const bool must_force = force || !state.parsed || state.running;
+            container_removed_ =
+                run_command(must_force ? std::vector<std::string>{"docker", "rm", "-f", name_}
+                                       : std::vector<std::string>{"docker", "rm", name_},
+                            10'000,
+                            output);
+            if (!container_removed_) append_error("pinned nginx cleanup failed: " + output);
+        }
+        if (cli_.pid >= 0 && !cli_.reaped && !wait_child(cli_, 3000)) {
+            (void)kill(cli_.pid, SIGKILL);
+            (void)wait_child(cli_, 2000);
+        }
+        if (cli_.reaped) cli_.pid = -1;
+        settle_pending_command_children();
+        active_ = !pinned_nginx_cleanup_is_complete(
+            container_removed_, cli_, pending_command_children_.size());
+    }
+
+    std::string name_;
+    TempDir& temp_;
+    std::string& error_;
+    Child cli_;
+    std::vector<Child> pending_command_children_;
+    bool active_ = false;
+    bool container_removed_ = false;
+    bool term_requested_ = false;
+    bool diagnostics_captured_ = false;
+    int last_connect_errno_ = 0;
+    std::chrono::steady_clock::time_point started_at_ = std::chrono::steady_clock::now();
+};
+
+static bool run_pinned_nginx_lifecycle_self_checks(std::string& error) {
+    if (pinned_nginx_readiness_decision(true, false, false) !=
+        PinnedNginxReadinessDecision::CliExited) {
+        error = "early attached-CLI exit did not dominate readiness";
+        return false;
+    }
+    if (pinned_nginx_readiness_decision(false, false, false) !=
+            PinnedNginxReadinessDecision::Wait ||
+        pinned_nginx_readiness_decision(false, true, false) !=
+            PinnedNginxReadinessDecision::Ready ||
+        pinned_nginx_readiness_decision(false, false, true) !=
+            PinnedNginxReadinessDecision::DeadlineExpired) {
+        error = "delayed readiness/deadline transition was not deterministic";
+        return false;
+    }
+
+    PinnedNginxContainerState parsed;
+    parsed.inspected = true;
+    if (!parse_pinned_nginx_container_state("running|true|0|false|\"\"", parsed) ||
+        !pinned_nginx_container_is_healthy_running(parsed)) {
+        error = "exact healthy five-field inspect state was not parsed";
+        return false;
+    }
+    for (const char* malformed : {"exited|false|0|false|",
+                                  "exited|false|0|false",
+                                  "exited|false|0|false|\"\"|extra",
+                                  "exited|false|0|false|not-json",
+                                  "|false|0|false|\"\"",
+                                  "unknown|false|0|false|\"\"",
+                                  "exited|maybe|0|false|\"\"",
+                                  "exited|false|256|false|\"\""}) {
+        PinnedNginxContainerState rejected;
+        rejected.inspected = true;
+        if (parse_pinned_nginx_container_state(malformed, rejected) || rejected.parsed) {
+            error = "malformed/truncated inspect state was accepted: " + std::string(malformed);
+            return false;
+        }
+    }
+    PinnedNginxContainerState nonempty_error;
+    nonempty_error.inspected = true;
+    if (!parse_pinned_nginx_container_state("exited|false|0|false|\"docker failure\"",
+                                            nonempty_error) ||
+        nonempty_error.state_error != "\"docker failure\"") {
+        error = "structurally valid nonempty JSON State.Error was not parsed for rejection";
+        return false;
+    }
+
+    Child clean_cli;
+    clean_cli.reaped = true;
+    clean_cli.status_valid = true;
+    clean_cli.status = 0;
+    PinnedNginxContainerState stopped;
+    stopped.inspected = true;
+    stopped.parsed = true;
+    stopped.status = "exited";
+    stopped.exit_code = 0;
+    stopped.state_error = "\"\"";
+    bool force_cleanup = true;
+    std::string reason;
+    if (!pinned_nginx_shutdown_evidence_is_accepted(
+            true, true, clean_cli, stopped, force_cleanup, reason) ||
+        force_cleanup) {
+        error = "controlled TERM evidence was not accepted: " + reason;
+        return false;
+    }
+
+    enum class NegativeKind {
+        TermNotOwned,
+        CliUnsettled,
+        CliStatusUnavailable,
+        CliSignaled,
+        CliNonzero,
+        InspectAbsent,
+        InspectUnparsed,
+        ContainerRunning,
+        ContainerNotExited,
+        ContainerNonzero,
+        ContainerOom,
+        ContainerError,
+    };
+    struct NegativeCase {
+        const char* name;
+        NegativeKind kind;
+        bool force_cleanup;
+    };
+    const NegativeCase negative_cases[] = {
+        {"TERM not test-owned", NegativeKind::TermNotOwned, false},
+        {"CLI unsettled", NegativeKind::CliUnsettled, true},
+        {"CLI status unavailable", NegativeKind::CliStatusUnavailable, false},
+        {"CLI signaled", NegativeKind::CliSignaled, false},
+        {"CLI nonzero", NegativeKind::CliNonzero, false},
+        {"inspect absent", NegativeKind::InspectAbsent, false},
+        {"inspect unparsed", NegativeKind::InspectUnparsed, false},
+        {"container running", NegativeKind::ContainerRunning, true},
+        {"container non-exited", NegativeKind::ContainerNotExited, false},
+        {"container nonzero", NegativeKind::ContainerNonzero, false},
+        {"container OOM", NegativeKind::ContainerOom, false},
+        {"container State.Error", NegativeKind::ContainerError, false},
+    };
+    for (const auto& test : negative_cases) {
+        bool term_requested = true;
+        bool cli_settled = true;
+        Child cli = clean_cli;
+        PinnedNginxContainerState state = stopped;
+        switch (test.kind) {
+            case NegativeKind::TermNotOwned:
+                term_requested = false;
+                break;
+            case NegativeKind::CliUnsettled:
+                cli_settled = false;
+                break;
+            case NegativeKind::CliStatusUnavailable:
+                cli.status_valid = false;
+                break;
+            case NegativeKind::CliSignaled:
+                cli.status = SIGTERM;
+                break;
+            case NegativeKind::CliNonzero:
+                cli.status = 1 << 8;
+                break;
+            case NegativeKind::InspectAbsent:
+                state.inspected = false;
+                break;
+            case NegativeKind::InspectUnparsed:
+                state.parsed = false;
+                break;
+            case NegativeKind::ContainerRunning:
+                state.status = "running";
+                state.running = true;
+                break;
+            case NegativeKind::ContainerNotExited:
+                state.status = "dead";
+                break;
+            case NegativeKind::ContainerNonzero:
+                state.exit_code = 1;
+                break;
+            case NegativeKind::ContainerOom:
+                state.oom_killed = true;
+                break;
+            case NegativeKind::ContainerError:
+                state.state_error = "\"failure\"";
+                break;
+        }
+        force_cleanup = !test.force_cleanup;
+        reason.clear();
+        if (pinned_nginx_shutdown_evidence_is_accepted(
+                term_requested, cli_settled, cli, state, force_cleanup, reason) ||
+            force_cleanup != test.force_cleanup || reason.empty()) {
+            error = "shutdown negative was not rejected with exact cleanup disposition: " +
+                    std::string(test.name);
+            return false;
+        }
+    }
+
+    Child owned_child;
+    owned_child.pid = 123;
+    if (!pinned_nginx_child_still_owned(owned_child) ||
+        pinned_nginx_cleanup_is_complete(true, owned_child, 0u)) {
+        error = "unreaped child was not retained as incomplete cleanup ownership";
+        return false;
+    }
+    owned_child.reaped = true;
+    if (pinned_nginx_child_still_owned(owned_child) ||
+        !pinned_nginx_cleanup_is_complete(true, owned_child, 0u) ||
+        pinned_nginx_cleanup_is_complete(true, owned_child, 1u) ||
+        pinned_nginx_cleanup_is_complete(false, owned_child, 0u)) {
+        error = "reaped/pending/container cleanup ownership transitions were not exact";
+        return false;
+    }
+    return true;
 }
 
 static bool send_all(int fd, const char* data, size_t len) {
@@ -30681,28 +31293,10 @@ static bool capture_static_query_proxy_oracle_side(
         return false;
     }
 
-    ChildGuard nginx;
-    DockerGuard docker(process_identity);
+    PinnedNginxDockerLifecycle nginx(process_identity, temp, error);
     close(*frontend_reservation);
     *frontend_reservation = -1;
-    if (!spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      process_identity,
-                      "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
-                      "-v",
-                      std::string(temp.path) + ":" + temp.path,
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     temp.nginx_log,
-                     nginx.child) ||
-        !wait_ready(frontend_port, nginx.child, error)) {
+    if (!nginx.start(frontend_port)) {
         if (error.empty())
             error =
                 std::string(profile.issue) + " nginx-only oracle frontend failed before readiness";
@@ -30710,7 +31304,7 @@ static bool capture_static_query_proxy_oracle_side(
     }
     const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!recorder_live(backend) && std::chrono::steady_clock::now() < ready_deadline) {
-        if (poll_child(nginx.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+        if (poll_child(nginx.cli()) || backend.listener_failed.load(std::memory_order_acquire)) {
             error = std::string(profile.issue) +
                     " nginx-only oracle frontend/recorder failed before readiness";
             return false;
@@ -30746,7 +31340,7 @@ static bool capture_static_query_proxy_oracle_side(
         [&](u32 expected, const char* phase, std::chrono::milliseconds duration) {
             const auto deadline = std::chrono::steady_clock::now() + duration;
             for (;;) {
-                if (poll_child(nginx.child) || !recorder_live(backend)) {
+                if (poll_child(nginx.cli()) || !recorder_live(backend)) {
                     error = std::string(profile.issue) +
                             " nginx-only oracle frontend/recorder stopped during " + phase;
                     return false;
@@ -30765,7 +31359,7 @@ static bool capture_static_query_proxy_oracle_side(
     const auto wait_count = [&](u32 expected) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
-            if (poll_child(nginx.child) || !recorder_live(backend)) return false;
+            if (poll_child(nginx.cli()) || !recorder_live(backend)) return false;
             const u32 accepts = backend.accepted.load(std::memory_order_acquire);
             const u32 requests_seen = backend.requests.load(std::memory_order_acquire);
             const u32 sends = backend.response_send_all_calls.load(std::memory_order_acquire);
@@ -30785,7 +31379,7 @@ static bool capture_static_query_proxy_oracle_side(
         }
     }
     for (size_t i = 0u; i < profile.vector_count; i++) {
-        if (poll_child(nginx.child) || !recorder_live(backend)) {
+        if (poll_child(nginx.cli()) || !recorder_live(backend)) {
             error = std::string(profile.issue) +
                     " nginx-only oracle frontend/recorder was not live before vector " +
                     std::to_string(i + 1u);
@@ -30833,7 +31427,7 @@ static bool capture_static_query_proxy_oracle_side(
             while (backend.response_peer_close_count.load(std::memory_order_acquire) !=
                        expected_forwards &&
                    std::chrono::steady_clock::now() < close_deadline) {
-                if (poll_child(nginx.child) || !recorder_live(backend)) break;
+                if (poll_child(nginx.cli()) || !recorder_live(backend)) break;
                 usleep(1000);
             }
             if (backend.response_peer_close_count.load(std::memory_order_acquire) !=
@@ -30860,7 +31454,7 @@ static bool capture_static_query_proxy_oracle_side(
         const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         for (;;) {
             std::string access_contents;
-            if (poll_child(nginx.child) || !recorder_live(backend) ||
+            if (poll_child(nginx.cli()) || !recorder_live(backend) ||
                 !read_proxy_hide_header_access(temp.nginx_access_log, access_contents, error)) {
                 if (error.empty()) error = "#373 failed while awaiting live exact access record";
                 return false;
@@ -30881,7 +31475,7 @@ static bool capture_static_query_proxy_oracle_side(
             std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         while (std::chrono::steady_clock::now() < access_stable_deadline) {
             std::string access_contents;
-            if (poll_child(nginx.child) || !recorder_live(backend) ||
+            if (poll_child(nginx.cli()) || !recorder_live(backend) ||
                 backend.accepted.load(std::memory_order_acquire) != 1u ||
                 backend.requests.load(std::memory_order_acquire) != 1u ||
                 backend.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
@@ -30900,18 +31494,12 @@ static bool capture_static_query_proxy_oracle_side(
     if (!observe_count(static_cast<u32>(profile.forward_count),
                        "live no-extra/retry window",
                        std::chrono::milliseconds(500)) ||
-        !stop_child(nginx.child)) {
+        !nginx.shutdown()) {
         if (error.empty())
             error = std::string(profile.issue) +
                     " nginx-only oracle frontend did not survive controlled shutdown";
         return false;
     }
-    if (!docker.remove()) {
-        error = std::string(profile.issue) +
-                " nginx-only oracle failed to remove pinned nginx container";
-        return false;
-    }
-
     backend.stop();
     backend_guard.recorder = nullptr;
     observation.forward_accepts = backend.accepted.load(std::memory_order_acquire);
@@ -33935,8 +34523,7 @@ static bool capture_wildcard_listen_oracle_side(
         error = std::string(profile.issue) + " recorder could not bind its reserved backend port";
         return false;
     }
-    ChildGuard nginx;
-    DockerGuard docker(process_identity);
+    PinnedNginxDockerLifecycle nginx(process_identity, temp, error);
     close(*frontend_reservation);
     *frontend_reservation = -1;
     if (profile.exact_loopback_address) {
@@ -33947,24 +34534,7 @@ static bool capture_wildcard_listen_oracle_side(
             return false;
         observation.negative_guard_blocked_wildcard_bind = true;
     }
-    if (!spawn_child({"docker",
-                      "run",
-                      "--pull=never",
-                      "--network",
-                      "host",
-                      "--name",
-                      process_identity,
-                      "-v",
-                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
-                      "-v",
-                      std::string(temp.path) + ":" + temp.path,
-                      kNginxImage,
-                      "nginx",
-                      "-g",
-                      "daemon off;"},
-                     temp.nginx_log,
-                     nginx.child) ||
-        !wait_ready(frontend_port, nginx.child, error)) {
+    if (!nginx.start(frontend_port)) {
         if (error.empty())
             error = std::string(profile.issue) + " pinned nginx failed before readiness";
         return false;
@@ -33976,7 +34546,7 @@ static bool capture_wildcard_listen_oracle_side(
     };
     const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!recorder_live() && std::chrono::steady_clock::now() < ready_deadline) {
-        if (poll_child(nginx.child) || backend.listener_failed.load(std::memory_order_acquire)) {
+        if (poll_child(nginx.cli()) || backend.listener_failed.load(std::memory_order_acquire)) {
             error = std::string(profile.issue) + " nginx/recorder failed before readiness";
             return false;
         }
@@ -33989,7 +34559,7 @@ static bool capture_wildcard_listen_oracle_side(
     const auto observe_count = [&](u32 expected, std::chrono::milliseconds duration) {
         const auto deadline = std::chrono::steady_clock::now() + duration;
         for (;;) {
-            if (poll_child(nginx.child) || !recorder_live()) return false;
+            if (poll_child(nginx.cli()) || !recorder_live()) return false;
             if (backend.accepted.load(std::memory_order_acquire) != expected ||
                 backend.requests.load(std::memory_order_acquire) != expected ||
                 backend.response_send_all_calls.load(std::memory_order_acquire) != expected)
@@ -34031,7 +34601,7 @@ static bool capture_wildcard_listen_oracle_side(
     }
     const auto episode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < episode_deadline && recorder_live() &&
-           !poll_child(nginx.child)) {
+           !poll_child(nginx.cli())) {
         if (backend.accepted.load(std::memory_order_acquire) > 1u ||
             backend.requests.load(std::memory_order_acquire) > 1u ||
             backend.response_send_all_calls.load(std::memory_order_acquire) > 1u)
@@ -34050,7 +34620,7 @@ static bool capture_wildcard_listen_oracle_side(
     if (profile.exact_loopback_address) {
         const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (!access_count_is(1u) && std::chrono::steady_clock::now() < access_deadline) {
-            if (poll_child(nginx.child) || !recorder_live()) break;
+            if (poll_child(nginx.cli()) || !recorder_live()) break;
             usleep(1000);
         }
         if (!access_count_is(1u)) {
@@ -34065,7 +34635,7 @@ static bool capture_wildcard_listen_oracle_side(
         }
         observation.negative_probe_after_quiet = true;
     }
-    if (!stop_child(nginx.child) || !docker.remove()) {
+    if (!nginx.shutdown()) {
         error = std::string(profile.issue) + " pinned nginx/container did not stop cleanly";
         return false;
     }
@@ -51977,6 +52547,8 @@ int main(int argc, char** argv) {
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
+    const bool pinned_nginx_lifecycle_self_check =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -52161,6 +52733,7 @@ int main(int argc, char** argv) {
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
+         !pinned_nginx_lifecycle_self_check &&
          !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
@@ -52322,6 +52895,7 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
+                     "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -52519,6 +53093,19 @@ int main(int argc, char** argv) {
                          "file\n";
             return 1;
         }
+    }
+
+    if (pinned_nginx_lifecycle_self_check) {
+        std::string lifecycle_error;
+        if (!run_pinned_nginx_lifecycle_self_checks(lifecycle_error)) {
+            std::cerr << "FAIL [#439 pinned nginx lifecycle self-check]: " << lifecycle_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #439 pinned nginx lifecycle transition checks reject early CLI "
+                     "exit, readiness deadline, TERM timeout/forced cleanup and invalid wait "
+                     "status while accepting delayed readiness and exact graceful TERM evidence\n";
+        return 0;
     }
 
     if (proxy_hide_header_source_self_check) {
