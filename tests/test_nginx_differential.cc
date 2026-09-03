@@ -51197,6 +51197,536 @@ static bool capture_proxy_hide_header_final(const char* rut_path,
     return true;
 }
 
+static constexpr char kPositiveGetDefaultOriginResponse[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: get-origin\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "Content-Length: 36\r\n\r\n"
+    "0123456789abcdefghijklmnopqrstuvwxyz";
+static_assert(sizeof(kPositiveGetDefaultOriginResponse) - 1u == 132u);
+static constexpr char kPositiveGetDefaultResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 36\r\n"
+    "Connection: keep-alive\r\n\r\n"
+    "0123456789abcdefghijklmnopqrstuvwxyz";
+static_assert(sizeof(kPositiveGetDefaultResponseNormalized) - 1u == 158u);
+static constexpr char kPositiveGetDefaultRequestHead[] =
+    "GET /buffered-positive-get?case=fragmented HTTP/1.1\r\n"
+    "Host: positive-get.client\r\n"
+    "Content-Length: 12\r\n"
+    "X-Positive-Get: binary-body\r\n\r\n";
+static constexpr unsigned char kPositiveGetDefaultRequestBody[] = {
+    'G', 0x00, 'E', 'T', 0xff, 0x7f, 'r', 0x0d, 0x0a, 'u', 't', '!'};
+static constexpr u32 kPositiveGetDefaultPrefixBody = 5u;
+static_assert(sizeof(kPositiveGetDefaultRequestBody) == 12u);
+
+static std::string make_positive_get_default_profile(u16 frontend_port,
+                                                     u16 backend_port,
+                                                     const std::string& access_path) {
+    return "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_positive_get_default_profile(const std::string& profile,
+                                                  u16 frontend_port,
+                                                  u16 backend_port,
+                                                  const std::string& access_path,
+                                                  std::string& error) {
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
+    const std::string upstream =
+        "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+    if (frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        access_path.empty() || profile.rfind("http {\n", 0u) != 0u ||
+        count_text(profile, "http {") != 1u || count_text(profile, "server {") != 1u ||
+        count_text(profile, "location / {") != 1u || count_text(profile, "location ") != 1u ||
+        count_text(profile, "log_format compat \"$request_length\";") != 1u ||
+        count_text(profile, "access_log " + access_path + " compat;") != 1u ||
+        count_text(profile, listener) != 1u || count_text(profile, upstream) != 1u ||
+        profile.find("proxy_read_timeout") != std::string::npos ||
+        profile.find("proxy_buffering") != std::string::npos ||
+        profile.find("proxy_request_buffering") != std::string::npos ||
+        profile.find("proxy_http_version") != std::string::npos ||
+        profile.find("proxy_set_header") != std::string::npos ||
+        profile.find("proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "/") !=
+            std::string::npos ||
+        profile.find("events") != std::string::npos ||
+        profile.find("include ") != std::string::npos) {
+        error = "#271 positive-GET profile escaped the exact omitted-directive root proxy shape";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_positive_get_default_generated_source(const std::string& source,
+                                                           u16 frontend_port,
+                                                           u16 backend_port,
+                                                           const std::string& access_path,
+                                                           std::string& error) {
+    const std::string access = "accessLog { path: \"" + access_path +
+                               "\", format: downstreamRequestBytes, publication: live }\n";
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kFixedRequestPolicy[] =
+        "        request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    if (source.rfind(access, 0u) != 0u || count_text(source, access) != 1u ||
+        count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
+        count_text(source, kCanonicalGeneratedNginxRootGetForward) != 1u ||
+        count_text(source, kFixedRequestPolicy) != 3u ||
+        count_text(source, "route HEAD \"/\" {") != 1u ||
+        count_text(source, "route GET \"/\" {") != 1u ||
+        count_text(source, "\nroute \"/\" {") != 1u ||
+        wildcard_listen_source_declarations(source, "route") != 3u ||
+        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
+        count_text(source, "        response_buffering: \"complete_content_length\"\n") != 1u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 1u ||
+        source.find("route POST ") != std::string::npos ||
+        source.find("proxy_read_timeout") != std::string::npos ||
+        source.find("proxy_buffering") != std::string::npos ||
+        source.find("proxy_request_buffering") != std::string::npos ||
+        source.find("proxy_http_version") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("workaround") != std::string::npos) {
+        error = "#271 generated source lost exact GET/fixed/60s/complete-buffering custody";
+        return false;
+    }
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#271 generated ordinary RUT source did not lex";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#271 generated ordinary RUT source did not parse";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    return true;
+}
+
+static bool build_positive_get_default_generated_source(const std::string& profile,
+                                                        u16 frontend_port,
+                                                        u16 backend_port,
+                                                        const std::string& access_path,
+                                                        std::string& source,
+                                                        std::string& error) {
+    const auto parsed =
+        rut::nginx::parse_http_profile({profile.data(), static_cast<u32>(profile.size())});
+    if (!parsed || parsed.value().server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        parsed.value().server.listen.ipv4_host != 0x7f000001u ||
+        parsed.value().server.listen.port != frontend_port ||
+        parsed.value().server.location.proxy_pass.port != backend_port ||
+        parsed.value().server.location.proxy_pass.has_uri ||
+        parsed.value().server.location.proxy_read_timeout.present) {
+        error = "#271 exact omitted-directive http profile did not retain its semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered || lowered.value().len == 0u ||
+        lowered.value().len >= rut::nginx::HttpProfileRutSource::kCapacity ||
+        lowered.value().data[lowered.value().len] != '\0') {
+        error = "#271 exact http profile did not lower to bounded owned ordinary RUT";
+        return false;
+    }
+    source.assign(lowered.value().data, lowered.value().len);
+    return validate_positive_get_default_generated_source(
+        source, frontend_port, backend_port, access_path, error);
+}
+
+static void configure_positive_get_default_origin(Recorder& origin) {
+    origin.read_exact_content_length_12_body = true;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    origin.permit_gated_complete_response = true;
+    for (u32 part = 0u; part < 4u; part++) {
+        origin.response_fragment_bytes[part] = kPositiveGetDefaultOriginResponse + part * 33u;
+        origin.response_fragment_lengths[part] = 33u;
+    }
+}
+
+static std::vector<char> positive_get_default_request_prefix() {
+    std::vector<char> wire(
+        kPositiveGetDefaultRequestHead,
+        kPositiveGetDefaultRequestHead + sizeof(kPositiveGetDefaultRequestHead) - 1u);
+    wire.insert(wire.end(),
+                reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody),
+                reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody) +
+                    kPositiveGetDefaultPrefixBody);
+    return wire;
+}
+
+static std::vector<char> positive_get_default_request_suffix() {
+    return {reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody) +
+                kPositiveGetDefaultPrefixBody,
+            reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody) +
+                sizeof(kPositiveGetDefaultRequestBody)};
+}
+
+static std::vector<char> expected_positive_get_default_upstream(u16 backend_port) {
+    const std::string head =
+        "GET /buffered-positive-get?case=fragmented HTTP/1.1\r\nHost: 127.0.0.1:" +
+        std::to_string(backend_port) +
+        "\r\nContent-Length: 12\r\nX-Positive-Get: binary-body\r\n\r\n";
+    std::vector<char> wire(head.begin(), head.end());
+    wire.insert(wire.end(),
+                reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody),
+                reinterpret_cast<const char*>(kPositiveGetDefaultRequestBody) +
+                    sizeof(kPositiveGetDefaultRequestBody));
+    return wire;
+}
+
+static bool canonicalize_positive_get_default_upstream(std::vector<char>& wire, u16 backend_port) {
+    const std::string authority = "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n";
+    const std::string canonical = "Host: 127.0.0.1:<backend>\r\n";
+    const auto at = std::search(wire.begin(), wire.end(), authority.begin(), authority.end());
+    if (at == wire.end() ||
+        std::search(at + authority.size(), wire.end(), authority.begin(), authority.end()) !=
+            wire.end())
+        return false;
+    const size_t offset = static_cast<size_t>(at - wire.begin());
+    wire.erase(wire.begin() + static_cast<std::ptrdiff_t>(offset),
+               wire.begin() + static_cast<std::ptrdiff_t>(offset + authority.size()));
+    wire.insert(
+        wire.begin() + static_cast<std::ptrdiff_t>(offset), canonical.begin(), canonical.end());
+    return true;
+}
+
+static bool run_converter_default_buffering_positive_get_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#271 positive-GET differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error = "#271 positive-GET differential could not create isolated side resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t i = 0u; i < 4u; i++) {
+        if (!reservations.reserve_four_digit(i, ports[i])) {
+            error = "#271 positive-GET differential could not hold four distinct ports";
+            return false;
+        }
+    }
+    const std::string nginx_profile =
+        make_positive_get_default_profile(ports[0], ports[1], temps[0].nginx_access_log);
+    const std::string rut_profile =
+        make_positive_get_default_profile(ports[2], ports[3], temps[1].rut_access_log);
+    if (!validate_positive_get_default_profile(
+            nginx_profile, ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_positive_get_default_profile(
+            rut_profile, ports[2], ports[3], temps[1].rut_access_log, error))
+        return false;
+    std::string generated_source;
+    if (!build_positive_get_default_generated_source(
+            rut_profile, ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !write_file(temps[0].nginx_config, nginx_profile.data(), nginx_profile.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty()) error = "#271 positive-GET differential could not persist inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    configure_positive_get_default_origin(origins[0]);
+    configure_positive_get_default_origin(origins[1]);
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#271 positive-GET origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend])) {
+            if (error.empty()) error = "#271 positive-GET origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#271 positive-GET origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#271 pinned nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "events {}; daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child) ||
+        !wait_ready(ports[0], frontends[0].child, error) ||
+        !handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#271 generated RUT bind", error) ||
+        !spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child) ||
+        !wait_ready(ports[2], frontends[1].child, error)) {
+        if (error.empty()) error = "#271 positive-GET frontends failed before paired readiness";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    clients.fds[0] = connect_once(ports[0]);
+    clients.fds[1] = connect_once(ports[2]);
+    const std::vector<char> prefix = positive_get_default_request_prefix();
+    const std::vector<char> suffix = positive_get_default_request_suffix();
+    if (clients.fds[0] < 0 || clients.fds[1] < 0 || prefix.empty() || suffix.empty() ||
+        !send_all(clients.fds[0], prefix.data(), prefix.size()) ||
+        !send_all(clients.fds[1], prefix.data(), prefix.size())) {
+        error = "#271 paired clients could not deliver both exact five-byte body prefixes";
+        return false;
+    }
+    const auto request_gate_started = std::chrono::steady_clock::now();
+    const auto request_gate_deadline = request_gate_started + std::chrono::milliseconds(1200);
+    for (;;) {
+        std::string nginx_access;
+        std::string rut_access;
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[0].requests.load(std::memory_order_acquire) != 0u ||
+            origins[1].requests.load(std::memory_order_acquire) != 0u ||
+            !read_request_length_access_file(temps[0].nginx_access_log, nginx_access, error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, rut_access, error) ||
+            !nginx_access.empty() || !rut_access.empty() ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+            if (error.empty())
+                error = "#271 paired request gate observed early origin/output/exit/error state";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= request_gate_deadline) break;
+    }
+    if (std::chrono::steady_clock::now() - request_gate_started < std::chrono::milliseconds(1200) ||
+        !send_all(clients.fds[0], suffix.data(), suffix.size()) ||
+        !send_all(clients.fds[1], suffix.data(), suffix.size())) {
+        if (error.empty()) error = "#271 paired request gate or exact seven-byte suffix failed";
+        return false;
+    }
+
+    const auto wait_both_fragments = [&](u32 expected, int budget_ms) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!frontends_live() || !origins_live()) return false;
+            bool complete = true;
+            for (const auto& origin : origins) {
+                if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                    origin.requests.load(std::memory_order_acquire) != 1u ||
+                    origin.response_send_failed.load(std::memory_order_acquire) ||
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                    origin.response_fragments_sent.load(std::memory_order_acquire) > expected)
+                    return false;
+                complete &=
+                    origin.response_fragments_sent.load(std::memory_order_acquire) == expected;
+            }
+            if (complete) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    if (!wait_both_fragments(1u, 2000)) {
+        error = "#271 origins did not reach the paired first-fragment gate exactly once";
+        return false;
+    }
+    for (u32 part = 1u; part < 4u; part++) {
+        const auto response_gate_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        for (;;) {
+            if (!frontends_live() || !origins_live() ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+                if (error.empty())
+                    error = "#271 paired response gate observed early bytes/EOF/exit/error";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= response_gate_deadline) break;
+        }
+        origins[0].response_fragment_permit.store(part + 1u, std::memory_order_release);
+        origins[1].response_fragment_permit.store(part + 1u, std::memory_order_release);
+        if (!wait_both_fragments(part + 1u, 500)) {
+            error = "#271 origins did not reach the next paired response fragment gate";
+            return false;
+        }
+    }
+    for (const auto& origin : origins) {
+        const u64 first = origin.response_fragment_sent_ns[0].load(std::memory_order_acquire);
+        const u64 final = origin.response_fragment_sent_ns[3].load(std::memory_order_acquire);
+        if (first == 0u || final <= first || final - first <= 1'000'000'000ull) {
+            error = "#271 four positive response fragments did not span more than one second";
+            return false;
+        }
+        for (u32 part = 1u; part < 4u; part++) {
+            const u64 before =
+                origin.response_fragment_sent_ns[part - 1u].load(std::memory_order_acquire);
+            const u64 after =
+                origin.response_fragment_sent_ns[part].load(std::memory_order_acquire);
+            if (after <= before || after - before < 350'000'000ull ||
+                after - before > 650'000'000ull) {
+                error = "#271 response fragment gap left the required 350-650ms window";
+                return false;
+            }
+        }
+    }
+
+    std::vector<char> responses[2];
+    if (!read_response(clients.fds[0], responses[0], error) ||
+        !read_response(clients.fds[1], responses[1], error)) {
+        if (error.empty()) error = "#271 paired completed responses were not readable";
+        return false;
+    }
+    std::vector<char> normalized[2] = {responses[0], responses[1]};
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != normalized[1] ||
+        normalized[0] !=
+            std::vector<char>(kPositiveGetDefaultResponseNormalized,
+                              kPositiveGetDefaultResponseNormalized +
+                                  sizeof(kPositiveGetDefaultResponseNormalized) - 1u) ||
+        !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 200, error) ||
+        !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 200, error)) {
+        if (error.empty()) error = "#271 final Date-normalized response/keep-alive mismatch";
+        return false;
+    }
+
+    const auto retirement_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        bool retired = true;
+        for (const auto& origin : origins)
+            retired &= origin.response_peer_closed.load(std::memory_order_acquire);
+        if (retired) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= retirement_deadline) {
+            error = "#271 one side did not retire its completed origin before cleanup";
+            return false;
+        }
+        usleep(1000);
+    }
+    settle_for_invalid_target_side_effects();
+    origins[0].stop();
+    origins[1].stop();
+    for (const auto& origin : origins) {
+        if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 4u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error = "#271 origin episode lacked exact no-retry retirement evidence";
+            return false;
+        }
+    }
+    const std::vector<char> expected[2] = {expected_positive_get_default_upstream(ports[1]),
+                                           expected_positive_get_default_upstream(ports[3])};
+    if (origins[0].history[0] != expected[0] || origins[1].history[0] != expected[1]) {
+        error = "#271 one origin request differed from its explicit expected binary vector";
+        return false;
+    }
+    std::vector<char> canonical[2] = {origins[0].history[0], origins[1].history[0]};
+    if (!canonicalize_positive_get_default_upstream(canonical[0], ports[1]) ||
+        !canonicalize_positive_get_default_upstream(canonical[1], ports[3]) ||
+        canonical[0] != canonical[1]) {
+        error = "#271 nginx and RUT origin requests differed beyond dynamic authority custody";
+        return false;
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    static constexpr char kExpectedAccess[] = "143\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access[2];
+        if (!read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error))
+            return false;
+        if (access[0] == kExpectedAccess && access[1] == kExpectedAccess) break;
+        if ((!access[0].empty() && access[0] != kExpectedAccess) ||
+            (!access[1].empty() && access[1] != kExpectedAccess) || !frontends_live() ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#271 paired access custody was not exactly one downstream 143-byte record";
+            return false;
+        }
+        usleep(5000);
+    }
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !rut_stopped || !container_removed ||
+        origins[0].thread_alive.load(std::memory_order_acquire) ||
+        origins[1].thread_alive.load(std::memory_order_acquire) || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0) {
+        error = "#271 paired frontend/container/origin/reservation cleanup was incomplete";
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -51240,6 +51770,9 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--converter-proxy-hide-header-generated-pair-self-check") == 0;
     const bool converter_proxy_hide_header_differential =
         argc == 3 && strcmp(argv[1], "--converter-proxy-hide-header-differential") == 0;
+    const bool converter_default_buffering_positive_get_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-default-buffering-positive-get-differential") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -51422,7 +51955,8 @@ int main(int argc, char** argv) {
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
          !proxy_hide_header_generated_pair_self_check &&
-         !converter_proxy_hide_header_differential && !wildcard_listen_oracle &&
+         !converter_proxy_hide_header_differential &&
+         !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
          !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
@@ -51488,6 +52022,7 @@ int main(int argc, char** argv) {
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
+        (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
@@ -51577,6 +52112,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-differential <absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-default-buffering-positive-get-differential "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -52643,6 +53181,31 @@ int main(int argc, char** argv) {
         if (!probe_error.empty()) std::cerr << probe_error << "\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
+    }
+    if (converter_default_buffering_positive_get_differential) {
+        const std::string container_name = "rut-nginx-271-positive-get-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_positive_get_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#271 converter default-buffering positive-GET differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #271 pinned nginx 1.29.7 and converter-generated ordinary RUT matched "
+               "one exact default-policy positive-Content-Length GET: both withheld a 12-byte "
+               "binary upload for at least 1.2s, emitted one authority-normalized byte-equal "
+               "origin request, withheld four 33-byte response writes spanning over 1s until "
+               "the complete CL36 body, then emitted the exact equal Date-normalized 158-byte "
+               "keep-alive response and retired one origin with no retry. The converter input "
+               "omits proxy_read_timeout/proxy_buffering/proxy_request_buffering/"
+               "proxy_http_version and the generated source retains exact GET/fixed-request/"
+               "60s/complete-content-length custody; this does not expiry-test 60s or claim "
+               "explicit directive lowering, broader methods/bodies/framing/status/protocols, "
+               "retry, or upstream reuse.\n";
+        return 0;
     }
     if (request_length_oracle) {
         const char* source_suffix = strrchr(temp.path, '/');
