@@ -54,6 +54,22 @@ inline bool response_read_deadline_fixed_upload_method_admitted(
     return false;
 }
 
+inline bool response_read_deadline_fixed_upload_profile_method_admitted(
+    ResponseReadDeadlineProfile profile, u8 method, ForwardResponseBufferingMode buffering) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+            return response_read_deadline_fixed_upload_method_admitted(method, buffering);
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
+            return buffering == ForwardResponseBufferingMode::None &&
+                   static_cast<LogHttpMethod>(method) == LogHttpMethod::Head;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
 inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method);
 
 inline bool complete_content_length_response_status_is_admitted(u16 status) {
@@ -237,12 +253,12 @@ inline bool response_read_deadline_persistence_owner_is_stable(
 
 inline bool complete_content_length_request_policy_owner_is_stable(
     const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
-    if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
-        return true;
     if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
         return c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
                proof.request_policy_id == c.request_policy_id;
     }
+    if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+        return true;
     return complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            proof.request_policy_id == c.request_policy_id;
 }
@@ -250,6 +266,7 @@ inline bool complete_content_length_request_policy_owner_is_stable(
 inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
     bool require_upload_complete,
     u16 bundle_id,
     u8 route_method,
@@ -258,11 +275,13 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     const RouteConfig* cfg = c.request_config;
     if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
         cfg->policy_bundles[bundle_id - 1].response_buffering != buffering ||
-        !response_read_deadline_fixed_upload_method_admitted(c.req_method, buffering) ||
+        !response_read_deadline_fixed_upload_profile_method_admitted(
+            profile, c.req_method, buffering) ||
         proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
         proof.route_index >= cfg->route_count || proof.upstream_id >= cfg->upstream_count ||
-        proof.request_policy_id == 0 || !request_policy_is_supported(proof.request_policy_id) ||
-        proof.route_fn == nullptr || proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        proof.request_policy_id != c.request_policy_id || proof.route_fn == nullptr ||
+        proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
         proof.raw_total_length <= proof.raw_header_end ||
         proof.raw_content_length != proof.raw_total_length - proof.raw_header_end ||
         proof.rewritten_header_end == 0 ||
@@ -300,6 +319,7 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     return response_read_deadline_fixed_upload_materialization_is_stable(
         c,
         proof,
+        c.response_read_deadline_profile,
         require_upload_complete,
         c.response_read_deadline_bundle_id,
         c.response_read_deadline_route_method,
@@ -318,18 +338,26 @@ inline bool response_read_deadline_fixed_upload_proof_is_stable(
 inline bool complete_content_length_fixed_upload_materialization_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
     bool require_upload_complete,
     u16 bundle_id,
     u8 route_method,
     ForwardResponseBufferingMode buffering,
     bool retired_episode = false) {
-    if (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+    if (profile != ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero ||
+        buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
         proof.request_policy_id != c.request_policy_id ||
         !complete_content_length_route_method_is_admitted(route_method) ||
         !response_read_deadline_route_method_matches(c.req_method, route_method) ||
-        !response_read_deadline_fixed_upload_materialization_is_stable(
-            c, proof, require_upload_complete, bundle_id, route_method, buffering, retired_episode))
+        !response_read_deadline_fixed_upload_materialization_is_stable(c,
+                                                                       proof,
+                                                                       profile,
+                                                                       require_upload_complete,
+                                                                       bundle_id,
+                                                                       route_method,
+                                                                       buffering,
+                                                                       retired_episode))
         return false;
     return retired_episode ? proof.upload_episode == c.upstream_retiring_episode
                            : proof.upload_episode == c.upstream_episode;
@@ -348,6 +376,7 @@ inline bool complete_content_length_fixed_upload_composition_is_stable(
            complete_content_length_fixed_upload_materialization_is_stable(
                c,
                proof,
+               c.response_read_deadline_profile,
                require_upload_complete,
                bundle_id,
                route_method,
@@ -870,7 +899,25 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     if (c.pipeline_stash_len != 0 && !coalesced_get) return false;
     const bool complete_buffering =
         c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
-    if (response_read_deadline_profile_suppresses_head(c.response_read_deadline_profile)) {
+    const bool fixed_upload =
+        response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile);
+    const bool suppresses_head =
+        response_read_deadline_profile_suppresses_head(c.response_read_deadline_profile);
+    if (fixed_upload && suppresses_head) {
+        if (c.response_read_deadline_profile !=
+                ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+            complete_buffering || c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+            !c.req_client_has_content_length || c.req_body_mode != BodyMode::ContentLength ||
+            c.req_body_remaining != 0 || !c.request_body_fully_buffered || c.req_body_streamed ||
+            !c.response_policy_suppress_body || !c.failure_policy_suppress_body ||
+            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+            timeout.head_mode != FailurePolicyHeadMode::SuppressBody || c.retry_req_send_len != 0 ||
+            c.response_mutations_snapshotted ||
+            !response_read_deadline_fixed_upload_proof_is_stable(c,
+                                                                 c.response_read_deadline_upload))
+            return false;
+    } else if (suppresses_head) {
         if (c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
             c.req_client_has_content_length || c.req_body_mode != BodyMode::None ||
             c.req_body_remaining != 0 || c.request_body_fully_buffered || c.req_body_streamed ||
@@ -889,7 +936,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             failure.head_mode != FailurePolicyHeadMode::Reject ||
             timeout.head_mode != FailurePolicyHeadMode::Reject)
             return false;
-    } else if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
+    } else if (fixed_upload) {
         if (!(complete_buffering
                   ? complete_content_length_fixed_upload_composition_is_stable(
                         c, c.response_read_deadline_upload, /*require_upload_complete=*/true)

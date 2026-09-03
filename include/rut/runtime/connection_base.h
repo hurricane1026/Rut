@@ -85,12 +85,16 @@ enum class ResponseReadDeadlineProfile : u8 {
     HeaderOnlyHead,
     BodylessNonHeadContentLengthZero,
     FixedContentLengthUploadNonHeadContentLengthZero,
+    FixedContentLengthUploadHeaderOnlyHead,
 };
+
+static_assert(sizeof(ResponseReadDeadlineProfile) == sizeof(u8));
 
 [[nodiscard]] constexpr bool response_read_deadline_profile_is_fixed_upload(
     ResponseReadDeadlineProfile profile) {
     switch (profile) {
         case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
             return true;
         case ResponseReadDeadlineProfile::None:
         case ResponseReadDeadlineProfile::HeaderOnlyHead:
@@ -104,6 +108,7 @@ enum class ResponseReadDeadlineProfile : u8 {
     ResponseReadDeadlineProfile profile) {
     switch (profile) {
         case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead:
             return true;
         case ResponseReadDeadlineProfile::None:
         case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:

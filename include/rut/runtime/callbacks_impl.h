@@ -1032,10 +1032,12 @@ inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection
 
 inline bool inspect_response_read_deadline_fixed_upload_request(
     const Connection& conn,
+    ResponseReadDeadlineProfile profile,
     ForwardResponseBufferingMode buffering,
     ResponseReadDeadlineFixedUploadRequest* out) {
     if (out == nullptr || conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0 ||
-        !response_read_deadline_fixed_upload_method_admitted(conn.req_method, buffering))
+        !response_read_deadline_fixed_upload_profile_method_admitted(
+            profile, conn.req_method, buffering))
         return false;
     HttpParser parser;
     ParsedRequest request;
@@ -1082,6 +1084,17 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
     return true;
 }
 
+inline bool inspect_response_read_deadline_fixed_upload_request(
+    const Connection& conn,
+    ForwardResponseBufferingMode buffering,
+    ResponseReadDeadlineFixedUploadRequest* out) {
+    return inspect_response_read_deadline_fixed_upload_request(
+        conn,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        buffering,
+        out);
+}
+
 inline bool response_read_deadline_route_index(const RouteConfig& config,
                                                const RouteEntry* route,
                                                u16* out) {
@@ -1118,8 +1131,10 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
         conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
     if (matched != &pinned) return false;
     ResponseReadDeadlineFixedUploadRequest request{};
-    if (!inspect_response_read_deadline_fixed_upload_request(
-            conn, conn.response_read_deadline_buffering, &request) ||
+    if (!inspect_response_read_deadline_fixed_upload_request(conn,
+                                                             conn.response_read_deadline_profile,
+                                                             conn.response_read_deadline_buffering,
+                                                             &request) ||
         request.header_end != proof.raw_header_end ||
         request.content_length != proof.raw_content_length ||
         request.total_length != proof.raw_total_length ||
@@ -3361,6 +3376,7 @@ void handle_jit_outcome(Loop* loop,
             }
             const bool complete_content_length_buffering =
                 forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+            bool staged_fixed_head_continuation = false;
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
                     if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
@@ -3387,6 +3403,22 @@ void handle_jit_outcome(Loop* loop,
                         config->failure_policies[forward_failure_policy_id - 1],
                         config->failure_policies[forward_timeout_failure_policy_id - 1],
                         forward_response_buffering);
+                }
+                staged_fixed_head_continuation =
+                    outcome_profile == ResponseReadDeadlineProfile::None &&
+                    conn.response_read_deadline_profile ==
+                        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+                    fn == nullptr && !conn.request_policy_body_pending &&
+                    request_body_state == RequestPolicyBodyState::Complete &&
+                    forward_response_buffering == ForwardResponseBufferingMode::None &&
+                    outcome.upstream_id == conn.response_read_deadline_upload.upstream_id &&
+                    outcome.request_policy_id ==
+                        conn.response_read_deadline_upload.request_policy_id &&
+                    outcome.policy_bundle_id == conn.response_read_deadline_bundle_id &&
+                    response_read_deadline_fixed_upload_route_stable(conn, true);
+                if (staged_fixed_head_continuation) {
+                    outcome_profile = conn.response_read_deadline_profile;
                 }
                 const bool fixed_upload =
                     response_read_deadline_profile_is_fixed_upload(outcome_profile);
@@ -3623,6 +3655,16 @@ void handle_jit_outcome(Loop* loop,
                     conn,
                     config->response_policies[forward_response_policy_id - 1],
                     forward_failure_policy_id != 0);
+            if (staged_fixed_head_continuation && forward_response_policy_id != 0 &&
+                forward_failure_policy_id != 0 && forward_timeout_failure_policy_id != 0 &&
+                config->response_policies[forward_response_policy_id - 1].head_mode ==
+                    ResponsePolicyHeadMode::SuppressBody &&
+                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
+                    FailurePolicyHeadMode::SuppressBody &&
+                config->failure_policies[forward_timeout_failure_policy_id - 1].head_mode ==
+                    FailurePolicyHeadMode::SuppressBody) {
+                suppress_body_head = true;
+            }
             const bool suppress_failure_head =
                 forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
                 config->response_policies[forward_response_policy_id - 1].head_mode ==
@@ -3797,7 +3839,10 @@ void handle_jit_outcome(Loop* loop,
                     ResponseReadDeadlineFixedUploadRequest rewritten{};
                     auto& proof = conn.response_read_deadline_upload;
                     if (!inspect_response_read_deadline_fixed_upload_request(
-                            conn, conn.response_read_deadline_buffering, &rewritten) ||
+                            conn,
+                            conn.response_read_deadline_profile,
+                            conn.response_read_deadline_buffering,
+                            &rewritten) ||
                         rewritten.content_length != proof.raw_content_length ||
                         rewritten.total_length != conn.recv_buf.len() ||
                         conn.req_initial_send_len != rewritten.total_length ||
@@ -8326,7 +8371,10 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 proof.upload_episode != 0 || proof.downstream_close ||
                 conn.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
                 !inspect_response_read_deadline_fixed_upload_request(
-                    conn, conn.response_read_deadline_buffering, &rewritten) ||
+                    conn,
+                    conn.response_read_deadline_profile,
+                    conn.response_read_deadline_buffering,
+                    &rewritten) ||
                 rewritten.header_end != proof.rewritten_header_end ||
                 rewritten.content_length != proof.raw_content_length ||
                 rewritten.total_length != proof.rewritten_total_length ||
@@ -9361,6 +9409,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                 response_read_deadline_fixed_upload_materialization_is_stable(
                                     conn,
                                     explicit_upload,
+                                    explicit_profile,
                                     /*require_upload_complete=*/true,
                                     explicit_bundle_id,
                                     explicit_route_method,
@@ -9401,6 +9450,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                  ? complete_content_length_fixed_upload_materialization_is_stable(
                        conn,
                        explicit_upload,
+                       explicit_profile,
                        /*require_upload_complete=*/true,
                        explicit_bundle_id,
                        explicit_route_method,
