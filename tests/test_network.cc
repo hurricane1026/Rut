@@ -37481,6 +37481,86 @@ TEST(response_read_deadline_non_head_cl0,
     }
 }
 
+TEST(response_read_deadline_profile_traits, current_values_and_invalid_values_are_exhaustive) {
+    struct Expected {
+        ResponseReadDeadlineProfile profile;
+        bool fixed_upload;
+        bool suppresses_head;
+    };
+    static constexpr Expected kExpected[] = {
+        {ResponseReadDeadlineProfile::None, false, false},
+        {ResponseReadDeadlineProfile::HeaderOnlyHead, false, true},
+        {ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero, false, false},
+        {ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+         true,
+         false},
+    };
+    for (const Expected& expected : kExpected) {
+        CHECK_EQ(response_read_deadline_profile_is_fixed_upload(expected.profile),
+                 expected.fixed_upload);
+        CHECK_EQ(response_read_deadline_profile_suppresses_head(expected.profile),
+                 expected.suppresses_head);
+    }
+
+    static constexpr ResponseReadDeadlineProfile kInvalid[] = {
+        static_cast<ResponseReadDeadlineProfile>(4u),
+        static_cast<ResponseReadDeadlineProfile>(0xffu),
+    };
+    for (ResponseReadDeadlineProfile profile : kInvalid) {
+        CHECK_FALSE(response_read_deadline_profile_is_fixed_upload(profile));
+        CHECK_FALSE(response_read_deadline_profile_suppresses_head(profile));
+    }
+
+    static_assert(
+        !response_read_deadline_profile_is_fixed_upload(ResponseReadDeadlineProfile::None));
+    static_assert(response_read_deadline_profile_is_fixed_upload(
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero));
+    static_assert(response_read_deadline_profile_suppresses_head(
+        ResponseReadDeadlineProfile::HeaderOnlyHead));
+    static_assert(!response_read_deadline_profile_suppresses_head(
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero));
+    static_assert(!response_read_deadline_profile_is_fixed_upload(
+        static_cast<ResponseReadDeadlineProfile>(0xffu)));
+    static_assert(!response_read_deadline_profile_suppresses_head(
+        static_cast<ResponseReadDeadlineProfile>(0xffu)));
+}
+
+TEST(response_read_deadline_profile_traits, existing_method_admission_is_unchanged) {
+    struct Expected {
+        LogHttpMethod method;
+        bool non_head;
+        bool fixed_none;
+        bool fixed_complete;
+    };
+    static constexpr Expected kExpected[] = {
+        {LogHttpMethod::Get, true, true, true},
+        {LogHttpMethod::Post, true, true, true},
+        {LogHttpMethod::Put, true, true, true},
+        {LogHttpMethod::Delete, true, false, true},
+        {LogHttpMethod::Patch, true, true, true},
+        {LogHttpMethod::Options, true, false, true},
+        {LogHttpMethod::Head, false, false, false},
+        {LogHttpMethod::Trace, true, false, false},
+        {LogHttpMethod::Connect, false, false, false},
+        {LogHttpMethod::Other, false, false, false},
+    };
+    for (const Expected& expected : kExpected) {
+        const u8 method = static_cast<u8>(expected.method);
+        CHECK_EQ(response_read_deadline_non_head_method_admitted(method), expected.non_head);
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::None),
+                 expected.fixed_none);
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::CompleteContentLength),
+                 expected.fixed_complete);
+    }
+    CHECK_FALSE(response_read_deadline_non_head_method_admitted(0xffu));
+    CHECK_FALSE(response_read_deadline_fixed_upload_method_admitted(
+        0xffu, ForwardResponseBufferingMode::None));
+    CHECK_FALSE(response_read_deadline_fixed_upload_method_admitted(
+        0xffu, ForwardResponseBufferingMode::CompleteContentLength));
+}
+
 TEST(response_read_deadline_fixed_upload,
      preflight_admits_only_bounded_method_by_buffering_and_options_shape) {
     struct Admission {

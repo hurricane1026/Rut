@@ -239,8 +239,7 @@ inline bool complete_content_length_request_policy_owner_is_stable(
     const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
     if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
         return true;
-    if (c.response_read_deadline_profile ==
-        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
+    if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
         return c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
                proof.request_policy_id == c.request_policy_id;
     }
@@ -345,8 +344,7 @@ inline bool complete_content_length_fixed_upload_composition_is_stable(
     bool retired_episode = false) {
     return c.response_read_deadline_buffering ==
                ForwardResponseBufferingMode::CompleteContentLength &&
-           c.response_read_deadline_profile ==
-               ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero &&
+           response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile) &&
            complete_content_length_fixed_upload_materialization_is_stable(
                c,
                proof,
@@ -872,7 +870,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     if (c.pipeline_stash_len != 0 && !coalesced_get) return false;
     const bool complete_buffering =
         c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
-    if (c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead) {
+    if (response_read_deadline_profile_suppresses_head(c.response_read_deadline_profile)) {
         if (c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
             c.req_client_has_content_length || c.req_body_mode != BodyMode::None ||
             c.req_body_remaining != 0 || c.request_body_fully_buffered || c.req_body_streamed ||
@@ -891,8 +889,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             failure.head_mode != FailurePolicyHeadMode::Reject ||
             timeout.head_mode != FailurePolicyHeadMode::Reject)
             return false;
-    } else if (c.response_read_deadline_profile ==
-               ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
+    } else if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
         if (!(complete_buffering
                   ? complete_content_length_fixed_upload_composition_is_stable(
                         c, c.response_read_deadline_upload, /*require_upload_complete=*/true)
@@ -912,8 +909,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
                                       ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
     const bool fixed_upload_post_commit =
         complete_buffering &&
-        c.response_read_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero &&
+        response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile) &&
         complete_content_length_fixed_upload_composition_is_stable(
             c, c.response_read_deadline_upload, /*require_upload_complete=*/true);
     const bool post_commit_owner =
@@ -1017,8 +1013,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c.response_read_deadline_route_method,
             retired_buffered_send);
     const bool fixed_upload =
-        c.response_read_deadline_profile ==
-        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile);
     const bool episode_stable =
         retired_buffered_send
             ? c.response_read_deadline_post_commit_episode == c.upstream_retiring_episode &&

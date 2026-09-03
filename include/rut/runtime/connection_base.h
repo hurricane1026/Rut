@@ -87,6 +87,32 @@ enum class ResponseReadDeadlineProfile : u8 {
     FixedContentLengthUploadNonHeadContentLengthZero,
 };
 
+[[nodiscard]] constexpr bool response_read_deadline_profile_is_fixed_upload(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
+[[nodiscard]] constexpr bool response_read_deadline_profile_suppresses_head(
+    ResponseReadDeadlineProfile profile) {
+    switch (profile) {
+        case ResponseReadDeadlineProfile::HeaderOnlyHead:
+            return true;
+        case ResponseReadDeadlineProfile::None:
+        case ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero:
+        case ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero:
+            return false;
+    }
+    return false;
+}
+
 // Immutable request-upload identity for the bounded fixed-Content-Length
 // explicit-deadline profile. The active, first-response-batch, and D1/D2
 // copies are compared byte-for-byte by field so no transition can manufacture
