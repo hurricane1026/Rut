@@ -8277,12 +8277,17 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
         out_len);
 }
 
-inline bool fixed_upload_head_preconnect_failure_response_is_stable(const Connection& conn,
-                                                                    const RouteConfig& config,
-                                                                    const u8* response,
-                                                                    u32 response_len) {
-    if (conn.response_read_deadline_profile !=
-            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+inline bool configured_forward_failure_date_is_normalized(Str value);
+
+inline bool fixed_upload_head_preconnect_failure_response_is_stable(
+    const Connection& conn,
+    const RouteConfig& config,
+    const u8* response,
+    u32 response_len,
+    ResponseReadDeadlineProfile expected_profile =
+        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead) {
+    if ((expected_profile != ResponseReadDeadlineProfile::None &&
+         conn.response_read_deadline_profile != expected_profile) ||
         response == nullptr || response_len == 0 ||
         !config.failure_policy_id_is_valid(conn.failure_policy_id))
         return false;
@@ -8316,7 +8321,7 @@ inline bool fixed_upload_head_preconnect_failure_response_is_stable(const Connec
                 return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "date", 4)) {
             ++date_count;
-            if (header.value.len != 29) return false;
+            if (!configured_forward_failure_date_is_normalized(header.value)) return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12)) {
             ++content_type_count;
             if (header.value.len != policy.content_type.len ||
@@ -9281,6 +9286,208 @@ enum class StrictResponseRejectionCause : u8 {
     UpstreamParse,
 };
 
+enum class ConfiguredForwardFailureDomain : u8 {
+    ValidStatusLineHeaderFailure,
+    CompleteUnsupportedResponse,
+    TerminalNoBytes,
+};
+
+// A parser Error is not by itself evidence of an HTTP response.  This small
+// independent witness deliberately accepts only a complete HTTP/1.0 or
+// HTTP/1.1 status line with a numeric 100..599 status; it therefore leaves
+// HTTP/0.9, invalid-version/status, and incomplete status-line inputs
+// fail-closed (#266).
+inline bool configured_forward_failure_status_line_witness(const u8* data,
+                                                           u32 len,
+                                                           u16* status_out) {
+    if (data == nullptr || len < 12u || __builtin_memcmp(data, "HTTP/1.", 7) != 0 ||
+        (data[7] != '0' && data[7] != '1') || data[8] != ' ' || len < 12u)
+        return false;
+    const u8 d0 = data[9], d1 = data[10], d2 = data[11];
+    if (d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9') return false;
+    const u16 status = static_cast<u16>((d0 - '0') * 100u + (d1 - '0') * 10u + (d2 - '0'));
+    if (status < 100u || status > 599u) return false;
+    u32 pos = 12u;
+    if (pos >= len || (data[pos] != ' ' && data[pos] != '\r')) return false;
+    while (pos < len && data[pos] != '\r') pos++;
+    if (pos + 1u >= len || data[pos + 1u] != '\n') return false;
+    if (status_out != nullptr) *status_out = status;
+    return true;
+}
+
+inline bool configured_forward_failure_date_is_normalized(Str value) {
+    return response_read_deadline_http_date_is_normalized(value);
+}
+
+inline bool fixed_upload_head_configured_failure_response_is_stable(const Connection& conn,
+                                                                    const RouteConfig& config,
+                                                                    const u8* response,
+                                                                    u32 response_len) {
+    return fixed_upload_head_preconnect_failure_response_is_stable(
+        conn, config, response, response_len, ResponseReadDeadlineProfile::None);
+}
+
+template <typename Loop>
+inline bool try_prebuilt_fixed_upload_head_configured_failure(
+    Loop* loop,
+    Connection& conn,
+    const IoEvent& ev,
+    ConfiguredForwardFailureDomain domain,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method,
+    u32 generation,
+    u16 bundle_id,
+    const ResponseReadDeadlineUploadProof& upload,
+    bool first_batch,
+    bool progress_batch) {
+    if constexpr (!requires(Loop* candidate, Connection& c) {
+                      candidate->begin_prebuilt_http1_response(
+                          c, u8{}, Http1RequestBufferDisposition::ExistingPipeline, u32{});
+                  }) {
+        return false;
+    } else {
+        const RouteConfig* config = conn.request_config;
+        u16 witnessed_status = 0;
+        const bool live_event = conn.upstream_recv_armed && ev.more && ev.result > 0;
+        const bool terminal_event = !conn.upstream_recv_armed && !ev.more;
+        const bool valid_status = configured_forward_failure_status_line_witness(
+            conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &witnessed_status);
+        if (loop == nullptr || config == nullptr ||
+            profile != ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+            buffering != ForwardResponseBufferingMode::None ||
+            method != static_cast<u8>(LogHttpMethod::Head) || route_method == kRouteMethodInvalid ||
+            generation == 0 || bundle_id == 0 || !config->policy_bundle_id_is_valid(bundle_id) ||
+            ev.type != IoEventType::UpstreamRecv || ev.conn_id != conn.id || ev.aux != 0 ||
+            ev.result == -ENOBUFS || ev.result == -ECANCELED ||
+            ev.upstream_episode != upload.upload_episode ||
+            (domain == ConfiguredForwardFailureDomain::TerminalNoBytes
+                 ? (conn.upstream_recv_buf.len() != 0 || ev.result > 0)
+                 : !valid_status) ||
+            (domain == ConfiguredForwardFailureDomain::CompleteUnsupportedResponse &&
+             conn.upstream_recv_buf.len() == 0) ||
+            (!live_event && !terminal_event) ||
+            (domain == ConfiguredForwardFailureDomain::ValidStatusLineHeaderFailure &&
+             terminal_event && ev.result > 0) ||
+            (domain != ConfiguredForwardFailureDomain::TerminalNoBytes && witnessed_status == 0))
+            return false;
+
+        const bool deadline_owner =
+            (first_batch && conn.response_read_deadline_first_batch &&
+             conn.response_read_deadline_first_batch_generation == generation &&
+             conn.response_read_deadline_first_batch_bundle_id == bundle_id &&
+             conn.response_read_deadline_first_batch_profile == profile &&
+             conn.response_read_deadline_first_batch_buffering == buffering &&
+             response_read_deadline_upload_proof_equal(
+                 conn.response_read_deadline_first_batch_upload, upload)) ||
+            (progress_batch && !first_batch &&
+             conn.response_read_deadline_state == ResponseReadDeadlineState::BatchPending &&
+             conn.response_read_deadline_generation == generation &&
+             conn.response_read_deadline_bundle_id == bundle_id &&
+             conn.response_read_deadline_profile == profile &&
+             conn.response_read_deadline_buffering == buffering &&
+             conn.response_read_deadline_progress_generation == generation &&
+             conn.response_read_deadline_progress_episode == upload.upload_episode &&
+             conn.response_read_deadline_progress_bytes != 0 &&
+             response_read_deadline_upload_proof_equal(conn.response_read_deadline_upload,
+                                                       upload)) ||
+            (!first_batch && !progress_batch &&
+             (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+              conn.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending) &&
+             conn.response_read_deadline_generation == generation &&
+             conn.response_read_deadline_bundle_id == bundle_id &&
+             conn.response_read_deadline_profile == profile &&
+             conn.response_read_deadline_buffering == buffering &&
+             conn.response_read_deadline_progress_generation == 0 &&
+             conn.response_read_deadline_progress_episode == 0 &&
+             conn.response_read_deadline_progress_bytes == 0 &&
+             response_read_deadline_upload_proof_equal(conn.response_read_deadline_upload, upload));
+        const bool terminal = terminal_event;
+        const bool transport_owner =
+            terminal
+                ? fixed_upload_head_terminal_failure_proof_is_stable(
+                      conn, upload, config, bundle_id, profile, buffering, method, route_method)
+                : fixed_upload_head_success_proof_is_stable(
+                      conn, upload, config, bundle_id, profile, buffering, method, route_method);
+        if (!deadline_owner || upload.upload_episode == 0 || method != conn.req_method ||
+            !response_read_deadline_route_method_matches(method, route_method) || !transport_owner)
+            return false;
+
+        const auto& bundle = config->policy_bundles[bundle_id - 1];
+        if (bundle.response_buffering != buffering ||
+            bundle.response_policy_id != conn.response_policy_id ||
+            bundle.failure_policy_id != conn.failure_policy_id ||
+            bundle.timeout_failure_policy_id != conn.timeout_failure_policy_id ||
+            !config->failure_policy_id_is_valid(conn.failure_policy_id))
+            return false;
+        const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
+        if (failure.version != ForwardFailurePolicyVersion::Http11 ||
+            failure.status_code != kStatusBadGateway ||
+            failure.connection != ForwardFailurePolicyConnection::Request ||
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody)
+            return false;
+
+        u8 scratch[SlicePool::kSliceSize];
+        u32 response_len = 0;
+        if (!build_failure_policy_response(conn,
+                                           *config,
+                                           /*suppress_body=*/true,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &response_len) ||
+            response_len == 0 || response_len > conn.response_header_buf.capacity() ||
+            !fixed_upload_head_configured_failure_response_is_stable(
+                conn, *config, scratch, response_len))
+            return false;
+
+        conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::HeaderOnlyHead;
+        conn.http1_prebuilt_response_purpose =
+            Http1PrebuiltResponsePurpose::ConfiguredForwardFailure;
+        conn.http1_prebuilt_deadline_profile = profile;
+        conn.http1_prebuilt_deadline_method = method;
+        conn.http1_prebuilt_deadline_route_method = route_method;
+        conn.http1_prebuilt_deadline_generation = generation;
+        conn.http1_prebuilt_deadline_bundle_id = bundle_id;
+        conn.http1_prebuilt_deadline_config = config;
+        conn.http1_prebuilt_deadline_upload = upload;
+        conn.http1_prebuilt_header_end = response_len;
+        conn.http1_prebuilt_total_len = response_len;
+        conn.http1_prebuilt_body_len = 0;
+        conn.http1_prebuilt_status = failure.status_code;
+        conn.resp_status = failure.status_code;
+        conn.resp_body_mode = BodyMode::None;
+        conn.resp_body_remaining = 0;
+        conn.resp_body_sent = 0;
+        conn.upstream_send_len = 0;
+        conn.response_header_buf.reset();
+        if (conn.response_header_buf.write(scratch, response_len) != response_len) {
+            loop->close_conn(conn);
+            return true;
+        }
+
+        const bool live = live_event;
+        if (!live && !terminal) return false;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->disarm_response_read_deadline(c);
+                      }) {
+            loop->disarm_response_read_deadline(conn);
+        } else {
+            return false;
+        }
+        const u8 selected_targets = live ? kUpstreamOpRecv : static_cast<u8>(0);
+        if (!loop->begin_prebuilt_http1_response(conn,
+                                                 selected_targets,
+                                                 Http1RequestBufferDisposition::ExistingPipeline,
+                                                 conn.retry_req_send_len)) {
+            if (conn.fd >= 0) loop->close_conn(conn);
+            return true;
+        }
+        conn.upstream_recv_buf.reset();
+        return true;
+    }
+}
+
 template <typename Loop>
 inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
     if constexpr (!requires(Loop* candidate, Connection& c) {
@@ -9436,6 +9643,24 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.response_read_deadline_first_batch = false;
         }
     };
+    auto try_configured_head_failure = [&](ConfiguredForwardFailureDomain domain) {
+        if (!(explicit_first_batch || explicit_progress_batch) ||
+            explicit_profile != ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead)
+            return false;
+        return try_prebuilt_fixed_upload_head_configured_failure(loop,
+                                                                 conn,
+                                                                 ev,
+                                                                 domain,
+                                                                 explicit_profile,
+                                                                 explicit_buffering,
+                                                                 explicit_method,
+                                                                 explicit_route_method,
+                                                                 explicit_generation,
+                                                                 explicit_bundle_id,
+                                                                 explicit_upload,
+                                                                 explicit_first_batch,
+                                                                 explicit_progress_batch);
+    };
 
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
@@ -9457,6 +9682,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        if (try_configured_head_failure(ConfiguredForwardFailureDomain::TerminalNoBytes)) return;
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
@@ -9516,6 +9742,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (ps == ParseStatus::Error) {
+        if (try_configured_head_failure(
+                ConfiguredForwardFailureDomain::ValidStatusLineHeaderFailure))
+            return;
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         if ((explicit_first_batch || explicit_progress_batch) &&
             (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
@@ -9665,6 +9894,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             raw_total - raw_header_end <= resp.content_length;
         if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get &&
             !strict_positive_head) {
+            if (try_configured_head_failure(
+                    ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
+                return;
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9674,6 +9906,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // status/header/persistence byte is materialized.
         conn.resp_status = resp.status_code;
         if (!build_strict_response_headers(conn, *config, resp)) {
+            if (try_configured_head_failure(
+                    ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
+                return;
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9694,6 +9929,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             output_response.content_length_count != 1 ||
             output_response.content_length != resp.content_length || output_response.chunked ||
             output_parser.header_end != output_len) {
+            if (try_configured_head_failure(
+                    ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
+                return;
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;

@@ -9,6 +9,18 @@
 
 namespace rut {
 
+inline bool response_read_deadline_http_date_is_normalized(Str value) {
+    if (value.ptr == nullptr || value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' ||
+        value.ptr[7] != ' ' || value.ptr[11] != ' ' || value.ptr[16] != ' ' ||
+        value.ptr[19] != ':' || value.ptr[22] != ':' || value.ptr[25] != ' ' ||
+        __builtin_memcmp(value.ptr + 26, "GMT", 3) != 0)
+        return false;
+    for (u32 i : {5u, 6u, 8u, 9u, 10u, 12u, 13u, 14u, 15u, 17u, 18u, 20u, 21u, 23u, 24u}) {
+        if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
+    }
+    return true;
+}
+
 enum class ResponseReadDeadlineOwnerPhase : u8 {
     ValidatedBeforeArm,
     ArmedForCopy,
@@ -408,6 +420,86 @@ inline bool fixed_upload_head_success_proof_is_stable(const Connection& c,
                          c.upstream_retiring_episode < c.upstream_episode &&
                          c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr;
     return live || retired;
+}
+
+// A terminal upstream recv CQE is consumed by io_uring before the response
+// callback runs: its armed bit and pending owner are gone, but the fd and
+// current episode remain live until D2 takes custody. Keep this intermediate
+// proof separate from the ordinary live/retired success predicate so those
+// predicates cannot be widened to accept an owner-free state.
+inline bool fixed_upload_head_terminal_failure_proof_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method) {
+    if (config == nullptr || config != c.request_config ||
+        !config->policy_bundle_id_is_valid(bundle_id) ||
+        profile != ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+        buffering != ForwardResponseBufferingMode::None ||
+        method != static_cast<u8>(LogHttpMethod::Head) || method != c.req_method ||
+        !response_read_deadline_route_method_matches(method, route_method) ||
+        c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+        c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
+        c.req_http_version != static_cast<u8>(HttpVersion::Http11) || !c.req_strict_h1_complete ||
+        c.req_path_canon.ptr == nullptr || c.req_client_content_length_count != 1 ||
+        !c.req_client_has_content_length || c.req_client_has_transfer_encoding ||
+        c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||
+        c.req_malformed || c.req_wants_upgrade || c.req_upgrade_is_websocket ||
+        c.resp_upgrade_is_websocket || !response_read_deadline_default_persistence_is_stable(c) ||
+        proof.downstream_close || !c.response_policy_suppress_body ||
+        !c.failure_policy_suppress_body || c.response_mutations_snapshotted ||
+        c.target_transform_recorded || c.req_path_overridden || c.req_header_override_count != 0 ||
+        c.req_header_override_overflow || c.resp_header_mutation_count != 0 ||
+        c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
+        c.resp_header_mutation_overflow || c.upstream_reused || c.upstream_attempts != 1 ||
+        !c.request_upload_complete || c.upstream_request_incomplete || c.retry_req_send_len != 0 ||
+        c.pipeline_stash_len != 0 || c.upstream_abandoned || c.upstream_fd < 0 ||
+        c.upstream_recv_armed || c.on_upstream_recv != nullptr || c.on_upstream_send != nullptr ||
+        c.upstream_connect_armed || c.upstream_send_armed || c.upstream_retirement_active ||
+        c.upstream_retirement_target_owned != 0 || c.upstream_retirement_cancel_owned != 0 ||
+        c.upstream_retirement_cancel_retry != 0 || c.upstream_close_episode != 0 ||
+        c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
+        c.upstream_close_pause_cancel_owned || c.upstream_recv_pause_cancel_pending ||
+        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+        c.upstream_recv_terminal_stale ||
+        !response_read_deadline_fixed_upload_materialization_is_stable(
+            c,
+            proof,
+            profile,
+            /*require_upload_complete=*/true,
+            bundle_id,
+            route_method,
+            buffering))
+        return false;
+    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    if (bundle.response_buffering != buffering ||
+        bundle.response_policy_id != c.response_policy_id ||
+        bundle.failure_policy_id != c.failure_policy_id ||
+        bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+        !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+        !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+        !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    const auto& response = config->response_policies[bundle.response_policy_id - 1];
+    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
+    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    return response_policy_spec_valid(response) && forward_failure_policy_spec_valid(failure) &&
+           forward_timeout_failure_policy_spec_valid(timeout) &&
+           response.version == ResponsePolicyVersion::Http11 &&
+           response.framing == ResponsePolicyFraming::ContentLength &&
+           response.connection == ResponsePolicyConnection::Request &&
+           response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+           failure.version == ForwardFailurePolicyVersion::Http11 && failure.status_code == 502 &&
+           failure.connection == ForwardFailurePolicyConnection::Request &&
+           failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+           timeout.version == ForwardFailurePolicyVersion::Http11 &&
+           timeout.connection == ForwardFailurePolicyConnection::Request &&
+           timeout.head_mode == FailurePolicyHeadMode::SuppressBody;
 }
 
 // First-batch and D2 callers retain the immutable bundle/route identity after
