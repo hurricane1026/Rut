@@ -1052,6 +1052,7 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
         return false;
     u32 host_count = 0;
     u32 content_length_count = 0;
+    const bool options = conn.req_method == static_cast<u8>(LogHttpMethod::Options);
     for (u32 i = 0; i < request.header_count; ++i) {
         const Header& header = request.headers[i];
         const Str name = header.name;
@@ -1063,7 +1064,11 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
                    http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
                    http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7) ||
+                   (options && (http_header_name_eq_ci(name.ptr, name.len, "max-forwards", 12) ||
+                                http_header_name_eq_ci(name.ptr, name.len, "origin", 6) ||
+                                (name.len >= 15 &&
+                                 http_header_name_eq_ci(name.ptr, 15, "access-control-", 15))))) {
             return false;
         }
     }
