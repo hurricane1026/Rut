@@ -589,6 +589,7 @@ private:
                !complete_content_length_fixed_upload_materialization_is_stable(
                    c,
                    c.http1_prebuilt_deadline_upload,
+                   c.http1_prebuilt_deadline_profile,
                    /*require_upload_complete=*/true,
                    c.http1_prebuilt_deadline_bundle_id,
                    c.http1_prebuilt_deadline_route_method,
@@ -636,6 +637,7 @@ private:
                        !response_read_deadline_fixed_upload_materialization_is_stable(
                            c,
                            c.http1_prebuilt_deadline_upload,
+                           c.http1_prebuilt_deadline_profile,
                            /*require_upload_complete=*/true,
                            c.http1_prebuilt_deadline_bundle_id,
                            c.http1_prebuilt_deadline_route_method,
