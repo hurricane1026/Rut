@@ -9381,6 +9381,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
          response_read_deadline_profile_is_fixed_upload(explicit_profile))) {
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(explicit_profile);
+        const bool fixed_upload_head =
+            explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
         const RouteConfig* config = conn.request_config;
         const bool pipeline_generation_exact =
             http1_pipeline_request_generation_upload_active_is_stable(conn,
@@ -9412,24 +9414,37 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             response_read_timeout_seconds_valid(
                 config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
             explicit_method == conn.req_method &&
-            (fixed_upload ? response_read_deadline_fixed_upload_method_admitted(
-                                explicit_method, explicit_buffering) &&
-                                response_read_deadline_fixed_upload_materialization_is_stable(
-                                    conn,
-                                    explicit_upload,
-                                    explicit_profile,
-                                    /*require_upload_complete=*/true,
-                                    explicit_bundle_id,
-                                    explicit_route_method,
-                                    explicit_buffering)
-                          : response_read_deadline_non_head_method_admitted(explicit_method)) &&
+            (fixed_upload
+                 ? (fixed_upload_head
+                        ? fixed_upload_head_success_proof_is_stable(conn,
+                                                                    explicit_upload,
+                                                                    config,
+                                                                    explicit_bundle_id,
+                                                                    explicit_profile,
+                                                                    explicit_buffering,
+                                                                    explicit_method,
+                                                                    explicit_route_method)
+                        : response_read_deadline_fixed_upload_method_admitted(explicit_method,
+                                                                              explicit_buffering) &&
+                              response_read_deadline_fixed_upload_materialization_is_stable(
+                                  conn,
+                                  explicit_upload,
+                                  explicit_profile,
+                                  /*require_upload_complete=*/true,
+                                  explicit_bundle_id,
+                                  explicit_route_method,
+                                  explicit_buffering))
+                 : response_read_deadline_non_head_method_admitted(explicit_method)) &&
             response_read_deadline_route_method_matches(explicit_method, explicit_route_method) &&
             config->response_policies[conn.response_policy_id - 1].head_mode ==
-                ResponsePolicyHeadMode::Reject &&
+                (fixed_upload_head ? ResponsePolicyHeadMode::SuppressBody
+                                   : ResponsePolicyHeadMode::Reject) &&
             config->failure_policies[conn.failure_policy_id - 1].head_mode ==
-                FailurePolicyHeadMode::Reject &&
+                (fixed_upload_head ? FailurePolicyHeadMode::SuppressBody
+                                   : FailurePolicyHeadMode::Reject) &&
             config->failure_policies[conn.timeout_failure_policy_id - 1].head_mode ==
-                FailurePolicyHeadMode::Reject;
+                (fixed_upload_head ? FailurePolicyHeadMode::SuppressBody
+                                   : FailurePolicyHeadMode::Reject);
         const bool strict_common =
             owner_exact && resp.version == HttpVersion::Http11 && resp.content_length_count == 1 &&
             resp.has_content_length && !resp.chunked && !resp.headers_truncated &&
@@ -9439,9 +9454,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                 conn.req_body_remaining == 0 && conn.request_body_fully_buffered
                           : conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
                                 !conn.request_body_fully_buffered) &&
-            !conn.req_body_streamed && !conn.response_policy_suppress_body &&
-            !conn.failure_policy_suppress_body && conn.resp_header_mutation_count == 0 &&
-            conn.resp_header_mutation_pending_count == 0 &&
+            !conn.req_body_streamed && conn.response_policy_suppress_body == fixed_upload_head &&
+            conn.failure_policy_suppress_body == fixed_upload_head &&
+            conn.resp_header_mutation_count == 0 && conn.resp_header_mutation_pending_count == 0 &&
             !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow &&
             !conn.target_transform_recorded && !conn.req_path_overridden &&
             conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
@@ -9477,7 +9492,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             raw_header_end <= conn.upstream_recv_buf.capacity() &&
             resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
             raw_total - raw_header_end <= resp.content_length;
-        if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get) {
+        const bool strict_positive_head =
+            strict_common && fixed_upload_head &&
+            explicit_buffering == ForwardResponseBufferingMode::None && resp.status_code == 200 &&
+            resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
+            raw_total - raw_header_end <= resp.content_length;
+        if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get &&
+            !strict_positive_head) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9561,9 +9582,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
 
-        conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+        conn.http1_prebuilt_response_layout =
+            strict_positive_head ? Http1PrebuiltResponseLayout::HeaderOnlyHead
+                                 : Http1PrebuiltResponseLayout::FullContentLengthNonHead;
         conn.http1_prebuilt_response_purpose =
-            Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
+            strict_positive_head ? Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly
+                                 : Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
         conn.http1_prebuilt_deadline_profile = explicit_profile;
         conn.http1_prebuilt_deadline_method = explicit_method;
         conn.http1_prebuilt_deadline_route_method = explicit_route_method;
@@ -9573,7 +9597,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_prebuilt_deadline_upload = explicit_upload;
         conn.http1_prebuilt_header_end = output_parser.header_end;
         conn.http1_prebuilt_total_len = output_len;
-        conn.http1_prebuilt_body_len = 0;
+        conn.http1_prebuilt_body_len = strict_positive_head ? resp.content_length : 0;
         conn.http1_prebuilt_status = 200;
         conn.resp_body_mode = BodyMode::None;
         conn.resp_body_remaining = 0;
