@@ -51284,7 +51284,7 @@ static bool validate_positive_get_default_generated_source(const std::string& so
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
     static constexpr char kFixedRequestPolicy[] =
-        "        request_policy: {\n"
+        "return forward(nginx_upstream, request_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            host: \"upstream\",\n"
         "            connection: \"omit\",\n"
