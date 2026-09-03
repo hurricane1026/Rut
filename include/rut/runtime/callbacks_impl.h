@@ -8192,6 +8192,67 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
         out_len);
 }
 
+inline bool fixed_upload_head_preconnect_failure_response_is_stable(const Connection& conn,
+                                                                    const RouteConfig& config,
+                                                                    const u8* response,
+                                                                    u32 response_len) {
+    if (conn.response_read_deadline_profile !=
+            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+        response == nullptr || response_len == 0 ||
+        !config.failure_policy_id_is_valid(conn.failure_policy_id))
+        return false;
+    const auto& policy = config.failure_policies[conn.failure_policy_id - 1];
+    HttpResponseParser parser;
+    ParsedResponse parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(response, response_len, &parsed) != ParseStatus::Complete ||
+        parser.header_end != response_len || parsed.version != HttpVersion::Http11 ||
+        parsed.status_code != kStatusBadGateway || parsed.status_code != policy.status_code ||
+        parsed.reason.len != policy.reason.len ||
+        (parsed.reason.len != 0 &&
+         __builtin_memcmp(parsed.reason.ptr, policy.reason.ptr, parsed.reason.len) != 0) ||
+        parsed.content_length_count != 1 || parsed.content_length != policy.body.len ||
+        parsed.chunked || parsed.headers_truncated)
+        return false;
+
+    u32 server_count = 0;
+    u32 date_count = 0;
+    u32 content_type_count = 0;
+    u32 connection_count = 0;
+    const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    for (u32 i = 0; i < parsed.header_count; ++i) {
+        const Header& header = parsed.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "server", 6)) {
+            ++server_count;
+            if (header.value.len != policy.server.len ||
+                (policy.server.len != 0 &&
+                 __builtin_memcmp(header.value.ptr, policy.server.ptr, policy.server.len) != 0))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "date", 4)) {
+            ++date_count;
+            if (header.value.len != 29) return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12)) {
+            ++content_type_count;
+            if (header.value.len != policy.content_type.len ||
+                (policy.content_type.len != 0 &&
+                 __builtin_memcmp(
+                     header.value.ptr, policy.content_type.ptr, policy.content_type.len) != 0))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
+            ++connection_count;
+            const char* expected = keep_alive ? "keep-alive" : "close";
+            const u32 expected_len = keep_alive ? 10u : 5u;
+            if (header.value.len != expected_len ||
+                __builtin_memcmp(header.value.ptr, expected, expected_len) != 0)
+                return false;
+        }
+    }
+    return server_count == 1 && date_count == 1 && content_type_count == 1 &&
+           connection_count == 1 && parsed.keep_alive == keep_alive &&
+           parsed.connection_close == !keep_alive;
+}
+
 template <typename Loop>
 inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                                                          const Connection& conn,
@@ -8329,10 +8390,57 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                                         ForwardResponseBufferingMode::CompleteContentLength;
         const bool fixed_upload =
             response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
+        const bool fixed_upload_head =
+            conn.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
         if (!response_read_deadline_persistence_owner_is_stable(conn,
                                                                 conn.response_read_deadline_upload))
             return false;
-        if (response_read_deadline_profile_suppresses_head(conn.response_read_deadline_profile)) {
+        if (fixed_upload) {
+            const auto& proof = conn.response_read_deadline_upload;
+            ResponseReadDeadlineFixedUploadRequest rewritten{};
+            const u16 route_index = static_cast<u16>(route - config->routes);
+            if (proof.handler_generation == 0 || proof.handler_generation != conn.handler_gen ||
+                proof.route_index != route_index || proof.route_fn != route->fn ||
+                proof.upstream_id != conn.upstream_idx ||
+                proof.request_policy_id != conn.request_policy_id || proof.raw_header_end == 0 ||
+                proof.raw_content_length == 0 ||
+                proof.raw_total_length != proof.raw_header_end + proof.raw_content_length ||
+                proof.rewritten_header_end == 0 ||
+                proof.rewritten_total_length !=
+                    proof.rewritten_header_end + proof.raw_content_length ||
+                proof.expected_upload_length != proof.rewritten_total_length ||
+                proof.upload_episode != 0 || proof.downstream_close ||
+                conn.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                !inspect_response_read_deadline_fixed_upload_request(
+                    conn,
+                    conn.response_read_deadline_profile,
+                    conn.response_read_deadline_buffering,
+                    &rewritten) ||
+                rewritten.header_end != proof.rewritten_header_end ||
+                rewritten.content_length != proof.raw_content_length ||
+                rewritten.total_length != proof.rewritten_total_length ||
+                conn.req_header_end != proof.rewritten_header_end ||
+                conn.req_content_length != proof.raw_content_length ||
+                conn.req_initial_send_len != proof.rewritten_total_length ||
+                conn.recv_buf.len() != proof.rewritten_total_length ||
+                conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining != 0 ||
+                !conn.request_body_fully_buffered || conn.req_body_streamed ||
+                (fixed_upload_head
+                     ? (complete_buffering ||
+                        conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+                        !conn.response_policy_suppress_body || !conn.failure_policy_suppress_body ||
+                        response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+                        failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+                        timeout.head_mode != FailurePolicyHeadMode::SuppressBody)
+                     : (!complete_buffering || conn.response_policy_suppress_body ||
+                        conn.failure_policy_suppress_body ||
+                        response.head_mode != ResponsePolicyHeadMode::Reject ||
+                        failure.head_mode != FailurePolicyHeadMode::Reject ||
+                        timeout.head_mode != FailurePolicyHeadMode::Reject)))
+                return false;
+        } else if (response_read_deadline_profile_suppresses_head(
+                       conn.response_read_deadline_profile)) {
             if (conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
                 conn.req_client_has_content_length || conn.req_body_mode != BodyMode::None ||
                 conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
@@ -8361,41 +8469,6 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                      /*allow_retired_episode=*/false,
                      /*require_upload_episode=*/false) ||
                  conn.recv_buf.len() <= conn.req_initial_send_len || conn.pipeline_stash_len != 0))
-                return false;
-        } else if (fixed_upload) {
-            const auto& proof = conn.response_read_deadline_upload;
-            ResponseReadDeadlineFixedUploadRequest rewritten{};
-            const u16 route_index = static_cast<u16>(route - config->routes);
-            if (!complete_buffering || proof.handler_generation == 0 ||
-                proof.handler_generation != conn.handler_gen || proof.route_index != route_index ||
-                proof.route_fn != route->fn || proof.upstream_id != conn.upstream_idx ||
-                proof.request_policy_id != conn.request_policy_id || proof.raw_header_end == 0 ||
-                proof.raw_content_length == 0 ||
-                proof.raw_total_length != proof.raw_header_end + proof.raw_content_length ||
-                proof.rewritten_header_end == 0 ||
-                proof.rewritten_total_length !=
-                    proof.rewritten_header_end + proof.raw_content_length ||
-                proof.expected_upload_length != proof.rewritten_total_length ||
-                proof.upload_episode != 0 || proof.downstream_close ||
-                conn.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
-                !inspect_response_read_deadline_fixed_upload_request(
-                    conn,
-                    conn.response_read_deadline_profile,
-                    conn.response_read_deadline_buffering,
-                    &rewritten) ||
-                rewritten.header_end != proof.rewritten_header_end ||
-                rewritten.content_length != proof.raw_content_length ||
-                rewritten.total_length != proof.rewritten_total_length ||
-                conn.req_header_end != proof.rewritten_header_end ||
-                conn.req_content_length != proof.raw_content_length ||
-                conn.req_initial_send_len != proof.rewritten_total_length ||
-                conn.recv_buf.len() != proof.rewritten_total_length ||
-                conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining != 0 ||
-                !conn.request_body_fully_buffered || conn.req_body_streamed ||
-                conn.response_policy_suppress_body || conn.failure_policy_suppress_body ||
-                response.head_mode != ResponsePolicyHeadMode::Reject ||
-                failure.head_mode != FailurePolicyHeadMode::Reject ||
-                timeout.head_mode != FailurePolicyHeadMode::Reject)
                 return false;
         } else {
             return false;
@@ -8444,7 +8517,11 @@ inline void respond_validated_preconnect_failure(Loop* loop,
                                        scratch,
                                        sizeof(scratch),
                                        &response_len) ||
-        response_len == 0 || response_len > conn.response_header_buf.capacity()) {
+        response_len == 0 || response_len > conn.response_header_buf.capacity() ||
+        (conn.response_read_deadline_profile ==
+             ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+         !fixed_upload_head_preconnect_failure_response_is_stable(
+             conn, *conn.request_config, scratch, response_len))) {
         fail_closed();
         return;
     }
@@ -8517,7 +8594,11 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
                                        scratch,
                                        sizeof(scratch),
                                        &response_len) ||
-        response_len == 0 || response_len > conn.response_header_buf.capacity()) {
+        response_len == 0 || response_len > conn.response_header_buf.capacity() ||
+        (conn.response_read_deadline_profile ==
+             ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+         !fixed_upload_head_preconnect_failure_response_is_stable(
+             conn, *conn.request_config, scratch, response_len))) {
         fail_closed();
         return;
     }
