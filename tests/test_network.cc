@@ -37726,6 +37726,7 @@ bool stage_unreachable_fixed_upload_head_wait(IoUringEventLoop* loop,
         conn->req_body_remaining != 7u || conn->req_header_end != sizeof(kPrefix) - 1u)
         return false;
     conn->handler_gen = 1;
+    conn->handler_ctx = reinterpret_cast<void*>(conn->handler_ctx_storage);
     conn->keep_alive = true;
     conn->request_config = &config;
     conn->req_start_us = monotonic_us();
@@ -37759,6 +37760,89 @@ bool stage_unreachable_fixed_upload_head_wait(IoUringEventLoop* loop,
     conn->transition_to_reading_body(&on_request_policy_body_recvd<IoUringEventLoop>);
     out->conn = conn;
     return response_read_deadline_fixed_upload_route_stable(*conn, false);
+}
+
+enum class FixedUploadHeadPreconnectFailureSite : u8 {
+    SocketCreate,
+    ConnectSubmit,
+    ConnectCompletion,
+};
+
+bool complete_unreachable_fixed_upload_head_to_preconnect(IoUringEventLoop* loop,
+                                                          PrebuiltD2Fixture& fixture) {
+    static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    if (loop == nullptr || fixture.conn == nullptr) return false;
+    Connection& conn = *fixture.conn;
+    if (conn.recv_buf.write(kLast, sizeof(kLast)) != sizeof(kLast)) return false;
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    on_request_policy_body_recvd<IoUringEventLoop>(
+        loop, conn, {conn.id, 7, 0, 0, IoEventType::Recv, 1});
+    return conn.fd >= 0 && conn.upstream_fd >= 0 && conn.upstream_connect_armed &&
+           conn.recv_armed && conn.pending_ops == 2u && conn.req_body_remaining == 0 &&
+           conn.request_body_fully_buffered && !conn.request_upload_complete &&
+           conn.response_read_deadline_upload.upload_episode == 0;
+}
+
+bool trigger_unreachable_fixed_upload_head_preconnect_failure(
+    IoUringEventLoop* loop,
+    PrebuiltD2Fixture& fixture,
+    FixedUploadHeadPreconnectFailureSite site,
+    bool fail_staged_send = false) {
+    static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    if (loop == nullptr || fixture.conn == nullptr) return false;
+    Connection& conn = *fixture.conn;
+    if (site == FixedUploadHeadPreconnectFailureSite::SocketCreate) {
+        if (conn.recv_buf.write(kLast, sizeof(kLast)) != sizeof(kLast)) return false;
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        test_fault::ScopedIoUringSubmitFailure send_failure(
+            /*connect_failures=*/0, fail_staged_send ? 2 : 0);
+        test_fault::ScopedSocketFailure socket_failure;
+        on_request_policy_body_recvd<IoUringEventLoop>(
+            loop, conn, {conn.id, 7, 0, 0, IoEventType::Recv, 1});
+    } else if (site == FixedUploadHeadPreconnectFailureSite::ConnectSubmit) {
+        if (conn.recv_buf.write(kLast, sizeof(kLast)) != sizeof(kLast)) return false;
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        test_fault::ScopedIoUringSubmitFailure failures(
+            /*connect_failures=*/1, fail_staged_send ? 2 : 0);
+        on_request_policy_body_recvd<IoUringEventLoop>(
+            loop, conn, {conn.id, 7, 0, 0, IoEventType::Recv, 1});
+    } else {
+        if (!complete_unreachable_fixed_upload_head_to_preconnect(loop, fixture)) return false;
+        test_fault::ScopedIoUringSubmitFailure send_failure(
+            /*connect_failures=*/0, fail_staged_send ? 2 : 0);
+        loop->dispatch({conn.id,
+                        -ECONNREFUSED,
+                        0,
+                        0,
+                        IoEventType::UpstreamConnect,
+                        0,
+                        0,
+                        conn.upstream_episode});
+    }
+    if (fail_staged_send) return conn.fd < 0;
+    return conn.fd >= 0 && conn.send_armed &&
+           conn.on_send == &on_validated_preconnect_failure_sent<IoUringEventLoop> &&
+           conn.resp_status == kStatusBadGateway &&
+           conn.response_read_deadline_state == ResponseReadDeadlineState::None;
+}
+
+bool stage_unreachable_fixed_upload_head_connect_submit_candidate(IoUringEventLoop* loop,
+                                                                  RouteConfig& config,
+                                                                  u8 route_method,
+                                                                  PrebuiltD2Fixture* out) {
+    if (!stage_unreachable_fixed_upload_head_wait(loop, config, route_method, out) ||
+        !complete_unreachable_fixed_upload_head_to_preconnect(loop, *out))
+        return false;
+    Connection& conn = *out->conn;
+    __atomic_store_n(loop->backend.sq_tail, out->sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = out->backend_pending_before;
+    conn.upstream_connect_armed = false;
+    --conn.pending_ops;
+    return validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
 }
 
 bool complete_unreachable_fixed_upload_head_and_arm(IoUringEventLoop* loop,
@@ -37852,6 +37936,440 @@ bool stage_unreachable_fixed_upload_head_prebuilt_candidate(IoUringEventLoop* lo
     conn.upstream_send_len = 0;
     loop->disarm_response_read_deadline(conn);
     return true;
+}
+
+TEST(response_read_deadline_fixed_upload_head_preconnect_unreachable,
+     exact_and_any_three_causes_publish_pinned_header_only_502_and_keepalive_successor) {
+    static constexpr FixedUploadHeadPreconnectFailureSite kSites[] = {
+        FixedUploadHeadPreconnectFailureSite::SocketCreate,
+        FixedUploadHeadPreconnectFailureSite::ConnectSubmit,
+        FixedUploadHeadPreconnectFailureSite::ConnectCompletion,
+    };
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: successor.example\r\nConnection: close\r\n\r\n";
+    const std::string expected =
+        "HTTP/1.1 502 Bad Gateway\r\nServer: rut-timeout-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 22\r\nConnection: keep-alive\r\n\r\n";
+    for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
+        for (const auto site : kSites) {
+            ScopedBackendHealthReset health_reset{};
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
+            REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+            RouteConfig replacement{};
+            REQUIRE(replacement.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_response_read_deadline_bundle(replacement));
+            REQUIRE(replacement.add_jit_handler(
+                "/one", route_method, &response_read_deadline_fixed_upload_handler, false, 2));
+            REQUIRE(replacement.add_static("/two", kRouteMethodGet, 204));
+            replacement.failure_policies[0].body = {"replacement", 11};
+            fixture.active_config = &replacement;
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+            const u32 failed_episode = conn.upstream_episode;
+            BackendHealth* health = backend_health(0, 0);
+            REQUIRE(health != nullptr);
+            REQUIRE_EQ(health->fails, 0u);
+
+            REQUIRE(trigger_unreachable_fixed_upload_head_preconnect_failure(loop, fixture, site));
+            CHECK_EQ(conn.request_config, &config);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE(conn.send_armed);
+            CHECK(conn.recv_armed);
+            CHECK_EQ(conn.pending_ops, 2u);
+            CHECK(conn.keep_alive);
+            CHECK_EQ(conn.resp_status, kStatusBadGateway);
+            CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+            CHECK_EQ(conn.resp_body_remaining, 0u);
+            CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK(conn.response_read_deadline_owner_is_neutral());
+            CHECK_EQ(conn.upstream_fd, -1);
+            CHECK(conn.upstream_abandoned);
+            CHECK_EQ(conn.response_header_buf.len(), static_cast<u32>(expected.size()));
+            u8 normalized[SlicePool::kSliceSize]{};
+            REQUIRE_LE(conn.response_header_buf.len(), sizeof(normalized));
+            __builtin_memcpy(
+                normalized, conn.response_header_buf.data(), conn.response_header_buf.len());
+            REQUIRE(normalize_redirect_date(normalized, conn.response_header_buf.len()));
+            CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+            HttpResponseParser parser;
+            ParsedResponse parsed;
+            parser.reset();
+            parsed.reset();
+            REQUIRE_EQ(
+                parser.parse(
+                    conn.response_header_buf.data(), conn.response_header_buf.len(), &parsed),
+                ParseStatus::Complete);
+            CHECK_EQ(parser.header_end, conn.response_header_buf.len());
+            CHECK_EQ(parsed.status_code, 502u);
+            CHECK_EQ(parsed.content_length_count, 1u);
+            CHECK_EQ(parsed.content_length, 22u);
+            CHECK_EQ(health->fails,
+                     site == FixedUploadHeadPreconnectFailureSite::ConnectCompletion ? 1u : 0u);
+            if (site == FixedUploadHeadPreconnectFailureSite::ConnectCompletion) {
+                CHECK_EQ(conn.upstream_retiring_episode, failed_episode);
+                CHECK_NE(conn.upstream_episode, failed_episode);
+                CHECK_FALSE(conn.upstream_retirement_active);
+                CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+                CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+            } else {
+                CHECK_EQ(conn.upstream_retiring_episode, 0u);
+                CHECK_EQ(conn.upstream_episode, failed_episode);
+            }
+
+            REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                       sizeof(kSuccessor) - 1u);
+            const u32 response_len = conn.response_header_buf.len();
+            loop->backend.send_state[id].remaining = 0;
+            loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.pipeline_depth, 1u);
+            CHECK_EQ(conn.resp_status, 204u);
+            CHECK(conn.send_armed);
+            CHECK(conn.recv_armed);
+            CHECK_EQ(conn.pending_ops, 2u);
+            CHECK(buf_has(conn.send_buf.data(), conn.send_buf.len(), "HTTP/1.1 204"));
+            CHECK_EQ(health->fails,
+                     site == FixedUploadHeadPreconnectFailureSite::ConnectCompletion ? 1u : 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_preconnect_unreachable,
+     config_reload_and_staged_send_failures_keep_pinned_custody_without_bytes) {
+    static constexpr FixedUploadHeadPreconnectFailureSite kSites[] = {
+        FixedUploadHeadPreconnectFailureSite::SocketCreate,
+        FixedUploadHeadPreconnectFailureSite::ConnectSubmit,
+        FixedUploadHeadPreconnectFailureSite::ConnectCompletion,
+    };
+    for (const auto site : kSites) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig pinned{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, pinned, kRouteMethodAny, &fixture));
+        RouteConfig replacement{};
+        REQUIRE(replacement.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(replacement));
+        REQUIRE(replacement.add_jit_handler(
+            "/one", kRouteMethodAny, &response_read_deadline_fixed_upload_handler, false, 2));
+        replacement.failure_policies[0].body = {"replacement", 11};
+        fixture.active_config = &replacement;
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 episode = conn.upstream_episode;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+
+        REQUIRE(trigger_unreachable_fixed_upload_head_preconnect_failure(
+            loop, fixture, site, /*fail_staged_send=*/true));
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_FALSE(closed.send_armed);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(health->fails,
+                 site == FixedUploadHeadPreconnectFailureSite::ConnectCompletion ? 1u : 0u);
+        if (site == FixedUploadHeadPreconnectFailureSite::ConnectCompletion) {
+            CHECK_EQ(closed.upstream_retiring_episode, episode);
+            CHECK_NE(closed.upstream_episode, episode);
+        } else {
+            CHECK_EQ(closed.upstream_retiring_episode, 0u);
+            CHECK_EQ(closed.upstream_episode, episode);
+        }
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_preconnect_unreachable,
+     owner_policy_upload_and_site_forgeries_fail_before_response_effects) {
+    enum class Mutation : u8 {
+        Profile,
+        Buffering,
+        Method,
+        Route,
+        Bundle,
+        ResponsePolicy,
+        FailurePolicy,
+        TimeoutPolicy,
+        Config,
+        HandlerGeneration,
+        RouteFunction,
+        UpstreamProof,
+        RawLength,
+        RewrittenLength,
+        RequestPolicy,
+        RequestComplete,
+        UploadEpisode,
+        Attempts,
+        Reused,
+        TargetMutation,
+        ResponseMutation,
+        Retry,
+        DownstreamRecv,
+        DownstreamCallback,
+        WrongSite,
+    };
+    static constexpr Mutation kMutations[] = {
+        Mutation::Profile,          Mutation::Buffering,
+        Mutation::Method,           Mutation::Route,
+        Mutation::Bundle,           Mutation::ResponsePolicy,
+        Mutation::FailurePolicy,    Mutation::TimeoutPolicy,
+        Mutation::Config,           Mutation::HandlerGeneration,
+        Mutation::RouteFunction,    Mutation::UpstreamProof,
+        Mutation::RawLength,        Mutation::RewrittenLength,
+        Mutation::RequestPolicy,    Mutation::RequestComplete,
+        Mutation::UploadEpisode,    Mutation::Attempts,
+        Mutation::Reused,           Mutation::TargetMutation,
+        Mutation::ResponseMutation, Mutation::Retry,
+        Mutation::DownstreamRecv,   Mutation::DownstreamCallback,
+        Mutation::WrongSite,
+    };
+    for (const Mutation mutation : kMutations) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_connect_submit_candidate(
+            loop, config, kRouteMethodAny, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        switch (mutation) {
+            case Mutation::Profile:
+                conn.response_read_deadline_profile = ResponseReadDeadlineProfile::HeaderOnlyHead;
+                break;
+            case Mutation::Buffering:
+                conn.response_read_deadline_buffering =
+                    ForwardResponseBufferingMode::CompleteContentLength;
+                break;
+            case Mutation::Method:
+                conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+                break;
+            case Mutation::Route:
+                conn.response_read_deadline_route_method = kRouteMethodPost;
+                break;
+            case Mutation::Bundle:
+                conn.response_read_deadline_bundle_id = 1;
+                break;
+            case Mutation::ResponsePolicy:
+                conn.response_policy_id = 0;
+                break;
+            case Mutation::FailurePolicy:
+                conn.failure_policy_id = 2;
+                break;
+            case Mutation::TimeoutPolicy:
+                conn.timeout_failure_policy_id = 1;
+                break;
+            case Mutation::Config:
+                conn.request_config = nullptr;
+                break;
+            case Mutation::HandlerGeneration:
+                ++conn.handler_gen;
+                break;
+            case Mutation::RouteFunction:
+                config.routes[0].fn = &response_read_deadline_handler;
+                break;
+            case Mutation::UpstreamProof:
+                conn.response_read_deadline_upload.upstream_id = 1;
+                break;
+            case Mutation::RawLength:
+                --conn.response_read_deadline_upload.raw_content_length;
+                break;
+            case Mutation::RewrittenLength:
+                --conn.response_read_deadline_upload.rewritten_total_length;
+                break;
+            case Mutation::RequestPolicy:
+                conn.request_policy_id = 0;
+                break;
+            case Mutation::RequestComplete:
+                conn.request_upload_complete = true;
+                break;
+            case Mutation::UploadEpisode:
+                conn.response_read_deadline_upload.upload_episode = conn.upstream_episode;
+                break;
+            case Mutation::Attempts:
+                conn.upstream_attempts = 2;
+                break;
+            case Mutation::Reused:
+                conn.upstream_reused = true;
+                break;
+            case Mutation::TargetMutation:
+                conn.target_transform_recorded = true;
+                break;
+            case Mutation::ResponseMutation:
+                conn.resp_header_mutation_count = 1;
+                break;
+            case Mutation::Retry:
+                conn.retry_req_send_len = 1;
+                break;
+            case Mutation::DownstreamRecv:
+                conn.recv_armed = false;
+                break;
+            case Mutation::DownstreamCallback:
+                conn.on_recv = &test_sentinel_callback<IoUringEventLoop>;
+                break;
+            case Mutation::WrongSite:
+                break;
+        }
+        const auto site = mutation == Mutation::WrongSite
+                              ? ValidatedPreconnectFailureSite::SocketCreate
+                              : ValidatedPreconnectFailureSite::ConnectSubmit;
+        const i32 fd = conn.fd;
+        const i32 upstream_fd = conn.upstream_fd;
+        const u32 episode = conn.upstream_episode;
+        const u32 pending = conn.pending_ops;
+        const u32 tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        CHECK_FALSE(validated_preconnect_failure_owner_is_stable(loop, conn, site));
+        CHECK_EQ(conn.fd, fd);
+        CHECK_EQ(conn.upstream_fd, upstream_fd);
+        CHECK_EQ(conn.upstream_episode, episode);
+        CHECK_EQ(conn.pending_ops, pending);
+        CHECK_EQ(conn.response_header_buf.len(), 0u);
+        CHECK_FALSE(conn.send_armed);
+        CHECK_EQ(health->fails, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail);
+
+        respond_validated_preconnect_failure(loop, conn, site);
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_FALSE(closed.send_armed);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(health->fails, 0u);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        closed.recv_armed = false;
+        closed.upstream_connect_armed = false;
+        closed.pending_ops = 0;
+        if (closed.recv_slice != nullptr) loop->reclaim_slot(id);
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_preconnect_unreachable,
+     connect_completion_event_and_downstream_send_completion_are_exact) {
+    enum class EventMutation : u8 { Type, Result, Aux, More, Connection, Episode };
+    static constexpr EventMutation kMutations[] = {EventMutation::Type,
+                                                   EventMutation::Result,
+                                                   EventMutation::Aux,
+                                                   EventMutation::More,
+                                                   EventMutation::Connection,
+                                                   EventMutation::Episode};
+    for (const EventMutation mutation : kMutations) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodHead, &fixture));
+        REQUIRE(complete_unreachable_fixed_upload_head_to_preconnect(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        conn.upstream_connect_armed = false;
+        --conn.pending_ops;
+        IoEvent event{
+            id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0, 0, conn.upstream_episode};
+        switch (mutation) {
+            case EventMutation::Type:
+                event.type = IoEventType::UpstreamSend;
+                break;
+            case EventMutation::Result:
+                event.result = 0;
+                break;
+            case EventMutation::Aux:
+                event.aux = 1;
+                break;
+            case EventMutation::More:
+                event.more = 1;
+                break;
+            case EventMutation::Connection:
+                event.conn_id = (id + 1u) % IoUringEventLoop::kMaxConns;
+                break;
+            case EventMutation::Episode:
+                ++event.upstream_episode;
+                break;
+        }
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        CHECK_FALSE(validated_connect_completion_failure_owner_is_stable(loop, conn, event));
+        CHECK_EQ(health->fails, 0u);
+        CHECK_EQ(conn.upstream_retiring_episode, 0u);
+        CHECK_EQ(conn.response_header_buf.len(), 0u);
+        respond_validated_connect_completion_failure(loop, conn, event);
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_FALSE(closed.send_armed);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(health->fails, 0u);
+        CHECK_EQ(closed.upstream_retiring_episode, 0u);
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        closed.recv_armed = false;
+        closed.pending_ops = 0;
+        if (closed.recv_slice != nullptr) loop->reclaim_slot(id);
+        close(fixture.peer_fd);
+    }
+
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
+    REQUIRE(trigger_unreachable_fixed_upload_head_preconnect_failure(
+        loop, fixture, FixedUploadHeadPreconnectFailureSite::ConnectSubmit));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    loop->backend.send_state[id] = {};
+    conn.send_armed = false;
+    --conn.pending_ops;
+    on_validated_preconnect_failure_sent<IoUringEventLoop>(
+        loop, conn, {id, -EPIPE, 0, 0, IoEventType::Send, 0});
+    const Connection& closed = loop->conns[id];
+    CHECK_EQ(closed.fd, -1);
+    CHECK_FALSE(closed.send_armed);
+    CHECK_EQ(closed.response_header_buf.len(), 0u);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+    u8 byte = 0;
+    errno = 0;
+    const i32 before_drain = recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT);
+    CHECK_LE(before_drain, 0);
+    if (before_drain < 0) CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    if (before_drain < 0) CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    close(fixture.peer_fd);
 }
 
 TEST(response_read_deadline_fixed_upload_head_unreachable,
@@ -38337,7 +38855,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
 }
 
 TEST(response_read_deadline_fixed_upload_head_unreachable,
-     configured_failure_timeout_and_parse_paths_remain_fail_closed) {
+     configured_timeout_and_parse_paths_remain_fail_closed) {
     static constexpr const char* kRejected[] = {
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nContent-Length: 12\r\n\r\n",
@@ -38368,35 +38886,6 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         CHECK_FALSE(closed.send_armed);
         CHECK_EQ(closed.response_header_buf.len(), 0u);
         CHECK_EQ(closed.http1_prebuilt_response_purpose, Http1PrebuiltResponsePurpose::None);
-        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-        u8 byte = 0;
-        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
-        close(fixture.peer_fd);
-        fixture.peer_fd = -1;
-        fixture.conn = nullptr;
-    }
-
-    {
-        ScopedIoUringLoopForRetirement guard;
-        if (!guard.init()) SKIP("io_uring unavailable");
-        auto* loop = guard.loop;
-        RouteConfig config{};
-        PrebuiltD2Fixture fixture{};
-        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
-        Connection& conn = *fixture.conn;
-        static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
-        REQUIRE_EQ(conn.recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
-        conn.recv_armed = false;
-        conn.pending_ops = 0;
-        on_request_policy_body_recvd<IoUringEventLoop>(
-            loop, conn, {conn.id, 7, 0, 0, IoEventType::Recv, 1});
-        REQUIRE(conn.upstream_connect_armed);
-        const u32 id = conn.id;
-        const u32 episode = conn.upstream_episode;
-        loop->dispatch({id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
-        CHECK_EQ(loop->conns[id].fd, -1);
-        CHECK_FALSE(loop->conns[id].send_armed);
-        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
         CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
         u8 byte = 0;
         CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
