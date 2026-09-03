@@ -37477,6 +37477,35 @@ TEST(response_read_deadline_non_head_cl0,
 
 TEST(response_read_deadline_fixed_upload,
      preflight_admits_only_positive_unique_content_length_get_post_put_delete_patch) {
+    struct Admission {
+        LogHttpMethod method;
+        bool none;
+        bool complete;
+    };
+    static constexpr Admission kAdmission[] = {
+        {LogHttpMethod::Get, true, true},
+        {LogHttpMethod::Post, true, true},
+        {LogHttpMethod::Put, true, true},
+        {LogHttpMethod::Delete, false, true},
+        {LogHttpMethod::Patch, true, true},
+        {LogHttpMethod::Options, false, false},
+        {LogHttpMethod::Head, false, false},
+        {LogHttpMethod::Trace, false, false},
+        {LogHttpMethod::Connect, false, false},
+        {LogHttpMethod::Other, false, false},
+    };
+    for (const Admission& admission : kAdmission) {
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     static_cast<u8>(admission.method), ForwardResponseBufferingMode::None),
+                 admission.none);
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     static_cast<u8>(admission.method),
+                     ForwardResponseBufferingMode::CompleteContentLength),
+                 admission.complete);
+        CHECK_FALSE(response_read_deadline_fixed_upload_method_admitted(
+            static_cast<u8>(admission.method), static_cast<ForwardResponseBufferingMode>(0xffu)));
+    }
+
     struct Accepted {
         const char* request;
         LogHttpMethod method;
@@ -37624,6 +37653,48 @@ TEST(response_read_deadline_fixed_upload,
         conn->request_config = &config;
         CHECK_FALSE(
             prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
+        CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+    }
+
+    for (const u8 route_method : {kRouteMethodDelete, kRouteMethodAny}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::None));
+        REQUIRE(config.add_jit_handler(
+            "/one", route_method, &response_read_deadline_fixed_upload_handler, false, 2));
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        static constexpr char kDelete[] =
+            "DELETE /one HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\na";
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kDelete), sizeof(kDelete) - 1u),
+                   sizeof(kDelete) - 1u);
+        capture_request_metadata(*conn);
+        conn->handler_gen = 1;
+        conn->keep_alive = true;
+        conn->request_config = &config;
+        const u32 id = conn->id;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 pending = loop->backend.pending;
+        response_read_deadline_fixed_upload_handler_calls = 0;
+        CHECK_FALSE(
+            prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(response_read_deadline_fixed_upload_handler_calls, 0u);
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_FALSE(closed.upstream_connect_armed);
+        CHECK_FALSE(closed.upstream_send_armed);
+        CHECK_FALSE(closed.upstream_recv_armed);
+        CHECK_EQ(closed.send_buf.len(), 0u);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        CHECK_EQ(loop->backend.pending, pending);
         CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     }
 }
@@ -38066,6 +38137,7 @@ TEST(response_read_deadline_fixed_upload,
         MethodPost,
         AnyRouteToPost,
         ExactRouteToPut,
+        Buffering,
         Policy,
         Length,
         Handler,
@@ -38078,6 +38150,7 @@ TEST(response_read_deadline_fixed_upload,
                                     Mutation::MethodPost,
                                     Mutation::AnyRouteToPost,
                                     Mutation::ExactRouteToPut,
+                                    Mutation::Buffering,
                                     Mutation::Policy,
                                     Mutation::Length,
                                     Mutation::Handler,
@@ -38124,6 +38197,8 @@ TEST(response_read_deadline_fixed_upload,
             config.routes[0].method = kRouteMethodPost;
         } else if (mutation == Mutation::ExactRouteToPut) {
             config.routes[0].method = kRouteMethodPut;
+        } else if (mutation == Mutation::Buffering) {
+            conn->response_read_deadline_buffering = ForwardResponseBufferingMode::None;
         } else if (mutation == Mutation::Policy) {
             conn->pending_forward_request_policy_id = 0;
         } else if (mutation == Mutation::Length) {
