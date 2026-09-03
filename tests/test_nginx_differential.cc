@@ -51797,6 +51797,137 @@ static bool run_converter_default_buffering_positive_get_differential(
     return true;
 }
 
+static bool run_pinned_positive_cl_options_default_buffering_oracle(
+    TempDir& temp,
+    const std::string& container_name,
+    std::vector<char>& observed_upstream,
+    DefaultBufferingCompleteObservation& observation,
+    std::string& error) {
+    u16 frontend_port = 0;
+    u16 backend_port = 0;
+    if (!allocate_port(frontend_port) || !allocate_port(backend_port) ||
+        frontend_port == backend_port) {
+        error = "#268 positive-CL OPTIONS could not allocate two distinct loopback ports";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    origin.permit_gated_complete_response = true;
+    origin.read_exact_content_length_12_body = true;
+    if (!origin.setup(backend_port)) {
+        error = "#268 positive-CL OPTIONS origin setup failed";
+        return false;
+    }
+
+    const std::string config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    const auto occurs_once = [&](const char* needle) {
+        const size_t first = config.find(needle);
+        return first != std::string::npos &&
+               config.find(needle, first + strlen(needle)) == std::string::npos;
+    };
+    if (!occurs_once("server {") || !occurs_once("listen 127.0.0.1:") ||
+        !occurs_once("location / {") || !occurs_once("proxy_pass http://127.0.0.1:") ||
+        !occurs_once("proxy_read_timeout 1s;") ||
+        config.find("proxy_request_buffering") != std::string::npos ||
+        config.find("proxy_buffering") != std::string::npos ||
+        config.find("proxy_http_version") != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#268 positive-CL OPTIONS config shape/omission or write check failed";
+        return false;
+    }
+
+    static constexpr char kRequestHead[] =
+        "OPTIONS /buffered-options-complete?q=1 HTTP/1.1\r\n"
+        "Host: options-client.example\r\n"
+        "X-Test: binary-options-defaults\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 12\r\n\r\n";
+    std::vector<char> prefix(kRequestHead, kRequestHead + sizeof(kRequestHead) - 1u);
+    prefix.insert(prefix.end(),
+                  reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                  reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                      kDefaultBufferingPostCompleteRequestPrefixBody);
+    const std::vector<char> suffix(
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            kDefaultBufferingPostCompleteRequestPrefixBody,
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            sizeof(kDefaultBufferingPostCompleteRequestBody));
+    std::string capture_error;
+    if (!capture_nginx_default_buffering_complete(frontend_port,
+                                                  temp.nginx_config,
+                                                  temp.nginx_log,
+                                                  container_name,
+                                                  origin,
+                                                  prefix,
+                                                  suffix,
+                                                  1200,
+                                                  kDefaultBufferingCompleteResponseNormalized,
+                                                  false,
+                                                  observation,
+                                                  capture_error)) {
+        error = "#268 positive-CL OPTIONS capture failed: " + capture_error;
+        dump_wire("#268 positive-CL OPTIONS downstream", observation.downstream);
+        dump_log(temp.nginx_config, "#268 positive-CL OPTIONS nginx config");
+        dump_log(temp.nginx_log, "#268 positive-CL OPTIONS nginx log");
+        return false;
+    }
+
+    const bool origin_live_before_cleanup = origin.running.load(std::memory_order_acquire) &&
+                                            origin.thread_alive.load(std::memory_order_acquire) &&
+                                            !origin.listener_failed.load(std::memory_order_acquire);
+    origin.stop();
+    observed_upstream = origin.request;
+    const std::string expected_head =
+        "OPTIONS /buffered-options-complete?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+        std::to_string(backend_port) +
+        "\r\nContent-Length: 12\r\nX-Test: binary-options-defaults\r\nContent-Type: "
+        "application/octet-stream\r\n\r\n";
+    std::vector<char> expected(expected_head.begin(), expected_head.end());
+    expected.insert(expected.end(),
+                    reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                    reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                        sizeof(kDefaultBufferingPostCompleteRequestBody));
+    const u64 first_fragment_ns =
+        origin.response_fragment_sent_ns[0].load(std::memory_order_acquire);
+    const u64 final_fragment_ns =
+        origin.response_fragment_sent_ns[3].load(std::memory_order_acquire);
+    const u64 peer_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (!origin_live_before_cleanup || origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.history[0] != expected || origin.request != expected ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 4u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire) ||
+        first_fragment_ns == 0u || final_fragment_ns <= first_fragment_ns ||
+        final_fragment_ns - first_fragment_ns <= 1'000'000'000ull ||
+        peer_closed_ns < final_fragment_ns ||
+        observation.request_suffix_sent_ns < observation.request_prefix_sent_ns ||
+        observation.request_suffix_sent_ns - observation.request_prefix_sent_ns <
+            1'200'000'000ull) {
+        error = "#268 positive-CL OPTIONS exact wire, timing, retirement, or cleanup mismatch";
+        dump_wire("expected #268 OPTIONS upstream", expected);
+        dump_wire("actual #268 OPTIONS upstream", observed_upstream);
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -51843,6 +51974,9 @@ int main(int argc, char** argv) {
     const bool converter_default_buffering_positive_get_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-default-buffering-positive-get-differential") == 0;
+    const bool pinned_positive_cl_options_default_buffering_oracle =
+        argc == 2 &&
+        strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -52026,6 +52160,7 @@ int main(int argc, char** argv) {
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
+         !pinned_positive_cl_options_default_buffering_oracle &&
          !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
@@ -52185,6 +52320,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--converter-default-buffering-positive-get-differential "
                      "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -53251,6 +53388,31 @@ int main(int argc, char** argv) {
         if (!probe_error.empty()) std::cerr << probe_error << "\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
+    }
+    if (pinned_positive_cl_options_default_buffering_oracle) {
+        const std::string container_name = "rut-nginx-268-positive-cl-options-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::vector<char> observed_upstream;
+        DefaultBufferingCompleteObservation observation;
+        std::string oracle_error;
+        if (!run_pinned_positive_cl_options_default_buffering_oracle(
+                temp, container_name, observed_upstream, observation, oracle_error)) {
+            std::cerr << "FAIL [#268 pinned positive-CL OPTIONS default-buffering oracle]: "
+                      << oracle_error << "\n";
+            dump_wire("#268 observed positive-CL OPTIONS upstream", observed_upstream);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #268 pinned nginx 1.29.7 buffers one origin-form positive-Content-Length "
+               "OPTIONS request until the exact 5+7 binary body is complete, then emits one "
+               "byte-exact authority-rewritten upstream request; its default response buffering "
+               "withholds four permit-gated application writes spanning over 1s until the "
+               "strict CL12 response is complete, preserves downstream keep-alive, and retires "
+               "the sole origin episode before cleanup with no retry (nginx-only oracle; no "
+               "converter, generated-RUT, RUT admission, OPTIONS-star, CORS, Max-Forwards, "
+               "reuse, streaming, TLS, or H2 claim)\n";
+        return 0;
     }
     if (converter_default_buffering_positive_get_differential) {
         const std::string container_name = "rut-nginx-271-positive-get-" +
