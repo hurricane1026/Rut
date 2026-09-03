@@ -38,10 +38,10 @@ inline bool response_read_deadline_fixed_upload_method_admitted(u8 method) {
         case LogHttpMethod::Get:
         case LogHttpMethod::Post:
         case LogHttpMethod::Put:
+        case LogHttpMethod::Delete:
         case LogHttpMethod::Patch:
             return true;
         case LogHttpMethod::Head:
-        case LogHttpMethod::Delete:
         case LogHttpMethod::Options:
         case LogHttpMethod::Trace:
         case LogHttpMethod::Connect:
