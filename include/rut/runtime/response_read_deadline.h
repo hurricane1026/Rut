@@ -332,6 +332,84 @@ inline bool response_read_deadline_fixed_upload_proof_is_stable(
         c, proof, /*require_upload_complete=*/true);
 }
 
+// The staged fixed-upload HEAD success path is deliberately narrower than the
+// generic fixed-upload and bodyless HEAD owners.  It may be checked while the
+// origin recv is live or after that exact episode has moved into the strict
+// retirement tombstone, but never creates or selects the profile itself.
+inline bool fixed_upload_head_success_proof_is_stable(const Connection& c,
+                                                      const ResponseReadDeadlineUploadProof& proof,
+                                                      const RouteConfig* config,
+                                                      u16 bundle_id,
+                                                      ResponseReadDeadlineProfile profile,
+                                                      ForwardResponseBufferingMode buffering,
+                                                      u8 method,
+                                                      u8 route_method,
+                                                      bool allow_retired_episode = false) {
+    if (config == nullptr || config != c.request_config ||
+        !config->policy_bundle_id_is_valid(bundle_id) ||
+        profile != ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+        buffering != ForwardResponseBufferingMode::None ||
+        method != static_cast<u8>(LogHttpMethod::Head) || method != c.req_method ||
+        !response_read_deadline_route_method_matches(method, route_method) ||
+        c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+        c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
+        c.req_http_version != static_cast<u8>(HttpVersion::Http11) || !c.req_strict_h1_complete ||
+        c.req_path_canon.ptr == nullptr || c.req_client_content_length_count != 1 ||
+        !c.req_client_has_content_length || c.req_client_has_transfer_encoding ||
+        c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||
+        c.req_malformed || c.req_wants_upgrade || c.req_upgrade_is_websocket ||
+        c.resp_upgrade_is_websocket || !response_read_deadline_default_persistence_is_stable(c) ||
+        proof.downstream_close || !c.response_policy_suppress_body ||
+        !c.failure_policy_suppress_body || c.response_mutations_snapshotted ||
+        c.target_transform_recorded || c.req_path_overridden || c.req_header_override_count != 0 ||
+        c.req_header_override_overflow || c.resp_header_mutation_count != 0 ||
+        c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
+        c.resp_header_mutation_overflow || c.upstream_reused || c.upstream_attempts != 1 ||
+        !c.request_upload_complete || c.upstream_request_incomplete || c.retry_req_send_len != 0 ||
+        c.pipeline_stash_len != 0 ||
+        !response_read_deadline_fixed_upload_materialization_is_stable(
+            c, proof, profile, true, bundle_id, route_method, buffering, allow_retired_episode))
+        return false;
+    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    if (bundle.response_buffering != buffering ||
+        bundle.response_policy_id != c.response_policy_id ||
+        bundle.failure_policy_id != c.failure_policy_id ||
+        bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+        !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+        !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+        !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    const auto& response = config->response_policies[bundle.response_policy_id - 1];
+    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
+    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
+        !forward_timeout_failure_policy_spec_valid(timeout) ||
+        response.version != ResponsePolicyVersion::Http11 ||
+        response.framing != ResponsePolicyFraming::ContentLength ||
+        response.connection != ResponsePolicyConnection::Request ||
+        response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+        failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||
+        failure.connection != ForwardFailurePolicyConnection::Request ||
+        failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+        timeout.version != ForwardFailurePolicyVersion::Http11 ||
+        timeout.connection != ForwardFailurePolicyConnection::Request ||
+        timeout.head_mode != FailurePolicyHeadMode::SuppressBody)
+        return false;
+    const bool live =
+        proof.upload_episode == c.upstream_episode && c.upstream_fd >= 0 && !c.upstream_abandoned &&
+        !c.upstream_retirement_active && c.upstream_retirement_target_owned == 0 &&
+        c.upstream_retirement_cancel_owned == 0 && c.upstream_retirement_cancel_retry == 0 &&
+        c.upstream_recv_armed && c.on_upstream_recv != nullptr;
+    const bool retired = allow_retired_episode && c.upstream_abandoned && c.upstream_fd < 0 &&
+                         proof.upload_episode == c.upstream_retiring_episode &&
+                         valid_upstream_episode(c.upstream_retiring_episode) &&
+                         valid_upstream_episode(c.upstream_episode) &&
+                         c.upstream_retiring_episode < c.upstream_episode &&
+                         c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr;
+    return live || retired;
+}
+
 // First-batch and D2 callers retain the immutable bundle/route identity after
 // the live deadline latch may have moved phases. They prove CompleteContentLength
 // at their boundary and use this helper for the exact policy/upload episode.
