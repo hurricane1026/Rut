@@ -701,30 +701,17 @@ private:
             if (c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ConfiguredForwardFailure) {
                 const auto& configured = failure;
-                const bool terminal_pre_d2 =
-                    !c.upstream_abandoned && c.upstream_fd >= 0 && !c.upstream_recv_armed &&
-                    c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr;
-                const bool configured_transport =
-                    terminal_pre_d2 ? fixed_upload_head_terminal_failure_proof_is_stable(
-                                          c,
-                                          c.http1_prebuilt_deadline_upload,
-                                          c.http1_prebuilt_deadline_config,
-                                          c.http1_prebuilt_deadline_bundle_id,
-                                          c.http1_prebuilt_deadline_profile,
-                                          bundle.response_buffering,
-                                          c.http1_prebuilt_deadline_method,
-                                          c.http1_prebuilt_deadline_route_method)
-                                    : fixed_upload_head_success_proof_is_stable(
-                                          c,
-                                          c.http1_prebuilt_deadline_upload,
-                                          c.http1_prebuilt_deadline_config,
-                                          c.http1_prebuilt_deadline_bundle_id,
-                                          c.http1_prebuilt_deadline_profile,
-                                          bundle.response_buffering,
-                                          c.http1_prebuilt_deadline_method,
-                                          c.http1_prebuilt_deadline_route_method,
-                                          /*allow_retired_episode=*/true);
-                if (!configured_transport) return false;
+                if (!fixed_upload_head_success_proof_is_stable(
+                        c,
+                        c.http1_prebuilt_deadline_upload,
+                        c.http1_prebuilt_deadline_config,
+                        c.http1_prebuilt_deadline_bundle_id,
+                        c.http1_prebuilt_deadline_profile,
+                        bundle.response_buffering,
+                        c.http1_prebuilt_deadline_method,
+                        c.http1_prebuilt_deadline_route_method,
+                        /*allow_retired_episode=*/true))
+                    return false;
                 HttpResponseParser parser;
                 ParsedResponse parsed;
                 parser.reset();
@@ -1184,7 +1171,8 @@ public:
     // Internal D2 seam. The complete header is already owned by
     // response_header_buf; this method proves transport and request-buffer
     // ownership before advancing the episode or submitting any downstream byte.
-    // No production policy path calls it in this slice.
+    // The staged deadline paths use this seam only after their immutable
+    // response and ownership proofs have completed.
     [[nodiscard]] bool begin_prebuilt_http1_response(Connection& c,
                                                      u8 selected_targets,
                                                      Http1RequestBufferDisposition disposition,
@@ -1232,9 +1220,7 @@ public:
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
             ((strict_head || fixed_upload_head_timeout || configured_forward_failure) &&
-             ((configured_forward_failure
-                   ? (selected_targets != 0 && selected_targets != kUpstreamOpRecv)
-                   : selected_targets != kUpstreamOpRecv) ||
+             (selected_targets != kUpstreamOpRecv ||
               disposition != Http1RequestBufferDisposition::ExistingPipeline ||
               request_prefix_len != 0)) ||
             !prebuilt_http1_response_is_complete(c) ||

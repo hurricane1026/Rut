@@ -8277,15 +8277,14 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
         out_len);
 }
 
-inline bool configured_forward_failure_date_is_normalized(Str value);
-
 inline bool fixed_upload_head_preconnect_failure_response_is_stable(
     const Connection& conn,
     const RouteConfig& config,
     const u8* response,
     u32 response_len,
     ResponseReadDeadlineProfile expected_profile =
-        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead) {
+        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead,
+    bool require_normalized_date = false) {
     if ((expected_profile != ResponseReadDeadlineProfile::None &&
          conn.response_read_deadline_profile != expected_profile) ||
         response == nullptr || response_len == 0 ||
@@ -8321,7 +8320,9 @@ inline bool fixed_upload_head_preconnect_failure_response_is_stable(
                 return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "date", 4)) {
             ++date_count;
-            if (!configured_forward_failure_date_is_normalized(header.value)) return false;
+            if (require_normalized_date ? !response_read_deadline_http_date_is_normalized(header.value)
+                                        : header.value.len != 29)
+                return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12)) {
             ++content_type_count;
             if (header.value.len != policy.content_type.len ||
@@ -9289,7 +9290,6 @@ enum class StrictResponseRejectionCause : u8 {
 enum class ConfiguredForwardFailureDomain : u8 {
     ValidStatusLineHeaderFailure,
     CompleteUnsupportedResponse,
-    TerminalNoBytes,
 };
 
 // A parser Error is not by itself evidence of an HTTP response.  This small
@@ -9315,16 +9315,17 @@ inline bool configured_forward_failure_status_line_witness(const u8* data,
     return true;
 }
 
-inline bool configured_forward_failure_date_is_normalized(Str value) {
-    return response_read_deadline_http_date_is_normalized(value);
-}
-
 inline bool fixed_upload_head_configured_failure_response_is_stable(const Connection& conn,
                                                                     const RouteConfig& config,
                                                                     const u8* response,
                                                                     u32 response_len) {
     return fixed_upload_head_preconnect_failure_response_is_stable(
-        conn, config, response, response_len, ResponseReadDeadlineProfile::None);
+        conn,
+        config,
+        response,
+        response_len,
+        ResponseReadDeadlineProfile::None,
+        /*require_normalized_date=*/true);
 }
 
 template <typename Loop>
@@ -9351,7 +9352,6 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
         const RouteConfig* config = conn.request_config;
         u16 witnessed_status = 0;
         const bool live_event = conn.upstream_recv_armed && ev.more && ev.result > 0;
-        const bool terminal_event = !conn.upstream_recv_armed && !ev.more;
         const bool valid_status = configured_forward_failure_status_line_witness(
             conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &witnessed_status);
         if (loop == nullptr || config == nullptr ||
@@ -9362,15 +9362,17 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             ev.type != IoEventType::UpstreamRecv || ev.conn_id != conn.id || ev.aux != 0 ||
             ev.result == -ENOBUFS || ev.result == -ECANCELED ||
             ev.upstream_episode != upload.upload_episode ||
-            (domain == ConfiguredForwardFailureDomain::TerminalNoBytes
-                 ? (conn.upstream_recv_buf.len() != 0 || ev.result > 0)
-                 : !valid_status) ||
+            ev.copy_witness != IoEventCopyWitness::Full ||
+            ev.copy_deadline_generation != generation ||
+            ev.copy_deadline_profile != static_cast<u8>(profile) ||
+            ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
+            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            ev.copy_end != conn.upstream_recv_buf.len() ||
+            ev.copy_begin != (progress_batch ? conn.response_read_deadline_progress_bytes : 0u) ||
+            !valid_status ||
             (domain == ConfiguredForwardFailureDomain::CompleteUnsupportedResponse &&
              conn.upstream_recv_buf.len() == 0) ||
-            (!live_event && !terminal_event) ||
-            (domain == ConfiguredForwardFailureDomain::ValidStatusLineHeaderFailure &&
-             terminal_event && ev.result > 0) ||
-            (domain != ConfiguredForwardFailureDomain::TerminalNoBytes && witnessed_status == 0))
+            !live_event || witnessed_status == 0)
             return false;
 
         const bool deadline_owner =
@@ -9403,13 +9405,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
              conn.response_read_deadline_progress_episode == 0 &&
              conn.response_read_deadline_progress_bytes == 0 &&
              response_read_deadline_upload_proof_equal(conn.response_read_deadline_upload, upload));
-        const bool terminal = terminal_event;
-        const bool transport_owner =
-            terminal
-                ? fixed_upload_head_terminal_failure_proof_is_stable(
-                      conn, upload, config, bundle_id, profile, buffering, method, route_method)
-                : fixed_upload_head_success_proof_is_stable(
-                      conn, upload, config, bundle_id, profile, buffering, method, route_method);
+        const bool transport_owner = fixed_upload_head_success_proof_is_stable(
+            conn, upload, config, bundle_id, profile, buffering, method, route_method);
         if (!deadline_owner || upload.upload_episode == 0 || method != conn.req_method ||
             !response_read_deadline_route_method_matches(method, route_method) || !transport_owner)
             return false;
@@ -9466,8 +9463,6 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             return true;
         }
 
-        const bool live = live_event;
-        if (!live && !terminal) return false;
         if constexpr (requires(Loop* candidate, Connection& c) {
                           candidate->disarm_response_read_deadline(c);
                       }) {
@@ -9475,9 +9470,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
         } else {
             return false;
         }
-        const u8 selected_targets = live ? kUpstreamOpRecv : static_cast<u8>(0);
         if (!loop->begin_prebuilt_http1_response(conn,
-                                                 selected_targets,
+                                                 kUpstreamOpRecv,
                                                  Http1RequestBufferDisposition::ExistingPipeline,
                                                  conn.retry_req_send_len)) {
             if (conn.fd >= 0) loop->close_conn(conn);
@@ -9661,6 +9655,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                                                  explicit_first_batch,
                                                                  explicit_progress_batch);
     };
+    auto record_reused_response_health = [&]() {
+        if (!conn.upstream_reused) return;
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        conn.upstream_reused = false;
+    };
+    const bool configured_head_candidate =
+        (explicit_first_batch || explicit_progress_batch) &&
+        explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
 
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
@@ -9682,7 +9685,6 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
-        if (try_configured_head_failure(ConfiguredForwardFailureDomain::TerminalNoBytes)) return;
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
@@ -9695,23 +9697,6 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-
-    // A reused pooled socket proved healthy once it returned response bytes; record
-    // success here rather than at synthetic connect time.
-    if (conn.upstream_reused) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
-        conn.upstream_reused = false;
-    }
-
-    // A response byte is now in hand, so the request will not be replayed. Drop the
-    // snapshot marker only when it is not also the offset to a stashed pipelined
-    // suffix; pipeline_recover / the merged stash+late path clear it after copying
-    // from that offset.
-    // recv_buf is NOT touched here — it was already reset at request-sent, so any
-    // bytes in it now are a genuine pipelined downstream request that must survive to
-    // flow through pipeline_recover / pipeline_dispatch on the completion path.
-    if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
 
     HttpResponseParser resp_parser;
     ParsedResponse resp;
@@ -9745,6 +9730,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (try_configured_head_failure(
                 ConfiguredForwardFailureDomain::ValidStatusLineHeaderFailure))
             return;
+        if (!configured_head_candidate) record_reused_response_health();
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         if ((explicit_first_batch || explicit_progress_batch) &&
             (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
@@ -9775,6 +9761,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if ((explicit_first_batch || explicit_progress_batch) &&
         (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
          response_read_deadline_profile_is_fixed_upload(explicit_profile))) {
+        // A fixed-upload HEAD candidate must prove a zero request prefix before
+        // the configured failure classifier can run. Other explicit profiles
+        // retain the legacy snapshot release at response-byte admission.
+        if (explicit_profile !=
+            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead) {
+            if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
+        }
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(explicit_profile);
         const bool fixed_upload_head =
             explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
@@ -9897,6 +9890,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
+            if (!configured_head_candidate) record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9909,6 +9903,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
+            if (!configured_head_candidate) record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9932,12 +9927,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
+            if (!configured_head_candidate) record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
         }
 
         if (strict_positive_complete_buffering || strict_positive_streaming_get) {
+            record_reused_response_health();
             if (strict_positive_complete_buffering) {
                 if constexpr (requires(Loop* candidate,
                                        Connection& c,
@@ -10003,6 +10000,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_prebuilt_total_len = output_len;
         conn.http1_prebuilt_body_len = strict_positive_head ? resp.content_length : 0;
         conn.http1_prebuilt_status = 200;
+        record_reused_response_health();
         conn.resp_body_mode = BodyMode::None;
         conn.resp_body_remaining = 0;
         conn.resp_body_sent = 0;
@@ -10029,6 +10027,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
+    // A response byte is now in hand, so the request will not be replayed. Drop
+    // the snapshot marker only when it is not also the offset to a stashed
+    // pipelined suffix; pipeline recovery clears that offset after copying.
+    if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
+    record_reused_response_health();
     conn.resp_status = resp.status_code;
 
     // A strict policy has no interim-response or Upgrade domain.  Reject all
