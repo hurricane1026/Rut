@@ -3353,6 +3353,10 @@ void handle_jit_outcome(Loop* loop,
             // on_header_received. Reading loop->config_ptr here would
             // pick up a post-swap config whose upstream table doesn't
             // match the indexing the handler compiled against.
+            const u16 original_outcome_response_policy_id = outcome.response_policy_id;
+            const u16 original_outcome_failure_policy_id = outcome.failure_policy_id;
+            const u16 original_outcome_timeout_failure_policy_id =
+                outcome.timeout_failure_policy_id;
             const RouteConfig* config = conn.request_config;
             u16 forward_response_policy_id = outcome.response_policy_id;
             u16 forward_failure_policy_id = outcome.failure_policy_id;
@@ -3416,6 +3420,10 @@ void handle_jit_outcome(Loop* loop,
                     outcome.request_policy_id ==
                         conn.response_read_deadline_upload.request_policy_id &&
                     outcome.policy_bundle_id == conn.response_read_deadline_bundle_id &&
+                    original_outcome_response_policy_id == forward_response_policy_id &&
+                    original_outcome_failure_policy_id == forward_failure_policy_id &&
+                    original_outcome_timeout_failure_policy_id ==
+                        forward_timeout_failure_policy_id &&
                     response_read_deadline_fixed_upload_route_stable(conn, true);
                 if (staged_fixed_head_continuation) {
                     outcome_profile = conn.response_read_deadline_profile;

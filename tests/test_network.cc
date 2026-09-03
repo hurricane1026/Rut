@@ -37924,6 +37924,68 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
 }
 
 TEST(response_read_deadline_fixed_upload_head_unreachable,
+     pending_policy_identity_mutations_fail_before_effects) {
+    enum class Mutation : u8 { ResponsePolicy, FailurePolicy, TimeoutFailurePolicy };
+    static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    for (const Mutation mutation :
+         {Mutation::ResponsePolicy, Mutation::FailurePolicy, Mutation::TimeoutFailurePolicy}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        switch (mutation) {
+            case Mutation::ResponsePolicy:
+                REQUIRE_EQ(conn.pending_forward_response_policy_id, 1u);
+                conn.pending_forward_response_policy_id = 0;
+                break;
+            case Mutation::FailurePolicy:
+                REQUIRE_EQ(conn.pending_forward_failure_policy_id, 1u);
+                conn.pending_forward_failure_policy_id = 0;
+                break;
+            case Mutation::TimeoutFailurePolicy:
+                REQUIRE_EQ(conn.pending_forward_timeout_failure_policy_id, 2u);
+                conn.pending_forward_timeout_failure_policy_id = 0;
+                break;
+        }
+        REQUIRE_EQ(conn.recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+        const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 backend_pending_before = loop->backend.pending;
+        conn.recv_armed = false;
+        conn.pending_ops = 0;
+        on_request_policy_body_recvd<IoUringEventLoop>(
+            loop, conn, {id, 7, 0, 0, IoEventType::Recv, 1});
+
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_FALSE(closed.upstream_connect_armed);
+        CHECK_FALSE(closed.upstream_send_armed);
+        CHECK_FALSE(closed.upstream_recv_armed);
+        CHECK_FALSE(closed.send_armed);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_FALSE(closed.proxy_resp_started);
+        CHECK_EQ(closed.resp_status, 0u);
+        CHECK_EQ(closed.resp_body_sent, 0u);
+        CHECK_EQ(closed.upstream_send_len, 0u);
+        CHECK_EQ(closed.send_buf.len(), 0u);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+        CHECK_EQ(loop->backend.pending, backend_pending_before);
+        u8 downstream_byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &downstream_byte, 1, MSG_DONTWAIT), 0);
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_unreachable,
      live_owner_and_first_batch_forgeries_fail_closed) {
     enum class OwnerForgery : u8 {
         Profile,
