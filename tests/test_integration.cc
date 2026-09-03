@@ -17605,6 +17605,72 @@ route HEAD "/deadline" {
     }
 };
 
+// One public ordinary-RUT program with two independently selected response-read
+// deadline bundles.  The distinct origins and timeout policies let the wire
+// test below detect swapped, collapsed, or process-global timeout selection.
+struct PublicDistinctResponseReadDeadlineSourceResources
+    : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 short_backend_port, u16 long_backend_port) {
+        std::string source =
+            "upstream short_backend at \"127.0.0.1:" + std::to_string(short_backend_port) +
+            "\"\nupstream long_backend at \"127.0.0.1:" + std::to_string(long_backend_port) +
+            "\"\n";
+        source += R"rut(
+route HEAD "/short-deadline" {
+  return forward(short_backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "suppress_body", server: "short-timeout",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Short Origin Failed",
+      content_type: "text/plain", server: "short-timeout", date: "current",
+      connection: "request", head_mode: "suppress_body", body: b"short failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Short Response Deadline", content_type: "text/plain",
+      server: "short-timeout", date: "current", connection: "request",
+      head_mode: "suppress_body", body: b"short deadline\n" },
+    response_read_timeout: 1s)
+}
+route HEAD "/long-deadline" {
+  return forward(long_backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "suppress_body", server: "long-timeout",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Long Origin Failed",
+      content_type: "text/plain", server: "long-timeout", date: "current",
+      connection: "request", head_mode: "suppress_body", body: b"long failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Long Response Deadline", content_type: "text/plain",
+      server: "long-timeout", date: "current", connection: "request",
+      head_mode: "suppress_body", body: b"long deadline\n" },
+    response_read_timeout: 3s)
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
 // Compiler/JIT lifetime for the bounded bodyless-GET, Content-Length: 0
 // response-read deadline profile.  This remains ordinary RUT source evidence;
 // it is not nginx.conf lowering or general response-body timeout support.
@@ -36084,6 +36150,301 @@ TEST(route, public_ordinary_source_narrow_first_response_deadline_iouring) {
     REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
     CHECK_EQ(backend.request_body_len, 0u);
+}
+
+TEST(route, public_ordinary_source_distinct_response_read_deadlines_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kShortExpected[] =
+        "HTTP/1.1 504 Short Response Deadline\r\n"
+        "Server: short-timeout\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 15\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kLongExpected[] =
+        "HTTP/1.1 504 Long Response Deadline\r\n"
+        "Server: long-timeout\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 14\r\n"
+        "Connection: keep-alive\r\n\r\n";
+
+    RecordingUpstream short_backend;
+    RecordingUpstream long_backend;
+    short_backend.stall_first_response_for_peer_close = true;
+    long_backend.stall_first_response_for_peer_close = true;
+    REQUIRE(short_backend.setup());
+    REQUIRE(long_backend.setup());
+    REQUIRE_NE(short_backend.port, long_backend.port);
+
+    PublicDistinctResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(short_backend.port, long_backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 2u);
+    REQUIRE_EQ(resources.rir.module.upstream_count, 2u);
+    REQUIRE_EQ(resources.rir.module.response_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.failure_policy_count, 4u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 2u);
+    REQUIRE_EQ(resources.cfg.route_count, 2u);
+    REQUIRE_EQ(resources.cfg.upstream_count, 2u);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 4u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 2u);
+
+    const u8 expected_seconds[] = {1u, 3u};
+    const u16 expected_response_ids[] = {1u, 2u};
+    const u16 expected_failure_ids[] = {1u, 3u};
+    const u16 expected_timeout_failure_ids[] = {2u, 4u};
+    const char* expected_paths[] = {"/short-deadline", "/long-deadline"};
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    for (u32 i = 0; i < 2; i++) {
+        const auto& function = resources.rir.module.functions[i];
+        REQUIRE(function.route_pattern.eq(
+            {expected_paths[i], static_cast<u32>(strlen(expected_paths[i]))}));
+        CHECK_EQ(function.http_method, kRouteMethodHead);
+        CHECK_EQ(function.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(function.preflight_forward_policy_bundle_id, i + 1u);
+        REQUIRE_EQ(function.block_count, 1u);
+        const auto* terminator = function.blocks[0].terminator();
+        REQUIRE(terminator != nullptr);
+        REQUIRE_EQ(terminator->op, rir::Opcode::RetForwardBundle);
+        REQUIRE_EQ(terminator->operand_count, 3u);
+        CHECK_EQ(const_i32_value(function.blocks[0], terminator->operands[0]), static_cast<i32>(i));
+        CHECK_EQ(const_i32_value(function.blocks[0], terminator->operands[1]), 1);
+        CHECK_EQ(const_i32_value(function.blocks[0], terminator->operands[2]),
+                 static_cast<i32>(i + 1u));
+
+        const auto& rir_bundle = resources.rir.module.policy_bundles[i];
+        CHECK_EQ(rir_bundle.response_policy_id, expected_response_ids[i]);
+        CHECK_EQ(rir_bundle.failure_policy_id, expected_failure_ids[i]);
+        CHECK_EQ(rir_bundle.timeout_failure_policy_id, expected_timeout_failure_ids[i]);
+        CHECK_EQ(rir_bundle.response_read_timeout_seconds, expected_seconds[i]);
+        CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::None);
+        const auto& config_bundle = resources.cfg.policy_bundles[i];
+        CHECK_EQ(config_bundle.response_policy_id, expected_response_ids[i]);
+        CHECK_EQ(config_bundle.failure_policy_id, expected_failure_ids[i]);
+        CHECK_EQ(config_bundle.timeout_failure_policy_id, expected_timeout_failure_ids[i]);
+        CHECK_EQ(config_bundle.response_read_timeout_seconds, expected_seconds[i]);
+        CHECK_EQ(config_bundle.response_buffering, ForwardResponseBufferingMode::None);
+
+        const auto& route = resources.cfg.routes[i];
+        REQUIRE_EQ(route.path_len, static_cast<u32>(strlen(expected_paths[i])));
+        CHECK_EQ(memcmp(route.path, expected_paths[i], route.path_len), 0);
+        CHECK_EQ(route.method, kRouteMethodHead);
+        CHECK_EQ(route.action, RouteAction::JitHandler);
+        CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(route.preflight_forward_policy_bundle_id, i + 1u);
+    }
+    REQUIRE(rir::verify_module(resources.rir.module).ok);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[1].addr_count, 1u);
+    CHECK_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), INADDR_LOOPBACK);
+    CHECK_EQ(ntohl(resources.cfg.upstreams[1].addrs[0].sin_addr.s_addr), INADDR_LOOPBACK);
+    CHECK_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), short_backend.port);
+    CHECK_EQ(ntohs(resources.cfg.upstreams[1].addrs[0].sin_port), long_backend.port);
+    CHECK(resources.cfg.failure_policies[1].reason.eq({"Short Response Deadline", 23u}));
+    CHECK(resources.cfg.failure_policies[1].server.eq({"short-timeout", 13u}));
+    CHECK(resources.cfg.failure_policies[1].body.eq({"short deadline\n", 15u}));
+    CHECK(resources.cfg.failure_policies[3].reason.eq({"Long Response Deadline", 22u}));
+    CHECK(resources.cfg.failure_policies[3].server.eq({"long-timeout", 12u}));
+    CHECK(resources.cfg.failure_policies[3].body.eq({"long deadline\n", 14u}));
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_EQ(IoUringEventLoop::kDefaultUpstreamTimeout, 30u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } short_client{connect_to(port)}, long_client{connect_to(port)};
+    REQUIRE_GE(short_client.fd, 0);
+    REQUIRE_GE(long_client.fd, 0);
+    set_socket_timeouts(short_client.fd, 7);
+    set_socket_timeouts(long_client.fd, 7);
+    static constexpr char kShortRequest[] =
+        "HEAD /short-deadline?case=one HTTP/1.1\r\n"
+        "Host: client.example\r\nX-Timeout-Case: short\r\n\r\n";
+    static constexpr char kLongRequest[] =
+        "HEAD /long-deadline?case=three HTTP/1.1\r\n"
+        "Host: client.example\r\nX-Timeout-Case: long\r\n\r\n";
+    REQUIRE(send_all(short_client.fd, kShortRequest, sizeof(kShortRequest) - 1u));
+    REQUIRE(send_all(long_client.fd, kLongRequest, sizeof(kLongRequest) - 1u));
+    for (u32 waited = 0;
+         waited < 600 &&
+         (!short_backend.first_response_stalled_open.load(std::memory_order_acquire) ||
+          !long_backend.first_response_stalled_open.load(std::memory_order_acquire) ||
+          short_backend.request_count.load(std::memory_order_acquire) != 1u ||
+          long_backend.request_count.load(std::memory_order_acquire) != 1u);
+         waited++)
+        usleep(5000);
+    REQUIRE(short_backend.first_response_stalled_open.load(std::memory_order_acquire));
+    REQUIRE(long_backend.first_response_stalled_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(short_backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(long_backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(short_backend.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(long_backend.request_count.load(std::memory_order_acquire), 1u);
+    const u64 short_request_complete_ns =
+        short_backend.request_recorded_ns[0].load(std::memory_order_acquire);
+    const u64 long_request_complete_ns =
+        long_backend.request_recorded_ns[0].load(std::memory_order_acquire);
+    REQUIRE_NE(short_request_complete_ns, 0u);
+    REQUIRE_NE(long_request_complete_ns, 0u);
+
+    auto monotonic_ns = []() -> u64 {
+        struct timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+        return static_cast<u64>(now.tv_sec) * 1000000000ull + static_cast<u64>(now.tv_nsec);
+    };
+    char short_response[512]{};
+    char long_response[512]{};
+    u32 short_response_len = 0;
+    u32 long_response_len = 0;
+    REQUIRE(read_public_head_response(
+        short_client.fd, false, short_response, sizeof(short_response), short_response_len, 5000));
+    const u64 short_response_complete_ns = monotonic_ns();
+    REQUIRE_NE(short_response_complete_ns, 0u);
+    REQUIRE(normalize_public_date(short_response, short_response_len));
+    REQUIRE_EQ(short_response_len, static_cast<u32>(strlen(kShortExpected)));
+    CHECK_EQ(memcmp(short_response, kShortExpected, short_response_len), 0);
+
+    // The three-second bundle must still be quiet after the one-second bundle
+    // has completed; a process-global or collapsed one-second timeout fails here.
+    char premature[64]{};
+    REQUIRE_EQ(recv_timeout(short_client.fd, premature, sizeof(premature), 150), -EAGAIN);
+    memset(premature, 0, sizeof(premature));
+    REQUIRE_EQ(recv_timeout(long_client.fd, premature, sizeof(premature), 150), -EAGAIN);
+    REQUIRE(read_public_head_response(
+        long_client.fd, false, long_response, sizeof(long_response), long_response_len, 6000));
+    const u64 long_response_complete_ns = monotonic_ns();
+    REQUIRE_NE(long_response_complete_ns, 0u);
+    REQUIRE(normalize_public_date(long_response, long_response_len));
+    REQUIRE_EQ(long_response_len, static_cast<u32>(strlen(kLongExpected)));
+    CHECK_EQ(memcmp(long_response, kLongExpected, long_response_len), 0);
+    memset(premature, 0, sizeof(premature));
+    REQUIRE_EQ(recv_timeout(short_client.fd, premature, sizeof(premature), 100), -EAGAIN);
+    memset(premature, 0, sizeof(premature));
+    REQUIRE_EQ(recv_timeout(long_client.fd, premature, sizeof(premature), 100), -EAGAIN);
+
+    REQUIRE_GT(short_response_complete_ns, short_request_complete_ns);
+    REQUIRE_GT(long_response_complete_ns, long_request_complete_ns);
+    const double short_elapsed =
+        static_cast<double>(short_response_complete_ns - short_request_complete_ns) / 1e9;
+    const double long_elapsed =
+        static_cast<double>(long_response_complete_ns - long_request_complete_ns) / 1e9;
+    const double completion_separation =
+        static_cast<double>(long_response_complete_ns - short_response_complete_ns) / 1e9;
+    CHECK_GT(short_elapsed, 0.50);
+    CHECK_LT(short_elapsed, 2.75);
+    CHECK_GT(long_elapsed, 2.50);
+    CHECK_LT(long_elapsed, 4.75);
+    CHECK_GT(completion_separation, 1.25);
+
+    for (u32 waited = 0;
+         waited < 600 &&
+         (!short_backend.first_peer_closed.load(std::memory_order_acquire) ||
+          !long_backend.first_peer_closed.load(std::memory_order_acquire)) &&
+         !short_backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !long_backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !short_backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !long_backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !short_backend.first_peer_observation_aborted.load(std::memory_order_acquire) &&
+         !long_backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(short_backend.first_peer_closed.load(std::memory_order_acquire));
+    REQUIRE(long_backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(short_backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(long_backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(short_backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(long_backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(short_backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    CHECK_FALSE(long_backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    CHECK_EQ(short_backend.response_application_write_count[0].load(std::memory_order_acquire), 0u);
+    CHECK_EQ(long_backend.response_application_write_count[0].load(std::memory_order_acquire), 0u);
+    CHECK_GT(short_backend.first_peer_closed_ns.load(std::memory_order_acquire),
+             short_request_complete_ns);
+    CHECK_GT(long_backend.first_peer_closed_ns.load(std::memory_order_acquire),
+             long_request_complete_ns);
+    usleep(100000);
+    CHECK_EQ(short_backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(long_backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(short_backend.request_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(long_backend.request_count.load(std::memory_order_acquire), 1u);
+
+    close(short_client.fd);
+    short_client.fd = -1;
+    close(long_client.fd);
+    long_client.fd = -1;
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    short_backend.teardown();
+    long_backend.teardown();
+    REQUIRE_FALSE(short_backend.thread_alive.load(std::memory_order_acquire));
+    REQUIRE_FALSE(long_backend.thread_alive.load(std::memory_order_acquire));
+    REQUIRE_FALSE(short_backend.listener_failed.load(std::memory_order_acquire));
+    REQUIRE_FALSE(long_backend.listener_failed.load(std::memory_order_acquire));
+
+    char expected_request[256]{};
+    int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /short-deadline?case=one HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Timeout-Case: short\r\n\r\n",
+                 short_backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(short_backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(short_backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(short_backend.request_history[0], expected_request, expected_request_len), 0);
+    CHECK_EQ(short_backend.request_body_len, 0u);
+    memset(expected_request, 0, sizeof(expected_request));
+    expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /long-deadline?case=three HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Timeout-Case: long\r\n\r\n",
+                 long_backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(long_backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(long_backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(long_backend.request_history[0], expected_request, expected_request_len), 0);
+    CHECK_EQ(long_backend.request_body_len, 0u);
+    for (u32 slot = 1; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(short_backend.request_history_len[slot], 0u);
+        CHECK_EQ(short_backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(long_backend.request_history_len[slot], 0u);
+        CHECK_EQ(long_backend.request_history_header_len[slot], 0u);
+    }
 }
 
 TEST(route, public_ordinary_source_get_cl0_response_deadline_reuses_downstream_iouring) {
