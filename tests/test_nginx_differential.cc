@@ -51568,17 +51568,22 @@ static bool run_converter_default_buffering_positive_get_differential(
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            if (!frontends_live() || !origins_live()) return false;
+            if (!frontends_live() || !origins_live() ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error))
+                return false;
             bool complete = true;
             for (const auto& origin : origins) {
-                if (origin.accepted.load(std::memory_order_acquire) != 1u ||
-                    origin.requests.load(std::memory_order_acquire) != 1u ||
+                const u32 accepted = origin.accepted.load(std::memory_order_acquire);
+                const u32 requests = origin.requests.load(std::memory_order_acquire);
+                const u32 fragments =
+                    origin.response_fragments_sent.load(std::memory_order_acquire);
+                if (accepted > 1u || requests > 1u ||
                     origin.response_send_failed.load(std::memory_order_acquire) ||
                     origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
-                    origin.response_fragments_sent.load(std::memory_order_acquire) > expected)
+                    fragments > expected)
                     return false;
-                complete &=
-                    origin.response_fragments_sent.load(std::memory_order_acquire) == expected;
+                complete &= accepted == 1u && requests == 1u && fragments == expected;
             }
             if (complete) return true;
             usleep(1000);
