@@ -51439,15 +51439,20 @@ static bool run_converter_default_buffering_positive_get_differential(
         make_positive_get_default_profile(ports[0], ports[1], temps[0].nginx_access_log);
     const std::string rut_profile =
         make_positive_get_default_profile(ports[2], ports[3], temps[1].rut_access_log);
+    const std::string nginx_config = "events {}\n" + nginx_profile;
     if (!validate_positive_get_default_profile(
             nginx_profile, ports[0], ports[1], temps[0].nginx_access_log, error) ||
         !validate_positive_get_default_profile(
-            rut_profile, ports[2], ports[3], temps[1].rut_access_log, error))
+            rut_profile, ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty()) error = "#271 pinned nginx wrapper lost its one events block";
         return false;
+    }
     std::string generated_source;
     if (!build_positive_get_default_generated_source(
             rut_profile, ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
-        !write_file(temps[0].nginx_config, nginx_profile.data(), nginx_profile.size()) ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
         !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
         if (error.empty()) error = "#271 positive-GET differential could not persist inputs";
         return false;
@@ -51487,8 +51492,9 @@ static bool run_converter_default_buffering_positive_get_differential(
     DockerGuard docker(container_name);
     ChildGuard frontends[2];
     if (!handoff_held_loopback_port(
-            &reservations.fds[0], ports[0], "#271 pinned nginx bind", error) ||
-        !spawn_child({"docker",
+            &reservations.fds[0], ports[0], "#271 pinned nginx bind", error))
+        return false;
+    if (!spawn_child({"docker",
                       "run",
                       "--pull=never",
                       "--network",
@@ -51502,17 +51508,31 @@ static bool run_converter_default_buffering_positive_get_differential(
                       "-c",
                       temps[0].nginx_config,
                       "-g",
-                      "events {}; daemon off;"},
+                      "daemon off;"},
                      temps[0].nginx_log,
-                     frontends[0].child) ||
-        !wait_ready(ports[0], frontends[0].child, error) ||
-        !handoff_held_loopback_port(
-            &reservations.fds[2], ports[2], "#271 generated RUT bind", error) ||
-        !spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     frontends[0].child)) {
+        error = "#271 could not spawn pinned nginx frontend";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = "#271 pinned nginx readiness failed: " + error;
+        dump_log(temps[0].nginx_config, "#271 pinned nginx config");
+        dump_log(temps[0].nginx_log, "#271 pinned nginx log");
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#271 generated RUT bind", error))
+        return false;
+    if (!spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
                      temps[1].rut_log,
-                     frontends[1].child) ||
-        !wait_ready(ports[2], frontends[1].child, error)) {
-        if (error.empty()) error = "#271 positive-GET frontends failed before paired readiness";
+                     frontends[1].child)) {
+        error = "#271 could not spawn generated RUT frontend";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = "#271 generated RUT readiness failed: " + error;
+        dump_log(temps[1].source, "#271 generated RUT source");
+        dump_log(temps[1].rut_log, "#271 generated RUT log");
         return false;
     }
     const auto frontends_live = [&]() {
