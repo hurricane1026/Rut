@@ -1202,9 +1202,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
         const ResponseReadDeadlineProfile profile = classify_response_read_deadline_profile(
             conn, response, failure, timeout, bundle.response_buffering);
-        const bool fixed_upload =
-            profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
         const bool preflight_downstream_close =
             complete_buffering &&
             profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1240,8 +1238,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
                conn.req_client_connection_close_exact && conn.req_client_connection_count == 1)) ||
             (complete_buffering &&
              ((profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-               profile !=
-                   ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) ||
+               !response_read_deadline_profile_is_fixed_upload(profile)) ||
               !response_read_deadline_non_head_method_admitted(conn.req_method) ||
               !complete_content_length_route_method_is_admitted(route->method) ||
               !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
@@ -2489,8 +2486,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const bool fixed_upload =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
-        conn.response_read_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
     if (ev.result <= 0 || !conn.request_policy_body_pending ||
         conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining == 0) {
         loop->close_conn(conn);
@@ -3393,8 +3389,7 @@ void handle_jit_outcome(Loop* loop,
                         forward_response_buffering);
                 }
                 const bool fixed_upload =
-                    outcome_profile ==
-                    ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+                    response_read_deadline_profile_is_fixed_upload(outcome_profile);
                 const auto& deadline_proof = conn.response_read_deadline_upload;
                 const bool coalesced_get =
                     outcome_profile ==
@@ -3797,8 +3792,8 @@ void handle_jit_outcome(Loop* loop,
                     proof.rewritten_total_length = conn.req_initial_send_len;
                     proof.expected_upload_length = conn.req_initial_send_len;
                 }
-                if (conn.response_read_deadline_profile ==
-                    ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
+                if (response_read_deadline_profile_is_fixed_upload(
+                        conn.response_read_deadline_profile)) {
                     ResponseReadDeadlineFixedUploadRequest rewritten{};
                     auto& proof = conn.response_read_deadline_upload;
                     if (!inspect_response_read_deadline_fixed_upload_request(
@@ -4178,7 +4173,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         const ResponseReadDeadlineProfile profile =
             explicit_deadline_expiry ? conn.response_read_deadline_profile
                                      : ResponseReadDeadlineProfile::HeaderOnlyHead;
-        const bool suppress_body = profile == ResponseReadDeadlineProfile::HeaderOnlyHead;
+        const bool suppress_body = response_read_deadline_profile_suppresses_head(profile);
         const bool profile_modes_match =
             suppress_body
                 ? response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
@@ -4186,8 +4181,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                       timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
                       conn.response_policy_suppress_body && conn.failure_policy_suppress_body
                 : (profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-                   profile == ResponseReadDeadlineProfile::
-                                  FixedContentLengthUploadNonHeadContentLengthZero) &&
+                   response_read_deadline_profile_is_fixed_upload(profile)) &&
                       response.head_mode == ResponsePolicyHeadMode::Reject &&
                       failure.head_mode == FailurePolicyHeadMode::Reject &&
                       timeout.head_mode == FailurePolicyHeadMode::Reject &&
@@ -4205,9 +4199,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         // The original request bytes were removed after the complete upload, so
         // use the pinned admission latch plus captured request facts instead of
         // re-running response_policy_suppress_head_admitted against recv_buf.
-        const bool fixed_upload =
-            profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
         const bool pipeline_generation_stable =
             ordinary_zero_progress || http1_pipeline_request_generation_upload_active_is_stable(
                                           conn,
@@ -4218,7 +4210,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                                           conn.response_read_deadline_route_method);
         if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-            ((profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            ((response_read_deadline_profile_suppresses_head(profile) &&
               conn.req_method != static_cast<u8>(LogHttpMethod::Head)) ||
              (profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
               (!response_read_deadline_non_head_method_admitted(conn.req_method) ||
@@ -5221,8 +5213,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
         if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
     }
-    if (conn.response_read_deadline_profile ==
-        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
+    if (response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile)) {
         auto& proof = conn.response_read_deadline_upload;
         proof.upload_episode = conn.upstream_episode;
         if (conn.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
@@ -5287,8 +5278,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const bool fixed_upload =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
-        conn.response_read_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
     const bool coalesced_get =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         conn.response_read_deadline_profile ==
@@ -8285,12 +8275,11 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         const bool complete_buffering = conn.response_read_deadline_buffering ==
                                         ForwardResponseBufferingMode::CompleteContentLength;
         const bool fixed_upload =
-            conn.response_read_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+            response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
         if (!response_read_deadline_persistence_owner_is_stable(conn,
                                                                 conn.response_read_deadline_upload))
             return false;
-        if (conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead) {
+        if (response_read_deadline_profile_suppresses_head(conn.response_read_deadline_profile)) {
             if (conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
                 conn.req_client_has_content_length || conn.req_body_mode != BodyMode::None ||
                 conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
@@ -9308,8 +9297,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         if ((explicit_first_batch || explicit_progress_batch) &&
             (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-             explicit_profile ==
-                 ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero)) {
+             response_read_deadline_profile_is_fixed_upload(explicit_profile))) {
             loop->close_conn(conn);
             return;
         }
@@ -9335,11 +9323,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     if ((explicit_first_batch || explicit_progress_batch) &&
         (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-         explicit_profile ==
-             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero)) {
-        const bool fixed_upload =
-            explicit_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+         response_read_deadline_profile_is_fixed_upload(explicit_profile))) {
+        const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(explicit_profile);
         const RouteConfig* config = conn.request_config;
         const bool pipeline_generation_exact =
             http1_pipeline_request_generation_upload_active_is_stable(conn,

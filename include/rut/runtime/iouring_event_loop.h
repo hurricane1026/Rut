@@ -585,8 +585,7 @@ private:
               !complete_content_length_route_method_is_admitted(
                   c.http1_prebuilt_deadline_route_method) ||
               c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||
-              (c.http1_prebuilt_deadline_profile ==
-                   ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero &&
+              (response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile) &&
                !complete_content_length_fixed_upload_materialization_is_stable(
                    c,
                    c.http1_prebuilt_deadline_upload,
@@ -611,8 +610,8 @@ private:
         const auto& failure = c.request_config->failure_policies[c.failure_policy_id - 1];
         const auto& timeout = c.request_config->failure_policies[c.timeout_failure_policy_id - 1];
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead)
-            return c.http1_prebuilt_deadline_profile ==
-                       ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            return response_read_deadline_profile_suppresses_head(
+                       c.http1_prebuilt_deadline_profile) &&
                    c.http1_prebuilt_response_purpose ==
                        Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
                    c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Head) &&
@@ -626,8 +625,7 @@ private:
             Http1PrebuiltResponseLayout::FullContentLengthNonHead)
             return false;
         const bool fixed_upload =
-            c.http1_prebuilt_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+            response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile);
         const bool coalesced_get =
             !fixed_upload && c.http1_prebuilt_deadline_upload.raw_total_length != 0;
         if ((!fixed_upload && c.http1_prebuilt_deadline_profile !=
@@ -1010,8 +1008,7 @@ public:
                                                      u32 request_prefix_len) {
         constexpr u8 kAllowed = kUpstreamOpConnect | kUpstreamOpSend | kUpstreamOpRecv;
         const bool fixed_upload =
-            c.http1_prebuilt_deadline_profile ==
-            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+            response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile);
         const bool explicit_close =
             c.http1_prebuilt_deadline_config != nullptr &&
             c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
