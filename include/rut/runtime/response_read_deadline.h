@@ -43,9 +43,9 @@ inline bool response_read_deadline_fixed_upload_method_admitted(
         case LogHttpMethod::Patch:
             return true;
         case LogHttpMethod::Delete:
+        case LogHttpMethod::Options:
             return buffering == ForwardResponseBufferingMode::CompleteContentLength;
         case LogHttpMethod::Head:
-        case LogHttpMethod::Options:
         case LogHttpMethod::Trace:
         case LogHttpMethod::Connect:
         case LogHttpMethod::Other:
