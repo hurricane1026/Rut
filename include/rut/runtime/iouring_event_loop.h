@@ -592,7 +592,8 @@ private:
                    c.http1_prebuilt_deadline_upload,
                    /*require_upload_complete=*/true,
                    c.http1_prebuilt_deadline_bundle_id,
-                   c.http1_prebuilt_deadline_route_method)) ||
+                   c.http1_prebuilt_deadline_route_method,
+                   bundle.response_buffering)) ||
               (c.http1_prebuilt_deadline_upload.downstream_close &&
                !complete_content_length_explicit_close_request_is_stable(
                    c,
@@ -633,13 +634,14 @@ private:
                                   ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) ||
             (fixed_upload
                  ? !response_read_deadline_fixed_upload_method_admitted(
-                       c.http1_prebuilt_deadline_method) ||
+                       c.http1_prebuilt_deadline_method, bundle.response_buffering) ||
                        !response_read_deadline_fixed_upload_materialization_is_stable(
                            c,
                            c.http1_prebuilt_deadline_upload,
                            /*require_upload_complete=*/true,
                            c.http1_prebuilt_deadline_bundle_id,
                            c.http1_prebuilt_deadline_route_method,
+                           bundle.response_buffering,
                            /*allow_retired_episode=*/true)
                  : !response_read_deadline_non_head_method_admitted(
                        c.http1_prebuilt_deadline_method) ||

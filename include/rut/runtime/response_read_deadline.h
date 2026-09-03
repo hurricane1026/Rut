@@ -33,15 +33,18 @@ inline bool response_read_deadline_non_head_method_admitted(u8 method) {
     return false;
 }
 
-inline bool response_read_deadline_fixed_upload_method_admitted(u8 method) {
+inline bool response_read_deadline_fixed_upload_method_admitted(
+    u8 method, ForwardResponseBufferingMode buffering) {
+    if (!forward_response_buffering_mode_valid(buffering)) return false;
     switch (static_cast<LogHttpMethod>(method)) {
         case LogHttpMethod::Get:
         case LogHttpMethod::Post:
         case LogHttpMethod::Put:
         case LogHttpMethod::Patch:
             return true;
-        case LogHttpMethod::Head:
         case LogHttpMethod::Delete:
+            return buffering == ForwardResponseBufferingMode::CompleteContentLength;
+        case LogHttpMethod::Head:
         case LogHttpMethod::Options:
         case LogHttpMethod::Trace:
         case LogHttpMethod::Connect:
@@ -251,9 +254,12 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     bool require_upload_complete,
     u16 bundle_id,
     u8 route_method,
+    ForwardResponseBufferingMode buffering,
     bool allow_retired_episode = false) {
     const RouteConfig* cfg = c.request_config;
-    if (cfg == nullptr || !response_read_deadline_fixed_upload_method_admitted(c.req_method) ||
+    if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
+        cfg->policy_bundles[bundle_id - 1].response_buffering != buffering ||
+        !response_read_deadline_fixed_upload_method_admitted(c.req_method, buffering) ||
         proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
         proof.route_index >= cfg->route_count || proof.upstream_id >= cfg->upstream_count ||
         proof.request_policy_id == 0 || !request_policy_is_supported(proof.request_policy_id) ||
@@ -297,7 +303,8 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
         proof,
         require_upload_complete,
         c.response_read_deadline_bundle_id,
-        c.response_read_deadline_route_method);
+        c.response_read_deadline_route_method,
+        c.response_read_deadline_buffering);
 }
 
 inline bool response_read_deadline_fixed_upload_proof_is_stable(
@@ -315,13 +322,15 @@ inline bool complete_content_length_fixed_upload_materialization_is_stable(
     bool require_upload_complete,
     u16 bundle_id,
     u8 route_method,
+    ForwardResponseBufferingMode buffering,
     bool retired_episode = false) {
-    if (c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+    if (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
         proof.request_policy_id != c.request_policy_id ||
         !complete_content_length_route_method_is_admitted(route_method) ||
         !response_read_deadline_route_method_matches(c.req_method, route_method) ||
         !response_read_deadline_fixed_upload_materialization_is_stable(
-            c, proof, require_upload_complete, bundle_id, route_method, retired_episode))
+            c, proof, require_upload_complete, bundle_id, route_method, buffering, retired_episode))
         return false;
     return retired_episode ? proof.upload_episode == c.upstream_retiring_episode
                            : proof.upload_episode == c.upstream_episode;
@@ -339,7 +348,13 @@ inline bool complete_content_length_fixed_upload_composition_is_stable(
            c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero &&
            complete_content_length_fixed_upload_materialization_is_stable(
-               c, proof, require_upload_complete, bundle_id, route_method, retired_episode);
+               c,
+               proof,
+               require_upload_complete,
+               bundle_id,
+               route_method,
+               c.response_read_deadline_buffering,
+               retired_episode);
 }
 
 inline bool complete_content_length_fixed_upload_composition_is_stable(
