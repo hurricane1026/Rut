@@ -4134,6 +4134,57 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev);
 // non-idempotent side effect can have occurred.
 inline constexpr u32 kMaxConnectAttempts = 3;
 
+inline bool fixed_upload_head_timeout_response_is_stable(const Connection& conn,
+                                                         const ForwardFailurePolicySpec& policy,
+                                                         const u8* response,
+                                                         u32 response_len) {
+    if (response == nullptr || response_len == 0) return false;
+    HttpResponseParser parser;
+    ParsedResponse parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(response, response_len, &parsed) != ParseStatus::Complete ||
+        parser.header_end != response_len || parsed.version != HttpVersion::Http11 ||
+        parsed.status_code != policy.status_code || parsed.reason.len != policy.reason.len ||
+        (policy.reason.len != 0 &&
+         __builtin_memcmp(parsed.reason.ptr, policy.reason.ptr, policy.reason.len) != 0) ||
+        parsed.content_length_count != 1 || parsed.content_length != policy.body.len ||
+        parsed.chunked || parsed.headers_truncated)
+        return false;
+
+    u32 server_count = 0;
+    u32 date_count = 0;
+    u32 content_type_count = 0;
+    u32 connection_count = 0;
+    for (u32 i = 0; i < parsed.header_count; ++i) {
+        const Header& header = parsed.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "server", 6)) {
+            ++server_count;
+            if (header.value.len != policy.server.len ||
+                (policy.server.len != 0 &&
+                 __builtin_memcmp(header.value.ptr, policy.server.ptr, policy.server.len) != 0))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "date", 4)) {
+            ++date_count;
+            if (header.value.len != 29) return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12)) {
+            ++content_type_count;
+            if (header.value.len != policy.content_type.len ||
+                (policy.content_type.len != 0 &&
+                 __builtin_memcmp(
+                     header.value.ptr, policy.content_type.ptr, policy.content_type.len) != 0))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
+            ++connection_count;
+            if (header.value.len != 10 || __builtin_memcmp(header.value.ptr, "keep-alive", 10) != 0)
+                return false;
+        }
+    }
+    return server_count == 1 && date_count == 1 && content_type_count == 1 &&
+           connection_count == 1 && parsed.keep_alive && !parsed.connection_close &&
+           conn.keep_alive && conn.req_client_keep_alive;
+}
+
 // On a failed upstream connect, try the next backend (round-robin) if the retry
 // budget isn't exhausted. Closes the dead fd, opens a fresh socket, and submits
 // a new connect routed back to on_upstream_connected. Returns true if a retry
@@ -4226,6 +4277,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         const ResponseReadDeadlineProfile profile =
             explicit_deadline_expiry ? conn.response_read_deadline_profile
                                      : ResponseReadDeadlineProfile::HeaderOnlyHead;
+        const bool fixed_upload_head =
+            profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
         const bool suppress_body = response_read_deadline_profile_suppresses_head(profile);
         const bool profile_modes_match =
             suppress_body
@@ -4271,11 +4324,12 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                !response_read_deadline_route_method_matches(
                    conn.response_read_deadline_method,
                    conn.response_read_deadline_route_method))) ||
-             (fixed_upload && (!response_read_deadline_fixed_upload_method_admitted(
-                                   conn.req_method, conn.response_read_deadline_buffering) ||
-                               conn.response_read_deadline_method != conn.req_method ||
-                               !response_read_deadline_fixed_upload_proof_is_stable(
-                                   conn, conn.response_read_deadline_upload)))) ||
+             (fixed_upload &&
+              (!response_read_deadline_fixed_upload_profile_method_admitted(
+                   profile, conn.req_method, conn.response_read_deadline_buffering) ||
+               conn.response_read_deadline_method != conn.req_method ||
+               !response_read_deadline_fixed_upload_proof_is_stable(
+                   conn, conn.response_read_deadline_upload)))) ||
             !conn.keep_alive ||
             !response_read_deadline_persistence_owner_is_stable(
                 conn, conn.response_read_deadline_upload) ||
@@ -4325,6 +4379,28 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             loop->keepalive_timeout == 0 || loop->keepalive_timeout >= TimerWheel::kSlots)
             return false;
 
+        if (fixed_upload_head &&
+            !fixed_upload_head_success_proof_is_stable(conn,
+                                                       conn.response_read_deadline_upload,
+                                                       config,
+                                                       conn.response_read_deadline_bundle_id,
+                                                       profile,
+                                                       conn.response_read_deadline_buffering,
+                                                       conn.response_read_deadline_method,
+                                                       conn.response_read_deadline_route_method))
+            return false;
+
+        if (retained_positive_progress) {
+            HttpResponseParser origin_parser;
+            ParsedResponse origin_response;
+            origin_parser.reset();
+            origin_response.reset();
+            if (origin_parser.parse(conn.upstream_recv_buf.data(),
+                                    conn.upstream_recv_buf.len(),
+                                    &origin_response) != ParseStatus::Incomplete)
+                return false;
+        }
+
         if (conn.upstream_idx >= config->upstream_count) return false;
         const auto& target = config->upstreams[conn.upstream_idx];
         const bool exact_slot =
@@ -4348,11 +4424,19 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                 ParseStatus::Complete ||
             timeout_response.version != HttpVersion::Http11 ||
             timeout_response.status_code != timeout.status_code ||
-            timeout_response.content_length_count != 1 || timeout_response.chunked ||
-            timeout_parser.header_end > response_len ||
+            timeout_response.reason.len != timeout.reason.len ||
+            (timeout.reason.len != 0 &&
+             __builtin_memcmp(
+                 timeout_response.reason.ptr, timeout.reason.ptr, timeout.reason.len) != 0) ||
+            timeout_response.content_length_count != 1 ||
+            timeout_response.content_length != timeout.body.len || timeout_response.chunked ||
+            timeout_response.headers_truncated || timeout_parser.header_end > response_len ||
             (suppress_body
                  ? timeout_parser.header_end != response_len
                  : timeout_response.content_length != response_len - timeout_parser.header_end))
+            return false;
+        if (fixed_upload_head &&
+            !fixed_upload_head_timeout_response_is_stable(conn, timeout, scratch, response_len))
             return false;
 
         // Capture the complete immutable response owner before removing the
@@ -4373,7 +4457,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
             conn.http1_prebuilt_header_end = timeout_parser.header_end;
             conn.http1_prebuilt_total_len = response_len;
-            conn.http1_prebuilt_body_len = response_len - timeout_parser.header_end;
+            conn.http1_prebuilt_body_len =
+                fixed_upload_head ? timeout.body.len : response_len - timeout_parser.header_end;
             conn.http1_prebuilt_status = timeout.status_code;
         }
 

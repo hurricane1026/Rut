@@ -37938,6 +37938,576 @@ bool stage_unreachable_fixed_upload_head_prebuilt_candidate(IoUringEventLoop* lo
     return true;
 }
 
+bool expire_unreachable_fixed_upload_head_timeout(
+    IoUringEventLoop* loop,
+    PrebuiltD2Fixture& fixture,
+    const u8* incomplete,
+    u32 incomplete_len,
+    ResponseReadDeadlineUploadProof* upload = nullptr) {
+    if (loop == nullptr || fixture.conn == nullptr ||
+        (incomplete == nullptr) != (incomplete_len == 0))
+        return false;
+    Connection& conn = *fixture.conn;
+    if (!complete_unreachable_fixed_upload_head_and_arm(loop, fixture)) return false;
+    if (upload != nullptr) *upload = conn.response_read_deadline_upload;
+    if (incomplete_len != 0) {
+        if (conn.upstream_recv_buf.write(incomplete, incomplete_len) != incomplete_len)
+            return false;
+        const IoEvent progress =
+            response_read_copy_event(conn, incomplete_len, true, 0, incomplete_len);
+        loop->dispatch_batch(&progress, 1);
+        if (conn.fd < 0 || conn.response_read_deadline_state != ResponseReadDeadlineState::Armed ||
+            conn.response_read_deadline_progress_generation !=
+                conn.response_read_deadline_generation ||
+            conn.response_read_deadline_progress_episode != conn.upstream_episode ||
+            conn.response_read_deadline_progress_bytes != incomplete_len ||
+            conn.upstream_start_us != 0)
+            return false;
+    }
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    return try_prebuilt_strict_read_timeout(loop, conn);
+}
+
+bool stage_unreachable_fixed_upload_head_timeout_candidate(IoUringEventLoop* loop,
+                                                           RouteConfig& config,
+                                                           PrebuiltD2Fixture* out) {
+    if (out == nullptr ||
+        !stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, out) ||
+        !complete_unreachable_fixed_upload_head_and_arm(loop, *out))
+        return false;
+    Connection& conn = *out->conn;
+    u8 scratch[SlicePool::kSliceSize]{};
+    u32 response_len = 0;
+    if (!build_timeout_failure_policy_response(
+            conn, config, true, scratch, sizeof(scratch), &response_len))
+        return false;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    if (parser.parse(scratch, response_len, &response) != ParseStatus::Complete ||
+        parser.header_end != response_len || response.content_length != 7u)
+        return false;
+    conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::HeaderOnlyHead;
+    conn.http1_prebuilt_response_purpose = Http1PrebuiltResponsePurpose::ResponseReadTimeout;
+    conn.http1_prebuilt_deadline_profile = conn.response_read_deadline_profile;
+    conn.http1_prebuilt_deadline_method = conn.response_read_deadline_method;
+    conn.http1_prebuilt_deadline_route_method = conn.response_read_deadline_route_method;
+    conn.http1_prebuilt_deadline_generation = conn.response_read_deadline_generation;
+    conn.http1_prebuilt_deadline_bundle_id = conn.response_read_deadline_bundle_id;
+    conn.http1_prebuilt_deadline_config = &config;
+    conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
+    conn.http1_prebuilt_header_end = parser.header_end;
+    conn.http1_prebuilt_total_len = parser.header_end;
+    conn.http1_prebuilt_body_len = 7;
+    conn.http1_prebuilt_status = config.failure_policies[1].status_code;
+    loop->disarm_response_read_deadline(conn);
+    conn.response_header_buf.reset();
+    if (conn.response_header_buf.write(scratch, response_len) != response_len) return false;
+    conn.resp_status = config.failure_policies[1].status_code;
+    conn.resp_body_mode = BodyMode::None;
+    conn.resp_body_remaining = 0;
+    conn.resp_body_sent = 0;
+    conn.upstream_send_len = 0;
+    return true;
+}
+
+TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
+     exact_and_any_zero_or_incomplete_expiry_publish_header_only_after_both_d2_orders) {
+    static constexpr u8 kIncomplete[] = "HTTP/1.1 200 OK\r\nContent-Len";
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: successor.example\r\nConnection: close\r\n\r\n";
+    const std::string expected =
+        "HTTP/1.1 504 Gateway Time-out\r\nServer: rut-timeout-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 7\r\nConnection: keep-alive\r\n\r\n";
+    for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
+        for (const bool retained_prefix : {false, true}) {
+            for (const bool retirement_first : {false, true}) {
+                ScopedBackendHealthReset health_reset{};
+                ScopedIoUringLoopForRetirement guard;
+                if (!guard.init()) SKIP("io_uring unavailable");
+                auto* loop = guard.loop;
+                RouteConfig pinned{};
+                PrebuiltD2Fixture fixture{};
+                REQUIRE(
+                    stage_unreachable_fixed_upload_head_wait(loop, pinned, route_method, &fixture));
+                REQUIRE(pinned.add_static("/two", kRouteMethodGet, 204));
+                RouteConfig replacement{};
+                REQUIRE(replacement.add_upstream("replacement", 0x7F000001, 9001).has_value());
+                REQUIRE(add_response_read_deadline_bundle(replacement));
+                REQUIRE(replacement.add_jit_handler(
+                    "/one", route_method, &response_read_deadline_fixed_upload_handler, false, 2));
+                REQUIRE(replacement.add_static("/two", kRouteMethodGet, 205));
+                replacement.failure_policies[1].status_code = 598;
+                replacement.failure_policies[1].reason = {"Replacement", 11};
+                replacement.failure_policies[1].body = {"replacement", 11};
+                fixture.active_config = &replacement;
+                Connection& conn = *fixture.conn;
+                const u32 id = conn.id;
+                BackendHealth* health = backend_health(0, 0);
+                REQUIRE(health != nullptr);
+                ResponseReadDeadlineUploadProof upload_proof_before{};
+                const u32 generation = conn.response_read_deadline_generation;
+                REQUIRE(expire_unreachable_fixed_upload_head_timeout(
+                    loop,
+                    fixture,
+                    retained_prefix ? kIncomplete : nullptr,
+                    retained_prefix ? sizeof(kIncomplete) - 1u : 0u,
+                    &upload_proof_before));
+
+                REQUIRE_GE(conn.fd, 0);
+                CHECK_EQ(conn.request_config, &pinned);
+                CHECK_EQ(conn.resp_status, 504u);
+                CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+                CHECK_EQ(conn.resp_body_remaining, 0u);
+                CHECK_EQ(conn.http1_prebuilt_response_layout,
+                         Http1PrebuiltResponseLayout::HeaderOnlyHead);
+                CHECK_EQ(conn.http1_prebuilt_response_purpose,
+                         Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+                CHECK_EQ(conn.http1_prebuilt_deadline_profile,
+                         ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
+                CHECK_EQ(conn.http1_prebuilt_deadline_generation, generation);
+                CHECK_EQ(conn.http1_prebuilt_deadline_config, &pinned);
+                CHECK(response_read_deadline_upload_proof_equal(conn.http1_prebuilt_deadline_upload,
+                                                                upload_proof_before));
+                CHECK(conn.response_read_deadline_upload.owner_is_neutral());
+                CHECK_EQ(conn.http1_prebuilt_header_end, conn.response_header_buf.len());
+                CHECK_EQ(conn.http1_prebuilt_total_len, conn.http1_prebuilt_header_end);
+                CHECK_EQ(conn.http1_prebuilt_body_len, 7u);
+                CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+                CHECK_EQ(conn.upstream_retiring_episode,
+                         conn.http1_prebuilt_deadline_upload.upload_episode);
+                CHECK_NE(conn.upstream_episode, conn.upstream_retiring_episode);
+                CHECK(conn.upstream_retirement_active);
+                CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+                CHECK_EQ(health->fails, 0u);
+                REQUIRE(conn.send_armed);
+                u8 normalized[SlicePool::kSliceSize]{};
+                REQUIRE_LE(conn.response_header_buf.len(), sizeof(normalized));
+                __builtin_memcpy(
+                    normalized, conn.response_header_buf.data(), conn.response_header_buf.len());
+                REQUIRE(normalize_redirect_date(normalized, conn.response_header_buf.len()));
+                REQUIRE_EQ(conn.response_header_buf.len(), static_cast<u32>(expected.size()));
+                CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+                u8 downstream_byte = 0;
+                errno = 0;
+                CHECK_EQ(recv(fixture.peer_fd, &downstream_byte, 1, MSG_DONTWAIT), -1);
+                CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+                IoEvent late{conn.id,
+                             1,
+                             0,
+                             0,
+                             IoEventType::UpstreamRecv,
+                             1,
+                             0,
+                             conn.upstream_retiring_episode};
+                late.copy_witness = IoEventCopyWitness::Full;
+                late.copy_deadline_generation = conn.http1_prebuilt_deadline_generation;
+                late.copy_deadline_profile = static_cast<u8>(conn.http1_prebuilt_deadline_profile);
+                late.copy_deadline_method = conn.http1_prebuilt_deadline_method;
+                late.copy_begin = 0;
+                late.copy_end = 1;
+                if (retirement_first) {
+                    drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+                    CHECK_FALSE(conn.http1_boundary_ready);
+                    complete_prebuilt_d2_header(loop, conn);
+                } else {
+                    complete_prebuilt_d2_header(loop, conn);
+                    CHECK_FALSE(conn.http1_boundary_ready);
+                    drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+                }
+                REQUIRE(conn.http1_boundary_ready);
+                const u32 pending_before_late = conn.pending_ops;
+                loop->dispatch(late);
+                CHECK_EQ(conn.pending_ops, pending_before_late);
+                CHECK_EQ(health->fails, 0u);
+                loop->resume_deferred_http1_boundaries();
+                REQUIRE_GE(conn.fd, 0);
+                REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+                REQUIRE(conn.recv_armed);
+
+                REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                           sizeof(kSuccessor) - 1u);
+                loop->dispatch(
+                    {id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+                CHECK_EQ(conn.resp_status, 205u);
+                CHECK(conn.send_armed);
+                CHECK_EQ(health->fails, 0u);
+                CHECK_NE(upload_proof_before.raw_total_length, 0u);
+                cleanup_prebuilt_d2(loop, fixture);
+            }
+        }
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
+     same_batch_incomplete_progress_refreshes_before_later_silent_expiry) {
+    static constexpr u8 kIncomplete[] = "HTTP/1.1 200 OK\r\nX-Origin: progress";
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
+    REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+               sizeof(kIncomplete) - 1u);
+    loop->timer.remove(&conn);
+    loop->timer.add(&conn, 0);
+    const IoEvent events[] = {
+        {0, 1, 0, 0, IoEventType::Timeout, 0},
+        response_read_copy_event(conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u),
+    };
+    loop->dispatch_batch(events, 2);
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_deadline_progress_bytes, sizeof(kIncomplete) - 1u);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    CHECK_FALSE(conn.send_armed);
+
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    REQUIRE(try_prebuilt_strict_read_timeout(loop, conn));
+    CHECK_EQ(conn.resp_status, 504u);
+    CHECK_EQ(conn.http1_prebuilt_body_len, 7u);
+    CHECK_EQ(backend_health(0, 0)->fails, 0u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
+     live_expiry_identity_and_policy_mutations_fail_before_effects) {
+    enum class Mutation : u8 {
+        Profile,
+        Buffering,
+        Method,
+        Route,
+        Bundle,
+        Config,
+        ResponsePolicyId,
+        FailurePolicyId,
+        TimeoutPolicyId,
+        ResponsePolicySpec,
+        FailurePolicySpec,
+        TimeoutPolicySpec,
+        RequestPolicy,
+        HandlerGeneration,
+        RouteFunction,
+        Upstream,
+        UploadLength,
+        UploadEpisode,
+        DeadlineGeneration,
+        OwnerGeneration,
+        OwnerEpisode,
+        ProgressGeneration,
+        ProgressEpisode,
+        ProgressBytes,
+        LiveRecvOwner,
+        Retry,
+    };
+    static constexpr u8 kIncomplete[] = "HTTP/1.1 200 OK\r\nContent-Len";
+    for (const Mutation mutation : {Mutation::Profile,
+                                    Mutation::Buffering,
+                                    Mutation::Method,
+                                    Mutation::Route,
+                                    Mutation::Bundle,
+                                    Mutation::Config,
+                                    Mutation::ResponsePolicyId,
+                                    Mutation::FailurePolicyId,
+                                    Mutation::TimeoutPolicyId,
+                                    Mutation::ResponsePolicySpec,
+                                    Mutation::FailurePolicySpec,
+                                    Mutation::TimeoutPolicySpec,
+                                    Mutation::RequestPolicy,
+                                    Mutation::HandlerGeneration,
+                                    Mutation::RouteFunction,
+                                    Mutation::Upstream,
+                                    Mutation::UploadLength,
+                                    Mutation::UploadEpisode,
+                                    Mutation::DeadlineGeneration,
+                                    Mutation::OwnerGeneration,
+                                    Mutation::OwnerEpisode,
+                                    Mutation::ProgressGeneration,
+                                    Mutation::ProgressEpisode,
+                                    Mutation::ProgressBytes,
+                                    Mutation::LiveRecvOwner,
+                                    Mutation::Retry}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
+        REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
+        Connection& conn = *fixture.conn;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+                   sizeof(kIncomplete) - 1u);
+        const IoEvent progress = response_read_copy_event(
+            conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+        loop->dispatch_batch(&progress, 1);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        loop->timer.remove(&conn);
+        conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        RouteConfig other_config{};
+        switch (mutation) {
+            case Mutation::Profile:
+                conn.response_read_deadline_profile = ResponseReadDeadlineProfile::HeaderOnlyHead;
+                break;
+            case Mutation::Buffering:
+                conn.response_read_deadline_buffering =
+                    ForwardResponseBufferingMode::CompleteContentLength;
+                break;
+            case Mutation::Method:
+                conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+                break;
+            case Mutation::Route:
+                conn.response_read_deadline_route_method = kRouteMethodGet;
+                break;
+            case Mutation::Bundle:
+                conn.response_read_deadline_bundle_id = 1;
+                break;
+            case Mutation::Config:
+                conn.request_config = &other_config;
+                break;
+            case Mutation::ResponsePolicyId:
+                conn.response_policy_id = 0;
+                break;
+            case Mutation::FailurePolicyId:
+                conn.failure_policy_id = 0;
+                break;
+            case Mutation::TimeoutPolicyId:
+                conn.timeout_failure_policy_id = 0;
+                break;
+            case Mutation::ResponsePolicySpec:
+                config.response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+                break;
+            case Mutation::FailurePolicySpec:
+                config.failure_policies[0].status_code = 501;
+                break;
+            case Mutation::TimeoutPolicySpec:
+                config.failure_policies[1].head_mode = FailurePolicyHeadMode::Reject;
+                break;
+            case Mutation::RequestPolicy:
+                conn.response_read_deadline_upload.request_policy_id = 0;
+                break;
+            case Mutation::HandlerGeneration:
+                ++conn.response_read_deadline_upload.handler_generation;
+                break;
+            case Mutation::RouteFunction:
+                conn.response_read_deadline_upload.route_fn = nullptr;
+                break;
+            case Mutation::Upstream:
+                ++conn.response_read_deadline_upload.upstream_id;
+                break;
+            case Mutation::UploadLength:
+                --conn.response_read_deadline_upload.expected_upload_length;
+                break;
+            case Mutation::UploadEpisode:
+                ++conn.response_read_deadline_upload.upload_episode;
+                break;
+            case Mutation::DeadlineGeneration:
+                ++conn.response_read_deadline_generation;
+                break;
+            case Mutation::OwnerGeneration:
+                ++conn.response_read_deadline_owner_generation;
+                break;
+            case Mutation::OwnerEpisode:
+                ++conn.response_read_deadline_upstream_episode;
+                break;
+            case Mutation::ProgressGeneration:
+                ++conn.response_read_deadline_progress_generation;
+                break;
+            case Mutation::ProgressEpisode:
+                ++conn.response_read_deadline_progress_episode;
+                break;
+            case Mutation::ProgressBytes:
+                ++conn.response_read_deadline_progress_bytes;
+                break;
+            case Mutation::LiveRecvOwner:
+                conn.on_upstream_recv = nullptr;
+                break;
+            case Mutation::Retry:
+                conn.retry_req_send_len = 1;
+                break;
+        }
+        const i32 upstream_fd = conn.upstream_fd;
+        const u32 episode = conn.upstream_episode;
+        const u32 pending = conn.pending_ops;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        CHECK_FALSE(try_prebuilt_strict_read_timeout(loop, conn));
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.upstream_fd, upstream_fd);
+        CHECK_EQ(conn.upstream_episode, episode);
+        CHECK_EQ(conn.pending_ops, pending);
+        CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kIncomplete) - 1u);
+        CHECK_EQ(conn.response_header_buf.len(), 0u);
+        CHECK_FALSE(conn.send_armed);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        CHECK_EQ(health->fails, 0u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
+     d2_purpose_layout_body_and_custody_forgeries_fail_before_effects) {
+    enum class Forgery : u8 {
+        Purpose,
+        Layout,
+        Status,
+        DeclaredLength,
+        WireContentLength,
+        BodyMode,
+        BodyRemaining,
+        Target,
+        Disposition,
+        Prefix,
+    };
+    for (const Forgery forgery : {Forgery::Purpose,
+                                  Forgery::Layout,
+                                  Forgery::Status,
+                                  Forgery::DeclaredLength,
+                                  Forgery::WireContentLength,
+                                  Forgery::BodyMode,
+                                  Forgery::BodyRemaining,
+                                  Forgery::Target,
+                                  Forgery::Disposition,
+                                  Forgery::Prefix}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_timeout_candidate(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        u8 target = kUpstreamOpRecv;
+        auto disposition = Http1RequestBufferDisposition::ExistingPipeline;
+        u32 prefix = 0;
+        switch (forgery) {
+            case Forgery::Purpose:
+                conn.http1_prebuilt_response_purpose =
+                    Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly;
+                break;
+            case Forgery::Layout:
+                conn.http1_prebuilt_response_layout =
+                    Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+                break;
+            case Forgery::Status:
+                ++conn.http1_prebuilt_status;
+                break;
+            case Forgery::DeclaredLength:
+                ++conn.http1_prebuilt_body_len;
+                break;
+            case Forgery::WireContentLength: {
+                static constexpr char kNeedle[] = "Content-Length: 7";
+                bool changed = false;
+                for (u32 i = 0; i + sizeof(kNeedle) - 1u <= conn.response_header_buf.len(); ++i) {
+                    if (__builtin_memcmp(conn.response_header_buf.data() + i,
+                                         kNeedle,
+                                         sizeof(kNeedle) - 1u) == 0) {
+                        const_cast<u8*>(conn.response_header_buf.data())[i + sizeof(kNeedle) - 2u] =
+                            '8';
+                        changed = true;
+                        break;
+                    }
+                }
+                REQUIRE(changed);
+                break;
+            }
+            case Forgery::BodyMode:
+                conn.resp_body_mode = BodyMode::ContentLength;
+                break;
+            case Forgery::BodyRemaining:
+                conn.resp_body_remaining = 1;
+                break;
+            case Forgery::Target:
+                target = kUpstreamOpSend;
+                break;
+            case Forgery::Disposition:
+                disposition = Http1RequestBufferDisposition::PrefixInRecv;
+                break;
+            case Forgery::Prefix:
+                prefix = 1;
+                break;
+        }
+        const i32 upstream_fd = conn.upstream_fd;
+        const u32 episode = conn.upstream_episode;
+        const u32 pending = conn.pending_ops;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        CHECK_FALSE(loop->begin_prebuilt_http1_response(conn, target, disposition, prefix));
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.upstream_fd, upstream_fd);
+        CHECK_EQ(conn.upstream_episode, episode);
+        CHECK_EQ(conn.pending_ops, pending);
+        CHECK_FALSE(conn.send_armed);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        CHECK_EQ(health->fails, 0u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
+     downstream_send_submission_and_completion_fail_closed_without_health_effect) {
+    for (const bool completion_failure : {false, true}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        u32 origin_episode = 0;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        if (completion_failure) {
+            REQUIRE(expire_unreachable_fixed_upload_head_timeout(loop, fixture, nullptr, 0));
+            REQUIRE(conn.send_armed);
+            origin_episode = conn.upstream_retiring_episode;
+            REQUIRE_EQ(conn.upstream_retiring_episode, origin_episode);
+            loop->dispatch({id, -EPIPE, 0, 0, IoEventType::Send, 0});
+        } else {
+            REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
+            origin_episode = conn.upstream_episode;
+            loop->timer.remove(&conn);
+            conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+            const u32 ring_entries = loop->backend.sq_ring_entries;
+            loop->backend.sq_ring_entries = 0;
+            REQUIRE(try_prebuilt_strict_read_timeout(loop, conn));
+            loop->backend.sq_ring_entries = ring_entries;
+        }
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_FALSE(loop->conns[id].send_armed);
+        CHECK_FALSE(loop->conns[id].http1_boundary_ready);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(health->fails, 0u);
+        CHECK_EQ(loop->conns[id].upstream_retiring_episode, origin_episode);
+        u8 byte = 0;
+        errno = 0;
+        const ssize_t observed = recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT);
+        if (completion_failure)
+            CHECK(observed >= 0 || errno == EAGAIN || errno == EWOULDBLOCK);
+        else
+            CHECK_LE(observed, 0);
+        if (observed < 0) CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
 TEST(response_read_deadline_fixed_upload_head_preconnect_unreachable,
      exact_and_any_three_causes_publish_pinned_header_only_502_and_keepalive_successor) {
     static constexpr FixedUploadHeadPreconnectFailureSite kSites[] = {
