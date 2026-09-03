@@ -275,6 +275,25 @@ static constexpr char kDefaultBufferingCompleteResponseNormalized[] =
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n"
     "abcdefghijkl";
+static constexpr char kPositiveClHeadEarlyRetirementOrigin[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: head-origin\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "Content-Type: application/octet-stream\r\n"
+    "Content-Length: 12\r\n"
+    "X-Origin: head-defaults\r\n"
+    "\r\n"
+    "abc";
+static constexpr char kPositiveClHeadEarlyRetirementResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: application/octet-stream\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: keep-alive\r\n"
+    "X-Origin: head-defaults\r\n"
+    "\r\n";
+static_assert(sizeof(kPositiveClHeadEarlyRetirementResponseNormalized) - 1u == 187u);
 static constexpr char kDefaultBufferingCloseCompleteRequest[] =
     "GET /buffered-close-complete?case=explicit-close HTTP/1.1\r\n"
     "Host: close-client.example\r\n"
@@ -52498,6 +52517,258 @@ static bool run_pinned_positive_cl_options_default_buffering_oracle(
     return true;
 }
 
+static bool run_pinned_positive_cl_head_default_buffering_oracle(
+    TempDir& temp,
+    const std::string& container_name,
+    std::vector<char>& observed_upstream,
+    std::vector<char>& observed_downstream,
+    std::string& error) {
+    u16 frontend_port = 0;
+    u16 backend_port = 0;
+    if (!allocate_port(frontend_port) || !allocate_port(backend_port) ||
+        frontend_port == backend_port) {
+        error = "#268 positive-CL HEAD could not allocate two distinct loopback ports";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    origin.read_exact_content_length_12_body = true;
+    if (!origin.setup(backend_port,
+                      1,
+                      kPositiveClHeadEarlyRetirementOrigin,
+                      sizeof(kPositiveClHeadEarlyRetirementOrigin) - 1u)) {
+        error = "#268 positive-CL HEAD origin setup failed";
+        return false;
+    }
+
+    const std::string config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    const auto occurs_once = [&](const char* needle) {
+        const size_t first = config.find(needle);
+        return first != std::string::npos &&
+               config.find(needle, first + strlen(needle)) == std::string::npos;
+    };
+    if (!occurs_once("server {") || !occurs_once("listen 127.0.0.1:") ||
+        !occurs_once("location / {") || !occurs_once("proxy_pass http://127.0.0.1:") ||
+        !occurs_once("proxy_read_timeout 1s;") ||
+        config.find("proxy_request_buffering") != std::string::npos ||
+        config.find("proxy_buffering") != std::string::npos ||
+        config.find("proxy_http_version") != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "#268 positive-CL HEAD config shape/omission or write check failed";
+        return false;
+    }
+
+    static constexpr char kRequestHead[] =
+        "HEAD /buffered-head?q=1 HTTP/1.1\r\n"
+        "Host: options-client.example\r\n"
+        "X-Test: binary-head-defaults\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 12\r\n\r\n";
+    std::vector<char> request_prefix(kRequestHead, kRequestHead + sizeof(kRequestHead) - 1u);
+    request_prefix.insert(request_prefix.end(),
+                          reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                          reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                              kDefaultBufferingPostCompleteRequestPrefixBody);
+    const std::vector<char> request_suffix(
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            kDefaultBufferingPostCompleteRequestPrefixBody,
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            sizeof(kDefaultBufferingPostCompleteRequestBody));
+
+    PinnedNginxDockerLifecycle nginx(container_name, temp, error);
+    if (!nginx.start(frontend_port)) {
+        if (error.empty()) error = "#268 positive-CL HEAD frontend failed before readiness";
+        return false;
+    }
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd, request_prefix.data(), request_prefix.size())) {
+        error = "#268 positive-CL HEAD request prefix send failed";
+        return false;
+    }
+    const u64 prefix_sent_ns = steady_now_ns();
+    bool early_eof = false;
+    std::string detail;
+    if (prefix_sent_ns == 0u || !wait_keepalive_quiet_or_eof(client.fd, 1200, early_eof, detail) ||
+        early_eof) {
+        error = early_eof ? "#268 positive-CL HEAD downstream closed during partial upload"
+                          : "#268 positive-CL HEAD partial-upload quiet gate failed: " + detail;
+        return false;
+    }
+    const u64 partial_gate_complete_ns = steady_now_ns();
+    if (partial_gate_complete_ns < prefix_sent_ns ||
+        partial_gate_complete_ns - prefix_sent_ns < 1'200'000'000ull ||
+        origin.accepted.load(std::memory_order_acquire) != 0u ||
+        origin.requests.load(std::memory_order_acquire) != 0u || poll_child(nginx.cli())) {
+        error = "#268 positive-CL HEAD partial upload reached origin or lost frontend custody";
+        return false;
+    }
+    if (!send_all(client.fd, request_suffix.data(), request_suffix.size())) {
+        error = "#268 positive-CL HEAD request suffix send failed";
+        return false;
+    }
+    const u64 suffix_sent_ns = steady_now_ns();
+
+    const auto origin_send_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < origin_send_deadline) {
+        if (poll_child(nginx.cli()) || origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) > 1u ||
+            origin.requests.load(std::memory_order_acquire) > 1u) {
+            error = "#268 positive-CL HEAD origin/frontend failed before response publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (!origin.response_sent_open.load(std::memory_order_acquire) || origin_sent_ns == 0u ||
+        suffix_sent_ns < partial_gate_complete_ns ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire)) {
+        error = "#268 positive-CL HEAD did not publish exactly one complete origin episode";
+        return false;
+    }
+
+    const auto retirement_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    while (!origin.response_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < retirement_deadline) {
+        if (poll_child(nginx.cli()) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#268 positive-CL HEAD origin retirement observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 origin_closed_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (!origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin_closed_ns < origin_sent_ns || origin_closed_ns - origin_sent_ns >= 800'000'000ull) {
+        error = "#268 positive-CL HEAD origin was not retired in the prompt sub-timeout class";
+        return false;
+    }
+
+    observed_downstream.clear();
+    const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (observed_downstream.size() <
+               sizeof(kPositiveClHeadEarlyRetirementResponseNormalized) - 1u &&
+           std::chrono::steady_clock::now() < response_deadline) {
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&p, 1, 50);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#268 positive-CL HEAD downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0) {
+            observed_downstream.insert(observed_downstream.end(), bytes, bytes + n);
+            if (observed_downstream.size() >
+                sizeof(kPositiveClHeadEarlyRetirementResponseNormalized) - 1u) {
+                error = "#268 positive-CL HEAD downstream included representation bytes or tail";
+                return false;
+            }
+            continue;
+        }
+        if (n == 0) {
+            error = "#268 positive-CL HEAD downstream closed instead of staying reusable";
+            return false;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        error = "#268 positive-CL HEAD downstream recv failed";
+        return false;
+    }
+    if (observed_downstream.size() !=
+            sizeof(kPositiveClHeadEarlyRetirementResponseNormalized) - 1u ||
+        header_end(observed_downstream) != observed_downstream.size() ||
+        !validate_exact_normalized_response(
+            observed_downstream, kPositiveClHeadEarlyRetirementResponseNormalized, detail)) {
+        error = "#268 positive-CL HEAD exact header-only response mismatch: " + detail;
+        return false;
+    }
+    const std::string downstream_text(observed_downstream.begin(), observed_downstream.end());
+    if (downstream_text.find("abc") != std::string::npos ||
+        downstream_text.find("502") != std::string::npos ||
+        downstream_text.find("504") != std::string::npos) {
+        error = "#268 positive-CL HEAD exposed body, failure, or tail bytes";
+        return false;
+    }
+
+    early_eof = false;
+    detail.clear();
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, early_eof, detail) || early_eof ||
+        poll_child(nginx.cli()) || !origin.running.load(std::memory_order_acquire) ||
+        !origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        error = early_eof ? "#268 positive-CL HEAD downstream keep-alive was not retained"
+                          : "#268 positive-CL HEAD post-retirement no-retry gate failed: " + detail;
+        return false;
+    }
+
+    close(client.fd);
+    client.fd = -1;
+    if (!nginx.shutdown()) {
+        if (error.empty()) error = "#268 positive-CL HEAD nginx controlled shutdown failed";
+        return false;
+    }
+    const bool origin_live_before_stop = origin.running.load(std::memory_order_acquire) &&
+                                         origin.thread_alive.load(std::memory_order_acquire) &&
+                                         !origin.listener_failed.load(std::memory_order_acquire);
+    origin.stop();
+    observed_upstream = origin.request;
+    const std::string expected_head =
+        "HEAD /buffered-head?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nContent-Length: 12\r\nX-Test: binary-head-defaults\r\nContent-Type: "
+        "application/octet-stream\r\n\r\n";
+    std::vector<char> expected_upstream(expected_head.begin(), expected_head.end());
+    expected_upstream.insert(
+        expected_upstream.end(),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            sizeof(kDefaultBufferingPostCompleteRequestBody));
+    const std::string upstream_text(observed_upstream.begin(), observed_upstream.end());
+    if (!origin_live_before_stop || origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listen_fd >= 0 || origin.history.size() != 1u ||
+        origin.history[0] != expected_upstream || observed_upstream != expected_upstream ||
+        upstream_text.find("options-client.example") != std::string::npos ||
+        upstream_text.find("\r\nConnection:") != std::string::npos ||
+        upstream_text.find("\r\nKeep-Alive:") != std::string::npos ||
+        upstream_text.find("\r\nTE:") != std::string::npos ||
+        upstream_text.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        upstream_text.find("\r\nExpect:") != std::string::npos ||
+        upstream_text.find("\r\nUpgrade:") != std::string::npos ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire)) {
+        error = "#268 positive-CL HEAD exact upstream, retirement, or cleanup mismatch";
+        dump_wire("expected #268 positive-CL HEAD upstream", expected_upstream);
+        dump_wire("actual #268 positive-CL HEAD upstream", observed_upstream);
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool nginx_coalesced_ingress_gate =
@@ -52547,6 +52818,9 @@ int main(int argc, char** argv) {
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
+    const bool pinned_positive_cl_head_default_buffering_oracle =
+        argc == 2 &&
+        strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
     const bool wildcard_listen_oracle =
@@ -52733,7 +53007,7 @@ int main(int argc, char** argv) {
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
-         !pinned_nginx_lifecycle_self_check &&
+         !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
@@ -52895,6 +53169,8 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
@@ -53999,6 +54275,31 @@ int main(int argc, char** argv) {
                "the sole origin episode before cleanup with no retry (nginx-only oracle; no "
                "converter, generated-RUT, RUT admission, OPTIONS-star, CORS, Max-Forwards, "
                "reuse, streaming, TLS, or H2 claim)\n";
+        return 0;
+    }
+    if (pinned_positive_cl_head_default_buffering_oracle) {
+        const std::string container_name = "rut-nginx-268-positive-cl-head-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::vector<char> observed_upstream;
+        std::vector<char> observed_downstream;
+        std::string oracle_error;
+        if (!run_pinned_positive_cl_head_default_buffering_oracle(
+                temp, container_name, observed_upstream, observed_downstream, oracle_error)) {
+            std::cerr << "FAIL [#268 pinned positive-CL HEAD default-buffering oracle]: "
+                      << oracle_error << "\n";
+            dump_wire("#268 observed positive-CL HEAD upstream", observed_upstream);
+            dump_wire("#268 observed positive-CL HEAD downstream", observed_downstream);
+            return 1;
+        }
+        std::cerr
+            << "PASS: #268 pinned nginx 1.29.7 buffers one positive-Content-Length HEAD "
+               "request until its exact 5+7 binary body completes, emits one byte-exact "
+               "authority-rewritten origin request, then treats complete response headers as "
+               "the HEAD response boundary: it returns the exact 187-byte header-only "
+               "keep-alive response and actively retires the still-open incomplete-CL origin "
+               "before the 1s read timeout, with no body leak or retry (nginx-only oracle; no "
+               "RUT admission or converter lowering claim)\n";
         return 0;
     }
     if (converter_default_buffering_positive_get_differential) {
