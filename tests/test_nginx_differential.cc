@@ -51584,16 +51584,37 @@ static bool run_converter_default_buffering_positive_get_differential(
         return false;
     }
 
-    const auto wait_both_fragments = [&](u32 expected, int budget_ms) {
+    const auto fragment_gate_state = [&](u32 expected) {
+        std::string state = "expected=" + std::to_string(expected);
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            state +=
+                std::string(side == 0u ? ", nginx{" : ", RUT{") +
+                "accepted=" + std::to_string(origin.accepted.load(std::memory_order_acquire)) +
+                ", requests=" + std::to_string(origin.requests.load(std::memory_order_acquire)) +
+                ", fragments=" +
+                std::to_string(origin.response_fragments_sent.load(std::memory_order_acquire)) +
+                ", send_failed=" +
+                std::to_string(origin.response_send_failed.load(std::memory_order_acquire)) +
+                ", peer_observation_failed=" +
+                std::to_string(
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire)) +
+                "}";
+        }
+        return state;
+    };
+    const auto wait_both_fragments = [&](u32 expected, int budget_ms, bool require_quiet) {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            if (!frontends_live() || !origins_live() ||
-                !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
-                !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error))
+            if (!frontends_live() || !origins_live()) {
+                error = "#271 fragment gate lost frontend/origin liveness: " +
+                        fragment_gate_state(expected);
                 return false;
+            }
             bool complete = true;
-            for (const auto& origin : origins) {
+            for (size_t side = 0u; side < 2u; side++) {
+                const auto& origin = origins[side];
                 const u32 accepted = origin.accepted.load(std::memory_order_acquire);
                 const u32 requests = origin.requests.load(std::memory_order_acquire);
                 const u32 fragments =
@@ -51601,17 +51622,36 @@ static bool run_converter_default_buffering_positive_get_differential(
                 if (accepted > 1u || requests > 1u ||
                     origin.response_send_failed.load(std::memory_order_acquire) ||
                     origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
-                    fragments > expected)
+                    fragments > expected) {
+                    error = std::string("#271 fragment gate observed invalid ") +
+                            (side == 0u ? "nginx" : "RUT") +
+                            " origin state: " + fragment_gate_state(expected);
                     return false;
+                }
                 complete &= accepted == 1u && requests == 1u && fragments == expected;
             }
             if (complete) return true;
+            if (require_quiet) {
+                for (size_t side = 0u; side < 2u; side++) {
+                    std::string quiet_error;
+                    if (!observe_client_open_and_quiet_nonconsuming(
+                            clients.fds[side], 10, quiet_error)) {
+                        error = std::string("#271 fragment gate observed ") +
+                                (side == 0u ? "nginx" : "RUT") +
+                                " downstream before fragment completion: " + quiet_error + "; " +
+                                fragment_gate_state(expected);
+                        return false;
+                    }
+                }
+            }
             usleep(1000);
         }
+        error = "#271 fragment gate timed out: " + fragment_gate_state(expected);
         return false;
     };
-    if (!wait_both_fragments(1u, 2000)) {
-        error = "#271 origins did not reach the paired first-fragment gate exactly once";
+    if (!wait_both_fragments(1u, 2000, true)) {
+        if (error.empty())
+            error = "#271 origins did not reach the paired first-fragment gate exactly once";
         return false;
     }
     for (u32 part = 1u; part < 4u; part++) {
@@ -51629,8 +51669,13 @@ static bool run_converter_default_buffering_positive_get_differential(
         }
         origins[0].response_fragment_permit.store(part + 1u, std::memory_order_release);
         origins[1].response_fragment_permit.store(part + 1u, std::memory_order_release);
-        if (!wait_both_fragments(part + 1u, 500)) {
-            error = "#271 origins did not reach the next paired response fragment gate";
+        // Once the fourth application write completes, either frontend may
+        // legitimately publish its fully buffered response before its peer.
+        // The preceding 400 ms gate already proved that both downstreams were
+        // quiet while only the first three fragments were available.
+        if (!wait_both_fragments(part + 1u, 500, part + 1u < 4u)) {
+            if (error.empty())
+                error = "#271 origins did not reach response fragment " + std::to_string(part + 1u);
             return false;
         }
     }
