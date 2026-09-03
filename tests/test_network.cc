@@ -38052,6 +38052,8 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: head\r\n\r\n";
     static constexpr u8 kCoalesced[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: head\r\n\r\nabc";
+    static constexpr u8 kFullyCoalesced[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Origin: head\r\n\r\nabc";
     static constexpr u8 kLargeDeclared[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\nX-Origin: head\r\n\r\nabc";
     struct Case {
@@ -38062,6 +38064,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
     static constexpr Case kCases[] = {
         {kHeaderOnly, sizeof(kHeaderOnly) - 1u, 12u},
         {kCoalesced, sizeof(kCoalesced) - 1u, 12u},
+        {kFullyCoalesced, sizeof(kFullyCoalesced) - 1u, 3u},
         {kLargeDeclared, sizeof(kLargeDeclared) - 1u, 8192u},
     };
     for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
@@ -38169,7 +38172,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
 TEST(response_read_deadline_fixed_upload_head_unreachable,
      success_d2_header_retirement_orders_and_late_body_cqes_are_isolated) {
     static constexpr u8 kResponse[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: isolate\r\n\r\nabc";
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Origin: isolate\r\n\r\nabc";
     for (const bool header_first : {true, false}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -38345,7 +38348,6 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         "HTTP/1.1 201 Created\r\nContent-Length: 12\r\n\r\n",
         "HTTP/1.1 404 Not Found\r\nContent-Length: 12\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc",
-        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
     };
     for (const char* wire : kRejected) {
         ScopedIoUringLoopForRetirement guard;

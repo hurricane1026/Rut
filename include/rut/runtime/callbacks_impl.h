@@ -9496,7 +9496,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             strict_common && fixed_upload_head &&
             explicit_buffering == ForwardResponseBufferingMode::None && resp.status_code == 200 &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            raw_total - raw_header_end < resp.content_length;
+            raw_total - raw_header_end <= resp.content_length;
         if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get &&
             !strict_positive_head) {
             disarm_explicit_deadline();
