@@ -1645,7 +1645,7 @@ bool put_root_forward(Writer& writer,
            (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
-           (buffered || timeout_present ? writer.put_cstr("s,\n") : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n}\n");
@@ -1667,7 +1667,7 @@ bool put_root_forward_action(Writer& writer,
            (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
-           (buffered || timeout_present ? writer.put_cstr("s,\n") : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n");

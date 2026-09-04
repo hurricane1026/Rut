@@ -28,7 +28,7 @@ struct RutSource {
     // completion remains strict (`len < kCapacity`), so the prospective exact
     // 301 shape fixes the generic owned-source bound without admitting that
     // still-unsupported nginx semantic composition.
-    static constexpr u32 kCapacity = 5946;
+    static constexpr u32 kCapacity = 7028;
     char data[kCapacity]{};
     u32 len = 0;
 
@@ -41,7 +41,7 @@ struct RutSource {
 // payload bytes. One final byte remains zero for termination.
 struct HttpProfileRutSource {
     static constexpr u32 kMaxAccessLogDeclarationLen = 329u;
-    static constexpr u32 kCapacity = 6275u;
+    static constexpr u32 kCapacity = 7357u;
     char data[kCapacity]{};
     u32 len = 0;
 
