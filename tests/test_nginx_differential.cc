@@ -2028,6 +2028,16 @@ struct Recorder {
     // Default-off positive-request baseline mode: do not publish the request
     // or respond until the declared fixed Content-Length body is fully read.
     bool read_exact_content_length_12_body = false;
+    // Default-off origin mode for a complete request that intentionally emits
+    // no response bytes and remains open until the peer closes it.
+    bool zero_response_stall = false;
+    std::atomic<bool> zero_response_stall_ready{false};
+    std::atomic<u64> zero_response_stall_started_ns{0};
+    std::atomic<bool> zero_response_stall_peer_closed{false};
+    std::atomic<u32> zero_response_stall_peer_close_count{0};
+    std::atomic<u64> zero_response_stall_peer_closed_ns{0};
+    std::atomic<bool> zero_response_stall_unexpected_data{false};
+    std::atomic<bool> zero_response_stall_observation_failed{false};
     std::atomic<u32> response_fragment_permit{0};
     std::atomic<u32> response_fragments_sent{0};
     std::atomic<u64> response_fragment_sent_ns[4]{};
@@ -2134,7 +2144,56 @@ struct Recorder {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
-                if (self->permit_gated_complete_response) {
+                if (self->zero_response_stall) {
+                    const u64 started_ns =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+                    self->zero_response_stall_started_ns.store(started_ns,
+                                                               std::memory_order_relaxed);
+                    self->zero_response_stall_ready.store(true, std::memory_order_release);
+                    bool observed = false;
+                    while (self->running.load(std::memory_order_acquire)) {
+                        pollfd peer_poll{client, POLLIN | POLLHUP | POLLERR, 0};
+                        const int peer_ready = poll(&peer_poll, 1, 50);
+                        if (peer_ready < 0) {
+                            if (errno == EINTR) continue;
+                            self->zero_response_stall_observation_failed.store(
+                                true, std::memory_order_release);
+                            observed = true;
+                            break;
+                        }
+                        if (peer_ready == 0) continue;
+                        char unexpected[64];
+                        const ssize_t n = recv(client, unexpected, sizeof(unexpected), 0);
+                        if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+                            const u64 closed_ns = static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+                            self->zero_response_stall_peer_closed_ns.store(
+                                closed_ns, std::memory_order_relaxed);
+                            self->zero_response_stall_peer_closed.store(true,
+                                                                        std::memory_order_release);
+                            self->zero_response_stall_peer_close_count.fetch_add(
+                                1u, std::memory_order_release);
+                        } else if (n > 0) {
+                            self->zero_response_stall_unexpected_data.store(
+                                true, std::memory_order_release);
+                        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                            self->zero_response_stall_observation_failed.store(
+                                true, std::memory_order_release);
+                        } else {
+                            continue;
+                        }
+                        observed = true;
+                        break;
+                    }
+                    if (!observed && self->running.load(std::memory_order_acquire)) {
+                        self->zero_response_stall_observation_failed.store(
+                            true, std::memory_order_release);
+                    }
+                } else if (self->permit_gated_complete_response) {
                     response_sent = true;
                     for (u32 part = 0; part < 4; part++) {
                         while (self->running.load(std::memory_order_acquire) &&
@@ -2280,7 +2339,10 @@ struct Recorder {
         if (expected == 0 || expected > 4) return false;
         if ((response_override == nullptr) != (response_override_len == 0)) return false;
         if ((permit_gated_complete_response && gate_incomplete_response_close) ||
-            (wait_response_peer_close && gate_incomplete_response_close))
+            (wait_response_peer_close && gate_incomplete_response_close) ||
+            (zero_response_stall && response_override != nullptr) ||
+            (zero_response_stall && (wait_response_peer_close || permit_gated_complete_response ||
+                                     gate_incomplete_response_close)))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -2339,6 +2401,13 @@ struct Recorder {
             response_closed_by_gate.store(false, std::memory_order_relaxed);
             response_close_failed.store(false, std::memory_order_relaxed);
             response_close_released_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_ready.store(false, std::memory_order_relaxed);
+            zero_response_stall_started_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_peer_closed.store(false, std::memory_order_relaxed);
+            zero_response_stall_peer_close_count.store(0u, std::memory_order_relaxed);
+            zero_response_stall_peer_closed_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_unexpected_data.store(false, std::memory_order_relaxed);
+            zero_response_stall_observation_failed.store(false, std::memory_order_relaxed);
             thread_alive.store(false, std::memory_order_relaxed);
             listener_failed.store(false, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
@@ -2369,6 +2438,130 @@ struct Recorder {
 
     ~Recorder() { stop(); }
 };
+
+static bool run_zero_response_stall_self_check(std::string& error) {
+    static constexpr char kRequest[] =
+        "GET /zero-response-stall HTTP/1.1\r\n"
+        "Host: zero-response-stall.example\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    Recorder incompatible_override;
+    incompatible_override.zero_response_stall = true;
+    if (incompatible_override.setup(0, 1, "ignored", 7)) {
+        error = "zero-response stall accepted a response override";
+        incompatible_override.stop();
+        return false;
+    }
+    Recorder incompatible_response_mode;
+    incompatible_response_mode.zero_response_stall = true;
+    incompatible_response_mode.wait_response_peer_close = true;
+    if (incompatible_response_mode.setup()) {
+        error = "zero-response stall accepted a response-wait mode";
+        incompatible_response_mode.stop();
+        return false;
+    }
+
+    Recorder recorder;
+    recorder.zero_response_stall = true;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup()) {
+        error = "zero-response stall recorder setup failed";
+        return false;
+    }
+    int client = connect_once(recorder.port);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        if (client >= 0) close(client);
+        recorder.stop();
+        error = "zero-response stall client connect/send failed";
+        return false;
+    }
+
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder.zero_response_stall_ready.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (recorder.listener_failed.load(std::memory_order_acquire) ||
+            !recorder.running.load(std::memory_order_acquire)) {
+            close(client);
+            recorder.stop();
+            error = "zero-response stall recorder stopped before ready";
+            return false;
+        }
+        usleep(1000);
+    }
+    const std::vector<char> expected_request(kRequest, kRequest + sizeof(kRequest) - 1u);
+    if (!recorder.zero_response_stall_ready.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_started_ns.load(std::memory_order_acquire) == 0u ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u ||
+        recorder.request != expected_request ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        recorder.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire)) {
+        close(client);
+        recorder.stop();
+        error = "zero-response stall did not publish one complete request without a send";
+        return false;
+    }
+
+    std::string quiet_error;
+    if (!observe_client_open_and_quiet_nonconsuming(client, 150, quiet_error)) {
+        close(client);
+        recorder.stop();
+        error = "zero-response stall emitted data or closed early: " + quiet_error;
+        return false;
+    }
+    if (close(client) != 0) {
+        recorder.stop();
+        error = "zero-response stall client close failed";
+        return false;
+    }
+    client = -1;
+
+    const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder.zero_response_stall_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < close_deadline) {
+        if (recorder.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
+            recorder.zero_response_stall_unexpected_data.load(std::memory_order_acquire)) {
+            recorder.stop();
+            error = "zero-response stall peer-close observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 started_ns = recorder.zero_response_stall_started_ns.load(std::memory_order_acquire);
+    const u64 closed_ns =
+        recorder.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire);
+    if (!recorder.zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        closed_ns < started_ns ||
+        recorder.zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
+        recorder.response_sent_open.load(std::memory_order_acquire) ||
+        recorder.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !recorder.running.load(std::memory_order_acquire) ||
+        !recorder.thread_alive.load(std::memory_order_acquire) ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u) {
+        recorder.stop();
+        error = "zero-response stall did not retain a live listener after one peer close";
+        return false;
+    }
+
+    recorder.stop();
+    if (client >= 0 || recorder.running.load(std::memory_order_acquire) ||
+        recorder.thread_alive.load(std::memory_order_acquire) || recorder.listen_fd >= 0 ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u ||
+        recorder.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        recorder.listener_failed.load(std::memory_order_acquire)) {
+        error = "zero-response stall cleanup did not retire the listener and origin episode";
+        return false;
+    }
+    return true;
+}
 
 static bool complete_origin_episode_is_exact(const Recorder& recorder) {
     return recorder.accepted.load(std::memory_order_acquire) == 1 &&
@@ -51862,6 +52055,58 @@ static bool validate_positive_get_default_profile(const std::string& profile,
     return true;
 }
 
+static std::string make_explicit_timeout_head_profile(u16 frontend_port,
+                                                      u16 backend_port,
+                                                      const std::string& access_path) {
+    return "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "      proxy_read_timeout 1s;\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_explicit_timeout_head_profile(const std::string& profile,
+                                                   u16 frontend_port,
+                                                   u16 backend_port,
+                                                   const std::string& access_path,
+                                                   std::string& error) {
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
+    const std::string upstream =
+        "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+    if (frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        access_path.empty() || profile.rfind("http {\n", 0u) != 0u ||
+        count_text(profile, "http {") != 1u || count_text(profile, "server {") != 1u ||
+        count_text(profile, "location / {") != 1u || count_text(profile, "location ") != 1u ||
+        count_text(profile, "log_format compat \"$request_length\";") != 1u ||
+        count_text(profile, "access_log " + access_path + " compat;") != 1u ||
+        count_text(profile, listener) != 1u || count_text(profile, upstream) != 1u ||
+        count_text(profile, "proxy_read_timeout 1s;") != 1u ||
+        profile.find("proxy_buffering") != std::string::npos ||
+        profile.find("proxy_request_buffering") != std::string::npos ||
+        profile.find("proxy_http_version") != std::string::npos ||
+        profile.find("proxy_set_header") != std::string::npos ||
+        profile.find("proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "/") !=
+            std::string::npos ||
+        profile.find("events") != std::string::npos ||
+        profile.find("include ") != std::string::npos) {
+        error = "#270 explicit-timeout HEAD profile escaped the exact bounded root proxy shape";
+        return false;
+    }
+    return true;
+}
+
 static bool validate_positive_get_default_generated_source(const std::string& source,
                                                            u16 frontend_port,
                                                            u16 backend_port,
@@ -51945,6 +52190,129 @@ static bool build_positive_get_default_generated_source(const std::string& profi
     source.assign(lowered.value().data, lowered.value().len);
     return validate_positive_get_default_generated_source(
         source, frontend_port, backend_port, access_path, error);
+}
+
+static bool validate_explicit_timeout_head_generated_source(const std::string& source,
+                                                            u16 frontend_port,
+                                                            u16 backend_port,
+                                                            const std::string& access_path,
+                                                            std::string& error) {
+    const std::string access = "accessLog { path: \"" + access_path +
+                               "\", format: downstreamRequestBytes, publication: live }\n";
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const size_t head_start = source.find("route HEAD \"/\" {\n");
+    const size_t get_start = source.find("route GET \"/\" {\n");
+    const size_t any_start = source.find("\nroute \"/\" {\n");
+    if (source.rfind(access, 0u) != 0u || count_text(source, access) != 1u ||
+        count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
+        count_text(source, "route HEAD \"/\" {\n") != 1u ||
+        count_text(source, "route GET \"/\" {\n") != 1u ||
+        count_text(source, "\nroute \"/\" {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "response_read_timeout: 1s") != 3u ||
+        count_text(source, "response_read_timeout: 1s,\n") != 1u ||
+        count_text(source, "response_buffering: \"complete_content_length\"\n") != 1u ||
+        head_start == std::string::npos || get_start == std::string::npos ||
+        any_start == std::string::npos || !(head_start < get_start && get_start < any_start) ||
+        source.find("response_read_timeout: 60s") != std::string::npos ||
+        source.find("proxy_read_timeout") != std::string::npos ||
+        source.find("proxy_buffering") != std::string::npos ||
+        source.find("proxy_request_buffering") != std::string::npos ||
+        source.find("proxy_http_version") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("converter") != std::string::npos) {
+        error = "#270 generated source lost exact HEAD/1s/None policy custody";
+        return false;
+    }
+    const std::string head_region = source.substr(head_start, get_start - head_start);
+    const std::string get_region = source.substr(get_start, any_start - get_start);
+    const std::string any_region = source.substr(any_start);
+    const auto policy_suppresses_body = [&](const char* policy, const std::string& region) {
+        const size_t start = region.find(policy);
+        const size_t end = region.find("        },", start);
+        const size_t suppress = region.find("head_mode: \"suppress_body\",", start);
+        return start != std::string::npos && end != std::string::npos && suppress < end;
+    };
+    if (count_text(head_region, "response_read_timeout: 1s") != 1u ||
+        count_text(get_region, "response_read_timeout: 1s") != 1u ||
+        count_text(any_region, "response_read_timeout: 1s") != 1u ||
+        head_region.find("response_buffering:") != std::string::npos ||
+        count_text(get_region, "response_buffering: \"complete_content_length\"\n") != 1u ||
+        any_region.find("response_buffering:") != std::string::npos ||
+        !policy_suppresses_body("response_policy: {", head_region) ||
+        !policy_suppresses_body("failure_policy: {", head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", head_region) ||
+        get_region.find("head_mode: \"suppress_body\",") != std::string::npos ||
+        any_region.find("head_mode: \"suppress_body\",") != std::string::npos) {
+        error = "#270 generated source did not isolate HEAD suppression and buffering modes";
+        return false;
+    }
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#270 generated explicit-timeout source did not lex";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#270 generated explicit-timeout source did not parse";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    return true;
+}
+
+static bool build_explicit_timeout_head_generated_source(const std::string& profile,
+                                                         u16 frontend_port,
+                                                         u16 backend_port,
+                                                         const std::string& access_path,
+                                                         std::string& source,
+                                                         std::string& error) {
+    std::string owned_profile = profile;
+    const auto parsed = rut::nginx::parse_http_profile(
+        {owned_profile.data(), static_cast<rut::u32>(owned_profile.size())});
+    if (!parsed || parsed.value().server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        parsed.value().server.listen.ipv4_host != 0x7f000001u ||
+        parsed.value().server.listen.port != frontend_port ||
+        parsed.value().server.location.proxy_pass.port != backend_port ||
+        parsed.value().server.location.proxy_pass.has_uri ||
+        !parsed.value().server.location.proxy_read_timeout.present ||
+        parsed.value().server.location.proxy_read_timeout.milliseconds != 1000u) {
+        error = "#270 explicit-timeout HEAD profile did not retain its semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered || lowered.value().len == 0u ||
+        lowered.value().len >= rut::nginx::HttpProfileRutSource::kCapacity ||
+        lowered.value().data[lowered.value().len] != '\0') {
+        error = "#270 explicit-timeout profile did not lower to bounded owned ordinary RUT";
+        return false;
+    }
+    source.assign(lowered.value().data, lowered.value().len);
+    std::fill(owned_profile.begin(), owned_profile.end(), 'x');
+    return validate_explicit_timeout_head_generated_source(
+        source, frontend_port, backend_port, access_path, error);
+}
+
+static bool run_converter_explicit_timeout_head_source_self_checks(std::string& error) {
+    constexpr u16 frontend_port = 18080u;
+    constexpr u16 backend_port = 18081u;
+    const std::string access_path = "/tmp/rut-explicit-timeout-head-access.log";
+    std::string profile =
+        make_explicit_timeout_head_profile(frontend_port, backend_port, access_path);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, access_path, error))
+        return false;
+    std::string generated;
+    if (!build_explicit_timeout_head_generated_source(
+            profile, frontend_port, backend_port, access_path, generated, error))
+        return false;
+    std::fill(profile.begin(), profile.end(), 'p');
+    return validate_explicit_timeout_head_generated_source(
+        generated, frontend_port, backend_port, access_path, error);
 }
 
 static void configure_positive_get_default_origin(Recorder& origin) {
@@ -52804,6 +53172,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
     const bool proxy_hide_header_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
+    const bool explicit_timeout_head_source_self_check =
+        argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -52823,6 +53193,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
+    const bool zero_response_stall_self_check =
+        argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -53004,10 +53376,11 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !proxy_hide_header_generated_pair_self_check &&
+         !explicit_timeout_head_source_self_check && !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
+         !zero_response_stall_self_check &&
          !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
@@ -53157,6 +53530,8 @@ int main(int argc, char** argv) {
                      "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                      "   or: test_nginx_differential "
+                     "--converter-explicit-timeout-head-source-self-check\n"
+                     "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-generated-side-self-check "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
@@ -53172,6 +53547,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
+                     "   or: test_nginx_differential --zero-response-stall-self-check\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -53384,6 +53760,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (explicit_timeout_head_source_self_check) {
+        std::string source_error;
+        if (!run_converter_explicit_timeout_head_source_self_checks(source_error)) {
+            if (source_error.empty())
+                source_error = "#270 explicit-timeout HEAD source self-check returned false";
+            std::cerr << "FAIL [#270 explicit-timeout HEAD source self-check]: " << source_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into "
+                     "owned ordinary RUT with isolated HEAD suppression and buffering modes\n";
+        return 0;
+    }
+
     if (proxy_hide_header_source_self_check) {
         std::string source_error;
         if (!run_proxy_hide_header_source_self_checks(source_error)) {
@@ -53433,6 +53823,16 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (zero_response_stall_self_check) {
+        std::string stall_error;
+        if (!run_zero_response_stall_self_check(stall_error)) {
+            std::cerr << "FAIL [zero-response stall self-check]: " << stall_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: zero-response origin stall accepted one complete request, emitted "
+                     "no bytes, observed one peer close, and retained then retired its listener\n";
+        return 0;
+    }
     TempDir temp;
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
