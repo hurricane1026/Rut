@@ -9932,6 +9932,22 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             } else if (explicit_first_batch) {
+                // The narrow precise HeaderOnlyHead owner stays armed while
+                // incomplete header fragments arrive. The timer CQE is
+                // arbitrated with the complete batch, so preserve the owner
+                // and continue the one-shot receive without per-fragment
+                // cancel/rearm.
+                if constexpr (requires(Loop* candidate, const Connection& c) {
+                                  candidate->response_read_deadline_uses_precise_timer(c);
+                              }) {
+                    if (loop->response_read_deadline_uses_precise_timer(conn) && ev.result > 0) {
+                        conn.response_read_deadline_first_batch = false;
+                        conn.response_read_deadline_state =
+                            ResponseReadDeadlineState::RefreshPending;
+                        if (!ev.more && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+                        return;
+                    }
+                }
                 disarm_explicit_deadline();
                 loop->close_conn(conn);
                 return;

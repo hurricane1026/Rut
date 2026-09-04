@@ -200,12 +200,19 @@ public:
         bool terminal_error = false;
         bool positive_terminal = false;
         bool body_complete_at_start = false;
+        bool saw_precise_timer = false;
+        bool precise_timer_valid = false;
+        u32 precise_timer_generation = 0;
+        bool precise_timer_target_seen = false;
+        bool precise_timer_cancel_seen = false;
+        bool precise_timer_semantic = false;
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
     u32 response_read_batch_owner_count;
     u32 response_read_batch_event_count;
     u32 response_read_batch_event_index;
+    const IoEvent* response_read_batch_events;
     u32 response_read_batch_pins[kMaxEventsPerWait];
     u32 response_read_batch_pin_count;
 
@@ -289,6 +296,7 @@ public:
         response_read_batch_owner_count = 0;
         response_read_batch_event_count = 0;
         response_read_batch_event_index = 0;
+        response_read_batch_events = nullptr;
         response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
@@ -2500,8 +2508,59 @@ public:
         c.upstream_recv_armed = true;
         c.response_read_deadline_upstream_episode = c.upstream_episode;
         c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
-        timer.refresh(&c, c.response_read_deadline_seconds);
+        if (response_read_deadline_uses_precise_timer(c)) {
+            timer.remove(&c);
+            const bool precise_timer_ok = backend.add_response_read_timer(
+                c.id,
+                c,
+                static_cast<u32>(c.response_read_deadline_seconds) * 1000u,
+                c.response_read_deadline_generation,
+                c.upstream_episode);
+            if (!precise_timer_ok) {
+                c.clear_response_read_deadline();
+                return false;
+            }
+            c.response_read_timer_last_progress_ns = monotonic_ns();
+        } else {
+            timer.refresh(&c, c.response_read_deadline_seconds);
+        }
         return true;
+    }
+
+    [[nodiscard]] bool response_read_deadline_uses_precise_timer(const Connection& c) const {
+        if (c.response_read_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
+            !c.response_read_deadline_upload.downstream_close ||
+            c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+            c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            c.protocol != ConnProtocol::Http11 || c.tls_active ||
+            c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+            c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+            c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
+            !valid_upstream_episode(c.upstream_episode) ||
+            c.response_read_deadline_upstream_episode != c.upstream_episode)
+            return false;
+        const RouteConfig* cfg = c.request_config;
+        return cfg != nullptr && header_only_head_explicit_close_arm_is_stable(
+                                     c,
+                                     c.response_read_deadline_upload,
+                                     cfg,
+                                     c.response_read_deadline_bundle_id,
+                                     ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                                     &on_upstream_response<Self>);
+    }
+
+    [[nodiscard]] bool rearm_precise_response_read_timer(Connection& c, u64 now_ns) {
+        if (!response_read_deadline_uses_precise_timer(c) ||
+            c.response_read_timer_last_progress_ns == 0)
+            return false;
+        const u64 timeout_ns =
+            static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
+        const u32 remaining_ms = response_read_timer_remaining_ms(
+            c.response_read_timer_last_progress_ns, timeout_ns, now_ns);
+        if (remaining_ms == 0) return false;
+        return backend.add_response_read_timer(
+            c.id, c, remaining_ms, c.response_read_deadline_generation, c.upstream_episode);
     }
 
     void disarm_response_read_deadline(Connection& c) {
@@ -2509,10 +2568,14 @@ public:
             c.clear_response_read_deadline();
             return;
         }
-        const bool owns_timer =
-            c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
-            c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending;
-        if (owns_timer) timer.remove(&c);
+        const bool owns_timer = c.response_read_deadline_state != ResponseReadDeadlineState::None;
+        if (owns_timer) {
+            if (c.response_read_timer_phase == ResponseReadTimerPhase::Armed)
+                // Keep the target owner if cancel SQ submission is unavailable;
+                // its natural CQE drains the immutable timespec and barrier.
+                (void)backend.cancel_response_read_timer(c.id, c);
+            timer.remove(&c);
+        }
         c.clear_response_read_deadline();
     }
 
@@ -2625,7 +2688,46 @@ public:
         return static_cast<u16>(++response_read_batch_owner_count);
     }
 
+    u16 find_or_add_precise_timer_batch_owner(u32 cid) {
+        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
+            if (response_read_batch_owners[i].conn_id == cid) {
+                auto& owner = response_read_batch_owners[i];
+                const Connection& c = conns[cid];
+                if (!c.response_read_timer_owner_is_valid()) {
+                    owner.valid = false;
+                    return static_cast<u16>(i + 1);
+                }
+                owner.precise_timer_valid = true;
+                owner.saw_precise_timer = true;
+                owner.precise_timer_generation = c.response_read_timer_owner_generation;
+                owner.precise_timer_semantic =
+                    c.response_read_deadline_state != ResponseReadDeadlineState::None &&
+                    c.response_read_timer_phase == ResponseReadTimerPhase::Armed;
+                return static_cast<u16>(i + 1);
+            }
+        }
+        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        const Connection& c = conns[cid];
+        if (!c.response_read_timer_owner_is_valid()) return 0;
+        auto& owner = response_read_batch_owners[response_read_batch_owner_count];
+        owner = {};
+        owner.conn_id = cid;
+        owner.deadline_generation = c.response_read_timer_deadline_generation;
+        owner.upstream_episode = c.response_read_timer_upstream_episode;
+        owner.profile = c.response_read_deadline_profile;
+        owner.method = c.response_read_deadline_method;
+        owner.valid = true;
+        owner.precise_timer_valid = true;
+        owner.saw_precise_timer = true;
+        owner.precise_timer_generation = c.response_read_timer_owner_generation;
+        owner.precise_timer_semantic =
+            c.response_read_deadline_state != ResponseReadDeadlineState::None &&
+            c.response_read_timer_phase == ResponseReadTimerPhase::Armed;
+        return static_cast<u16>(++response_read_batch_owner_count);
+    }
+
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
+        response_read_batch_events = events;
         response_read_batch_owner_count = 0;
         response_read_batch_event_count = count;
         response_read_batch_event_index = 0;
@@ -2644,6 +2746,8 @@ public:
             const bool downstream_terminal = ev.type == IoEventType::Recv && ev.result <= 0;
             if (current_upstream || downstream_terminal)
                 (void)find_or_add_response_read_batch_owner(ev.conn_id);
+            if (ev.type == IoEventType::ResponseReadTimer)
+                (void)find_or_add_precise_timer_batch_owner(ev.conn_id);
         }
 
         for (u32 i = 0; i < count; ++i) {
@@ -2658,6 +2762,24 @@ public:
             }
             if (owner_index == 0) continue;
             auto& owner = response_read_batch_owners[owner_index - 1];
+            if (ev.type == IoEventType::ResponseReadTimer) {
+                const bool transport_valid = valid_response_read_timer_transport_event(ev);
+                const bool identity_valid =
+                    owner.precise_timer_valid &&
+                    (ev.non_upstream_generation & kResponseReadTimerGenerationMask) ==
+                        owner.precise_timer_generation;
+                owner.saw_precise_timer = true;
+                const bool cancel = (ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+                if (cancel) {
+                    if (owner.precise_timer_cancel_seen) owner.valid = false;
+                    owner.precise_timer_cancel_seen = true;
+                } else {
+                    if (owner.precise_timer_target_seen) owner.valid = false;
+                    owner.precise_timer_target_seen = true;
+                }
+                if (!transport_valid || !identity_valid) owner.valid = false;
+                continue;
+            }
             if (ev.type == IoEventType::Recv && ev.result <= 0) {
                 owner.valid = false;
                 continue;
@@ -2731,7 +2853,7 @@ public:
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
             const Connection& c = conns[owner.conn_id];
-            if (!owner.saw_relevant) owner.valid = false;
+            if (!owner.saw_relevant && !owner.saw_precise_timer) owner.valid = false;
             const u32 pre_batch_bytes =
                 owner.saw_positive ? owner.first_copy_begin : c.upstream_recv_buf.len();
             const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
@@ -2773,6 +2895,11 @@ public:
             auto& owner = response_read_batch_owners[oi];
             pin_response_read_batch_slot(owner.conn_id);
             Connection& c = conns[owner.conn_id];
+            // A timer can outlive the logical deadline owner after a successful
+            // disarm (for example while the exact 504 Send is in flight). Its
+            // CQE is custody-only: keep the slot pinned, but do not force the
+            // ordinary deadline state machine to manufacture a mismatch.
+            if (owner.saw_precise_timer && !owner.precise_timer_semantic) continue;
             const bool key_stable =
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
@@ -3060,9 +3187,109 @@ public:
 
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
-            const auto& owner = response_read_batch_owners[oi];
-            if (!owner.valid || owner.conn_id >= kMaxConns) continue;
+            auto& owner = response_read_batch_owners[oi];
+            if (owner.conn_id >= kMaxConns) continue;
             Connection& c = conns[owner.conn_id];
+            if (owner.saw_precise_timer) {
+                bool custody_ok = owner.valid;
+                bool saw_semantic_target = false;
+                bool saw_canceled_target = false;
+                if (response_read_batch_events != nullptr) {
+                    for (u32 ei = 0; ei < response_read_batch_event_count; ++ei) {
+                        const IoEvent& timer_ev = response_read_batch_events[ei];
+                        if (timer_ev.type != IoEventType::ResponseReadTimer ||
+                            timer_ev.conn_id != owner.conn_id)
+                            continue;
+                        const u32 generation =
+                            timer_ev.non_upstream_generation & kResponseReadTimerGenerationMask;
+                        if (!valid_response_read_timer_transport_event(timer_ev) ||
+                            generation != owner.precise_timer_generation ||
+                            !c.consume_response_read_timer_completion(
+                                timer_ev.non_upstream_generation)) {
+                            custody_ok = false;
+                            continue;
+                        }
+                        const bool cancel =
+                            (timer_ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+                        if (cancel) {
+                            if (timer_ev.result != 0 && timer_ev.result != -ENOENT)
+                                custody_ok = false;
+                        } else if (timer_ev.result != -ETIME && timer_ev.result != -ECANCELED) {
+                            custody_ok = false;
+                        }
+                        if (!cancel && owner.precise_timer_semantic) {
+                            // -ECANCELED is a custody-only target result (the
+                            // cancel won the race); only natural -ETIME can
+                            // drive logical expiry.
+                            if (timer_ev.result == -ETIME)
+                                saw_semantic_target = true;
+                            else if (timer_ev.result == -ECANCELED)
+                                saw_canceled_target = true;
+                        }
+                    }
+                }
+                if (!custody_ok) {
+                    if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
+                    continue;
+                }
+                if (!owner.valid || (owner.saw_terminal && !owner.saw_positive)) {
+                    if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
+                    continue;
+                }
+                // The logical deadline was already disarmed before this
+                // custody-only CQE was harvested. No timer result can affect
+                // the successor/504 state; only the owner barrier is drained.
+                if (!owner.precise_timer_semantic) continue;
+                const bool precise_active = response_read_deadline_uses_precise_timer(c);
+                if (saw_canceled_target && precise_active) {
+                    // A cancelled target can arrive before its cancel CQE.
+                    // Keep the logical identity until the second owner drains;
+                    // only a fully neutral transport owner may be cleared here.
+                    if (!c.response_read_timer_cancel_owned) c.clear_response_read_deadline();
+                    continue;
+                }
+                if (!precise_active) {
+                    // A semantic timer-only owner must not be left in
+                    // BatchPending when its full HeaderOnlyHead proof was
+                    // invalidated during the wait.  The small timer key was
+                    // enough to consume custody, but it cannot authorize a
+                    // rearm or ordinary expiry after the full proof fails.
+                    // A response in this same batch disarms the logical
+                    // deadline and leaves a downstream Sending owner; that
+                    // path has saw_relevant set (or is no longer
+                    // BatchPending) and remains custody-only here.
+                    if ((saw_semantic_target || saw_canceled_target) && !owner.saw_relevant &&
+                        c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending &&
+                        c.fd >= 0)
+                        close_conn(c);
+                    continue;
+                }
+                if (!saw_semantic_target) continue;
+                const u64 now_ns = monotonic_ns();
+                if (owner.saw_positive) {
+                    c.response_read_timer_last_progress_ns = now_ns;
+                    if (!rearm_precise_response_read_timer(c, now_ns)) {
+                        if (c.fd >= 0) close_conn(c);
+                    } else {
+                        c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                    }
+                    continue;
+                }
+                const u64 timeout_ns =
+                    static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
+                const u64 last = c.response_read_timer_last_progress_ns;
+                const bool due = response_read_timer_remaining_ms(last, timeout_ns, now_ns) == 0;
+                if (due) {
+                    c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+                    response_read_deadline_expiry_pending = true;
+                } else if (!rearm_precise_response_read_timer(c, now_ns)) {
+                    if (c.fd >= 0) close_conn(c);
+                } else {
+                    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                }
+                continue;
+            }
+            if (!owner.valid) continue;
             const bool key_stable =
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
@@ -3159,7 +3386,8 @@ public:
                     c.pending_ops++;
                     c.upstream_recv_armed = true;
                 }
-                timer.refresh(&c, c.response_read_deadline_seconds);
+                if (!response_read_deadline_uses_precise_timer(c))
+                    timer.refresh(&c, c.response_read_deadline_seconds);
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
             } else if (key_stable && owner.post_commit_at_start &&
                        c.response_read_deadline_post_commit_phase !=
@@ -3198,7 +3426,8 @@ public:
                         c.pending_ops++;
                         c.upstream_recv_armed = true;
                     }
-                    timer.refresh(&c, c.response_read_deadline_seconds);
+                    if (!response_read_deadline_uses_precise_timer(c))
+                        timer.refresh(&c, c.response_read_deadline_seconds);
                     c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
                 }
                 if (c.response_read_deadline_post_commit_phase ==
@@ -3212,6 +3441,11 @@ public:
                     close_conn(c);
                     continue;
                 }
+                if (response_read_deadline_uses_precise_timer(c)) {
+                    c.response_read_timer_last_progress_ns = monotonic_ns();
+                    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                    continue;
+                }
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
                 c.response_read_deadline_progress_bytes =
@@ -3219,7 +3453,8 @@ public:
                             ResponseReadDeadlinePostCommitPhase::None
                         ? c.upstream_recv_buf.len()
                         : c.response_read_deadline_post_commit_origin_received;
-                timer.refresh(&c, c.response_read_deadline_seconds);
+                if (!response_read_deadline_uses_precise_timer(c))
+                    timer.refresh(&c, c.response_read_deadline_seconds);
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
             } else if (key_stable &&
                        (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
@@ -3297,6 +3532,7 @@ public:
         response_read_batch_pin_count = 0;
         response_read_batch_owner_count = 0;
         response_read_batch_event_count = 0;
+        response_read_batch_events = nullptr;
         reclaim_pending();
     }
 
@@ -4090,7 +4326,10 @@ public:
                             conn.response_read_deadline_buffering;
                         const ResponseReadDeadlineUploadProof first_upload =
                             conn.response_read_deadline_upload;
-                        disarm_response_read_deadline(conn);
+                        const bool precise_positive =
+                            response_read_deadline_uses_precise_timer(conn) && ev.result > 0 &&
+                            ev.copy_witness == IoEventCopyWitness::Full;
+                        if (!precise_positive) disarm_response_read_deadline(conn);
                         conn.response_read_deadline_first_batch = true;
                         conn.response_read_deadline_first_batch_profile = first_profile;
                         conn.response_read_deadline_first_batch_method = first_method;
@@ -4182,9 +4421,15 @@ public:
             case IoEventType::ResponseReadTimer:
                 if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
                     auto& c = conns[ev.conn_id];
-                    if (c.consume_response_read_timer_completion(ev.non_upstream_generation) &&
-                        c.response_read_timer_owner_is_neutral())
-                        reclaim_pending();
+                    // Timer CQEs are settled after the complete wait batch so
+                    // a same-batch positive Full-copy response wins regardless
+                    // of CQE order. Direct dispatch callers retain the simple
+                    // consume-only behavior.
+                    if (response_read_batch_event_count == 0) {
+                        if (c.consume_response_read_timer_completion(ev.non_upstream_generation) &&
+                            c.response_read_timer_owner_is_neutral())
+                            reclaim_pending();
+                    }
                 }
                 break;
             case IoEventType::Count:

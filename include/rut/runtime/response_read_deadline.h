@@ -9,6 +9,18 @@
 
 namespace rut {
 
+// Pure millisecond rounding used when a precise timeout CQE arrives before
+// its logical deadline. A zero result means the deadline is due now.
+inline u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
+    if (last_progress_ns == 0 || timeout_ns > UINT64_MAX - last_progress_ns ||
+        now_ns >= last_progress_ns + timeout_ns)
+        return 0;
+    const u64 remaining_ns = last_progress_ns + timeout_ns - now_ns;
+    u64 remaining_ms = (remaining_ns + 999'999ull) / 1'000'000ull;
+    if (remaining_ms == 0) remaining_ms = 1;
+    return remaining_ms > UINT32_MAX ? UINT32_MAX : static_cast<u32>(remaining_ms);
+}
+
 inline bool response_read_deadline_http_date_is_normalized(Str value) {
     if (value.ptr == nullptr || value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' ||
         value.ptr[7] != ' ' || value.ptr[11] != ' ' || value.ptr[16] != ' ' ||
