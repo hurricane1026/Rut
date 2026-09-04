@@ -403,12 +403,15 @@ inline bool header_only_head_explicit_close_arm_is_stable(
 // this check separate from the generic CompleteContentLength proofs: this
 // profile has no request body and its timeout representation is a header-only
 // 504 carrying the policy's declared body length.
+enum class ResponseReadTimeoutHeaderOnlyHeadPhase : u8 { PreBegin, SendingRetired };
+
 inline bool response_read_timeout_header_only_head_response_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& copied_proof,
     const RouteConfig* config,
     u16 bundle_id,
-    u32 expected_generation) {
+    u32 expected_generation,
+    ResponseReadTimeoutHeaderOnlyHeadPhase phase) {
     if (config == nullptr || config != c.request_config ||
         !config->policy_bundle_id_is_valid(bundle_id) ||
         c.http1_prebuilt_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
@@ -452,9 +455,41 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         c.http1_prebuilt_total_len != c.http1_prebuilt_header_end ||
         c.http1_prebuilt_total_len != c.response_header_buf.len() ||
         c.http1_prebuilt_body_len == 0 || c.http1_prebuilt_status != 504 || c.resp_status != 504 ||
-        c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 || c.resp_body_sent != 0 ||
+        c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 ||
         c.upstream_send_len != 0 || c.response_header_buf.data() == nullptr)
         return false;
+    if (phase != ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin &&
+        phase != ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired)
+        return false;
+    if (phase == ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin) {
+        if (c.state != ConnState::Proxying ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
+            c.http1_prebuilt_request_prefix_len != 0 || c.resp_body_sent != 0)
+            return false;
+    } else if (c.state != ConnState::Sending ||
+               c.http1_prebuilt_disposition != Http1RequestBufferDisposition::ExistingPipeline ||
+               c.resp_body_sent != c.http1_prebuilt_total_len ||
+               c.resp_body_sent != c.http1_prebuilt_header_end || c.upstream_fd >= 0 ||
+               !c.upstream_abandoned ||
+               copied_proof.upload_episode != c.upstream_retiring_episode ||
+               !valid_upstream_episode(copied_proof.upload_episode) ||
+               !valid_upstream_episode(c.upstream_episode) ||
+               c.upstream_retiring_episode >= c.upstream_episode || c.upstream_recv_armed ||
+               c.on_upstream_recv != nullptr || c.on_upstream_send != nullptr)
+        return false;
+    if (phase == ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired) {
+        const u8 target = c.upstream_retirement_target_owned;
+        const u8 cancel = c.upstream_retirement_cancel_owned;
+        const u8 retry = c.upstream_retirement_cancel_retry;
+        const u8 recv = kUpstreamOpRecv;
+        const bool ledger_active = c.upstream_retirement_active &&
+                                   (target | cancel | retry) == recv &&
+                                   (retry & static_cast<u8>(~target)) == 0 && (cancel & retry) == 0;
+        const bool ledger_drained =
+            !c.upstream_retirement_active && c.upstream_retirement_target_owned == 0 &&
+            c.upstream_retirement_cancel_owned == 0 && c.upstream_retirement_cancel_retry == 0;
+        if (!ledger_active && !ledger_drained) return false;
+    }
     const auto& bundle = config->policy_bundles[bundle_id - 1];
     if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
         bundle.response_policy_id != c.response_policy_id ||
@@ -536,6 +571,8 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         return false;
     const RouteEntry& route = config->routes[copied_proof.route_index];
     const UpstreamTarget& target = config->upstreams[copied_proof.upstream_id];
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
     return copied_proof.handler_generation != 0 &&
            copied_proof.handler_generation == c.handler_gen && copied_proof.route_fn != nullptr &&
            copied_proof.upstream_id == c.upstream_idx && copied_proof.raw_header_end != 0 &&
@@ -551,7 +588,12 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
            route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
-           target.addrs[0].sin_family == AF_INET && target.max_inflight == 0;
+           target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
+           config->match_canonical(c.req_path_canon,
+                                   route_method_key(static_cast<LogHttpMethod>(c.req_method)),
+                                   params,
+                                   &param_count,
+                                   kMaxRouteParams) == &route;
 }
 
 inline bool response_read_timeout_header_only_head_live_proof_is_stable(
@@ -568,7 +610,12 @@ inline bool response_read_timeout_header_only_head_live_proof_is_stable(
                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                expected_upstream_recv) &&
            response_read_timeout_header_only_head_response_is_stable(
-               c, copied_proof, config, bundle_id, c.response_read_deadline_generation) &&
+               c,
+               copied_proof,
+               config,
+               bundle_id,
+               c.response_read_deadline_generation,
+               ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin) &&
            config->policy_bundles[bundle_id - 1].response_read_timeout_seconds ==
                c.response_read_deadline_seconds &&
            copied_proof.upload_episode == c.upstream_episode;

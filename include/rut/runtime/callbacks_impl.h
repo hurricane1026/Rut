@@ -4395,6 +4395,15 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                                           conn.response_read_deadline_buffering,
                                           conn.req_method,
                                           conn.response_read_deadline_route_method);
+        const bool header_only_head_explicit_close =
+            profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            header_only_head_explicit_close_arm_is_stable(
+                conn,
+                conn.response_read_deadline_upload,
+                config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Loop>);
         if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             ((response_read_deadline_profile_suppresses_head(profile) &&
@@ -4411,7 +4420,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                conn.response_read_deadline_method != conn.req_method ||
                !response_read_deadline_fixed_upload_proof_is_stable(
                    conn, conn.response_read_deadline_upload)))) ||
-            !conn.keep_alive ||
+            (!conn.keep_alive && !header_only_head_explicit_close) ||
             !response_read_deadline_persistence_owner_is_stable(
                 conn, conn.response_read_deadline_upload) ||
             (!fixed_upload && conn.req_client_has_content_length) ||
@@ -4442,7 +4451,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             !conn.upstream_recv_armed || conn.on_upstream_recv != &on_upstream_response<Loop> ||
             conn.upstream_connect_armed || conn.upstream_send_armed ||
             conn.on_upstream_send != nullptr || conn.retry_req_send_len != 0 ||
-            (!fixed_upload && conn.response_mutations_snapshotted) || !pipeline_generation_stable ||
+            (!fixed_upload && conn.response_mutations_snapshotted) ||
+            (!pipeline_generation_stable && !header_only_head_explicit_close) ||
             conn.recv_paused_for_send || conn.recv_pause_cancel_pending ||
             conn.recv_pause_rearm_pending || conn.upstream_recv_paused_for_send ||
             conn.upstream_recv_pause_cancel_pending || conn.upstream_recv_pause_rearm_pending ||
@@ -4539,7 +4549,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_header_end = timeout_parser.header_end;
             conn.http1_prebuilt_total_len = response_len;
             conn.http1_prebuilt_body_len =
-                fixed_upload_head ? timeout.body.len : response_len - timeout_parser.header_end;
+                suppress_body ? timeout.body.len : response_len - timeout_parser.header_end;
             conn.http1_prebuilt_status = timeout.status_code;
         }
 

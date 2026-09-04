@@ -538,27 +538,48 @@ private:
         // field is at its canonical reset value.  Once any copied field is
         // published, a non-legacy request must prove the complete strict
         // identity before layout-None or header-only can return.
+        const bool header_only_head_timeout =
+            c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead &&
+            c.http1_prebuilt_response_purpose ==
+                Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+            c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead;
+        const auto response_phase =
+            c.state == ConnState::Sending &&
+                    c.http1_prebuilt_disposition == Http1RequestBufferDisposition::ExistingPipeline
+                ? ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired
+                : ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin;
         if (!c.http1_prebuilt_response_proof_is_neutral() && !http1_pipeline_request_is_legacy(c)) {
-            ForwardResponseBufferingMode copied_buffering = ForwardResponseBufferingMode::None;
-            if (c.http1_prebuilt_deadline_config != nullptr &&
-                c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
-                    c.http1_prebuilt_deadline_bundle_id)) {
-                copied_buffering = c.http1_prebuilt_deadline_config
-                                       ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                                       .response_buffering;
+            if (header_only_head_timeout) {
+                if (!response_read_timeout_header_only_head_response_is_stable(
+                        c,
+                        c.http1_prebuilt_deadline_upload,
+                        c.http1_prebuilt_deadline_config,
+                        c.http1_prebuilt_deadline_bundle_id,
+                        c.http1_prebuilt_deadline_generation,
+                        response_phase))
+                    return false;
+            } else {
+                ForwardResponseBufferingMode copied_buffering = ForwardResponseBufferingMode::None;
+                if (c.http1_prebuilt_deadline_config != nullptr &&
+                    c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                        c.http1_prebuilt_deadline_bundle_id)) {
+                    copied_buffering = c.http1_prebuilt_deadline_config
+                                           ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                           .response_buffering;
+                }
+                if (!http1_pipeline_request_generation_prebuilt_is_stable(
+                        c,
+                        c.http1_prebuilt_deadline_upload,
+                        c.http1_prebuilt_deadline_config,
+                        c.http1_prebuilt_deadline_bundle_id,
+                        c.http1_prebuilt_deadline_profile,
+                        copied_buffering,
+                        c.http1_prebuilt_deadline_method,
+                        c.http1_prebuilt_deadline_route_method,
+                        c.http1_prebuilt_response_layout,
+                        c.http1_prebuilt_response_purpose))
+                    return false;
             }
-            if (!http1_pipeline_request_generation_prebuilt_is_stable(
-                    c,
-                    c.http1_prebuilt_deadline_upload,
-                    c.http1_prebuilt_deadline_config,
-                    c.http1_prebuilt_deadline_bundle_id,
-                    c.http1_prebuilt_deadline_profile,
-                    copied_buffering,
-                    c.http1_prebuilt_deadline_method,
-                    c.http1_prebuilt_deadline_route_method,
-                    c.http1_prebuilt_response_layout,
-                    c.http1_prebuilt_response_purpose))
-                return false;
         }
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::None)
             return prebuilt_http1_header_is_complete(c);
@@ -569,7 +590,10 @@ private:
         const bool header_only_representation =
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly ||
-            fixed_upload_head_timeout;
+            fixed_upload_head_timeout ||
+            (c.http1_prebuilt_response_purpose ==
+                 Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+             c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead);
         if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.http1_prebuilt_deadline_method != c.req_method ||
             !response_read_deadline_route_method_matches(c.http1_prebuilt_deadline_method,
@@ -635,7 +659,18 @@ private:
                 return false;
             if (c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ResponseReadTimeout) {
-                if (!fixed_upload_head_timeout) return c.http1_prebuilt_body_len == 0;
+                if (!fixed_upload_head_timeout) {
+                    if (c.http1_prebuilt_deadline_profile ==
+                        ResponseReadDeadlineProfile::HeaderOnlyHead)
+                        return response_read_timeout_header_only_head_response_is_stable(
+                            c,
+                            c.http1_prebuilt_deadline_upload,
+                            c.http1_prebuilt_deadline_config,
+                            c.http1_prebuilt_deadline_bundle_id,
+                            c.http1_prebuilt_deadline_generation,
+                            response_phase);
+                    return c.http1_prebuilt_body_len == 0;
+                }
                 if (!fixed_upload_head_success_proof_is_stable(
                         c,
                         c.http1_prebuilt_deadline_upload,
@@ -1239,17 +1274,29 @@ public:
                                                  c.http1_prebuilt_deadline_profile,
                                                  c.http1_prebuilt_deadline_method,
                                                  c.http1_prebuilt_deadline_upload.upload_episode);
-        const bool explicit_close =
-            c.http1_prebuilt_deadline_config != nullptr &&
-            c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
-                c.http1_prebuilt_deadline_bundle_id) &&
-            complete_content_length_explicit_close_request_is_stable(
+        const bool header_only_head_timeout =
+            c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            c.http1_prebuilt_response_purpose ==
+                Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+            response_read_timeout_header_only_head_response_is_stable(
                 c,
                 c.http1_prebuilt_deadline_upload,
-                c.http1_prebuilt_deadline_config
-                    ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                    .response_buffering,
-                c.http1_prebuilt_deadline_profile);
+                c.http1_prebuilt_deadline_config,
+                c.http1_prebuilt_deadline_bundle_id,
+                c.http1_prebuilt_deadline_generation,
+                ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin);
+        const bool explicit_close =
+            header_only_head_timeout ||
+            (c.http1_prebuilt_deadline_config != nullptr &&
+             c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                 c.http1_prebuilt_deadline_bundle_id) &&
+             complete_content_length_explicit_close_request_is_stable(
+                 c,
+                 c.http1_prebuilt_deadline_upload,
+                 c.http1_prebuilt_deadline_config
+                     ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                     .response_buffering,
+                 c.http1_prebuilt_deadline_profile));
         if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
             ((!c.keep_alive || !c.req_client_keep_alive) && !explicit_close) ||
@@ -1267,7 +1314,8 @@ public:
             (selected_targets & static_cast<u8>(~kAllowed)) != 0 ||
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
-            ((strict_head || fixed_upload_head_timeout || configured_forward_failure) &&
+            ((strict_head || fixed_upload_head_timeout || configured_forward_failure ||
+              header_only_head_timeout) &&
              (((selected_targets != kUpstreamOpRecv || consumed_terminal != nullptr) &&
                !exact_consumed_terminal) ||
               disposition != Http1RequestBufferDisposition::ExistingPipeline ||
@@ -1739,16 +1787,27 @@ public:
                     !c.upstream_connect_armed && !c.upstream_send_armed && !c.upstream_recv_armed &&
                     !has_request_callback;
                 const bool explicit_close =
-                    c.http1_prebuilt_deadline_config != nullptr &&
-                    c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
-                        c.http1_prebuilt_deadline_bundle_id) &&
-                    complete_content_length_explicit_close_request_is_stable(
-                        c,
-                        c.http1_prebuilt_deadline_upload,
-                        c.http1_prebuilt_deadline_config
-                            ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                            .response_buffering,
-                        c.http1_prebuilt_deadline_profile);
+                    (c.http1_prebuilt_deadline_profile ==
+                         ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                     c.http1_prebuilt_response_purpose ==
+                         Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+                     response_read_timeout_header_only_head_response_is_stable(
+                         c,
+                         c.http1_prebuilt_deadline_upload,
+                         c.http1_prebuilt_deadline_config,
+                         c.http1_prebuilt_deadline_bundle_id,
+                         c.http1_prebuilt_deadline_generation,
+                         ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired)) ||
+                    (c.http1_prebuilt_deadline_config != nullptr &&
+                     c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                         c.http1_prebuilt_deadline_bundle_id) &&
+                     complete_content_length_explicit_close_request_is_stable(
+                         c,
+                         c.http1_prebuilt_deadline_upload,
+                         c.http1_prebuilt_deadline_config
+                             ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                             .response_buffering,
+                         c.http1_prebuilt_deadline_profile));
                 if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
                     if (c.fd >= 0) close_conn(c);
                     continue;
