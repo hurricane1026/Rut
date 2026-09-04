@@ -52055,6 +52055,58 @@ static bool validate_positive_get_default_profile(const std::string& profile,
     return true;
 }
 
+static std::string make_explicit_timeout_head_profile(u16 frontend_port,
+                                                      u16 backend_port,
+                                                      const std::string& access_path) {
+    return "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "      proxy_read_timeout 1s;\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_explicit_timeout_head_profile(const std::string& profile,
+                                                   u16 frontend_port,
+                                                   u16 backend_port,
+                                                   const std::string& access_path,
+                                                   std::string& error) {
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + ";";
+    const std::string upstream =
+        "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";";
+    if (frontend_port == 0u || backend_port == 0u || frontend_port == backend_port ||
+        access_path.empty() || profile.rfind("http {\n", 0u) != 0u ||
+        count_text(profile, "http {") != 1u || count_text(profile, "server {") != 1u ||
+        count_text(profile, "location / {") != 1u || count_text(profile, "location ") != 1u ||
+        count_text(profile, "log_format compat \"$request_length\";") != 1u ||
+        count_text(profile, "access_log " + access_path + " compat;") != 1u ||
+        count_text(profile, listener) != 1u || count_text(profile, upstream) != 1u ||
+        count_text(profile, "proxy_read_timeout 1s;") != 1u ||
+        profile.find("proxy_buffering") != std::string::npos ||
+        profile.find("proxy_request_buffering") != std::string::npos ||
+        profile.find("proxy_http_version") != std::string::npos ||
+        profile.find("proxy_set_header") != std::string::npos ||
+        profile.find("proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "/") !=
+            std::string::npos ||
+        profile.find("events") != std::string::npos ||
+        profile.find("include ") != std::string::npos) {
+        error = "#270 explicit-timeout HEAD profile escaped the exact bounded root proxy shape";
+        return false;
+    }
+    return true;
+}
+
 static bool validate_positive_get_default_generated_source(const std::string& source,
                                                            u16 frontend_port,
                                                            u16 backend_port,
@@ -52138,6 +52190,129 @@ static bool build_positive_get_default_generated_source(const std::string& profi
     source.assign(lowered.value().data, lowered.value().len);
     return validate_positive_get_default_generated_source(
         source, frontend_port, backend_port, access_path, error);
+}
+
+static bool validate_explicit_timeout_head_generated_source(const std::string& source,
+                                                            u16 frontend_port,
+                                                            u16 backend_port,
+                                                            const std::string& access_path,
+                                                            std::string& error) {
+    const std::string access = "accessLog { path: \"" + access_path +
+                               "\", format: downstreamRequestBytes, publication: live }\n";
+    const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
+    const std::string upstream =
+        "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    const size_t head_start = source.find("route HEAD \"/\" {\n");
+    const size_t get_start = source.find("route GET \"/\" {\n");
+    const size_t any_start = source.find("\nroute \"/\" {\n");
+    if (source.rfind(access, 0u) != 0u || count_text(source, access) != 1u ||
+        count_text(source, listener) != 1u || count_text(source, upstream) != 1u ||
+        count_text(source, "route HEAD \"/\" {\n") != 1u ||
+        count_text(source, "route GET \"/\" {\n") != 1u ||
+        count_text(source, "\nroute \"/\" {\n") != 1u ||
+        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "response_read_timeout: 1s") != 3u ||
+        count_text(source, "response_read_timeout: 1s,\n") != 1u ||
+        count_text(source, "response_buffering: \"complete_content_length\"\n") != 1u ||
+        head_start == std::string::npos || get_start == std::string::npos ||
+        any_start == std::string::npos || !(head_start < get_start && get_start < any_start) ||
+        source.find("response_read_timeout: 60s") != std::string::npos ||
+        source.find("proxy_read_timeout") != std::string::npos ||
+        source.find("proxy_buffering") != std::string::npos ||
+        source.find("proxy_request_buffering") != std::string::npos ||
+        source.find("proxy_http_version") != std::string::npos ||
+        source.find("nginx.conf") != std::string::npos ||
+        source.find("nginx::") != std::string::npos ||
+        source.find("nginx_compat") != std::string::npos ||
+        source.find("converter") != std::string::npos) {
+        error = "#270 generated source lost exact HEAD/1s/None policy custody";
+        return false;
+    }
+    const std::string head_region = source.substr(head_start, get_start - head_start);
+    const std::string get_region = source.substr(get_start, any_start - get_start);
+    const std::string any_region = source.substr(any_start);
+    const auto policy_suppresses_body = [&](const char* policy, const std::string& region) {
+        const size_t start = region.find(policy);
+        const size_t end = region.find("        },", start);
+        const size_t suppress = region.find("head_mode: \"suppress_body\",", start);
+        return start != std::string::npos && end != std::string::npos && suppress < end;
+    };
+    if (count_text(head_region, "response_read_timeout: 1s") != 1u ||
+        count_text(get_region, "response_read_timeout: 1s") != 1u ||
+        count_text(any_region, "response_read_timeout: 1s") != 1u ||
+        head_region.find("response_buffering:") != std::string::npos ||
+        count_text(get_region, "response_buffering: \"complete_content_length\"\n") != 1u ||
+        any_region.find("response_buffering:") != std::string::npos ||
+        !policy_suppresses_body("response_policy: {", head_region) ||
+        !policy_suppresses_body("failure_policy: {", head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", head_region) ||
+        get_region.find("head_mode: \"suppress_body\",") != std::string::npos ||
+        any_region.find("head_mode: \"suppress_body\",") != std::string::npos) {
+        error = "#270 generated source did not isolate HEAD suppression and buffering modes";
+        return false;
+    }
+    const auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+    if (!lexed) {
+        error = "#270 generated explicit-timeout source did not lex";
+        return false;
+    }
+    const auto parsed = rut::parse_file(lexed.value());
+    if (!parsed) {
+        error = "#270 generated explicit-timeout source did not parse";
+        return false;
+    }
+    std::unique_ptr<rut::AstFile> ast(parsed.value());
+    return true;
+}
+
+static bool build_explicit_timeout_head_generated_source(const std::string& profile,
+                                                         u16 frontend_port,
+                                                         u16 backend_port,
+                                                         const std::string& access_path,
+                                                         std::string& source,
+                                                         std::string& error) {
+    std::string owned_profile = profile;
+    const auto parsed = rut::nginx::parse_http_profile(
+        {owned_profile.data(), static_cast<rut::u32>(owned_profile.size())});
+    if (!parsed || parsed.value().server.listen.address != rut::ListenerAddress::IPv4Exact ||
+        parsed.value().server.listen.ipv4_host != 0x7f000001u ||
+        parsed.value().server.listen.port != frontend_port ||
+        parsed.value().server.location.proxy_pass.port != backend_port ||
+        parsed.value().server.location.proxy_pass.has_uri ||
+        !parsed.value().server.location.proxy_read_timeout.present ||
+        parsed.value().server.location.proxy_read_timeout.milliseconds != 1000u) {
+        error = "#270 explicit-timeout HEAD profile did not retain its semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered || lowered.value().len == 0u ||
+        lowered.value().len >= rut::nginx::HttpProfileRutSource::kCapacity ||
+        lowered.value().data[lowered.value().len] != '\0') {
+        error = "#270 explicit-timeout profile did not lower to bounded owned ordinary RUT";
+        return false;
+    }
+    source.assign(lowered.value().data, lowered.value().len);
+    std::fill(owned_profile.begin(), owned_profile.end(), 'x');
+    return validate_explicit_timeout_head_generated_source(
+        source, frontend_port, backend_port, access_path, error);
+}
+
+static bool run_converter_explicit_timeout_head_source_self_checks(std::string& error) {
+    constexpr u16 frontend_port = 18080u;
+    constexpr u16 backend_port = 18081u;
+    const std::string access_path = "/tmp/rut-explicit-timeout-head-access.log";
+    std::string profile =
+        make_explicit_timeout_head_profile(frontend_port, backend_port, access_path);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, access_path, error))
+        return false;
+    std::string generated;
+    if (!build_explicit_timeout_head_generated_source(
+            profile, frontend_port, backend_port, access_path, generated, error))
+        return false;
+    std::fill(profile.begin(), profile.end(), 'p');
+    return validate_explicit_timeout_head_generated_source(
+        generated, frontend_port, backend_port, access_path, error);
 }
 
 static void configure_positive_get_default_origin(Recorder& origin) {
@@ -52997,6 +53172,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-oracle") == 0;
     const bool proxy_hide_header_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
+    const bool explicit_timeout_head_source_self_check =
+        argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -53199,7 +53376,7 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !proxy_hide_header_generated_pair_self_check &&
+         !explicit_timeout_head_source_self_check && !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
@@ -53352,6 +53529,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
+                     "   or: test_nginx_differential "
+                     "--converter-explicit-timeout-head-source-self-check\n"
                      "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-generated-side-self-check "
                      "<absolute-rut-executable>\n"
@@ -53578,6 +53757,20 @@ int main(int argc, char** argv) {
         std::cerr << "PASS: #439 pinned nginx lifecycle transition checks reject early CLI "
                      "exit, readiness deadline, TERM timeout/forced cleanup and invalid wait "
                      "status while accepting delayed readiness and exact graceful TERM evidence\n";
+        return 0;
+    }
+
+    if (explicit_timeout_head_source_self_check) {
+        std::string source_error;
+        if (!run_converter_explicit_timeout_head_source_self_checks(source_error)) {
+            if (source_error.empty())
+                source_error = "#270 explicit-timeout HEAD source self-check returned false";
+            std::cerr << "FAIL [#270 explicit-timeout HEAD source self-check]: " << source_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into "
+                     "owned ordinary RUT with isolated HEAD suppression and buffering modes\n";
         return 0;
     }
 
