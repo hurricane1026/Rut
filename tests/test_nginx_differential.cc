@@ -52353,12 +52353,8 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
             profile, frontend_port, backend_port, temp.rut_access_log, error))
         return false;
     std::string source;
-    if (!build_explicit_timeout_head_generated_source(profile,
-                                                      frontend_port,
-                                                      backend_port,
-                                                      temp.rut_access_log,
-                                                      source,
-                                                      error) ||
+    if (!build_explicit_timeout_head_generated_source(
+            profile, frontend_port, backend_port, temp.rut_access_log, source, error) ||
         !write_file(temp.source, source.data(), source.size())) {
         if (error.empty()) error = "#270 generated timeout episode could not persist RUT source";
         return false;
@@ -52385,10 +52381,8 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
                origin.thread_alive.load(std::memory_order_acquire) &&
                !origin.listener_failed.load(std::memory_order_acquire);
     };
-    const auto origin_ready_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
-        usleep(1000);
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline) usleep(1000);
     if (!origin_live()) {
         error = "#270 generated timeout episode Recorder was not live before RUT start";
         return false;
@@ -52404,14 +52398,13 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
         if (error.empty()) error = "#270 generated timeout episode RUT failed before readiness";
         return false;
     }
-    const auto runtime_ready_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
-            !log_contains(temp.rut_log,
-                          ("Listening on port " + std::to_string(frontend_port) +
-                           " with 1 shard(s)\n")
-                              .c_str())) &&
-           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (
+        (!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+         !log_contains(temp.rut_log,
+                       ("Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n")
+                           .c_str())) &&
+        std::chrono::steady_clock::now() < runtime_ready_deadline) {
         if (poll_child(runtime.child)) {
             error = "#270 generated timeout episode RUT exited before io_uring readiness";
             return false;
@@ -52439,9 +52432,8 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
         }
     } client{connect_once(frontend_port)};
     if (client.fd < 0 ||
-        !send_all(client.fd,
-                  kExplicitTimeoutHeadRequest,
-                  sizeof(kExplicitTimeoutHeadRequest) - 1u)) {
+        !send_all(
+            client.fd, kExplicitTimeoutHeadRequest, sizeof(kExplicitTimeoutHeadRequest) - 1u)) {
         error = "#270 generated timeout episode HEAD request connect/send failed";
         return false;
     }
@@ -52456,12 +52448,25 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
     }
     const u64 stall_started_ns =
         origin.zero_response_stall_started_ns.load(std::memory_order_acquire);
-    if (!origin.zero_response_stall_ready.load(std::memory_order_acquire) || stall_started_ns == 0u ||
-        origin.accepted.load(std::memory_order_acquire) != 1u ||
-        origin.requests.load(std::memory_order_acquire) != 1u ||
+    const std::string expected_upstream_request =
+        "HEAD /timeout-zero?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\n\r\n";
+    const std::vector<char> expected_upstream_bytes(expected_upstream_request.begin(),
+                                                    expected_upstream_request.end());
+    if (!origin.zero_response_stall_ready.load(std::memory_order_acquire) ||
+        stall_started_ns == 0u || origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.request != expected_upstream_bytes || origin.history[0] != expected_upstream_bytes ||
         origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
         origin.response_send_succeeded.load(std::memory_order_acquire)) {
-        error = "#270 generated timeout episode did not reach one zero-response origin stall";
+        error =
+            "#270 generated timeout episode did not reach the exact one-request zero-response "
+            "origin stall (expected=" +
+            expected_upstream_request + ", observed=" +
+            (origin.request.empty() ? std::string("<empty>")
+                                    : std::string(origin.request.begin(), origin.request.end())) +
+            ")";
+        dump_wire("#270 generated timeout upstream request", origin.request);
         return false;
     }
     std::vector<char> response;
@@ -52481,21 +52486,22 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
             char byte = 0;
             const ssize_t n = recv(client.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                error = "#270 generated timeout episode emitted before the 800ms gate "
-                        "(elapsed_ns=" +
-                        std::to_string(steady_now_ns() - stall_started_ns) + ", recv=" +
-                        std::to_string(n) + ", origin_accepts=" +
-                        std::to_string(origin.accepted.load(std::memory_order_acquire)) +
-                        ", origin_requests=" +
-                        std::to_string(origin.requests.load(std::memory_order_acquire)) +
-                        ", origin_peer_closed=" +
-                        std::to_string(origin.zero_response_stall_peer_closed.load(
-                            std::memory_order_acquire)) +
-                        ", origin_close_elapsed_ns=" +
-                        std::to_string(
-                            origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) -
-                            stall_started_ns) +
-                        ", child=" + child_status_description(runtime.child) + ")";
+                error =
+                    "#270 generated timeout episode emitted before the 800ms gate "
+                    "(elapsed_ns=" +
+                    std::to_string(steady_now_ns() - stall_started_ns) +
+                    ", recv=" + std::to_string(n) + ", origin_accepts=" +
+                    std::to_string(origin.accepted.load(std::memory_order_acquire)) +
+                    ", origin_requests=" +
+                    std::to_string(origin.requests.load(std::memory_order_acquire)) +
+                    ", origin_peer_closed=" +
+                    std::to_string(
+                        origin.zero_response_stall_peer_closed.load(std::memory_order_acquire)) +
+                    ", origin_close_elapsed_ns=" +
+                    std::to_string(
+                        origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) -
+                        stall_started_ns) +
+                    ", child=" + child_status_description(runtime.child) + ")";
                 dump_log(temp.rut_log, "#270 generated timeout runtime log");
                 dump_wire("#270 generated timeout partial downstream", response);
                 return false;
@@ -52560,8 +52566,8 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
     const auto origin_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!origin.zero_response_stall_peer_closed.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < origin_close_deadline) {
-        if (poll_child(runtime.child) || origin.zero_response_stall_observation_failed.load(
-                                             std::memory_order_acquire) ||
+        if (poll_child(runtime.child) ||
+            origin.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
             origin.zero_response_stall_unexpected_data.load(std::memory_order_acquire)) {
             error = "#270 generated timeout episode origin-close observation failed";
             return false;
@@ -52570,7 +52576,8 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
     }
     if (!origin.zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
         origin.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
-        origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) < stall_started_ns ||
+        origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) <
+            stall_started_ns ||
         origin.zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
         origin.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
         !origin_live()) {
@@ -53789,240 +53796,241 @@ int main(int argc, char** argv) {
          (argv[2][0] != '/' || argv[3][0] != '/')) ||
         (late_successor_differential &&
          (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/'))) {
-        std::cerr << "usage: test_nginx_differential <absolute-rut-executable> "
-                     "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
-                     "   or: test_nginx_differential --nginx-gate-spike "
-                     "<absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
-                     "<absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --exact-local-return-baseline\n"
-                     "   or: test_nginx_differential --root-proxy-trace-oracle\n"
-                     "   or: test_nginx_differential --api-proxy-trace-oracle\n"
-                     "   or: test_nginx_differential --exact-absolute-redirect-oracle\n"
-                     "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
-                     "   or: test_nginx_differential --api-non-root-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-wildcard-service-no-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--converter-wildcard-service-no-uri-differential <absolute-rut>\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-static-query-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-zero-suffix-static-query-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-empty-query-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
-                     "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--converter-explicit-timeout-head-source-self-check\n"
-                     "   or: test_nginx_differential "
-                     "--converter-explicit-timeout-head-generated-episode <absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-proxy-hide-header-generated-side-self-check "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-proxy-hide-header-generated-pair-self-check "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-proxy-hide-header-differential <absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-default-buffering-positive-get-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
-                     "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
-                     "   or: test_nginx_differential --zero-response-stall-self-check\n"
-                     "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-listen-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-request-length-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-request-length-split-header-oracle\n"
-                     "   or: test_nginx_differential --rut-initial-header-split-public "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-request-length-fixed-body-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-request-length-split-fixed-body-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--converter-request-length-differential <absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-request-length-split-header-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-request-length-fixed-body-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-request-length-split-fixed-body-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-return204-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-bodyful-return-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-return302-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-return301-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-prefix-root-replacement-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-api-v1-replacement-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-api-no-uri-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--pinned-nginx-exact-loopback-service-no-uri-oracle\n"
-                     "   or: test_nginx_differential --converter-wildcard-listen-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-asterisk-wildcard-listen-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-listen-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-return204-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-bodyful-return-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-return302-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-return301-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-prefix-root-replacement-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-api-v1-replacement-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-api-no-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-service-no-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-max-proxy-prefix-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-loopback-max-no-uri-prefix-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-wildcard-max-no-uri-prefix-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
-                     "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
-                     "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
-                     "   or: test_nginx_differential --trailing-slash-no-content-oracle\n"
-                     "   or: test_nginx_differential --max-boundary-no-content-oracle\n"
-                     "   or: test_nginx_differential --bodyful-normalized-exact-oracle\n"
-                     "   or: test_nginx_differential --exact-local-body-space-oracle\n"
-                     "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
-                     "   or: test_nginx_differential --exact-local-return204-oracle\n"
-                     "   or: test_nginx_differential --exact-local-return204-query-oracle\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-local-body-space-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-local-body-multiple-space-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-local-return204-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-local-return204-query-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-bounded-no-content-path-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-trailing-slash-no-content-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-max-boundary-no-content-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-bodyful-normalized-exact-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-api-non-root-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-static-query-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-zero-suffix-static-query-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-empty-query-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-root-empty-query-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-service-root-proxy-uri-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-max-proxy-prefix-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-max-proxy-replacement-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-bounded-exact-local-path-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-normalized-exact-trailing-slash-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --converter-root-proxy-trace-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --converter-api-proxy-trace-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-absolute-redirect-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential "
-                     "--converter-exact-absolute-redirect-302-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --strict-local-response-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --converter-exact-local-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --exact-strict-route-differential "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --slash-normalized-exact-rut-production "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --no-content204-rut-production "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --rut-exact-ipv4-listener-production "
-                     "<absolute-rut-executable>\n"
-                     "   or: test_nginx_differential --converter-coalesced-successor-differential "
-                     "<absolute-rut-executable> <absolute-nginx-preload-helper> "
-                     "<absolute-rut-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-gate-spike "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-gate-ready-mutation-negative "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-gate-owner-death-negative "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-gate-connect-journal-negative "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --rut-iouring-coalesced-ingress-gate "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n"
-                     "   or: test_nginx_differential --late-successor-differential "
-                     "<absolute-rut-executable> <absolute-nginx-preload-helper> "
-                     "<absolute-rut-preload-helper>\n";
+        std::cerr
+            << "usage: test_nginx_differential <absolute-rut-executable> "
+               "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
+               "   or: test_nginx_differential --nginx-gate-spike "
+               "<absolute-preload-helper>\n"
+               "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
+               "<absolute-preload-helper>\n"
+               "   or: test_nginx_differential --exact-local-return-baseline\n"
+               "   or: test_nginx_differential --root-proxy-trace-oracle\n"
+               "   or: test_nginx_differential --api-proxy-trace-oracle\n"
+               "   or: test_nginx_differential --exact-absolute-redirect-oracle\n"
+               "   or: test_nginx_differential --exact-absolute-redirect-302-oracle\n"
+               "   or: test_nginx_differential --api-non-root-proxy-uri-oracle\n"
+               "   or: test_nginx_differential --service-root-proxy-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-wildcard-service-no-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--converter-wildcard-service-no-uri-differential <absolute-rut>\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-static-query-proxy-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-zero-suffix-static-query-proxy-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-empty-query-proxy-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-root-empty-query-proxy-uri-oracle\n"
+               "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
+               "   or: test_nginx_differential "
+               "--converter-explicit-timeout-head-source-self-check\n"
+               "   or: test_nginx_differential "
+               "--converter-explicit-timeout-head-generated-episode <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-proxy-hide-header-generated-side-self-check "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-proxy-hide-header-generated-pair-self-check "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-proxy-hide-header-differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-positive-get-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
+               "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
+               "   or: test_nginx_differential --zero-response-stall-self-check\n"
+               "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-listen-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-request-length-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-request-length-split-header-oracle\n"
+               "   or: test_nginx_differential --rut-initial-header-split-public "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-request-length-fixed-body-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-request-length-split-fixed-body-oracle\n"
+               "   or: test_nginx_differential "
+               "--converter-request-length-differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-request-length-split-header-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-request-length-fixed-body-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-request-length-split-fixed-body-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-return204-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-bodyful-return-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-return302-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-return301-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-prefix-root-replacement-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-api-v1-replacement-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-api-no-uri-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-exact-loopback-service-no-uri-oracle\n"
+               "   or: test_nginx_differential --converter-wildcard-listen-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-asterisk-wildcard-listen-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-listen-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-return204-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-bodyful-return-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-return302-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-return301-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-prefix-root-replacement-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-api-v1-replacement-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-api-no-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-service-no-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-max-proxy-prefix-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-loopback-max-no-uri-prefix-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-wildcard-max-no-uri-prefix-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --bounded-exact-local-path-oracle\n"
+               "   or: test_nginx_differential --bounded-no-content-path-oracle\n"
+               "   or: test_nginx_differential --normalized-exact-trailing-slash-oracle\n"
+               "   or: test_nginx_differential --trailing-slash-no-content-oracle\n"
+               "   or: test_nginx_differential --max-boundary-no-content-oracle\n"
+               "   or: test_nginx_differential --bodyful-normalized-exact-oracle\n"
+               "   or: test_nginx_differential --exact-local-body-space-oracle\n"
+               "   or: test_nginx_differential --exact-local-body-multiple-space-oracle\n"
+               "   or: test_nginx_differential --exact-local-return204-oracle\n"
+               "   or: test_nginx_differential --exact-local-return204-query-oracle\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-local-body-space-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-local-body-multiple-space-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-local-return204-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-local-return204-query-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-bounded-no-content-path-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-trailing-slash-no-content-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-max-boundary-no-content-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-bodyful-normalized-exact-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-api-non-root-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-static-query-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-zero-suffix-static-query-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-empty-query-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-root-empty-query-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-service-root-proxy-uri-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-max-proxy-prefix-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-max-proxy-replacement-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-bounded-exact-local-path-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-normalized-exact-trailing-slash-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --converter-root-proxy-trace-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --converter-api-proxy-trace-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-absolute-redirect-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-exact-absolute-redirect-302-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --strict-local-response-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --converter-exact-local-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --exact-strict-route-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --slash-normalized-exact-rut-production "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --no-content204-rut-production "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --rut-exact-ipv4-listener-production "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential --converter-coalesced-successor-differential "
+               "<absolute-rut-executable> <absolute-nginx-preload-helper> "
+               "<absolute-rut-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-gate-spike "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-gate-ready-mutation-negative "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-gate-owner-death-negative "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-gate-connect-journal-negative "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --rut-iouring-coalesced-ingress-gate "
+               "<absolute-rut-executable> <absolute-preload-helper>\n"
+               "   or: test_nginx_differential --late-successor-differential "
+               "<absolute-rut-executable> <absolute-nginx-preload-helper> "
+               "<absolute-rut-preload-helper>\n";
         return 1;
     }
     if (converter_root_empty_query_proxy_uri_differential) {
