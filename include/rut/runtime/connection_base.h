@@ -685,6 +685,9 @@ struct ConnectionBase {
     u32 response_read_timer_owner_generation = 0;
     u32 response_read_timer_deadline_generation = 0;
     u32 response_read_timer_upstream_episode = 0;
+    // Monotonic logical progress clock for the narrow precise owner. Positive
+    // Full-copy fragments update this value; fragments never cancel/rearm it.
+    u64 response_read_timer_last_progress_ns = 0;
     ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
     bool response_read_timer_target_owned = false;
     bool response_read_timer_cancel_owned = false;
@@ -698,6 +701,7 @@ struct ConnectionBase {
         visit(c.response_read_timer_owner_generation, u32{0});
         visit(c.response_read_timer_deadline_generation, u32{0});
         visit(c.response_read_timer_upstream_episode, u32{0});
+        visit(c.response_read_timer_last_progress_ns, u64{0});
         visit(c.response_read_timer_phase, ResponseReadTimerPhase::None);
         visit(c.response_read_timer_target_owned, false);
         visit(c.response_read_timer_cancel_owned, false);
