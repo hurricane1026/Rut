@@ -4548,8 +4548,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
             conn.http1_prebuilt_header_end = timeout_parser.header_end;
             conn.http1_prebuilt_total_len = response_len;
-            conn.http1_prebuilt_body_len =
-                suppress_body ? timeout.body.len : response_len - timeout_parser.header_end;
+            conn.http1_prebuilt_body_len = (fixed_upload_head || header_only_head_explicit_close)
+                                               ? timeout.body.len
+                                               : response_len - timeout_parser.header_end;
             conn.http1_prebuilt_status = timeout.status_code;
         }
 

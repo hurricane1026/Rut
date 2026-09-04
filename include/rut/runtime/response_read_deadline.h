@@ -405,6 +405,41 @@ inline bool header_only_head_explicit_close_arm_is_stable(
 // 504 carrying the policy's declared body length.
 enum class ResponseReadTimeoutHeaderOnlyHeadPhase : u8 { PreBegin, SendingRetired };
 
+inline bool response_read_timeout_header_only_head_explicit_close_is_stable(
+    const Connection& c, const RouteConfig* config, u16 bundle_id) {
+    if (config == nullptr || config != c.request_config ||
+        !config->policy_bundle_id_is_valid(bundle_id) ||
+        c.http1_prebuilt_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
+        c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout ||
+        c.http1_prebuilt_deadline_config != config ||
+        c.http1_prebuilt_deadline_bundle_id != bundle_id ||
+        c.http1_prebuilt_deadline_generation == 0 ||
+        c.http1_prebuilt_deadline_generation != c.response_read_deadline_generation ||
+        c.http1_prebuilt_deadline_method != static_cast<u8>(LogHttpMethod::Head) ||
+        c.req_method != c.http1_prebuilt_deadline_method ||
+        !response_read_deadline_route_method_matches(c.http1_prebuilt_deadline_method,
+                                                     c.http1_prebuilt_deadline_route_method) ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||
+        !c.http1_prebuilt_deadline_upload.downstream_close)
+        return false;
+    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
+        bundle.response_policy_id != c.response_policy_id ||
+        bundle.failure_policy_id != c.failure_policy_id ||
+        bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+        !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+        !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    return config->response_policies[bundle.response_policy_id - 1].head_mode ==
+               ResponsePolicyHeadMode::SuppressBody &&
+           config->failure_policies[bundle.failure_policy_id - 1].head_mode ==
+               FailurePolicyHeadMode::SuppressBody &&
+           config->failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
+               FailurePolicyHeadMode::SuppressBody;
+}
+
 inline bool response_read_timeout_header_only_head_response_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& copied_proof,

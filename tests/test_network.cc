@@ -35980,6 +35980,10 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     conn->upstream_send_len = 0;
     REQUIRE(response_read_timeout_header_only_head_live_proof_is_stable(
         *conn, proof, &config, 2, &on_upstream_response<IoUringEventLoop>));
+    REQUIRE(response_read_timeout_header_only_head_explicit_close_is_stable(*conn, &config, 2));
+    conn->http1_prebuilt_deadline_upload.downstream_close = false;
+    CHECK_FALSE(response_read_timeout_header_only_head_explicit_close_is_stable(*conn, &config, 2));
+    conn->http1_prebuilt_deadline_upload.downstream_close = true;
 
     auto rejects_timeout_wire_mutation = [&](const char* needle) {
         u8* wire = const_cast<u8*>(conn->response_header_buf.data());

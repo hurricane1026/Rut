@@ -540,9 +540,8 @@ private:
         // identity before layout-None or header-only can return.
         const bool header_only_head_timeout =
             c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead &&
-            c.http1_prebuilt_response_purpose ==
-                Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
-            c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead;
+            response_read_timeout_header_only_head_explicit_close_is_stable(
+                c, c.http1_prebuilt_deadline_config, c.http1_prebuilt_deadline_bundle_id);
         const auto response_phase =
             c.state == ConnState::Sending &&
                     c.http1_prebuilt_disposition == Http1RequestBufferDisposition::ExistingPipeline
@@ -590,10 +589,7 @@ private:
         const bool header_only_representation =
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly ||
-            fixed_upload_head_timeout ||
-            (c.http1_prebuilt_response_purpose ==
-                 Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
-             c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead);
+            fixed_upload_head_timeout || header_only_head_timeout;
         if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.http1_prebuilt_deadline_method != c.req_method ||
             !response_read_deadline_route_method_matches(c.http1_prebuilt_deadline_method,
@@ -660,8 +656,7 @@ private:
             if (c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ResponseReadTimeout) {
                 if (!fixed_upload_head_timeout) {
-                    if (c.http1_prebuilt_deadline_profile ==
-                        ResponseReadDeadlineProfile::HeaderOnlyHead)
+                    if (header_only_head_timeout)
                         return response_read_timeout_header_only_head_response_is_stable(
                             c,
                             c.http1_prebuilt_deadline_upload,
