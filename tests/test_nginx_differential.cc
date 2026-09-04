@@ -2451,6 +2451,231 @@ struct Recorder {
     ~Recorder() { stop(); }
 };
 
+enum class TimeoutHeadPhase {
+    ZeroProgressHold,
+    DelayedPartialHeaderHold,
+    CompleteHeadSuccess,
+};
+
+static const char* timeout_head_phase_name(TimeoutHeadPhase phase) {
+    switch (phase) {
+        case TimeoutHeadPhase::ZeroProgressHold:
+            return "zero_progress_hold";
+        case TimeoutHeadPhase::DelayedPartialHeaderHold:
+            return "delayed_partial_header_hold";
+        case TimeoutHeadPhase::CompleteHeadSuccess:
+            return "complete_head_success";
+    }
+    return "invalid";
+}
+
+// Test-only origin for the #268 wall-clock differential.  The request-complete
+// timestamp is published only after the entire upstream header is present.
+// The delayed phase performs exactly one declared application write after the
+// requested delay and then remains silent until the proxy retires the peer.
+struct TimeoutHeadPhaseRecorder {
+    int listen_fd = -1;
+    u16 port = 0;
+    TimeoutHeadPhase phase = TimeoutHeadPhase::ZeroProgressHold;
+    std::atomic<bool> running{false};
+    std::atomic<bool> thread_alive{false};
+    std::atomic<bool> listener_failed{false};
+    std::atomic<u32> accepted{0};
+    std::atomic<u32> requests{0};
+    std::atomic<u32> response_send_calls{0};
+    std::atomic<u32> response_bytes_sent{0};
+    std::atomic<bool> response_send_failed{false};
+    std::atomic<bool> peer_closed{false};
+    std::atomic<u32> peer_close_count{0};
+    std::atomic<bool> peer_unexpected_data{false};
+    std::atomic<bool> peer_observation_failed{false};
+    std::atomic<u64> request_complete_ns{0};
+    std::atomic<u64> last_fragment_sent_ns{0};
+    std::vector<char> request;
+    std::vector<std::vector<char>> history;
+    pthread_t thread{};
+    bool thread_started = false;
+
+    static constexpr u64 kDelayedFragmentNs = 400'000'000ull;
+    static constexpr char kPartialHeader[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: timeout-phase-origin\r\n";
+
+    static u64 now_ns() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+
+    static void* run(void* opaque) {
+        auto* self = static_cast<TimeoutHeadPhaseRecorder*>(opaque);
+        struct LivenessGuard {
+            TimeoutHeadPhaseRecorder* recorder;
+            ~LivenessGuard() { recorder->thread_alive.store(false, std::memory_order_release); }
+        } liveness{self};
+        self->thread_alive.store(true, std::memory_order_release);
+        const int listener = self->listen_fd;
+        while (self->running.load(std::memory_order_acquire)) {
+            pollfd listener_poll{listener, POLLIN, 0};
+            const int ready = poll(&listener_poll, 1, 25);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                self->listener_failed.store(true, std::memory_order_release);
+                self->running.store(false, std::memory_order_release);
+                break;
+            }
+            if (!self->running.load(std::memory_order_acquire)) break;
+            if (ready == 0) continue;
+            if (listener_poll.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                self->listener_failed.store(true, std::memory_order_release);
+                self->running.store(false, std::memory_order_release);
+                break;
+            }
+            if (!(listener_poll.revents & POLLIN)) continue;
+            const int client = accept(listener, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                self->listener_failed.store(true, std::memory_order_release);
+                self->running.store(false, std::memory_order_release);
+                break;
+            }
+            self->accepted.fetch_add(1u, std::memory_order_release);
+            const int flags = fcntl(client, F_GETFL, 0);
+            if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+                close(client);
+                continue;
+            }
+            std::vector<char> wire;
+            char buffer[1024];
+            while (self->running.load(std::memory_order_acquire)) {
+                pollfd client_poll{client, POLLIN, 0};
+                const int client_ready = poll(&client_poll, 1, 25);
+                if (client_ready < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (client_ready == 0) continue;
+                const ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+                if (n > 0) {
+                    wire.insert(wire.end(), buffer, buffer + n);
+                    if (header_end(wire) != 0u) break;
+                    continue;
+                }
+                if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                break;
+            }
+            if (header_end(wire) != 0u) {
+                self->history.push_back(wire);
+                if (self->history.size() == 1u) self->request = wire;
+                self->requests.fetch_add(1u, std::memory_order_release);
+                const u64 complete_ns = now_ns();
+                self->request_complete_ns.store(complete_ns, std::memory_order_release);
+                const char* response = nullptr;
+                size_t response_size = 0u;
+                if (self->phase == TimeoutHeadPhase::DelayedPartialHeaderHold) {
+                    const u64 target_ns = complete_ns + kDelayedFragmentNs;
+                    while (self->running.load(std::memory_order_acquire) && now_ns() < target_ns)
+                        usleep(1000);
+                    response = kPartialHeader;
+                    response_size = sizeof(kPartialHeader) - 1u;
+                } else if (self->phase == TimeoutHeadPhase::CompleteHeadSuccess) {
+                    response = kHeadBackendResponse;
+                    response_size = sizeof(kHeadBackendResponse) - 1u;
+                }
+                if (response != nullptr && self->running.load(std::memory_order_acquire)) {
+                    self->response_send_calls.fetch_add(1u, std::memory_order_release);
+                    if (send_all(client, response, response_size)) {
+                        self->response_bytes_sent.store(static_cast<u32>(response_size),
+                                                        std::memory_order_release);
+                        self->last_fragment_sent_ns.store(now_ns(), std::memory_order_release);
+                    } else {
+                        self->response_send_failed.store(true, std::memory_order_release);
+                    }
+                }
+                bool observed = false;
+                while (self->running.load(std::memory_order_acquire)) {
+                    pollfd peer_poll{client, POLLIN | POLLHUP | POLLERR, 0};
+                    const int peer_ready = poll(&peer_poll, 1, 25);
+                    if (peer_ready < 0) {
+                        if (errno == EINTR) continue;
+                        self->peer_observation_failed.store(true, std::memory_order_release);
+                        observed = true;
+                        break;
+                    }
+                    if (peer_ready == 0) continue;
+                    char unexpected[64];
+                    const ssize_t n = recv(client, unexpected, sizeof(unexpected), 0);
+                    if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+                        self->peer_closed.store(true, std::memory_order_release);
+                        self->peer_close_count.fetch_add(1u, std::memory_order_release);
+                    } else if (n > 0) {
+                        self->peer_unexpected_data.store(true, std::memory_order_release);
+                    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        self->peer_observation_failed.store(true, std::memory_order_release);
+                    } else {
+                        continue;
+                    }
+                    observed = true;
+                    break;
+                }
+                if (!observed && self->running.load(std::memory_order_acquire))
+                    self->peer_observation_failed.store(true, std::memory_order_release);
+            }
+            (void)shutdown(client, SHUT_RDWR);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(u16 requested_port, TimeoutHeadPhase requested_phase) {
+        phase = requested_phase;
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) return false;
+        int one = 1;
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(requested_port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            listen(listen_fd, 8) != 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        const int flags = fcntl(listen_fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        port = requested_port;
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, &TimeoutHeadPhaseRecorder::run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        thread_started = true;
+        return true;
+    }
+
+    void stop() {
+        running.store(false, std::memory_order_release);
+        if (thread_started) {
+            pthread_join(thread, nullptr);
+            thread_started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+
+    ~TimeoutHeadPhaseRecorder() { stop(); }
+};
+
 static bool run_zero_response_stall_self_check(std::string& error) {
     static constexpr char kRequest[] =
         "GET /zero-response-stall HTTP/1.1\r\n"
@@ -52604,6 +52829,503 @@ static bool run_converter_explicit_timeout_head_generated_episode(const char* ru
     return true;
 }
 
+struct TimeoutHeadPhaseObservation {
+    TimeoutHeadPhase phase = TimeoutHeadPhase::ZeroProgressHold;
+    std::vector<char> downstream;
+    std::vector<char> upstream;
+    u64 request_complete_ns = 0u;
+    u64 last_origin_fragment_ns = 0u;
+    // The pinned nginx oracle determines which observed event owns the
+    // response-header timeout. Keep the origin publication time separate.
+    u64 last_progress_ns = 0u;
+    u64 first_downstream_byte_ns = 0u;
+    u64 downstream_eof_ns = 0u;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 response_send_calls = 0u;
+    u32 response_bytes_sent = 0u;
+    u32 peer_close_count = 0u;
+    bool server_exited_cleanly = false;
+};
+
+static std::string timeout_head_phase_request(TimeoutHeadPhase phase) {
+    const char* target = nullptr;
+    switch (phase) {
+        case TimeoutHeadPhase::ZeroProgressHold:
+            target = "/timeout-zero?q=1";
+            break;
+        case TimeoutHeadPhase::DelayedPartialHeaderHold:
+            target = "/timeout-partial?q=1";
+            break;
+        case TimeoutHeadPhase::CompleteHeadSuccess:
+            target = "/timeout-complete?q=1";
+            break;
+    }
+    return std::string("HEAD ") + target +
+           " HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+}
+
+static std::vector<char> timeout_head_expected_upstream(TimeoutHeadPhase phase, u16 backend_port) {
+    const std::string downstream = timeout_head_phase_request(phase);
+    const size_t target_end = downstream.find(" HTTP/1.1\r\n");
+    const std::string target = downstream.substr(5u, target_end - 5u);
+    const std::string upstream = "HEAD " + target +
+                                 " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                 "\r\n\r\n";
+    return {upstream.begin(), upstream.end()};
+}
+
+static bool read_timeout_head_phase_response(int client,
+                                             u64 deadline_ns,
+                                             TimeoutHeadPhaseObservation& observation,
+                                             std::string& error) {
+    while (steady_now_ns() < deadline_ns) {
+        pollfd descriptor{client, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&descriptor, 1, 25);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#268 phase downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[512];
+        const ssize_t n = recv(client, bytes, sizeof(bytes), 0);
+        const u64 now_ns = steady_now_ns();
+        if (n > 0) {
+            if (observation.first_downstream_byte_ns == 0u)
+                observation.first_downstream_byte_ns = now_ns;
+            observation.downstream.insert(observation.downstream.end(), bytes, bytes + n);
+            if (observation.downstream.size() > 4096u) {
+                error = "#268 phase downstream response exceeded bounded capacity";
+                return false;
+            }
+            continue;
+        }
+        if (n == 0) {
+            observation.downstream_eof_ns = now_ns;
+            if (observation.first_downstream_byte_ns == 0u) {
+                error = observation.phase == TimeoutHeadPhase::CompleteHeadSuccess
+                            ? "#268 complete phase reached EOF before its response headers"
+                            : "#268 timeout phase reached EOF without the expected header-only "
+                              "504";
+                return false;
+            }
+            return true;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        error = "#268 phase downstream recv failed";
+        return false;
+    }
+    error = "#268 phase downstream response/EOF exceeded its bounded deadline";
+    return false;
+}
+
+static bool capture_timeout_head_phase_side(const char* rut_path,
+                                            bool pinned_nginx,
+                                            TimeoutHeadPhase phase,
+                                            u32 ordinal,
+                                            TimeoutHeadPhaseObservation& observation,
+                                            std::string& error) {
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#268 phase side could not create a secure temporary directory";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve(0u, frontend_port) || !reservations.reserve(1u, backend_port) ||
+        frontend_port == backend_port) {
+        error = "#268 phase side could not reserve distinct loopback ports";
+        return false;
+    }
+
+    const std::string access_path = pinned_nginx ? temp.nginx_access_log : temp.rut_access_log;
+    const std::string profile =
+        make_explicit_timeout_head_profile(frontend_port, backend_port, access_path);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, access_path, error))
+        return false;
+
+    if (pinned_nginx) {
+        const std::string config = "events {}\n" + profile;
+        if (!write_file(temp.nginx_config, config.data(), config.size())) {
+            error = "#268 phase side could not persist the pinned nginx config";
+            return false;
+        }
+    } else {
+        std::string source;
+        if (!build_explicit_timeout_head_generated_source(
+                profile, frontend_port, backend_port, access_path, source, error) ||
+            !write_file(temp.source, source.data(), source.size())) {
+            if (error.empty())
+                error = "#268 phase side could not persist converter-generated ordinary RUT";
+            return false;
+        }
+    }
+
+    TimeoutHeadPhaseRecorder origin;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#268 phase origin bind", error) ||
+        !origin.setup(backend_port, phase)) {
+        if (error.empty()) error = "#268 phase origin setup failed";
+        return false;
+    }
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.thread_alive.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listener_failed.load(std::memory_order_acquire)) {
+        error = "#268 phase origin was not live before frontend start";
+        return false;
+    }
+
+    const std::string identity = "rut-nginx-268-phase-" + std::to_string(getpid()) + "-" +
+                                 std::to_string(ordinal) + (pinned_nginx ? "-n" : "-r");
+    PinnedNginxDockerLifecycle nginx(identity, temp, error);
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#268 phase frontend bind", error))
+        return false;
+    if (pinned_nginx) {
+        if (!nginx.start(frontend_port)) {
+            if (error.empty()) error = "#268 phase pinned nginx failed before readiness";
+            return false;
+        }
+    } else {
+        if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+            !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                         temp.rut_log,
+                         runtime.child) ||
+            !wait_ready(frontend_port, runtime.child, error)) {
+            if (error.empty()) error = "#268 phase generated RUT failed before readiness";
+            return false;
+        }
+        const auto io_uring_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!log_contains(temp.rut_log, "Backend: io_uring\n") &&
+               std::chrono::steady_clock::now() < io_uring_deadline) {
+            if (poll_child(runtime.child)) {
+                error = "#268 phase generated RUT exited before io_uring readiness";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!log_contains(temp.rut_log, "Backend: io_uring\n")) {
+            error = "#268 phase generated RUT lacked io_uring readiness";
+            return false;
+        }
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    const std::string request = timeout_head_phase_request(phase);
+    if (client.fd < 0 || !send_all(client.fd, request.data(), request.size())) {
+        error = "#268 phase downstream HEAD connect/send failed";
+        return false;
+    }
+
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.request_complete_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        if (origin.listener_failed.load(std::memory_order_acquire) ||
+            (!pinned_nginx && poll_child(runtime.child)) ||
+            (pinned_nginx && poll_child(nginx.cli()))) {
+            error = "#268 phase frontend/origin failed before upstream request completion";
+            return false;
+        }
+        usleep(1000);
+    }
+    observation.phase = phase;
+    observation.request_complete_ns = origin.request_complete_ns.load(std::memory_order_acquire);
+    if (observation.request_complete_ns == 0u) {
+        error = "#268 phase did not observe the complete upstream request";
+        return false;
+    }
+    if (phase == TimeoutHeadPhase::DelayedPartialHeaderHold) {
+        const auto fragment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (origin.last_fragment_sent_ns.load(std::memory_order_acquire) == 0u &&
+               std::chrono::steady_clock::now() < fragment_deadline) {
+            if (origin.response_send_failed.load(std::memory_order_acquire)) {
+                error = "#268 delayed phase origin fragment send failed";
+                return false;
+            }
+            usleep(1000);
+        }
+        observation.last_origin_fragment_ns =
+            origin.last_fragment_sent_ns.load(std::memory_order_acquire);
+        const u64 delay_ns = observation.last_origin_fragment_ns - observation.request_complete_ns;
+        if (observation.last_origin_fragment_ns < observation.request_complete_ns ||
+            delay_ns < 350'000'000ull || delay_ns >= 650'000'000ull) {
+            error = "#268 delayed phase fragment escaped the 350..650ms publication window";
+            return false;
+        }
+    }
+    // Pinned nginx 1.29.7 retains the initial response-header read deadline
+    // when this incomplete header prefix arrives. Therefore request completion,
+    // not the origin's send timestamp, is the semantic timeout reference for
+    // this exact phase. Both timestamps remain asserted and reported.
+    observation.last_progress_ns = observation.request_complete_ns;
+
+    if (!read_timeout_head_phase_response(
+            client.fd, observation.last_progress_ns + 2'000'000'000ull, observation, error)) {
+        error +=
+            " (request_complete_ns=" + std::to_string(observation.request_complete_ns) +
+            ", last_progress_ns=" + std::to_string(observation.last_progress_ns) +
+            ", last_origin_fragment_ns=" + std::to_string(observation.last_origin_fragment_ns) +
+            ", observation_ns=" + std::to_string(steady_now_ns()) + ", request_to_eof_ns=" +
+            std::to_string(observation.downstream_eof_ns - observation.request_complete_ns) +
+            (observation.last_origin_fragment_ns == 0u
+                 ? std::string()
+                 : ", fragment_to_eof_ns=" + std::to_string(observation.downstream_eof_ns -
+                                                            observation.last_origin_fragment_ns)) +
+            ")";
+        if (!pinned_nginx) dump_log(temp.rut_log, "#268 generated RUT phase runtime log");
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+
+    const auto peer_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!origin.peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < peer_close_deadline) {
+        if (origin.peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#268 phase origin peer-close observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!origin.peer_closed.load(std::memory_order_acquire)) {
+        error = "#268 phase frontend did not retire its origin peer";
+        return false;
+    }
+
+    // Keep both listener and frontend alive after the first origin FIN so a
+    // queued retry cannot hide behind immediate fixture teardown.
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            (!pinned_nginx && poll_child(runtime.child)) ||
+            (pinned_nginx && poll_child(nginx.cli()))) {
+            error = "#268 phase observed a retry or lost frontend/origin custody";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    if (pinned_nginx) {
+        observation.server_exited_cleanly = nginx.shutdown();
+    } else {
+        observation.server_exited_cleanly = stop_child(runtime.child) && runtime.child.pid < 0;
+    }
+    origin.stop();
+    observation.upstream = origin.request;
+    observation.accepted = origin.accepted.load(std::memory_order_acquire);
+    observation.requests = origin.requests.load(std::memory_order_acquire);
+    observation.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    observation.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    observation.peer_close_count = origin.peer_close_count.load(std::memory_order_acquire);
+    if (!observation.server_exited_cleanly || origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.peer_observation_failed.load(std::memory_order_acquire) ||
+        origin.response_send_failed.load(std::memory_order_acquire) || observation.accepted != 1u ||
+        observation.requests != 1u || origin.history.size() != 1u ||
+        observation.upstream != origin.history[0] || observation.peer_close_count != 1u) {
+        error = "#268 phase side lost exact process/origin lifecycle evidence";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_timeout_head_phase_observation(const TimeoutHeadPhaseObservation& value,
+                                                    u16 backend_port,
+                                                    std::string& error) {
+    const std::vector<char> expected_upstream =
+        timeout_head_expected_upstream(value.phase, backend_port);
+    std::vector<char> normalized = value.downstream;
+    const char* expected_response = value.phase == TimeoutHeadPhase::CompleteHeadSuccess
+                                        ? kHeadResponseNormalized
+                                        : kExplicitTimeoutHeadResponseNormalized;
+    const size_t expected_response_size = strlen(expected_response);
+    const u32 expected_send_calls = value.phase == TimeoutHeadPhase::ZeroProgressHold ? 0u : 1u;
+    const u32 expected_origin_bytes =
+        value.phase == TimeoutHeadPhase::ZeroProgressHold
+            ? 0u
+            : (value.phase == TimeoutHeadPhase::DelayedPartialHeaderHold
+                   ? static_cast<u32>(sizeof(TimeoutHeadPhaseRecorder::kPartialHeader) - 1u)
+                   : static_cast<u32>(sizeof(kHeadBackendResponse) - 1u));
+    if (!normalize_date(normalized) || normalized.size() != expected_response_size ||
+        memcmp(normalized.data(), expected_response, expected_response_size) != 0 ||
+        value.upstream != expected_upstream || value.accepted != 1u || value.requests != 1u ||
+        value.response_send_calls != expected_send_calls ||
+        value.response_bytes_sent != expected_origin_bytes || value.peer_close_count != 1u ||
+        !value.server_exited_cleanly || value.request_complete_ns == 0u ||
+        value.last_progress_ns == 0u || value.first_downstream_byte_ns < value.last_progress_ns ||
+        value.downstream_eof_ns < value.first_downstream_byte_ns ||
+        header_end(value.downstream) != value.downstream.size()) {
+        error = std::string("#268 ") + timeout_head_phase_name(value.phase) +
+                " exact wire/count/timestamp/lifecycle mismatch";
+        return false;
+    }
+    if (value.phase == TimeoutHeadPhase::DelayedPartialHeaderHold &&
+        (value.last_origin_fragment_ns < value.request_complete_ns ||
+         value.last_origin_fragment_ns - value.request_complete_ns < 350'000'000ull ||
+         value.last_origin_fragment_ns - value.request_complete_ns >= 650'000'000ull ||
+         value.first_downstream_byte_ns < value.last_origin_fragment_ns)) {
+        error = "#268 delayed partial-header origin fragment timestamp was not exact";
+        return false;
+    }
+    const u64 elapsed_ns = value.first_downstream_byte_ns - value.last_progress_ns;
+    if (value.phase == TimeoutHeadPhase::CompleteHeadSuccess) {
+        if (elapsed_ns >= 750'000'000ull) {
+            error = "#268 complete HEAD success did not beat the timeout lower bound";
+            return false;
+        }
+    } else if (elapsed_ns < 750'000'000ull || elapsed_ns >= 1'700'000'000ull) {
+        error = std::string("#268 ") + timeout_head_phase_name(value.phase) +
+                " timeout escaped 750..1700ms (elapsed_ns=" + std::to_string(elapsed_ns) + ")";
+        return false;
+    }
+    return true;
+}
+
+static bool run_explicit_timeout_head_phase_differential(const char* rut_path, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#268 phase differential requires an executable absolute RUT path";
+        return false;
+    }
+    static constexpr TimeoutHeadPhase kPhases[] = {
+        TimeoutHeadPhase::ZeroProgressHold,
+        TimeoutHeadPhase::CompleteHeadSuccess,
+        TimeoutHeadPhase::DelayedPartialHeaderHold,
+    };
+    // Each side uses a distinct ephemeral backend port. Validate its Host
+    // rewrite by extracting that exact endpoint from the observed wire.
+    const auto validate_side = [&](const TimeoutHeadPhaseObservation& side, std::string& detail) {
+        const std::string wire(side.upstream.begin(), side.upstream.end());
+        const size_t host = wire.find("\r\nHost: 127.0.0.1:");
+        if (host == std::string::npos) {
+            detail = "#268 upstream Host endpoint was absent";
+            return false;
+        }
+        const size_t digits = host + strlen("\r\nHost: 127.0.0.1:");
+        const size_t end = wire.find("\r\n", digits);
+        if (end == std::string::npos) {
+            detail = "#268 upstream Host endpoint was unterminated";
+            return false;
+        }
+        char* parsed_end = nullptr;
+        errno = 0;
+        const std::string port_text = wire.substr(digits, end - digits);
+        const long parsed = strtol(port_text.c_str(), &parsed_end, 10);
+        if (errno != 0 || parsed_end == nullptr || *parsed_end != '\0' || parsed <= 0 ||
+            parsed > 65535) {
+            detail = "#268 upstream Host port was not canonical decimal";
+            return false;
+        }
+        return validate_timeout_head_phase_observation(side, static_cast<u16>(parsed), detail);
+    };
+    for (u32 index = 0u; index < std::size(kPhases); index++) {
+        TimeoutHeadPhaseObservation nginx;
+        TimeoutHeadPhaseObservation rut;
+        if (!capture_timeout_head_phase_side(rut_path, true, kPhases[index], index, nginx, error)) {
+            error = std::string("pinned nginx ") + timeout_head_phase_name(kPhases[index]) + ": " +
+                    error;
+            return false;
+        }
+        if (!validate_side(nginx, error)) {
+            error = std::string("pinned nginx oracle ") + timeout_head_phase_name(kPhases[index]) +
+                    " was unexpected: " + error;
+            dump_wire("#268 pinned nginx downstream", nginx.downstream);
+            dump_wire("#268 pinned nginx upstream", nginx.upstream);
+            return false;
+        }
+        std::cerr << "PASS: #268 pinned nginx " << timeout_head_phase_name(kPhases[index])
+                  << " oracle matched exact wire/count/timing evidence (request-to-first-byte="
+                  << static_cast<double>(nginx.first_downstream_byte_ns -
+                                         nginx.request_complete_ns) /
+                         1e9;
+        if (kPhases[index] == TimeoutHeadPhase::DelayedPartialHeaderHold)
+            std::cerr << ", fragment-delay="
+                      << static_cast<double>(nginx.last_origin_fragment_ns -
+                                             nginx.request_complete_ns) /
+                             1e9
+                      << ", fragment-to-first-byte="
+                      << static_cast<double>(nginx.first_downstream_byte_ns -
+                                             nginx.last_origin_fragment_ns) /
+                             1e9;
+        std::cerr << ")\n";
+        if (!capture_timeout_head_phase_side(rut_path, false, kPhases[index], index, rut, error)) {
+            error = std::string("generated RUT ") + timeout_head_phase_name(kPhases[index]) + ": " +
+                    error;
+            return false;
+        }
+        if (!validate_side(rut, error)) {
+            error = std::string("generated RUT ") + timeout_head_phase_name(kPhases[index]) +
+                    " mismatch: " + error;
+            dump_wire("#268 generated RUT downstream", rut.downstream);
+            dump_wire("#268 generated RUT upstream", rut.upstream);
+            return false;
+        }
+        std::vector<char> nginx_normalized = nginx.downstream;
+        std::vector<char> rut_normalized = rut.downstream;
+        if (!normalize_date(nginx_normalized) || !normalize_date(rut_normalized) ||
+            nginx_normalized != rut_normalized) {
+            error = std::string("#268 ") + timeout_head_phase_name(kPhases[index]) +
+                    " Date-normalized nginx/RUT response wires differed";
+            return false;
+        }
+        if (kPhases[index] != TimeoutHeadPhase::CompleteHeadSuccess) {
+            const u64 nginx_elapsed = nginx.first_downstream_byte_ns - nginx.last_progress_ns;
+            const u64 rut_elapsed = rut.first_downstream_byte_ns - rut.last_progress_ns;
+            const u64 delta = nginx_elapsed > rut_elapsed ? nginx_elapsed - rut_elapsed
+                                                          : rut_elapsed - nginx_elapsed;
+            if (delta > 350'000'000ull) {
+                error = std::string("#268 ") + timeout_head_phase_name(kPhases[index]) +
+                        " nginx/RUT timeout delta exceeded 350ms (nginx_ns=" +
+                        std::to_string(nginx_elapsed) + ", rut_ns=" + std::to_string(rut_elapsed) +
+                        ", delta_ns=" + std::to_string(delta) + ")";
+                return false;
+            }
+            std::cerr << "PASS: #268 " << timeout_head_phase_name(kPhases[index])
+                      << " nginx/RUT inactivity seconds="
+                      << static_cast<double>(nginx_elapsed) / 1e9 << "/"
+                      << static_cast<double>(rut_elapsed) / 1e9
+                      << " delta=" << static_cast<double>(delta) / 1e9 << "\n";
+            if (kPhases[index] == TimeoutHeadPhase::DelayedPartialHeaderHold) {
+                std::cerr << "PASS: #268 delayed partial-header origin-to-first-byte seconds="
+                          << static_cast<double>(nginx.first_downstream_byte_ns -
+                                                 nginx.last_origin_fragment_ns) /
+                                 1e9
+                          << "/"
+                          << static_cast<double>(rut.first_downstream_byte_ns -
+                                                 rut.last_origin_fragment_ns) /
+                                 1e9
+                          << " (pinned nginx retained the initial header-read deadline)\n";
+            }
+        } else {
+            std::cerr
+                << "PASS: #268 complete_head_success nginx/RUT request-to-first-byte "
+                   "seconds="
+                << static_cast<double>(nginx.first_downstream_byte_ns - nginx.request_complete_ns) /
+                       1e9
+                << "/"
+                << static_cast<double>(rut.first_downstream_byte_ns - rut.request_complete_ns) / 1e9
+                << " (both before the 750ms timeout floor)\n";
+        }
+    }
+    return true;
+}
+
 static void configure_positive_get_default_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -53465,6 +54187,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool explicit_timeout_head_generated_episode =
         argc == 3 && strcmp(argv[1], "--converter-explicit-timeout-head-generated-episode") == 0;
+    const bool explicit_timeout_head_phase_differential =
+        argc == 3 && strcmp(argv[1], "--explicit-timeout-head-phase-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -53668,6 +54392,7 @@ int main(int argc, char** argv) {
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
          !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !explicit_timeout_head_phase_differential &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
@@ -53738,7 +54463,8 @@ int main(int argc, char** argv) {
         ((proxy_hide_header_generated_side_self_check ||
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
-        (explicit_timeout_head_generated_episode && argv[2][0] != '/') ||
+        ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential) &&
+         argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
@@ -53827,6 +54553,8 @@ int main(int argc, char** argv) {
                "--converter-explicit-timeout-head-source-self-check\n"
                "   or: test_nginx_differential "
                "--converter-explicit-timeout-head-generated-episode <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--explicit-timeout-head-phase-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
                "<absolute-rut-executable>\n"
@@ -54959,6 +55687,18 @@ int main(int argc, char** argv) {
         if (!probe_error.empty()) std::cerr << probe_error << "\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
+    }
+    if (explicit_timeout_head_phase_differential) {
+        std::string phase_error;
+        if (!run_explicit_timeout_head_phase_differential(argv[2], phase_error)) {
+            std::cerr << "FAIL [#268 explicit-timeout HEAD phase differential]: " << phase_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #268 pinned nginx and converter-generated ordinary RUT matched "
+                     "zero-progress and delayed-progress 1s inactivity timing plus the complete "
+                     "HEAD success control\n";
+        return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
         const std::string container_name = "rut-nginx-268-positive-cl-options-" +
