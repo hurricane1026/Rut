@@ -8320,8 +8320,9 @@ inline bool fixed_upload_head_preconnect_failure_response_is_stable(
                 return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "date", 4)) {
             ++date_count;
-            if (require_normalized_date ? !response_read_deadline_http_date_is_normalized(header.value)
-                                        : header.value.len != 29)
+            if (require_normalized_date
+                    ? !response_read_deadline_http_date_is_normalized(header.value)
+                    : header.value.len != 29)
                 return false;
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12)) {
             ++content_type_count;
@@ -9372,8 +9373,9 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             !valid_status ||
             (domain == ConfiguredForwardFailureDomain::CompleteUnsupportedResponse &&
              conn.upstream_recv_buf.len() == 0) ||
-            !live_event || witnessed_status == 0)
+            !live_event || witnessed_status == 0) {
             return false;
+        }
 
         const bool deadline_owner =
             (first_batch && conn.response_read_deadline_first_batch &&
@@ -9389,9 +9391,12 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
              conn.response_read_deadline_bundle_id == bundle_id &&
              conn.response_read_deadline_profile == profile &&
              conn.response_read_deadline_buffering == buffering &&
-             conn.response_read_deadline_progress_generation == generation &&
-             conn.response_read_deadline_progress_episode == upload.upload_episode &&
-             conn.response_read_deadline_progress_bytes != 0 &&
+             ((conn.response_read_deadline_progress_generation == 0 &&
+               conn.response_read_deadline_progress_episode == 0 &&
+               conn.response_read_deadline_progress_bytes == 0 && ev.copy_begin == 0) ||
+              (conn.response_read_deadline_progress_generation == generation &&
+               conn.response_read_deadline_progress_episode == upload.upload_episode &&
+               conn.response_read_deadline_progress_bytes != 0)) &&
              response_read_deadline_upload_proof_equal(conn.response_read_deadline_upload,
                                                        upload)) ||
             (!first_batch && !progress_batch &&
@@ -9408,22 +9413,26 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
         const bool transport_owner = fixed_upload_head_success_proof_is_stable(
             conn, upload, config, bundle_id, profile, buffering, method, route_method);
         if (!deadline_owner || upload.upload_episode == 0 || method != conn.req_method ||
-            !response_read_deadline_route_method_matches(method, route_method) || !transport_owner)
+            !response_read_deadline_route_method_matches(method, route_method) ||
+            !transport_owner) {
             return false;
+        }
 
         const auto& bundle = config->policy_bundles[bundle_id - 1];
         if (bundle.response_buffering != buffering ||
             bundle.response_policy_id != conn.response_policy_id ||
             bundle.failure_policy_id != conn.failure_policy_id ||
             bundle.timeout_failure_policy_id != conn.timeout_failure_policy_id ||
-            !config->failure_policy_id_is_valid(conn.failure_policy_id))
+            !config->failure_policy_id_is_valid(conn.failure_policy_id)) {
             return false;
+        }
         const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
         if (failure.version != ForwardFailurePolicyVersion::Http11 ||
             failure.status_code != kStatusBadGateway ||
             failure.connection != ForwardFailurePolicyConnection::Request ||
-            failure.head_mode != FailurePolicyHeadMode::SuppressBody)
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody) {
             return false;
+        }
 
         u8 scratch[SlicePool::kSliceSize];
         u32 response_len = 0;
@@ -9435,8 +9444,9 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
                                            &response_len) ||
             response_len == 0 || response_len > conn.response_header_buf.capacity() ||
             !fixed_upload_head_configured_failure_response_is_stable(
-                conn, *config, scratch, response_len))
+                conn, *config, scratch, response_len)) {
             return false;
+        }
 
         conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::HeaderOnlyHead;
         conn.http1_prebuilt_response_purpose =
@@ -9664,7 +9674,6 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
-
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
     // late event re-enter parsing, release state twice, or append bytes.
@@ -9707,30 +9716,37 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (ps == ParseStatus::Incomplete) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
-        else if (explicit_progress_batch) {
-            if constexpr (requires(Loop* candidate, Connection& c, const IoEvent& event) {
-                              candidate->continue_response_read_deadline_after_incomplete(c, event);
-                          }) {
-                if (!loop->continue_response_read_deadline_after_incomplete(conn, ev))
+        else {
+            if (!configured_head_candidate) record_reused_response_health();
+            if (explicit_progress_batch) {
+                if constexpr (requires(Loop* candidate, Connection& c, const IoEvent& event) {
+                                  candidate->continue_response_read_deadline_after_incomplete(
+                                      c, event);
+                              }) {
+                    if (!loop->continue_response_read_deadline_after_incomplete(conn, ev))
+                        loop->close_conn(conn);
+                } else {
                     loop->close_conn(conn);
-            } else {
+                }
+                return;
+            } else if (explicit_first_batch) {
+                disarm_explicit_deadline();
                 loop->close_conn(conn);
+                return;
+            } else {
+                if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+                return;
             }
-            return;
-        } else if (explicit_first_batch) {
-            disarm_explicit_deadline();
-            loop->close_conn(conn);
-            return;
-        } else {
-            if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
-            return;
         }
     }
     if (ps == ParseStatus::Error) {
         if (try_configured_head_failure(
                 ConfiguredForwardFailureDomain::ValidStatusLineHeaderFailure))
             return;
-        if (!configured_head_candidate) record_reused_response_health();
+        // If the configured live-only classifier cannot admit this event
+        // (notably a terminal CQE), retain the legacy reused-origin health
+        // accounting and clear the one-shot marker before closing.
+        record_reused_response_health();
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         if ((explicit_first_batch || explicit_progress_batch) &&
             (explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
@@ -9851,7 +9867,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             strict_response_upload_ready(conn);
         const u32 raw_header_end = resp_parser.header_end;
         const u32 raw_total = conn.upstream_recv_buf.len();
-        const bool strict_cl0 = strict_common && resp.status_code == 200 &&
+        const bool strict_cl0 = strict_common && !fixed_upload_head && resp.status_code == 200 &&
                                 resp.content_length == 0 && raw_header_end == raw_total;
         const bool strict_positive_complete_buffering =
             strict_common &&
@@ -9890,7 +9906,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
-            if (!configured_head_candidate) record_reused_response_health();
+            record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9903,7 +9919,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
-            if (!configured_head_candidate) record_reused_response_health();
+            record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -9927,7 +9943,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
-            if (!configured_head_candidate) record_reused_response_health();
+            record_reused_response_health();
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
