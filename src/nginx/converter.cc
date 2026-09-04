@@ -1201,7 +1201,7 @@ FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
         timeout.milliseconds % 1000 != 0) {
         return unsupported(timeout.value_span, lit_str("invalid proxy_read_timeout milliseconds"));
     }
-    return unsupported(timeout.span, lit_str("proxy_read_timeout lowering is not implemented"));
+    return true;
 }
 
 enum class ProxyLocationDirectiveKind : u8 { ProxyPass, ProxyReadTimeout, ProxyHideHeader };
@@ -1610,7 +1610,7 @@ bool put_failure_policy(Writer& writer, bool suppress_body, bool buffered) {
            writer.put_cstr("\"\n") && writer.put_cstr(buffered ? "        },\n" : "        }\n");
 }
 
-bool put_timeout_failure_policy(Writer& writer) {
+bool put_timeout_failure_policy(Writer& writer, bool suppress_body) {
     return writer.put_cstr("        timeout_failure_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            status: 504,\n") &&
@@ -1619,6 +1619,7 @@ bool put_timeout_failure_policy(Writer& writer) {
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
            writer.put_cstr("            date: \"current\",\n") &&
            writer.put_cstr("            connection: \"request\",\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
            writer.put_cstr("            body: b\"") &&
            writer.put_lit(kGatewayTimeoutBody, sizeof(kGatewayTimeoutBody) - 1) &&
            writer.put_cstr("\"\n") && writer.put_cstr("        },\n");
@@ -1629,36 +1630,56 @@ bool put_root_forward(Writer& writer,
                       u32 method_len,
                       bool suppress_body,
                       bool buffered,
-                      bool hide_compat_header) {
+                      bool hide_compat_header,
+                      bool timeout_present,
+                      u8 timeout_seconds) {
     return writer.put_cstr("route ") &&
            (method_len == 0
                 ? writer.put_cstr("\"/\" {\n")
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
            writer.put_cstr("    return forward(nginx_upstream, ") && put_request_policy(writer) &&
            put_response_policy(writer, suppress_body, hide_compat_header) &&
-           put_failure_policy(writer, suppress_body, buffered) &&
-           (buffered ? put_timeout_failure_policy(writer) : true) &&
-           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
+           ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
+                                          : true) &&
+           (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
+                                        : true) &&
+           (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n}\n");
 }
 
-bool put_root_forward_action(
-    Writer& writer, bool suppress_body, bool buffered, bool hide_compat_header, Str indent) {
+bool put_root_forward_action(Writer& writer,
+                             bool suppress_body,
+                             bool buffered,
+                             bool hide_compat_header,
+                             bool timeout_present,
+                             u8 timeout_seconds,
+                             Str indent) {
     return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
            put_request_policy(writer) &&
            put_response_policy(writer, suppress_body, hide_compat_header) &&
-           put_failure_policy(writer, suppress_body, buffered) &&
-           (buffered ? put_timeout_failure_policy(writer) : true) &&
-           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
+           ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
+                                          : true) &&
+           (buffered || timeout_present ? writer.put_cstr("        response_read_timeout: ")
+                                        : true) &&
+           (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
+           (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n");
 }
 
-bool put_exact_absolute_redirect(
-    Writer& writer, Str location_path, u16 status, Str static_authority, Str target_path) {
+bool put_exact_absolute_redirect(Writer& writer,
+                                 Str location_path,
+                                 u16 status,
+                                 Str static_authority,
+                                 Str target_path,
+                                 bool timeout_present,
+                                 u8 timeout_seconds) {
     const char* reason = nullptr;
     const char* body = nullptr;
     u32 reason_len = 0;
@@ -1697,7 +1718,8 @@ bool put_exact_absolute_redirect(
            writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
            writer.put_lit(body, body_len) && writer.put_cstr("\"})\n") &&
            writer.put_cstr("    } else {\n") &&
-           put_root_forward_action(writer, false, true, false, lit_str("        ")) &&
+           put_root_forward_action(
+               writer, false, true, false, timeout_present, timeout_seconds, lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
 
@@ -1949,6 +1971,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!proxy_location) return core::make_unexpected(proxy_location.error());
     bool hide_compat_header = false;
     bool exact_listener = false;
+    const bool timeout_present = server.location.proxy_read_timeout.present;
+    u8 timeout_seconds = timeout_present ? 0u : 60u;
     if (proxy_hide_header_has_inventory(server.location.proxy_hide_header)) {
         auto listener =
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
@@ -1960,6 +1984,10 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     } else {
         auto timeout = validate_proxy_read_timeout(server);
         if (!timeout) return core::make_unexpected(timeout.error());
+        timeout_seconds =
+            timeout_present
+                ? static_cast<u8>(server.location.proxy_read_timeout.milliseconds / 1000u)
+                : 60u;
         auto listener =
             validate_listener(server, proxy_location.value(), exact_absolute_redirect.value());
         if (!listener) return core::make_unexpected(listener.error());
@@ -2031,15 +2059,38 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return fail_overflow();
 
     if (is_root) {
-        if (!put_root_forward(writer, "HEAD", 4, true, false, hide_compat_header) ||
+        if (!put_root_forward(writer,
+                              "HEAD",
+                              4,
+                              true,
+                              false,
+                              hide_compat_header,
+                              timeout_present,
+                              timeout_seconds) ||
             (exact_absolute_redirect.value()
                  ? !put_exact_absolute_redirect(writer,
                                                 server.exact_absolute_redirect.path,
                                                 server.exact_absolute_redirect.response.status,
                                                 server.exact_absolute_redirect.response.authority,
-                                                server.exact_absolute_redirect.response.path)
-                 : !put_root_forward(writer, "GET", 3, false, true, hide_compat_header)) ||
-            !put_root_forward(writer, "", 0, false, false, hide_compat_header) ||
+                                                server.exact_absolute_redirect.response.path,
+                                                timeout_present,
+                                                timeout_seconds)
+                 : !put_root_forward(writer,
+                                     "GET",
+                                     3,
+                                     false,
+                                     true,
+                                     hide_compat_header,
+                                     timeout_present,
+                                     timeout_seconds)) ||
+            !put_root_forward(writer,
+                              "",
+                              0,
+                              false,
+                              false,
+                              hide_compat_header,
+                              timeout_present,
+                              timeout_seconds) ||
             (exact_local_return.value() &&
              !put_exact_local_return(writer,
                                      server.exact_local_return.path,
