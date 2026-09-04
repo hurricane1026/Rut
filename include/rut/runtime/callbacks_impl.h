@@ -1266,7 +1266,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
              !(complete_buffering && route->method == kRouteMethodGet &&
                inspect_response_read_deadline_coalesced_get_phase1(conn))) ||
             (fixed_upload && (!inspect_response_read_deadline_fixed_upload_request(
-                                  conn, bundle.response_buffering, &upload_request) ||
+                                  conn, profile, bundle.response_buffering, &upload_request) ||
                               !response_read_deadline_route_index(*config, route, &route_index)))) {
             loop->close_conn(conn);
             return false;
@@ -3381,6 +3381,8 @@ void handle_jit_outcome(Loop* loop,
             const bool complete_content_length_buffering =
                 forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
             bool staged_fixed_head_continuation = false;
+            bool fixed_upload_head_admitted = false;
+            bool fixed_upload_head_initial_phase = false;
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
                     if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
@@ -3534,12 +3536,37 @@ void handle_jit_outcome(Loop* loop,
                         if (coalesced_get) proof.upstream_id = outcome.upstream_id;
                     }
                 }
+                fixed_upload_head_initial_phase =
+                    outcome_profile ==
+                        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+                    conn.response_read_deadline_profile ==
+                        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
+                    forward_response_buffering == ForwardResponseBufferingMode::None &&
+                    conn.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                    conn.response_read_deadline_method == conn.req_method && fn != nullptr &&
+                    fn == conn.response_read_deadline_upload.route_fn;
                 conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
             } else if (conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
                 // A preflight-marked route must return the same immutable bundle;
                 // absence or a mismatched outcome cannot silently shed timing.
                 loop->close_conn(conn);
                 return;
+            }
+            if (outcome.response_read_timeout_seconds != 0 && config != nullptr) {
+                const bool fixed_upload_head_policies_admitted =
+                    forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
+                    forward_timeout_failure_policy_id != 0 &&
+                    config->response_policies[forward_response_policy_id - 1].head_mode ==
+                        ResponsePolicyHeadMode::SuppressBody &&
+                    config->failure_policies[forward_failure_policy_id - 1].head_mode ==
+                        FailurePolicyHeadMode::SuppressBody &&
+                    config->failure_policies[forward_timeout_failure_policy_id - 1].head_mode ==
+                        FailurePolicyHeadMode::SuppressBody;
+                fixed_upload_head_admitted =
+                    fixed_upload_head_policies_admitted &&
+                    (fixed_upload_head_initial_phase || staged_fixed_head_continuation);
             }
             if (conn.target_transform_recorded) {
                 // Validate every deterministic Forward reference and the bounded
@@ -3663,14 +3690,7 @@ void handle_jit_outcome(Loop* loop,
                     conn,
                     config->response_policies[forward_response_policy_id - 1],
                     forward_failure_policy_id != 0);
-            if (staged_fixed_head_continuation && forward_response_policy_id != 0 &&
-                forward_failure_policy_id != 0 && forward_timeout_failure_policy_id != 0 &&
-                config->response_policies[forward_response_policy_id - 1].head_mode ==
-                    ResponsePolicyHeadMode::SuppressBody &&
-                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
-                    FailurePolicyHeadMode::SuppressBody &&
-                config->failure_policies[forward_timeout_failure_policy_id - 1].head_mode ==
-                    FailurePolicyHeadMode::SuppressBody) {
+            if (fixed_upload_head_admitted) {
                 suppress_body_head = true;
             }
             const bool suppress_failure_head =
@@ -7942,6 +7962,47 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
         response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true))
         return ResponseReadDeadlineProfile::HeaderOnlyHead;
+
+    // A positive Content-Length HEAD request still has to be uploaded in full
+    // before the response deadline owner can be published. The shared fixed
+    // upload inspector owns the request parser and exact framing proof; the
+    // classifier deliberately has no route/config knowledge.
+    ResponseReadDeadlineFixedUploadRequest fixed_upload_head{};
+    if (response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+        failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+        timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
+        response_read_deadline_fixed_upload_profile_method_admitted(
+            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead,
+            conn.req_method,
+            buffering) &&
+        conn.req_http_version == static_cast<u8>(HttpVersion::Http11) && conn.keep_alive &&
+        conn.req_client_keep_alive && !conn.req_client_connection_close &&
+        !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0 &&
+        conn.req_client_has_content_length && !conn.req_client_has_transfer_encoding &&
+        !conn.req_client_has_te && !conn.req_client_has_expect &&
+        !conn.req_client_has_upgrade_header && !conn.req_malformed && !conn.req_wants_upgrade &&
+        conn.req_path_canon.ptr != nullptr && conn.req_body_mode == BodyMode::ContentLength &&
+        !conn.request_body_fully_buffered && !conn.req_body_streamed &&
+        conn.request_policy_id == 0 && !conn.request_policy_body_pending &&
+        conn.pending_forward_request_policy_id == 0 &&
+        conn.pending_forward_response_policy_id == 0 &&
+        conn.pending_forward_failure_policy_id == 0 &&
+        conn.pending_forward_timeout_failure_policy_id == 0 &&
+        conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
+        conn.resp_header_mutation_count == 0 && conn.resp_header_mutation_pending_count == 0 &&
+        !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow &&
+        conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 &&
+        conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+        inspect_response_read_deadline_fixed_upload_request(
+            conn,
+            ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead,
+            buffering,
+            &fixed_upload_head) &&
+        fixed_upload_head.header_end == conn.req_header_end &&
+        fixed_upload_head.content_length == conn.req_content_length &&
+        conn.req_initial_send_len == conn.recv_buf.len() &&
+        conn.req_body_remaining == fixed_upload_head.total_length - conn.recv_buf.len())
+        return ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
 
     // A bounded fixed-upload profile keeps the complete request private until
     // the request policy has rebuilt it and the exact bytes have been sent on a
