@@ -36776,6 +36776,61 @@ TEST(iouring_response_read_timer,
     }
 }
 
+TEST(iouring_response_read_timer,
+     complete_head_response_wins_precise_timer_custody_in_both_orders) {
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    for (const bool response_first : {false, true}) {
+        for (const bool cancel_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_head(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+            neutralize_staged_precise_timer(loop, fixture);
+            REQUIRE(install_inert_response_read_timer_owner(
+                conn,
+                ResponseReadTimerPhase::Armed,
+                conn.response_read_deadline_generation,
+                conn.upstream_episode));
+            const u32 timer_generation = conn.response_read_timer_owner_generation;
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                        sizeof(kOrigin) - 1u);
+            const IoEvent response = response_read_copy_event(
+                conn, static_cast<i32>(sizeof(kOrigin) - 1u), true, 0, sizeof(kOrigin) - 1u);
+            const IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+            const IoEvent cancel = inert_response_read_timer_event(
+                conn.id, timer_generation | kResponseReadTimerCancelBit);
+            const IoEvent custody = cancel_first ? cancel : target;
+            const IoEvent events[2] = {response_first ? response : custody,
+                                       response_first ? custody : response};
+            loop->dispatch_batch(events, 2);
+
+            CHECK_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_EQ(conn.resp_status, 200u);
+            CHECK(conn.state == ConnState::Sending);
+            CHECK_GT(conn.response_header_buf.len(), 0u);
+            CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                                conn.response_header_buf.len(),
+                                "504 Gateway Time-out"));
+            const u32 header_len = conn.response_header_buf.len();
+            CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+            CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+            CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+
+            const IoEvent late = cancel_first ? target : cancel;
+            loop->dispatch(late);
+            CHECK(conn.response_read_timer_owner_is_neutral());
+            CHECK_EQ(conn.response_header_buf.len(), header_len);
+            CHECK_EQ(conn.resp_status, 200u);
+            CHECK_GE(conn.fd, 0);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
 TEST(iouring_response_read_timer, precise_fragmented_progress_without_timer_cqes_does_not_churn) {
     static constexpr u8 kFirst[] = "HTTP/1.1 200";
     static constexpr u8 kSecond[] = " OK\r\n";
@@ -36820,7 +36875,7 @@ TEST(iouring_response_read_timer, precise_fragmented_progress_without_timer_cqes
     cleanup_prebuilt_d2(loop, fixture);
 }
 
-TEST(iouring_response_read_timer, add_and_rearm_sq_full_fail_atomically_and_without_wheel) {
+TEST(iouring_response_read_timer, add_and_early_rearm_sq_full_fails_closed_without_wheel) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
@@ -36854,7 +36909,13 @@ TEST(iouring_response_read_timer, add_and_rearm_sq_full_fail_atomically_and_with
     loop->backend.ring_fd = -1;
     __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
     const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
-    loop->dispatch_batch(&timer, 1);
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                sizeof(kPartial) - 1u);
+    const IoEvent progress = response_read_copy_event(
+        conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+    const IoEvent events[2] = {timer, progress};
+    loop->dispatch_batch(events, 2);
     CHECK_EQ(conn.fd, -1);
     CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
     CHECK_EQ(conn.timer_node.next, &conn.timer_node);
