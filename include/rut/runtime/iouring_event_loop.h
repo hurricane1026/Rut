@@ -3255,7 +3255,24 @@ public:
                         c.clear_response_read_deadline();
                     continue;
                 }
-                if (!saw_semantic_target || !precise_active)
+                if (!precise_active) {
+                    // A semantic timer-only owner must not be left in
+                    // BatchPending when its full HeaderOnlyHead proof was
+                    // invalidated during the wait.  The small timer key was
+                    // enough to consume custody, but it cannot authorize a
+                    // rearm or ordinary expiry after the full proof fails.
+                    // A response in this same batch disarms the logical
+                    // deadline and leaves a downstream Sending owner; that
+                    // path has saw_relevant set (or is no longer
+                    // BatchPending) and remains custody-only here.
+                    if ((saw_semantic_target || saw_canceled_target) &&
+                        !owner.saw_relevant &&
+                        c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending &&
+                        c.fd >= 0)
+                        close_conn(c);
+                    continue;
+                }
+                if (!saw_semantic_target)
                     continue;
                 const u64 now_ns = monotonic_ns();
                 if (owner.saw_positive) {

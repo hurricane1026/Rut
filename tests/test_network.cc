@@ -36737,6 +36737,45 @@ TEST(iouring_response_read_timer, precise_terminal_and_timer_same_batch_fail_clo
     }
 }
 
+TEST(iouring_response_read_timer,
+     precise_timer_only_invalidated_head_proof_fails_closed_after_custody) {
+    enum class Mutation : u8 { RequestConfig, BundleResponsePolicy };
+    for (const Mutation mutation : {Mutation::RequestConfig, Mutation::BundleResponsePolicy}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_head(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        neutralize_staged_precise_timer(loop, fixture);
+        REQUIRE(install_inert_response_read_timer_owner(
+            conn,
+            ResponseReadTimerPhase::Armed,
+            conn.response_read_deadline_generation,
+            conn.upstream_episode));
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        if (mutation == Mutation::RequestConfig) {
+            conn.request_config = nullptr;
+        } else {
+            // Keep the small timer key intact while invalidating the full
+            // bundle/route-policy identity proof used by the precise owner.
+            config.policy_bundles[1].response_policy_id = 2;
+        }
+        CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+        const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
+        loop->dispatch_batch(&timer, 1);
+
+        CHECK_EQ(conn.fd, -1);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK_NE(conn.resp_status, 504u);
+        CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+        CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
 TEST(iouring_response_read_timer, precise_fragmented_progress_without_timer_cqes_does_not_churn) {
     static constexpr u8 kFirst[] = "HTTP/1.1 200";
     static constexpr u8 kSecond[] = " OK\r\n";
