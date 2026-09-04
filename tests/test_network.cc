@@ -53704,11 +53704,14 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
         errno = 0;
         if (exclusion.expected_close) {
             CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+            close(fixture.peer_fd);
+            fixture.peer_fd = -1;
+            fixture.conn = nullptr;
         } else {
             CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), -1);
             CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+            cleanup_prebuilt_d2(loop, fixture);
         }
-        cleanup_prebuilt_d2(loop, fixture);
     }
 
     for (const i32 terminal_result : {-ENOBUFS, -ECANCELED}) {
@@ -54508,7 +54511,9 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
         CHECK_FALSE(loop->conns[id].http1_boundary_ready);
         CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
         CHECK_EQ(loop->conns[id].upstream_retirement_cancel_owned, 0u);
-        cleanup_prebuilt_d2(loop, fixture);
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
     }
 }
 
