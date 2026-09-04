@@ -2940,6 +2940,52 @@ public:
         return true;
     }
 
+    // Publish cumulative response progress only after the wait-batch copy
+    // ledger, the live deadline owner, the receive continuation, and the
+    // cumulative parser result all agree.  Keeping this transition separate
+    // from the transport timer clock lets a policy choose whether accepted
+    // bytes move its deadline origin without weakening the progress proof used
+    // by a later expiry.
+    [[nodiscard]] bool commit_response_read_deadline_incomplete_progress(
+        Connection& c, const ResponseReadBatchOwner& owner) {
+        if (!owner.valid || !owner.saw_positive || owner.terminal_fault || owner.conn_id != c.id ||
+            owner.deadline_generation == 0 ||
+            owner.deadline_generation != c.response_read_deadline_generation ||
+            owner.upstream_episode != c.upstream_episode ||
+            c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending ||
+            !c.upstream_recv_armed || !response_read_deadline_identity_is_stable(c))
+            return false;
+
+        const u32 total = c.upstream_recv_buf.len();
+        if (total == 0 || owner.expected_copy_end != total ||
+            owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+            owner.first_copy_begin + owner.positive_bytes != total)
+            return false;
+        const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
+                                       c.response_read_deadline_progress_episode == 0 &&
+                                       c.response_read_deadline_progress_bytes == 0;
+        const bool exact_prior_progress =
+            c.response_read_deadline_progress_generation == owner.deadline_generation &&
+            c.response_read_deadline_progress_episode == owner.upstream_episode &&
+            c.response_read_deadline_progress_bytes == owner.first_copy_begin &&
+            owner.first_copy_begin != 0;
+        if ((owner.first_copy_begin == 0 && !no_prior_progress) ||
+            (owner.first_copy_begin != 0 && !exact_prior_progress))
+            return false;
+
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(c.upstream_recv_buf.data(), total, &response) != ParseStatus::Incomplete)
+            return false;
+
+        c.response_read_deadline_progress_generation = owner.deadline_generation;
+        c.response_read_deadline_progress_episode = owner.upstream_episode;
+        c.response_read_deadline_progress_bytes = total;
+        return true;
+    }
+
     [[nodiscard]] bool begin_response_read_deadline_body_stream(Connection& c,
                                                                 const IoEvent& ev,
                                                                 u32 raw_header_end,
@@ -3264,17 +3310,13 @@ public:
                         close_conn(c);
                     continue;
                 }
-                if (!saw_semantic_target) continue;
-                const u64 now_ns = monotonic_ns();
-                if (owner.saw_positive) {
-                    c.response_read_timer_last_progress_ns = now_ns;
-                    if (!rearm_precise_response_read_timer(c, now_ns)) {
-                        if (c.fd >= 0) close_conn(c);
-                    } else {
-                        c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
-                    }
+                if (owner.saw_positive &&
+                    !commit_response_read_deadline_incomplete_progress(c, owner)) {
+                    if (c.fd >= 0) close_conn(c);
                     continue;
                 }
+                if (!saw_semantic_target) continue;
+                const u64 now_ns = monotonic_ns();
                 const u64 timeout_ns =
                     static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
                 const u64 last = c.response_read_timer_last_progress_ns;
@@ -3442,7 +3484,10 @@ public:
                     continue;
                 }
                 if (response_read_deadline_uses_precise_timer(c)) {
-                    c.response_read_timer_last_progress_ns = monotonic_ns();
+                    if (!commit_response_read_deadline_incomplete_progress(c, owner)) {
+                        close_conn(c);
+                        continue;
+                    }
                     c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
                     continue;
                 }
