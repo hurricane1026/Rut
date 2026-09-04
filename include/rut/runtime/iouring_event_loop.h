@@ -2362,9 +2362,19 @@ public:
     bool response_read_deadline_profile_is_stable(const Connection& c,
                                                   const RouteConfig& cfg,
                                                   u16 bundle_id) const {
-        return c.request_config == &cfg && c.response_read_deadline_bundle_id == bundle_id &&
-               response_read_deadline_owner_is_stable(
-                   c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ActiveAfterCopy);
+        if (c.request_config != &cfg || c.response_read_deadline_bundle_id != bundle_id)
+            return false;
+        if (c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            c.response_read_deadline_upload.downstream_close)
+            return header_only_head_explicit_close_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                &cfg,
+                bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Self>);
+        return response_read_deadline_owner_is_stable(
+            c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ActiveAfterCopy);
     }
 
     [[nodiscard]] bool arm_first_response_read_deadline(Connection& c) {
@@ -2384,10 +2394,24 @@ public:
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
             bundle.failure_policy_id != c.failure_policy_id ||
-            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
-            !response_read_deadline_owner_is_stable(
-                c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm))
+            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id)
             return false;
+        const bool special_shape =
+            c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            c.response_read_deadline_upload.downstream_close;
+        const bool owner_stable =
+            !special_shape &&
+            response_read_deadline_owner_is_stable(
+                c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm);
+        const bool header_only_head_explicit_close =
+            special_shape && header_only_head_explicit_close_arm_is_stable(
+                                 c,
+                                 c.response_read_deadline_upload,
+                                 cfg,
+                                 bundle_id,
+                                 ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm,
+                                 &on_upstream_response<Self>);
+        if (!owner_stable && !header_only_head_explicit_close) return false;
         if (c.upstream_idx >= cfg->upstream_count ||
             cfg->upstreams[c.upstream_idx].addr_count != 1 ||
             cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET)
@@ -2480,6 +2504,13 @@ public:
                  ResponseReadDeadlinePostCommitPhase::Buffering) &&
             (c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
              c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
+        const bool header_only_head_explicit_close = header_only_head_explicit_close_arm_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            cfg,
+            bundle_id,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+            &on_upstream_response<Self>);
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_upload_active_is_stable(
                 c,
@@ -2495,10 +2526,10 @@ public:
                !c.upstream_request_incomplete &&
                (c.on_upstream_recv == &on_upstream_response<Self> ||
                 (post_commit && c.on_upstream_recv == nullptr)) &&
-               pipeline_generation_stable && !c.target_transform_recorded &&
-               !c.req_path_overridden && c.req_header_override_count == 0 &&
-               !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
-               c.resp_header_mutation_pending_count == 0 &&
+               (pipeline_generation_stable || header_only_head_explicit_close) &&
+               !c.target_transform_recorded && !c.req_path_overridden &&
+               c.req_header_override_count == 0 && !c.req_header_override_overflow &&
+               c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
                !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
                !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
                !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&

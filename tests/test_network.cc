@@ -35672,6 +35672,7 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     capture_request_metadata(*conn);
     conn->keep_alive = false;
+    conn->handler_gen = 1;
     conn->request_config = &config;
     REQUIRE(prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
     CHECK(conn->response_read_deadline_upload.downstream_close);
@@ -35694,6 +35695,171 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     CHECK(conn->upstream_connect_armed);
     CHECK_FALSE(conn->upstream_recv_armed);
 
+    loop->dispatch({id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+    REQUIRE(conn->upstream_send_armed);
+    auto& send = loop->backend.upstream_send_state[id];
+    REQUIRE_EQ(send.type, IoEventType::UpstreamSend);
+    REQUIRE_EQ(send.src, conn->recv_buf.data());
+    REQUIRE_EQ(send.fd, conn->upstream_fd);
+    REQUIRE_EQ(send.offset, 0u);
+    const u32 sent_len = send.remaining;
+    REQUIRE_GT(sent_len, 0u);
+    send.offset = sent_len;
+    send.remaining = 0;
+    loop->dispatch(
+        {id, static_cast<i32>(sent_len), 0, 0, IoEventType::UpstreamSend, 0, 0, episode});
+    CHECK_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK(conn->fd >= 0);
+    CHECK(conn->upstream_recv_armed);
+    REQUIRE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    auto proof = conn->response_read_deadline_upload;
+    conn->response_read_deadline_upload.handler_generation++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.route_index = 0xffffu;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.route_fn = nullptr;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.upstream_id = 1;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.upload_episode++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.raw_header_end++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.raw_content_length++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.raw_total_length++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.expected_upload_length++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.rewritten_header_end++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_upload.rewritten_total_length++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_upload = proof;
+    conn->response_read_deadline_state = ResponseReadDeadlineState::None;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    const u32 deadline_generation = conn->response_read_deadline_generation;
+    conn->response_read_deadline_generation++;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_generation = deadline_generation;
+
+    const u16 deadline_bundle_id = conn->response_read_deadline_bundle_id;
+    conn->response_read_deadline_bundle_id = 1;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->response_read_deadline_bundle_id = deadline_bundle_id;
+    const RouteConfig* request_config = conn->request_config;
+    conn->request_config = nullptr;
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        request_config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    conn->request_config = request_config;
+
     conn->response_read_deadline_upload.request_policy_id = 0;
     CHECK_FALSE(
         header_only_head_explicit_close_is_stable(*conn, conn->response_read_deadline_upload));
@@ -35701,14 +35867,40 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     conn->req_client_connection_close_exact = false;
     CHECK_FALSE(
         header_only_head_explicit_close_is_stable(*conn, conn->response_read_deadline_upload));
+    CHECK_FALSE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
     conn->req_client_connection_close_exact = true;
+
+    loop->timer.remove(conn);
+    loop->timer.add(conn, 0);
+    loop->dispatch({id, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::ExpiryPending);
+    CHECK(loop->response_read_deadline_expiry_pending);
+    REQUIRE(header_only_head_explicit_close_arm_is_stable(
+        *conn,
+        conn->response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    const u16 expiry_bundle_id = conn->response_read_deadline_bundle_id;
+    conn->response_read_deadline_bundle_id = 1;
+    CHECK_FALSE(loop->response_read_deadline_identity_is_stable(*conn));
+    conn->response_read_deadline_bundle_id = expiry_bundle_id;
 
     loop->close_conn(*conn);
     __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
-    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
     loop->dispatch(
-        {id, -ENOENT, 0, 0, IoEventType::UpstreamConnect, 0, kUpstreamCloseCancelAux, episode});
+        {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamCloseCancelAux, episode});
+    CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+    CHECK_FALSE(loop->backend.fatal_error.load(std::memory_order_acquire));
     close(downstream[1]);
 }
 

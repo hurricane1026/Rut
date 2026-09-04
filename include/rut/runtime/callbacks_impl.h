@@ -1223,7 +1223,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             bundle.response_buffering == ForwardResponseBufferingMode::None &&
             conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
             !conn.req_client_keep_alive && conn.req_client_connection_close &&
-            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1 &&
+            conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0;
         const bool preflight_downstream_close =
             complete_buffering &&
             profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1298,7 +1299,9 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
                 conn.http1_pipeline_request_generation;
         }
         conn.response_read_deadline_upload.downstream_close = downstream_close;
-        if (conn.recv_buf.len() > conn.req_initial_send_len) {
+        if (conn.recv_buf.len() > conn.req_initial_send_len ||
+            (profile == ResponseReadDeadlineProfile::HeaderOnlyHead && conn.pipeline_depth == 0 &&
+             conn.http1_pipeline_request_generation == 0)) {
             auto& proof = conn.response_read_deadline_upload;
             if (!response_read_deadline_route_index(*config, route, &route_index)) {
                 loop->close_conn(conn);
@@ -3446,7 +3449,9 @@ void handle_jit_outcome(Loop* loop,
                     conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
                     conn.response_read_deadline_upload.downstream_close &&
                     !conn.req_client_keep_alive && conn.req_client_connection_close &&
-                    conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+                    conn.req_client_connection_close_exact &&
+                    conn.req_client_connection_count == 1 && conn.pipeline_depth == 0 &&
+                    conn.http1_pipeline_request_generation == 0;
                 const auto& deadline_proof = conn.response_read_deadline_upload;
                 const bool coalesced_get =
                     outcome_profile ==
@@ -3556,12 +3561,19 @@ void handle_jit_outcome(Loop* loop,
                     }
                 } else if (header_only_head_explicit_close) {
                     auto& proof = conn.response_read_deadline_upload;
-                    if (proof.request_policy_id != 0 ||
+                    if (proof.handler_generation == 0 ||
+                        proof.handler_generation != conn.handler_gen || proof.route_fn == nullptr ||
+                        fn == nullptr || proof.route_fn != fn ||
+                        proof.route_index >= config->route_count ||
+                        (proof.upstream_id != 0xffffu &&
+                         proof.upstream_id != outcome.upstream_id) ||
+                        proof.request_policy_id != 0 ||
                         outcome.request_policy_id !=
                             static_cast<u16>(RequestPolicyId::Http11FixedStrip)) {
                         loop->close_conn(conn);
                         return;
                     }
+                    proof.upstream_id = outcome.upstream_id;
                     proof.request_policy_id = outcome.request_policy_id;
                 }
                 fixed_upload_head_initial_phase =
@@ -3911,6 +3923,27 @@ void handle_jit_outcome(Loop* loop,
                     proof.rewritten_header_end = rewritten.header_end;
                     proof.rewritten_total_length = rewritten.total_length;
                     proof.expected_upload_length = rewritten.total_length;
+                }
+                if (conn.response_read_deadline_profile ==
+                        ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                    conn.response_read_deadline_upload.downstream_close &&
+                    conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0) {
+                    auto& proof = conn.response_read_deadline_upload;
+                    if (conn.request_policy_id !=
+                            static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                        proof.handler_generation == 0 ||
+                        proof.handler_generation != conn.handler_gen || proof.route_fn == nullptr ||
+                        proof.upstream_id != outcome.upstream_id || conn.req_header_end == 0 ||
+                        conn.req_initial_send_len != conn.req_header_end ||
+                        conn.req_initial_send_len != conn.recv_buf.len() ||
+                        conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+                        conn.request_body_fully_buffered || conn.req_body_streamed) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                    proof.rewritten_header_end = conn.req_header_end;
+                    proof.rewritten_total_length = conn.req_initial_send_len;
+                    proof.expected_upload_length = conn.req_initial_send_len;
                 }
                 request_policy_prepared = true;
             }
@@ -5604,6 +5637,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // (header plus any already-buffered fixed body). Do not infer this from
     // req_body_remaining: that counter is advanced before asynchronous writes.
     conn.request_upload_complete = true;
+    if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+        conn.response_read_deadline_upload.downstream_close && conn.pipeline_depth == 0 &&
+        conn.http1_pipeline_request_generation == 0)
+        conn.response_read_deadline_upload.upload_episode = conn.upstream_episode;
 
     // FRESH (non-retry) send path: recv_buf still holds exactly the just-sent request
     // (plus any pipelined surplus after it). Stash that surplus, optionally snapshot
