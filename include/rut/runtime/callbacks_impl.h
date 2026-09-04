@@ -9944,8 +9944,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                         conn.response_read_deadline_first_batch = false;
                         conn.response_read_deadline_state =
                             ResponseReadDeadlineState::RefreshPending;
-                        if (!ev.more && !loop->submit_recv_upstream(conn))
-                            loop->close_conn(conn);
+                        if (!ev.more && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
                         return;
                     }
                 }

@@ -2511,11 +2511,11 @@ public:
         if (response_read_deadline_uses_precise_timer(c)) {
             timer.remove(&c);
             const bool precise_timer_ok = backend.add_response_read_timer(
-                    c.id,
-                    c,
-                    static_cast<u32>(c.response_read_deadline_seconds) * 1000u,
-                    c.response_read_deadline_generation,
-                    c.upstream_episode);
+                c.id,
+                c,
+                static_cast<u32>(c.response_read_deadline_seconds) * 1000u,
+                c.response_read_deadline_generation,
+                c.upstream_episode);
             if (!precise_timer_ok) {
                 c.clear_response_read_deadline();
                 return false;
@@ -2541,30 +2541,26 @@ public:
             c.response_read_deadline_upstream_episode != c.upstream_episode)
             return false;
         const RouteConfig* cfg = c.request_config;
-        return cfg != nullptr &&
-               header_only_head_explicit_close_arm_is_stable(
-                   c,
-                   c.response_read_deadline_upload,
-                   cfg,
-                   c.response_read_deadline_bundle_id,
-                   ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
-                   &on_upstream_response<Self>);
+        return cfg != nullptr && header_only_head_explicit_close_arm_is_stable(
+                                     c,
+                                     c.response_read_deadline_upload,
+                                     cfg,
+                                     c.response_read_deadline_bundle_id,
+                                     ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                                     &on_upstream_response<Self>);
     }
 
     [[nodiscard]] bool rearm_precise_response_read_timer(Connection& c, u64 now_ns) {
         if (!response_read_deadline_uses_precise_timer(c) ||
             c.response_read_timer_last_progress_ns == 0)
             return false;
-        const u64 timeout_ns = static_cast<u64>(c.response_read_deadline_seconds) *
-                               1'000'000'000ull;
+        const u64 timeout_ns =
+            static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
         const u32 remaining_ms = response_read_timer_remaining_ms(
             c.response_read_timer_last_progress_ns, timeout_ns, now_ns);
         if (remaining_ms == 0) return false;
-        return backend.add_response_read_timer(c.id,
-                                               c,
-                                               remaining_ms,
-                                               c.response_read_deadline_generation,
-                                               c.upstream_episode);
+        return backend.add_response_read_timer(
+            c.id, c, remaining_ms, c.response_read_deadline_generation, c.upstream_episode);
     }
 
     void disarm_response_read_deadline(Connection& c) {
@@ -2773,8 +2769,7 @@ public:
                     (ev.non_upstream_generation & kResponseReadTimerGenerationMask) ==
                         owner.precise_timer_generation;
                 owner.saw_precise_timer = true;
-                const bool cancel =
-                    (ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+                const bool cancel = (ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
                 if (cancel) {
                     if (owner.precise_timer_cancel_seen) owner.valid = false;
                     owner.precise_timer_cancel_seen = true;
@@ -3205,8 +3200,8 @@ public:
                         if (timer_ev.type != IoEventType::ResponseReadTimer ||
                             timer_ev.conn_id != owner.conn_id)
                             continue;
-                        const u32 generation = timer_ev.non_upstream_generation &
-                                               kResponseReadTimerGenerationMask;
+                        const u32 generation =
+                            timer_ev.non_upstream_generation & kResponseReadTimerGenerationMask;
                         if (!valid_response_read_timer_transport_event(timer_ev) ||
                             generation != owner.precise_timer_generation ||
                             !c.consume_response_read_timer_completion(
@@ -3214,13 +3209,12 @@ public:
                             custody_ok = false;
                             continue;
                         }
-                        const bool cancel = (timer_ev.non_upstream_generation &
-                                             kResponseReadTimerCancelBit) != 0;
+                        const bool cancel =
+                            (timer_ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
                         if (cancel) {
                             if (timer_ev.result != 0 && timer_ev.result != -ENOENT)
                                 custody_ok = false;
-                        } else if (timer_ev.result != -ETIME &&
-                                   timer_ev.result != -ECANCELED) {
+                        } else if (timer_ev.result != -ETIME && timer_ev.result != -ECANCELED) {
                             custody_ok = false;
                         }
                         if (!cancel && owner.precise_timer_semantic) {
@@ -3251,8 +3245,7 @@ public:
                     // A cancelled target can arrive before its cancel CQE.
                     // Keep the logical identity until the second owner drains;
                     // only a fully neutral transport owner may be cleared here.
-                    if (!c.response_read_timer_cancel_owned)
-                        c.clear_response_read_deadline();
+                    if (!c.response_read_timer_cancel_owned) c.clear_response_read_deadline();
                     continue;
                 }
                 if (!precise_active) {
@@ -3265,15 +3258,13 @@ public:
                     // deadline and leaves a downstream Sending owner; that
                     // path has saw_relevant set (or is no longer
                     // BatchPending) and remains custody-only here.
-                    if ((saw_semantic_target || saw_canceled_target) &&
-                        !owner.saw_relevant &&
+                    if ((saw_semantic_target || saw_canceled_target) && !owner.saw_relevant &&
                         c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending &&
                         c.fd >= 0)
                         close_conn(c);
                     continue;
                 }
-                if (!saw_semantic_target)
-                    continue;
+                if (!saw_semantic_target) continue;
                 const u64 now_ns = monotonic_ns();
                 if (owner.saw_positive) {
                     c.response_read_timer_last_progress_ns = now_ns;
@@ -3284,8 +3275,8 @@ public:
                     }
                     continue;
                 }
-                const u64 timeout_ns = static_cast<u64>(c.response_read_deadline_seconds) *
-                                       1'000'000'000ull;
+                const u64 timeout_ns =
+                    static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
                 const u64 last = c.response_read_timer_last_progress_ns;
                 const bool due = response_read_timer_remaining_ms(last, timeout_ns, now_ns) == 0;
                 if (due) {

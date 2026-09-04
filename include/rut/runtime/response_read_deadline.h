@@ -11,9 +11,7 @@ namespace rut {
 
 // Pure millisecond rounding used when a precise timeout CQE arrives before
 // its logical deadline. A zero result means the deadline is due now.
-inline u32 response_read_timer_remaining_ms(u64 last_progress_ns,
-                                             u64 timeout_ns,
-                                             u64 now_ns) {
+inline u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
     if (last_progress_ns == 0 || timeout_ns > UINT64_MAX - last_progress_ns ||
         now_ns >= last_progress_ns + timeout_ns)
         return 0;

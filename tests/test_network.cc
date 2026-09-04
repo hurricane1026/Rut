@@ -26959,28 +26959,26 @@ TEST(iouring_response_read_timer, precise_activation_is_exact_and_remaining_time
     conn.req_client_connection_count = 1;
     conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
-    CHECK(header_only_head_explicit_close_is_stable(
-        conn, conn.response_read_deadline_upload));
+    CHECK(header_only_head_explicit_close_is_stable(conn, conn.response_read_deadline_upload));
 
     conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
-    CHECK_FALSE(header_only_head_explicit_close_is_stable(
-        conn, conn.response_read_deadline_upload));
+    CHECK_FALSE(
+        header_only_head_explicit_close_is_stable(conn, conn.response_read_deadline_upload));
     conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None;
     conn.pipeline_depth = 1;
-    CHECK_FALSE(header_only_head_explicit_close_is_stable(
-        conn, conn.response_read_deadline_upload));
+    CHECK_FALSE(
+        header_only_head_explicit_close_is_stable(conn, conn.response_read_deadline_upload));
     conn.pipeline_depth = 0;
     conn.request_policy_id = 0;
-    CHECK_FALSE(header_only_head_explicit_close_is_stable(
-        conn, conn.response_read_deadline_upload));
+    CHECK_FALSE(
+        header_only_head_explicit_close_is_stable(conn, conn.response_read_deadline_upload));
 
     CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 100), 1000u);
     CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 100'000'101), 900u);
     CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 1'000'000'100), 0u);
 }
 
-TEST(iouring_response_read_timer,
-     post_disarm_custody_cqes_never_close_live_owner_in_either_order) {
+TEST(iouring_response_read_timer, post_disarm_custody_cqes_never_close_live_owner_in_either_order) {
     for (const bool cancel_first : {false, true}) {
         for (const i32 cancel_result : {0, -ENOENT}) {
             ScopedIoUringLoopForRetirement guard;
@@ -26999,8 +26997,8 @@ TEST(iouring_response_read_timer,
 
             IoEvent target = inert_response_read_timer_event(conn->id, generation);
             target.result = -ECANCELED;
-            IoEvent cancel = inert_response_read_timer_event(
-                conn->id, generation | kResponseReadTimerCancelBit);
+            IoEvent cancel =
+                inert_response_read_timer_event(conn->id, generation | kResponseReadTimerCancelBit);
             cancel.result = cancel_result;
             const IoEvent events[2] = {cancel_first ? cancel : target,
                                        cancel_first ? target : cancel};
@@ -27031,8 +27029,8 @@ TEST(iouring_response_read_timer,
         if (malformed_kind == 0) malformed.non_upstream_generation = generation + 1u;
         if (malformed_kind == 1) malformed.aux = 1;
         if (malformed_kind == 2) {
-            IoEvent cancel = inert_response_read_timer_event(
-                conn->id, generation | kResponseReadTimerCancelBit);
+            IoEvent cancel =
+                inert_response_read_timer_event(conn->id, generation | kResponseReadTimerCancelBit);
             cancel.result = 0;
             const IoEvent duplicate[3] = {malformed, malformed, cancel};
             loop->dispatch_batch(duplicate, 3);
@@ -27046,8 +27044,8 @@ TEST(iouring_response_read_timer,
         CHECK_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
         IoEvent target = inert_response_read_timer_event(conn->id, generation);
         target.result = -ECANCELED;
-        IoEvent cancel = inert_response_read_timer_event(
-            conn->id, generation | kResponseReadTimerCancelBit);
+        IoEvent cancel =
+            inert_response_read_timer_event(conn->id, generation | kResponseReadTimerCancelBit);
         cancel.result = 0;
         const IoEvent valid[2] = {target, cancel};
         loop->dispatch_batch(valid, 2);
@@ -29294,9 +29292,7 @@ void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
 // The live explicit-close HEAD path deliberately stages its SQEs without
 // submitting them in these focused tests.  Keep the original ring position so
 // synthetic CQEs cannot leave a kernel-owned timespec behind at teardown.
-bool stage_live_precise_head(IoUringEventLoop* loop,
-                             RouteConfig& config,
-                             PrebuiltD2Fixture* out) {
+bool stage_live_precise_head(IoUringEventLoop* loop, RouteConfig& config, PrebuiltD2Fixture* out) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !add_response_read_deadline_bundle(config, 5) ||
@@ -36304,8 +36300,7 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     REQUIRE_GT(sent_len, 0u);
     send.offset = sent_len;
     send.remaining = 0;
-    const u32 arm_sq_tail_before =
-        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 arm_sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 arm_pending_before = loop->backend.pending;
     loop->dispatch(
         {id, static_cast<i32>(sent_len), 0, 0, IoEventType::UpstreamSend, 0, 0, episode});
@@ -36539,8 +36534,8 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
     IoEvent timer_target = inert_response_read_timer_event(id, timer_generation);
     timer_target.result = -ECANCELED;
-    IoEvent timer_cancel = inert_response_read_timer_event(
-        id, timer_generation | kResponseReadTimerCancelBit);
+    IoEvent timer_cancel =
+        inert_response_read_timer_event(id, timer_generation | kResponseReadTimerCancelBit);
     timer_cancel.result = 0;
     const IoEvent timer_events[2] = {timer_target, timer_cancel};
     loop->dispatch_batch(timer_events, 2);
@@ -36565,8 +36560,7 @@ TEST(iouring_response_read_timer, precise_arm_publishes_transport_owner_after_li
     CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
     CHECK(conn.response_read_timer_target_owned);
     CHECK_FALSE(conn.response_read_timer_cancel_owned);
-    CHECK_EQ(conn.response_read_timer_deadline_generation,
-             conn.response_read_deadline_generation);
+    CHECK_EQ(conn.response_read_timer_deadline_generation, conn.response_read_deadline_generation);
     CHECK_EQ(conn.response_read_timer_upstream_episode, conn.upstream_episode);
     CHECK_EQ(conn.response_read_timer_timespec.tv_sec, 5);
     CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, 0);
@@ -36634,7 +36628,8 @@ TEST(iouring_response_read_timer, precise_early_etime_rearms_with_ceil_remaining
     CHECK_EQ(sqe.len, 1u);
     CHECK_EQ(sqe.off, 0u);
     CHECK(conn.response_read_timer_timespec.tv_sec >= 0);
-    CHECK(conn.response_read_timer_timespec.tv_nsec > 0 || conn.response_read_timer_timespec.tv_sec > 0);
+    CHECK(conn.response_read_timer_timespec.tv_nsec > 0 ||
+          conn.response_read_timer_timespec.tv_sec > 0);
     CHECK_EQ(conn.timer_node.next, &conn.timer_node);
     CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
 
@@ -36660,7 +36655,7 @@ TEST(iouring_response_read_timer, precise_progress_and_timer_same_batch_rearm_in
         const u32 old_timer_generation = conn.response_read_timer_owner_generation;
         const u64 before_progress = conn.response_read_timer_last_progress_ns;
         REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
-                    sizeof(kPartial) - 1u);
+                   sizeof(kPartial) - 1u);
         const IoEvent progress =
             response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
         const IoEvent timeout = inert_response_read_timer_event(conn.id, old_timer_generation);
@@ -36707,14 +36702,8 @@ TEST(iouring_response_read_timer, precise_terminal_and_timer_same_batch_fail_clo
                 conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
             const u32 timer_generation = conn.response_read_timer_owner_generation;
             const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
-            const IoEvent terminal{conn.id,
-                                   terminal_result,
-                                   0,
-                                   0,
-                                   IoEventType::UpstreamRecv,
-                                   0,
-                                   0,
-                                   logical_episode};
+            const IoEvent terminal{
+                conn.id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, logical_episode};
             const IoEvent events[2] = {timer_first ? timer : terminal,
                                        timer_first ? terminal : timer};
             loop->dispatch_batch(events, 2);
@@ -36749,11 +36738,10 @@ TEST(iouring_response_read_timer,
         REQUIRE(stage_live_precise_head(loop, config, &fixture));
         Connection& conn = *fixture.conn;
         neutralize_staged_precise_timer(loop, fixture);
-        REQUIRE(install_inert_response_read_timer_owner(
-            conn,
-            ResponseReadTimerPhase::Armed,
-            conn.response_read_deadline_generation,
-            conn.upstream_episode));
+        REQUIRE(install_inert_response_read_timer_owner(conn,
+                                                        ResponseReadTimerPhase::Armed,
+                                                        conn.response_read_deadline_generation,
+                                                        conn.upstream_episode));
         const u32 timer_generation = conn.response_read_timer_owner_generation;
         if (mutation == Mutation::RequestConfig) {
             conn.request_config = nullptr;
@@ -36789,14 +36777,13 @@ TEST(iouring_response_read_timer,
             REQUIRE(stage_live_precise_head(loop, config, &fixture));
             Connection& conn = *fixture.conn;
             neutralize_staged_precise_timer(loop, fixture);
-            REQUIRE(install_inert_response_read_timer_owner(
-                conn,
-                ResponseReadTimerPhase::Armed,
-                conn.response_read_deadline_generation,
-                conn.upstream_episode));
+            REQUIRE(install_inert_response_read_timer_owner(conn,
+                                                            ResponseReadTimerPhase::Armed,
+                                                            conn.response_read_deadline_generation,
+                                                            conn.upstream_episode));
             const u32 timer_generation = conn.response_read_timer_owner_generation;
             REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
-                        sizeof(kOrigin) - 1u);
+                       sizeof(kOrigin) - 1u);
             const IoEvent response = response_read_copy_event(
                 conn, static_cast<i32>(sizeof(kOrigin) - 1u), true, 0, sizeof(kOrigin) - 1u);
             const IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
@@ -36842,11 +36829,10 @@ TEST(iouring_response_read_timer, precise_fragmented_progress_without_timer_cqes
     REQUIRE(stage_live_precise_head(loop, config, &fixture));
     Connection& conn = *fixture.conn;
     neutralize_staged_precise_timer(loop, fixture);
-    REQUIRE(install_inert_response_read_timer_owner(
-        conn,
-        ResponseReadTimerPhase::Armed,
-        conn.response_read_deadline_generation,
-        conn.upstream_episode));
+    REQUIRE(install_inert_response_read_timer_owner(conn,
+                                                    ResponseReadTimerPhase::Armed,
+                                                    conn.response_read_deadline_generation,
+                                                    conn.upstream_episode));
     const u32 timer_generation = conn.response_read_timer_owner_generation;
     const auto timespec = conn.response_read_timer_timespec;
     const auto phase = conn.response_read_timer_phase;
@@ -36885,9 +36871,8 @@ TEST(iouring_response_read_timer, add_and_early_rearm_sq_full_fails_closed_witho
     const u32 saved_head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
     const i32 saved_ring_fd = loop->backend.ring_fd;
     loop->backend.ring_fd = -1;
-    __atomic_store_n(loop->backend.sq_tail,
-                     saved_head + loop->backend.sq_ring_entries,
-                     __ATOMIC_RELEASE);
+    __atomic_store_n(
+        loop->backend.sq_tail, saved_head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
     CHECK_FALSE(loop->backend.add_response_read_timer(direct->id, *direct, 100, 7, 11));
     CHECK(direct->response_read_timer_owner_is_neutral());
     CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
@@ -36901,8 +36886,10 @@ TEST(iouring_response_read_timer, add_and_early_rearm_sq_full_fails_closed_witho
     REQUIRE(stage_live_precise_head(loop, config, &fixture));
     Connection& conn = *fixture.conn;
     neutralize_staged_precise_timer(loop, fixture);
-    REQUIRE(install_inert_response_read_timer_owner(
-        conn, ResponseReadTimerPhase::Armed, conn.response_read_deadline_generation, conn.upstream_episode));
+    REQUIRE(install_inert_response_read_timer_owner(conn,
+                                                    ResponseReadTimerPhase::Armed,
+                                                    conn.response_read_deadline_generation,
+                                                    conn.upstream_episode));
     const u32 timer_generation = conn.response_read_timer_owner_generation;
     const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
     const i32 ring_fd = loop->backend.ring_fd;
@@ -36911,9 +36898,9 @@ TEST(iouring_response_read_timer, add_and_early_rearm_sq_full_fails_closed_witho
     const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
     static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
-                sizeof(kPartial) - 1u);
-    const IoEvent progress = response_read_copy_event(
-        conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+               sizeof(kPartial) - 1u);
+    const IoEvent progress =
+        response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
     const IoEvent events[2] = {timer, progress};
     loop->dispatch_batch(events, 2);
     CHECK_EQ(conn.fd, -1);
@@ -37098,8 +37085,8 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
     IoEvent timer_target = inert_response_read_timer_event(conn->id, timer_generation);
     timer_target.result = -ECANCELED;
-    IoEvent timer_cancel = inert_response_read_timer_event(
-        conn->id, timer_generation | kResponseReadTimerCancelBit);
+    IoEvent timer_cancel =
+        inert_response_read_timer_event(conn->id, timer_generation | kResponseReadTimerCancelBit);
     timer_cancel.result = 0;
     const IoEvent timer_events[2] = {timer_target, timer_cancel};
     loop->dispatch_batch(timer_events, 2);
