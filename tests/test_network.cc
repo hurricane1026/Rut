@@ -36205,6 +36205,13 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     CHECK_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
     CHECK(conn->fd >= 0);
     CHECK(conn->upstream_recv_armed);
+    CHECK(loop->response_read_deadline_uses_precise_timer(*conn));
+    conn->pipeline_depth = 1;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(*conn));
+    conn->pipeline_depth = 0;
+    conn->response_read_deadline_upload.downstream_close = false;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(*conn));
+    conn->response_read_deadline_upload.downstream_close = true;
     REQUIRE(header_only_head_explicit_close_arm_is_stable(
         *conn,
         conn->response_read_deadline_upload,
