@@ -100,15 +100,17 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   `6d0ab94c17e0f6f8e2fde875a2616f8f5b109b23`, exact-head CI `33830389147`,
   15/15 green) records live-only Stage 2C2b1 evidence for the classifier-
   unreachable fixed-upload HEAD profile. A complete valid HTTP/1.x status-line
-  witness gates configured header-only 502 mapping for parse/unsupported
-  responses; strict 200 positive-Content-Length success wins, while invalid
-  status, unsupported framing, partial input, and proof/event/output identity
-  mutations fail closed. This internal staging evidence does not prove terminal
-  Recv handling or timeout-vs-response same-batch precedence, and does not
-  activate the profile or add converter/public ordinary-source lowering. The
-  `nginx default proxied response buffering/commit` row therefore remains
-  `BLOCKED_BY_RUT`; proxied response status/body and header policy remain
-  `PARTIAL`; `proxy_read_timeout` remains `NOT_IMPLEMENTED`.
+  witness permits valid-status parse/unsupported domains, including unsupported
+  framing, to map to configured header-only 502; strict 200 positive-
+  Content-Length success wins. Invalid or status-line-less HTTP/0.9, terminal
+  configured responses, and proof/event/output identity mutations do not publish
+  configured 502, while fragmented live partial input safely continues. This
+  internal staging evidence does not prove terminal Recv handling or
+  timeout-vs-response same-batch precedence, and does not activate the profile
+  or add converter/public ordinary-source lowering. The `nginx default proxied
+  response buffering/commit` row therefore remains `BLOCKED_BY_RUT`; proxied
+  response status/body and header policy remain `PARTIAL`;
+  `proxy_read_timeout` remains `NOT_IMPLEMENTED`.
 
 ## Semantic risks already observed
 
