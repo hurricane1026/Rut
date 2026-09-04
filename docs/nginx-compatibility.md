@@ -96,6 +96,24 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 ## Internal evidence notes
 
+- PR #448 (accepted head `0b23e428b7dab71c20ac9a87768e157721b9ff22`, merge
+  `7343364d0aa9863b2033dcc45c7c80211407a944`, exact-head CI `33835342238`,
+  15/15 green) records terminal-positive Stage 2C2b2 evidence for the classifier-
+  unreachable fixed-upload HEAD profile. An exact per-dispatch witness admits
+  zero-target D2 custody for current terminal Recv: strict HTTP/1.1 200 with one
+  positive Content-Length produces header-only success, while complete valid
+  HTTP/1.x parse/unsupported witnesses may produce the pinned configured header-
+  only 502. Invalid/statusless/HTTP/0.9, incomplete, body-overrun, transport-error
+  and mutated witnesses fail closed; same-batch live-plus-terminal fragments,
+  late CQEs, successor custody and downstream send failures are covered. The
+  initial sanitizer-only fixture double cleanup was corrected without production
+  changes and the exact-head rerun is fully green. This internal staging evidence
+  does not activate the profile, provide public ordinary-source behavior or add
+  converter lowering. Timeout-versus-response same-batch coverage is the next
+  test-only increment. The buffering row therefore remains `BLOCKED_BY_RUT`,
+  proxied response behavior remains `PARTIAL`, and `proxy_read_timeout` remains
+  `NOT_IMPLEMENTED`.
+
 - PR #447 (accepted head `97fadbfe04609e74c045512678d412a0318439ce`, merge
   `6d0ab94c17e0f6f8e2fde875a2616f8f5b109b23`, exact-head CI `33830389147`,
   15/15 green) records live-only Stage 2C2b1 evidence for the classifier-
