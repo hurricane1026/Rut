@@ -37,7 +37,7 @@ static_assert(std::is_trivially_copyable_v<nginx::HttpProfileRutSource>);
 static_assert(nginx::HttpProfileRutSource::kMaxAccessLogDeclarationLen == 329u);
 static_assert(nginx::HttpProfileRutSource::kCapacity == 7357u);
 static_assert(offsetof(nginx::HttpProfileRutSource, len) == 7360u);
-static_assert(sizeof(nginx::HttpProfileRutSource) == 7368u);
+static_assert(sizeof(nginx::HttpProfileRutSource) == 7364u);
 
 TEST(nginx_converter, rut_source_capacity_layout_zero_reserve_and_copy_ownership) {
     static_assert(nginx::RutSource::kCapacity == 7028u);
