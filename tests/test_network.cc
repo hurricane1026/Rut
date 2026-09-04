@@ -24304,6 +24304,156 @@ TEST(legacy_loop, async_reclaim_pending_reclaims_ready_slots) {
     loop->shutdown();
 }
 
+static bool install_inert_response_read_timer_owner(Connection& conn,
+                                                    ResponseReadTimerPhase phase,
+                                                    u32 deadline_generation = 17,
+                                                    u32 upstream_episode = 19) {
+    if (!conn.next_response_read_timer_generation()) return false;
+    conn.response_read_timer_timespec = {0, 40'000'000};
+    conn.response_read_timer_deadline_generation = deadline_generation;
+    conn.response_read_timer_upstream_episode = upstream_episode;
+    conn.response_read_timer_phase = phase;
+    conn.response_read_timer_target_owned = true;
+    conn.response_read_timer_cancel_owned = phase == ResponseReadTimerPhase::CancelPending;
+    return conn.response_read_timer_owner_is_valid();
+}
+
+static IoEvent inert_response_read_timer_event(u32 conn_id, u32 tagged_generation) {
+    IoEvent event{};
+    event.conn_id = conn_id;
+    event.type = IoEventType::ResponseReadTimer;
+    event.result = (tagged_generation & kResponseReadTimerCancelBit) != 0 ? 0 : -ETIME;
+    event.non_upstream_generation = tagged_generation;
+    return event;
+}
+
+template <typename Loop>
+static void check_matching_response_read_timer_mutations_do_not_consume(rut::test::TestCase* _tc,
+                                                                        Loop& loop,
+                                                                        Connection& conn,
+                                                                        u32 generation) {
+    IoEvent invalid[13];
+    for (auto& event : invalid) event = inert_response_read_timer_event(conn.id, generation);
+    invalid[0].result = 1;
+    invalid[1].result = -EIO;
+    invalid[2].more = 1;
+    invalid[3].aux = 1;
+    invalid[4].upstream_episode = 1;
+    invalid[5].has_buf = 1;
+    invalid[6].buf_id = 1;
+    invalid[7].copy_witness = IoEventCopyWitness::Full;
+    invalid[8].copy_deadline_generation = 1;
+    invalid[9].copy_deadline_profile = 1;
+    invalid[10].copy_deadline_method = 0;
+    invalid[11].copy_begin = 1;
+    invalid[12].copy_end = 1;
+
+    for (const auto& event : invalid) {
+        loop.dispatch(event);
+        CHECK(conn.response_read_timer_owner_is_valid());
+    }
+}
+
+TEST(legacy_async_loop, response_read_timer_owner_blocks_reuse_until_exact_expiry) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    const u32 free_before = loop->free_top;
+    REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+    const u32 generation = conn->response_read_timer_owner_generation;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->pending_ops = 0;
+
+    loop->close_conn(*conn);
+    Connection& deferred = loop->conns[id];
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+    CHECK_EQ(deferred.response_read_timer_owner_generation, generation);
+    CHECK(deferred.response_read_timer_owner_is_valid());
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+
+    check_matching_response_read_timer_mutations_do_not_consume(_tc, *loop, deferred, generation);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+
+    IoEvent stale = inert_response_read_timer_event(id, generation + 1u);
+    loop->dispatch(stale);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+    CHECK(deferred.response_read_timer_owner_is_valid());
+
+    IoEvent expiry = inert_response_read_timer_event(id, generation);
+    loop->dispatch(expiry);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK(deferred.response_read_timer_owner_is_neutral());
+
+    // Duplicate G cannot push the reclaimed slot twice or consume successor G+1.
+    loop->dispatch(expiry);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    IoEvent stale_recv{};
+    stale_recv.conn_id = id;
+    stale_recv.type = IoEventType::Recv;
+    stale_recv.result = -ECANCELED;
+    loop->dispatch(stale_recv);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    Connection* successor = loop->alloc_conn();
+    REQUIRE(successor != nullptr);
+    REQUIRE_EQ(successor->id, id);
+    REQUIRE(install_inert_response_read_timer_owner(*successor, ResponseReadTimerPhase::Armed));
+    CHECK_EQ(successor->response_read_timer_owner_generation, generation + 1u);
+    loop->dispatch(expiry);
+    CHECK(successor->response_read_timer_owner_is_valid());
+    CHECK_EQ(loop->free_top, free_before);
+    expiry.non_upstream_generation = generation + 1u;
+    loop->dispatch(expiry);
+    CHECK(successor->response_read_timer_owner_is_neutral());
+    successor->fd = -1;
+    loop->free_conn(*successor);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    loop->shutdown();
+}
+
+TEST(legacy_async_loop, response_read_timer_cancel_requires_both_completions) {
+    for (const bool cancel_first : {false, true}) {
+        auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+        REQUIRE(loop->init(0, -1).has_value());
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        REQUIRE(
+            install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::CancelPending));
+        const u32 generation = conn->response_read_timer_owner_generation;
+        conn->fd = -1;
+        conn->pending_ops = 0;
+        loop->free_conn(*conn);
+
+        IoEvent first = inert_response_read_timer_event(
+            id, generation | (cancel_first ? kResponseReadTimerCancelBit : 0u));
+        first.result = cancel_first ? 0 : -ECANCELED;
+        loop->dispatch(first);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        CHECK_EQ(loop->free_top, free_before);
+        CHECK_EQ(loop->conns[id].response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+
+        IoEvent second = inert_response_read_timer_event(
+            id, generation | (cancel_first ? 0u : kResponseReadTimerCancelBit));
+        second.result = cancel_first ? -ECANCELED : 0;
+        loop->dispatch(second);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK(loop->conns[id].response_read_timer_owner_is_neutral());
+        loop->shutdown();
+    }
+}
+
 TEST(legacy_loop, async_dispatch_stale_cqe_reclaims_slot) {
     auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
     auto initialized = loop->init(0, -1);
@@ -26376,6 +26526,7 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 expected = jit::YieldKind::Timer;
                 break;
             case IoEventType::Accept:
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }
@@ -26409,6 +26560,134 @@ TEST(state_invariant, iouring_user_data_preserves_full_timer_generation) {
     CHECK_EQ(conn_id, 16383u);
     CHECK_EQ(static_cast<u8>(type), static_cast<u8>(IoEventType::Recv));
     CHECK_EQ(aux, 0x80000000u);
+}
+
+TEST(state_invariant, response_read_timer_tokens_preserve_generation_and_cancel_domain) {
+    CHECK_EQ(encode_non_upstream_user_data({0, IoEventType::ResponseReadTimer, 0}),
+             kInvalidIoUserData);
+    CHECK_EQ(encode_non_upstream_user_data(
+                 {0, IoEventType::ResponseReadTimer, kResponseReadTimerCancelBit}),
+             kInvalidIoUserData);
+    for (const u32 generation : {1u, 0x12345678u, kResponseReadTimerGenerationMask}) {
+        for (const bool cancel : {false, true}) {
+            const u32 tagged = generation | (cancel ? kResponseReadTimerCancelBit : 0u);
+            const u64 data = IoUringBackend::encode_user_data(
+                kIoUserDataMaxConnId, IoEventType::ResponseReadTimer, tagged);
+            u32 conn_id = 0;
+            u32 decoded_generation = 0;
+            IoEventType type = IoEventType::Count;
+            IoUringBackend::decode_user_data(data, conn_id, type, decoded_generation);
+            CHECK_EQ(conn_id, kIoUserDataMaxConnId);
+            CHECK_EQ(type, IoEventType::ResponseReadTimer);
+            CHECK_EQ(decoded_generation, tagged);
+            CHECK_NE(data,
+                     IoUringBackend::encode_user_data(
+                         kIoUserDataMaxConnId, IoEventType::HandlerTimer, tagged));
+            CHECK_NE(data,
+                     IoUringBackend::encode_user_data(
+                         kIoUserDataMaxConnId, IoEventType::Timeout, tagged));
+            const NonUpstreamUserData source{
+                kIoUserDataMaxConnId, IoEventType::ResponseReadTimer, tagged};
+            const u64 checked_data = encode_non_upstream_user_data(source);
+            CHECK_NE(checked_data, kInvalidIoUserData);
+            NonUpstreamUserData decoded;
+            REQUIRE(decode_non_upstream_user_data(checked_data, &decoded));
+            CHECK_EQ(decoded.generation, tagged);
+        }
+    }
+
+    IoEvent target = inert_response_read_timer_event(7, 1);
+    CHECK(valid_response_read_timer_transport_event(target));
+    target.result = -ECANCELED;
+    CHECK(valid_response_read_timer_transport_event(target));
+    target.result = 0;
+    CHECK_FALSE(valid_response_read_timer_transport_event(target));
+    target.result = -EIO;
+    CHECK_FALSE(valid_response_read_timer_transport_event(target));
+
+    IoEvent cancel = inert_response_read_timer_event(7, 1 | kResponseReadTimerCancelBit);
+    CHECK(valid_response_read_timer_transport_event(cancel));
+    cancel.result = -ENOENT;
+    CHECK(valid_response_read_timer_transport_event(cancel));
+    cancel.result = -EALREADY;
+    CHECK_FALSE(valid_response_read_timer_transport_event(cancel));
+    cancel.result = -ECANCELED;
+    CHECK_FALSE(valid_response_read_timer_transport_event(cancel));
+}
+
+TEST(state_invariant, response_read_timer_owner_reset_and_exhaustion_are_strict) {
+    ConnectionBase conn{};
+    conn.reset();
+    REQUIRE(conn.response_read_timer_owner_is_neutral());
+    REQUIRE(conn.response_read_timer_owner_is_valid());
+
+    REQUIRE(conn.next_response_read_timer_generation());
+    conn.response_read_timer_timespec = {0, 41'000'000};
+    conn.response_read_timer_deadline_generation = 17;
+    conn.response_read_timer_upstream_episode = 23;
+    conn.response_read_timer_phase = ResponseReadTimerPhase::Armed;
+    conn.response_read_timer_target_owned = true;
+    REQUIRE(conn.response_read_timer_owner_is_valid());
+    const u32 generation = conn.response_read_timer_owner_generation;
+    conn.response_read_timer_generation++;
+    CHECK_FALSE(conn.response_read_timer_owner_is_valid());
+    conn.response_read_timer_generation = generation;
+    REQUIRE(conn.response_read_timer_owner_is_valid());
+
+    // reset() cannot invalidate kernel-borrowed storage or identity.
+    conn.reset();
+    CHECK_EQ(conn.response_read_timer_generation, generation);
+    CHECK_EQ(conn.response_read_timer_owner_generation, generation);
+    CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, 41'000'000);
+    CHECK_EQ(conn.response_read_timer_deadline_generation, 17u);
+    CHECK_EQ(conn.response_read_timer_upstream_episode, 23u);
+    CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    CHECK(conn.response_read_timer_target_owned);
+    CHECK_FALSE(conn.response_read_timer_cancel_owned);
+    REQUIRE(conn.response_read_timer_owner_is_valid());
+
+    REQUIRE(conn.consume_response_read_timer_completion(generation));
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    CHECK_EQ(conn.response_read_timer_generation, generation);
+
+    conn.response_read_timer_generation = kResponseReadTimerGenerationMask;
+    CHECK_FALSE(conn.next_response_read_timer_generation());
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    conn.reset();
+    CHECK_EQ(conn.response_read_timer_generation, kResponseReadTimerGenerationMask);
+    CHECK_FALSE(conn.next_response_read_timer_generation());
+}
+
+TEST(state_invariant, response_read_timer_cancel_owners_drain_in_either_order) {
+    for (const bool cancel_first : {false, true}) {
+        ConnectionBase conn{};
+        conn.reset();
+        REQUIRE(conn.next_response_read_timer_generation());
+        conn.response_read_timer_timespec = {1, 0};
+        conn.response_read_timer_deadline_generation = 31;
+        conn.response_read_timer_upstream_episode = 37;
+        conn.response_read_timer_phase = ResponseReadTimerPhase::CancelPending;
+        conn.response_read_timer_target_owned = true;
+        conn.response_read_timer_cancel_owned = true;
+        REQUIRE(conn.response_read_timer_owner_is_valid());
+        const u32 generation = conn.response_read_timer_owner_generation;
+        const u32 first = generation | (cancel_first ? kResponseReadTimerCancelBit : 0u);
+        const u32 second = generation | (cancel_first ? 0u : kResponseReadTimerCancelBit);
+
+        REQUIRE(conn.consume_response_read_timer_completion(first));
+        CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        CHECK_EQ(conn.response_read_timer_owner_generation, generation);
+        CHECK_EQ(conn.response_read_timer_deadline_generation, 31u);
+        CHECK_EQ(conn.response_read_timer_upstream_episode, 37u);
+        CHECK_EQ(conn.response_read_timer_target_owned, cancel_first);
+        CHECK_EQ(conn.response_read_timer_cancel_owned, !cancel_first);
+        REQUIRE(conn.response_read_timer_owner_is_valid());
+
+        CHECK_FALSE(conn.consume_response_read_timer_completion(first));
+        REQUIRE(conn.consume_response_read_timer_completion(second));
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        CHECK_EQ(conn.response_read_timer_generation, generation);
+    }
 }
 
 TEST(state_invariant, upstream_event_token_layout_round_trips_and_separates_generations) {
@@ -26590,6 +26869,79 @@ struct ScopedIoUringLoopForRetirement {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+
+TEST(iouring_response_read_timer,
+     armed_owner_blocks_reuse_and_exact_expiry_reclaims_without_live_behavior) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    IoUringEventLoop* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    const u32 free_before = loop->free_top;
+    REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+    const u32 generation = conn->response_read_timer_owner_generation;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->pending_ops = 0;
+
+    loop->close_conn(*conn);
+    Connection& deferred = loop->conns[id];
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+    CHECK(deferred.response_read_timer_owner_is_valid());
+    loop->reclaim_slot(id);
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+
+    check_matching_response_read_timer_mutations_do_not_consume(_tc, *loop, deferred, generation);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+
+    IoEvent expiry = inert_response_read_timer_event(id, generation);
+    loop->dispatch(expiry);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK(deferred.response_read_timer_owner_is_neutral());
+
+    loop->dispatch(expiry);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+}
+
+TEST(iouring_response_read_timer, cancel_pending_reclaims_only_after_both_cqes) {
+    for (const bool cancel_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        IoUringEventLoop* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        REQUIRE(
+            install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::CancelPending));
+        const u32 generation = conn->response_read_timer_owner_generation;
+        conn->fd = -1;
+        conn->pending_ops = 0;
+        loop->free_conn(*conn);
+
+        IoEvent first = inert_response_read_timer_event(
+            id, generation | (cancel_first ? kResponseReadTimerCancelBit : 0u));
+        first.result = cancel_first ? 0 : -ECANCELED;
+        loop->dispatch(first);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        CHECK_EQ(loop->free_top, free_before);
+        CHECK_EQ(loop->conns[id].response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+
+        IoEvent second = inert_response_read_timer_event(
+            id, generation | (cancel_first ? 0u : kResponseReadTimerCancelBit));
+        second.result = cancel_first ? -ECANCELED : 0;
+        loop->dispatch(second);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK(loop->conns[id].response_read_timer_owner_is_neutral());
+    }
+}
 
 struct StagedLocalSendFixture {
     void* loop_storage = MAP_FAILED;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include <cerrno>
 
 namespace rut {
 
@@ -12,17 +13,19 @@ enum class IoEventType : u8 {
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
-    Timeout,       // 1-second TimerWheel tick (keepalive driver)
-    HandlerTimer,  // JIT handler yield timer expired. Precise to ms.
-                   // io_uring: IORING_OP_TIMEOUT — conn_id identifies the
-                   //   target connection whose pending_handler_fn resumes.
-                   // epoll:   shared one-shot timerfd — event is a global
-                   //   notification; conn_id is unused, the event loop
-                   //   drains its min-heap to find which conns to resume.
+    Timeout,            // 1-second TimerWheel tick (keepalive driver)
+    HandlerTimer,       // JIT handler yield timer expired. Precise to ms.
+                        // io_uring: IORING_OP_TIMEOUT — conn_id identifies the
+                        //   target connection whose pending_handler_fn resumes.
+                        // epoll:   shared one-shot timerfd — event is a global
+                        //   notification; conn_id is unused, the event loop
+                        //   drains its min-heap to find which conns to resume.
+    ResponseReadTimer,  // Generic precise response-read transport timer.
+                        // Kept distinct from JIT and TimerWheel wakeups.
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 8u,
+static_assert(static_cast<u8>(IoEventType::Count) == 9u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:
@@ -61,6 +64,8 @@ struct NonUpstreamUserData {
 
 inline constexpr u32 kNonUpstreamSendCancelBit = 0x80000000u;
 inline constexpr u32 kNonUpstreamSendGenerationMask = 0x7FFFFFFFu;
+inline constexpr u32 kResponseReadTimerCancelBit = 0x80000000u;
+inline constexpr u32 kResponseReadTimerGenerationMask = 0x7FFFFFFFu;
 
 inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
     return token.conn_id <= kIoUserDataMaxConnId && io_event_is_upstream(token.type) &&
@@ -90,9 +95,13 @@ inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* 
 }
 
 inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& value) {
-    return value.conn_id <= kIoUserDataMaxConnId &&
-           static_cast<u8>(value.type) < static_cast<u8>(IoEventType::Count) &&
-           !io_event_is_upstream(value.type);
+    if (value.conn_id > kIoUserDataMaxConnId ||
+        static_cast<u8>(value.type) >= static_cast<u8>(IoEventType::Count) ||
+        io_event_is_upstream(value.type))
+        return false;
+    if (value.type == IoEventType::ResponseReadTimer)
+        return (value.generation & kResponseReadTimerGenerationMask) != 0;
+    return true;
 }
 
 inline constexpr u64 encode_non_upstream_user_data(const NonUpstreamUserData& value) {
@@ -165,6 +174,23 @@ struct IoEvent {
     u32 copy_begin = 0;
     u32 copy_end = 0;
 };
+
+// ResponseReadTimer is a transport-only event. Accept only the exact result
+// domains emitted by IORING_OP_TIMEOUT / IORING_OP_ASYNC_CANCEL and require
+// every unrelated payload field to remain canonical-neutral before ownership
+// may be consumed.
+inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& event) {
+    if (event.type != IoEventType::ResponseReadTimer) return false;
+    const bool cancel = (event.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+    const u32 generation = event.non_upstream_generation & kResponseReadTimerGenerationMask;
+    const bool result_valid = cancel ? (event.result == 0 || event.result == -ENOENT)
+                                     : (event.result == -ETIME || event.result == -ECANCELED);
+    return generation != 0 && result_valid && event.buf_id == 0 && event.has_buf == 0 &&
+           event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
+           event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
+           event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&
+           event.copy_begin == 0 && event.copy_end == 0;
+}
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {
     return io_event_is_upstream(event.type) &&

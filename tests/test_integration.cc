@@ -4806,6 +4806,181 @@ TEST(uring, wait_emits_timeout_tick) {
     close(lfd);
 }
 
+TEST(uring, precise_response_read_timer_expires_with_exact_transport_identity) {
+    using namespace rut;
+    IoUringBackend backend;
+    auto rc = backend.init(0, -1);
+    if (!rc) SKIP("io_uring unavailable");
+
+    TestConn tc;
+    tc.init(0, -1);
+    constexpr u32 kMilliseconds = 40;
+    constexpr u32 kDeadlineGeneration = 71;
+    constexpr u32 kUpstreamEpisode = 73;
+
+    struct timespec before{};
+    struct timespec after{};
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    REQUIRE(backend.add_response_read_timer(
+        tc.conn.id, tc.conn, kMilliseconds, kDeadlineGeneration, kUpstreamEpisode));
+    const u32 generation = tc.conn.response_read_timer_owner_generation;
+    REQUIRE_EQ(generation, 1u);
+    REQUIRE(tc.conn.response_read_timer_owner_is_valid());
+    CHECK_EQ(tc.conn.pending_ops, 0u);
+
+    IoEvent events[4]{};
+    const u32 count = backend.wait(events, 4, &tc.conn, 1);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    REQUIRE_EQ(count, 1u);
+    const IoEvent& event = events[0];
+    CHECK_EQ(event.conn_id, tc.conn.id);
+    CHECK_EQ(event.type, IoEventType::ResponseReadTimer);
+    CHECK_EQ(event.result, -ETIME);
+    CHECK_EQ(event.non_upstream_generation, generation);
+    CHECK_EQ(event.buf_id, 0u);
+    CHECK_EQ(event.has_buf, 0u);
+    CHECK_EQ(event.more, 0u);
+    CHECK_EQ(event.aux, 0u);
+    CHECK_EQ(event.upstream_episode, 0u);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(event.copy_deadline_generation, 0u);
+    CHECK_EQ(event.copy_deadline_profile, 0u);
+    CHECK_EQ(event.copy_deadline_method, 0xffu);
+    CHECK_EQ(event.copy_begin, 0u);
+    CHECK_EQ(event.copy_end, 0u);
+
+    const i64 elapsed_ns = static_cast<i64>(after.tv_sec - before.tv_sec) * 1'000'000'000LL +
+                           static_cast<i64>(after.tv_nsec - before.tv_nsec);
+    const u64 elapsed_ms = static_cast<u64>((elapsed_ns + 999'999) / 1'000'000);
+    CHECK_GE(elapsed_ms, 30u);
+    CHECK_LT(elapsed_ms, 500u);
+    REQUIRE(tc.conn.consume_response_read_timer_completion(event.non_upstream_generation));
+    CHECK(tc.conn.response_read_timer_owner_is_neutral());
+    CHECK_EQ(tc.conn.pending_ops, 0u);
+
+    backend.shutdown();
+}
+
+TEST(uring, precise_response_read_timer_cancel_emits_target_and_tagged_cancel_once) {
+    using namespace rut;
+    IoUringBackend backend;
+    auto rc = backend.init(0, -1);
+    if (!rc) SKIP("io_uring unavailable");
+
+    TestConn tc;
+    tc.init(0, -1);
+    REQUIRE(backend.add_response_read_timer(tc.conn.id, tc.conn, 500, 79, 83));
+    const u32 generation = tc.conn.response_read_timer_owner_generation;
+    REQUIRE(backend.cancel_response_read_timer(tc.conn.id, tc.conn));
+    REQUIRE_EQ(tc.conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    REQUIRE(tc.conn.response_read_timer_target_owned);
+    REQUIRE(tc.conn.response_read_timer_cancel_owned);
+    CHECK_EQ(tc.conn.pending_ops, 0u);
+
+    u32 target_count = 0;
+    u32 cancel_count = 0;
+    for (u32 attempt = 0; attempt < 4 && (target_count == 0 || cancel_count == 0); ++attempt) {
+        IoEvent events[8]{};
+        const u32 count = backend.wait(events, 8, &tc.conn, 1);
+        for (u32 i = 0; i < count; ++i) {
+            const IoEvent& event = events[i];
+            if (event.type != IoEventType::ResponseReadTimer) continue;
+            CHECK_EQ(event.conn_id, tc.conn.id);
+            CHECK_EQ(event.buf_id, 0u);
+            CHECK_EQ(event.has_buf, 0u);
+            CHECK_EQ(event.more, 0u);
+            CHECK_EQ(event.aux, 0u);
+            CHECK_EQ(event.upstream_episode, 0u);
+            CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+            CHECK_EQ(event.copy_deadline_generation, 0u);
+            CHECK_EQ(event.copy_deadline_profile, 0u);
+            CHECK_EQ(event.copy_deadline_method, 0xffu);
+            CHECK_EQ(event.copy_begin, 0u);
+            CHECK_EQ(event.copy_end, 0u);
+
+            if ((event.non_upstream_generation & kResponseReadTimerCancelBit) != 0) {
+                cancel_count++;
+                CHECK_EQ(event.non_upstream_generation, generation | kResponseReadTimerCancelBit);
+                CHECK_EQ(event.result, 0);
+            } else {
+                target_count++;
+                CHECK_EQ(event.non_upstream_generation, generation);
+                CHECK_EQ(event.result, -ECANCELED);
+            }
+            REQUIRE(tc.conn.consume_response_read_timer_completion(event.non_upstream_generation));
+        }
+    }
+    CHECK_EQ(target_count, 1u);
+    CHECK_EQ(cancel_count, 1u);
+    REQUIRE(tc.conn.response_read_timer_owner_is_neutral());
+    CHECK_EQ(tc.conn.pending_ops, 0u);
+
+    // A fully drained owner may acquire the next generation without aliasing G.
+    REQUIRE(backend.add_response_read_timer(tc.conn.id, tc.conn, 40, 89, 97));
+    CHECK_EQ(tc.conn.response_read_timer_owner_generation, generation + 1u);
+    IoEvent reuse_events[4]{};
+    const u32 reuse_count = backend.wait(reuse_events, 4, &tc.conn, 1);
+    REQUIRE_EQ(reuse_count, 1u);
+    CHECK_EQ(reuse_events[0].type, IoEventType::ResponseReadTimer);
+    CHECK_EQ(reuse_events[0].result, -ETIME);
+    CHECK_EQ(reuse_events[0].non_upstream_generation, generation + 1u);
+    REQUIRE(
+        tc.conn.consume_response_read_timer_completion(reuse_events[0].non_upstream_generation));
+    CHECK(tc.conn.response_read_timer_owner_is_neutral());
+    CHECK_EQ(tc.conn.pending_ops, 0u);
+
+    backend.shutdown();
+}
+
+TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
+    using namespace rut;
+    constexpr u16 kBufId = 11;
+    const u32 malformed_flags[] = {
+        IORING_CQE_F_MORE,
+        IORING_CQE_F_BUFFER | (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
+        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+            (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
+    };
+    for (const u32 flags : malformed_flags) {
+        IoUringBackend backend;
+        auto rc = backend.init(0, -1);
+        if (!rc) SKIP("io_uring unavailable");
+
+        TestConn tc;
+        tc.init(0, -1);
+        u8 upstream_storage[32];
+        u8 recv_expected[kTestBufSize];
+        u8 upstream_expected[sizeof(upstream_storage)];
+        __builtin_memset(tc.recv_storage, 0xA5, sizeof(tc.recv_storage));
+        __builtin_memset(upstream_storage, 0x5A, sizeof(upstream_storage));
+        __builtin_memset(recv_expected, 0xA5, sizeof(recv_expected));
+        __builtin_memset(upstream_expected, 0x5A, sizeof(upstream_expected));
+        tc.conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        __builtin_memset(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize, 0xC3, 4);
+        const u16 buffer_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+        const u32 head_before = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = backend.cq_entries[tail & *backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({0, IoEventType::ResponseReadTimer, 1});
+        cqe.res = 4;
+        cqe.flags = flags;
+        __atomic_store_n(backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
+
+        IoEvent event{};
+        CHECK_EQ(backend.wait(&event, 1, &tc.conn, 1), 0u);
+        CHECK_EQ(backend.failure_code(), EPROTO);
+        CHECK_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), head_before);
+        CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), buffer_tail_before);
+        CHECK_EQ(tc.conn.recv_buf.len(), 0u);
+        CHECK_EQ(tc.conn.upstream_recv_buf.len(), 0u);
+        CHECK(__builtin_memcmp(tc.recv_storage, recv_expected, sizeof(recv_expected)) == 0);
+        CHECK(__builtin_memcmp(upstream_storage, upstream_expected, sizeof(upstream_expected)) ==
+              0);
+
+        backend.shutdown();
+    }
+}
+
 // Verify provided-buffer recv CQEs are copied into Connection.recv_buf and the
 // emitted IoEvent no longer owns a provided buffer.
 TEST(uring, wait_copies_recv_into_conn_buffer) {
