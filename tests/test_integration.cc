@@ -27849,6 +27849,14 @@ TEST(route, public_ordinary_source_fragmented_incomplete_head_uses_initial_deadl
         CHECK_LT(gap, 0.65);
     }
     REQUIRE_LE(request_recorded_ns, fragment_times[0]);
+    const u64 last_fragment_ns = fragment_times[fragment_count - 1];
+    const double request_to_last_fragment_seconds =
+        static_cast<double>(last_fragment_ns - request_recorded_ns) / 1e9;
+    CHECK_GT(request_to_last_fragment_seconds, 0.35);
+    CHECK_LT(request_to_last_fragment_seconds, 0.65);
+    const double last_fragment_to_first_byte_seconds =
+        static_cast<double>(first_downstream_byte_ns - last_fragment_ns) / 1e9;
+    CHECK_LT(last_fragment_to_first_byte_seconds, 0.75);
     const double request_to_first_byte_seconds =
         static_cast<double>(first_downstream_byte_ns - request_recorded_ns) / 1e9;
     CHECK_GT(request_to_first_byte_seconds, 0.75);
