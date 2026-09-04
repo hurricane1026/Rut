@@ -2028,6 +2028,16 @@ struct Recorder {
     // Default-off positive-request baseline mode: do not publish the request
     // or respond until the declared fixed Content-Length body is fully read.
     bool read_exact_content_length_12_body = false;
+    // Default-off origin mode for a complete request that intentionally emits
+    // no response bytes and remains open until the peer closes it.
+    bool zero_response_stall = false;
+    std::atomic<bool> zero_response_stall_ready{false};
+    std::atomic<u64> zero_response_stall_started_ns{0};
+    std::atomic<bool> zero_response_stall_peer_closed{false};
+    std::atomic<u32> zero_response_stall_peer_close_count{0};
+    std::atomic<u64> zero_response_stall_peer_closed_ns{0};
+    std::atomic<bool> zero_response_stall_unexpected_data{false};
+    std::atomic<bool> zero_response_stall_observation_failed{false};
     std::atomic<u32> response_fragment_permit{0};
     std::atomic<u32> response_fragments_sent{0};
     std::atomic<u64> response_fragment_sent_ns[4]{};
@@ -2134,7 +2144,56 @@ struct Recorder {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
-                if (self->permit_gated_complete_response) {
+                if (self->zero_response_stall) {
+                    const u64 started_ns =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+                    self->zero_response_stall_started_ns.store(started_ns,
+                                                               std::memory_order_relaxed);
+                    self->zero_response_stall_ready.store(true, std::memory_order_release);
+                    bool observed = false;
+                    while (self->running.load(std::memory_order_acquire)) {
+                        pollfd peer_poll{client, POLLIN | POLLHUP | POLLERR, 0};
+                        const int peer_ready = poll(&peer_poll, 1, 50);
+                        if (peer_ready < 0) {
+                            if (errno == EINTR) continue;
+                            self->zero_response_stall_observation_failed.store(
+                                true, std::memory_order_release);
+                            observed = true;
+                            break;
+                        }
+                        if (peer_ready == 0) continue;
+                        char unexpected[64];
+                        const ssize_t n = recv(client, unexpected, sizeof(unexpected), 0);
+                        if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+                            const u64 closed_ns = static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+                            self->zero_response_stall_peer_closed_ns.store(
+                                closed_ns, std::memory_order_relaxed);
+                            self->zero_response_stall_peer_closed.store(true,
+                                                                        std::memory_order_release);
+                            self->zero_response_stall_peer_close_count.fetch_add(
+                                1u, std::memory_order_release);
+                        } else if (n > 0) {
+                            self->zero_response_stall_unexpected_data.store(
+                                true, std::memory_order_release);
+                        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                            self->zero_response_stall_observation_failed.store(
+                                true, std::memory_order_release);
+                        } else {
+                            continue;
+                        }
+                        observed = true;
+                        break;
+                    }
+                    if (!observed && self->running.load(std::memory_order_acquire)) {
+                        self->zero_response_stall_observation_failed.store(
+                            true, std::memory_order_release);
+                    }
+                } else if (self->permit_gated_complete_response) {
                     response_sent = true;
                     for (u32 part = 0; part < 4; part++) {
                         while (self->running.load(std::memory_order_acquire) &&
@@ -2280,7 +2339,10 @@ struct Recorder {
         if (expected == 0 || expected > 4) return false;
         if ((response_override == nullptr) != (response_override_len == 0)) return false;
         if ((permit_gated_complete_response && gate_incomplete_response_close) ||
-            (wait_response_peer_close && gate_incomplete_response_close))
+            (wait_response_peer_close && gate_incomplete_response_close) ||
+            (zero_response_stall && response_override != nullptr) ||
+            (zero_response_stall && (wait_response_peer_close || permit_gated_complete_response ||
+                                     gate_incomplete_response_close)))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -2339,6 +2401,13 @@ struct Recorder {
             response_closed_by_gate.store(false, std::memory_order_relaxed);
             response_close_failed.store(false, std::memory_order_relaxed);
             response_close_released_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_ready.store(false, std::memory_order_relaxed);
+            zero_response_stall_started_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_peer_closed.store(false, std::memory_order_relaxed);
+            zero_response_stall_peer_close_count.store(0u, std::memory_order_relaxed);
+            zero_response_stall_peer_closed_ns.store(0, std::memory_order_relaxed);
+            zero_response_stall_unexpected_data.store(false, std::memory_order_relaxed);
+            zero_response_stall_observation_failed.store(false, std::memory_order_relaxed);
             thread_alive.store(false, std::memory_order_relaxed);
             listener_failed.store(false, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
@@ -2369,6 +2438,130 @@ struct Recorder {
 
     ~Recorder() { stop(); }
 };
+
+static bool run_zero_response_stall_self_check(std::string& error) {
+    static constexpr char kRequest[] =
+        "GET /zero-response-stall HTTP/1.1\r\n"
+        "Host: zero-response-stall.example\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    Recorder incompatible_override;
+    incompatible_override.zero_response_stall = true;
+    if (incompatible_override.setup(0, 1, "ignored", 7)) {
+        error = "zero-response stall accepted a response override";
+        incompatible_override.stop();
+        return false;
+    }
+    Recorder incompatible_response_mode;
+    incompatible_response_mode.zero_response_stall = true;
+    incompatible_response_mode.wait_response_peer_close = true;
+    if (incompatible_response_mode.setup()) {
+        error = "zero-response stall accepted a response-wait mode";
+        incompatible_response_mode.stop();
+        return false;
+    }
+
+    Recorder recorder;
+    recorder.zero_response_stall = true;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup()) {
+        error = "zero-response stall recorder setup failed";
+        return false;
+    }
+    int client = connect_once(recorder.port);
+    if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+        if (client >= 0) close(client);
+        recorder.stop();
+        error = "zero-response stall client connect/send failed";
+        return false;
+    }
+
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder.zero_response_stall_ready.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        if (recorder.listener_failed.load(std::memory_order_acquire) ||
+            !recorder.running.load(std::memory_order_acquire)) {
+            close(client);
+            recorder.stop();
+            error = "zero-response stall recorder stopped before ready";
+            return false;
+        }
+        usleep(1000);
+    }
+    const std::vector<char> expected_request(kRequest, kRequest + sizeof(kRequest) - 1u);
+    if (!recorder.zero_response_stall_ready.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_started_ns.load(std::memory_order_acquire) == 0u ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u ||
+        recorder.request != expected_request ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        recorder.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire)) {
+        close(client);
+        recorder.stop();
+        error = "zero-response stall did not publish one complete request without a send";
+        return false;
+    }
+
+    std::string quiet_error;
+    if (!observe_client_open_and_quiet_nonconsuming(client, 150, quiet_error)) {
+        close(client);
+        recorder.stop();
+        error = "zero-response stall emitted data or closed early: " + quiet_error;
+        return false;
+    }
+    if (close(client) != 0) {
+        recorder.stop();
+        error = "zero-response stall client close failed";
+        return false;
+    }
+    client = -1;
+
+    const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder.zero_response_stall_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < close_deadline) {
+        if (recorder.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
+            recorder.zero_response_stall_unexpected_data.load(std::memory_order_acquire)) {
+            recorder.stop();
+            error = "zero-response stall peer-close observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 started_ns = recorder.zero_response_stall_started_ns.load(std::memory_order_acquire);
+    const u64 closed_ns =
+        recorder.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire);
+    if (!recorder.zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        closed_ns < started_ns ||
+        recorder.zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
+        recorder.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
+        recorder.response_sent_open.load(std::memory_order_acquire) ||
+        recorder.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !recorder.running.load(std::memory_order_acquire) ||
+        !recorder.thread_alive.load(std::memory_order_acquire) ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u) {
+        recorder.stop();
+        error = "zero-response stall did not retain a live listener after one peer close";
+        return false;
+    }
+
+    recorder.stop();
+    if (client >= 0 || recorder.running.load(std::memory_order_acquire) ||
+        recorder.thread_alive.load(std::memory_order_acquire) || recorder.listen_fd >= 0 ||
+        recorder.accepted.load(std::memory_order_acquire) != 1u ||
+        recorder.requests.load(std::memory_order_acquire) != 1u ||
+        recorder.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        recorder.listener_failed.load(std::memory_order_acquire)) {
+        error = "zero-response stall cleanup did not retire the listener and origin episode";
+        return false;
+    }
+    return true;
+}
 
 static bool complete_origin_episode_is_exact(const Recorder& recorder) {
     return recorder.accepted.load(std::memory_order_acquire) == 1 &&
@@ -52823,6 +53016,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
+    const bool zero_response_stall_self_check =
+        argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -53008,6 +53203,7 @@ int main(int argc, char** argv) {
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
+         !zero_response_stall_self_check &&
          !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
          !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
          !request_length_oracle && !request_length_split_header_oracle &&
@@ -53172,6 +53368,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential "
                      "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
                      "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
+                     "   or: test_nginx_differential --zero-response-stall-self-check\n"
                      "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                      "   or: test_nginx_differential "
                      "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -53433,6 +53630,16 @@ int main(int argc, char** argv) {
     }
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
+    if (zero_response_stall_self_check) {
+        std::string stall_error;
+        if (!run_zero_response_stall_self_check(stall_error)) {
+            std::cerr << "FAIL [zero-response stall self-check]: " << stall_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: zero-response origin stall accepted one complete request, emitted "
+                     "no bytes, observed one peer close, and retained then retired its listener\n";
+        return 0;
+    }
     TempDir temp;
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
