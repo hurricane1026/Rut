@@ -37628,8 +37628,8 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
     }
 }
 
-TEST(response_read_deadline_fixed_upload_head_unreachable,
-     classifier_and_preflight_remain_fail_closed_without_effects) {
+TEST(response_read_deadline_fixed_upload_head_activation,
+     classifier_and_preflight_pin_partial_and_complete_uploads_without_effects) {
     static constexpr u8 kPrefix[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
         "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
@@ -37663,7 +37663,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
                 config.failure_policies[bundle.failure_policy_id - 1],
                 config.failure_policies[bundle.timeout_failure_policy_id - 1],
                 bundle.response_buffering);
-            CHECK_EQ(profile, ResponseReadDeadlineProfile::None);
+            CHECK_EQ(profile, ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
             CHECK(conn->response_read_deadline_owner_is_neutral());
             CHECK_EQ(conn->req_body_remaining, 12u - body_len);
 
@@ -37671,25 +37671,393 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
             const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
             const u32 pending = loop->backend.pending;
             response_read_deadline_fixed_upload_handler_calls = 0;
-            CHECK_FALSE(
+            CHECK(
                 prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
-            const Connection& closed = loop->conns[id];
             CHECK_EQ(response_read_deadline_fixed_upload_handler_calls, 0u);
-            CHECK_EQ(closed.fd, -1);
-            CHECK_EQ(closed.upstream_fd, -1);
-            CHECK_FALSE(closed.upstream_connect_armed);
-            CHECK_FALSE(closed.upstream_send_armed);
-            CHECK_FALSE(closed.upstream_recv_armed);
-            CHECK_EQ(closed.send_buf.len(), 0u);
-            CHECK_EQ(closed.response_header_buf.len(), 0u);
+            CHECK_EQ(conn->response_read_deadline_profile,
+                     ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
+            CHECK_EQ(conn->response_read_deadline_bundle_id, 2u);
+            CHECK_EQ(conn->response_read_deadline_method, static_cast<u8>(LogHttpMethod::Head));
+            CHECK_EQ(conn->response_read_deadline_route_method, route_method);
+            CHECK_EQ(conn->response_read_deadline_upload.raw_header_end, conn->req_header_end);
+            CHECK_EQ(conn->response_read_deadline_upload.raw_content_length, 12u);
+            CHECK_EQ(conn->response_read_deadline_upload.raw_total_length,
+                     conn->req_header_end + 12u);
+            CHECK_EQ(conn->response_read_deadline_upload.route_fn,
+                     &response_read_deadline_fixed_upload_handler);
+            CHECK_EQ(conn->upstream_fd, -1);
+            CHECK_FALSE(conn->upstream_connect_armed);
+            CHECK_FALSE(conn->upstream_send_armed);
+            CHECK_FALSE(conn->upstream_recv_armed);
+            CHECK_EQ(conn->send_buf.len(), 0u);
+            CHECK_EQ(conn->response_header_buf.len(), 0u);
             CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
             CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
             CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
             CHECK_EQ(loop->backend.pending, pending);
             u8 byte = 0;
-            CHECK_EQ(recv(downstream[1], &byte, 1, MSG_DONTWAIT), 0);
+            errno = 0;
+            CHECK_EQ(recv(downstream[1], &byte, 1, MSG_DONTWAIT), -1);
+            CHECK_EQ(errno, EAGAIN);
+            loop->close_conn(*conn);
             close(downstream[1]);
         }
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_activation,
+     normal_dispatch_pins_partial_and_complete_uploads_once) {
+    static constexpr u8 kPrefix[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+    static constexpr u8 kBody[] = {
+        0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    static constexpr char kRewrittenHead[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+
+    for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
+        for (const u32 initial_body_len : {5u, 12u}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_response_read_deadline_bundle(config));
+            REQUIRE(config.add_jit_handler(
+                "/one", route_method, &response_read_deadline_fixed_upload_handler, false, 2));
+            const RouteConfig* active = &config;
+            loop->config_ptr = &active;
+
+            Connection* conn = loop->alloc_conn();
+            REQUIRE(conn != nullptr);
+            i32 downstream[2] = {-1, -1};
+            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+            conn->fd = downstream[0];
+            REQUIRE_EQ(conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
+            REQUIRE_EQ(conn->recv_buf.write(kBody, initial_body_len), initial_body_len);
+            const u32 id = conn->id;
+            const u32 free_top_before = loop->free_top;
+            const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+            const u32 backend_pending_before = loop->backend.pending;
+            const auto restore_ring = [&]() {
+                __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+                loop->backend.pending = backend_pending_before;
+            };
+            response_read_deadline_fixed_upload_handler_calls = 0;
+            on_header_received<IoUringEventLoop>(
+                loop,
+                *conn,
+                {id, static_cast<i32>(conn->recv_buf.len()), 0, 0, IoEventType::Recv, 1});
+
+            REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
+            REQUIRE_EQ(conn->response_read_deadline_profile,
+                       ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
+            REQUIRE_EQ(conn->response_read_deadline_method, static_cast<u8>(LogHttpMethod::Head));
+            REQUIRE_EQ(conn->response_read_deadline_route_method, route_method);
+            REQUIRE_EQ(conn->response_read_deadline_bundle_id, 2u);
+            REQUIRE_EQ(conn->response_read_deadline_buffering, ForwardResponseBufferingMode::None);
+            REQUIRE_EQ(conn->response_read_deadline_upload.raw_header_end,
+                       static_cast<u32>(sizeof(kPrefix) - 1u));
+            REQUIRE_EQ(conn->response_read_deadline_upload.raw_content_length, 12u);
+            REQUIRE_EQ(conn->response_read_deadline_upload.raw_total_length,
+                       static_cast<u32>(sizeof(kPrefix) - 1u + 12u));
+            REQUIRE_EQ(conn->response_read_deadline_upload.route_index, 0u);
+            REQUIRE_EQ(conn->response_read_deadline_upload.route_fn,
+                       &response_read_deadline_fixed_upload_handler);
+            REQUIRE_EQ(conn->request_policy_id,
+                       static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+            if (initial_body_len < 12u) {
+                REQUIRE_EQ(conn->upstream_fd, -1);
+                REQUIRE_FALSE(conn->upstream_connect_armed);
+                REQUIRE_FALSE(conn->upstream_send_armed);
+                REQUIRE_FALSE(conn->upstream_recv_armed);
+            } else {
+                REQUIRE(conn->upstream_fd >= 0);
+                REQUIRE(conn->upstream_connect_armed);
+                REQUIRE_FALSE(conn->upstream_send_armed);
+                REQUIRE_FALSE(conn->upstream_recv_armed);
+            }
+            if (initial_body_len < 12u)
+                REQUIRE_EQ(conn->send_buf.len(), 0u);
+            else
+                REQUIRE_EQ(conn->send_buf.len(),
+                           static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+            REQUIRE_EQ(conn->response_header_buf.len(), 0u);
+            if (initial_body_len < 12u) {
+                REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+                u8 downstream_byte = 0;
+                errno = 0;
+                REQUIRE_EQ(recv(downstream[1], &downstream_byte, 1, MSG_DONTWAIT), -1);
+                REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+            }
+
+            if (initial_body_len < 12u) {
+                REQUIRE(conn->request_policy_body_pending);
+                REQUIRE_EQ(conn->req_body_remaining, 7u);
+                REQUIRE_EQ(conn->on_recv, &on_request_policy_body_recvd<IoUringEventLoop>);
+                REQUIRE(conn->recv_armed);
+                REQUIRE_EQ(conn->pending_ops, 1u);
+                REQUIRE_EQ(conn->recv_buf.write(kBody + initial_body_len, 7u), 7u);
+                REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
+                // Keep the connection's receive ownership intact while removing the
+                // synthetic SQE. dispatch() must retire the receive CQE and invoke the
+                // parked continuation through the production callback slot.
+                restore_ring();
+                loop->dispatch({id, 7, 0, 0, IoEventType::Recv, 0, 0, 0});
+            }
+
+            REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
+            REQUIRE_FALSE(conn->request_policy_body_pending);
+            REQUIRE_EQ(conn->req_body_remaining, 0u);
+            REQUIRE(conn->request_body_fully_buffered);
+            REQUIRE(conn->upstream_connect_armed);
+            REQUIRE_FALSE(conn->upstream_send_armed);
+            REQUIRE_FALSE(conn->upstream_recv_armed);
+            REQUIRE_EQ(conn->response_read_deadline_upload.rewritten_header_end,
+                       static_cast<u32>(sizeof(kRewrittenHead) - 1u));
+            REQUIRE_EQ(conn->response_read_deadline_upload.rewritten_total_length,
+                       static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+            REQUIRE_EQ(conn->response_read_deadline_upload.expected_upload_length,
+                       conn->recv_buf.len());
+            REQUIRE_EQ(conn->recv_buf.len(),
+                       static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+            REQUIRE_EQ(__builtin_memcmp(
+                           conn->recv_buf.data(), kRewrittenHead, sizeof(kRewrittenHead) - 1u),
+                       0);
+            REQUIRE_EQ(
+                __builtin_memcmp(
+                    conn->recv_buf.data() + sizeof(kRewrittenHead) - 1u, kBody, sizeof(kBody)),
+                0);
+            REQUIRE_EQ(conn->response_read_deadline_upload.upstream_id, 0u);
+            REQUIRE_EQ(conn->response_read_deadline_upload.request_policy_id,
+                       static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+            const u32 episode = conn->upstream_episode;
+            REQUIRE(conn->upstream_connect_armed);
+            REQUIRE_EQ(conn->pending_ops, 1u);
+            REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
+            restore_ring();
+            loop->dispatch({id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+            REQUIRE(conn->upstream_send_armed);
+            REQUIRE_FALSE(conn->upstream_recv_armed);
+            REQUIRE_EQ(conn->pending_ops, 1u);
+            const auto proof = conn->response_read_deadline_upload;
+            const auto& send = loop->backend.upstream_send_state[id];
+            REQUIRE_EQ(send.remaining, proof.expected_upload_length);
+            REQUIRE_EQ(send.upstream_episode, episode);
+            REQUIRE_EQ(__builtin_memcmp(send.src, conn->recv_buf.data(), send.remaining), 0);
+            REQUIRE_EQ(send.remaining,
+                       static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+
+            loop->backend.upstream_send_state[id].offset = send.remaining;
+            loop->backend.upstream_send_state[id].remaining = 0;
+            REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
+            restore_ring();
+            loop->dispatch({id,
+                            static_cast<i32>(proof.expected_upload_length),
+                            0,
+                            0,
+                            IoEventType::UpstreamSend,
+                            0,
+                            0,
+                            episode});
+            REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
+            REQUIRE(conn->request_upload_complete);
+            REQUIRE_FALSE(conn->upstream_send_armed);
+            REQUIRE(conn->upstream_recv_armed);
+            REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            REQUIRE(response_read_deadline_fixed_upload_proof_is_stable(*conn, proof));
+            REQUIRE_EQ(conn->response_read_deadline_upload.upload_episode, episode);
+            REQUIRE(conn->upstream_fd >= 0);
+            REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+            REQUIRE_EQ(conn->pending_ops, 1u);
+            REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
+            const u32 close_episode = conn->upstream_episode;
+            loop->close_conn(*conn);
+            REQUIRE_EQ(conn->fd, -1);
+            REQUIRE_EQ(conn->upstream_fd, -1);
+            REQUIRE_EQ(conn->pending_ops, 2u);
+            REQUIRE_EQ(conn->upstream_close_episode, close_episode);
+            REQUIRE_EQ(conn->upstream_close_target_owned, kUpstreamOpRecv);
+            REQUIRE_EQ(conn->upstream_close_cancel_owned, kUpstreamOpRecv);
+            // close_conn() submits the cancel while the original receive remains
+            // owned by the connection. Drain both CQEs through the close consumer;
+            // neither event may be routed to the live upstream callback.
+            restore_ring();
+            loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, close_episode});
+            REQUIRE_EQ(loop->conns[id].pending_ops, 1u);
+            loop->dispatch({id,
+                            -ECANCELED,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            kUpstreamCloseCancelAux,
+                            close_episode});
+            REQUIRE_EQ(loop->conns[id].pending_ops, 0u);
+            REQUIRE_EQ(loop->conns[id].upstream_close_target_owned, 0u);
+            REQUIRE_EQ(loop->conns[id].upstream_close_cancel_owned, 0u);
+            REQUIRE_EQ(loop->pending_free_count, 0u);
+            REQUIRE_EQ(loop->free_top, free_top_before + 1u);
+            close(downstream[1]);
+        }
+    }
+}
+
+TEST(response_read_deadline_fixed_upload_head_activation,
+     classifier_negative_shapes_remain_effect_free_and_fail_closed) {
+    static constexpr u8 kValid[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Length: 3\r\n\r\nabc";
+    static constexpr const char* kInvalidRequests[] = {
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: nope\r\n\r\n",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nTransfer-Encoding: chunked\r\n"
+        "\r\n3\r\nabc\r\n0\r\n\r\n",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nTE: trailers\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nExpect: 100-continue\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nUpgrade: websocket\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "HEAD * HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc",
+    };
+
+    auto check = [&](const u8* request,
+                     u32 request_len,
+                     bool tls,
+                     bool h2,
+                     bool complete_buffering,
+                     bool fully_buffered,
+                     bool streamed,
+                     u16 pipeline_depth,
+                     u16 pipeline_stash_len,
+                     bool request_mutation,
+                     bool response_mutation,
+                     bool mutate_policy) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        auto& bundle = config.policy_bundles[1];
+        if (complete_buffering)
+            bundle.response_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+        if (mutate_policy)
+            config.response_policies[bundle.response_policy_id - 1].head_mode =
+                ResponsePolicyHeadMode::Reject;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->recv_buf.write(request, request_len), request_len);
+        capture_request_metadata(*conn);
+        conn->keep_alive = true;
+        conn->tls_active = tls;
+        if (h2) REQUIRE(loop->alloc_h2(*conn));
+        conn->request_body_fully_buffered = fully_buffered;
+        conn->req_body_streamed = streamed;
+        conn->pipeline_depth = pipeline_depth;
+        conn->pipeline_stash_len = pipeline_stash_len;
+        if (request_mutation) conn->req_header_override_count = 1;
+        if (response_mutation) conn->resp_header_mutation_count = 1;
+        const auto profile = classify_response_read_deadline_profile(
+            *conn,
+            config.response_policies[bundle.response_policy_id - 1],
+            config.failure_policies[bundle.failure_policy_id - 1],
+            config.failure_policies[bundle.timeout_failure_policy_id - 1],
+            bundle.response_buffering);
+        CHECK_EQ(profile, ResponseReadDeadlineProfile::None);
+        CHECK(conn->response_read_deadline_owner_is_neutral());
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(conn->send_buf.len(), 0u);
+        CHECK_EQ(conn->response_header_buf.len(), 0u);
+        loop->close_conn(*conn);
+    };
+
+    for (const char* request : kInvalidRequests)
+        check(reinterpret_cast<const u8*>(request),
+              static_cast<u32>(__builtin_strlen(request)),
+              false,
+              false,
+              false,
+              false,
+              false,
+              0,
+              0,
+              false,
+              false,
+              false);
+    check(kValid, sizeof(kValid) - 1u, true, false, false, false, false, 0, 0, false, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, true, false, false, false, 0, 0, false, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, true, false, false, 0, 0, false, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, false, true, false, 0, 0, false, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, false, false, true, 0, 0, false, false, false);
+    check(
+        kValid, sizeof(kValid) - 1u, false, false, false, false, false, 1, 0, false, false, false);
+    check(
+        kValid, sizeof(kValid) - 1u, false, false, false, false, false, 0, 1, false, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, false, false, false, 0, 0, true, false, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, false, false, false, 0, 0, false, true, false);
+    check(kValid, sizeof(kValid) - 1u, false, false, false, false, false, 0, 0, false, false, true);
+}
+
+TEST(response_read_deadline_fixed_upload_head_activation,
+     preflight_rejects_route_and_policy_identity_mutations) {
+    static constexpr u8 kRequest[] =
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc";
+    enum class Mutation : u8 { RouteMismatch, ResponseHead, FailureHead, TimeoutHead };
+    for (const Mutation mutation : {Mutation::RouteMismatch,
+                                    Mutation::ResponseHead,
+                                    Mutation::FailureHead,
+                                    Mutation::TimeoutHead}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        const u8 route_method =
+            mutation == Mutation::RouteMismatch ? kRouteMethodGet : kRouteMethodAny;
+        REQUIRE(config.add_jit_handler(
+            "/one", route_method, &response_read_deadline_fixed_upload_handler, false, 2));
+        auto& bundle = config.policy_bundles[1];
+        if (mutation == Mutation::ResponseHead)
+            config.response_policies[bundle.response_policy_id - 1].head_mode =
+                ResponsePolicyHeadMode::Reject;
+        else if (mutation == Mutation::FailureHead)
+            config.failure_policies[bundle.failure_policy_id - 1].head_mode =
+                FailurePolicyHeadMode::Reject;
+        else if (mutation == Mutation::TimeoutHead)
+            config.failure_policies[bundle.timeout_failure_policy_id - 1].head_mode =
+                FailurePolicyHeadMode::Reject;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+        capture_request_metadata(*conn);
+        conn->keep_alive = true;
+        conn->request_config = &config;
+        const u32 id = conn->id;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        response_read_deadline_fixed_upload_handler_calls = 0;
+        CHECK_FALSE(
+            prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(response_read_deadline_fixed_upload_handler_calls, 0u);
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_EQ(closed.send_buf.len(), 0u);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     }
 }
 
