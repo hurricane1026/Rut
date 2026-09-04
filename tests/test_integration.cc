@@ -39203,8 +39203,12 @@ TEST(route, public_ordinary_source_progress_then_response_deadline_iouring) {
     REQUIRE(resources.compile(backend.port));
     REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
     CHECK_EQ(resources.rir.module.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::None);
     REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
     CHECK_EQ(resources.cfg.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::None);
     CHECK_EQ(resources.cfg.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(resources.cfg.policy_bundles[0].failure_policy_id, 1u);
     CHECK_EQ(resources.cfg.policy_bundles[0].timeout_failure_policy_id, 2u);
