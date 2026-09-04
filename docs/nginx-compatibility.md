@@ -44,7 +44,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default buffering for bounded root bodyless origin-form GET, cleartext H1.1, sequential downstream requests only, no CL/TE/Expect/Upgrade, strict 200 with one positive bounded CL | implicit | yes; exact GET lowering restored in `caa9fce3`, with HEAD/ANY and `/api/` isolated | yes for this exact sequential RUT domain: initial same-batch complete+EOF settlement, validated SocketCreate/ConnectSubmit/async ConnectCompletion 502, canonical sequential response neutrality, and the ordinary unavailable-upstream wire are implemented. #276 closes one late-arrival 502-to-ordinary-local pipeline slice, but this row remains explicitly sequential; #277 and broader pipelining are excluded, while the separate exact #278 late-successor row is declared below | golden plus AST/HIR/MIR/RIR/RouteConfig ownership passes. Converter-generated pinned-nginx differentials prove complete fixed-CL response plus immediate origin EOF, exact downstream response/EOF and live no-retry settle, and strictly sequential same-downstream unavailable-upstream 502 keep-alive then 502 close/EOF. Deterministic and ordinary-RUT production evidence proves the corresponding settlement and two failure/health episodes | SUPPORTED |
 | bounded late-arrival strict successor: same root bodyless origin-form GET route, cleartext H1.1, request 1 default keep-alive and unavailable single IPv4 upstream, complete request 2 arrives after request 1 failure is staged but before its first response byte, depth exactly 1, request 2 has one normalized `Connection: close` | implicit in the accepted exact-root fragment | yes; existing exact GET lowering generates ordinary RUT with FixedStrip request policy, request-bound nginx-shaped 502/504 policies, 60s read deadline, and complete-content-length buffering | yes for this exact generation-bound fresh-connect domain; #278 closed. Both live and terminal-consumed downstream Recv ownership are covered; retry/reuse, mutations, bodies, other methods, protocols, transports, targets, and greater depth remain excluded | deterministic normal/ASan ownership and forgery matrices; ordinary-source raw-CQ production wire with two independent failure episodes and exact accounting; converter-generated pinned-nginx causal-gate differential proves byte-identical 502 keep-alive then 502 close and real EOF, with exactly two scoped upstream attempts on each side | SUPPORTED |
 | bounded pre-admission coalesced successor: one application `send(R1\|\|R2)` where R1 is a root bodyless origin-form GET with default keep-alive and an unavailable fresh single-IPv4 upstream, and R2 is an exact `/static` bodyless GET with normalized `Connection: close`, cleartext H1.1, depth 0→1 | implicit in the accepted root-proxy plus exact-local-return fragment | yes; the fragment lowers to an ordinary root forward plus method-omitted exact strict-local route | yes for this exact request-bound, no-body/no-CL/TE, no-retry/reuse/mutation domain; #277 closed. Other methods, bodies, fragmentation patterns, protocols, transports, targets, and greater depth remain excluded | deterministic ownership/exclusion matrices and ordinary-source production wire; converter-generated pinned-nginx E1/E2/E3 causal gates prove the identical complete wire exists before nginx parsing and RUT dispatch, then Date-only-equal 502 keep-alive → exact-local 200 close/EOF, zero tail, and exactly one scoped upstream attempt per side | SUPPORTED |
-| `proxy_read_timeout` response-read inactivity timing | yes for explicit raw root-location `1s..63s`; all excluded forms/contexts reject explicitly | yes for the accepted root proxy lowering: preserves explicit `1s..63s` on generated HEAD/GET/method-omitted-ANY forward bundles (and accepted exact-redirect GET fallback), with owned policy metadata and fail-closed unsupported/forged models; no behavioral promotion | partial: ordinary RUT carries exact 1..63s metadata, and #455/#457 prove narrow `HeaderOnlyHead` + converter-required `Http11FixedStrip` admission/ownership with one exact 58-byte upstream HEAD request, no origin sends/retry, and the exact zero-stall header-only 504/EOF episode. #458's precise response-read io_uring timer primitive is merged but inert, so live timing fidelity remains blocked; policy 0 is non-equivalent because it preserves the client Host/Connection unchanged instead of applying the required upstream rewrite. Larger/chunked/close-delimited bodies, broader nginx response semantics and transports remain unavailable | PR #455/#457 provide generated ordinary-RUT wire/episode evidence; current generated-RUT timing is near 2s for `1s` versus pinned nginx 1.29.7 near 1.001–1.002s. No pinned-nginx/generated-RUT timing differential or behavior-equivalence claim exists; #458 must be integrated and timing measured across phase variants first | PARTIAL |
+| `proxy_read_timeout` response-read inactivity timing | yes for explicit raw root-location `1s..63s`; all excluded forms/contexts reject explicitly | yes for the accepted root proxy lowering: preserves explicit `1s..63s` on generated HEAD/GET/method-omitted-ANY forward bundles (and accepted exact-redirect GET fallback), with owned policy metadata and fail-closed unsupported/forged models; no broader behavioral promotion | partial: ordinary RUT carries exact 1..63s metadata. PR #460 connects the precise io_uring timer only for the narrow cleartext H1.1 bodyless `HeaderOnlyHead` + converter-required `Http11FixedStrip` profile with `proxy_buffering off`, a fresh single IPv4 upstream, explicit downstream close, one upstream episode and no retry. PR #463 preserves the configured timeout failure after accepted incomplete response headers. Larger/chunked/close-delimited bodies, broader methods, request/response bodies, upstream reuse/retry, default buffering, TLS/H2/epoll and wider lifecycles remain outside the proven capability under #268/#271 | PR #462 drives the nginx fragment through the independent converter into ordinary RUT and compares it with pinned nginx 1.29.7. Zero progress measures about 1.00140s/1.00082s (nginx/RUT); one delayed incomplete-header fragment measures about 1.00145s/1.00081s from complete upstream request. Both match the exact Date-normalized header-only 504/zero-body/EOF wire. The complete-HEAD control matches exact 200 behavior before the timeout floor. Every phase proves one exact upstream episode/no retry and only the declared origin sends. This is evidence only for the stated narrow profile; #268/#270/#271 remain open | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | one exact literal `location = /static` returning status 200 with a 1..64-byte token-safe quoted ASCII body beside the accepted root proxy; bounded cleartext H1.1 bodyless origin-form GET, fresh explicit-close HEAD, and fresh depth-zero header-absent explicit-close POST | yes for this exact two-location model; #286 closed | yes: emits a method-omitted ordinary RUT exact strict-local route beside the unchanged root fallback | yes for the declared literal exact strict-local GET/HEAD/header-absent POST domain; #287 and #288 closed. POST explicitly excludes CL including CL0, Transfer-Encoding/TE, Expect, Upgrade, body/tail, and pipeline; #281/#284 remain open | golden plus AST/HIR/MIR/RIR/RouteConfig ownership; converter-generated explicit-close GET, HEAD, and header-absent POST `/static` pinned-nginx differential proves Date-only-equal ordered wires, exact body or HEAD suppression, close/EOF, and zero upstream effects; causal one-send root GET → exact `/static` GET differential proves 502 keep-alive → 200 close/EOF, zero tail, and exactly one upstream attempt per side | SUPPORTED |
 | the same bounded exact local return with body `"hello world"`, containing exactly one non-edge ASCII space, fresh bodyless explicit-close H1.1 GET only | yes: contextual raw quote scan only after accepted `return 200`; exact borrowed interior/body span accepts old safe grammar plus one non-edge SP and rejects all broader quoting; `3946c555` | yes: quote-delimiter/common-source validation then unchanged ordinary-RUT byte-literal emission; dual-order full golden, legacy isolation, exact 5664/5681 capacity and post-lifetime owned RouteConfig pass; `32a13f91` | yes: ordinary RUT `b"hello world"` compiles, owns and serves the exact wire through the public CLI/io_uring; no RUT capability issue is needed | independently approved pinned oracle `c70c8c32` and converter-generated public-CLI/io_uring differential `9ffd4c4f` prove both real declaration orders and four isolated nginx/RUT sides: exact Date-normalized 154-byte 200/CL11/`hello world`/close/EOF wire with no newline/tail/Location, live and settled zero upstream, and one raw access record. Sol focused 5/5 and complete nginx 34/34 pass | SUPPORTED |
@@ -113,8 +113,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   lowering for explicit root `proxy_read_timeout 1s..63s` across the
   already-supported HEAD/GET/method-omitted-ANY bundles, with focused ownership,
   policy mapping, capacity and fail-closed mutation coverage. CI run
-  `33876573639` passes the 15 standard jobs (privileged broker skipped). No
-  pinned-nginx/generated-RUT timeout differential exists yet, so this row is
+  `33876573639` passes the 15 standard jobs (privileged broker skipped). At that
+  relay no pinned-nginx/generated-RUT timeout differential existed; PR #462 now
+  supplies one for the narrower declared HEAD profile, while the row remains
   `PARTIAL`, not `SUPPORTED`.
 
 - PR #453 (accepted head `06d71e52`, merge `2315c18e`, exact-head CI 15/15) is
@@ -130,11 +131,32 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   zero-stall 504 path with exact header-only 504/EOF behavior. Together with
   #455, this establishes the bounded admission/ownership and wire episode.
 
-- PR #458 (merge `61b80933`) adds the precise response-read io_uring timer
-  primitive, but it remains inert and is not wired into live proxy behavior.
-  The generated `1s` episode still measures near 2s versus pinned nginx 1.29.7
-  near 1.001–1.002s, so #268 blocks timing fidelity and
-  `proxy_read_timeout` remains `PARTIAL`, never `SUPPORTED`.
+- PR #460 (merge `b7cfa699`) connects the precise response-read io_uring timer
+  to the narrow cleartext H1.1 bodyless `HeaderOnlyHead` + `Http11FixedStrip`,
+  buffering-none, fresh-single-IPv4-upstream, explicit-downstream-close profile.
+  It retains generation-owned timer/CQE custody, response/timeout batch ordering,
+  exact configured 504 publication and fail-closed exclusions without adding an
+  nginx-specific runtime mode.
+
+- PR #463 (merge `3d009441`) closes #461 for that same profile: accepted
+  incomplete upstream response-header progress retains the proof required for a
+  later due timer to publish the configured header-only 504, while preserving
+  the pinned initial deadline origin, timer custody and response precedence.
+
+- PR #462 (merge `46815019`) adds the real pinned-nginx 1.29.7 versus
+  converter-generated ordinary-RUT phase differential. Zero progress measures
+  about 1.00140s/1.00082s (nginx/RUT), and the delayed incomplete-header phase
+  about 1.00145s/1.00081s from complete upstream request; both produce the exact
+  Date-normalized header-only 504/zero-body/EOF. A complete HEAD response is the
+  exact 200 control before the timeout floor. All phases prove one exact upstream
+  episode/no retry and only the declared origin sends. This closes the historical
+  near-2s precision gap only for the declared profile; #268/#270/#271 remain open
+  and the matrix row remains `PARTIAL`.
+
+- PR #458 (merge `61b80933`) historically introduced the precise response-read
+  io_uring timer primitive as inert scaffolding. PR #460 subsequently connected
+  it to the narrow live proxy profile, and PR #462 now supplies the phase-varied
+  behavior evidence described above.
 
 - PR #451 (accepted head `7228f3a0d4d4ff55a0bd1bb395bf7475587ef6ee`, merge
   `b0eb92dc725a799a5aba51fdcf47588f9081bcfc`, exact-head CI `33869863683`,
@@ -144,8 +166,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   and initially complete positive fixed-Content-Length uploads. It proves
   exactly-once dispatch/materialization/upload and deadline arming only after
   upload completion. No converter lowering or differential was added by #451;
-  #452 subsequently supplies the bounded lowering, while #268/#271 and the
-  behavior differential remain open.
+  #452 subsequently supplied the bounded lowering. PR #462 later supplied the
+  bodyless explicit-close HEAD differential, while the fixed-upload and broader
+  #268/#271 domains remain open.
 
 - PR #449 (accepted head `18985dd9a94501610b3667a48a17eb53c8c2962b`, merge
   `499bc405d02b859a0465b8ccc2d462a7b698f6a7`, exact-head CI `33857715293`,
@@ -224,9 +247,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - nginx prefix matching is byte-prefix based; RUT routing is segment-aware.
   The root `/` case overlaps, but broader prefix support cannot reuse that fact.
 - PR #455/#457 establish the narrow `HeaderOnlyHead`/`Http11FixedStrip`
-  admission, downstream-close ownership and zero-stall wire episode; #458's
-  precise timer remains inert until integrated, so generated timeout timing must
-  not be treated as nginx-equivalent.
+  admission, downstream-close ownership and zero-stall wire episode. PR
+  #460/#463 connect and complete the precise live timer path for this profile,
+  and PR #462 proves its zero-progress, delayed-incomplete-header and complete-200
+  phases against pinned nginx. This does not extend equivalence to broader
+  methods, bodies, buffering, reuse/retry, transports or lifecycles.
 - `OPTIONS *` and ordinary authority-form CONNECT do not have a canonical
   origin-form path in current RUT. They miss the converter's method-omitted `/`
   route, then select the generated exact OPTIONS/CONNECT policy before the
@@ -384,7 +409,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   exact 200/close completion. It accelerates the global runtime clock only
   before shard spawn and therefore does not prove #268 precise source-level
   duration semantics; #452 supplies bounded converter lowering, but a pinned
-  nginx timing differential is still absent. Every excluded phase/layout,
+  nginx timing differential for this reusable paired-HEAD profile is still
+  absent. PR #462 proves only the separately declared explicit-close profile.
+  Every excluded phase/layout,
   including epoll, remains zero-byte fail-closed. #268 separately tracks
   per-forward read-timeout timing semantics. The broader
   failure domain stays unsupported and does not
