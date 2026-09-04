@@ -521,6 +521,18 @@ static constexpr char kHeadGatewayKeepAliveResponseNormalized[] =
     "Content-Type: text/html\r\n"
     "Content-Length: 157\r\n"
     "Connection: keep-alive\r\n\r\n";
+static constexpr char kExplicitTimeoutHeadRequest[] =
+    "HEAD /timeout-zero?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExplicitTimeoutHeadResponseNormalized[] =
+    "HTTP/1.1 504 Gateway Time-out\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 167\r\n"
+    "Connection: close\r\n\r\n";
+static_assert(sizeof(kExplicitTimeoutHeadResponseNormalized) - 1u == 157u);
 static constexpr char kApiResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -52315,6 +52327,276 @@ static bool run_converter_explicit_timeout_head_source_self_checks(std::string& 
         generated, frontend_port, backend_port, access_path, error);
 }
 
+static bool run_converter_explicit_timeout_head_generated_episode(const char* rut_path,
+                                                                  std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#270 generated timeout episode requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#270 generated timeout episode could not create its temporary directory";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve(0u, frontend_port) || !reservations.reserve(1u, backend_port) ||
+        frontend_port == backend_port) {
+        error = "#270 generated timeout episode could not reserve distinct loopback ports";
+        return false;
+    }
+
+    const std::string profile =
+        make_explicit_timeout_head_profile(frontend_port, backend_port, temp.rut_access_log);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, temp.rut_access_log, error))
+        return false;
+    std::string source;
+    if (!build_explicit_timeout_head_generated_source(profile,
+                                                      frontend_port,
+                                                      backend_port,
+                                                      temp.rut_access_log,
+                                                      source,
+                                                      error) ||
+        !write_file(temp.source, source.data(), source.size())) {
+        if (error.empty()) error = "#270 generated timeout episode could not persist RUT source";
+        return false;
+    }
+
+    struct RecorderGuard {
+        Recorder* recorder;
+        ~RecorderGuard() {
+            if (recorder != nullptr) recorder->stop();
+        }
+    };
+    Recorder origin;
+    RecorderGuard origin_guard{&origin};
+    origin.zero_response_stall = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], backend_port, "#270 generated Recorder bind", error) ||
+        !origin.setup(backend_port)) {
+        if (error.empty()) error = "#270 generated timeout episode Recorder setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origin_live()) {
+        error = "#270 generated timeout episode Recorder was not live before RUT start";
+        return false;
+    }
+
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], frontend_port, "#270 generated public bind", error) ||
+        !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temp.rut_log,
+                     runtime.child) ||
+        !wait_ready(frontend_port, runtime.child, error)) {
+        if (error.empty()) error = "#270 generated timeout episode RUT failed before readiness";
+        return false;
+    }
+    const auto runtime_ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temp.rut_log, "Backend: io_uring\n") ||
+            !log_contains(temp.rut_log,
+                          ("Listening on port " + std::to_string(frontend_port) +
+                           " with 1 shard(s)\n")
+                              .c_str())) &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(runtime.child)) {
+            error = "#270 generated timeout episode RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (poll_child(runtime.child) || !log_contains(temp.rut_log, "Backend: io_uring\n")) {
+        error = "#270 generated timeout episode lacked io_uring readiness";
+        return false;
+    }
+    static constexpr char kPoison[] = "destroyed-after-270-timeout-load\n";
+    std::string poison_readback;
+    if (!write_file(temp.source, kPoison, sizeof(kPoison) - 1u) ||
+        !read_exact_return204_log(
+            temp.source, "#270 poisoned generated timeout source", poison_readback, error) ||
+        poison_readback != kPoison || poll_child(runtime.child)) {
+        error = "#270 generated timeout source poison did not preserve a live child";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 ||
+        !send_all(client.fd,
+                  kExplicitTimeoutHeadRequest,
+                  sizeof(kExplicitTimeoutHeadRequest) - 1u)) {
+        error = "#270 generated timeout episode HEAD request connect/send failed";
+        return false;
+    }
+    const auto stall_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.zero_response_stall_ready.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < stall_ready_deadline) {
+        if (poll_child(runtime.child) || !origin_live()) {
+            error = "#270 generated timeout episode stopped before origin stall-ready";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 stall_started_ns =
+        origin.zero_response_stall_started_ns.load(std::memory_order_acquire);
+    if (!origin.zero_response_stall_ready.load(std::memory_order_acquire) || stall_started_ns == 0u ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        origin.response_send_succeeded.load(std::memory_order_acquire)) {
+        error = "#270 generated timeout episode did not reach one zero-response origin stall";
+        return false;
+    }
+    std::vector<char> response;
+    const auto quiet_until = stall_started_ns + 800'000'000ull;
+    while (steady_now_ns() < quiet_until) {
+        if (poll_child(runtime.child) || !origin_live()) {
+            error = "#270 generated timeout episode lost live ownership before timeout gate";
+            return false;
+        }
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&p, 1, 50);
+        if (ready < 0 && errno != EINTR) {
+            error = "#270 generated timeout episode quiet-window poll failed";
+            return false;
+        }
+        if (ready > 0) {
+            char byte = 0;
+            const ssize_t n = recv(client.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                error = "#270 generated timeout episode emitted before the 800ms gate "
+                        "(elapsed_ns=" +
+                        std::to_string(steady_now_ns() - stall_started_ns) + ", recv=" +
+                        std::to_string(n) + ", origin_accepts=" +
+                        std::to_string(origin.accepted.load(std::memory_order_acquire)) +
+                        ", origin_requests=" +
+                        std::to_string(origin.requests.load(std::memory_order_acquire)) +
+                        ", origin_peer_closed=" +
+                        std::to_string(origin.zero_response_stall_peer_closed.load(
+                            std::memory_order_acquire)) +
+                        ", origin_close_elapsed_ns=" +
+                        std::to_string(
+                            origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) -
+                            stall_started_ns) +
+                        ", child=" + child_status_description(runtime.child) + ")";
+                dump_log(temp.rut_log, "#270 generated timeout runtime log");
+                dump_wire("#270 generated timeout partial downstream", response);
+                return false;
+            }
+        }
+    }
+
+    u64 first_byte_ns = 0u;
+    const auto response_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= response_deadline) {
+            error = "#270 generated timeout episode produced no response before 3s";
+            return false;
+        }
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&p, 1, 50);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#270 generated timeout episode response poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[1024];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        if (n > 0) {
+            if (first_byte_ns == 0u) first_byte_ns = steady_now_ns();
+            response.insert(response.end(), bytes, bytes + n);
+            const size_t end = header_end(response);
+            if (end != 0u) {
+                if (response.size() != end) {
+                    error = "#270 generated timeout episode emitted HEAD body bytes";
+                    return false;
+                }
+                break;
+            }
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        error = n == 0 ? "#270 generated timeout episode closed before response headers"
+                       : "#270 generated timeout episode response recv failed";
+        return false;
+    }
+    const u64 elapsed_ns = first_byte_ns - stall_started_ns;
+    std::vector<char> normalized = response;
+    const std::vector<char> expected(kExplicitTimeoutHeadResponseNormalized,
+                                     kExplicitTimeoutHeadResponseNormalized +
+                                         sizeof(kExplicitTimeoutHeadResponseNormalized) - 1u);
+    if (first_byte_ns < stall_started_ns || elapsed_ns < 800'000'000ull ||
+        elapsed_ns >= 3'000'000'000ull || !normalize_date(normalized) || normalized != expected) {
+        error = "#270 generated timeout episode timing/header mismatch (elapsed_ns=" +
+                std::to_string(elapsed_ns) + ")";
+        dump_wire("#270 generated timeout response", response);
+        return false;
+    }
+    if (!read_eof(client.fd, error)) {
+        error = "#270 generated timeout episode did not close downstream: " + error;
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+
+    const auto origin_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.zero_response_stall_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < origin_close_deadline) {
+        if (poll_child(runtime.child) || origin.zero_response_stall_observation_failed.load(
+                                             std::memory_order_acquire) ||
+            origin.zero_response_stall_unexpected_data.load(std::memory_order_acquire)) {
+            error = "#270 generated timeout episode origin-close observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!origin.zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+        origin.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.zero_response_stall_peer_closed_ns.load(std::memory_order_acquire) < stall_started_ns ||
+        origin.zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
+        origin.zero_response_stall_observation_failed.load(std::memory_order_acquire) ||
+        !origin_live()) {
+        error = "#270 generated timeout episode did not retire exactly one live origin peer";
+        return false;
+    }
+    if (!stop_child(runtime.child) || !runtime.child.status_valid ||
+        !WIFEXITED(runtime.child.status) || WEXITSTATUS(runtime.child.status) != 0) {
+        error = "#270 generated timeout episode RUT did not exit cleanly";
+        return false;
+    }
+    origin.stop();
+    origin_guard.recorder = nullptr;
+    if (origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        origin.zero_response_stall_peer_close_count.load(std::memory_order_acquire) != 1u) {
+        error = "#270 generated timeout episode cleanup lost exact ownership evidence";
+        return false;
+    }
+    return true;
+}
+
 static void configure_positive_get_default_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -53174,6 +53456,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
     const bool explicit_timeout_head_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
+    const bool explicit_timeout_head_generated_episode =
+        argc == 3 && strcmp(argv[1], "--converter-explicit-timeout-head-generated-episode") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -53376,7 +53660,8 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !proxy_hide_header_generated_pair_self_check &&
+         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
@@ -53446,6 +53731,7 @@ int main(int argc, char** argv) {
         ((proxy_hide_header_generated_side_self_check ||
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
+        (explicit_timeout_head_generated_episode && argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
@@ -53531,6 +53817,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --pinned-nginx-proxy-hide-header-oracle\n"
                      "   or: test_nginx_differential "
                      "--converter-explicit-timeout-head-source-self-check\n"
+                     "   or: test_nginx_differential "
+                     "--converter-explicit-timeout-head-generated-episode <absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-proxy-hide-header-generated-side-self-check "
                      "<absolute-rut-executable>\n"
@@ -53831,6 +54119,18 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: zero-response origin stall accepted one complete request, emitted "
                      "no bytes, observed one peer close, and retained then retired its listener\n";
+        return 0;
+    }
+    if (explicit_timeout_head_generated_episode) {
+        std::string episode_error;
+        if (!run_converter_explicit_timeout_head_generated_episode(argv[2], episode_error)) {
+            std::cerr << "FAIL [#270 generated explicit-timeout HEAD episode]: " << episode_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 generated ordinary RUT bodyless HEAD remained quiet through "
+                     "the 1s response-read deadline, emitted the exact header-only 504/EOF, "
+                     "rewrote one upstream request, and retired one origin episode\n";
         return 0;
     }
     TempDir temp;
