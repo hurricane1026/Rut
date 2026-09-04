@@ -1259,6 +1259,17 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 30
     )
     add_test(
+        NAME test_nginx_issue268_explicit_timeout_head_phase_differential
+        COMMAND test_nginx_differential --explicit-timeout-head-phase-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue268_explicit_timeout_head_phase_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue373_converter_proxy_hide_header_generated_side_self_check
         COMMAND test_nginx_differential --converter-proxy-hide-header-generated-side-self-check $<TARGET_FILE:rut>
     )
