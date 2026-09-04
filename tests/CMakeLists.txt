@@ -1263,7 +1263,7 @@ if(RUT_ENABLE_JIT)
         COMMAND test_nginx_differential --explicit-timeout-head-phase-differential $<TARGET_FILE:rut>
     )
     set_tests_properties(test_nginx_issue268_explicit_timeout_head_phase_differential PROPERTIES
-        LABELS "integration;io_uring;network;nginx"
+        LABELS "integration;io_uring;network;nginx;docker"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
         TIMEOUT 180
