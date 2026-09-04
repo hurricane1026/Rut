@@ -26943,6 +26943,103 @@ TEST(iouring_response_read_timer, cancel_pending_reclaims_only_after_both_cqes) 
     }
 }
 
+TEST(iouring_response_read_timer, precise_activation_is_exact_and_remaining_time_is_rounded_up) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    Connection conn{};
+    conn.response_read_deadline_profile = ResponseReadDeadlineProfile::HeaderOnlyHead;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Head);
+    conn.response_read_deadline_upload.downstream_close = true;
+    conn.req_method = static_cast<u8>(LogHttpMethod::Head);
+    conn.req_keep_alive = true;
+    conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = true;
+    conn.req_client_connection_close_exact = true;
+    conn.req_client_connection_count = 1;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    CHECK(header_only_head_explicit_close_is_stable(
+        conn, conn.response_read_deadline_upload));
+
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    CHECK_FALSE(header_only_head_explicit_close_is_stable(
+        conn, conn.response_read_deadline_upload));
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    conn.pipeline_depth = 1;
+    CHECK_FALSE(header_only_head_explicit_close_is_stable(
+        conn, conn.response_read_deadline_upload));
+    conn.pipeline_depth = 0;
+    conn.request_policy_id = 0;
+    CHECK_FALSE(header_only_head_explicit_close_is_stable(
+        conn, conn.response_read_deadline_upload));
+
+    CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 100), 1000u);
+    CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 100'000'101), 900u);
+    CHECK_EQ(response_read_timer_remaining_ms(100, 1'000'000'000ull, 1'000'000'100), 0u);
+}
+
+TEST(iouring_response_read_timer,
+     post_disarm_custody_cqes_never_close_live_owner_in_either_order) {
+    for (const bool cancel_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        IoUringEventLoop* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
+        REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+        const u32 generation = conn->response_read_timer_owner_generation;
+        loop->disarm_response_read_deadline(*conn);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+        REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+
+        IoEvent target = inert_response_read_timer_event(conn->id, generation);
+        target.result = -ECANCELED;
+        IoEvent cancel = inert_response_read_timer_event(
+            conn->id, generation | kResponseReadTimerCancelBit);
+        cancel.result = 0;
+        const IoEvent events[2] = {cancel_first ? cancel : target,
+                                   cancel_first ? target : cancel};
+        loop->dispatch_batch(events, 2);
+        CHECK(conn->fd >= 0);
+        CHECK(conn->response_read_timer_owner_is_neutral());
+        loop->close_conn(*conn);
+    }
+}
+
+TEST(iouring_response_read_timer, cancel_submission_failure_keeps_natural_target_identity) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    IoUringEventLoop* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+    const u32 generation = conn->response_read_timer_owner_generation;
+    const u32 deadline_generation = conn->response_read_timer_deadline_generation;
+    const u32 episode = conn->response_read_timer_upstream_episode;
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(loop->backend.sq_tail,
+                     head + loop->backend.sq_ring_entries,
+                     __ATOMIC_RELEASE);
+    loop->disarm_response_read_deadline(*conn);
+    CHECK_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    CHECK_EQ(conn->response_read_timer_owner_generation, generation);
+    CHECK_EQ(conn->response_read_timer_deadline_generation, deadline_generation);
+    CHECK_EQ(conn->response_read_timer_upstream_episode, episode);
+    __atomic_store_n(loop->backend.sq_tail, head, __ATOMIC_RELEASE);
+
+    IoEvent target = inert_response_read_timer_event(conn->id, generation);
+    loop->dispatch(target);
+    CHECK(conn->response_read_timer_owner_is_neutral());
+    loop->close_conn(*conn);
+}
+
 struct StagedLocalSendFixture {
     void* loop_storage = MAP_FAILED;
     IoUringEventLoop* loop = nullptr;
@@ -36251,6 +36348,15 @@ TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_
     loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
     loop->dispatch(
         {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamCloseCancelAux, episode});
+    const u32 timer_generation = conn->response_read_timer_owner_generation;
+    REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    IoEvent timer_target = inert_response_read_timer_event(id, timer_generation);
+    timer_target.result = -ECANCELED;
+    IoEvent timer_cancel = inert_response_read_timer_event(
+        id, timer_generation | kResponseReadTimerCancelBit);
+    timer_cancel.result = 0;
+    const IoEvent timer_events[2] = {timer_target, timer_cancel};
+    loop->dispatch_batch(timer_events, 2);
     CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     CHECK_FALSE(loop->backend.fatal_error.load(std::memory_order_acquire));
     close(downstream[1]);
@@ -36421,6 +36527,16 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     conn->response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
     const u32 close_episode = conn->upstream_episode;
     REQUIRE(try_prebuilt_strict_read_timeout(loop, *conn));
+    const u32 timer_generation = conn->response_read_timer_owner_generation;
+    REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    IoEvent timer_target = inert_response_read_timer_event(conn->id, timer_generation);
+    timer_target.result = -ECANCELED;
+    IoEvent timer_cancel = inert_response_read_timer_event(
+        conn->id, timer_generation | kResponseReadTimerCancelBit);
+    timer_cancel.result = 0;
+    const IoEvent timer_events[2] = {timer_target, timer_cancel};
+    loop->dispatch_batch(timer_events, 2);
+    CHECK(conn->response_read_timer_owner_is_neutral());
     CHECK_EQ(conn->state, ConnState::Sending);
     CHECK_EQ(conn->resp_body_sent, conn->response_header_buf.len());
     CHECK_EQ(conn->upstream_fd, -1);

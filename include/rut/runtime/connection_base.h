@@ -701,7 +701,6 @@ struct ConnectionBase {
         visit(c.response_read_timer_owner_generation, u32{0});
         visit(c.response_read_timer_deadline_generation, u32{0});
         visit(c.response_read_timer_upstream_episode, u32{0});
-        visit(c.response_read_timer_last_progress_ns, u64{0});
         visit(c.response_read_timer_phase, ResponseReadTimerPhase::None);
         visit(c.response_read_timer_target_owned, false);
         visit(c.response_read_timer_cancel_owned, false);
@@ -778,8 +777,12 @@ struct ConnectionBase {
         } else {
             return false;
         }
-        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned)
-            return clear_response_read_timer_owner();
+        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned) {
+            const bool cleared = clear_response_read_timer_owner();
+            if (cleared && response_read_deadline_state == ResponseReadDeadlineState::None)
+                response_read_timer_last_progress_ns = 0;
+            return cleared;
+        }
         return true;
     }
 
@@ -910,6 +913,7 @@ struct ConnectionBase {
         clear_response_read_deadline_send_owner();
         response_read_deadline_upload.clear_owner();
         response_read_deadline_first_batch_upload.clear_owner();
+        if (response_read_timer_owner_is_neutral()) response_read_timer_last_progress_ns = 0;
     }
 
     template <typename Self, typename Visitor>

@@ -2528,17 +2528,27 @@ public:
     }
 
     [[nodiscard]] bool response_read_deadline_uses_precise_timer(const Connection& c) const {
-        return c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
-               c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-               c.response_read_deadline_upload.downstream_close &&
-               c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
-               c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
-               c.protocol == ConnProtocol::Http11 && !c.tls_active &&
-               c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
-               c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-               !c.upstream_reused && c.upstream_attempts == 1 && c.upstream_fd >= 0 &&
-               valid_upstream_episode(c.upstream_episode) &&
-               c.response_read_deadline_upstream_episode == c.upstream_episode;
+        if (c.response_read_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
+            !c.response_read_deadline_upload.downstream_close ||
+            c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+            c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            c.protocol != ConnProtocol::Http11 || c.tls_active ||
+            c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+            c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
+            c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
+            !valid_upstream_episode(c.upstream_episode) ||
+            c.response_read_deadline_upstream_episode != c.upstream_episode)
+            return false;
+        const RouteConfig* cfg = c.request_config;
+        return cfg != nullptr &&
+               header_only_head_explicit_close_arm_is_stable(
+                   c,
+                   c.response_read_deadline_upload,
+                   cfg,
+                   c.response_read_deadline_bundle_id,
+                   ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                   &on_upstream_response<Self>);
     }
 
     [[nodiscard]] bool rearm_precise_response_read_timer(Connection& c, u64 now_ns) {
@@ -2562,9 +2572,7 @@ public:
             c.clear_response_read_deadline();
             return;
         }
-        const bool owns_timer =
-            c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
-            c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending;
+        const bool owns_timer = c.response_read_deadline_state != ResponseReadDeadlineState::None;
         if (owns_timer) {
             if (c.response_read_timer_phase == ResponseReadTimerPhase::Armed)
                 // Keep the target owner if cancel SQ submission is unavailable;
@@ -2712,6 +2720,7 @@ public:
         owner.upstream_episode = c.response_read_timer_upstream_episode;
         owner.profile = c.response_read_deadline_profile;
         owner.method = c.response_read_deadline_method;
+        owner.valid = true;
         owner.precise_timer_valid = true;
         owner.saw_precise_timer = true;
         owner.precise_timer_generation = c.response_read_timer_owner_generation;
@@ -2891,6 +2900,11 @@ public:
             auto& owner = response_read_batch_owners[oi];
             pin_response_read_batch_slot(owner.conn_id);
             Connection& c = conns[owner.conn_id];
+            // A timer can outlive the logical deadline owner after a successful
+            // disarm (for example while the exact 504 Send is in flight). Its
+            // CQE is custody-only: keep the slot pinned, but do not force the
+            // ordinary deadline state machine to manufacture a mismatch.
+            if (owner.saw_precise_timer && !owner.precise_timer_semantic) continue;
             const bool key_stable =
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
@@ -3202,6 +3216,13 @@ public:
                         }
                         const bool cancel = (timer_ev.non_upstream_generation &
                                              kResponseReadTimerCancelBit) != 0;
+                        if (cancel) {
+                            if (timer_ev.result != 0 && timer_ev.result != -ENOENT)
+                                custody_ok = false;
+                        } else if (timer_ev.result != -ETIME &&
+                                   timer_ev.result != -ECANCELED) {
+                            custody_ok = false;
+                        }
                         if (!cancel && owner.precise_timer_semantic) {
                             // -ECANCELED is a custody-only target result (the
                             // cancel won the race); only natural -ETIME can
@@ -3213,14 +3234,25 @@ public:
                         }
                     }
                 }
-                if (!custody_ok || !owner.valid ||
-                    (owner.saw_terminal && !owner.saw_positive)) {
+                if (!custody_ok) {
                     if (c.fd >= 0) close_conn(c);
                     continue;
                 }
+                if (!owner.valid || (owner.saw_terminal && !owner.saw_positive)) {
+                    if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
+                    continue;
+                }
+                // The logical deadline was already disarmed before this
+                // custody-only CQE was harvested. No timer result can affect
+                // the successor/504 state; only the owner barrier is drained.
+                if (!owner.precise_timer_semantic) continue;
                 const bool precise_active = response_read_deadline_uses_precise_timer(c);
                 if (saw_canceled_target && precise_active) {
-                    c.clear_response_read_deadline();
+                    // A cancelled target can arrive before its cancel CQE.
+                    // Keep the logical identity until the second owner drains;
+                    // only a fully neutral transport owner may be cleared here.
+                    if (!c.response_read_timer_cancel_owned)
+                        c.clear_response_read_deadline();
                     continue;
                 }
                 if (!saw_semantic_target || !precise_active)
@@ -3228,8 +3260,11 @@ public:
                 const u64 now_ns = monotonic_ns();
                 if (owner.saw_positive) {
                     c.response_read_timer_last_progress_ns = now_ns;
-                    if (!rearm_precise_response_read_timer(c, now_ns) && c.fd >= 0)
-                        close_conn(c);
+                    if (!rearm_precise_response_read_timer(c, now_ns)) {
+                        if (c.fd >= 0) close_conn(c);
+                    } else {
+                        c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                    }
                     continue;
                 }
                 const u64 timeout_ns = static_cast<u64>(c.response_read_deadline_seconds) *
@@ -3239,8 +3274,10 @@ public:
                 if (due) {
                     c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
                     response_read_deadline_expiry_pending = true;
-                } else if (!rearm_precise_response_read_timer(c, now_ns) && c.fd >= 0) {
-                    close_conn(c);
+                } else if (!rearm_precise_response_read_timer(c, now_ns)) {
+                    if (c.fd >= 0) close_conn(c);
+                } else {
+                    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
                 }
                 continue;
             }
