@@ -685,8 +685,9 @@ struct ConnectionBase {
     u32 response_read_timer_owner_generation = 0;
     u32 response_read_timer_deadline_generation = 0;
     u32 response_read_timer_upstream_episode = 0;
-    // Monotonic logical progress clock for the narrow precise owner. Positive
-    // Full-copy fragments update this value; fragments never cancel/rearm it.
+    // Monotonic deadline origin for the narrow precise owner. Accepted progress
+    // is proved separately; a profile may retain this pinned origin without
+    // cancel/rearm churn.
     u64 response_read_timer_last_progress_ns = 0;
     ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
     bool response_read_timer_target_owned = false;
