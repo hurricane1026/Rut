@@ -694,9 +694,8 @@ inline bool header_only_head_keep_alive_precise_candidate(const Connection& c) {
     const auto& proof = c.response_read_deadline_upload;
     return c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
            !proof.downstream_close && response_read_deadline_default_persistence_is_stable(c) &&
-           (c.request_policy_id != 0 || proof.request_policy_id != 0 ||
-            proof.handler_generation != 0 || proof.route_fn != nullptr ||
-            proof.upstream_id != 0xffffu);
+           (c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+            proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip));
 }
 inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
                                                       const ResponseReadDeadlineUploadProof& proof,

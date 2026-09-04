@@ -3456,6 +3456,8 @@ void handle_jit_outcome(Loop* loop,
                     outcome_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
                     forward_response_buffering == ForwardResponseBufferingMode::None &&
                     conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                    outcome.request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
                     !conn.response_read_deadline_upload.downstream_close &&
                     response_read_deadline_default_persistence_is_stable(conn) &&
                     conn.handler_gen != 0 && conn.pipeline_depth == 0 &&
