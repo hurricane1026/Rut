@@ -27012,6 +27012,51 @@ TEST(iouring_response_read_timer,
     }
 }
 
+TEST(iouring_response_read_timer,
+     post_disarm_malformed_custody_cqes_do_not_touch_live_or_successor_owner) {
+    for (const u32 malformed_kind : {0u, 1u, 2u}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        IoUringEventLoop* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
+        REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+        const u32 generation = conn->response_read_timer_owner_generation;
+        loop->disarm_response_read_deadline(*conn);
+
+        IoEvent malformed = inert_response_read_timer_event(conn->id, generation);
+        if (malformed_kind == 0) malformed.non_upstream_generation = generation + 1u;
+        if (malformed_kind == 1) malformed.aux = 1;
+        if (malformed_kind == 2) {
+            IoEvent cancel = inert_response_read_timer_event(
+                conn->id, generation | kResponseReadTimerCancelBit);
+            cancel.result = 0;
+            const IoEvent duplicate[3] = {malformed, malformed, cancel};
+            loop->dispatch_batch(duplicate, 3);
+            CHECK(conn->fd >= 0);
+            CHECK(conn->response_read_timer_owner_is_neutral());
+            loop->close_conn(*conn);
+            continue;
+        }
+        loop->dispatch_batch(&malformed, 1);
+        CHECK(conn->fd >= 0);
+        CHECK_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        IoEvent target = inert_response_read_timer_event(conn->id, generation);
+        target.result = -ECANCELED;
+        IoEvent cancel = inert_response_read_timer_event(
+            conn->id, generation | kResponseReadTimerCancelBit);
+        cancel.result = 0;
+        const IoEvent valid[2] = {target, cancel};
+        loop->dispatch_batch(valid, 2);
+        CHECK(conn->fd >= 0);
+        CHECK(conn->response_read_timer_owner_is_neutral());
+        loop->close_conn(*conn);
+    }
+}
+
 TEST(iouring_response_read_timer, cancel_submission_failure_keeps_natural_target_identity) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

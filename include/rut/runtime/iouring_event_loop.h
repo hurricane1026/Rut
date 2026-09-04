@@ -3235,7 +3235,7 @@ public:
                     }
                 }
                 if (!custody_ok) {
-                    if (c.fd >= 0) close_conn(c);
+                    if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
                 }
                 if (!owner.valid || (owner.saw_terminal && !owner.saw_positive)) {
