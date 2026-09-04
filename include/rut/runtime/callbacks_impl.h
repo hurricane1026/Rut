@@ -3452,6 +3452,18 @@ void handle_jit_outcome(Loop* loop,
                     conn.req_client_connection_close_exact &&
                     conn.req_client_connection_count == 1 && conn.pipeline_depth == 0 &&
                     conn.http1_pipeline_request_generation == 0;
+                const bool header_only_head_keep_alive =
+                    outcome_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                    forward_response_buffering == ForwardResponseBufferingMode::None &&
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                    outcome.request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                    !conn.response_read_deadline_upload.downstream_close &&
+                    response_read_deadline_default_persistence_is_stable(conn) &&
+                    conn.handler_gen != 0 && conn.pipeline_depth == 0 &&
+                    conn.http1_pipeline_request_generation == 0;
+                const bool header_only_head_materialization =
+                    header_only_head_explicit_close || header_only_head_keep_alive;
                 const auto& deadline_proof = conn.response_read_deadline_upload;
                 const bool coalesced_get =
                     outcome_profile ==
@@ -3482,7 +3494,7 @@ void handle_jit_outcome(Loop* loop,
                      fn == nullptr && !conn.request_policy_body_pending &&
                      request_body_state == RequestPolicyBodyState::Complete);
                 const bool request_policy_valid =
-                    header_only_head_explicit_close
+                    header_only_head_materialization
                         ? outcome.request_policy_id ==
                                   static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
                               request_body_state == RequestPolicyBodyState::Complete
@@ -3559,7 +3571,7 @@ void handle_jit_outcome(Loop* loop,
                         proof.request_policy_id = outcome.request_policy_id;
                         if (coalesced_get) proof.upstream_id = outcome.upstream_id;
                     }
-                } else if (header_only_head_explicit_close) {
+                } else if (header_only_head_materialization) {
                     auto& proof = conn.response_read_deadline_upload;
                     if (proof.handler_generation == 0 ||
                         proof.handler_generation != conn.handler_gen || proof.route_fn == nullptr ||
@@ -3926,7 +3938,12 @@ void handle_jit_outcome(Loop* loop,
                 }
                 if (conn.response_read_deadline_profile ==
                         ResponseReadDeadlineProfile::HeaderOnlyHead &&
-                    conn.response_read_deadline_upload.downstream_close &&
+                    (conn.response_read_deadline_upload.downstream_close ||
+                     (response_read_deadline_default_persistence_is_stable(conn) &&
+                      conn.response_read_deadline_upload.handler_generation != 0 &&
+                      conn.response_read_deadline_upload.route_fn != nullptr &&
+                      conn.response_read_deadline_upload.request_policy_id ==
+                          static_cast<u16>(RequestPolicyId::Http11FixedStrip))) &&
                     conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0) {
                     auto& proof = conn.response_read_deadline_upload;
                     if (conn.request_policy_id !=
@@ -4397,7 +4414,18 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                                           conn.response_read_deadline_route_method);
         const bool header_only_head_explicit_close =
             profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            conn.response_read_deadline_upload.downstream_close &&
             header_only_head_explicit_close_arm_is_stable(
+                conn,
+                conn.response_read_deadline_upload,
+                config,
+                conn.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Loop>);
+        const bool header_only_head_keep_alive =
+            profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            !conn.response_read_deadline_upload.downstream_close &&
+            header_only_head_keep_alive_arm_is_stable(
                 conn,
                 conn.response_read_deadline_upload,
                 config,
@@ -4452,7 +4480,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.upstream_connect_armed || conn.upstream_send_armed ||
             conn.on_upstream_send != nullptr || conn.retry_req_send_len != 0 ||
             (!fixed_upload && conn.response_mutations_snapshotted) ||
-            (!pipeline_generation_stable && !header_only_head_explicit_close) ||
+            (!pipeline_generation_stable && !header_only_head_explicit_close &&
+             !header_only_head_keep_alive) ||
             conn.recv_paused_for_send || conn.recv_pause_cancel_pending ||
             conn.recv_pause_rearm_pending || conn.upstream_recv_paused_for_send ||
             conn.upstream_recv_pause_cancel_pending || conn.upstream_recv_pause_rearm_pending ||
@@ -4548,7 +4577,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
             conn.http1_prebuilt_header_end = timeout_parser.header_end;
             conn.http1_prebuilt_total_len = response_len;
-            conn.http1_prebuilt_body_len = (fixed_upload_head || header_only_head_explicit_close)
+            conn.http1_prebuilt_body_len = (fixed_upload_head || header_only_head_explicit_close ||
+                                            header_only_head_keep_alive)
                                                ? timeout.body.len
                                                : response_len - timeout_parser.header_end;
             conn.http1_prebuilt_status = timeout.status_code;
@@ -5650,8 +5680,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.request_upload_complete = true;
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
-        conn.response_read_deadline_upload.downstream_close && conn.pipeline_depth == 0 &&
-        conn.http1_pipeline_request_generation == 0)
+        (conn.response_read_deadline_upload.downstream_close ||
+         header_only_head_keep_alive_precise_candidate(conn)) &&
+        conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0)
         conn.response_read_deadline_upload.upload_episode = conn.upstream_episode;
 
     // FRESH (non-retry) send path: recv_buf still holds exactly the just-sent request

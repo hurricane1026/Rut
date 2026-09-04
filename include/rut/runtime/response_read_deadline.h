@@ -452,6 +452,45 @@ inline bool response_read_timeout_header_only_head_explicit_close_is_stable(
                FailurePolicyHeadMode::SuppressBody;
 }
 
+inline bool response_read_timeout_header_only_head_is_stable(const Connection& c,
+                                                             const RouteConfig* config,
+                                                             u16 bundle_id) {
+    if (response_read_timeout_header_only_head_explicit_close_is_stable(c, config, bundle_id))
+        return true;
+    if (config == nullptr || config != c.request_config ||
+        !config->policy_bundle_id_is_valid(bundle_id) ||
+        c.http1_prebuilt_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
+        c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout ||
+        c.http1_prebuilt_deadline_config != config ||
+        c.http1_prebuilt_deadline_bundle_id != bundle_id ||
+        c.http1_prebuilt_deadline_generation == 0 ||
+        c.http1_prebuilt_deadline_generation != c.response_read_deadline_generation ||
+        c.http1_prebuilt_deadline_method != static_cast<u8>(LogHttpMethod::Head) ||
+        c.req_method != c.http1_prebuilt_deadline_method ||
+        !response_read_deadline_route_method_matches(c.http1_prebuilt_deadline_method,
+                                                     c.http1_prebuilt_deadline_route_method) ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||
+        c.http1_prebuilt_deadline_upload.downstream_close ||
+        !response_read_deadline_default_persistence_is_stable(c))
+        return false;
+    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
+        bundle.response_policy_id != c.response_policy_id ||
+        bundle.failure_policy_id != c.failure_policy_id ||
+        bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+        !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+        !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    return config->response_policies[bundle.response_policy_id - 1].head_mode ==
+               ResponsePolicyHeadMode::SuppressBody &&
+           config->failure_policies[bundle.failure_policy_id - 1].head_mode ==
+               FailurePolicyHeadMode::SuppressBody &&
+           config->failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
+               FailurePolicyHeadMode::SuppressBody;
+}
+
 inline bool response_read_timeout_header_only_head_response_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& copied_proof,
@@ -483,9 +522,7 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         c.resp_header_mutation_count != 0 || c.resp_header_mutation_pending_count != 0 ||
         c.resp_header_mutation_pending_overflow || c.resp_header_mutation_overflow ||
         !c.request_upload_complete || c.upstream_request_incomplete || c.upstream_reused ||
-        c.upstream_attempts != 1 || !copied_proof.downstream_close || c.req_client_keep_alive ||
-        !c.req_client_connection_close || !c.req_client_connection_close_exact ||
-        c.req_client_connection_count != 1 || !c.req_keep_alive ||
+        c.upstream_attempts != 1 || !c.req_keep_alive ||
         c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
         c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout ||
         c.http1_prebuilt_response_layout != Http1PrebuiltResponseLayout::HeaderOnlyHead ||
@@ -505,6 +542,13 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 ||
         c.upstream_send_len != 0 || c.response_header_buf.data() == nullptr)
         return false;
+    const bool explicit_close = copied_proof.downstream_close && !c.req_client_keep_alive &&
+                                c.req_client_connection_close &&
+                                c.req_client_connection_close_exact &&
+                                c.req_client_connection_count == 1;
+    const bool default_keep_alive =
+        !copied_proof.downstream_close && response_read_deadline_default_persistence_is_stable(c);
+    if (!explicit_close && !default_keep_alive) return false;
     if (phase != ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin &&
         phase != ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired)
         return false;
@@ -629,7 +673,7 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
            copied_proof.rewritten_total_length == c.req_initial_send_len &&
            copied_proof.expected_upload_length == copied_proof.rewritten_total_length &&
            copied_proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
-           copied_proof.downstream_close && route.action == RouteAction::JitHandler &&
+           (explicit_close || default_keep_alive) && route.action == RouteAction::JitHandler &&
            route.fn == copied_proof.route_fn &&
            route.method == c.http1_prebuilt_deadline_route_method && !route.needs_req_body &&
            route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
@@ -643,19 +687,45 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
                                    kMaxRouteParams) == &route;
 }
 
+inline bool response_read_deadline_owner_is_stable(const Connection& c,
+                                                   Connection::Callback expected_upstream_recv,
+                                                   ResponseReadDeadlineOwnerPhase phase);
+inline bool header_only_head_keep_alive_precise_candidate(const Connection& c) {
+    const auto& proof = c.response_read_deadline_upload;
+    return c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+           !proof.downstream_close && response_read_deadline_default_persistence_is_stable(c) &&
+           (c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+            proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+}
+inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
+                                                      const ResponseReadDeadlineUploadProof& proof,
+                                                      const RouteConfig* config,
+                                                      u16 bundle_id,
+                                                      ResponseReadDeadlineOwnerPhase phase,
+                                                      Connection::Callback expected_upstream_recv);
+
 inline bool response_read_timeout_header_only_head_live_proof_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& copied_proof,
     const RouteConfig* config,
     u16 bundle_id,
     Connection::Callback expected_upstream_recv) {
-    return header_only_head_explicit_close_arm_is_stable(
-               c,
-               copied_proof,
-               config,
-               bundle_id,
-               ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
-               expected_upstream_recv) &&
+    const bool live_owner = copied_proof.downstream_close
+                                ? header_only_head_explicit_close_arm_is_stable(
+                                      c,
+                                      copied_proof,
+                                      config,
+                                      bundle_id,
+                                      ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                                      expected_upstream_recv)
+                                : header_only_head_keep_alive_arm_is_stable(
+                                      c,
+                                      copied_proof,
+                                      config,
+                                      bundle_id,
+                                      ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                                      expected_upstream_recv);
+    return live_owner &&
            response_read_timeout_header_only_head_response_is_stable(
                c,
                copied_proof,
@@ -1556,6 +1626,52 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
                    c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
     return state_ok && c.response_read_deadline_upstream_episode == c.upstream_episode &&
            (phase == ResponseReadDeadlineOwnerPhase::ActiveAfterCopy || c.upstream_recv_armed);
+}
+
+inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
+                                                      const ResponseReadDeadlineUploadProof& proof,
+                                                      const RouteConfig* config,
+                                                      u16 bundle_id,
+                                                      ResponseReadDeadlineOwnerPhase phase,
+                                                      Connection::Callback expected_upstream_recv) {
+    if (config == nullptr || config != c.request_config ||
+        c.response_read_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
+        c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
+        c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Head) ||
+        c.req_method != c.response_read_deadline_method || proof.downstream_close ||
+        !response_read_deadline_default_persistence_is_stable(c) || c.pipeline_depth != 0 ||
+        c.http1_pipeline_request_generation != 0 || c.response_mutations_snapshotted ||
+        c.retry_req_send_len != 0 ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
+        proof.handler_generation != c.handler_gen || proof.route_index >= config->route_count ||
+        proof.route_fn == nullptr || proof.upstream_id >= config->upstream_count ||
+        proof.upstream_id != c.upstream_idx || proof.raw_header_end == 0 ||
+        proof.raw_content_length != 0 || proof.raw_total_length != proof.raw_header_end ||
+        proof.rewritten_header_end == 0 || proof.rewritten_header_end != c.req_header_end ||
+        proof.rewritten_total_length != c.req_initial_send_len ||
+        proof.rewritten_total_length != proof.rewritten_header_end ||
+        proof.expected_upload_length != proof.rewritten_total_length ||
+        !valid_upstream_episode(proof.upload_episode) ||
+        proof.upload_episode != c.upstream_episode || c.upstream_abandoned ||
+        !response_read_deadline_owner_is_stable(c, expected_upstream_recv, phase))
+        return false;
+    const RouteEntry& route = config->routes[proof.route_index];
+    const UpstreamTarget& target = config->upstreams[proof.upstream_id];
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    return c.response_read_deadline_bundle_id == bundle_id &&
+           route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
+           route.method == c.response_read_deadline_route_method && !route.needs_req_body &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
+           route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
+           target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
+           config->match_canonical(c.req_path_canon,
+                                   route_method_key(static_cast<LogHttpMethod>(c.req_method)),
+                                   params,
+                                   &param_count,
+                                   kMaxRouteParams) == &route;
 }
 
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
