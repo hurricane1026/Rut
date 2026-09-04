@@ -96,6 +96,17 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 ## Internal evidence notes
 
+- PR #449 (accepted head `18985dd9a94501610b3667a48a17eb53c8c2962b`, merge
+  `499bc405d02b859a0465b8ccc2d462a7b698f6a7`, exact-head CI `33857715293`,
+  15/15 green) adds tests-only Stage 2C2b3 evidence that a current fixed-upload
+  HEAD/ANY response wins a same-batch expiry independent of event array order.
+  Live and terminal positive Recv cover strict 200 and valid-status configured
+  header-only 502; incomplete live progress refreshes, incomplete/invalid terminal
+  input fails closed, and timeout-only controls retain configured header-only 504.
+  The existing batch ledger required no production change and no new RUT issue.
+  This does not activate the profile, prove public ordinary-source behavior or add
+  converter lowering, so all compatibility statuses remain unchanged.
+
 - PR #448 (accepted head `0b23e428b7dab71c20ac9a87768e157721b9ff22`, merge
   `7343364d0aa9863b2033dcc45c7c80211407a944`, exact-head CI `33835342238`,
   15/15 green) records terminal-positive Stage 2C2b2 evidence for the classifier-
