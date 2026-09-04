@@ -9353,6 +9353,15 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
         const RouteConfig* config = conn.request_config;
         u16 witnessed_status = 0;
         const bool live_event = conn.upstream_recv_armed && ev.more && ev.result > 0;
+        bool terminal_event = false;
+        if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                          candidate->current_terminal_response_recv_is_exact(
+                              c, event, u32{}, ResponseReadDeadlineProfile::None, u8{}, u32{});
+                      }) {
+            terminal_event = loop != nullptr &&
+                             loop->current_terminal_response_recv_is_exact(
+                                 conn, ev, generation, profile, method, upload.upload_episode);
+        }
         const bool valid_status = configured_forward_failure_status_line_witness(
             conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &witnessed_status);
         if (loop == nullptr || config == nullptr ||
@@ -9369,12 +9378,33 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
             ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
             ev.copy_end != conn.upstream_recv_buf.len() ||
-            ev.copy_begin != (progress_batch ? conn.response_read_deadline_progress_bytes : 0u) ||
+            (!terminal_event &&
+             ev.copy_begin != (progress_batch ? conn.response_read_deadline_progress_bytes : 0u)) ||
             !valid_status ||
             (domain == ConfiguredForwardFailureDomain::CompleteUnsupportedResponse &&
              conn.upstream_recv_buf.len() == 0) ||
-            !live_event || witnessed_status == 0) {
+            (!live_event && !terminal_event) || witnessed_status == 0) {
             return false;
+        }
+
+        // Bytes beyond any single declared Content-Length are not an
+        // unsupported response; the terminal copy boundary is corrupt for this
+        // early-retirement profile and must remain zero-byte fail-closed.
+        if (terminal_event &&
+            domain == ConfiguredForwardFailureDomain::CompleteUnsupportedResponse) {
+            HttpResponseParser terminal_parser;
+            ParsedResponse terminal_response;
+            terminal_parser.reset();
+            terminal_response.reset();
+            if (terminal_parser.parse(conn.upstream_recv_buf.data(),
+                                      conn.upstream_recv_buf.len(),
+                                      &terminal_response) == ParseStatus::Complete &&
+                terminal_response.content_length_count == 1 &&
+                terminal_response.has_content_length && !terminal_response.chunked &&
+                terminal_parser.header_end <= conn.upstream_recv_buf.len() &&
+                conn.upstream_recv_buf.len() - terminal_parser.header_end >
+                    terminal_response.content_length)
+                return false;
         }
 
         const bool deadline_owner =
@@ -9393,7 +9423,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
              conn.response_read_deadline_buffering == buffering &&
              ((conn.response_read_deadline_progress_generation == 0 &&
                conn.response_read_deadline_progress_episode == 0 &&
-               conn.response_read_deadline_progress_bytes == 0 && ev.copy_begin == 0) ||
+               conn.response_read_deadline_progress_bytes == 0 &&
+               (ev.copy_begin == 0 || terminal_event)) ||
               (conn.response_read_deadline_progress_generation == generation &&
                conn.response_read_deadline_progress_episode == upload.upload_episode &&
                conn.response_read_deadline_progress_bytes != 0)) &&
@@ -9410,8 +9441,17 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
              conn.response_read_deadline_progress_episode == 0 &&
              conn.response_read_deadline_progress_bytes == 0 &&
              response_read_deadline_upload_proof_equal(conn.response_read_deadline_upload, upload));
-        const bool transport_owner = fixed_upload_head_success_proof_is_stable(
-            conn, upload, config, bundle_id, profile, buffering, method, route_method);
+        const bool transport_owner =
+            fixed_upload_head_success_proof_is_stable(conn,
+                                                      upload,
+                                                      config,
+                                                      bundle_id,
+                                                      profile,
+                                                      buffering,
+                                                      method,
+                                                      route_method,
+                                                      /*allow_retired_episode=*/false,
+                                                      terminal_event);
         if (!deadline_owner || upload.upload_episode == 0 || method != conn.req_method ||
             !response_read_deadline_route_method_matches(method, route_method) ||
             !transport_owner) {
@@ -9480,10 +9520,12 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
         } else {
             return false;
         }
+        const u8 selected_targets = terminal_event ? static_cast<u8>(0) : kUpstreamOpRecv;
         if (!loop->begin_prebuilt_http1_response(conn,
-                                                 kUpstreamOpRecv,
+                                                 selected_targets,
                                                  Http1RequestBufferDisposition::ExistingPipeline,
-                                                 conn.retry_req_send_len)) {
+                                                 conn.retry_req_send_len,
+                                                 terminal_event ? &ev : nullptr)) {
             if (conn.fd >= 0) loop->close_conn(conn);
             return true;
         }
@@ -9674,6 +9716,20 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
+    bool exact_terminal_response_recv = false;
+    if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                      candidate->current_terminal_response_recv_is_exact(
+                          c, event, u32{}, ResponseReadDeadlineProfile::None, u8{}, u32{});
+                  }) {
+        exact_terminal_response_recv =
+            configured_head_candidate &&
+            loop->current_terminal_response_recv_is_exact(conn,
+                                                          ev,
+                                                          explicit_generation,
+                                                          explicit_profile,
+                                                          explicit_method,
+                                                          explicit_upload.upload_episode);
+    }
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
     // late event re-enter parsing, release state twice, or append bytes.
@@ -9717,6 +9773,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
         else {
+            // A positive terminal record has consumed the only proven Recv
+            // owner.  Incomplete headers cannot be reclassified as a configured
+            // response and cannot continue from an inferred owner.
+            if (exact_terminal_response_recv) {
+                disarm_explicit_deadline();
+                loop->close_conn(conn);
+                return;
+            }
             if (!configured_head_candidate) record_reused_response_health();
             if (explicit_progress_batch) {
                 if constexpr (requires(Loop* candidate, Connection& c, const IoEvent& event) {
@@ -9827,7 +9891,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                                                     explicit_profile,
                                                                     explicit_buffering,
                                                                     explicit_method,
-                                                                    explicit_route_method)
+                                                                    explicit_route_method,
+                                                                    /*allow_retired_episode=*/false,
+                                                                    exact_terminal_response_recv)
                         : response_read_deadline_fixed_upload_method_admitted(explicit_method,
                                                                               explicit_buffering) &&
                               response_read_deadline_fixed_upload_materialization_is_stable(
@@ -10031,7 +10097,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     conn,
                     selected_targets,
                     Http1RequestBufferDisposition::ExistingPipeline,
-                    conn.retry_req_send_len)) {
+                    conn.retry_req_send_len,
+                    exact_terminal_response_recv ? &ev : nullptr)) {
                 if (conn.fd >= 0) loop->close_conn(conn);
                 return;
             }

@@ -366,15 +366,17 @@ inline bool response_read_deadline_fixed_upload_proof_is_stable(
 // generic fixed-upload and bodyless HEAD owners.  It may be checked while the
 // origin recv is live or after that exact episode has moved into the strict
 // retirement tombstone, but never creates or selects the profile itself.
-inline bool fixed_upload_head_success_proof_is_stable(const Connection& c,
-                                                      const ResponseReadDeadlineUploadProof& proof,
-                                                      const RouteConfig* config,
-                                                      u16 bundle_id,
-                                                      ResponseReadDeadlineProfile profile,
-                                                      ForwardResponseBufferingMode buffering,
-                                                      u8 method,
-                                                      u8 route_method,
-                                                      bool allow_retired_episode = false) {
+inline bool fixed_upload_head_success_proof_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method,
+    bool allow_retired_episode = false,
+    bool allow_consumed_terminal_episode = false) {
     if (config == nullptr || config != c.request_config ||
         !config->policy_bundle_id_is_valid(bundle_id) ||
         profile != ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
@@ -437,7 +439,18 @@ inline bool fixed_upload_head_success_proof_is_stable(const Connection& c,
                          valid_upstream_episode(c.upstream_episode) &&
                          c.upstream_retiring_episode < c.upstream_episode &&
                          c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr;
-    return live || retired;
+    // The io_uring dispatcher accounts a positive terminal Recv before invoking
+    // its callback.  A caller may admit that owner-free instant only when it has
+    // independently retained the exact current-batch CQE witness; this predicate
+    // still proves all persistent request/policy/transport state and deliberately
+    // does not infer terminal ownership from !upstream_recv_armed alone.
+    const bool consumed_terminal =
+        allow_consumed_terminal_episode && proof.upload_episode == c.upstream_episode &&
+        c.upstream_fd >= 0 && !c.upstream_abandoned && !c.upstream_retirement_active &&
+        c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
+        c.upstream_retirement_cancel_retry == 0 && !c.upstream_recv_armed &&
+        c.on_upstream_recv != nullptr && c.on_upstream_send == nullptr;
+    return live || retired || consumed_terminal;
 }
 
 // First-batch and D2 callers retain the immutable bundle/route identity after
