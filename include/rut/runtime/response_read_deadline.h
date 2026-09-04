@@ -275,9 +275,24 @@ inline bool complete_content_length_explicit_close_is_stable(
         c, proof, c.response_read_deadline_buffering, c.response_read_deadline_profile);
 }
 
+inline bool header_only_head_explicit_close_is_stable(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    return proof.downstream_close &&
+           c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+           c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+           c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Head) &&
+           c.req_method == c.response_read_deadline_method && c.req_keep_alive &&
+           !c.req_client_keep_alive && c.req_client_connection_close &&
+           c.req_client_connection_close_exact && c.req_client_connection_count == 1 &&
+           c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           proof.request_policy_id == c.request_policy_id;
+}
+
 inline bool response_read_deadline_persistence_owner_is_stable(
     const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
-    if (proof.downstream_close) return complete_content_length_explicit_close_is_stable(c, proof);
+    if (proof.downstream_close)
+        return complete_content_length_explicit_close_is_stable(c, proof) ||
+               header_only_head_explicit_close_is_stable(c, proof);
     return response_read_deadline_default_persistence_is_stable(c);
 }
 

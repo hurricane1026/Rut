@@ -35653,6 +35653,65 @@ TEST(response_read_deadline, preflight_pins_only_the_exact_cleartext_head_shape)
     loop->close_conn(*reused);
 }
 
+TEST(response_read_deadline, header_only_head_explicit_close_admits_fixed_strip_owner) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    REQUIRE(config.add_jit_handler(
+        "/one", 'H', &response_read_deadline_handler, false, /*preflight bundle=*/2));
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kRequest[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    capture_request_metadata(*conn);
+    conn->keep_alive = false;
+    conn->request_config = &config;
+    REQUIRE(prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
+    CHECK(conn->response_read_deadline_upload.downstream_close);
+    const u32 id = conn->id;
+    const u32 episode = conn->upstream_episode;
+    const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    outcome.policy_bundle_id = 2;
+    handle_jit_outcome<IoUringEventLoop>(
+        loop, *conn, outcome, &response_read_deadline_handler, false);
+    REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+    CHECK_EQ(conn->request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK(conn->req_keep_alive);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->response_read_deadline_upload.request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK(conn->upstream_connect_armed);
+    CHECK_FALSE(conn->upstream_recv_armed);
+
+    conn->response_read_deadline_upload.request_policy_id = 0;
+    CHECK_FALSE(
+        header_only_head_explicit_close_is_stable(*conn, conn->response_read_deadline_upload));
+    conn->response_read_deadline_upload.request_policy_id = conn->request_policy_id;
+    conn->req_client_connection_close_exact = false;
+    CHECK_FALSE(
+        header_only_head_explicit_close_is_stable(*conn, conn->response_read_deadline_upload));
+    conn->req_client_connection_close_exact = true;
+
+    loop->close_conn(*conn);
+    __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+    loop->dispatch(
+        {id, -ENOENT, 0, 0, IoEventType::UpstreamConnect, 0, kUpstreamCloseCancelAux, episode});
+    close(downstream[1]);
+}
+
 TEST(response_read_deadline, preflight_rejects_ambiguous_tls_and_unsupported_loop_shapes) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -35667,16 +35726,20 @@ TEST(response_read_deadline, preflight_rejects_ambiguous_tls_and_unsupported_loo
     struct Vector {
         const char* request;
         bool tls;
+        bool admitted;
     } vectors[] = {
-        {"GET /one HTTP/1.1\r\nHost: x\r\n\r\n", false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n", false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", false},
+        {"GET /one HTTP/1.1\r\nHost: x\r\n\r\n", false, false},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", false, false},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", false, false},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n", false, false},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", false, true},
         {"HEAD /one HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n",
+         false,
          false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n", false},
-        {"HEAD /one HTTP/1.1\r\nHost: x\r\n\r\n", true},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+         false,
+         false},
+        {"HEAD /one HTTP/1.1\r\nHost: x\r\n\r\n", true, false},
     };
     for (const auto& vector : vectors) {
         Connection* conn = loop->alloc_conn();
@@ -35688,7 +35751,9 @@ TEST(response_read_deadline, preflight_rejects_ambiguous_tls_and_unsupported_loo
         conn->keep_alive = true;
         conn->tls_active = vector.tls;
         conn->request_config = &config;
-        CHECK_FALSE(prepare_response_read_deadline_preflight(loop, *conn, route, &config));
+        CHECK_EQ(prepare_response_read_deadline_preflight(loop, *conn, route, &config),
+                 vector.admitted);
+        if (vector.admitted) loop->close_conn(*conn);
         CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     }
 

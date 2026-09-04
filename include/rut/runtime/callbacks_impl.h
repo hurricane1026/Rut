@@ -1218,18 +1218,25 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         const ResponseReadDeadlineProfile profile = classify_response_read_deadline_profile(
             conn, response, failure, timeout, bundle.response_buffering);
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
+        const bool header_only_head_explicit_close =
+            profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+            bundle.response_buffering == ForwardResponseBufferingMode::None &&
+            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+            !conn.req_client_keep_alive && conn.req_client_connection_close &&
+            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
         const bool preflight_downstream_close =
             complete_buffering &&
             profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             !conn.req_client_keep_alive && conn.req_client_connection_close &&
             conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+        const bool downstream_close = preflight_downstream_close || header_only_head_explicit_close;
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_provisional_is_stable(conn,
                                                                     profile,
                                                                     bundle.response_buffering,
                                                                     conn.req_method,
                                                                     route->method,
-                                                                    preflight_downstream_close);
+                                                                    downstream_close);
         ResponseReadDeadlineFixedUploadRequest upload_request{};
         u16 route_index = 0xffffu;
         if (response.version != ResponsePolicyVersion::Http11 ||
@@ -1250,7 +1257,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
              !(complete_buffering &&
                profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
                !conn.req_client_keep_alive && conn.req_client_connection_close &&
-               conn.req_client_connection_close_exact && conn.req_client_connection_count == 1)) ||
+               conn.req_client_connection_close_exact && conn.req_client_connection_count == 1) &&
+             !header_only_head_explicit_close) ||
             (complete_buffering &&
              ((profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
                !response_read_deadline_profile_is_fixed_upload(profile)) ||
@@ -1289,7 +1297,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             conn.response_read_deadline_upload.handler_generation =
                 conn.http1_pipeline_request_generation;
         }
-        conn.response_read_deadline_upload.downstream_close = preflight_downstream_close;
+        conn.response_read_deadline_upload.downstream_close = downstream_close;
         if (conn.recv_buf.len() > conn.req_initial_send_len) {
             auto& proof = conn.response_read_deadline_upload;
             if (!response_read_deadline_route_index(*config, route, &route_index)) {
@@ -3432,6 +3440,13 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const bool fixed_upload =
                     response_read_deadline_profile_is_fixed_upload(outcome_profile);
+                const bool header_only_head_explicit_close =
+                    outcome_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                    forward_response_buffering == ForwardResponseBufferingMode::None &&
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                    conn.response_read_deadline_upload.downstream_close &&
+                    !conn.req_client_keep_alive && conn.req_client_connection_close &&
+                    conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
                 const auto& deadline_proof = conn.response_read_deadline_upload;
                 const bool coalesced_get =
                     outcome_profile ==
@@ -3462,9 +3477,13 @@ void handle_jit_outcome(Loop* loop,
                      fn == nullptr && !conn.request_policy_body_pending &&
                      request_body_state == RequestPolicyBodyState::Complete);
                 const bool request_policy_valid =
-                    fixed_upload ? outcome.request_policy_id ==
-                                           static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
-                                       request_body_state != RequestPolicyBodyState::Invalid
+                    header_only_head_explicit_close
+                        ? outcome.request_policy_id ==
+                                  static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                              request_body_state == RequestPolicyBodyState::Complete
+                    : fixed_upload ? outcome.request_policy_id ==
+                                             static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                                         request_body_state != RequestPolicyBodyState::Invalid
                     : complete_content_length_buffering
                         ? complete_content_length_request_policy_is_admitted(
                               outcome.request_policy_id) &&
@@ -3535,6 +3554,15 @@ void handle_jit_outcome(Loop* loop,
                         proof.request_policy_id = outcome.request_policy_id;
                         if (coalesced_get) proof.upstream_id = outcome.upstream_id;
                     }
+                } else if (header_only_head_explicit_close) {
+                    auto& proof = conn.response_read_deadline_upload;
+                    if (proof.request_policy_id != 0 ||
+                        outcome.request_policy_id !=
+                            static_cast<u16>(RequestPolicyId::Http11FixedStrip)) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                    proof.request_policy_id = outcome.request_policy_id;
                 }
                 fixed_upload_head_initial_phase =
                     outcome_profile ==
