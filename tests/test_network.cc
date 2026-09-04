@@ -26982,31 +26982,33 @@ TEST(iouring_response_read_timer, precise_activation_is_exact_and_remaining_time
 TEST(iouring_response_read_timer,
      post_disarm_custody_cqes_never_close_live_owner_in_either_order) {
     for (const bool cancel_first : {false, true}) {
-        ScopedIoUringLoopForRetirement guard;
-        if (!guard.init()) SKIP("io_uring unavailable");
-        IoUringEventLoop* loop = guard.loop;
-        Connection* conn = loop->alloc_conn();
-        REQUIRE(conn != nullptr);
-        conn->fd = dup(STDERR_FILENO);
-        REQUIRE_GE(conn->fd, 0);
-        conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
-        REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
-        const u32 generation = conn->response_read_timer_owner_generation;
-        loop->disarm_response_read_deadline(*conn);
-        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::None);
-        REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        for (const i32 cancel_result : {0, -ENOENT}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            IoUringEventLoop* loop = guard.loop;
+            Connection* conn = loop->alloc_conn();
+            REQUIRE(conn != nullptr);
+            conn->fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn->fd, 0);
+            conn->response_read_deadline_state = ResponseReadDeadlineState::Armed;
+            REQUIRE(install_inert_response_read_timer_owner(*conn, ResponseReadTimerPhase::Armed));
+            const u32 generation = conn->response_read_timer_owner_generation;
+            loop->disarm_response_read_deadline(*conn);
+            REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+            REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
 
-        IoEvent target = inert_response_read_timer_event(conn->id, generation);
-        target.result = -ECANCELED;
-        IoEvent cancel = inert_response_read_timer_event(
-            conn->id, generation | kResponseReadTimerCancelBit);
-        cancel.result = 0;
-        const IoEvent events[2] = {cancel_first ? cancel : target,
-                                   cancel_first ? target : cancel};
-        loop->dispatch_batch(events, 2);
-        CHECK(conn->fd >= 0);
-        CHECK(conn->response_read_timer_owner_is_neutral());
-        loop->close_conn(*conn);
+            IoEvent target = inert_response_read_timer_event(conn->id, generation);
+            target.result = -ECANCELED;
+            IoEvent cancel = inert_response_read_timer_event(
+                conn->id, generation | kResponseReadTimerCancelBit);
+            cancel.result = cancel_result;
+            const IoEvent events[2] = {cancel_first ? cancel : target,
+                                       cancel_first ? target : cancel};
+            loop->dispatch_batch(events, 2);
+            CHECK(conn->fd >= 0);
+            CHECK(conn->response_read_timer_owner_is_neutral());
+            loop->close_conn(*conn);
+        }
     }
 }
 
@@ -27023,16 +27025,14 @@ TEST(iouring_response_read_timer, cancel_submission_failure_keeps_natural_target
     const u32 generation = conn->response_read_timer_owner_generation;
     const u32 deadline_generation = conn->response_read_timer_deadline_generation;
     const u32 episode = conn->response_read_timer_upstream_episode;
-    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
-    __atomic_store_n(loop->backend.sq_tail,
-                     head + loop->backend.sq_ring_entries,
-                     __ATOMIC_RELEASE);
+    const u32 saved_ring_entries = loop->backend.sq_ring_entries;
+    loop->backend.sq_ring_entries = 0;
     loop->disarm_response_read_deadline(*conn);
     CHECK_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::Armed);
     CHECK_EQ(conn->response_read_timer_owner_generation, generation);
     CHECK_EQ(conn->response_read_timer_deadline_generation, deadline_generation);
     CHECK_EQ(conn->response_read_timer_upstream_episode, episode);
-    __atomic_store_n(loop->backend.sq_tail, head, __ATOMIC_RELEASE);
+    loop->backend.sq_ring_entries = saved_ring_entries;
 
     IoEvent target = inert_response_read_timer_event(conn->id, generation);
     loop->dispatch(target);
