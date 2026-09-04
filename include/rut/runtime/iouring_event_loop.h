@@ -531,7 +531,8 @@ private:
         return status == c.resp_status;
     }
 
-    static bool prebuilt_http1_response_is_complete(const Connection& c) {
+    static bool prebuilt_http1_response_is_complete(const Connection& c,
+                                                    bool allow_consumed_terminal_episode = false) {
         // A generic pipeline generation token is not a strict activation bit.
         // Preserve the legacy layout shortcut only while every copied owner
         // field is at its canonical reset value.  Once any copied field is
@@ -644,7 +645,8 @@ private:
                         bundle.response_buffering,
                         c.http1_prebuilt_deadline_method,
                         c.http1_prebuilt_deadline_route_method,
-                        true))
+                        true,
+                        false))
                     return false;
                 HttpResponseParser parser;
                 ParsedResponse parsed;
@@ -710,7 +712,8 @@ private:
                         bundle.response_buffering,
                         c.http1_prebuilt_deadline_method,
                         c.http1_prebuilt_deadline_route_method,
-                        /*allow_retired_episode=*/true))
+                        /*allow_retired_episode=*/true,
+                        allow_consumed_terminal_episode))
                     return false;
                 HttpResponseParser parser;
                 ParsedResponse parsed;
@@ -776,7 +779,8 @@ private:
                                                            bundle.response_buffering,
                                                            c.http1_prebuilt_deadline_method,
                                                            c.http1_prebuilt_deadline_route_method,
-                                                           true))
+                                                           true,
+                                                           allow_consumed_terminal_episode))
                 return false;
             HttpResponseParser parser;
             ParsedResponse parsed;
@@ -1160,6 +1164,39 @@ public:
         return begin_upstream_retirement_impl(c, selected_targets, false, true);
     }
 
+    // Exact one-dispatch witness for a positive terminal upstream Recv.  The
+    // owner was captured before generic CQE accounting consumed the armed flag
+    // and pending count.  It is intentionally stored only in the bounded batch
+    // ledger and becomes unavailable as soon as dispatch_batch returns.
+    [[nodiscard]] bool current_terminal_response_recv_is_exact(const Connection& c,
+                                                               const IoEvent& ev,
+                                                               u32 deadline_generation,
+                                                               ResponseReadDeadlineProfile profile,
+                                                               u8 method,
+                                                               u32 upstream_episode) const {
+        if (response_read_batch_event_index >= response_read_batch_event_count ||
+            ev.type != IoEventType::UpstreamRecv || ev.conn_id != c.id || ev.aux != 0 ||
+            ev.result <= 0 || ev.more || ev.upstream_episode != upstream_episode ||
+            ev.copy_witness != IoEventCopyWitness::Full ||
+            ev.copy_deadline_generation != deadline_generation ||
+            ev.copy_deadline_profile != static_cast<u8>(profile) ||
+            ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
+            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            ev.copy_end != c.upstream_recv_buf.len() || c.upstream_episode != upstream_episode)
+            return false;
+        const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
+        if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
+        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        return owner.valid && owner.conn_id == c.id &&
+               owner.deadline_generation == deadline_generation && owner.profile == profile &&
+               owner.method == method && owner.upstream_episode == upstream_episode &&
+               !owner.post_commit_at_start && owner.saw_positive && owner.saw_terminal &&
+               owner.positive_terminal && !owner.terminal_fault && !owner.clean_eof &&
+               !owner.terminal_error && owner.last_relevant == response_read_batch_event_index &&
+               owner.last_positive == response_read_batch_event_index &&
+               owner.expected_copy_end == c.upstream_recv_buf.len();
+    }
+
     // Advance an exact, owner-free episode into the persistent tombstone. This
     // is for callbacks that observe a terminal upstream record after normal CQE
     // accounting has already cleared the final target; it never fabricates an
@@ -1176,7 +1213,8 @@ public:
     [[nodiscard]] bool begin_prebuilt_http1_response(Connection& c,
                                                      u8 selected_targets,
                                                      Http1RequestBufferDisposition disposition,
-                                                     u32 request_prefix_len) {
+                                                     u32 request_prefix_len,
+                                                     const IoEvent* consumed_terminal = nullptr) {
         constexpr u8 kAllowed = kUpstreamOpConnect | kUpstreamOpSend | kUpstreamOpRecv;
         const bool fixed_upload =
             response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile);
@@ -1191,6 +1229,16 @@ public:
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ConfiguredForwardFailure;
+        const bool exact_consumed_terminal = selected_targets == 0 &&
+                                             consumed_terminal != nullptr &&
+                                             (strict_head || configured_forward_failure) &&
+                                             current_terminal_response_recv_is_exact(
+                                                 c,
+                                                 *consumed_terminal,
+                                                 c.http1_prebuilt_deadline_generation,
+                                                 c.http1_prebuilt_deadline_profile,
+                                                 c.http1_prebuilt_deadline_method,
+                                                 c.http1_prebuilt_deadline_upload.upload_episode);
         const bool explicit_close =
             c.http1_prebuilt_deadline_config != nullptr &&
             c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
@@ -1220,10 +1268,11 @@ public:
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
             ((strict_head || fixed_upload_head_timeout || configured_forward_failure) &&
-             (selected_targets != kUpstreamOpRecv ||
+             (((selected_targets != kUpstreamOpRecv || consumed_terminal != nullptr) &&
+               !exact_consumed_terminal) ||
               disposition != Http1RequestBufferDisposition::ExistingPipeline ||
               request_prefix_len != 0)) ||
-            !prebuilt_http1_response_is_complete(c) ||
+            !prebuilt_http1_response_is_complete(c, exact_consumed_terminal) ||
             !prebuilt_http1_layout_is_valid(c, selected_targets, disposition, request_prefix_len))
             return false;
 
@@ -1263,11 +1312,12 @@ public:
     }
 
     [[nodiscard]] bool complete_prebuilt_http1_header_send(Connection& c) {
+        const u8 expected_wait =
+            kHttp1WaitHeaderSend |
+            (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
         if (c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
-            (c.http1_prebuilt_wait != kHttp1WaitHeaderSend &&
-             c.http1_prebuilt_wait != (kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement)) ||
-            c.http1_boundary_deferred || c.http1_boundary_ready ||
-            c.http1_boundary_successor_episode != c.upstream_episode)
+            c.http1_prebuilt_wait != expected_wait || c.http1_boundary_deferred ||
+            c.http1_boundary_ready || c.http1_boundary_successor_episode != c.upstream_episode)
             return false;
         c.http1_prebuilt_wait &= static_cast<u8>(~kHttp1WaitHeaderSend);
         c.http1_boundary_deferred = true;
@@ -1277,12 +1327,15 @@ public:
 
     bool prebuilt_http1_header_send_completion_is_valid(const Connection& c,
                                                         const IoEvent& ev) const {
+        const u8 expected_wait =
+            kHttp1WaitHeaderSend |
+            (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
         if (c.id >= kMaxConns || ev.conn_id != c.id || ev.type != IoEventType::Send || ev.more ||
             ev.aux != 0 || ev.result <= 0 ||
             static_cast<u32>(ev.result) != c.response_header_buf.len() ||
             !prebuilt_http1_response_is_complete(c) ||
             c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
-            (c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0 || c.state != ConnState::Sending ||
+            c.http1_prebuilt_wait != expected_wait || c.state != ConnState::Sending ||
             c.send_armed || c.req_start_us == 0 || c.epoch_held ||
             c.on_send != &on_prebuilt_http1_header_sent<IoUringEventLoop>)
             return false;
