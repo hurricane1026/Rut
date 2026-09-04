@@ -36920,13 +36920,12 @@ TEST(iouring_response_read_timer, add_and_early_rearm_sq_full_fails_closed_witho
     CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
     CHECK_EQ(conn.timer_node.next, &conn.timer_node);
     CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+    CHECK(conn.response_read_timer_owner_is_neutral());
     loop->backend.ring_fd = ring_fd;
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending_before;
-    conn.response_read_timer_target_owned = false;
-    conn.response_read_timer_cancel_owned = false;
-    conn.response_read_timer_phase = ResponseReadTimerPhase::None;
-    CHECK(conn.clear_response_read_timer_owner());
+    // The fixture deliberately never submits these synthetic SQEs. Restore
+    // the staged ring position before releasing the deferred ordinary owners.
     release_closed_response_read_fixture(fixture);
 }
 
