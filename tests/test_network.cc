@@ -29289,10 +29289,14 @@ void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     fixture.conn = nullptr;
 }
 
-// The live explicit-close HEAD path deliberately stages its SQEs without
-// submitting them in these focused tests.  Keep the original ring position so
-// synthetic CQEs cannot leave a kernel-owned timespec behind at teardown.
-bool stage_live_precise_head(IoUringEventLoop* loop, RouteConfig& config, PrebuiltD2Fixture* out) {
+// The live HEAD path deliberately stages its SQEs without submitting them in
+// these focused tests. Keep the original ring position so synthetic CQEs
+// cannot leave a kernel-owned timespec behind at teardown.
+bool stage_live_precise_head(IoUringEventLoop* loop,
+                             RouteConfig& config,
+                             PrebuiltD2Fixture* out,
+                             bool downstream_close = true,
+                             bool force_initial_timer_sq_full = false) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !add_response_read_deadline_bundle(config, 5) ||
@@ -29331,12 +29335,16 @@ bool stage_live_precise_head(IoUringEventLoop* loop, RouteConfig& config, Prebui
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return fail();
     conn->fd = downstream[0];
     out->peer_fd = downstream[1];
-    static constexpr u8 kRequest[] =
+    static constexpr u8 kCloseRequest[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
-    if (conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
-        return fail();
+    static constexpr u8 kKeepAliveRequest[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    const u8* request = downstream_close ? kCloseRequest : kKeepAliveRequest;
+    const u32 request_len =
+        downstream_close ? sizeof(kCloseRequest) - 1u : sizeof(kKeepAliveRequest) - 1u;
+    if (conn->recv_buf.write(request, request_len) != request_len) return fail();
     capture_request_metadata(*conn);
-    conn->keep_alive = false;
+    conn->keep_alive = !downstream_close;
     conn->handler_gen = 1;
     conn->request_config = &config;
     if (!prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config)) {
@@ -29363,6 +29371,16 @@ bool stage_live_precise_head(IoUringEventLoop* loop, RouteConfig& config, Prebui
     const u32 sent_len = send.remaining;
     send.offset = sent_len;
     send.remaining = 0;
+    const u32 tail_before_send = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const i32 ring_fd = loop->backend.ring_fd;
+    if (force_initial_timer_sq_full) {
+        const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+        loop->backend.ring_fd = -1;
+        // Leave exactly one SQ slot for the first upstream Recv. The precise
+        // timeout submission that follows must observe a full queue.
+        __atomic_store_n(
+            loop->backend.sq_tail, head + loop->backend.sq_ring_entries - 1u, __ATOMIC_RELEASE);
+    }
     loop->dispatch({conn->id,
                     static_cast<i32>(sent_len),
                     0,
@@ -29371,6 +29389,15 @@ bool stage_live_precise_head(IoUringEventLoop* loop, RouteConfig& config, Prebui
                     0,
                     0,
                     out->episode});
+    if (force_initial_timer_sq_full) {
+        loop->backend.ring_fd = ring_fd;
+        __atomic_store_n(loop->backend.sq_tail, tail_before_send, __ATOMIC_RELEASE);
+        return conn->fd < 0 &&
+               conn->response_read_deadline_state == ResponseReadDeadlineState::None &&
+               conn->response_read_timer_owner_is_neutral() &&
+               conn->timer_node.next == &conn->timer_node &&
+               conn->timer_node.prev == &conn->timer_node;
+    }
     const bool staged = conn->fd >= 0 && conn->upstream_recv_armed &&
                         conn->response_read_deadline_state == ResponseReadDeadlineState::Armed &&
                         conn->response_read_timer_owner_is_valid();
@@ -36585,6 +36612,305 @@ TEST(iouring_response_read_timer, precise_arm_publishes_transport_owner_after_li
     CHECK_EQ(sqe_generation, conn.response_read_timer_owner_generation);
     neutralize_staged_precise_timer(loop, fixture);
     cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_head_classifier_and_arm_are_exact_without_wheel) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_head(loop, config, &fixture, false));
+    Connection& conn = *fixture.conn;
+    REQUIRE(loop->response_read_deadline_uses_precise_timer(conn));
+    CHECK_FALSE(conn.response_read_deadline_upload.downstream_close);
+    CHECK(response_read_deadline_default_persistence_is_stable(conn));
+    CHECK(response_read_deadline_owner_is_stable(conn,
+                                                 &on_upstream_response<IoUringEventLoop>,
+                                                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+    CHECK(conn.response_read_timer_owner_is_valid());
+    CHECK_EQ(conn.response_read_timer_deadline_generation, conn.response_read_deadline_generation);
+    CHECK_EQ(conn.response_read_timer_upstream_episode, conn.upstream_episode);
+    CHECK_EQ(conn.response_read_timer_timespec.tv_sec, 5);
+    CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, 0);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+
+    const u32 tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    REQUIRE_GT(tail, fixture.sq_tail_before);
+    const io_uring_sqe& sqe = loop->backend.sq_entries[(tail - 1u) & *loop->backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, IORING_OP_TIMEOUT);
+    CHECK_EQ(sqe.addr, reinterpret_cast<u64>(&conn.response_read_timer_timespec));
+
+    const auto stable_method = conn.req_method;
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.req_method = stable_method;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    conn.pipeline_depth = 1;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.pipeline_depth = 0;
+    conn.http1_pipeline_request_generation = 1;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.http1_pipeline_request_generation = 0;
+    conn.upstream_reused = true;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.upstream_reused = false;
+    conn.upstream_attempts = 2;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.upstream_attempts = 1;
+    conn.tls_active = true;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.tls_active = false;
+    conn.h2 = reinterpret_cast<Http2Conn*>(1);
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.h2 = nullptr;
+    conn.request_policy_id = 0;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.req_client_has_content_length = true;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.req_client_has_content_length = false;
+    conn.req_body_mode = BodyMode::ContentLength;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.req_body_mode = BodyMode::None;
+    conn.response_mutations_snapshotted = true;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.response_mutations_snapshotted = false;
+    ++conn.response_read_deadline_upload.handler_generation;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    --conn.response_read_deadline_upload.handler_generation;
+    conn.request_config = nullptr;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+    conn.request_config = &config;
+    config.upstreams[0].addr_count = 2;
+    CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+
+    neutralize_staged_precise_timer(loop, fixture);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_head_due_is_header_only_504_and_retires_before_request_two) {
+    static constexpr char kTimeoutBody[] =
+        "<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n"
+        "<center><h1>504 Gateway Time-out</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kTimeoutBody) - 1u == 167u);
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
+    for (const bool partial : {false, true}) {
+        for (const bool timer_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_head(loop, config, &fixture, false));
+            Connection& conn = *fixture.conn;
+            config.failure_policies[1].body = {kTimeoutBody, sizeof(kTimeoutBody) - 1u};
+            const u32 logical_generation = conn.response_read_deadline_generation;
+            const u32 logical_episode = conn.upstream_episode;
+            neutralize_staged_precise_timer(loop, fixture);
+            REQUIRE(install_inert_response_read_timer_owner(
+                conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
+            const u32 timer_generation = conn.response_read_timer_owner_generation;
+            conn.req_start_us = monotonic_us();
+            conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+            IoEvent events[2] = {inert_response_read_timer_event(conn.id, timer_generation), {}};
+            u32 event_count = 1;
+            if (partial) {
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                           sizeof(kPartial) - 1u);
+                const IoEvent progress = response_read_copy_event(
+                    conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+                if (timer_first) {
+                    events[1] = progress;
+                } else {
+                    events[1] = events[0];
+                    events[0] = progress;
+                }
+                event_count = 2;
+            }
+            loop->dispatch_batch(events, event_count);
+
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.resp_status, 504u);
+            REQUIRE_EQ(conn.state, ConnState::Sending);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK(conn.response_read_timer_owner_is_neutral());
+            CHECK_EQ(conn.http1_prebuilt_response_layout,
+                     Http1PrebuiltResponseLayout::HeaderOnlyHead);
+            CHECK_EQ(conn.http1_prebuilt_body_len, 167u);
+            CHECK_EQ(conn.http1_prebuilt_header_end, conn.response_header_buf.len());
+            CHECK_EQ(conn.http1_prebuilt_total_len, conn.response_header_buf.len());
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "Content-Length: 167\r\n"));
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "Connection: keep-alive\r\n"));
+            CHECK_FALSE(buf_has(
+                conn.response_header_buf.data(), conn.response_header_buf.len(), kTimeoutBody));
+            CHECK(response_read_timeout_header_only_head_is_stable(conn, &config, 2));
+            CHECK(conn.upstream_retirement_active);
+            CHECK_FALSE(conn.http1_boundary_ready);
+
+            // Exercise both D1/D2 rendezvous orders: neither the header nor
+            // origin retirement alone may expose request 2.
+            if (timer_first) {
+                drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+                CHECK_FALSE(conn.http1_boundary_ready);
+                complete_prebuilt_d2_header(loop, conn);
+            } else {
+                complete_prebuilt_d2_header(loop, conn);
+                CHECK_FALSE(conn.http1_boundary_ready);
+                drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            }
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK_FALSE(conn.http1_boundary_deferred);
+            CHECK_EQ(conn.http1_boundary_successor_episode, 0u);
+            CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+            CHECK_EQ(conn.upstream_fd, -1);
+            CHECK_FALSE(conn.upstream_slot_held);
+            const u16 completed_status = conn.resp_status;
+            REQUIRE_EQ(completed_status, 504u);
+
+            // The retired timer generation is a custody tombstone and cannot
+            // perturb the live request-2 boundary.
+            const IoEvent stale = inert_response_read_timer_event(conn.id, timer_generation);
+            loop->dispatch_batch(&stale, 1);
+            CHECK_GE(conn.fd, 0);
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK_EQ(conn.resp_status, completed_status);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_head_complete_response_wins_timer_in_both_orders) {
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    for (const bool response_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_head(loop, config, &fixture, false));
+        Connection& conn = *fixture.conn;
+        neutralize_staged_precise_timer(loop, fixture);
+        REQUIRE(install_inert_response_read_timer_owner(conn,
+                                                        ResponseReadTimerPhase::Armed,
+                                                        conn.response_read_deadline_generation,
+                                                        conn.upstream_episode));
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                   sizeof(kOrigin) - 1u);
+        const IoEvent response =
+            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+        const IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+        const IoEvent events[2] = {response_first ? response : target,
+                                   response_first ? target : response};
+        loop->dispatch_batch(events, 2);
+
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 200u);
+        CHECK_EQ(conn.state, ConnState::Sending);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "504 Gateway Time-out"));
+        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        IoEvent cancel = inert_response_read_timer_event(
+            conn.id, timer_generation | kResponseReadTimerCancelBit);
+        cancel.result = -ENOENT;
+        loop->dispatch(cancel);
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_head_early_rearm_and_sq_full_fail_closed_without_wheel) {
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_head(loop, config, &fixture, false));
+    Connection& conn = *fixture.conn;
+    const u32 logical_generation = conn.response_read_deadline_generation;
+    const u32 logical_episode = conn.upstream_episode;
+    const u64 deadline_origin = conn.response_read_timer_last_progress_ns;
+    neutralize_staged_precise_timer(loop, fixture);
+    conn.response_read_timer_last_progress_ns = deadline_origin;
+    REQUIRE(install_inert_response_read_timer_owner(
+        conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
+    const u32 first_timer_generation = conn.response_read_timer_owner_generation;
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const IoEvent early = inert_response_read_timer_event(conn.id, first_timer_generation);
+    loop->dispatch_batch(&early, 1);
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_timer_owner_generation, first_timer_generation + 1u);
+    CHECK_EQ(conn.response_read_timer_deadline_generation, logical_generation);
+    CHECK_EQ(conn.response_read_timer_upstream_episode, logical_episode);
+    CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 1u);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+
+    neutralize_staged_precise_timer(loop, fixture);
+    conn.response_read_timer_last_progress_ns = deadline_origin;
+    REQUIRE(install_inert_response_read_timer_owner(
+        conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
+    const u32 full_timer_generation = conn.response_read_timer_owner_generation;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+               sizeof(kPartial) - 1u);
+    const IoEvent progress =
+        response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+    const IoEvent full_timer = inert_response_read_timer_event(conn.id, full_timer_generation);
+    const IoEvent events[2] = {full_timer, progress};
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    const i32 ring_fd = loop->backend.ring_fd;
+    loop->backend.ring_fd = -1;
+    __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop->dispatch_batch(events, 2);
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    loop->backend.ring_fd = ring_fd;
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    release_closed_response_read_fixture(fixture);
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_head_initial_timer_sq_full_fails_closed_without_wheel) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_head(loop, config, &fixture, false, true));
+    Connection& conn = *fixture.conn;
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK(conn.response_read_timer_owner_is_neutral());
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    release_closed_response_read_fixture(fixture);
 }
 
 TEST(iouring_response_read_timer, precise_early_etime_rearms_with_ceil_remaining_and_identity) {

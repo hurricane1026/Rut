@@ -548,7 +548,7 @@ private:
         // identity before layout-None or header-only can return.
         const bool header_only_head_timeout =
             c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead &&
-            response_read_timeout_header_only_head_explicit_close_is_stable(
+            response_read_timeout_header_only_head_is_stable(
                 c, c.http1_prebuilt_deadline_config, c.http1_prebuilt_deadline_bundle_id);
         const auto response_phase =
             c.state == ConnState::Sending &&
@@ -1289,7 +1289,7 @@ public:
                 c.http1_prebuilt_deadline_generation,
                 ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin);
         const bool explicit_close =
-            header_only_head_timeout ||
+            (header_only_head_timeout && c.http1_prebuilt_deadline_upload.downstream_close) ||
             (c.http1_prebuilt_deadline_config != nullptr &&
              c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                  c.http1_prebuilt_deadline_bundle_id) &&
@@ -1794,6 +1794,7 @@ public:
                          ResponseReadDeadlineProfile::HeaderOnlyHead &&
                      c.http1_prebuilt_response_purpose ==
                          Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+                     c.http1_prebuilt_deadline_upload.downstream_close &&
                      response_read_timeout_header_only_head_response_is_stable(
                          c,
                          c.http1_prebuilt_deadline_upload,
@@ -2439,6 +2440,14 @@ public:
                 bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Self>);
+        if (header_only_head_keep_alive_precise_candidate(c))
+            return header_only_head_keep_alive_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                &cfg,
+                bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Self>);
         return response_read_deadline_owner_is_stable(
             c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ActiveAfterCopy);
     }
@@ -2462,22 +2471,35 @@ public:
             bundle.failure_policy_id != c.failure_policy_id ||
             bundle.timeout_failure_policy_id != c.timeout_failure_policy_id)
             return false;
-        const bool special_shape =
+        const bool header_only_head_explicit_close_shape =
             c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
             c.response_read_deadline_upload.downstream_close;
+        const bool header_only_head_keep_alive_shape =
+            header_only_head_keep_alive_precise_candidate(c);
         const bool owner_stable =
-            !special_shape &&
+            !header_only_head_explicit_close_shape && !header_only_head_keep_alive_shape &&
             response_read_deadline_owner_is_stable(
                 c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm);
         const bool header_only_head_explicit_close =
-            special_shape && header_only_head_explicit_close_arm_is_stable(
-                                 c,
-                                 c.response_read_deadline_upload,
-                                 cfg,
-                                 bundle_id,
-                                 ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm,
-                                 &on_upstream_response<Self>);
-        if (!owner_stable && !header_only_head_explicit_close) return false;
+            header_only_head_explicit_close_shape &&
+            header_only_head_explicit_close_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                cfg,
+                bundle_id,
+                ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm,
+                &on_upstream_response<Self>);
+        const bool header_only_head_keep_alive =
+            header_only_head_keep_alive_shape &&
+            header_only_head_keep_alive_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                cfg,
+                bundle_id,
+                ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm,
+                &on_upstream_response<Self>);
+        if (!owner_stable && !header_only_head_explicit_close && !header_only_head_keep_alive)
+            return false;
         if (c.upstream_idx >= cfg->upstream_count ||
             cfg->upstreams[c.upstream_idx].addr_count != 1 ||
             cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET)
@@ -2530,24 +2552,32 @@ public:
     [[nodiscard]] bool response_read_deadline_uses_precise_timer(const Connection& c) const {
         if (c.response_read_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
-            !c.response_read_deadline_upload.downstream_close ||
             c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
             c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             c.protocol != ConnProtocol::Http11 || c.tls_active ||
             c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
             c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
             c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
-            !valid_upstream_episode(c.upstream_episode) ||
+            c.response_mutations_snapshotted || !valid_upstream_episode(c.upstream_episode) ||
             c.response_read_deadline_upstream_episode != c.upstream_episode)
             return false;
         const RouteConfig* cfg = c.request_config;
-        return cfg != nullptr && header_only_head_explicit_close_arm_is_stable(
-                                     c,
-                                     c.response_read_deadline_upload,
-                                     cfg,
-                                     c.response_read_deadline_bundle_id,
-                                     ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
-                                     &on_upstream_response<Self>);
+        if (cfg == nullptr) return false;
+        if (c.response_read_deadline_upload.downstream_close)
+            return header_only_head_explicit_close_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                cfg,
+                c.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Self>);
+        return header_only_head_keep_alive_arm_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            cfg,
+            c.response_read_deadline_bundle_id,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+            &on_upstream_response<Self>);
     }
 
     [[nodiscard]] bool rearm_precise_response_read_timer(Connection& c, u64 now_ns) {
