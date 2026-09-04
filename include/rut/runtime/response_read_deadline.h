@@ -9,6 +9,36 @@
 
 namespace rut {
 
+inline bool response_read_deadline_http_date_is_normalized(Str value) {
+    if (value.ptr == nullptr || value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' ||
+        value.ptr[7] != ' ' || value.ptr[11] != ' ' || value.ptr[16] != ' ' ||
+        value.ptr[19] != ':' || value.ptr[22] != ':' || value.ptr[25] != ' ' ||
+        __builtin_memcmp(value.ptr + 26, "GMT", 3) != 0)
+        return false;
+    static constexpr const char* kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static constexpr const char* kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    bool weekday = false;
+    for (const char* token : kWeekdays) {
+        if (__builtin_memcmp(value.ptr, token, 3) == 0) {
+            weekday = true;
+            break;
+        }
+    }
+    bool month = false;
+    for (const char* token : kMonths) {
+        if (__builtin_memcmp(value.ptr + 8, token, 3) == 0) {
+            month = true;
+            break;
+        }
+    }
+    if (!weekday || !month) return false;
+    for (u32 i : {5u, 6u, 12u, 13u, 14u, 15u, 17u, 18u, 20u, 21u, 23u, 24u}) {
+        if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
+    }
+    return true;
+}
+
 enum class ResponseReadDeadlineOwnerPhase : u8 {
     ValidatedBeforeArm,
     ArmedForCopy,

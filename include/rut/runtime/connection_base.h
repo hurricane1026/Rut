@@ -182,6 +182,7 @@ enum class Http1PrebuiltResponsePurpose : u8 {
     StrictHeadHeaderOnly,
     StrictNonHeadCl0Success,
     ResponseReadTimeout,
+    ConfiguredForwardFailure,
 };
 
 // Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
