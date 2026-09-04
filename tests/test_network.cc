@@ -35913,6 +35913,8 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     REQUIRE(add_response_read_deadline_bundle(config));
     REQUIRE(config.add_jit_handler(
         "/one", 'H', &response_read_deadline_handler, false, /*preflight bundle=*/2));
+    REQUIRE(config.add_jit_handler(
+        "/other", 'H', &response_read_deadline_handler, false, /*preflight bundle=*/2));
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     i32 downstream[2] = {-1, -1};
@@ -35978,6 +35980,10 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     conn->upstream_send_len = 0;
     REQUIRE(response_read_timeout_header_only_head_live_proof_is_stable(
         *conn, proof, &config, 2, &on_upstream_response<IoUringEventLoop>));
+    REQUIRE(response_read_timeout_header_only_head_explicit_close_is_stable(*conn, &config, 2));
+    conn->http1_prebuilt_deadline_upload.downstream_close = false;
+    CHECK_FALSE(response_read_timeout_header_only_head_explicit_close_is_stable(*conn, &config, 2));
+    conn->http1_prebuilt_deadline_upload.downstream_close = true;
 
     auto rejects_timeout_wire_mutation = [&](const char* needle) {
         u8* wire = const_cast<u8*>(conn->response_header_buf.data());
@@ -36052,29 +36058,86 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
         *conn, proof, &config, 2, &on_upstream_response<IoUringEventLoop>));
     conn->response_read_deadline_seconds = saved_seconds;
 
-    loop->disarm_response_read_deadline(*conn);
-    REQUIRE(conn->response_read_deadline_owner_is_neutral());
+    // Restore the actual expiry entry state after the copied-proof mutation
+    // checks. The production timeout helper owns response construction and
+    // must observe an empty prebuilt/send state before it disarms the live
+    // deadline and begins the immutable response.
+    conn->clear_http1_prebuilt_response_proof();
+    conn->response_header_buf.reset();
+    conn->resp_status = 0;
+    conn->req_start_us = monotonic_us();
+    conn->response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
     const u32 close_episode = conn->upstream_episode;
-    loop->close_conn(*conn);
+    REQUIRE(try_prebuilt_strict_read_timeout(loop, *conn));
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->resp_body_sent, conn->response_header_buf.len());
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->upstream_abandoned);
+    CHECK_EQ(conn->upstream_retiring_episode, close_episode);
+    CHECK_EQ(conn->http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+    REQUIRE(response_read_timeout_header_only_head_response_is_stable(
+        *conn,
+        conn->http1_prebuilt_deadline_upload,
+        &config,
+        2,
+        conn->http1_prebuilt_deadline_generation,
+        ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired));
+    {
+        const auto saved_proof = conn->http1_prebuilt_deadline_upload;
+        auto alternate = saved_proof;
+        alternate.route_index = 1;
+        conn->http1_prebuilt_deadline_upload.route_index = 1;
+        CHECK_FALSE(response_read_timeout_header_only_head_response_is_stable(
+            *conn,
+            alternate,
+            &config,
+            2,
+            conn->http1_prebuilt_deadline_generation,
+            ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired));
+        conn->http1_prebuilt_deadline_upload = saved_proof;
+    }
+    {
+        const u32 saved_episode = conn->upstream_retiring_episode;
+        conn->upstream_retiring_episode = saved_episode + 1u;
+        CHECK_FALSE(response_read_timeout_header_only_head_response_is_stable(
+            *conn,
+            conn->http1_prebuilt_deadline_upload,
+            &config,
+            2,
+            conn->http1_prebuilt_deadline_generation,
+            ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired));
+        conn->upstream_retiring_episode = saved_episode;
+    }
+    {
+        const u8 saved_target = conn->upstream_retirement_target_owned;
+        conn->upstream_retirement_target_owned = static_cast<u8>(saved_target | kUpstreamOpSend);
+        CHECK_FALSE(response_read_timeout_header_only_head_response_is_stable(
+            *conn,
+            conn->http1_prebuilt_deadline_upload,
+            &config,
+            2,
+            conn->http1_prebuilt_deadline_generation,
+            ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired));
+        conn->upstream_retirement_target_owned = saved_target;
+    }
+    CHECK_FALSE(response_read_timeout_header_only_head_response_is_stable(
+        *conn,
+        conn->http1_prebuilt_deadline_upload,
+        &config,
+        2,
+        conn->http1_prebuilt_deadline_generation,
+        static_cast<ResponseReadTimeoutHeaderOnlyHeadPhase>(0xff)));
+    complete_prebuilt_d2_header(loop, *conn);
+    drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
+    REQUIRE(conn->http1_boundary_ready);
+    CHECK_FALSE(conn->upstream_retirement_active);
+    CHECK_EQ(conn->http1_prebuilt_wait, 0u);
+    loop->resume_deferred_http1_boundaries();
     REQUIRE_EQ(conn->fd, -1);
     REQUIRE_EQ(conn->upstream_fd, -1);
-    REQUIRE_EQ(conn->pending_ops, 2u);
-    REQUIRE_EQ(conn->upstream_close_episode, close_episode);
-    REQUIRE_EQ(conn->upstream_close_target_owned, kUpstreamOpRecv);
-    REQUIRE_EQ(conn->upstream_close_cancel_owned, kUpstreamOpRecv);
-    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, close_episode});
-    REQUIRE_EQ(loop->conns[id].pending_ops, 1u);
-    loop->dispatch({id,
-                    -ECANCELED,
-                    0,
-                    0,
-                    IoEventType::UpstreamRecv,
-                    0,
-                    kUpstreamCloseCancelAux,
-                    close_episode});
-    REQUIRE_EQ(loop->conns[id].pending_ops, 0u);
-    REQUIRE_EQ(loop->conns[id].upstream_close_target_owned, 0u);
-    REQUIRE_EQ(loop->conns[id].upstream_close_cancel_owned, 0u);
+    CHECK_EQ(conn->upstream_close_episode, 0u);
+    CHECK_EQ(conn->upstream_close_target_owned, 0u);
+    CHECK_EQ(conn->upstream_close_cancel_owned, 0u);
     REQUIRE_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
     close(downstream[1]);
 }
