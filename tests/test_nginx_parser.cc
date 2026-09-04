@@ -9548,18 +9548,16 @@ TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_li
     CHECK(populated->target_transforms[0].replace_prefix.eq(lit_str("/")));
 }
 
-TEST(nginx_converter, rejects_parsed_proxy_read_timeout_before_lowering) {
+TEST(nginx_converter, lowers_parsed_proxy_read_timeout) {
     const char source[] =
         "server { listen 8080; location / { proxy_read_timeout 1s; proxy_pass "
         "http://127.0.0.1:9000; } }";
     const auto parsed = nginx::parse({source, sizeof(source) - 1});
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(lowered);
-    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lowered.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
-    CHECK_EQ(lowered.error().span.start,
-             static_cast<u32>(strstr(source, "proxy_read_timeout") - source));
+    REQUIRE(lowered);
+    const std::string output(lowered.value().data, lowered.value().len);
+    CHECK_EQ(count_text(output, "response_read_timeout: 1s,"), 3u);
 }
 
 TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
@@ -9572,10 +9570,9 @@ TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
     valid_present.listen.port = 0;
     auto guarded_first = nginx::lower_to_rut(valid_present);
     REQUIRE_FALSE(guarded_first);
-    CHECK_EQ(guarded_first.error().code, FrontendError::UnsupportedSyntax);
-    CHECK_EQ(guarded_first.error().span.start, 24u);
-    CHECK(
-        guarded_first.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
+    CHECK_EQ(guarded_first.error().code, FrontendError::InvalidInteger);
+    CHECK(guarded_first.error().detail.eq(lit_str("invalid model listen port")));
+    CHECK_EQ(guarded_first.error().span.start, valid_present.listen.span.start);
 
     auto api_present = valid_present;
     api_present.listen.port = 8080;
@@ -18492,6 +18489,8 @@ TEST(nginx_parser_issue373, parses_literal_proxy_hide_header_in_four_orders_with
             count_text(generated,
                        "hide_headers: [\"Date\", \"Server\", \"X-Pad\", \"X-Compat-Hidden\"]\n"),
             3u);
+        CHECK_EQ(count_text(generated, "response_read_timeout: 60s,"), 1u);
+        CHECK_EQ(count_text(generated, "response_read_timeout: 0s,"), 0u);
         CHECK_EQ(count_text(generated, "proxy_hide_header"), 0u);
     }
 }
@@ -19052,8 +19051,102 @@ TEST(nginx_converter_issue373, rejects_forged_hide_inventory_without_dynamic_rea
     hand_built.listen.port = 0u;
     const auto legacy_order = nginx::lower_to_rut(hand_built);
     REQUIRE_FALSE(legacy_order);
-    CHECK(
-        legacy_order.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
+    CHECK_EQ(legacy_order.error().code, FrontendError::InvalidInteger);
+    CHECK(legacy_order.error().detail.eq(lit_str("invalid model listen port")));
+    CHECK_EQ(legacy_order.error().span.start, hand_built.listen.span.start);
+}
+
+TEST(nginx_converter_issue270, explicit_root_timeout_is_emitted_on_all_proxy_forwards) {
+    for (const char* directive : {"proxy_read_timeout 1s;", "proxy_read_timeout 63s;"}) {
+        const std::string source = std::string("server { listen 127.0.0.1:8080; location / { ") +
+                                   directive + " proxy_pass http://127.0.0.1:9000; } }";
+        const auto parsed = nginx::parse({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        const std::string output(lowered.value().data, lowered.value().len);
+        const std::string seconds =
+            std::string("response_read_timeout: ") + (directive[19] == '1' ? "1s," : "63s,");
+        CHECK_EQ(count_text(output, seconds), 3u);
+        CHECK_EQ(count_text(output, "timeout_failure_policy:"), 3u);
+        CHECK_EQ(count_text(output, "response_buffering: \"complete_content_length\""), 1u);
+
+        const auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        const auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        const auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        const auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        FrontendRirModule rir{};
+        RirGuard guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        RouteConfig config{};
+        REQUIRE(populate_route_config(config, rir.module));
+        REQUIRE_EQ(config.route_count, 3u);
+        REQUIRE_EQ(config.upstream_count, 1u);
+        REQUIRE_EQ(config.policy_bundle_count, 3u);
+        const u8 methods[] = {kRouteMethodHead, kRouteMethodGet, kRouteMethodAny};
+        const auto expected_buffering = {ForwardResponseBufferingMode::None,
+                                         ForwardResponseBufferingMode::CompleteContentLength,
+                                         ForwardResponseBufferingMode::None};
+        u32 i = 0;
+        for (const auto buffering : expected_buffering) {
+            CHECK_EQ(config.routes[i].method, methods[i]);
+            CHECK_EQ(config.routes[i].action, RouteAction::JitHandler);
+            CHECK_EQ(config.routes[i].upstream_id, 0u);
+            REQUIRE(config.routes[i].fn != nullptr);
+            const auto bundle_id = config.routes[i].preflight_forward_policy_bundle_id;
+            REQUIRE(config.policy_bundle_id_is_valid(bundle_id));
+            CHECK_EQ(config.policy_bundles[bundle_id - 1].response_buffering, buffering);
+            CHECK_EQ(config.policy_bundles[bundle_id - 1].response_read_timeout_seconds,
+                     directive[19] == '1' ? 1u : 63u);
+            REQUIRE(config.response_policy_id_is_valid(
+                config.policy_bundles[bundle_id - 1].response_policy_id));
+            REQUIRE(config.failure_policy_id_is_valid(
+                config.policy_bundles[bundle_id - 1].failure_policy_id));
+            REQUIRE(config.timeout_failure_policy_id_is_valid(
+                config.policy_bundles[bundle_id - 1].timeout_failure_policy_id));
+            const auto response_id = config.policy_bundles[bundle_id - 1].response_policy_id;
+            const auto failure_id = config.policy_bundles[bundle_id - 1].failure_policy_id;
+            const auto timeout_id = config.policy_bundles[bundle_id - 1].timeout_failure_policy_id;
+            const bool suppress = i == 0;
+            CHECK_EQ(
+                config.response_policies[response_id - 1].head_mode,
+                suppress ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject);
+            CHECK_EQ(
+                config.failure_policies[failure_id - 1].head_mode,
+                suppress ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+            CHECK_EQ(
+                config.failure_policies[timeout_id - 1].head_mode,
+                suppress ? FailurePolicyHeadMode::SuppressBody : FailurePolicyHeadMode::Reject);
+            ++i;
+        }
+        for (u32 i = 0; i < config.policy_bundle_count; ++i)
+            CHECK_EQ(config.policy_bundles[i].response_read_timeout_seconds,
+                     directive[19] == '1' ? 1u : 63u);
+        CHECK_EQ(count_text(output, "response_read_timeout: 60s,"), 0u);
+    }
+}
+
+TEST(nginx_converter_issue270, exact_redirect_keeps_timeout_on_get_fallback_forward) {
+    const char source[] =
+        "server { listen 127.0.0.1:8080; location / { proxy_read_timeout 1s; "
+        "proxy_pass http://127.0.0.1:9000; } location = /old { return 302 "
+        "http://redirect.example/new; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    const std::string output(lowered.value().data, lowered.value().len);
+    CHECK_EQ(count_text(output, "response_read_timeout: 1s,"), 3u);
+    CHECK_EQ(count_text(output, "if req.pathOnly == \"/old\""), 1u);
+    CHECK_EQ(count_text(output, "return redirect({"), 1u);
 }
 
 TEST(nginx_converter_issue373, borrowed_hide_model_requires_live_stable_source) {
@@ -19291,12 +19384,8 @@ TEST(nginx_converter_issue398, broader_numeric_ipv4_compositions_remain_fail_clo
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE_FALSE(lowered);
         CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-        if (i != 6u)
-            CHECK(lowered.error().detail.eq(
-                lit_str("numeric exact listen requires the minimal root proxy profile")));
-        else
-            CHECK(lowered.error().detail.eq(
-                lit_str("proxy_read_timeout lowering is not implemented")));
+        CHECK(lowered.error().detail.eq(
+            lit_str("numeric exact listen requires the minimal root proxy profile")));
     }
 
     const char duplicate[] =
