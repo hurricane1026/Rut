@@ -141,6 +141,7 @@ public:
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
+            case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 break;
         }
@@ -601,6 +602,16 @@ public:
     // Called inline from dispatch() when a stale CQE completes reclamation,
     // so a later Accept in the same batch can reuse the slot immediately.
     void reclaim_slot(u32 cid) {
+        if (cid >= kMaxConns || !conns[cid].response_read_timer_owner_is_neutral()) return;
+        bool was_pending = false;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            if (pending_free[i] == cid) {
+                pending_free[i] = pending_free[--pending_free_count];
+                was_pending = true;
+                break;
+            }
+        }
+        if (!was_pending) return;
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -619,24 +630,16 @@ public:
             conns[cid].response_header_slice = nullptr;
         }
         free_stack[free_top++] = cid;
-        // Remove from pending_free (swap with last element).
-        for (u32 i = 0; i < pending_free_count; i++) {
-            if (pending_free[i] == cid) {
-                pending_free[i] = pending_free[--pending_free_count];
-                break;
-            }
-        }
     }
 
     // CQE-driven reclamation: only reclaim slots whose in-flight I/O has
-    // fully completed (pending_ops == 0). Slots still waiting for CQEs
-    // remain in pending_free until a future dispatch() decrements their
-    // pending_ops to 0.
+    // fully completed and the precise response-read timer has no kernel owner.
+    // Slots still waiting for either class remain in pending_free.
     void reclaim_pending() {
         u32 remaining = 0;
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
-            if (conns[cid].pending_ops == 0) {
+            if (conns[cid].pending_ops == 0 && conns[cid].response_read_timer_owner_is_neutral()) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -776,11 +779,9 @@ public:
             c.ws_u2c_msg = nullptr;
         }
         if constexpr (Backend::kAsyncIo) {
-            // Async backend (io_uring): if no ops are in flight (the close
-            // was triggered by the final CQE), reclaim immediately — no
-            // need to defer. This avoids blocking alloc_conn at saturation
-            // when a close and accept arrive in the same dispatch batch.
-            if (c.pending_ops == 0) {
+            // Async backend (io_uring): reclaim immediately only when ordinary
+            // ops and the separately-accounted response-read timer are drained.
+            if (c.pending_ops == 0 && c.response_read_timer_owner_is_neutral()) {
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -789,8 +790,7 @@ public:
                 free_stack[free_top++] = cid;
                 return;
             }
-            // Ops still in flight: defer until CQEs arrive and pending_ops
-            // reaches 0 in reclaim_pending().
+            // Kernel ownership remains: defer until its CQEs drain.
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
@@ -933,8 +933,8 @@ public:
             c.upstream_slot_held = false;
         }
         if constexpr (Backend::kAsyncIo) {
-            // Only cancel when ops are in flight. If pending_ops == 0,
-            // the slot is freed immediately — no cancels needed.
+            // Only cancel ordinary pending_ops here. A response-read timer has
+            // separate ownership and independently blocks slot reuse.
             // Add cancel count to pending_ops so the slot isn't reclaimed
             // until all cancel CQEs have been processed.
             if (c.pending_ops > 0) {
@@ -1092,6 +1092,14 @@ public:
                             reclaim_slot(ev.conn_id);
                         }
                     }
+                }
+                break;
+            case IoEventType::ResponseReadTimer:
+                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                    auto& conn = conns[ev.conn_id];
+                    if (conn.consume_response_read_timer_completion(ev.non_upstream_generation) &&
+                        conn.response_read_timer_owner_is_neutral())
+                        reclaim_pending();
                 }
                 break;
             case IoEventType::Count:

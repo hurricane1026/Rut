@@ -77,6 +77,15 @@ enum class ResponseReadDeadlineSendKind : u8 {
     Body,
 };
 
+// Kernel ownership for the generic precise response-read timer. CancelPending
+// retains the immutable identity until both the timeout target and the cancel
+// SQE completions have been harvested, in either order.
+enum class ResponseReadTimerPhase : u8 {
+    None,
+    Armed,
+    CancelPending,
+};
+
 // Immutable request/response contract selected before the JIT handler runs.
 // The profile is part of every explicit-deadline ownership proof; method tests
 // outside the centralized classifier must never widen this domain.
@@ -666,6 +675,109 @@ struct ConnectionBase {
     u32 response_read_deadline_send_close_generation = 0;
     bool response_read_deadline_send_close_target_owned = false;
     bool response_read_deadline_send_close_cancel_owned = false;
+
+    // Generic precise response-read transport timer. The timespec and active
+    // identity are kernel-owned storage: reset() must not mutate them before
+    // every owned CQE has been harvested. The generation counter survives
+    // ordinary reset/slot reuse and never wraps through the cancel-marker bit.
+    __kernel_timespec response_read_timer_timespec{};
+    u32 response_read_timer_generation = 0;
+    u32 response_read_timer_owner_generation = 0;
+    u32 response_read_timer_deadline_generation = 0;
+    u32 response_read_timer_upstream_episode = 0;
+    ResponseReadTimerPhase response_read_timer_phase = ResponseReadTimerPhase::None;
+    bool response_read_timer_target_owned = false;
+    bool response_read_timer_cancel_owned = false;
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_timer_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_timer_timespec.tv_sec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_sec)>(0));
+        visit(c.response_read_timer_timespec.tv_nsec,
+              static_cast<decltype(c.response_read_timer_timespec.tv_nsec)>(0));
+        visit(c.response_read_timer_owner_generation, u32{0});
+        visit(c.response_read_timer_deadline_generation, u32{0});
+        visit(c.response_read_timer_upstream_episode, u32{0});
+        visit(c.response_read_timer_phase, ResponseReadTimerPhase::None);
+        visit(c.response_read_timer_target_owned, false);
+        visit(c.response_read_timer_cancel_owned, false);
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_neutral() const {
+        bool neutral = true;
+        visit_response_read_timer_owner_fields(*this,
+                                               [&](const auto& value, const auto& reset_value) {
+                                                   neutral = neutral && value == reset_value;
+                                               });
+        return neutral;
+    }
+
+    [[nodiscard]] bool response_read_timer_owner_is_valid() const {
+        const bool keys_valid =
+            response_read_timer_owner_generation != 0 &&
+            response_read_timer_owner_generation <= kResponseReadTimerGenerationMask &&
+            response_read_timer_owner_generation == response_read_timer_generation &&
+            response_read_timer_deadline_generation != 0 &&
+            valid_upstream_episode(response_read_timer_upstream_episode);
+        const bool timespec_valid =
+            response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
+            response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
+            (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+        switch (response_read_timer_phase) {
+            case ResponseReadTimerPhase::None:
+                return response_read_timer_owner_is_neutral();
+            case ResponseReadTimerPhase::Armed:
+                return keys_valid && timespec_valid && response_read_timer_target_owned &&
+                       !response_read_timer_cancel_owned;
+            case ResponseReadTimerPhase::CancelPending:
+                return keys_valid && timespec_valid &&
+                       (response_read_timer_target_owned || response_read_timer_cancel_owned);
+        }
+        return false;
+    }
+
+    // Clear is legal only after every kernel owner has drained. This protects
+    // response_read_timer_timespec from reset/reuse while IORING_OP_TIMEOUT can
+    // still dereference it.
+    bool clear_response_read_timer_owner() {
+        if (response_read_timer_target_owned || response_read_timer_cancel_owned) return false;
+        visit_response_read_timer_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        return true;
+    }
+
+    bool next_response_read_timer_generation() {
+        if (!response_read_timer_owner_is_neutral() ||
+            response_read_timer_generation >= kResponseReadTimerGenerationMask)
+            return false;
+        ++response_read_timer_generation;
+        response_read_timer_owner_generation = response_read_timer_generation;
+        return true;
+    }
+
+    // Consume one exact target/cancel CQE. CancelPending owners drain
+    // independently; their keys remain unchanged until the second CQE arrives.
+    bool consume_response_read_timer_completion(u32 tagged_generation) {
+        if (!response_read_timer_owner_is_valid()) return false;
+        const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
+        const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
+        if (generation == 0 || generation != response_read_timer_owner_generation) return false;
+        if (response_read_timer_phase == ResponseReadTimerPhase::Armed) {
+            if (cancel || !response_read_timer_target_owned || response_read_timer_cancel_owned)
+                return false;
+            response_read_timer_target_owned = false;
+        } else if (response_read_timer_phase == ResponseReadTimerPhase::CancelPending) {
+            bool& owned =
+                cancel ? response_read_timer_cancel_owned : response_read_timer_target_owned;
+            if (!owned) return false;
+            owned = false;
+        } else {
+            return false;
+        }
+        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned)
+            return clear_response_read_timer_owner();
+        return true;
+    }
 
     bool next_response_read_deadline_send_generation() {
         if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
@@ -1502,6 +1614,11 @@ struct ConnectionBase {
         clear_response_read_deadline();
         visit_response_read_deadline_send_close_owner_fields(
             *this, [](auto& value, const auto& reset_value) { value = reset_value; });
+        // The precise response-read timer owns its on-connection timespec until
+        // both target/cancel CQEs drain. Preserve active ownership across reset;
+        // neutral storage may be hygienically cleared without touching its
+        // persistent generation counter.
+        if (response_read_timer_owner_is_neutral()) clear_response_read_timer_owner();
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

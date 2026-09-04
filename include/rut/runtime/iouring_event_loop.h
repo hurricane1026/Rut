@@ -2022,7 +2022,8 @@ public:
 
     void reclaim_slot(u32 cid) {
         if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
-            strict_upstream_retirement_blocks_reclaim(conns[cid]))
+            strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
+            !conns[cid].response_read_timer_owner_is_neutral())
             return;
         bool was_pending = false;
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -2062,7 +2063,8 @@ public:
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
             if (!response_read_batch_reuse_pinned(cid) && conns[cid].pending_ops == 0 &&
-                !strict_upstream_retirement_blocks_reclaim(conns[cid])) {
+                !strict_upstream_retirement_blocks_reclaim(conns[cid]) &&
+                conns[cid].response_read_timer_owner_is_neutral()) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -2145,9 +2147,11 @@ public:
             pool.free(c.ws_u2c_msg);
             c.ws_u2c_msg = nullptr;
         }
-        // If no ops are in flight, reclaim immediately.
+        // Reclaim immediately only after ordinary ops and the separately
+        // accounted response-read timer have both drained.
         if (c.pending_ops == 0 && !response_read_batch_reuse_pinned(cid) &&
-            !strict_upstream_retirement_blocks_reclaim(c)) {
+            !strict_upstream_retirement_blocks_reclaim(c) &&
+            c.response_read_timer_owner_is_neutral()) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -2158,7 +2162,7 @@ public:
             if (!c.upstream_episode_quarantined) free_stack[free_top++] = cid;
             return;
         }
-        // Ops still in flight: defer until CQEs arrive.
+        // Kernel ownership remains: defer until its CQEs drain.
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         u8* us = c.upstream_recv_slice;
@@ -4173,6 +4177,14 @@ public:
                         // Stale CQE for a genuinely closed connection.
                         reclaim_slot(ev.conn_id);
                     }
+                }
+                break;
+            case IoEventType::ResponseReadTimer:
+                if (ev.conn_id < kMaxConns && valid_response_read_timer_transport_event(ev)) {
+                    auto& c = conns[ev.conn_id];
+                    if (c.consume_response_read_timer_completion(ev.non_upstream_generation) &&
+                        c.response_read_timer_owner_is_neutral())
+                        reclaim_pending();
                 }
                 break;
             case IoEventType::Count:
