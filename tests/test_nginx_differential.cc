@@ -52554,6 +52554,20 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
         "\"Upgrade\"]\n"
         "        },\n";
+    static constexpr char kAfterHostRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            content_length_position: \"after_host\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    static constexpr char kFramingSelector[] = "    if req.hasContentLength {\n";
+    static constexpr char kFramingElse[] = "    } else {\n";
+    static constexpr char kHeadRouteClose[] = "    }\n}\n";
+    static constexpr char kAfterHostField[] =
+        "            content_length_position: \"after_host\",\n";
     const size_t head_start = source.find("route HEAD \"/\" {\n");
     const size_t get_start = source.find("route GET \"/\" {\n");
     const size_t any_start = source.find("\nroute \"/\" {\n");
@@ -52562,10 +52576,17 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "return forward(nginx_upstream,") != 4u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
-        count_text(source, "response_read_timeout: 1s") != 3u ||
+        count_text(source, kAfterHostRequestPolicy) != 1u ||
+        count_text(source, kFramingSelector) != 1u || count_text(source, kFramingElse) != 1u ||
+        count_text(source, "content_length_position: \"after_host\"") != 1u ||
+        count_text(source, "        response_policy: {\n") != 4u ||
+        count_text(source, "        failure_policy: {\n") != 4u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 4u ||
+        count_text(source, "response_read_timeout: 1s") != 4u ||
         count_text(source, "response_read_timeout: 1s,\n") != 1u ||
+        count_text(source, "response_read_timeout: 1s\n") != 3u ||
         count_text(source, "response_buffering: \"complete_content_length\"\n") != 1u ||
         head_start == std::string::npos || get_start == std::string::npos ||
         any_start == std::string::npos || !(head_start < get_start && get_start < any_start) ||
@@ -52584,21 +52605,76 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
     const std::string head_region = source.substr(head_start, get_start - head_start);
     const std::string get_region = source.substr(get_start, any_start - get_start);
     const std::string any_region = source.substr(any_start);
+    const size_t selector_start = head_region.find(kFramingSelector);
+    const size_t else_start =
+        selector_start == std::string::npos
+            ? std::string::npos
+            : head_region.find(kFramingElse, selector_start + sizeof(kFramingSelector) - 1u);
+    if (selector_start == std::string::npos || else_start == std::string::npos ||
+        selector_start >= else_start || head_region.size() < sizeof(kHeadRouteClose) - 1u ||
+        head_region.compare(head_region.size() - (sizeof(kHeadRouteClose) - 1u),
+                            sizeof(kHeadRouteClose) - 1u,
+                            kHeadRouteClose) != 0) {
+        error = "#270 generated HEAD route lost its exact framing selector branches";
+        return false;
+    }
+    const std::string content_length_head_region =
+        head_region.substr(selector_start + sizeof(kFramingSelector) - 1u,
+                           else_start - selector_start - (sizeof(kFramingSelector) - 1u));
+    const size_t bodyless_start = else_start + sizeof(kFramingElse) - 1u;
+    const size_t bodyless_end = head_region.size() - (sizeof(kHeadRouteClose) - 1u);
+    if (bodyless_start > bodyless_end) {
+        error = "#270 generated HEAD route framing branches overlap their exact close";
+        return false;
+    }
+    const std::string bodyless_head_region =
+        head_region.substr(bodyless_start, bodyless_end - bodyless_start);
+    std::string normalized_content_length_head_region = content_length_head_region;
+    const size_t after_host_field = normalized_content_length_head_region.find(kAfterHostField);
+    if (after_host_field == std::string::npos) {
+        error = "#270 generated HEAD true branch lost its after-host field";
+        return false;
+    }
+    normalized_content_length_head_region.erase(after_host_field, sizeof(kAfterHostField) - 1u);
     const auto policy_suppresses_body = [&](const char* policy, const std::string& region) {
         const size_t start = region.find(policy);
         const size_t end = region.find("        },", start);
         const size_t suppress = region.find("head_mode: \"suppress_body\",", start);
         return start != std::string::npos && end != std::string::npos && suppress < end;
     };
-    if (count_text(head_region, "response_read_timeout: 1s") != 1u ||
+    if (count_text(head_region, "return forward(nginx_upstream,") != 2u ||
+        count_text(head_region, "response_read_timeout: 1s") != 2u ||
         count_text(get_region, "response_read_timeout: 1s") != 1u ||
         count_text(any_region, "response_read_timeout: 1s") != 1u ||
+        count_text(content_length_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(content_length_head_region, kAfterHostRequestPolicy) != 1u ||
+        content_length_head_region.find(kFixedRequestPolicy) != std::string::npos ||
+        count_text(content_length_head_region, "response_read_timeout: 1s") != 1u ||
+        count_text(bodyless_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(bodyless_head_region, kFixedRequestPolicy) != 1u ||
+        bodyless_head_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        bodyless_head_region.find("content_length_position: \"after_host\"") != std::string::npos ||
+        count_text(bodyless_head_region, "response_read_timeout: 1s") != 1u ||
+        normalized_content_length_head_region != bodyless_head_region ||
+        count_text(get_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(get_region, kFixedRequestPolicy) != 1u ||
+        get_region.find(kFramingSelector) != std::string::npos ||
+        get_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        get_region.find("content_length_position: \"after_host\"") != std::string::npos ||
+        count_text(any_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(any_region, kFixedRequestPolicy) != 1u ||
+        any_region.find(kFramingSelector) != std::string::npos ||
+        any_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        any_region.find("content_length_position: \"after_host\"") != std::string::npos ||
         head_region.find("response_buffering:") != std::string::npos ||
         count_text(get_region, "response_buffering: \"complete_content_length\"\n") != 1u ||
         any_region.find("response_buffering:") != std::string::npos ||
-        !policy_suppresses_body("response_policy: {", head_region) ||
-        !policy_suppresses_body("failure_policy: {", head_region) ||
-        !policy_suppresses_body("timeout_failure_policy: {", head_region) ||
+        !policy_suppresses_body("response_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("failure_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("response_policy: {", bodyless_head_region) ||
+        !policy_suppresses_body("failure_policy: {", bodyless_head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", bodyless_head_region) ||
         get_region.find("head_mode: \"suppress_body\",") != std::string::npos ||
         any_region.find("head_mode: \"suppress_body\",") != std::string::npos) {
         error = "#270 generated source did not isolate HEAD suppression and buffering modes";
@@ -55426,8 +55502,11 @@ int main(int argc, char** argv) {
                       << "\n";
             return 1;
         }
-        std::cerr << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into "
-                     "owned ordinary RUT with isolated HEAD suppression and buffering modes\n";
+        std::cerr
+            << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into owned "
+               "ordinary RUT with an isolated HEAD framing selector, after-host/legacy request "
+               "policies, byte-identical remaining branch bundles, suppression and buffering "
+               "modes\n";
         return 0;
     }
 
