@@ -1011,6 +1011,33 @@ struct HeldLoopbackPorts {
         return true;
     }
 
+    bool reserve_reusable(size_t index, u16& port) {
+        if (index >= std::size(fds) || fds[index] >= 0) return false;
+        const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return false;
+        int one = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
+            close(fd);
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        socklen_t length = sizeof(address);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+            length != sizeof(address) || ntohl(address.sin_addr.s_addr) != 0x7f000001u ||
+            ntohs(address.sin_port) == 0u) {
+            close(fd);
+            return false;
+        }
+        fds[index] = fd;
+        port = ntohs(address.sin_port);
+        return true;
+    }
+
     bool reserve_four_digit(size_t index, u16& port) {
         if (index >= std::size(fds) || fds[index] >= 0) return false;
         static constexpr u16 kFirstPort = 1024u;
@@ -1057,6 +1084,25 @@ static bool validate_held_loopback_port(int fd, u16 port, const char* label, std
         getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_length) != 0 ||
         accepting_length != sizeof(accepting) || accepting != 0) {
         error = std::string("#357 invalid live held port before ") + label;
+        return false;
+    }
+    return true;
+}
+
+static bool validate_reusable_held_loopback_port(int fd,
+                                                 u16 port,
+                                                 const char* label,
+                                                 std::string& error) {
+    if (!validate_held_loopback_port(fd, port, label, error)) return false;
+    int reuse_address = 0;
+    socklen_t reuse_address_length = sizeof(reuse_address);
+    int reuse_port = 0;
+    socklen_t reuse_port_length = sizeof(reuse_port);
+    if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address, &reuse_address_length) != 0 ||
+        reuse_address_length != sizeof(reuse_address) || reuse_address != 1 ||
+        getsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, &reuse_port_length) != 0 ||
+        reuse_port_length != sizeof(reuse_port) || reuse_port != 1) {
+        error = std::string("#497 invalid reusable held port before ") + label;
         return false;
     }
     return true;
@@ -2038,6 +2084,25 @@ static bool wait_keepalive_quiet_or_eof(int fd, int quiet_ms, bool& eof, std::st
 
 struct DeadPort {
     int fd = -1;
+
+    bool adopt_held_loopback_port(int* reservation,
+                                  u16 port,
+                                  const char* label,
+                                  std::string& error) {
+        if (fd >= 0 || reservation == nullptr ||
+            !validate_held_loopback_port(*reservation, port, label, error)) {
+            if (error.empty()) error = std::string("#497 dead port was not empty before ") + label;
+            return false;
+        }
+        fd = *reservation;
+        *reservation = -1;
+        if (*reservation != -1 || !validate_held_loopback_port(fd, port, label, error)) {
+            if (error.empty())
+                error = std::string("#497 backend holder transfer failed before ") + label;
+            return false;
+        }
+        return true;
+    }
 
     bool reserve(u16 port) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -23802,7 +23867,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                                        std::string& error,
                                        DeadPort* shared_dead = nullptr,
                                        const std::string* shared_fragment = nullptr,
-                                       LateSuccessorObservation* observation = nullptr) {
+                                       LateSuccessorObservation* observation = nullptr,
+                                       int* reusable_frontend_reservation = nullptr) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "RUT executable path is not absolute and executable";
         return false;
@@ -23825,8 +23891,17 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "shared RUT dead upstream reservation is not live";
         return false;
     }
+    if (reusable_frontend_reservation != nullptr &&
+        !validate_reusable_held_loopback_port(*reusable_frontend_reservation,
+                                              frontend_port,
+                                              "RUT io_uring gate child startup",
+                                              error))
+        return false;
+    const std::string listener = reusable_frontend_reservation == nullptr
+                                     ? std::to_string(frontend_port)
+                                     : "127.0.0.1:" + std::to_string(frontend_port);
     const std::string local_fragment =
-        "server {\n  listen " + std::to_string(frontend_port) +
+        "server {\n  listen " + listener +
         ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
         ";\n  }\n}\n";
     const std::string& fragment = shared_fragment == nullptr ? local_fragment : *shared_fragment;
@@ -58414,24 +58489,53 @@ int main(int argc, char** argv) {
     if (rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
         rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
         rut_iouring_gate_connect_journal_negative) {
+        HeldLoopbackPorts reservations;
         u16 rut_frontend_port = 0;
         u16 rut_backend_port = 0;
-        if (!allocate_port(rut_frontend_port) || !allocate_port(rut_backend_port) ||
-            rut_frontend_port == rut_backend_port) {
-            std::cerr << "FAIL [RUT io_uring gate preflight]: dynamic port allocation failed\n";
+        std::string gate_error;
+        DeadPort dead;
+        if (!reservations.reserve_reusable(0u, rut_frontend_port) ||
+            !reservations.reserve(1u, rut_backend_port) || rut_frontend_port == rut_backend_port ||
+            !validate_reusable_held_loopback_port(reservations.fds[0],
+                                                  rut_frontend_port,
+                                                  "RUT io_uring gate frontend reservation",
+                                                  gate_error) ||
+            !dead.adopt_held_loopback_port(&reservations.fds[1],
+                                           rut_backend_port,
+                                           "RUT io_uring gate backend adoption",
+                                           gate_error)) {
+            std::cerr << "FAIL [RUT io_uring gate preflight]: "
+                      << (gate_error.empty() ? "dynamic port reservation failed" : gate_error)
+                      << "\n";
             return 1;
         }
-        std::string gate_error;
-        if (!run_rut_iouring_gate_spike(rut_frontend_port,
-                                        rut_backend_port,
-                                        temp,
-                                        argv[2],
-                                        argv[3],
-                                        rut_iouring_gate_identity_negative,
-                                        rut_iouring_gate_ready_mutation_negative,
-                                        rut_iouring_gate_owner_death_negative,
-                                        rut_iouring_gate_connect_journal_negative,
-                                        gate_error)) {
+        const bool gate_ok = run_rut_iouring_gate_spike(rut_frontend_port,
+                                                        rut_backend_port,
+                                                        temp,
+                                                        argv[2],
+                                                        argv[3],
+                                                        rut_iouring_gate_identity_negative,
+                                                        rut_iouring_gate_ready_mutation_negative,
+                                                        rut_iouring_gate_owner_death_negative,
+                                                        rut_iouring_gate_connect_journal_negative,
+                                                        gate_error,
+                                                        &dead,
+                                                        nullptr,
+                                                        nullptr,
+                                                        &reservations.fds[0]);
+        std::string retained_error;
+        const bool frontend_retained =
+            validate_reusable_held_loopback_port(reservations.fds[0],
+                                                 rut_frontend_port,
+                                                 "RUT io_uring gate child settlement",
+                                                 retained_error);
+        const bool backend_retained = validate_held_loopback_port(
+            dead.fd, rut_backend_port, "RUT io_uring gate child settlement", retained_error);
+        if (!gate_ok || !frontend_retained || !backend_retained) {
+            if (!frontend_retained || !backend_retained) {
+                if (!gate_error.empty()) gate_error += "; ";
+                gate_error += retained_error;
+            }
             std::cerr << "FAIL [RUT io_uring gate "
                       << (rut_iouring_gate_identity_negative
                               ? "identity negative]: "
