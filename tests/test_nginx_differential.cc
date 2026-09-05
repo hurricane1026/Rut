@@ -54030,6 +54030,370 @@ static bool run_keepalive_timeout_head_differential(const char* rut_path, std::s
     return true;
 }
 
+static std::vector<char> fixed_upload_head_request_prefix() {
+    static constexpr char kHead[] =
+        "HEAD /buffered-head?q=1 HTTP/1.1\r\n"
+        "Host: options-client.example\r\n"
+        "X-Test: binary-head-defaults\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 12\r\n\r\n";
+    std::vector<char> request(kHead, kHead + sizeof(kHead) - 1u);
+    request.insert(request.end(),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                       kDefaultBufferingPostCompleteRequestPrefixBody);
+    return request;
+}
+
+static std::vector<char> fixed_upload_head_request_suffix() {
+    return {reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                kDefaultBufferingPostCompleteRequestPrefixBody,
+            reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                sizeof(kDefaultBufferingPostCompleteRequestBody)};
+}
+
+static std::vector<char> expected_fixed_upload_head_upstream(u16 backend_port) {
+    const std::string head =
+        "HEAD /buffered-head?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nContent-Length: 12\r\nX-Test: binary-head-defaults\r\nContent-Type: "
+        "application/octet-stream\r\n\r\n";
+    std::vector<char> request(head.begin(), head.end());
+    request.insert(request.end(),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                       sizeof(kDefaultBufferingPostCompleteRequestBody));
+    return request;
+}
+
+static void configure_fixed_upload_head_origin(Recorder& origin) {
+    origin.read_exact_content_length_12_body = true;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+}
+
+static bool run_fixed_upload_head_success_differential(const char* rut_path, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#270 fixed-upload HEAD differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error = "#270 fixed-upload HEAD differential could not create isolated side resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (u32 index = 0u; index < 4u; index++) {
+        if (!reservations.reserve(index, ports[index])) {
+            error = "#270 fixed-upload HEAD differential could not reserve four loopback ports";
+            return false;
+        }
+        for (u32 previous = 0u; previous < index; previous++) {
+            if (ports[index] == ports[previous]) {
+                error = "#270 fixed-upload HEAD differential reused a reserved loopback port";
+                return false;
+            }
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    std::string generated_source;
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        !build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty()) error = "#270 fixed-upload HEAD differential could not persist inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    configure_fixed_upload_head_origin(origins[0]);
+    configure_fixed_upload_head_origin(origins[1]);
+    for (u32 side = 0u; side < 2u; side++) {
+        const u32 backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#270 fixed-upload HEAD origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend],
+                                 1u,
+                                 kPositiveClHeadEarlyRetirementOrigin,
+                                 sizeof(kPositiveClHeadEarlyRetirementOrigin) - 1u)) {
+            if (error.empty()) error = "#270 fixed-upload HEAD origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#270 fixed-upload HEAD origins were not live before frontend handoff";
+        return false;
+    }
+
+    const std::string container_name =
+        "rut-nginx-270-fixed-upload-head-" + std::to_string(getpid());
+    PinnedNginxDockerLifecycle nginx(container_name, temps[0], error);
+    ChildGuard rut;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#270 fixed-upload HEAD nginx bind", error) ||
+        !nginx.start(ports[0])) {
+        if (error.empty()) error = "#270 fixed-upload HEAD pinned nginx failed before readiness";
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#270 fixed-upload HEAD RUT bind", error) ||
+        !spawn_child(
+            {rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+            temps[1].rut_log,
+            rut.child) ||
+        !wait_ready(ports[2], rut.child, error)) {
+        if (error.empty()) error = "#270 fixed-upload HEAD generated RUT failed before readiness";
+        return false;
+    }
+    const pid_t nginx_pid = nginx.cli().pid;
+    const pid_t rut_pid = rut.child.pid;
+    const std::string loaded = "Loaded program: " + temps[1].source + " (opt O2)\n";
+    const std::string listening =
+        "Listening on port " + std::to_string(ports[2]) + " with 1 shard(s)\n";
+    const auto rut_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temps[1].rut_log, loaded.c_str()) ||
+            !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+            !log_contains(temps[1].rut_log, listening.c_str())) &&
+           std::chrono::steady_clock::now() < rut_ready_deadline) {
+        if (poll_child(rut.child)) {
+            error = "#270 fixed-upload HEAD generated RUT exited before O2/io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (nginx_pid <= 0 || rut_pid <= 0 || nginx_pid == rut_pid ||
+        !log_contains(temps[1].rut_log, loaded.c_str()) ||
+        !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+        !log_contains(temps[1].rut_log, listening.c_str())) {
+        error = "#270 fixed-upload HEAD lacked independent public frontend identity/readiness";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(nginx.cli()) && !poll_child(rut.child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    clients.fds[0] = connect_once(ports[0]);
+    clients.fds[1] = connect_once(ports[2]);
+    const std::vector<char> prefix = fixed_upload_head_request_prefix();
+    const std::vector<char> suffix = fixed_upload_head_request_suffix();
+    if (clients.fds[0] < 0 || clients.fds[1] < 0 || prefix.empty() || suffix.empty() ||
+        !send_all(clients.fds[0], prefix.data(), prefix.size()) ||
+        !send_all(clients.fds[1], prefix.data(), prefix.size())) {
+        error = "#270 fixed-upload HEAD clients could not send both five-byte prefixes";
+        return false;
+    }
+    const auto upload_gate_started = std::chrono::steady_clock::now();
+    const auto upload_gate_deadline = upload_gate_started + std::chrono::milliseconds(1200);
+    for (;;) {
+        std::string nginx_access;
+        std::string rut_access;
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[0].requests.load(std::memory_order_acquire) != 0u ||
+            origins[1].requests.load(std::memory_order_acquire) != 0u ||
+            origins[0].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[1].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !read_request_length_access_file(temps[0].nginx_access_log, nginx_access, error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, rut_access, error) ||
+            !nginx_access.empty() || !rut_access.empty() ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+            if (error.empty())
+                error = "#270 fixed-upload HEAD quiet gate observed early origin/output/exit";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= upload_gate_deadline) break;
+    }
+    if (std::chrono::steady_clock::now() - upload_gate_started < std::chrono::milliseconds(1200) ||
+        !send_all(clients.fds[0], suffix.data(), suffix.size()) ||
+        !send_all(clients.fds[1], suffix.data(), suffix.size())) {
+        if (error.empty()) error = "#270 fixed-upload HEAD seven-byte suffix publication failed";
+        return false;
+    }
+
+    const auto origin_send_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        const bool both_sent = origins[0].response_sent_open.load(std::memory_order_acquire) &&
+                               origins[1].response_sent_open.load(std::memory_order_acquire);
+        if (both_sent) break;
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) > 1u ||
+            origins[1].accepted.load(std::memory_order_acquire) > 1u ||
+            origins[0].requests.load(std::memory_order_acquire) > 1u ||
+            origins[1].requests.load(std::memory_order_acquire) > 1u ||
+            origins[0].response_send_failed.load(std::memory_order_acquire) ||
+            origins[1].response_send_failed.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= origin_send_deadline) {
+            error = "#270 fixed-upload HEAD origins did not publish one complete response";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 origin_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        origin_sent_ns[side] = origins[side].response_sent_ns.load(std::memory_order_acquire);
+        if (origin_sent_ns[side] == 0u ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload HEAD lost exact origin request/send cardinality";
+            return false;
+        }
+    }
+
+    const auto retirement_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    for (;;) {
+        const bool both_retired = origins[0].response_peer_closed.load(std::memory_order_acquire) &&
+                                  origins[1].response_peer_closed.load(std::memory_order_acquire);
+        if (both_retired) break;
+        if (!frontends_live() || !origins_live() ||
+            origins[0].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[1].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[0].response_peer_observation_failed.load(std::memory_order_acquire) ||
+            origins[1].response_peer_observation_failed.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= retirement_deadline) {
+            error = "#270 fixed-upload HEAD origin retirement observation failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    for (u32 side = 0u; side < 2u; side++) {
+        const u64 closed_ns = origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+        if (closed_ns < origin_sent_ns[side] ||
+            closed_ns - origin_sent_ns[side] >= 800'000'000ull ||
+            origins[side].response_peer_close_count.load(std::memory_order_acquire) != 1u) {
+            error = "#270 fixed-upload HEAD origin retirement escaped the 800ms bound";
+            return false;
+        }
+    }
+
+    std::vector<char> downstream[2];
+    u64 first_byte_ns[2]{};
+    if (!read_timed_head_response(clients.fds[0], downstream[0], first_byte_ns[0], error) ||
+        !read_timed_head_response(clients.fds[1], downstream[1], first_byte_ns[1], error)) {
+        if (error.empty()) error = "#270 fixed-upload HEAD downstream response read failed";
+        return false;
+    }
+    std::vector<char> normalized[2] = {downstream[0], downstream[1]};
+    std::string detail;
+    if (!validate_exact_normalized_response(
+            downstream[0], kPositiveClHeadEarlyRetirementResponseNormalized, detail) ||
+        !validate_exact_normalized_response(
+            downstream[1], kPositiveClHeadEarlyRetirementResponseNormalized, detail) ||
+        !normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != normalized[1] ||
+        !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 500, detail) ||
+        !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 500, detail)) {
+        error = "#270 fixed-upload HEAD exact header-only response/keep-alive mismatch: " + detail;
+        return false;
+    }
+
+    for (u32 side = 0u; side < 2u; side++) {
+        if (!frontends_live() || !origins_live() ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_failed.load(std::memory_order_acquire) ||
+            origins[side].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload HEAD no-retry/lifecycle window failed";
+            return false;
+        }
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    const bool nginx_clean = nginx.shutdown();
+    const bool rut_clean = stop_child(rut.child) && rut.child.pid < 0 && rut.child.status_valid &&
+                           WIFEXITED(rut.child.status) && WEXITSTATUS(rut.child.status) == 0;
+    if (!nginx_clean || !rut_clean) {
+        error = "#270 fixed-upload HEAD frontends did not shut down cleanly";
+        return false;
+    }
+    std::string access_logs[2];
+    if (!read_exact_return204_log(
+            temps[0].nginx_access_log, "#270 nginx fixed-upload access", access_logs[0], error) ||
+        !read_exact_return204_log(
+            temps[1].rut_access_log, "#270 RUT fixed-upload access", access_logs[1], error))
+        return false;
+
+    std::vector<char> upstream[2];
+    for (u32 side = 0u; side < 2u; side++) {
+        const bool live_before_stop =
+            origins[side].running.load(std::memory_order_acquire) &&
+            origins[side].thread_alive.load(std::memory_order_acquire) &&
+            !origins[side].listener_failed.load(std::memory_order_acquire);
+        origins[side].stop();
+        const std::vector<char> expected =
+            expected_fixed_upload_head_upstream(ports[side * 2u + 1u]);
+        if (origins[side].history.size() == 1u) upstream[side] = origins[side].history[0];
+        if (origins[side].history.size() != 1u || upstream[side] != expected ||
+            origins[side].request != expected) {
+            error = "#270 fixed-upload HEAD exact upstream wire mismatch";
+            dump_wire("expected #270 fixed-upload HEAD upstream", expected);
+            dump_wire("actual #270 fixed-upload HEAD upstream", upstream[side]);
+            return false;
+        }
+        if (!live_before_stop || origins[side].thread_alive.load(std::memory_order_acquire) ||
+            origins[side].listen_fd >= 0 ||
+            !origins[side].response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origins[side].response_connection_closed.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload HEAD recorder cleanup mismatch";
+            return false;
+        }
+    }
+    std::vector<char> canonical_upstream[2] = {upstream[0], upstream[1]};
+    const std::string expected_access = std::to_string(prefix.size() + suffix.size()) + "\n";
+    if (!canonicalize_keepalive_timeout_upstream(canonical_upstream[0], ports[1]) ||
+        !canonicalize_keepalive_timeout_upstream(canonical_upstream[1], ports[3]) ||
+        canonical_upstream[0] != canonical_upstream[1] || access_logs[0] != expected_access ||
+        access_logs[1] != expected_access || temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log ||
+        generated_source.find("nginx.conf") != std::string::npos) {
+        error = "#270 fixed-upload HEAD cross-side wire/access/resource evidence differed";
+        return false;
+    }
+    return true;
+}
+
 static void configure_positive_get_default_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -54895,6 +55259,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--explicit-timeout-head-phase-differential") == 0;
     const bool keepalive_timeout_head_differential =
         argc == 3 && strcmp(argv[1], "--keepalive-timeout-head-differential") == 0;
+    const bool fixed_upload_head_success_differential =
+        argc == 3 && strcmp(argv[1], "--fixed-upload-head-success-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -55099,7 +55465,7 @@ int main(int argc, char** argv) {
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
          !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
          !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
-         !proxy_hide_header_generated_pair_self_check &&
+         !fixed_upload_head_success_differential && !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
@@ -55170,7 +55536,7 @@ int main(int argc, char** argv) {
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
         ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential ||
-          keepalive_timeout_head_differential) &&
+          keepalive_timeout_head_differential || fixed_upload_head_success_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
@@ -55264,6 +55630,8 @@ int main(int argc, char** argv) {
                "--explicit-timeout-head-phase-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--keepalive-timeout-head-differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--fixed-upload-head-success-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
                "<absolute-rut-executable>\n"
@@ -56424,6 +56792,20 @@ int main(int argc, char** argv) {
                "the default-downstream-keep-alive bodyless H1.1 HEAD 1s initial response-header "
                "deadline, header-only 504, origin retirement, and fresh-origin request-2 "
                "HEAD 200 control (bounded evidence; proxy_read_timeout remains PARTIAL)\n";
+        return 0;
+    }
+    if (fixed_upload_head_success_differential) {
+        std::string differential_error;
+        if (!run_fixed_upload_head_success_differential(argv[2], differential_error)) {
+            std::cerr << "FAIL [#270 fixed-upload HEAD success differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 pinned nginx 1.29.7 and converter-generated ordinary RUT buffered "
+                     "the split fixed-length HEAD upload for over 1.2s, then matched the exact "
+                     "complete upstream request, header-only 200, prompt origin retirement, and "
+                     "retained downstream keep-alive (success boundary only; proxy_read_timeout "
+                     "remains PARTIAL)\n";
         return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
