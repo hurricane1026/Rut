@@ -1424,7 +1424,7 @@ private:
                                                      const rir::Module& mod,
                                                      jit::JitEngine& engine);
 
-    // Verified-RIR publication entry. Deferred mode is inaccessible to native
+    // Verified-RIR publication entry. Deferred modes are inaccessible to native
     // callers and admitted only after register_jit_routes verifies the module.
     bool add_verified_jit_handler(const char* path,
                                   u8 method,
@@ -1454,6 +1454,11 @@ private:
              !complete_content_length_route_method_is_admitted(method_key) ||
              policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
                  ForwardResponseBufferingMode::CompleteContentLength))
+            return false;
+        if (forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection &&
+            (needs_req_body || method_key != kRouteMethodHead ||
+             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                 ForwardResponseBufferingMode::None))
             return false;
         auto& r = routes[route_count];
         r.path_len = 0;

@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -34520,6 +34521,7 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     for (const ForwardPreflightMode forged_mode : {
              ForwardPreflightMode::None,
              ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
              static_cast<ForwardPreflightMode>(0xff),
          }) {
         hir->routes[0].forward_preflight_mode = forged_mode;
@@ -34536,6 +34538,7 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     for (const ForwardPreflightMode forged_mode : {
              ForwardPreflightMode::None,
              ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
              static_cast<ForwardPreflightMode>(0xff),
          }) {
         mir->functions[0].forward_preflight_mode = forged_mode;
@@ -34566,6 +34569,8 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
     fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     fn.forward_preflight_mode = static_cast<ForwardPreflightMode>(0xff);
     CHECK_FALSE(rir::verify_module(rir.module).ok);
@@ -38038,6 +38043,124 @@ TEST(frontend, deferred_forward_preflight_rejects_alternate_source_conditions) {
         REQUIRE_FALSE(hir.has_value());
         CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
+}
+
+TEST(frontend, request_framing_selection_preflight_is_exact_and_verified_at_each_boundary) {
+    for (const char* method : {"GET", "POST", ""}) {
+        std::string rejected_source(kFramingSelectionPreflightSource);
+        const auto pos = rejected_source.find("route HEAD");
+        REQUIRE_NE(pos, std::string::npos);
+        rejected_source.replace(pos, 10, std::string("route ") + method);
+        auto rejected_lexed =
+            lex({rejected_source.data(), static_cast<u32>(rejected_source.size())});
+        REQUIRE(rejected_lexed);
+        auto rejected_ast = parse_file_heap(rejected_lexed.value());
+        REQUIRE(rejected_ast);
+        CHECK_FALSE(analyze_file_heap(rejected_ast.value()).has_value());
+    }
+    auto lexed = lex(lit(kFramingSelectionPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodHead);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_hir_rejection = [&]() { CHECK_FALSE(build_mir_heap(hir.value()).has_value()); };
+    route.control.cond.kind = HirExprKind::ReqChunked;
+    expect_hir_rejection();
+    route.control.cond.kind = HirExprKind::ReqHasContentLength;
+    route.method = kRouteMethodAny;
+    expect_hir_rejection();
+    route.method = kRouteMethodHead;
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    expect_hir_rejection();
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    route.control.else_term.upstream_index = 1;
+    expect_hir_rejection();
+    route.control.else_term.upstream_index = route.control.then_term.upstream_index;
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& mf = mir->functions[0];
+    CHECK_EQ(mf.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(mf.blocks.len, 3u);
+    CHECK_EQ(mf.blocks[0].term.cond.kind, MirValueKind::ReqHasContentLength);
+    CHECK_EQ(mf.blocks[1].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(mf.blocks[2].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_mir_rejection = [&]() {
+        FrontendRirModule rejected{};
+        CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    };
+    mf.blocks[0].term.then_block = 2;
+    expect_mir_rejection();
+    mf.blocks[0].term.then_block = 1;
+    mf.blocks[0].effects.len = 1;
+    expect_mir_rejection();
+    mf.blocks[0].effects.len = 0;
+    mf.blocks[2].term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_buffering = ForwardResponseBufferingMode::None;
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 2;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 1;
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(lowered.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(fn.blocks[0].insts[1].op, rir::Opcode::Br);
+    CHECK_EQ(fn.blocks[1].insts[3].op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(fn.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+
+    auto expect_rir_rejection = [&]() {
+        const auto verified = rir::verify_module(lowered.module);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+    };
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 2;
+    expect_rir_rejection();
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 1;
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqChunked;
+    expect_rir_rejection();
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqHasContentLength;
+    fn.http_method = kRouteMethodAny;
+    expect_rir_rejection();
+    fn.http_method = kRouteMethodHead;
+    fn.blocks[2].insts[2].imm.i32_val = 2;
+    expect_rir_rejection();
+    fn.blocks[2].insts[2].imm.i32_val = 1;
+    CHECK(rir::verify_module(lowered.module).ok);
+
+    char printed[4096]{};
+    rir::PrintBuf print_buf;
+    print_buf.init(printed, sizeof(printed), -1);
+    rir::print_module(print_buf, lowered.module);
+    CHECK_FALSE(print_buf.overflow);
+    CHECK(std::string(printed, print_buf.len)
+              .find("forward_preflight: after_request_framing_selection bundle=1") !=
+          std::string::npos);
+    lowered.destroy();
 }
 
 int main(int argc, char** argv) {

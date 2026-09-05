@@ -11,11 +11,13 @@ enum class ForwardPreflightMode : u8 {
     None = 0,
     EagerDirect = 1,
     AfterCanonicalSelection = 2,
+    AfterRequestFramingSelection = 3,
 };
 
 inline constexpr bool forward_preflight_mode_valid(ForwardPreflightMode mode) {
     return mode == ForwardPreflightMode::None || mode == ForwardPreflightMode::EagerDirect ||
-           mode == ForwardPreflightMode::AfterCanonicalSelection;
+           mode == ForwardPreflightMode::AfterCanonicalSelection ||
+           mode == ForwardPreflightMode::AfterRequestFramingSelection;
 }
 
 inline constexpr bool forward_preflight_metadata_is_eager_runtime_safe(ForwardPreflightMode mode,
@@ -30,15 +32,18 @@ inline constexpr bool forward_preflight_metadata_is_eager_runtime_safe(ForwardPr
 inline constexpr bool forward_preflight_metadata_is_verified_runtime_safe(ForwardPreflightMode mode,
                                                                           u16 bundle_id) {
     return forward_preflight_metadata_is_eager_runtime_safe(mode, bundle_id) ||
-           (mode == ForwardPreflightMode::AfterCanonicalSelection && bundle_id != 0);
+           ((mode == ForwardPreflightMode::AfterCanonicalSelection ||
+             mode == ForwardPreflightMode::AfterRequestFramingSelection) &&
+            bundle_id != 0);
 }
 
-// Once a preflight has actually been armed, both compiler-proven timings share
+// Once a preflight has actually been armed, all compiler-proven timings share
 // the same downstream ownership invariants. The connection deadline state,
 // rather than this metadata alone, distinguishes armed deferred routes.
 inline constexpr bool forward_preflight_mode_can_own_runtime_deadline(ForwardPreflightMode mode) {
     return mode == ForwardPreflightMode::EagerDirect ||
-           mode == ForwardPreflightMode::AfterCanonicalSelection;
+           mode == ForwardPreflightMode::AfterCanonicalSelection ||
+           mode == ForwardPreflightMode::AfterRequestFramingSelection;
 }
 
 }  // namespace rut

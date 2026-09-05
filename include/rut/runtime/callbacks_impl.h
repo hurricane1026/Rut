@@ -1388,6 +1388,54 @@ inline bool deferred_canonical_selection_route_is_valid(const Connection& conn,
            bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
 }
 
+inline bool deferred_request_framing_selection_route_is_valid(const Connection& conn,
+                                                              const RouteEntry* route,
+                                                              const RouteConfig* config,
+                                                              jit::HandlerFn fn) {
+    if (route == nullptr || config == nullptr || conn.request_config != config) return false;
+    bool owned = false;
+    for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
+    if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
+        route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
+        route->throttle_down_bps != 0 || route->ws_terminate ||
+        route->forward_preflight_mode != ForwardPreflightMode::AfterRequestFramingSelection ||
+        route->preflight_forward_policy_bundle_id == 0 || route->method != kRouteMethodHead ||
+        !config->policy_bundle_id_is_valid(route->preflight_forward_policy_bundle_id))
+        return false;
+    const auto& bundle = config->policy_bundles[route->preflight_forward_policy_bundle_id - 1];
+    if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+        bundle.response_buffering != ForwardResponseBufferingMode::None ||
+        !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+        !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+        !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    return fixed_upload_head_timeout_policies_valid(
+        config->response_policies[bundle.response_policy_id - 1],
+        config->failure_policies[bundle.failure_policy_id - 1],
+        config->failure_policies[bundle.timeout_failure_policy_id - 1]);
+}
+
+inline bool deferred_request_framing_selection_outcome_is_valid(const Connection& conn,
+                                                                const RouteEntry& route,
+                                                                const JitDispatchOutcome& outcome) {
+    if (outcome.kind != JitDispatchOutcome::Kind::Forward ||
+        outcome.policy_bundle_id != route.preflight_forward_policy_bundle_id ||
+        conn.req_method != static_cast<u8>(LogHttpMethod::Head) || conn.req_malformed ||
+        conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
+        conn.req_client_has_expect || conn.req_client_has_upgrade_header || conn.req_wants_upgrade)
+        return false;
+    const bool has_content_length = conn.req_client_has_content_length;
+    if ((has_content_length && conn.req_client_content_length_count != 1) ||
+        (!has_content_length &&
+         (conn.req_client_content_length_count != 0 || conn.req_content_length != 0)))
+        return false;
+    const u16 expected_policy =
+        has_content_length
+            ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
+            : static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    return outcome.request_policy_id == expected_policy;
+}
+
 template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
@@ -2247,6 +2295,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
+    } else if (route != nullptr && route->forward_preflight_mode ==
+                                       ForwardPreflightMode::AfterRequestFramingSelection) {
+        if (!deferred_request_framing_selection_route_is_valid(conn, route, config, route->fn) ||
+            !deferred_canonical_selection_state_is_neutral(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
     } else if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) {
         return;
     }
@@ -3023,6 +3078,23 @@ void handle_jit_outcome(Loop* loop,
             loop->close_conn(conn);
             return;
         }
+    }
+    if (selected_route != nullptr && selected_route->forward_preflight_mode ==
+                                         ForwardPreflightMode::AfterRequestFramingSelection) {
+        const RouteConfig* config = conn.request_config;
+        if (!deferred_request_framing_selection_route_is_valid(conn, selected_route, config, fn) ||
+            !deferred_canonical_selection_state_is_neutral(conn) ||
+            !deferred_request_framing_selection_outcome_is_valid(conn, *selected_route, outcome)) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (!prepare_response_read_deadline_preflight_for_mode(
+                loop,
+                conn,
+                selected_route,
+                config,
+                ForwardPreflightMode::AfterRequestFramingSelection))
+            return;
     }
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
         outcome.kind != JitDispatchOutcome::Kind::Forward) {

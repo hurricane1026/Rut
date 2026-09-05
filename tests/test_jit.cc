@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -20015,6 +20016,53 @@ TEST(jit, deferred_preflight_selector_returns_only_exact_redirect_or_bundle_iden
             CHECK_EQ(raw.upstream_id, 0u);
             CHECK_EQ(raw.next_state, 1u);
         }
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, request_framing_preflight_selects_literal_policy_identity_by_content_length) {
+    auto lexed = lex(lit(kFramingSelectionPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.functions[0].forward_preflight_mode,
+               ForwardPreflightMode::AfterRequestFramingSelection);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct Case {
+        const char* request;
+        RequestPolicyId expected;
+    } cases[] = {
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\nContent-Length: 12\r\n\r\nhello world!",
+         RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n",
+         RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\n\r\n", RequestPolicyId::Http11FixedStrip},
+    };
+    for (const auto& test : cases) {
+        const u32 len = static_cast<u32>(__builtin_strlen(test.request));
+        const auto result = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(test.request), len, nullptr));
+        CHECK_EQ(result.action, HandlerAction::ForwardBundle);
+        CHECK_EQ(result.status_code, static_cast<u16>(test.expected));
+        CHECK_EQ(result.upstream_id, 0u);
+        CHECK_EQ(result.next_state, 1u);
     }
 
     engine.shutdown();
