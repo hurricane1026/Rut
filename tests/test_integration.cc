@@ -31602,7 +31602,8 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
     REQUIRE_EQ(runner.exact_target_send_sqe_count, 1u);
     REQUIRE_EQ(runner.exact_stage_generation, runner.exact_stage_handler_generation);
     REQUIRE_NE(runner.exact_stage_generation, 0u);
-    REQUIRE_EQ(runner.exact_stage_upstream_attempts, 1u);
+    // Request 1 is settled; metadata-only local request 2 creates no upstream attempt.
+    REQUIRE_EQ(runner.exact_stage_upstream_attempts, 0u);
     REQUIRE_EQ(runner.exact_stage_upstream_retiring_episode, runner.connect_episode);
     REQUIRE(valid_upstream_episode(runner.exact_stage_upstream_retiring_episode));
     REQUIRE(valid_upstream_episode(runner.exact_stage_upstream_episode));
