@@ -39770,6 +39770,475 @@ TEST(
 
 TEST(
     route,
+    public_ordinary_source_precise_fixed_upload_head_two_incomplete_headers_retain_initial_deadline_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr u8 kBody[] = {
+        0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    static constexpr char kFirstOriginFragment[] =
+        "HTTP/1.1 200 OK\r\n"
+        "X-Progress: fixed-head\r\n";
+    static constexpr char kSecondOriginFragment[] = "X-Second: still-incomplete\r\n";
+    static constexpr char kIncompleteOrigin[] =
+        "HTTP/1.1 200 OK\r\n"
+        "X-Progress: fixed-head\r\n"
+        "X-Second: still-incomplete\r\n";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 7\r\n\r\n";
+    static constexpr char kTimeoutExpected[] =
+        "HTTP/1.1 504 Gateway Time-out\r\n"
+        "Server: rut\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 7\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static_assert(sizeof(kBody) == 12u);
+    static_assert(sizeof(kFirstOriginFragment) - 1u == 41u);
+    static_assert(sizeof(kSecondOriginFragment) - 1u == 28u);
+    static_assert(sizeof(kIncompleteOrigin) - 1u == 69u);
+    static_assert(sizeof(kFirstOriginFragment) - 1u + sizeof(kSecondOriginFragment) - 1u ==
+                  sizeof(kIncompleteOrigin) - 1u);
+    static_assert(kIncompleteOrigin[sizeof(kIncompleteOrigin) - 4u] != '\n');
+    static_assert(sizeof(kTimeoutExpected) - 1u == 152u);
+    static_assert(sizeof(kSecondExpected) - 1u == 112u);
+
+    RecordingUpstream backend;
+    backend.response = kIncompleteOrigin;
+    backend.response_len = sizeof(kIncompleteOrigin) - 1u;
+    CHECK_FALSE(buf_contains(backend.response, backend.response_len, "\r\n\r\n", 4u));
+    backend.response_chunk_size = sizeof(kFirstOriginFragment) - 1u;
+    backend.gate_first_response_fragments = true;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1u;
+    backend.wait_first_response_for_peer_close = true;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicFixedUploadHeadResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_GT(resources.lex_token_count, 1u);
+    REQUIRE_EQ(resources.ast_item_count, 2u);
+    REQUIRE(resources.hir_selector_verified);
+    REQUIRE(resources.mir_selector_verified);
+    REQUIRE(resources.rir_selector_verified);
+    REQUIRE(resources.jit_o2_verified);
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    REQUIRE_EQ(resources.rir.module.upstream_count, 1u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_function = resources.rir.module.functions[0];
+    REQUIRE_EQ(rir_function.http_method, kRouteMethodHead);
+    REQUIRE_EQ(rir_function.block_count, 3u);
+    CHECK_EQ(rir_function.forward_preflight_mode,
+             ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(rir_function.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir_function.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(rir_function.blocks[0].insts[1].op, rir::Opcode::Br);
+    const auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    for (u32 block_index = 1; block_index < 3; block_index++) {
+        const auto& block = rir_function.blocks[block_index];
+        const rir::Instruction* forward = nullptr;
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].op == rir::Opcode::RetForwardBundle) forward = &block.insts[i];
+        }
+        REQUIRE(forward != nullptr);
+        REQUIRE_EQ(forward->operand_count, 3u);
+        CHECK_EQ(const_i32_value(block, forward->operands[0]), 0);
+        CHECK_EQ(const_i32_value(block, forward->operands[1]), block_index == 1 ? 2 : 1);
+        CHECK_EQ(const_i32_value(block, forward->operands[2]), 1);
+    }
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_policy_id, 1u);
+    CHECK_EQ(rir_bundle.failure_policy_id, 1u);
+    CHECK_EQ(rir_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::None);
+
+    REQUIRE_EQ(resources.cfg.upstream_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    CHECK_EQ(resources.cfg.upstreams[0].addrs[0].sin_family, AF_INET);
+    CHECK_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), backend.port);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& cfg_bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(cfg_bundle.response_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.failure_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(cfg_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(cfg_bundle.response_buffering, ForwardResponseBufferingMode::None);
+    CHECK_EQ(resources.cfg.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.failure_policies[1].head_mode, FailurePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.failure_policies[1].status_code, 504u);
+    CHECK(resources.cfg.failure_policies[1].reason.eq({"Gateway Time-out", 16u}));
+    CHECK(resources.cfg.failure_policies[1].body.eq({"slow", 4u}));
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    const auto& route = resources.cfg.routes[0];
+    CHECK_EQ(route.method, kRouteMethodHead);
+    CHECK_EQ(route.action, RouteAction::JitHandler);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.preflight_forward_policy_bundle_id, 1u);
+    CHECK_NE(route.fn, nullptr);
+    REQUIRE_EQ(resources.cfg.match_canonical({"one", 3u}, kRouteMethodHead), &route);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest1Head[] =
+        "HEAD /one?progress=1 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test: binary-one\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 12\r\n\r\n";
+    static constexpr char kRequest2Head[] =
+        "HEAD /one?complete=2 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Test: binary-two\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: 12\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest1Head, sizeof(kRequest1Head) - 1u));
+    REQUIRE(send_all(client.fd, reinterpret_cast<const char*>(kBody), 5u));
+    const u64 partial_sent_ns = monotonic_ns();
+    REQUIRE_NE(partial_sent_ns, 0u);
+    char quiet[16]{};
+    bool upload_quiet = true;
+    u64 final_fragment_release_ns = partial_sent_ns;
+    while (final_fragment_release_ns - partial_sent_ns < 1200000000ull) {
+        upload_quiet &= backend.accepted_count.load(std::memory_order_acquire) == 0u;
+        upload_quiet &= backend.request_count.load(std::memory_order_acquire) == 0u;
+        upload_quiet &=
+            backend.response_application_write_count[0].load(std::memory_order_acquire) == 0u;
+        upload_quiet &= backend.first_response_fragment_count.load(std::memory_order_acquire) == 0u;
+        upload_quiet &= backend.running.load(std::memory_order_acquire);
+        upload_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        upload_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        upload_quiet &= shard.loop->is_running();
+        upload_quiet &= shard.backend_failure_code() == 0;
+        upload_quiet &= recv_timeout(client.fd, quiet, sizeof(quiet), 1) == -EAGAIN;
+        usleep(3000);
+        final_fragment_release_ns = monotonic_ns();
+        REQUIRE_NE(final_fragment_release_ns, 0u);
+    }
+    REQUIRE(upload_quiet);
+    REQUIRE_GE(final_fragment_release_ns - partial_sent_ns, 1200000000ull);
+    REQUIRE_LT(final_fragment_release_ns - partial_sent_ns, 1400000000ull);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_FALSE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(recv(client.fd, quiet, sizeof(quiet), MSG_DONTWAIT), -1);
+    REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+    REQUIRE(send_all(client.fd, reinterpret_cast<const char*>(kBody + 5u), 7u));
+    const u64 final_fragment_sent_ns = monotonic_ns();
+    REQUIRE_GE(final_fragment_sent_ns - partial_sent_ns, 1200000000ull);
+    REQUIRE_LT(final_fragment_sent_ns - partial_sent_ns, 1400000000ull);
+
+    for (u32 waited = 0;
+         waited < 1200 && backend.request_count.load(std::memory_order_acquire) < 1u;
+         waited++)
+        usleep(1000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    const u64 request1_recorded_ns = backend.request_recorded_ns[0].load(std::memory_order_acquire);
+    REQUIRE_GT(request1_recorded_ns, final_fragment_sent_ns);
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 0u);
+
+    char expected_request[512]{};
+    int expected_header_len = snprintf(expected_request,
+                                       sizeof(expected_request),
+                                       "HEAD /one?progress=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                       "Content-Length: 12\r\nX-Test: binary-one\r\n"
+                                       "Content-Type: application/octet-stream\r\n\r\n",
+                                       backend.port);
+    REQUIRE_GT(expected_header_len, 0);
+    REQUIRE_LT(static_cast<u32>(expected_header_len) + sizeof(kBody), sizeof(expected_request));
+    __builtin_memcpy(expected_request + expected_header_len, kBody, sizeof(kBody));
+    const u32 expected_request_len = static_cast<u32>(expected_header_len) + sizeof(kBody);
+    REQUIRE_EQ(backend.request_history_len[0], expected_request_len);
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_header_len));
+    CHECK_EQ(__builtin_memcmp(backend.request_history[0], expected_request, expected_request_len),
+             0);
+
+    // request_count's acquire observes the published request timestamp. Each
+    // permit therefore makes the two application writes causally relative to
+    // the same initial response-read deadline origin.
+    constexpr u64 kFirstFragmentTargetDelayNs = 300000000ull;
+    constexpr u64 kSecondFragmentTargetDelayNs = 700000000ull;
+    u64 first_gate_release_ns = monotonic_ns();
+    REQUIRE_GE(first_gate_release_ns, request1_recorded_ns);
+    while (first_gate_release_ns < request1_recorded_ns + kFirstFragmentTargetDelayNs) {
+        usleep(1000);
+        first_gate_release_ns = monotonic_ns();
+    }
+    backend.allowed_first_response_fragments.store(1u, std::memory_order_release);
+    for (u32 waited = 0;
+         waited < 600 && backend.first_response_fragment_count.load(std::memory_order_acquire) < 1u;
+         waited++) {
+        REQUIRE(backend.running.load(std::memory_order_acquire));
+        REQUIRE(backend.thread_alive.load(std::memory_order_acquire));
+        REQUIRE_FALSE(backend.listener_failed.load(std::memory_order_acquire));
+        REQUIRE(shard.loop->is_running());
+        REQUIRE_EQ(shard.backend_failure_code(), 0);
+        usleep(1000);
+    }
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 1u);
+    REQUIRE_FALSE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    const u64 first_fragment_sent_ns =
+        backend.first_response_fragment_sent_ns[0].load(std::memory_order_acquire);
+    REQUIRE_GE(first_fragment_sent_ns, first_gate_release_ns);
+    REQUIRE_GT(first_fragment_sent_ns, request1_recorded_ns);
+    const u64 request_to_first_fragment_ns = first_fragment_sent_ns - request1_recorded_ns;
+    CHECK_GE(request_to_first_fragment_ns, 250000000ull);
+    CHECK_LT(request_to_first_fragment_ns, 500000000ull);
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 1), -EAGAIN);
+
+    bool before_second_quiet = true;
+    u64 second_gate_release_ns = monotonic_ns();
+    while (second_gate_release_ns < request1_recorded_ns + kSecondFragmentTargetDelayNs) {
+        before_second_quiet &=
+            backend.first_response_fragment_count.load(std::memory_order_acquire) == 1u;
+        before_second_quiet &=
+            backend.response_application_write_count[0].load(std::memory_order_acquire) == 1u;
+        before_second_quiet &= !backend.first_response_sent_open.load(std::memory_order_acquire);
+        before_second_quiet &= backend.running.load(std::memory_order_acquire);
+        before_second_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        before_second_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        before_second_quiet &= shard.loop->is_running();
+        before_second_quiet &= shard.backend_failure_code() == 0;
+        before_second_quiet &= recv_timeout(client.fd, quiet, sizeof(quiet), 1) == -EAGAIN;
+        usleep(2000);
+        second_gate_release_ns = monotonic_ns();
+    }
+    REQUIRE(before_second_quiet);
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 1u);
+    REQUIRE_FALSE(backend.first_response_sent_open.load(std::memory_order_acquire));
+
+    backend.allowed_first_response_fragments.store(2u, std::memory_order_release);
+    bool second_fragment_sent_open = false;
+    for (u32 waited = 0; waited < 600 && !second_fragment_sent_open; waited++) {
+        const u32 fragment_count =
+            backend.first_response_fragment_count.load(std::memory_order_acquire);
+        const bool sent_open = backend.first_response_sent_open.load(std::memory_order_acquire);
+        second_fragment_sent_open = fragment_count == 2u && sent_open;
+        if (second_fragment_sent_open) break;
+        REQUIRE_LE(fragment_count, 2u);
+        REQUIRE(backend.running.load(std::memory_order_acquire));
+        REQUIRE(backend.thread_alive.load(std::memory_order_acquire));
+        REQUIRE_FALSE(backend.listener_failed.load(std::memory_order_acquire));
+        REQUIRE(shard.loop->is_running());
+        REQUIRE_EQ(shard.backend_failure_code(), 0);
+        usleep(1000);
+    }
+    REQUIRE(second_fragment_sent_open);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 2u);
+    const u64 second_fragment_sent_ns =
+        backend.first_response_fragment_sent_ns[1].load(std::memory_order_acquire);
+    REQUIRE_GE(second_fragment_sent_ns, second_gate_release_ns);
+    REQUIRE_GT(second_fragment_sent_ns, first_fragment_sent_ns);
+    const u64 request_to_second_fragment_ns = second_fragment_sent_ns - request1_recorded_ns;
+    const u64 fragment_gap_ns = second_fragment_sent_ns - first_fragment_sent_ns;
+    CHECK_GE(request_to_second_fragment_ns, 650000000ull);
+    CHECK_LT(request_to_second_fragment_ns, 850000000ull);
+    CHECK_GE(fragment_gap_ns, 250000000ull);
+    CHECK_LT(fragment_gap_ns, 600000000ull);
+
+    const u64 after_second_quiet_started_ns = monotonic_ns();
+    bool after_second_quiet = true;
+    u64 after_second_quiet_finished_ns = after_second_quiet_started_ns;
+    while (after_second_quiet_finished_ns - after_second_quiet_started_ns < 50000000ull) {
+        after_second_quiet &=
+            backend.first_response_fragment_count.load(std::memory_order_acquire) == 2u;
+        after_second_quiet &=
+            backend.response_application_write_count[0].load(std::memory_order_acquire) == 2u;
+        after_second_quiet &= backend.first_response_sent_open.load(std::memory_order_acquire);
+        after_second_quiet &= backend.running.load(std::memory_order_acquire);
+        after_second_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        after_second_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        after_second_quiet &= shard.loop->is_running();
+        after_second_quiet &= shard.backend_failure_code() == 0;
+        after_second_quiet &= recv_timeout(client.fd, quiet, sizeof(quiet), 1) == -EAGAIN;
+        usleep(1000);
+        after_second_quiet_finished_ns = monotonic_ns();
+    }
+    REQUIRE(after_second_quiet);
+    REQUIRE_GE(after_second_quiet_finished_ns - after_second_quiet_started_ns, 50000000ull);
+    REQUIRE_LT(after_second_quiet_finished_ns - request1_recorded_ns, 900000000ull);
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 2u);
+
+    char response[512]{};
+    u32 response_len = 0;
+    u64 first_downstream_byte_ns = 0;
+    REQUIRE(read_public_head_response(client.fd,
+                                      false,
+                                      response,
+                                      sizeof(response),
+                                      response_len,
+                                      3000,
+                                      &first_downstream_byte_ns));
+    REQUIRE_GT(first_downstream_byte_ns, second_fragment_sent_ns);
+    const u64 request_to_first_byte_ns = first_downstream_byte_ns - request1_recorded_ns;
+    const u64 first_fragment_to_first_byte_ns = first_downstream_byte_ns - first_fragment_sent_ns;
+    const u64 second_fragment_to_first_byte_ns = first_downstream_byte_ns - second_fragment_sent_ns;
+    // These public wall-clock envelopes complement the focused #493
+    // cross-batch owner/origin invariants; they do not infer internal timer
+    // custody from timing alone.
+    CHECK_GE(request_to_first_byte_ns, 850000000ull);
+    CHECK_LT(request_to_first_byte_ns, 1250000000ull);
+    CHECK_GE(first_fragment_to_first_byte_ns, 350000000ull);
+    CHECK_LT(first_fragment_to_first_byte_ns, 950000000ull);
+    CHECK_GE(second_fragment_to_first_byte_ns, 50000000ull);
+    CHECK_LT(second_fragment_to_first_byte_ns, 550000000ull);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, 152u);
+    REQUIRE_EQ(response_len, static_cast<u32>(sizeof(kTimeoutExpected) - 1u));
+    CHECK_EQ(__builtin_memcmp(response, kTimeoutExpected, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "slow", 4u));
+    CHECK_FALSE(buf_contains(response, response_len, "502", 3u));
+    CHECK_FALSE(buf_contains(response, response_len, "X-Progress", 10u));
+    CHECK_FALSE(buf_contains(response, response_len, "X-Second", 8u));
+    CHECK_FALSE(buf_contains(response, response_len, "fixed-head", 10u));
+    CHECK_FALSE(buf_contains(response, response_len, "still-incomplete", 16u));
+    REQUIRE_EQ(recv(client.fd, quiet, sizeof(quiet), MSG_DONTWAIT), -1);
+    REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    for (u32 waited = 0;
+         waited < 600 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    const u64 peer_closed_ns = backend.first_peer_closed_ns.load(std::memory_order_acquire);
+    REQUIRE_GT(peer_closed_ns, second_fragment_sent_ns);
+    CHECK_GE(peer_closed_ns - request1_recorded_ns, 850000000ull);
+    CHECK_LT(peer_closed_ns - request1_recorded_ns, 1250000000ull);
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    usleep(100000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    u8 request2[sizeof(kRequest2Head) - 1u + sizeof(kBody)]{};
+    __builtin_memcpy(request2, kRequest2Head, sizeof(kRequest2Head) - 1u);
+    __builtin_memcpy(request2 + sizeof(kRequest2Head) - 1u, kBody, sizeof(kBody));
+    REQUIRE(send_all(client.fd, reinterpret_cast<const char*>(request2), sizeof(request2)));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len, 5000));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, 112u);
+    REQUIRE_EQ(response_len, static_cast<u32>(sizeof(kSecondExpected) - 1u));
+    CHECK_EQ(__builtin_memcmp(response, kSecondExpected, response_len), 0);
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2u;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    memset(expected_request, 0, sizeof(expected_request));
+    expected_header_len = snprintf(expected_request,
+                                   sizeof(expected_request),
+                                   "HEAD /one?complete=2 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                   "Content-Length: 12\r\nX-Test: binary-two\r\n"
+                                   "Content-Type: application/octet-stream\r\n\r\n",
+                                   backend.port);
+    REQUIRE_GT(expected_header_len, 0);
+    REQUIRE_LT(static_cast<u32>(expected_header_len) + sizeof(kBody), sizeof(expected_request));
+    __builtin_memcpy(expected_request + expected_header_len, kBody, sizeof(kBody));
+    const u32 expected_request2_len = static_cast<u32>(expected_header_len) + sizeof(kBody);
+    REQUIRE_EQ(backend.request_history_len[1], expected_request2_len);
+    REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_header_len));
+    CHECK_EQ(__builtin_memcmp(backend.request_history[1], expected_request, expected_request2_len),
+             0);
+    CHECK_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.response_application_write_count[1].load(std::memory_order_acquire), 1u);
+    CHECK(backend.thread_alive.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.listener_failed.load(std::memory_order_acquire));
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
+        for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
+            zero = backend.request_history[slot][i] == '\0';
+        CHECK(zero);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        CHECK_EQ(backend.response_application_write_count[slot].load(std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_last_application_write_completed_ns[slot].load(
+                     std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_connection_closed_ns[slot].load(std::memory_order_acquire), 0u);
+    }
+
+    close(client.fd);
+    client.fd = -1;
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    backend.teardown();
+    REQUIRE_FALSE(backend.thread_alive.load(std::memory_order_acquire));
+}
+
+TEST(
+    route,
     public_ordinary_source_precise_fixed_upload_head_zero_response_timeout_reuses_downstream_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
