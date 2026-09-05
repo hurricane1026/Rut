@@ -37079,6 +37079,8 @@ TEST(
     REQUIRE(shard.init(0, listen_fd).has_value());
     shard.route_config = &resources.cfg;
     REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
     REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
     REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
     REQUIRE(shard.spawn(-1).has_value());
@@ -37194,6 +37196,37 @@ TEST(
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
     }
+
+    // Completion is published while the ordinary-source shard is still live;
+    // neither the old deadline horizon nor shutdown may manufacture a second
+    // transaction record.
+    REQUIRE(shard.loop->is_running());
+    for (u32 waited = 0; waited < 400 && shard.log_ring->available() == 0u; waited++) usleep(5000);
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+    const u64 access_observation_started_ns = monotonic_ns();
+    REQUIRE_NE(access_observation_started_ns, 0u);
+    while (monotonic_ns() - access_observation_started_ns < 1'200'000'000ull) {
+        REQUIRE(shard.loop->is_running());
+        REQUIRE_EQ(shard.backend_failure_code(), 0);
+        REQUIRE_EQ(shard.log_ring->available(), 1u);
+        usleep(5000);
+    }
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+    AccessLogEntry access{};
+    REQUIRE(shard.log_ring->pop(access));
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access.req_size, sizeof(kRequest) - 1u);
+    CHECK_EQ(access.resp_size, response_len);
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(access.target_length, sizeof("/buffered?clean-eof=1") - 1u);
+    CHECK_EQ(memcmp(access.path, "/buffered?clean-eof=1", sizeof("/buffered?clean-eof=1") - 1u), 0);
+    AccessLogEntry duplicate{};
+    CHECK_FALSE(shard.log_ring->pop(duplicate));
 }
 
 TEST(

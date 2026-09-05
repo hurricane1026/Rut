@@ -6538,25 +6538,46 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     if (available == 0) {
         if (complete_buffering && conn.response_read_deadline_post_commit_close_after_drain) {
             const ResponseReadDeadlineUploadProof close_proof = conn.response_read_deadline_upload;
-            if (!close_proof.downstream_close) {
-                loop->close_conn(conn);
-                return;
-            }
-            if (!complete_content_length_explicit_close_is_stable(conn, close_proof)) {
+            const bool explicit_close = close_proof.downstream_close;
+            const bool persistence_owner_stable =
+                explicit_close ? complete_content_length_explicit_close_is_stable(conn, close_proof)
+                               : response_read_deadline_default_persistence_is_stable(conn);
+            const bool response_fully_drained =
+                conn.response_read_deadline_post_commit_downstream_submitted == publish_body &&
+                conn.response_read_deadline_post_commit_downstream_completed == publish_body &&
+                conn.response_read_deadline_post_commit_inflight_body == 0 && !conn.send_armed &&
+                !conn.response_read_deadline_send_owner_active && conn.send_progress == 0 &&
+                conn.resp_body_remaining == 0 &&
+                conn.resp_body_sent == conn.response_header_buf.len() + publish_body;
+            const bool completion_callback_valid =
+                publish_body == 0 ? conn.on_send == &on_response_header_sent<Loop>
+                                  : conn.on_send == &on_response_body_sent<Loop>;
+            const bool request_completion_owner_valid = conn.state == ConnState::Sending &&
+                                                        completion_callback_valid &&
+                                                        conn.req_start_us != 0 && !conn.epoch_held;
+            if (!persistence_owner_stable || !response_fully_drained ||
+                !request_completion_owner_valid) {
                 loop->close_conn(conn);
                 return;
             }
             conn.clear_slots();
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
-            conn.http1_prebuilt_deadline_upload = close_proof;
             conn.clear_response_read_deadline();
-            if constexpr (requires(Loop* candidate, Connection& c) {
-                              candidate->defer_http1_request_boundary(c);
-                          }) {
-                if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn))
-                    return;
+            if (explicit_close) {
+                // Preserve the explicit-close retirement rendezvous: it owns
+                // terminal transport settlement, never successor dispatch.
+                conn.http1_prebuilt_deadline_upload = close_proof;
+                if constexpr (requires(Loop* candidate, Connection& c) {
+                                  candidate->defer_http1_request_boundary(c);
+                              }) {
+                    if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn))
+                        return;
+                }
             }
+            // A default-persistent request reached a verified truncated
+            // response terminal.  The transaction is complete, but the
+            // connection is not reusable and must not dispatch a successor.
             loop->close_conn(conn);
             return;
         }
