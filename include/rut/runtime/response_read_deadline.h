@@ -710,6 +710,14 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
     u16 bundle_id,
     ResponseReadDeadlineOwnerPhase phase,
     Connection::Callback expected_upstream_recv);
+inline bool fixed_upload_head_after_host_precise_arm_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineOwnerPhase phase,
+    Connection::Callback expected_upstream_recv,
+    bool allow_consumed_terminal_episode = false);
 
 inline bool response_read_timeout_header_only_head_live_proof_is_stable(
     const Connection& c,
@@ -1736,6 +1744,47 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
                                    params,
                                    &param_count,
                                    kMaxRouteParams) == &route;
+}
+
+// A fully materialized positive fixed-length HEAD upload may start the same
+// generation-owned response-header clock as the bodyless precise profiles.
+// The exceptional terminal phase is admitted only when the dispatcher has an
+// exact current-batch CQE witness; this helper never infers it from an absent
+// live Recv owner.
+inline bool fixed_upload_head_after_host_precise_arm_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineOwnerPhase phase,
+    Connection::Callback expected_upstream_recv,
+    bool allow_consumed_terminal_episode) {
+    if (c.response_read_deadline_progress_generation != 0 ||
+        c.response_read_deadline_progress_episode != 0 ||
+        c.response_read_deadline_progress_bytes != 0 ||
+        c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
+        c.request_policy_id !=
+            static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
+        proof.request_policy_id != c.request_policy_id ||
+        c.response_read_deadline_route_method != kRouteMethodHead ||
+        !fixed_upload_head_success_proof_is_stable(c,
+                                                   proof,
+                                                   config,
+                                                   bundle_id,
+                                                   c.response_read_deadline_profile,
+                                                   c.response_read_deadline_buffering,
+                                                   c.response_read_deadline_method,
+                                                   c.response_read_deadline_route_method,
+                                                   /*allow_retired_episode=*/false,
+                                                   allow_consumed_terminal_episode))
+        return false;
+    if (response_read_deadline_owner_is_stable(c, expected_upstream_recv, phase)) return true;
+    return allow_consumed_terminal_episode &&
+           phase == ResponseReadDeadlineOwnerPhase::ActiveAfterCopy &&
+           c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending &&
+           c.response_read_deadline_upstream_episode == c.upstream_episode &&
+           !c.upstream_recv_armed && c.on_upstream_recv == expected_upstream_recv &&
+           c.on_upstream_send == nullptr;
 }
 
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
