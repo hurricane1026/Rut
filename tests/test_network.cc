@@ -3002,9 +3002,8 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
     handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
 
     CHECK_FALSE(conn->target_transform_recorded);
-    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
-    const std::string rewritten(reinterpret_cast<const char*>(conn->send_buf.data()),
-                                conn->send_buf.len());
+    const std::string rewritten(reinterpret_cast<const char*>(conn->recv_buf.data()),
+                                conn->recv_buf.len());
     CHECK(buf_has(reinterpret_cast<const u8*>(rewritten.data()),
                   rewritten.size(),
                   "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
@@ -3013,6 +3012,7 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
                   "Host: 127.0.0.1:9000\r\n"));
     CHECK(buf_has(
         reinterpret_cast<const u8*>(rewritten.data()), rewritten.size(), "X-Test: keep\r\n"));
+    CHECK_EQ(conn->send_buf.len(), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     if (conn->upstream_fd >= 0) {
         close(conn->upstream_fd);
@@ -3049,6 +3049,10 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
         REQUIRE_EQ(conn.recv_buf.len(), expected_len);
         CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
     };
+    auto require_materialized_wire = [&](const u8* expected, u32 expected_len) {
+        require_wire(expected, expected_len);
+        CHECK_EQ(conn.send_buf.len(), 0u);
+    };
 
     static constexpr char kContentLengthAfterOrdinary[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nX-First:\t one \t\r\n"
@@ -3059,14 +3063,14 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     static constexpr char kExpected[] =
         "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 3\r\n"
         "X-First: one\r\nX-Second: two\r\n\r\nabc";
-    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
 
     static constexpr char kContentLengthBeforeOrdinary[] =
         "POST /upload HTTP/1.1\r\nContent-Length:\t3 \t\r\nX-First: one\r\n"
         "Host: client\r\nX-Second: two\r\n\r\nabc";
     prepare_text(kContentLengthBeforeOrdinary);
     REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
-    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
 
     static constexpr char kNoContentLength[] =
         "GET /upload HTTP/1.1\r\nX-First:\t one \t\r\nHost: client\r\n"
@@ -3076,12 +3080,12 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
         "X-Second: two\r\n\r\n";
     prepare_text(kNoContentLength);
     REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
-    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
-                 sizeof(kExpectedNoContentLength) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                              sizeof(kExpectedNoContentLength) - 1u);
     prepare_text(kNoContentLength);
     REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
-    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
-                 sizeof(kExpectedNoContentLength) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                              sizeof(kExpectedNoContentLength) - 1u);
 
     static constexpr char kPartialHeader[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nX-Binary: yes\r\nContent-Length: 5\r\n\r\n";
@@ -3114,6 +3118,7 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
                               expected_binary,
                               sizeof(expected_binary)),
              0);
+    CHECK_EQ(conn.send_buf.len(), 0u);
 
     static constexpr char kExplicitZero[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n";
@@ -3128,8 +3133,8 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
     static constexpr char kExpectedLegacyZero[] =
         "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 0\r\n\r\n";
-    require_wire(reinterpret_cast<const u8*>(kExpectedLegacyZero),
-                 sizeof(kExpectedLegacyZero) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedLegacyZero),
+                              sizeof(kExpectedLegacyZero) - 1u);
 
     const char* invalid[] = {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
@@ -29839,6 +29844,12 @@ TEST(response_read_deadline_request_framing_selection,
     CHECK_EQ(conn->upstream_retiring_episode, 1u);
     CHECK_EQ(conn->upstream_fd, fake_upstream_fd);
     CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<DeferredPreflightMockLoop>);
+    static constexpr u8 kExpectedUpstream[] = "HEAD /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.len(), sizeof(kExpectedUpstream) - 1u);
+    CHECK_EQ(
+        __builtin_memcmp(conn->recv_buf.data(), kExpectedUpstream, sizeof(kExpectedUpstream) - 1u),
+        0);
+    CHECK_EQ(conn->send_buf.len(), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
@@ -39765,8 +39776,9 @@ TEST(response_read_deadline_non_head_cl0,
                                           "X-Test: method\r\n\r\n",
                                           test.name);
         REQUIRE_GT(expected_len, 0);
-        REQUIRE_EQ(conn->send_buf.len(), static_cast<u32>(expected_len));
-        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), expected, expected_len), 0);
+        REQUIRE_EQ(conn->recv_buf.len(), static_cast<u32>(expected_len));
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected, expected_len), 0);
+        CHECK_EQ(conn->send_buf.len(), 0u);
         CHECK_EQ(conn->req_body_mode, BodyMode::None);
         CHECK_EQ(conn->req_body_remaining, 0u);
         loop->close_conn(*conn);

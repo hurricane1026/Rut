@@ -5366,6 +5366,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     conn.request_policy_id = policy_id;
     conn.request_body_fully_buffered = req.has_content_length;
     conn.request_upload_complete = false;
+    // The rewritten request is now owned transactionally by recv_buf.  The
+    // send buffer was only materialization scratch; retry snapshots, response
+    // mutation snapshots, and pipeline stashes establish their own explicit
+    // ownership later and must not inherit these obsolete bytes.
+    conn.send_buf.reset();
     return true;
 }
 
