@@ -21337,8 +21337,8 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3573u ||
-        rut::nginx::RutSource::kCapacity != 7028u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/7028 bytes";
+        rut::nginx::RutSource::kCapacity != 8750u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/8750 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -22412,8 +22412,8 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
-        rut::nginx::RutSource::kCapacity != 7028u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/7028 bytes";
+        rut::nginx::RutSource::kCapacity != 8750u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/8750 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -30416,7 +30416,7 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     kRootEmptyQueryProxyUpstreamRequestSizes,
     true,
     3343u,
-    3684u,
+    5406u,
     true,
     true,
     true};
@@ -33361,11 +33361,11 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3337u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 3690u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5412u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty())
-            error = "#360 canonical declaration-order source lost exact 3337/3690 evidence";
+            error = "#360 canonical declaration-order source lost exact 3337/5412 evidence";
         return false;
     }
 
@@ -33554,10 +33554,10 @@ static bool run_root_empty_query_proxy_differential_self_checks(std::string& err
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3343u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 3684u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5406u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
-        if (error.empty()) error = "#372 canonical source lost exact 3343/3684 evidence";
+        if (error.empty()) error = "#372 canonical source lost exact 3343/5406 evidence";
         return false;
     }
 
@@ -43428,7 +43428,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 3446u : 3602u) ||
+            (profile.uses_target_transform ? 5168u : 5324u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -43893,9 +43893,9 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3417u ||
-        rut::nginx::RutSource::kCapacity != 7028u ||
-        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 3611u ||
-        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 3610u ||
+        rut::nginx::RutSource::kCapacity != 8750u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 5333u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 5332u ||
         maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
         !validate_max_proxy_prefix_generated_source(
             std::string(maximum_lowered.value().data, maximum_lowered.value().len),
@@ -43906,7 +43906,7 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
             false,
             kWildcardMaxProxyPrefixNoUriProfile)) {
         if (error.empty())
-            error = "#357 genuine maximum wildcard endpoints lost 3417/7028/3611/3610 evidence";
+            error = "#357 genuine maximum wildcard endpoints lost 3417/8750/5333/5332 evidence";
         return false;
     }
 
@@ -50373,7 +50373,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
     if (source.empty() || source.size() != 5366u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 1661u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 3383u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
@@ -57270,7 +57270,8 @@ int main(int argc, char** argv) {
                "with zero extra upstream. Generated source ownership, zero target transforms "
                "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
                "source size was derived from actual port widths; genuine maximum ports/IP is "
-               "3426 bytes with NUL reserve and 2520 bytes capacity headroom (#356 boundary "
+               "3426 bytes with 5324 bytes capacity delta and 5323 bytes payload headroom "
+               "before NUL (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
                "#352 remaining access fields, broader methods/bodies/framing/reuse/retries/"
@@ -57306,8 +57307,8 @@ int main(int argc, char** argv) {
                "binding, owned policies and zero transforms through source/intermediate teardown "
                "and post-readiness source overwrite. All three wildcard nginx spellings and both "
                "orders were preflight-proven byte-identical at P63; only port-only listen-first "
-               "behavior ran here. Maximum endpoints emit 3417 bytes with 3611 capacity delta "
-               "and 3610 payload headroom before NUL; P64 is only the declared converter "
+               "behavior ran here. Maximum endpoints emit 3417 bytes with 5333 capacity delta "
+               "and 5332 payload headroom before NUL; P64 is only the declared converter "
                "support-boundary rejection (#357 remains PARTIAL; nginx.conf was translated, "
                "never loaded by RUT; configured URI/query, normalization-sensitive/absolute "
                "targets, broader methods/bodies/framing/reuse/failures/H1.0/H2/TLS and "
@@ -58261,7 +58262,7 @@ int main(int argc, char** argv) {
                "X-Dupe fields, with no fifth/retry, and six ordered original raw-target access "
                "records under its current runtime-specific schema. The generated orders retain "
                "exact 3337-byte canonical 8080/9000 source "
-               "with 3690 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
+               "with 5412 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
                "source/RIR/compiler teardown, post-load source overwrite, disjoint resources "
                "and clean lifecycle (#360 bounded converter equivalence only; excludes /? "
                "profile, exact-listener allowlists, variables, quoted/escaped/repeated-query, "
@@ -58295,7 +58296,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: #372 exact /api/ with proxy_pass replacement /? in both declaration "
                "orders traversed the genuine borrowed nginx parser/model and independent "
-               "converter lowering into exact 3343-byte ordinary RUT sources with 3684 bytes "
+               "converter lowering into exact 3343-byte ordinary RUT sources with 5406 bytes "
                "NUL headroom and one owned generic transform ID 1. Two isolated pinned nginx "
                "1.29.7 sides and two public-CLI/O2-JIT/io_uring generated-RUT sides used eight "
                "simultaneously held unique endpoints, with all four generated endpoints P4, "
