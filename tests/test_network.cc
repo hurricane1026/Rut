@@ -37793,6 +37793,124 @@ TEST(iouring_response_read_timer,
 }
 
 TEST(iouring_response_read_timer,
+     precise_fixed_upload_head_cross_batch_second_fragment_due_is_504_in_both_timer_orders) {
+    static constexpr u8 kFirst[] = "HTTP/1.1 200 OK\r\n";
+    static constexpr u8 kSecond[] = "X-Progress: fixed-head\r\n";
+    for (const bool timer_first : {false, true}) {
+        for (const bool terminal_second : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_fixed_upload_head(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+            const u32 deadline_generation = conn.response_read_deadline_generation;
+            const u32 episode = conn.upstream_episode;
+            neutralize_staged_precise_timer(loop, fixture);
+            REQUIRE(install_inert_response_read_timer_owner(
+                conn, ResponseReadTimerPhase::Armed, deadline_generation, episode));
+            const u32 timer_generation = conn.response_read_timer_owner_generation;
+            const u64 deadline_origin = monotonic_ns() - 6'000'000'000ull;
+            conn.response_read_timer_last_progress_ns = deadline_origin;
+
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u),
+                       sizeof(kFirst) - 1u);
+            const IoEvent first =
+                response_read_copy_event(conn, sizeof(kFirst) - 1u, true, 0, sizeof(kFirst) - 1u);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            REQUIRE_EQ(conn.response_read_deadline_progress_bytes, sizeof(kFirst) - 1u);
+            REQUIRE_EQ(conn.response_read_timer_owner_generation, timer_generation);
+            REQUIRE_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+
+            const u32 begin = conn.upstream_recv_buf.len();
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u),
+                       sizeof(kSecond) - 1u);
+            const IoEvent second = response_read_copy_event(
+                conn, sizeof(kSecond) - 1u, !terminal_second, begin, conn.upstream_recv_buf.len());
+            const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
+            const IoEvent events[2] = {timer_first ? timer : second, timer_first ? second : timer};
+            loop->dispatch_batch(events, 2);
+
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.resp_status, 504u);
+            CHECK_EQ(conn.state, ConnState::Sending);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK(conn.response_read_timer_owner_is_neutral());
+            CHECK_EQ(conn.http1_prebuilt_response_layout,
+                     Http1PrebuiltResponseLayout::HeaderOnlyHead);
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "HTTP/1.1 504 Gateway Time-out\r\n"));
+            CHECK(conn.upstream_retirement_active);
+            CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+            CHECK_EQ(conn.upstream_retirement_cancel_owned, kUpstreamOpRecv);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(iouring_response_read_timer,
+     precise_fixed_upload_head_cross_batch_second_fragment_early_rearms_from_original_origin) {
+    static constexpr u8 kFirst[] = "HTTP/1.1 200 OK\r\n";
+    static constexpr u8 kSecond[] = "X-Progress: fixed-head\r\n";
+    for (const bool timer_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_fixed_upload_head(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 deadline_generation = conn.response_read_deadline_generation;
+        const u32 episode = conn.upstream_episode;
+        const u64 deadline_origin = conn.response_read_timer_last_progress_ns;
+        neutralize_staged_precise_timer(loop, fixture);
+        REQUIRE(install_inert_response_read_timer_owner(
+            conn, ResponseReadTimerPhase::Armed, deadline_generation, episode));
+        const u32 old_timer_generation = conn.response_read_timer_owner_generation;
+        conn.response_read_timer_last_progress_ns = deadline_origin;
+
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
+        const IoEvent first =
+            response_read_copy_event(conn, sizeof(kFirst) - 1u, true, 0, sizeof(kFirst) - 1u);
+        loop->dispatch_batch(&first, 1);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(conn.response_read_deadline_progress_bytes, sizeof(kFirst) - 1u);
+        REQUIRE_EQ(conn.response_read_timer_owner_generation, old_timer_generation);
+        REQUIRE_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+
+        const u32 begin = conn.upstream_recv_buf.len();
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u),
+                   sizeof(kSecond) - 1u);
+        const IoEvent second = response_read_copy_event(
+            conn, sizeof(kSecond) - 1u, true, begin, conn.upstream_recv_buf.len());
+        const IoEvent timer = inert_response_read_timer_event(conn.id, old_timer_generation);
+        const IoEvent events[2] = {timer_first ? timer : second, timer_first ? second : timer};
+        loop->dispatch_batch(events, 2);
+
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 0u);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        CHECK_EQ(conn.response_read_deadline_progress_generation, deadline_generation);
+        CHECK_EQ(conn.response_read_deadline_progress_episode, episode);
+        CHECK_EQ(conn.response_read_deadline_progress_bytes,
+                 sizeof(kFirst) - 1u + sizeof(kSecond) - 1u);
+        CHECK_EQ(conn.response_read_timer_owner_generation, old_timer_generation + 1u);
+        CHECK_EQ(conn.response_read_timer_deadline_generation, deadline_generation);
+        CHECK_EQ(conn.response_read_timer_upstream_episode, episode);
+        CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+        CHECK(conn.response_read_timer_owner_is_valid());
+        CHECK_NE(conn.response_read_deadline_state, ResponseReadDeadlineState::RefreshPending);
+        CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+        CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+        neutralize_staged_precise_timer(loop, fixture);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer,
      precise_fixed_upload_head_terminal_progress_sq_full_fails_closed_without_wheel) {
     static constexpr u8 kIncomplete[] = "HTTP/1.1 200 OK\r\nX-Progress: fixed-head\r\n";
     {
