@@ -659,6 +659,17 @@ static u64 response_read_deadline_fixed_upload_handler(
         .pack();
 }
 
+static u32 response_read_deadline_framing_selection_handler_calls = 0;
+static u64 response_read_deadline_framing_selection_handler(
+    void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++response_read_deadline_framing_selection_handler_calls;
+    const auto* conn = static_cast<const Connection*>(opaque);
+    const auto policy = conn != nullptr && conn->req_client_has_content_length
+                            ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
+                            : RequestPolicyId::Http11FixedStrip;
+    return jit::HandlerResult::make_forward_with_bundle(0, static_cast<u16>(policy), 2).pack();
+}
+
 static u64 h1_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
@@ -2991,9 +3002,8 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
     handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
 
     CHECK_FALSE(conn->target_transform_recorded);
-    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
-    const std::string rewritten(reinterpret_cast<const char*>(conn->send_buf.data()),
-                                conn->send_buf.len());
+    const std::string rewritten(reinterpret_cast<const char*>(conn->recv_buf.data()),
+                                conn->recv_buf.len());
     CHECK(buf_has(reinterpret_cast<const u8*>(rewritten.data()),
                   rewritten.size(),
                   "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
@@ -3002,6 +3012,7 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
                   "Host: 127.0.0.1:9000\r\n"));
     CHECK(buf_has(
         reinterpret_cast<const u8*>(rewritten.data()), rewritten.size(), "X-Test: keep\r\n"));
+    CHECK_EQ(conn->send_buf.len(), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     if (conn->upstream_fd >= 0) {
         close(conn->upstream_fd);
@@ -3038,6 +3049,10 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
         REQUIRE_EQ(conn.recv_buf.len(), expected_len);
         CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
     };
+    auto require_materialized_wire = [&](const u8* expected, u32 expected_len) {
+        require_wire(expected, expected_len);
+        CHECK_EQ(conn.send_buf.len(), 0u);
+    };
 
     static constexpr char kContentLengthAfterOrdinary[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nX-First:\t one \t\r\n"
@@ -3048,14 +3063,14 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     static constexpr char kExpected[] =
         "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 3\r\n"
         "X-First: one\r\nX-Second: two\r\n\r\nabc";
-    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
 
     static constexpr char kContentLengthBeforeOrdinary[] =
         "POST /upload HTTP/1.1\r\nContent-Length:\t3 \t\r\nX-First: one\r\n"
         "Host: client\r\nX-Second: two\r\n\r\nabc";
     prepare_text(kContentLengthBeforeOrdinary);
     REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
-    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
 
     static constexpr char kNoContentLength[] =
         "GET /upload HTTP/1.1\r\nX-First:\t one \t\r\nHost: client\r\n"
@@ -3065,12 +3080,12 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
         "X-Second: two\r\n\r\n";
     prepare_text(kNoContentLength);
     REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
-    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
-                 sizeof(kExpectedNoContentLength) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                              sizeof(kExpectedNoContentLength) - 1u);
     prepare_text(kNoContentLength);
     REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
-    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
-                 sizeof(kExpectedNoContentLength) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                              sizeof(kExpectedNoContentLength) - 1u);
 
     static constexpr char kPartialHeader[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nX-Binary: yes\r\nContent-Length: 5\r\n\r\n";
@@ -3103,6 +3118,7 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
                               expected_binary,
                               sizeof(expected_binary)),
              0);
+    CHECK_EQ(conn.send_buf.len(), 0u);
 
     static constexpr char kExplicitZero[] =
         "POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n";
@@ -3117,8 +3133,8 @@ TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_bounda
     REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
     static constexpr char kExpectedLegacyZero[] =
         "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 0\r\n\r\n";
-    require_wire(reinterpret_cast<const u8*>(kExpectedLegacyZero),
-                 sizeof(kExpectedLegacyZero) - 1u);
+    require_materialized_wire(reinterpret_cast<const u8*>(kExpectedLegacyZero),
+                              sizeof(kExpectedLegacyZero) - 1u);
 
     const char* invalid[] = {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
@@ -17551,8 +17567,15 @@ TEST(access_request_size,
         make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
-    const u32 response_len = conn->send_buf.len();
-    REQUIRE_GT(response_len, 0u);
+    const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    REQUIRE_EQ(kMockHttpResponseLen, 40u);
+    REQUIRE_EQ(downstream_send->fd, conn->fd);
+    REQUIRE_EQ(downstream_send->send_len, kMockHttpResponseLen);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kMockHttpResponse, kMockHttpResponseLen),
+               0);
+    REQUIRE_EQ(conn->send_buf.len(), 0u);
+    const u32 response_len = downstream_send->send_len;
     const u32 completed_id = conn->id;
     loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, response_len));
 
@@ -17729,8 +17752,15 @@ TEST(access_request_size,
         make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
-    const u32 response_len = conn->send_buf.len();
-    REQUIRE_GT(response_len, 0u);
+    const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    REQUIRE_EQ(kMockHttpResponseLen, 40u);
+    REQUIRE_EQ(downstream_send->fd, conn->fd);
+    REQUIRE_EQ(downstream_send->send_len, kMockHttpResponseLen);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kMockHttpResponse, kMockHttpResponseLen),
+               0);
+    REQUIRE_EQ(conn->send_buf.len(), 0u);
+    const u32 response_len = downstream_send->send_len;
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
     CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
@@ -29780,6 +29810,151 @@ TEST(response_read_deadline_request_framing_selection,
         neutral, &config.routes[0], &config, config.routes[0].fn));
 }
 
+TEST(response_read_deadline_request_framing_selection,
+     completed_keepalive_boundary_starts_one_fresh_id1_episode_only_after_owner_settlement) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodHead, &response_read_deadline_framing_selection_handler, false, 2));
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
+    const RouteConfig* active = &config;
+    static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: client\r\n\r\n";
+
+    DeferredPreflightMockLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    conn->fd = dup(2);
+    REQUIRE_GE(conn->fd, 0);
+    const i32 downstream_fd = conn->fd;
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    conn->downstream_completed_request_count = 1;
+    conn->upstream_attempts = 1;
+    // Match the settled production retirement observed at request 2: request 1
+    // remains the older tombstone while request 2 owns the next episode token.
+    conn->upstream_episode = 2;
+    conn->upstream_retiring_episode = 1;
+    REQUIRE(http1_pipeline_successor_tombstone_is_safe(*conn));
+    REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*conn));
+    REQUIRE(conn->response_read_deadline_owner_is_neutral());
+
+    const i32 fake_upstream_fd = dup(2);
+    REQUIRE_GE(fake_upstream_fd, 0);
+    ScopedFakeSocket fake_socket(fake_upstream_fd);
+    response_read_deadline_framing_selection_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<DeferredPreflightMockLoop>(
+        &loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+
+    REQUIRE_EQ(response_read_deadline_framing_selection_handler_calls, 1u);
+    REQUIRE_EQ(loop.free_top, DeferredPreflightMockLoop::kMaxConns - 1u);
+    CHECK_EQ(conn->fd, downstream_fd);
+    CHECK_EQ(conn->request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_EQ(conn->upstream_episode, 2u);
+    CHECK_EQ(conn->upstream_retiring_episode, 1u);
+    CHECK_EQ(conn->upstream_fd, fake_upstream_fd);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<DeferredPreflightMockLoop>);
+    static constexpr u8 kExpectedUpstream[] = "HEAD /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.len(), sizeof(kExpectedUpstream) - 1u);
+    CHECK_EQ(
+        __builtin_memcmp(conn->recv_buf.data(), kExpectedUpstream, sizeof(kExpectedUpstream) - 1u),
+        0);
+    CHECK_EQ(conn->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+
+    conn->upstream_fd = -1;
+    conn->clear_slots();
+    loop.close_conn(*conn);
+    close(fake_upstream_fd);
+    close(downstream_fd);
+
+    enum class RejectedPredecessor : u8 {
+        FreshTransport,
+        FutureTombstone,
+        ActiveConnectOwner,
+        ExcessAttempts,
+        QuarantinedEpisode,
+        ZeroCurrentEpisode,
+    };
+    for (const RejectedPredecessor predecessor : {RejectedPredecessor::FreshTransport,
+                                                  RejectedPredecessor::FutureTombstone,
+                                                  RejectedPredecessor::ActiveConnectOwner,
+                                                  RejectedPredecessor::ExcessAttempts,
+                                                  RejectedPredecessor::QuarantinedEpisode,
+                                                  RejectedPredecessor::ZeroCurrentEpisode}) {
+        DeferredPreflightMockLoop rejected_loop;
+        rejected_loop.setup();
+        rejected_loop.config_ptr = &active;
+        Connection* rejected = rejected_loop.alloc_conn();
+        REQUIRE(rejected != nullptr);
+        const u32 rejected_id = rejected->id;
+        rejected->fd = dup(2);
+        REQUIRE_GE(rejected->fd, 0);
+        const i32 rejected_downstream_fd = rejected->fd;
+        REQUIRE_EQ(rejected->recv_buf.write(kRequest, sizeof(kRequest) - 1u),
+                   sizeof(kRequest) - 1u);
+        rejected->upstream_attempts = 1;
+        i32 active_upstream_fd = -1;
+        if (predecessor != RejectedPredecessor::FreshTransport) {
+            rejected->downstream_completed_request_count = 1;
+            rejected->upstream_episode = 2;
+            rejected->upstream_retiring_episode = 1;
+        }
+        if (predecessor == RejectedPredecessor::FutureTombstone) {
+            rejected->upstream_retiring_episode = 3;
+            REQUIRE_FALSE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+        } else if (predecessor == RejectedPredecessor::ActiveConnectOwner) {
+            active_upstream_fd = dup(2);
+            REQUIRE_GE(active_upstream_fd, 0);
+            rejected->upstream_fd = active_upstream_fd;
+            rejected->upstream_connect_armed = true;
+            rejected->on_upstream_send = &on_upstream_connected<DeferredPreflightMockLoop>;
+            rejected->pending_ops = 1;
+            REQUIRE_FALSE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::ExcessAttempts) {
+            rejected->upstream_attempts = 2;
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::QuarantinedEpisode) {
+            rejected->upstream_episode_quarantined = true;
+            REQUIRE(valid_upstream_episode(rejected->upstream_episode));
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::ZeroCurrentEpisode) {
+            rejected->upstream_episode = 0;
+            rejected->upstream_retiring_episode = 0;
+            REQUIRE_FALSE(valid_upstream_episode(rejected->upstream_episode));
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        }
+
+        response_read_deadline_framing_selection_handler_calls = 0;
+        rejected_loop.backend.clear_ops();
+        on_header_received<DeferredPreflightMockLoop>(
+            &rejected_loop,
+            *rejected,
+            {rejected_id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+
+        CHECK_EQ(response_read_deadline_framing_selection_handler_calls, 0u);
+        CHECK_EQ(rejected_loop.free_top, DeferredPreflightMockLoop::kMaxConns);
+        const Connection& closed = rejected_loop.conns[rejected_id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Recv), 0u);
+        if (active_upstream_fd >= 0) close(active_upstream_fd);
+        close(rejected_downstream_fd);
+    }
+}
+
 bool add_bodyless_non_head_response_read_deadline_bundle(
     RouteConfig& config,
     u8 seconds = 5,
@@ -32739,6 +32914,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_EQ(metrics.requests_total, 0u);
         REQUIRE_EQ(metrics.requests_active, 1u);
         REQUIRE_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+        REQUIRE_EQ(conn.upstream_attempts, 1u);
 
         const u32 advanced_episode = conn.upstream_episode;
         const auto check_connect_completion_neutrality = [&] {
@@ -32778,7 +32954,7 @@ TEST(iouring_validated_failure_pipeline,
         CHECK_EQ(conn.pipeline_depth, 1u);
         CHECK_NE(conn.handler_gen, 0u);
         CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-        CHECK_EQ(conn.upstream_attempts, 1u);
+        CHECK_EQ(conn.upstream_attempts, 0u);
         CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
         CHECK(http1_pipeline_request_generation_provisional_is_stable(
             conn,
@@ -32902,6 +33078,7 @@ TEST(iouring_validated_failure_pipeline,
     // Publication of request1's configured response already owns Send. Only
     // now does request2 arrive through the still-live downstream Recv owner.
     REQUIRE(conn.send_armed);
+    REQUIRE_EQ(conn.upstream_attempts, 1u);
     REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending;
@@ -32914,7 +33091,7 @@ TEST(iouring_validated_failure_pipeline,
     CHECK_EQ(conn.pipeline_depth, 1u);
     CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
     CHECK_FALSE(conn.keep_alive);
-    CHECK_EQ(conn.upstream_attempts, 1u);
+    CHECK_EQ(conn.upstream_attempts, 0u);
     CHECK_EQ(conn.upstream_retiring_episode, failed_episode);
     CHECK_FALSE(conn.upstream_connect_armed);
     CHECK_FALSE(conn.upstream_send_armed);
@@ -33042,6 +33219,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE(config.add_static("/two", kRouteMethodGet, 205));
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
+        REQUIRE_EQ(conn.upstream_attempts, 1u);
         REQUIRE_EQ(conn.recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
         if (terminal_late_recv) {
             conn.recv_armed = false;
@@ -33067,6 +33245,7 @@ TEST(iouring_validated_failure_pipeline,
         CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), expected_tail);
         CHECK_EQ(metrics.requests_total, 1u);
         CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(conn.upstream_attempts, 1u);
 
         REQUIRE_EQ(conn.recv_buf.write(kRemainder, sizeof(kRemainder) - 1u),
                    sizeof(kRemainder) - 1u);
@@ -33079,7 +33258,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_GE(conn.fd, 0);
         CHECK_NE(conn.handler_gen, 0u);
         CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-        CHECK_EQ(conn.upstream_attempts, 1u);
+        CHECK_EQ(conn.upstream_attempts, 0u);
         CHECK_EQ(conn.resp_status, 205u);
         CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
         CHECK(conn.send_armed);
@@ -39638,8 +39817,9 @@ TEST(response_read_deadline_non_head_cl0,
                                           "X-Test: method\r\n\r\n",
                                           test.name);
         REQUIRE_GT(expected_len, 0);
-        REQUIRE_EQ(conn->send_buf.len(), static_cast<u32>(expected_len));
-        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), expected, expected_len), 0);
+        REQUIRE_EQ(conn->recv_buf.len(), static_cast<u32>(expected_len));
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected, expected_len), 0);
+        CHECK_EQ(conn->send_buf.len(), 0u);
         CHECK_EQ(conn->req_body_mode, BodyMode::None);
         CHECK_EQ(conn->req_body_remaining, 0u);
         loop->close_conn(*conn);
@@ -40035,11 +40215,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
                 REQUIRE_FALSE(conn->upstream_send_armed);
                 REQUIRE_FALSE(conn->upstream_recv_armed);
             }
-            if (initial_body_len < 12u)
-                REQUIRE_EQ(conn->send_buf.len(), 0u);
-            else
-                REQUIRE_EQ(conn->send_buf.len(),
-                           static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
             REQUIRE_EQ(conn->response_header_buf.len(), 0u);
             if (initial_body_len < 12u) {
                 REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
@@ -40068,6 +40244,10 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             REQUIRE_FALSE(conn->request_policy_body_pending);
             REQUIRE_EQ(conn->req_body_remaining, 0u);
             REQUIRE(conn->request_body_fully_buffered);
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
+            REQUIRE_EQ(conn->retry_req_send_len, 0u);
+            REQUIRE_EQ(conn->pipeline_stash_len, 0u);
+            REQUIRE_FALSE(conn->response_mutations_snapshotted);
             REQUIRE(conn->upstream_connect_armed);
             REQUIRE_FALSE(conn->upstream_send_armed);
             REQUIRE_FALSE(conn->upstream_recv_armed);
@@ -40103,6 +40283,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             const auto& send = loop->backend.upstream_send_state[id];
             REQUIRE_EQ(send.remaining, proof.expected_upload_length);
             REQUIRE_EQ(send.upstream_episode, episode);
+            REQUIRE_EQ(send.src, conn->recv_buf.data());
             REQUIRE_EQ(__builtin_memcmp(send.src, conn->recv_buf.data(), send.remaining), 0);
             REQUIRE_EQ(send.remaining,
                        static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
@@ -40128,6 +40309,11 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             REQUIRE_EQ(conn->response_read_deadline_upload.upload_episode, episode);
             REQUIRE(conn->upstream_fd >= 0);
             REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+            REQUIRE_EQ(conn->recv_buf.len(), 0u);
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
+            REQUIRE_EQ(conn->retry_req_send_len, 0u);
+            REQUIRE_EQ(conn->pipeline_stash_len, 0u);
+            REQUIRE_FALSE(conn->response_mutations_snapshotted);
             REQUIRE_EQ(conn->pending_ops, 1u);
             REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
             const u32 close_episode = conn->upstream_episode;

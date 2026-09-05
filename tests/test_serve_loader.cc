@@ -3551,7 +3551,7 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
         REQUIRE(lowered);
         REQUIRE_EQ(lowered.value().len, 3417u);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 3611u);
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 5333u);
         generated.assign(lowered.value().data, lowered.value().len);
         REQUIRE_EQ(generated.rfind("listen :65535\n", 0u), 0u);
         CHECK(generated.find("target_transform") == std::string::npos);

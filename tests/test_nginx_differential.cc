@@ -21337,8 +21337,8 @@ static bool run_max_proxy_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3573u ||
-        rut::nginx::RutSource::kCapacity != 7028u) {
-        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/7028 bytes";
+        rut::nginx::RutSource::kCapacity != 8750u) {
+        if (error.empty()) error = "#335 maximum generated source was not exactly 3573/8750 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -22412,8 +22412,8 @@ static bool run_max_proxy_replacement_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3468u ||
-        rut::nginx::RutSource::kCapacity != 7028u) {
-        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/7028 bytes";
+        rut::nginx::RutSource::kCapacity != 8750u) {
+        if (error.empty()) error = "#336 maximum generated source was not exactly 3468/8750 bytes";
         return false;
     }
     const rut::Str maximum_source_view = maximum_lowered.value().view();
@@ -30416,7 +30416,7 @@ static constexpr StaticQueryProxyOracleProfile kRootEmptyQueryProxyOracleProfile
     kRootEmptyQueryProxyUpstreamRequestSizes,
     true,
     3343u,
-    3684u,
+    5406u,
     true,
     true,
     true};
@@ -33361,11 +33361,11 @@ static bool run_empty_query_proxy_differential_self_checks(std::string& error) {
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3337u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 3690u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5412u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
         if (error.empty())
-            error = "#360 canonical declaration-order source lost exact 3337/3690 evidence";
+            error = "#360 canonical declaration-order source lost exact 3337/5412 evidence";
         return false;
     }
 
@@ -33554,10 +33554,10 @@ static bool run_root_empty_query_proxy_differential_self_checks(std::string& err
     std::string canonical[2];
     if (!lower(8080u, 9000u, true, canonical[0]) || !lower(8080u, 9000u, false, canonical[1]) ||
         canonical[0] != canonical[1] || canonical[0].size() != 3343u ||
-        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 3684u ||
+        rut::nginx::RutSource::kCapacity - canonical[0].size() - 1u != 5406u ||
         !validate_static_query_proxy_generated_source(canonical[0], 8080u, 9000u, error, profile) ||
         !validate_static_query_proxy_generated_source(canonical[1], 8080u, 9000u, error, profile)) {
-        if (error.empty()) error = "#372 canonical source lost exact 3343/3684 evidence";
+        if (error.empty()) error = "#372 canonical source lost exact 3343/5406 evidence";
         return false;
     }
 
@@ -43428,7 +43428,7 @@ static bool run_exact_max_proxy_prefix_self_checks(
         maximum_ipv4_lowered.value().len != profile.maximum_exact_size ||
         profile.maximum_exact_size >= rut::nginx::RutSource::kCapacity ||
         rut::nginx::RutSource::kCapacity - profile.maximum_exact_size !=
-            (profile.uses_target_transform ? 3446u : 3602u) ||
+            (profile.uses_target_transform ? 5168u : 5324u) ||
         maximum_ipv4_lowered.value().data[maximum_ipv4_lowered.value().len] != '\0') {
         error = std::string(profile.issue) +
                 " P63 genuine maximum lowering lost its canonical size/capacity/NUL boundary";
@@ -43893,9 +43893,9 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
     }
     const auto maximum_lowered = rut::nginx::lower_to_rut(maximum_parsed.value());
     if (!maximum_lowered || maximum_lowered.value().len != 3417u ||
-        rut::nginx::RutSource::kCapacity != 7028u ||
-        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 3611u ||
-        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 3610u ||
+        rut::nginx::RutSource::kCapacity != 8750u ||
+        rut::nginx::RutSource::kCapacity - maximum_lowered.value().len != 5333u ||
+        rut::nginx::RutSource::kCapacity - 1u - maximum_lowered.value().len != 5332u ||
         maximum_lowered.value().data[maximum_lowered.value().len] != '\0' ||
         !validate_max_proxy_prefix_generated_source(
             std::string(maximum_lowered.value().data, maximum_lowered.value().len),
@@ -43906,7 +43906,7 @@ static bool run_wildcard_max_no_uri_prefix_self_checks(std::string& error) {
             false,
             kWildcardMaxProxyPrefixNoUriProfile)) {
         if (error.empty())
-            error = "#357 genuine maximum wildcard endpoints lost 3417/7028/3611/3610 evidence";
+            error = "#357 genuine maximum wildcard endpoints lost 3417/8750/5333/5332 evidence";
         return false;
     }
 
@@ -50373,7 +50373,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
     if (source.empty() || source.size() != 5366u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 1661u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 3383u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
@@ -52554,6 +52554,20 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
         "\"Upgrade\"]\n"
         "        },\n";
+    static constexpr char kAfterHostRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            content_length_position: \"after_host\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
+    static constexpr char kFramingSelector[] = "    if req.hasContentLength {\n";
+    static constexpr char kFramingElse[] = "    } else {\n";
+    static constexpr char kHeadRouteClose[] = "    }\n}\n";
+    static constexpr char kAfterHostField[] =
+        "            content_length_position: \"after_host\",\n";
     const size_t head_start = source.find("route HEAD \"/\" {\n");
     const size_t get_start = source.find("route GET \"/\" {\n");
     const size_t any_start = source.find("\nroute \"/\" {\n");
@@ -52562,10 +52576,17 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         count_text(source, "route HEAD \"/\" {\n") != 1u ||
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
-        count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, "return forward(nginx_upstream,") != 4u ||
         count_text(source, kFixedRequestPolicy) != 3u ||
-        count_text(source, "response_read_timeout: 1s") != 3u ||
+        count_text(source, kAfterHostRequestPolicy) != 1u ||
+        count_text(source, kFramingSelector) != 1u || count_text(source, kFramingElse) != 1u ||
+        count_text(source, "content_length_position: \"after_host\"") != 1u ||
+        count_text(source, "        response_policy: {\n") != 4u ||
+        count_text(source, "        failure_policy: {\n") != 4u ||
+        count_text(source, "        timeout_failure_policy: {\n") != 4u ||
+        count_text(source, "response_read_timeout: 1s") != 4u ||
         count_text(source, "response_read_timeout: 1s,\n") != 1u ||
+        count_text(source, "response_read_timeout: 1s\n") != 3u ||
         count_text(source, "response_buffering: \"complete_content_length\"\n") != 1u ||
         head_start == std::string::npos || get_start == std::string::npos ||
         any_start == std::string::npos || !(head_start < get_start && get_start < any_start) ||
@@ -52584,21 +52605,76 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
     const std::string head_region = source.substr(head_start, get_start - head_start);
     const std::string get_region = source.substr(get_start, any_start - get_start);
     const std::string any_region = source.substr(any_start);
+    const size_t selector_start = head_region.find(kFramingSelector);
+    const size_t else_start =
+        selector_start == std::string::npos
+            ? std::string::npos
+            : head_region.find(kFramingElse, selector_start + sizeof(kFramingSelector) - 1u);
+    if (selector_start == std::string::npos || else_start == std::string::npos ||
+        selector_start >= else_start || head_region.size() < sizeof(kHeadRouteClose) - 1u ||
+        head_region.compare(head_region.size() - (sizeof(kHeadRouteClose) - 1u),
+                            sizeof(kHeadRouteClose) - 1u,
+                            kHeadRouteClose) != 0) {
+        error = "#270 generated HEAD route lost its exact framing selector branches";
+        return false;
+    }
+    const std::string content_length_head_region =
+        head_region.substr(selector_start + sizeof(kFramingSelector) - 1u,
+                           else_start - selector_start - (sizeof(kFramingSelector) - 1u));
+    const size_t bodyless_start = else_start + sizeof(kFramingElse) - 1u;
+    const size_t bodyless_end = head_region.size() - (sizeof(kHeadRouteClose) - 1u);
+    if (bodyless_start > bodyless_end) {
+        error = "#270 generated HEAD route framing branches overlap their exact close";
+        return false;
+    }
+    const std::string bodyless_head_region =
+        head_region.substr(bodyless_start, bodyless_end - bodyless_start);
+    std::string normalized_content_length_head_region = content_length_head_region;
+    const size_t after_host_field = normalized_content_length_head_region.find(kAfterHostField);
+    if (after_host_field == std::string::npos) {
+        error = "#270 generated HEAD true branch lost its after-host field";
+        return false;
+    }
+    normalized_content_length_head_region.erase(after_host_field, sizeof(kAfterHostField) - 1u);
     const auto policy_suppresses_body = [&](const char* policy, const std::string& region) {
         const size_t start = region.find(policy);
         const size_t end = region.find("        },", start);
         const size_t suppress = region.find("head_mode: \"suppress_body\",", start);
         return start != std::string::npos && end != std::string::npos && suppress < end;
     };
-    if (count_text(head_region, "response_read_timeout: 1s") != 1u ||
+    if (count_text(head_region, "return forward(nginx_upstream,") != 2u ||
+        count_text(head_region, "response_read_timeout: 1s") != 2u ||
         count_text(get_region, "response_read_timeout: 1s") != 1u ||
         count_text(any_region, "response_read_timeout: 1s") != 1u ||
+        count_text(content_length_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(content_length_head_region, kAfterHostRequestPolicy) != 1u ||
+        content_length_head_region.find(kFixedRequestPolicy) != std::string::npos ||
+        count_text(content_length_head_region, "response_read_timeout: 1s") != 1u ||
+        count_text(bodyless_head_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(bodyless_head_region, kFixedRequestPolicy) != 1u ||
+        bodyless_head_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        bodyless_head_region.find("content_length_position: \"after_host\"") != std::string::npos ||
+        count_text(bodyless_head_region, "response_read_timeout: 1s") != 1u ||
+        normalized_content_length_head_region != bodyless_head_region ||
+        count_text(get_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(get_region, kFixedRequestPolicy) != 1u ||
+        get_region.find(kFramingSelector) != std::string::npos ||
+        get_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        get_region.find("content_length_position: \"after_host\"") != std::string::npos ||
+        count_text(any_region, "return forward(nginx_upstream,") != 1u ||
+        count_text(any_region, kFixedRequestPolicy) != 1u ||
+        any_region.find(kFramingSelector) != std::string::npos ||
+        any_region.find(kAfterHostRequestPolicy) != std::string::npos ||
+        any_region.find("content_length_position: \"after_host\"") != std::string::npos ||
         head_region.find("response_buffering:") != std::string::npos ||
         count_text(get_region, "response_buffering: \"complete_content_length\"\n") != 1u ||
         any_region.find("response_buffering:") != std::string::npos ||
-        !policy_suppresses_body("response_policy: {", head_region) ||
-        !policy_suppresses_body("failure_policy: {", head_region) ||
-        !policy_suppresses_body("timeout_failure_policy: {", head_region) ||
+        !policy_suppresses_body("response_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("failure_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", content_length_head_region) ||
+        !policy_suppresses_body("response_policy: {", bodyless_head_region) ||
+        !policy_suppresses_body("failure_policy: {", bodyless_head_region) ||
+        !policy_suppresses_body("timeout_failure_policy: {", bodyless_head_region) ||
         get_region.find("head_mode: \"suppress_body\",") != std::string::npos ||
         any_region.find("head_mode: \"suppress_body\",") != std::string::npos) {
         error = "#270 generated source did not isolate HEAD suppression and buffering modes";
@@ -55426,8 +55502,11 @@ int main(int argc, char** argv) {
                       << "\n";
             return 1;
         }
-        std::cerr << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into "
-                     "owned ordinary RUT with isolated HEAD suppression and buffering modes\n";
+        std::cerr
+            << "PASS: #270 parsed and lowered one explicit 1s root proxy timeout into owned "
+               "ordinary RUT with an isolated HEAD framing selector, after-host/legacy request "
+               "policies, byte-identical remaining branch bundles, suppression and buffering "
+               "modes\n";
         return 0;
     }
 
@@ -57270,7 +57349,8 @@ int main(int argc, char** argv) {
                "with zero extra upstream. Generated source ownership, zero target transforms "
                "through public RIR/config, scoped access and clean lifecycle passed. Runtime "
                "source size was derived from actual port widths; genuine maximum ports/IP is "
-               "3426 bytes with NUL reserve and 2520 bytes capacity headroom (#356 boundary "
+               "3426 bytes with 5324 bytes capacity delta and 5323 bytes payload headroom "
+               "before NUL (#356 boundary "
                "only; representative both-order behavior is separately proven; wildcard "
                "no-URI, configured URI/query, normalization-sensitive/absolute-form targets, "
                "#352 remaining access fields, broader methods/bodies/framing/reuse/retries/"
@@ -57306,8 +57386,8 @@ int main(int argc, char** argv) {
                "binding, owned policies and zero transforms through source/intermediate teardown "
                "and post-readiness source overwrite. All three wildcard nginx spellings and both "
                "orders were preflight-proven byte-identical at P63; only port-only listen-first "
-               "behavior ran here. Maximum endpoints emit 3417 bytes with 3611 capacity delta "
-               "and 3610 payload headroom before NUL; P64 is only the declared converter "
+               "behavior ran here. Maximum endpoints emit 3417 bytes with 5333 capacity delta "
+               "and 5332 payload headroom before NUL; P64 is only the declared converter "
                "support-boundary rejection (#357 remains PARTIAL; nginx.conf was translated, "
                "never loaded by RUT; configured URI/query, normalization-sensitive/absolute "
                "targets, broader methods/bodies/framing/reuse/failures/H1.0/H2/TLS and "
@@ -58261,7 +58341,7 @@ int main(int argc, char** argv) {
                "X-Dupe fields, with no fifth/retry, and six ordered original raw-target access "
                "records under its current runtime-specific schema. The generated orders retain "
                "exact 3337-byte canonical 8080/9000 source "
-               "with 3690 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
+               "with 5412 bytes headroom, one owned /api/ + /v1/? RouteConfig transform after "
                "source/RIR/compiler teardown, post-load source overwrite, disjoint resources "
                "and clean lifecycle (#360 bounded converter equivalence only; excludes /? "
                "profile, exact-listener allowlists, variables, quoted/escaped/repeated-query, "
@@ -58295,7 +58375,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: #372 exact /api/ with proxy_pass replacement /? in both declaration "
                "orders traversed the genuine borrowed nginx parser/model and independent "
-               "converter lowering into exact 3343-byte ordinary RUT sources with 3684 bytes "
+               "converter lowering into exact 3343-byte ordinary RUT sources with 5406 bytes "
                "NUL headroom and one owned generic transform ID 1. Two isolated pinned nginx "
                "1.29.7 sides and two public-CLI/O2-JIT/io_uring generated-RUT sides used eight "
                "simultaneously held unique endpoints, with all four generated endpoints P4, "

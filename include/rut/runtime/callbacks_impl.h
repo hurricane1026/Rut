@@ -2084,6 +2084,17 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // upstream_abandoned would skew the 504 timeout logic. This is the canonical
     // new-request boundary (past the incomplete/pipeline-wait returns above), hit
     // exactly once per complete request, before route matching / handler dispatch.
+    // `upstream_attempts` is request-local, but unlike the fields below it is
+    // also a useful fail-closed witness for an unexpected live predecessor.  A
+    // completed downstream request may discard it only after proving that the
+    // predecessor's episode tombstone and every upstream transport owner are
+    // settled.  Fresh transports and ambiguous predecessors retain the value so
+    // deferred preflight rejects them as non-neutral.
+    if (conn.downstream_completed_request_count != 0 && conn.upstream_attempts == 1 &&
+        valid_upstream_episode(conn.upstream_episode) && !conn.upstream_episode_quarantined &&
+        http1_pipeline_successor_tombstone_is_safe(conn) &&
+        http1_pipeline_successor_upstream_owners_are_neutral(conn))
+        conn.upstream_attempts = 0;
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
     conn.target_transform_id = 0;
@@ -5356,6 +5367,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     conn.request_policy_id = policy_id;
     conn.request_body_fully_buffered = req.has_content_length;
     conn.request_upload_complete = false;
+    // The rewritten request is now owned transactionally by recv_buf.  The
+    // send buffer was only materialization scratch; retry snapshots, response
+    // mutation snapshots, and pipeline stashes establish their own explicit
+    // ownership later and must not inherit these obsolete bytes.
+    conn.send_buf.reset();
     return true;
 }
 
