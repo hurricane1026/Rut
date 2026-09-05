@@ -1270,6 +1270,17 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue270_keepalive_timeout_head_differential
+        COMMAND test_nginx_differential --keepalive-timeout-head-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_keepalive_timeout_head_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue373_converter_proxy_hide_header_generated_side_self_check
         COMMAND test_nginx_differential --converter-proxy-hide-header-generated-side-self-check $<TARGET_FILE:rut>
     )

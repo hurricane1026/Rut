@@ -533,6 +533,21 @@ static constexpr char kExplicitTimeoutHeadResponseNormalized[] =
     "Content-Length: 167\r\n"
     "Connection: close\r\n\r\n";
 static_assert(sizeof(kExplicitTimeoutHeadResponseNormalized) - 1u == 157u);
+static constexpr char kKeepAliveTimeoutHeadRequest1[] =
+    "HEAD /timeout-keepalive?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n\r\n";
+static constexpr char kKeepAliveTimeoutHeadRequest2[] =
+    "HEAD /timeout-keepalive?q=2 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kKeepAliveTimeoutHeadResponseNormalized[] =
+    "HTTP/1.1 504 Gateway Time-out\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 167\r\n"
+    "Connection: keep-alive\r\n\r\n";
+static_assert(sizeof(kKeepAliveTimeoutHeadResponseNormalized) - 1u == 162u);
 static constexpr char kApiResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -2876,17 +2891,22 @@ static bool observe_live_complete_origin_quiet(Recorder& recorder,
 // keeps accepted upstream fds open, records the connection id with every
 // request, and deliberately delays the representation body after the response
 // headers so a HEAD leak cannot be hidden by coalescing.
+static u64 steady_now_ns();
+
 struct KeepAlivePinnedRecorder {
     enum class FirstResponseMode : uint8_t {
         Normal,
         InvalidHeaderWaitPeerClose,
         IncompleteWaitGate,
+        DelayedIncompleteThenComplete,
     };
     enum class ActiveWaitKind : uint8_t {
         None,
         InvalidHeaderPeerClose,
         IncompleteGate,
         IncompleteAbortHold,
+        DelayedIncompleteDue,
+        DelayedIncompletePeerClose,
     };
     enum class IncompleteGateState : uint8_t {
         Idle,
@@ -2922,6 +2942,8 @@ struct KeepAlivePinnedRecorder {
     int listen_fd = -1;
     u16 port = 0;
     std::atomic<bool> running{false};
+    std::atomic<bool> thread_alive{false};
+    std::atomic<bool> listener_failed{false};
     std::atomic<u32> accepted{0};
     std::atomic<u32> requests{0};
     std::vector<Entry> history;
@@ -2935,6 +2957,13 @@ struct KeepAlivePinnedRecorder {
     std::atomic<bool> first_peer_closed{false};
     std::atomic<bool> first_peer_unexpected_data{false};
     std::atomic<bool> first_peer_observation_failed{false};
+    std::atomic<u64> request_complete_ns[2]{};
+    std::atomic<u64> first_partial_sent_ns{0};
+    std::atomic<u64> first_peer_closed_ns{0};
+    std::atomic<u64> second_complete_sent_ns{0};
+    std::atomic<u32> response_send_calls{0};
+    std::atomic<u32> response_bytes_sent{0};
+    std::atomic<bool> response_send_failed{false};
     std::atomic<IncompleteGateState> incomplete_gate_state{IncompleteGateState::Idle};
     std::atomic<IncompleteGateCommand> incomplete_gate_command{IncompleteGateCommand::Wait};
     pthread_t thread{};
@@ -2986,10 +3015,40 @@ struct KeepAlivePinnedRecorder {
         const size_t end = find_header_end(item.wire, item.parsed);
         if (end == 0) return true;
         const bool first_request = self.requests.load(std::memory_order_relaxed) == 0;
+        const bool second_request = self.requests.load(std::memory_order_relaxed) == 1;
         std::vector<char> request(item.wire.begin() + item.parsed, item.wire.begin() + end);
         self.history.push_back({item.connection_id, request});
+        if (first_request)
+            self.request_complete_ns[0].store(steady_now_ns(), std::memory_order_release);
+        else if (second_request)
+            self.request_complete_ns[1].store(steady_now_ns(), std::memory_order_release);
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
+        if (self.first_response_mode == FirstResponseMode::DelayedIncompleteThenComplete) {
+            if (item.wire.size() != end || (!first_request && !second_request)) {
+                self.first_peer_unexpected_data.store(true, std::memory_order_release);
+                return false;
+            }
+            if (first_request) {
+                item.wait_kind = ActiveWaitKind::DelayedIncompleteDue;
+                item.body_due = now + std::chrono::milliseconds(400);
+                return true;
+            }
+            self.response_send_calls.fetch_add(1, std::memory_order_release);
+            if (!send_head_response(item.fd)) {
+                self.response_send_failed.store(true, std::memory_order_release);
+                return false;
+            }
+            static constexpr u32 kHeadResponseBytes = sizeof(
+                                                          "HTTP/1.1 200 OK\r\n"
+                                                          "Server: origin-head\r\n"
+                                                          "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+                                                          "Content-Length: 5\r\n\r\n") -
+                                                      1u;
+            self.response_bytes_sent.fetch_add(kHeadResponseBytes, std::memory_order_release);
+            self.second_complete_sent_ns.store(steady_now_ns(), std::memory_order_release);
+            return true;
+        }
         if (self.first_response_mode == FirstResponseMode::InvalidHeaderWaitPeerClose &&
             first_request) {
             static constexpr char kMalformed[] = "HTTP/1.1 200 OK\r\n:\r\n\r\n";
@@ -3042,6 +3101,7 @@ struct KeepAlivePinnedRecorder {
 
     static void* run(void* opaque) {
         auto* self = static_cast<KeepAlivePinnedRecorder*>(opaque);
+        self->thread_alive.store(true, std::memory_order_release);
         std::vector<Active> active;
         u32 next_connection_id = 1;
         const auto acknowledge_incomplete_abort = [&]() {
@@ -3072,6 +3132,7 @@ struct KeepAlivePinnedRecorder {
             const int ready = poll(polls.data(), polls.size(), 25);
             if (ready < 0) {
                 if (errno == EINTR) continue;
+                self->listener_failed.store(true, std::memory_order_release);
                 break;
             }
             acknowledge_incomplete_abort();
@@ -3084,6 +3145,7 @@ struct KeepAlivePinnedRecorder {
                     if (client < 0) {
                         if (errno == EINTR) continue;
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        self->listener_failed.store(true, std::memory_order_release);
                         self->running.store(false, std::memory_order_release);
                         break;
                     }
@@ -3102,6 +3164,22 @@ struct KeepAlivePinnedRecorder {
                 const size_t poll_index = index;
                 bool remove = false;
                 acknowledge_incomplete_abort();
+                if (item.wait_kind == ActiveWaitKind::DelayedIncompleteDue &&
+                    now >= item.body_due) {
+                    static constexpr char kIncomplete[] =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
+                    self->response_send_calls.fetch_add(1, std::memory_order_release);
+                    if (!send_all(item.fd, kIncomplete, sizeof(kIncomplete) - 1u)) {
+                        self->response_send_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else {
+                        self->response_bytes_sent.fetch_add(sizeof(kIncomplete) - 1u,
+                                                            std::memory_order_release);
+                        self->first_partial_sent_ns.store(steady_now_ns(),
+                                                          std::memory_order_release);
+                        item.wait_kind = ActiveWaitKind::DelayedIncompletePeerClose;
+                    }
+                }
                 if (item.wait_kind == ActiveWaitKind::IncompleteGate) {
                     IncompleteGateCommand command =
                         self->incomplete_gate_command.load(std::memory_order_acquire);
@@ -3180,6 +3258,25 @@ struct KeepAlivePinnedRecorder {
                         remove = true;
                     }
                 }
+                if (!remove && item.wait_kind == ActiveWaitKind::DelayedIncompletePeerClose &&
+                    (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
+                    char unexpected[256];
+                    const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
+                    if (n == 0 || (n < 0 && errno == ECONNRESET) ||
+                        (n < 0 && (polls[poll_index].revents & POLLHUP) != 0 &&
+                         (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                        self->first_peer_closed_ns.store(steady_now_ns(),
+                                                         std::memory_order_release);
+                        self->first_peer_closed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (n > 0) {
+                        self->first_peer_unexpected_data.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    }
+                }
                 if (!remove && !item.body_pending && item.wait_kind == ActiveWaitKind::None &&
                     (polls[poll_index].revents & POLLIN)) {
                     char buf[4096];
@@ -3232,6 +3329,7 @@ struct KeepAlivePinnedRecorder {
             close(self->listen_fd);
             self->listen_fd = -1;
         }
+        self->thread_alive.store(false, std::memory_order_release);
         return nullptr;
     }
 
@@ -3266,11 +3364,20 @@ struct KeepAlivePinnedRecorder {
         history.clear();
         accepted.store(0, std::memory_order_relaxed);
         requests.store(0, std::memory_order_relaxed);
+        thread_alive.store(false, std::memory_order_relaxed);
+        listener_failed.store(false, std::memory_order_relaxed);
         first_malformed_sent_open.store(false, std::memory_order_relaxed);
         first_malformed_send_failed.store(false, std::memory_order_relaxed);
         first_peer_closed.store(false, std::memory_order_relaxed);
         first_peer_unexpected_data.store(false, std::memory_order_relaxed);
         first_peer_observation_failed.store(false, std::memory_order_relaxed);
+        for (auto& timestamp : request_complete_ns) timestamp.store(0, std::memory_order_relaxed);
+        first_partial_sent_ns.store(0, std::memory_order_relaxed);
+        first_peer_closed_ns.store(0, std::memory_order_relaxed);
+        second_complete_sent_ns.store(0, std::memory_order_relaxed);
+        response_send_calls.store(0, std::memory_order_relaxed);
+        response_bytes_sent.store(0, std::memory_order_relaxed);
+        response_send_failed.store(false, std::memory_order_relaxed);
         incomplete_gate_state.store(IncompleteGateState::Idle, std::memory_order_relaxed);
         incomplete_gate_command.store(IncompleteGateCommand::Wait, std::memory_order_relaxed);
         running.store(true, std::memory_order_release);
@@ -52439,6 +52546,14 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
     const std::string listener = "listen 127.0.0.1:" + std::to_string(frontend_port) + "\n";
     const std::string upstream =
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+    static constexpr char kFixedRequestPolicy[] =
+        "return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n";
     const size_t head_start = source.find("route HEAD \"/\" {\n");
     const size_t get_start = source.find("route GET \"/\" {\n");
     const size_t any_start = source.find("\nroute \"/\" {\n");
@@ -52448,6 +52563,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         count_text(source, "route GET \"/\" {\n") != 1u ||
         count_text(source, "\nroute \"/\" {\n") != 1u ||
         count_text(source, "return forward(nginx_upstream,") != 3u ||
+        count_text(source, kFixedRequestPolicy) != 3u ||
         count_text(source, "response_read_timeout: 1s") != 3u ||
         count_text(source, "response_read_timeout: 1s,\n") != 1u ||
         count_text(source, "response_buffering: \"complete_content_length\"\n") != 1u ||
@@ -53326,6 +53442,518 @@ static bool run_explicit_timeout_head_phase_differential(const char* rut_path, s
     return true;
 }
 
+struct KeepAliveTimeoutHeadObservation {
+    std::string side;
+    std::string temp_path;
+    std::string config_path;
+    std::string runtime_log_path;
+    std::string access_log_path;
+    std::string process_identity;
+    std::string source;
+    std::string access_log;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    std::vector<char> downstream[2];
+    std::vector<char> upstream[2];
+    u32 connection_id[2]{};
+    u64 request_complete_ns[2]{};
+    u64 first_partial_sent_ns = 0u;
+    u64 first_downstream_byte_ns[2]{};
+    u64 first_peer_closed_ns = 0u;
+    u64 second_complete_sent_ns = 0u;
+    u32 accepted = 0u;
+    u32 requests = 0u;
+    u32 response_send_calls = 0u;
+    u32 response_bytes_sent = 0u;
+    bool loaded_o2 = false;
+    bool io_uring = false;
+    bool process_clean = false;
+    bool recorder_clean = false;
+};
+
+static bool read_timed_head_response(int fd,
+                                     std::vector<char>& bytes,
+                                     u64& first_byte_ns,
+                                     std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bytes.clear();
+    first_byte_ns = 0u;
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor{fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&descriptor, 1, 25);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#270 keep-alive HEAD downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char buffer[512];
+        const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n > 0) {
+            if (first_byte_ns == 0u) first_byte_ns = steady_now_ns();
+            bytes.insert(bytes.end(), buffer, buffer + n);
+            const size_t end = header_end(bytes);
+            if (end != 0u) {
+                if (bytes.size() != end) {
+                    error = "#270 keep-alive HEAD response included body/trailing bytes";
+                    return false;
+                }
+                return true;
+            }
+            if (bytes.size() > 4096u) {
+                error = "#270 keep-alive HEAD response exceeded bounded capacity";
+                return false;
+            }
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        error = n == 0 ? "#270 keep-alive HEAD reached EOF before complete headers"
+                       : "#270 keep-alive HEAD downstream recv failed";
+        return false;
+    }
+    error = "#270 keep-alive HEAD response exceeded its 3s deadline";
+    return false;
+}
+
+static bool wait_keepalive_timeout_origin_retired(KeepAlivePinnedRecorder& recorder,
+                                                  std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (recorder.response_send_failed.load(std::memory_order_acquire) ||
+            recorder.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            recorder.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            recorder.listener_failed.load(std::memory_order_acquire) ||
+            !recorder.thread_alive.load(std::memory_order_acquire)) {
+            error = "#270 keep-alive timeout origin recorder failed before retirement";
+            return false;
+        }
+        if (recorder.first_peer_closed.load(std::memory_order_acquire)) return true;
+        usleep(1000);
+    }
+    error = "#270 keep-alive timeout did not retire origin 1 within 2s";
+    return false;
+}
+
+static std::vector<char> keepalive_timeout_expected_upstream(u16 backend_port, bool second) {
+    const std::string request = std::string("HEAD /timeout-keepalive?q=") + (second ? "2" : "1") +
+                                " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                                "\r\n\r\n";
+    return {request.begin(), request.end()};
+}
+
+static bool capture_keepalive_timeout_head_side(const char* rut_path,
+                                                bool pinned_nginx,
+                                                int* frontend_reservation,
+                                                u16 frontend_port,
+                                                int* backend_reservation,
+                                                u16 backend_port,
+                                                KeepAliveTimeoutHeadObservation& observation,
+                                                std::string& error) {
+    TempDir temp;
+    if (!temp.create()) {
+        error = "#270 keep-alive side could not create a secure temporary directory";
+        return false;
+    }
+    if (!validate_optional_held_loopback_pair(frontend_reservation,
+                                              frontend_port,
+                                              backend_reservation,
+                                              backend_port,
+                                              true,
+                                              "#270 keep-alive side",
+                                              error) ||
+        frontend_port == backend_port) {
+        if (error.empty()) error = "#270 keep-alive side lacked its distinct held port pair";
+        return false;
+    }
+    observation = KeepAliveTimeoutHeadObservation{};
+    observation.side = pinned_nginx ? "pinned-nginx-1.29.7" : "converter-generated-rut";
+    observation.temp_path = temp.path;
+    observation.config_path = pinned_nginx ? temp.nginx_config : temp.source;
+    observation.runtime_log_path = pinned_nginx ? temp.nginx_log : temp.rut_log;
+    observation.access_log_path = pinned_nginx ? temp.nginx_access_log : temp.rut_access_log;
+    observation.frontend_port = frontend_port;
+    observation.backend_port = backend_port;
+
+    const std::string profile = make_explicit_timeout_head_profile(
+        frontend_port, backend_port, observation.access_log_path);
+    if (!validate_explicit_timeout_head_profile(
+            profile, frontend_port, backend_port, observation.access_log_path, error))
+        return false;
+    if (pinned_nginx) {
+        observation.source = "events {}\n" + profile;
+        if (!write_file(temp.nginx_config, observation.source.data(), observation.source.size())) {
+            error = "#270 keep-alive side could not persist the pinned nginx config";
+            return false;
+        }
+    } else if (!build_explicit_timeout_head_generated_source(profile,
+                                                             frontend_port,
+                                                             backend_port,
+                                                             observation.access_log_path,
+                                                             observation.source,
+                                                             error) ||
+               !write_file(temp.source, observation.source.data(), observation.source.size())) {
+        if (error.empty())
+            error = "#270 keep-alive side could not persist converter-generated ordinary RUT";
+        return false;
+    }
+
+    KeepAlivePinnedRecorder origin(
+        KeepAlivePinnedRecorder::FirstResponseMode::DelayedIncompleteThenComplete);
+    if (!handoff_held_loopback_port(
+            backend_reservation, backend_port, "#270 keep-alive origin bind", error) ||
+        !origin.setup(backend_port)) {
+        if (error.empty()) error = "#270 keep-alive origin setup failed";
+        return false;
+    }
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.thread_alive.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origin.thread_alive.load(std::memory_order_acquire) ||
+        origin.listener_failed.load(std::memory_order_acquire)) {
+        error = "#270 keep-alive origin was not live before frontend start";
+        return false;
+    }
+
+    observation.process_identity =
+        "rut-nginx-270-keepalive-" + std::to_string(getpid()) + (pinned_nginx ? "-nginx" : "-rut");
+    PinnedNginxDockerLifecycle nginx(observation.process_identity, temp, error);
+    ChildGuard runtime;
+    if (!handoff_held_loopback_port(
+            frontend_reservation, frontend_port, "#270 keep-alive frontend bind", error))
+        return false;
+    if (pinned_nginx) {
+        if (!nginx.start(frontend_port)) {
+            if (error.empty()) error = "#270 pinned nginx failed before keep-alive readiness";
+            return false;
+        }
+    } else {
+        if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0 ||
+            !spawn_child(
+                {rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+                temp.rut_log,
+                runtime.child) ||
+            !wait_ready(frontend_port, runtime.child, error)) {
+            if (error.empty()) error = "#270 generated RUT failed before keep-alive readiness";
+            return false;
+        }
+        const std::string loaded = "Loaded program: " + temp.source + " (opt O2)\n";
+        const std::string listening =
+            "Listening on port " + std::to_string(frontend_port) + " with 1 shard(s)\n";
+        const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((!log_contains(temp.rut_log, loaded.c_str()) ||
+                !log_contains(temp.rut_log, "Backend: io_uring\n") ||
+                !log_contains(temp.rut_log, listening.c_str())) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            if (poll_child(runtime.child)) {
+                error = "#270 generated RUT exited before exact O2/io_uring readiness";
+                return false;
+            }
+            usleep(1000);
+        }
+        observation.loaded_o2 = log_contains(temp.rut_log, loaded.c_str());
+        observation.io_uring = log_contains(temp.rut_log, "Backend: io_uring\n");
+        if (!observation.loaded_o2 || !observation.io_uring ||
+            !log_contains(temp.rut_log, listening.c_str())) {
+            error = "#270 generated RUT lacked exact public O2/io_uring readiness";
+            return false;
+        }
+    }
+
+    const auto frontend_live = [&]() {
+        return pinned_nginx ? !poll_child(nginx.cli()) : !poll_child(runtime.child);
+    };
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 ||
+        !send_all(
+            client.fd, kKeepAliveTimeoutHeadRequest1, sizeof(kKeepAliveTimeoutHeadRequest1) - 1u)) {
+        error = "#270 keep-alive request 1 connect/send failed";
+        return false;
+    }
+    const auto partial_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (origin.first_partial_sent_ns.load(std::memory_order_acquire) == 0u &&
+           std::chrono::steady_clock::now() < partial_deadline) {
+        if (!frontend_live() || origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire)) {
+            error = "#270 keep-alive side failed before incomplete origin publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    observation.request_complete_ns[0] =
+        origin.request_complete_ns[0].load(std::memory_order_acquire);
+    observation.first_partial_sent_ns =
+        origin.first_partial_sent_ns.load(std::memory_order_acquire);
+    if (observation.request_complete_ns[0] == 0u || observation.first_partial_sent_ns == 0u ||
+        observation.first_partial_sent_ns < observation.request_complete_ns[0]) {
+        error = "#270 keep-alive side lacked ordered request/partial timestamps";
+        return false;
+    }
+    const u64 partial_delay_ns =
+        observation.first_partial_sent_ns - observation.request_complete_ns[0];
+    if (partial_delay_ns < 350'000'000ull || partial_delay_ns >= 650'000'000ull) {
+        error = "#270 incomplete origin publication escaped 350..650ms";
+        return false;
+    }
+    if (!read_timed_head_response(
+            client.fd, observation.downstream[0], observation.first_downstream_byte_ns[0], error))
+        return false;
+    std::string detail;
+    if (!validate_exact_normalized_response(
+            observation.downstream[0], kKeepAliveTimeoutHeadResponseNormalized, detail)) {
+        error = "#270 keep-alive timeout response mismatch: " + detail;
+        return false;
+    }
+    if (observation.first_downstream_byte_ns[0] < observation.request_complete_ns[0] ||
+        observation.first_downstream_byte_ns[0] - observation.request_complete_ns[0] <
+            750'000'000ull ||
+        observation.first_downstream_byte_ns[0] - observation.request_complete_ns[0] >=
+            1'700'000'000ull ||
+        observation.first_downstream_byte_ns[0] < observation.first_partial_sent_ns ||
+        observation.first_downstream_byte_ns[0] - observation.first_partial_sent_ns >=
+            750'000'000ull) {
+        error = "#270 keep-alive timeout escaped pinned initial-deadline bounds";
+        return false;
+    }
+    if (!observe_client_open_and_quiet_nonconsuming(client.fd, 150, detail)) {
+        error = "#270 request-1 downstream was not reusable and EAGAIN-quiet: " + detail;
+        return false;
+    }
+    if (!wait_keepalive_timeout_origin_retired(origin, detail)) {
+        error = observation.side + ": " + detail;
+        return false;
+    }
+    observation.first_peer_closed_ns = origin.first_peer_closed_ns.load(std::memory_order_acquire);
+    if (observation.first_peer_closed_ns < observation.first_partial_sent_ns ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u) {
+        error = "#270 origin 1 retirement/count evidence was not exact before request 2";
+        return false;
+    }
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontend_live() || origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#270 origin 1 retirement window observed retry/data/lifecycle drift";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    if (!send_all(
+            client.fd, kKeepAliveTimeoutHeadRequest2, sizeof(kKeepAliveTimeoutHeadRequest2) - 1u) ||
+        !read_timed_head_response(
+            client.fd, observation.downstream[1], observation.first_downstream_byte_ns[1], error) ||
+        !read_eof(client.fd, detail)) {
+        if (error.empty()) error = "#270 keep-alive request 2 response/EOF failed: " + detail;
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+    if (!wait_pinned_requests(origin, 2u, detail)) {
+        error = "#270 keep-alive request 2 origin evidence failed: " + detail;
+        return false;
+    }
+    observation.request_complete_ns[1] =
+        origin.request_complete_ns[1].load(std::memory_order_acquire);
+    observation.second_complete_sent_ns =
+        origin.second_complete_sent_ns.load(std::memory_order_acquire);
+    if (!validate_exact_normalized_response(
+            observation.downstream[1], kHeadResponseNormalized, detail) ||
+        observation.request_complete_ns[1] == 0u ||
+        observation.second_complete_sent_ns < observation.request_complete_ns[1] ||
+        observation.first_downstream_byte_ns[1] < observation.request_complete_ns[1] ||
+        observation.first_downstream_byte_ns[1] - observation.request_complete_ns[1] >=
+            750'000'000ull) {
+        error = "#270 keep-alive request 2 did not produce the exact prompt HEAD 200/EOF";
+        return false;
+    }
+    const auto final_quiet_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    while (std::chrono::steady_clock::now() < final_quiet_deadline) {
+        if (!frontend_live() || origin.accepted.load(std::memory_order_acquire) != 2u ||
+            origin.requests.load(std::memory_order_acquire) != 2u ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.first_peer_observation_failed.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire)) {
+            error = "#270 final window observed a third origin episode or fixture failure";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    if (pinned_nginx) {
+        observation.process_clean = nginx.shutdown();
+    } else {
+        observation.process_clean = stop_child(runtime.child) && runtime.child.pid < 0 &&
+                                    runtime.child.status_valid && WIFEXITED(runtime.child.status) &&
+                                    WEXITSTATUS(runtime.child.status) == 0;
+    }
+    if (!observation.process_clean) {
+        error = "#270 keep-alive frontend did not shut down cleanly";
+        return false;
+    }
+    if (!read_exact_return204_log(observation.access_log_path,
+                                  "#270 keep-alive access log",
+                                  observation.access_log,
+                                  error))
+        return false;
+    origin.stop();
+    observation.accepted = origin.accepted.load(std::memory_order_acquire);
+    observation.requests = origin.requests.load(std::memory_order_acquire);
+    observation.response_send_calls = origin.response_send_calls.load(std::memory_order_acquire);
+    observation.response_bytes_sent = origin.response_bytes_sent.load(std::memory_order_acquire);
+    if (origin.history.size() == 2u) {
+        for (u32 index = 0u; index < 2u; index++) {
+            observation.connection_id[index] = origin.history[index].connection_id;
+            observation.upstream[index] = origin.history[index].wire;
+        }
+    }
+    observation.recorder_clean =
+        !origin.thread_alive.load(std::memory_order_acquire) &&
+        !origin.listener_failed.load(std::memory_order_acquire) &&
+        !origin.response_send_failed.load(std::memory_order_acquire) &&
+        !origin.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+        !origin.first_peer_observation_failed.load(std::memory_order_acquire);
+    static constexpr size_t kIncompleteBytes =
+        sizeof("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n") - 1u;
+    static constexpr size_t kCompleteBytes = sizeof(
+                                                 "HTTP/1.1 200 OK\r\n"
+                                                 "Server: origin-head\r\n"
+                                                 "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+                                                 "Content-Length: 5\r\n\r\n") -
+                                             1u;
+    const std::string expected_access =
+        std::to_string(sizeof(kKeepAliveTimeoutHeadRequest1) - 1u) + "\n" +
+        std::to_string(sizeof(kKeepAliveTimeoutHeadRequest2) - 1u) + "\n";
+    if (!observation.recorder_clean || observation.accepted != 2u || observation.requests != 2u ||
+        origin.history.size() != 2u || observation.connection_id[0] == 0u ||
+        observation.connection_id[1] == 0u ||
+        observation.connection_id[0] == observation.connection_id[1] ||
+        observation.response_send_calls != 2u ||
+        observation.response_bytes_sent != kIncompleteBytes + kCompleteBytes ||
+        observation.upstream[0] != keepalive_timeout_expected_upstream(backend_port, false) ||
+        observation.upstream[1] != keepalive_timeout_expected_upstream(backend_port, true) ||
+        observation.access_log != expected_access) {
+        error = "#270 keep-alive side lost exact wire/count/send/log/lifecycle evidence";
+        return false;
+    }
+    return true;
+}
+
+static bool canonicalize_keepalive_timeout_upstream(std::vector<char>& wire, u16 backend_port) {
+    const std::string endpoint = "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n";
+    const std::string canonical = "Host: 127.0.0.1:BACKEND\r\n";
+    const auto at = std::search(wire.begin(), wire.end(), endpoint.begin(), endpoint.end());
+    if (at == wire.end() || std::search(at + static_cast<std::ptrdiff_t>(endpoint.size()),
+                                        wire.end(),
+                                        endpoint.begin(),
+                                        endpoint.end()) != wire.end())
+        return false;
+    const size_t offset = static_cast<size_t>(at - wire.begin());
+    wire.erase(wire.begin() + static_cast<std::ptrdiff_t>(offset),
+               wire.begin() + static_cast<std::ptrdiff_t>(offset + endpoint.size()));
+    wire.insert(
+        wire.begin() + static_cast<std::ptrdiff_t>(offset), canonical.begin(), canonical.end());
+    return true;
+}
+
+static bool run_keepalive_timeout_head_differential(const char* rut_path, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#270 keep-alive differential requires an executable absolute RUT path";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (u32 index = 0u; index < 4u; index++) {
+        if (!reservations.reserve(index, ports[index])) {
+            error = "#270 keep-alive differential could not reserve four loopback ports";
+            return false;
+        }
+        for (u32 previous = 0u; previous < index; previous++) {
+            if (ports[index] == ports[previous]) {
+                error = "#270 keep-alive differential reservation reused a loopback port";
+                return false;
+            }
+        }
+    }
+    KeepAliveTimeoutHeadObservation nginx;
+    KeepAliveTimeoutHeadObservation rut;
+    if (!capture_keepalive_timeout_head_side(rut_path,
+                                             true,
+                                             &reservations.fds[0],
+                                             ports[0],
+                                             &reservations.fds[1],
+                                             ports[1],
+                                             nginx,
+                                             error)) {
+        error = "pinned nginx keep-alive side: " + error;
+        return false;
+    }
+    if (!capture_keepalive_timeout_head_side(rut_path,
+                                             false,
+                                             &reservations.fds[2],
+                                             ports[2],
+                                             &reservations.fds[3],
+                                             ports[3],
+                                             rut,
+                                             error)) {
+        error = "generated RUT keep-alive side: " + error;
+        return false;
+    }
+    if (nginx.temp_path == rut.temp_path || nginx.config_path == rut.config_path ||
+        nginx.runtime_log_path == rut.runtime_log_path ||
+        nginx.access_log_path == rut.access_log_path ||
+        nginx.process_identity == rut.process_identity ||
+        nginx.frontend_port == rut.frontend_port || nginx.frontend_port == rut.backend_port ||
+        nginx.backend_port == rut.frontend_port || nginx.backend_port == rut.backend_port ||
+        !rut.loaded_o2 || !rut.io_uring || !nginx.process_clean || !rut.process_clean ||
+        !nginx.recorder_clean || !rut.recorder_clean) {
+        error =
+            "#270 differential sides reused identity/resources or lacked public lifecycle proof";
+        return false;
+    }
+    std::vector<char> nginx_downstream[2] = {nginx.downstream[0], nginx.downstream[1]};
+    std::vector<char> rut_downstream[2] = {rut.downstream[0], rut.downstream[1]};
+    std::vector<char> nginx_upstream[2] = {nginx.upstream[0], nginx.upstream[1]};
+    std::vector<char> rut_upstream[2] = {rut.upstream[0], rut.upstream[1]};
+    for (u32 index = 0u; index < 2u; index++) {
+        if (!normalize_date(nginx_downstream[index]) || !normalize_date(rut_downstream[index]) ||
+            nginx_downstream[index] != rut_downstream[index] ||
+            !canonicalize_keepalive_timeout_upstream(nginx_upstream[index], nginx.backend_port) ||
+            !canonicalize_keepalive_timeout_upstream(rut_upstream[index], rut.backend_port) ||
+            nginx_upstream[index] != rut_upstream[index]) {
+            error = "#270 nginx/RUT request or Date-normalized response wires differed";
+            return false;
+        }
+    }
+    const u64 nginx_elapsed = nginx.first_downstream_byte_ns[0] - nginx.request_complete_ns[0];
+    const u64 rut_elapsed = rut.first_downstream_byte_ns[0] - rut.request_complete_ns[0];
+    const u64 delta =
+        nginx_elapsed > rut_elapsed ? nginx_elapsed - rut_elapsed : rut_elapsed - nginx_elapsed;
+    if (delta > 350'000'000ull) {
+        error = "#270 nginx/RUT keep-alive timeout delta exceeded 350ms (nginx_ns=" +
+                std::to_string(nginx_elapsed) + ", rut_ns=" + std::to_string(rut_elapsed) +
+                ", delta_ns=" + std::to_string(delta) + ")";
+        return false;
+    }
+    std::cerr << "PASS: #270 keep-alive HEAD initial-deadline seconds nginx/RUT="
+              << static_cast<double>(nginx_elapsed) / 1e9 << "/"
+              << static_cast<double>(rut_elapsed) / 1e9
+              << " delta=" << static_cast<double>(delta) / 1e9 << "\n";
+    return true;
+}
+
 static void configure_positive_get_default_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -54189,6 +54817,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-explicit-timeout-head-generated-episode") == 0;
     const bool explicit_timeout_head_phase_differential =
         argc == 3 && strcmp(argv[1], "--explicit-timeout-head-phase-differential") == 0;
+    const bool keepalive_timeout_head_differential =
+        argc == 3 && strcmp(argv[1], "--keepalive-timeout-head-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -54392,7 +55022,7 @@ int main(int argc, char** argv) {
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_source_self_check && !proxy_hide_header_generated_side_self_check &&
          !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential &&
+         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
@@ -54463,7 +55093,8 @@ int main(int argc, char** argv) {
         ((proxy_hide_header_generated_side_self_check ||
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
-        ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential) &&
+        ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential ||
+          keepalive_timeout_head_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
@@ -54555,6 +55186,8 @@ int main(int argc, char** argv) {
                "--converter-explicit-timeout-head-generated-episode <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--explicit-timeout-head-phase-differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--keepalive-timeout-head-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
                "<absolute-rut-executable>\n"
@@ -55698,6 +56331,20 @@ int main(int argc, char** argv) {
         std::cerr << "PASS: #268 pinned nginx and converter-generated ordinary RUT matched "
                      "zero-progress and delayed-progress 1s inactivity timing plus the complete "
                      "HEAD success control\n";
+        return 0;
+    }
+    if (keepalive_timeout_head_differential) {
+        std::string differential_error;
+        if (!run_keepalive_timeout_head_differential(argv[2], differential_error)) {
+            std::cerr << "FAIL [#270 keep-alive timeout HEAD differential]: " << differential_error
+                      << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #270 pinned nginx 1.29.7 and converter-generated ordinary RUT matched "
+               "the default-downstream-keep-alive bodyless H1.1 HEAD 1s initial response-header "
+               "deadline, header-only 504, origin retirement, and fresh-origin request-2 "
+               "HEAD 200 control (bounded evidence; proxy_read_timeout remains PARTIAL)\n";
         return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
