@@ -9782,6 +9782,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
          !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
         return frontend_error(
             FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
+    if (stmt.has_forward_response_read_timeout &&
+        !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("request policy is not admitted to response read timeout"));
     const bool has_response_buffering =
         stmt.forward_response_buffering != ForwardResponseBufferingMode::None;
     if (stmt.has_forward_response_buffering != has_response_buffering ||

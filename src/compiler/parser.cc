@@ -2031,6 +2031,7 @@ struct Parser {
                         bool have_host = false;
                         bool have_connection = false;
                         bool have_strip_headers = false;
+                        bool have_content_length_position = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2047,8 +2048,6 @@ struct Parser {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
-                                stmt.forward_request_policy_id =
-                                    static_cast<u16>(RequestPolicyId::Http11FixedStrip);
                             } else if (field_name.eq({"host", 4})) {
                                 seen = &have_host;
                                 auto value = expect(TokenType::StringLit);
@@ -2064,6 +2063,15 @@ struct Parser {
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (!v.eq({"omit", 4}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                            } else if (field_name.eq({"content_length_position", 23})) {
+                                seen = &have_content_length_position;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"after_host", 10}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
@@ -2127,6 +2135,10 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()),
                                                   kw_text);
+                        stmt.forward_request_policy_id = static_cast<u16>(
+                            have_content_length_position
+                                ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
+                                : RequestPolicyId::Http11FixedStrip);
                         stmt.has_forward_request_policy = true;
                     } else if (kw_text.eq({"response_policy", 15})) {
                         if (stmt.has_forward_response_policy)

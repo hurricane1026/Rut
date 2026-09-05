@@ -3010,6 +3010,209 @@ TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
     loop.free_conn(*conn);
 }
 
+TEST(request_policy, content_length_after_host_exact_wire_and_fail_closed_boundaries) {
+    static constexpr u16 kLegacy = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    static constexpr u16 kAfterHost =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    Connection conn{};
+    u8 recv[1024]{};
+    u8 send[1024]{};
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+
+    auto prepare = [&](const u8* wire, u32 len) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        REQUIRE_EQ(conn.recv_buf.write(wire, len), len);
+        capture_request_metadata(conn);
+    };
+    auto prepare_text = [&](const char* wire) {
+        prepare(reinterpret_cast<const u8*>(wire), static_cast<u32>(strlen(wire)));
+    };
+    auto require_wire = [&](const u8* expected, u32 expected_len) {
+        REQUIRE_EQ(conn.recv_buf.len(), expected_len);
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
+    };
+
+    static constexpr char kContentLengthAfterOrdinary[] =
+        "POST /upload HTTP/1.1\r\nHost: client\r\nX-First:\t one \t\r\n"
+        "Content-Length: 3\r\nX-Second:two\r\nConnection: close\r\n\r\nabc";
+    prepare_text(kContentLengthAfterOrdinary);
+    REQUIRE_EQ(inspect_request_policy_body(conn, kAfterHost), RequestPolicyBodyState::Complete);
+    REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
+    static constexpr char kExpected[] =
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 3\r\n"
+        "X-First: one\r\nX-Second: two\r\n\r\nabc";
+    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+
+    static constexpr char kContentLengthBeforeOrdinary[] =
+        "POST /upload HTTP/1.1\r\nContent-Length:\t3 \t\r\nX-First: one\r\n"
+        "Host: client\r\nX-Second: two\r\n\r\nabc";
+    prepare_text(kContentLengthBeforeOrdinary);
+    REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
+    require_wire(reinterpret_cast<const u8*>(kExpected), sizeof(kExpected) - 1u);
+
+    static constexpr char kNoContentLength[] =
+        "GET /upload HTTP/1.1\r\nX-First:\t one \t\r\nHost: client\r\n"
+        "X-Second:two\r\n\r\n";
+    static constexpr char kExpectedNoContentLength[] =
+        "GET /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-First: one\r\n"
+        "X-Second: two\r\n\r\n";
+    prepare_text(kNoContentLength);
+    REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
+    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                 sizeof(kExpectedNoContentLength) - 1u);
+    prepare_text(kNoContentLength);
+    REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
+    require_wire(reinterpret_cast<const u8*>(kExpectedNoContentLength),
+                 sizeof(kExpectedNoContentLength) - 1u);
+
+    static constexpr char kPartialHeader[] =
+        "POST /upload HTTP/1.1\r\nHost: client\r\nX-Binary: yes\r\nContent-Length: 5\r\n\r\n";
+    const u8 partial_body[] = {0x00, 0xff};
+    const u8 final_body[] = {0x0d, 0x0a, 0x7f};
+    u8 partial[sizeof(kPartialHeader) - 1u + sizeof(partial_body)]{};
+    __builtin_memcpy(partial, kPartialHeader, sizeof(kPartialHeader) - 1u);
+    __builtin_memcpy(partial + sizeof(kPartialHeader) - 1u, partial_body, sizeof(partial_body));
+    prepare(partial, sizeof(partial));
+    u8 untouched[sizeof(partial)]{};
+    __builtin_memcpy(untouched, conn.recv_buf.data(), conn.recv_buf.len());
+    REQUIRE_EQ(inspect_request_policy_body(conn, kAfterHost), RequestPolicyBodyState::Waiting);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kAfterHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    require_wire(untouched, sizeof(untouched));
+    REQUIRE_EQ(conn.recv_buf.write(final_body, sizeof(final_body)), sizeof(final_body));
+    conn.req_body_remaining = 0;
+    REQUIRE_EQ(inspect_request_policy_body(conn, kAfterHost), RequestPolicyBodyState::Complete);
+    REQUIRE(apply_request_policy(conn, endpoint, kAfterHost));
+    static constexpr char kExpectedBinaryHeader[] =
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 5\r\n"
+        "X-Binary: yes\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.len(),
+               sizeof(kExpectedBinaryHeader) - 1u + sizeof(partial_body) + sizeof(final_body));
+    CHECK_EQ(__builtin_memcmp(
+                 conn.recv_buf.data(), kExpectedBinaryHeader, sizeof(kExpectedBinaryHeader) - 1u),
+             0);
+    const u8 expected_binary[] = {0x00, 0xff, 0x0d, 0x0a, 0x7f};
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data() + sizeof(kExpectedBinaryHeader) - 1u,
+                              expected_binary,
+                              sizeof(expected_binary)),
+             0);
+
+    static constexpr char kExplicitZero[] =
+        "POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n";
+    prepare_text(kExplicitZero);
+    u8 zero_untouched[sizeof(kExplicitZero) - 1u]{};
+    __builtin_memcpy(zero_untouched, conn.recv_buf.data(), conn.recv_buf.len());
+    CHECK_EQ(inspect_request_policy_body(conn, kAfterHost), RequestPolicyBodyState::Invalid);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, kAfterHost));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    require_wire(zero_untouched, sizeof(zero_untouched));
+    REQUIRE_EQ(inspect_request_policy_body(conn, kLegacy), RequestPolicyBodyState::Complete);
+    REQUIRE(apply_request_policy(conn, endpoint, kLegacy));
+    static constexpr char kExpectedLegacyZero[] =
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 0\r\n\r\n";
+    require_wire(reinterpret_cast<const u8*>(kExpectedLegacyZero),
+                 sizeof(kExpectedLegacyZero) - 1u);
+
+    const char* invalid[] = {
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: websocket\r\n"
+        "Content-Length: 3\r\n\r\nabc",
+    };
+    for (const char* wire : invalid) {
+        prepare_text(wire);
+        const u32 before_len = conn.recv_buf.len();
+        u8 before[1024]{};
+        __builtin_memcpy(before, conn.recv_buf.data(), before_len);
+        CHECK_EQ(inspect_request_policy_body(conn, kAfterHost), RequestPolicyBodyState::Invalid);
+        CHECK_FALSE(apply_request_policy(conn, endpoint, kAfterHost));
+        CHECK_EQ(conn.send_buf.len(), 0u);
+        require_wire(before, before_len);
+    }
+    prepare_text(kNoContentLength);
+    CHECK_EQ(inspect_request_policy_body(conn, 3), RequestPolicyBodyState::Invalid);
+    CHECK_FALSE(apply_request_policy(conn, endpoint, 3));
+
+    prepare_text(kContentLengthAfterOrdinary);
+    const u32 transparent_len = conn.recv_buf.len();
+    u8 transparent[sizeof(kContentLengthAfterOrdinary) - 1u]{};
+    __builtin_memcpy(transparent, conn.recv_buf.data(), transparent_len);
+    REQUIRE(apply_request_policy(conn, endpoint, 0));
+    CHECK_EQ(conn.send_buf.len(), 0u);
+    require_wire(transparent, transparent_len);
+}
+
+TEST(request_policy, content_length_after_host_wait_and_rejection_never_touch_upstream) {
+    static constexpr u16 kAfterHost =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+
+    auto dispatch = [&](const char* request, u16 policy_id) -> Connection* {
+        auto* conn = loop.alloc_conn();
+        if (conn == nullptr) return nullptr;
+        const u32 request_len = static_cast<u32>(strlen(request));
+        if (conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len) !=
+            request_len) {
+            loop.free_conn(*conn);
+            return nullptr;
+        }
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.request_policy_id = policy_id;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        return conn;
+    };
+
+    auto* waiting =
+        dispatch("POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n\r\nA", kAfterHost);
+    REQUIRE(waiting != nullptr);
+    CHECK(waiting->request_policy_body_pending);
+    CHECK_EQ(waiting->upstream_fd, -1);
+    CHECK_FALSE(waiting->upstream_slot_held);
+    CHECK_EQ(waiting->upstream_attempts, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+    loop.free_conn(*waiting);
+
+    const char* rejected[] = {
+        "POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n",
+        "GET /upload HTTP/1.1\r\nHost: client\r\n\r\n",
+    };
+    const u16 rejected_policy[] = {kAfterHost, 3u};
+    for (u32 i = 0; i < 2; ++i) {
+        auto* conn = dispatch(rejected[i], rejected_policy[i]);
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(conn->upstream_attempts, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.free_conn(*conn);
+    }
+}
+
 TEST(target_transform, h1_valid_materialization_reaches_upstream_selection) {
     SmallLoop loop;
     loop.setup();

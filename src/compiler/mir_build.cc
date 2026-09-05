@@ -66,6 +66,9 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
     if (preflight_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
     if (preflight_term_count != 1) return false;
+    if (!response_read_deadline_request_policy_is_admitted(
+            preflight_term->forward_request_policy_id))
+        return false;
 
     const bool complete_buffering = preflight_term->forward_response_buffering ==
                                     ForwardResponseBufferingMode::CompleteContentLength;

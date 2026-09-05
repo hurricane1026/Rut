@@ -3096,6 +3096,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (term.forward_response_read_timeout_seconds != 0 &&
             !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (term.forward_response_read_timeout_seconds != 0 &&
+            !response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (term.forward_response_buffering != ForwardResponseBufferingMode::None) {
@@ -3307,6 +3310,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
     if (timeout_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
     if (timeout_count != 1) return false;
+    if (!response_read_deadline_request_policy_is_admitted(timeout_term->forward_request_policy_id))
+        return false;
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&

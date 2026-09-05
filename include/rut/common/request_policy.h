@@ -10,12 +10,25 @@ namespace rut {
 enum class RequestPolicyId : u16 {
     None = 0,
     Http11FixedStrip = 1,
+    Http11FixedStripContentLengthAfterHost = 2,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,
 };
 
 inline bool request_policy_is_supported(u16 id) {
-    return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+           id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+}
+
+inline bool request_policy_places_content_length_after_host(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+}
+
+// Closed admission set for every response-read-deadline profile. New request
+// policies remain ordinary-forward-only until their timing custody is proven.
+inline bool response_read_deadline_request_policy_is_admitted(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::None) ||
+           id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
 }
 
 // Closed admission set for the bounded complete-content-length response
@@ -27,7 +40,7 @@ inline bool complete_content_length_request_policy_is_admitted(u16 id) {
 }
 
 inline const char* request_policy_version(u16 id) {
-    return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ? "HTTP/1.1" : nullptr;
+    return request_policy_is_supported(id) ? "HTTP/1.1" : nullptr;
 }
 
 }  // namespace rut
