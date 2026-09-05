@@ -1569,11 +1569,15 @@ bool put_pre_route_trace(Writer& writer, ImplicitPreRouteProfile profile) {
            writer.put_lit(kTraceBody, sizeof(kTraceBody) - 1u) && writer.put_cstr("\"\n}) }\n");
 }
 
-bool put_request_policy(Writer& writer) {
+enum class RequestPolicyPlacement : u8 { Legacy, ContentLengthAfterHost };
+
+bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
     return writer.put_cstr("request_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
            writer.put_cstr("            host: \"upstream\",\n") &&
            writer.put_cstr("            connection: \"omit\",\n") &&
+           (placement != RequestPolicyPlacement::ContentLengthAfterHost ||
+            writer.put_cstr("            content_length_position: \"after_host\",\n")) &&
            writer.put_cstr(
                "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
                "\"Upgrade\"]\n") &&
@@ -1628,6 +1632,7 @@ bool put_timeout_failure_policy(Writer& writer, bool suppress_body) {
 bool put_root_forward(Writer& writer,
                       const char* method,
                       u32 method_len,
+                      RequestPolicyPlacement request_policy_placement,
                       bool suppress_body,
                       bool buffered,
                       bool hide_compat_header,
@@ -1637,7 +1642,8 @@ bool put_root_forward(Writer& writer,
            (method_len == 0
                 ? writer.put_cstr("\"/\" {\n")
                 : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
-           writer.put_cstr("    return forward(nginx_upstream, ") && put_request_policy(writer) &&
+           writer.put_cstr("    return forward(nginx_upstream, ") &&
+           put_request_policy(writer, request_policy_placement) &&
            put_response_policy(writer, suppress_body, hide_compat_header) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
            ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
@@ -1652,6 +1658,7 @@ bool put_root_forward(Writer& writer,
 }
 
 bool put_root_forward_action(Writer& writer,
+                             RequestPolicyPlacement request_policy_placement,
                              bool suppress_body,
                              bool buffered,
                              bool hide_compat_header,
@@ -1659,7 +1666,7 @@ bool put_root_forward_action(Writer& writer,
                              u8 timeout_seconds,
                              Str indent) {
     return writer.put(indent) && writer.put_cstr("return forward(nginx_upstream, ") &&
-           put_request_policy(writer) &&
+           put_request_policy(writer, request_policy_placement) &&
            put_response_policy(writer, suppress_body, hide_compat_header) &&
            put_failure_policy(writer, suppress_body, buffered || timeout_present) &&
            ((buffered || timeout_present) ? put_timeout_failure_policy(writer, suppress_body)
@@ -1671,6 +1678,29 @@ bool put_root_forward_action(Writer& writer,
            (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
                      : true) &&
            writer.put_cstr("    )\n");
+}
+
+bool put_root_timeout_head_forward(Writer& writer, bool hide_compat_header, u8 timeout_seconds) {
+    return writer.put_cstr("route HEAD \"/\" {\n") &&
+           writer.put_cstr("    if req.hasContentLength {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::ContentLengthAfterHost,
+                                   true,
+                                   false,
+                                   hide_compat_header,
+                                   true,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    } else {\n") &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   true,
+                                   false,
+                                   hide_compat_header,
+                                   true,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
+           writer.put_cstr("    }\n}\n");
 }
 
 bool put_exact_absolute_redirect(Writer& writer,
@@ -1718,8 +1748,14 @@ bool put_exact_absolute_redirect(Writer& writer,
            writer.put(target_path) && writer.put_cstr("\", body: b\"") &&
            writer.put_lit(body, body_len) && writer.put_cstr("\"})\n") &&
            writer.put_cstr("    } else {\n") &&
-           put_root_forward_action(
-               writer, false, true, false, timeout_present, timeout_seconds, lit_str("        ")) &&
+           put_root_forward_action(writer,
+                                   RequestPolicyPlacement::Legacy,
+                                   false,
+                                   true,
+                                   false,
+                                   timeout_present,
+                                   timeout_seconds,
+                                   lit_str("        ")) &&
            writer.put_cstr("    }\n}\n");
 }
 
@@ -2059,14 +2095,17 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return fail_overflow();
 
     if (is_root) {
-        if (!put_root_forward(writer,
-                              "HEAD",
-                              4,
-                              true,
-                              false,
-                              hide_compat_header,
-                              timeout_present,
-                              timeout_seconds) ||
+        if ((timeout_present
+                 ? !put_root_timeout_head_forward(writer, hide_compat_header, timeout_seconds)
+                 : !put_root_forward(writer,
+                                     "HEAD",
+                                     4,
+                                     RequestPolicyPlacement::Legacy,
+                                     true,
+                                     false,
+                                     hide_compat_header,
+                                     false,
+                                     timeout_seconds)) ||
             (exact_absolute_redirect.value()
                  ? !put_exact_absolute_redirect(writer,
                                                 server.exact_absolute_redirect.path,
@@ -2078,6 +2117,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                  : !put_root_forward(writer,
                                      "GET",
                                      3,
+                                     RequestPolicyPlacement::Legacy,
                                      false,
                                      true,
                                      hide_compat_header,
@@ -2086,6 +2126,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
             !put_root_forward(writer,
                               "",
                               0,
+                              RequestPolicyPlacement::Legacy,
                               false,
                               false,
                               hide_compat_header,
