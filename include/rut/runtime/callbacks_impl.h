@@ -3506,7 +3506,8 @@ void handle_jit_outcome(Loop* loop,
                               outcome.request_policy_id) &&
                               request_body_state == RequestPolicyBodyState::Complete
                         : outcome.request_policy_id == 0 ||
-                              (request_policy_is_supported(outcome.request_policy_id) &&
+                              (response_read_deadline_request_policy_is_admitted(
+                                   outcome.request_policy_id) &&
                                request_body_state == RequestPolicyBodyState::Complete);
                 if (!loop_supports_deadline || !deadline_phase_valid ||
                     conn.response_read_deadline_owner_generation == 0 ||
@@ -5116,6 +5117,8 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (!req.has_content_length ||
         req.content_length > conn.recv_buf.capacity() - parser.header_end)
         return RequestPolicyBodyState::Invalid;
+    if (request_policy_places_content_length_after_host(policy_id) && req.content_length == 0)
+        return RequestPolicyBodyState::Invalid;
     const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
     if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
     if (conn.recv_buf.len() < required) return RequestPolicyBodyState::Waiting;
@@ -5214,6 +5217,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (!append_lit("Host: ", 6) ||
         !append(reinterpret_cast<const u8*>(authority), authority_len) || !append_lit("\r\n", 2))
         return false;
+    const bool content_length_after_host =
+        request_policy_places_content_length_after_host(policy_id);
+    if (content_length_after_host && req.has_content_length &&
+        (!append_lit("Content-Length: ", 16) || !append_dec(body_len) || !append_lit("\r\n", 2)))
+        return false;
 
     const u8* hs = line_end + 2;
     const u8* header_end = end - 2;
@@ -5231,7 +5239,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                           request_policy_name_eq(hs, name_len, "expect", 6) ||
                           request_policy_name_eq(hs, name_len, "upgrade", 7) ||
                           request_policy_name_eq(hs, name_len, "transfer-encoding", 17);
-        if (is_cl) {
+        if (is_cl && !content_length_after_host) {
             if (!append_lit("Content-Length: ", 16) || !append_dec(body_len) ||
                 !append_lit("\r\n", 2))
                 return false;
@@ -7883,7 +7891,7 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
         (conn.req_body_mode != BodyMode::None && conn.req_body_mode != BodyMode::ContentLength) ||
         conn.recv_buf.len() != conn.req_initial_send_len)
         return false;
-    return request_policy_is_supported(conn.request_policy_id);
+    return conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
 }
 
 // Check immediately before strict response headers are committed. The body

@@ -33063,6 +33063,107 @@ route GET "/" {
     }
 }
 
+TEST(frontend, request_policy_content_length_position_selects_id_after_complete_object) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route POST "/legacy" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+route POST "/after" {
+    return forward(backend, request_policy: {
+        content_length_position: "after_host", strip_headers: ["Connection", "Keep-Alive",
+            "TE", "Expect", "Upgrade"], connection: "omit", host: "upstream",
+        version: "HTTP/1.1"
+    })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(ast->items[2].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    for (u32 i = 0; i < 2; i++) {
+        const auto* ret = find_first_op(rir.module.functions[i], rir::Opcode::RetForward);
+        REQUIRE(ret != nullptr);
+        REQUIRE_EQ(ret->operand_count, 2u);
+        const auto policy = ret->operand(1);
+        const auto& value = rir.module.functions[i].values[policy.id];
+        auto& constant = rir.module.functions[i].blocks[value.def_block.id].insts[value.def_inst];
+        REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+        CHECK_EQ(constant.imm.i32_val, static_cast<i32>(i + 1));
+    }
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    const char* invalid[] = {
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"before_host\" }) }\n",
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"after_host\", content_length_position: "
+        "\"after_host\" }) }\n",
+    };
+    for (const char* bad : invalid) {
+        lexed = lex(lit(bad));
+        REQUIRE(lexed);
+        auto rejected = parse_file_heap(lexed.value());
+        CHECK_FALSE(rejected.has_value());
+    }
+
+    const char timeout[] = R"rut(
+upstream b
+route POST "/" {
+    return forward(b, request_policy: { version: "HTTP/1.1", host: "upstream",
+        connection: "omit", content_length_position: "after_host",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_read_timeout: 1s)
+}
+)rut";
+    lexed = lex(lit(timeout));
+    REQUIRE(lexed);
+    auto timeout_ast = parse_file_heap(lexed.value());
+    REQUIRE(timeout_ast);
+    auto timeout_hir = analyze_file_heap(timeout_ast.value());
+    REQUIRE_FALSE(timeout_hir.has_value());
+    CHECK(timeout_hir.error().detail.eq(
+        lit("request policy is not admitted to response read timeout")));
+
+    CHECK(request_policy_is_supported(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(complete_content_length_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(request_policy_is_supported(3));
+}
+
 TEST(frontend, request_policy_rejects_response_mutation_combination) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"

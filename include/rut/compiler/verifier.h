@@ -1194,6 +1194,10 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 const bool duration = response_read_timeout_seconds_valid(
                     mod.policy_bundles[bundle_id - 1].response_read_timeout_seconds);
                 if (!duration) continue;
+                if (!response_read_deadline_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
