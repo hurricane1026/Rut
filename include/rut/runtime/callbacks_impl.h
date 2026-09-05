@@ -10066,11 +10066,6 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
-    const bool precise_fixed_upload_head_candidate =
-        configured_head_candidate && explicit_route_method == kRouteMethodHead &&
-        conn.request_policy_id ==
-            static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
-        explicit_upload.request_policy_id == conn.request_policy_id;
     bool exact_terminal_response_recv = false;
     if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
                       candidate->current_terminal_response_recv_is_exact(
@@ -10084,6 +10079,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                                           explicit_profile,
                                                           explicit_method,
                                                           explicit_upload.upload_episode);
+    }
+    bool precise_fixed_upload_head_candidate = false;
+    if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                      candidate->current_positive_response_read_uses_precise_timer(
+                          c, event, bool{});
+                  }) {
+        precise_fixed_upload_head_candidate =
+            configured_head_candidate && loop->current_positive_response_read_uses_precise_timer(
+                                             conn, ev, exact_terminal_response_recv);
     }
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
@@ -10128,18 +10132,26 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
         else {
-            // A positive terminal record has consumed the only proven Recv
-            // owner.  Incomplete headers cannot be reclassified as a configured
-            // response and cannot continue from an inferred owner.
-            if (exact_terminal_response_recv) {
-                disarm_explicit_deadline();
-                loop->close_conn(conn);
+            // This exact ID2 profile retains a proven incomplete prefix without
+            // moving the original timer origin. A terminal CQE first acquires a
+            // replacement Recv; F_MORE retains its live owner. Whole-batch
+            // settlement publishes the copy ledger only after that succeeds.
+            if (precise_fixed_upload_head_candidate) {
+                if constexpr (requires(Loop* candidate, Connection& c, const IoEvent& event) {
+                                  candidate->continue_response_read_deadline_after_incomplete(
+                                      c, event);
+                              }) {
+                    conn.response_read_deadline_first_batch = false;
+                    if (!loop->continue_response_read_deadline_after_incomplete(conn, ev))
+                        loop->close_conn(conn);
+                } else {
+                    loop->close_conn(conn);
+                }
                 return;
             }
-            // This precise fixed-upload slice has evidence only for a silent
-            // origin. Positive bytes that still do not complete the response
-            // header must not acquire progress, refresh, or a guessed 504.
-            if (precise_fixed_upload_head_candidate) {
+            // Every other terminal incomplete response has consumed its only
+            // proven Recv owner and remains fail-closed.
+            if (exact_terminal_response_recv) {
                 disarm_explicit_deadline();
                 loop->close_conn(conn);
                 return;
