@@ -3,6 +3,7 @@
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
 #include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "rut/runtime/cache_table.h"
@@ -4983,6 +4984,200 @@ TEST(serve_loader, verified_deferred_preflight_route_owns_identity_after_compile
     CHECK(program.config.redirect_policies[0].static_authority.eq({"redirect.example", 16}));
     CHECK(program.config.redirect_policies[0].target_path.eq({"/new", 4}));
     CHECK(program.config.redirect_policies[0].body.eq({"fixed", 5}));
+    program.destroy();
+}
+
+TEST(serve_loader, verified_request_framing_selection_publishes_only_through_public_jit) {
+    const std::string path = write_file(
+        "/tmp/rut_serve_loader_framing_selection", "app.rut", kFramingSelectionPreflightSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    const auto& function = program.rir.module.functions[0];
+    const auto& route = program.config.routes[0];
+    CHECK_EQ(function.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.method, kRouteMethodHead);
+    REQUIRE(route.fn != nullptr);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::None);
+
+    auto native = std::make_unique<RouteConfig>();
+    REQUIRE(native->add_response_policy(program.config.response_policies[0]) == 1u);
+    REQUIRE(native->add_failure_policy(program.config.failure_policies[0]) == 1u);
+    REQUIRE(native->add_failure_policy(program.config.failure_policies[1]) == 2u);
+    REQUIRE(native->add_policy_bundle(1, 1, 2, 1, ForwardResponseBufferingMode::None) == 1u);
+    CHECK_FALSE(native->add_jit_handler("/one",
+                                        kRouteMethodHead,
+                                        route.fn,
+                                        false,
+                                        ForwardPreflightMode::AfterRequestFramingSelection,
+                                        1));
+
+    static constexpr u8 kNoContentLengthRequest[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    static constexpr char kNoContentLengthUpstream[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: one\r\n\r\n";
+    static constexpr u8 kContentLengthPrefix[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+    static constexpr u8 kBody[] = {
+        0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    static constexpr char kContentLengthUpstream[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 12\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n";
+
+    const auto run_runtime_case = [&](const u8* prefix,
+                                      u32 prefix_len,
+                                      const u8* body,
+                                      u32 initial_body_len,
+                                      const char* expected_head,
+                                      u32 expected_head_len,
+                                      RequestPolicyId expected_policy,
+                                      ResponseReadDeadlineProfile expected_profile) {
+        ScopedPublicIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        const RouteConfig* active = &program.config;
+        loop->config_ptr = &active;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        conn->fd = downstream[0];
+        REQUIRE_EQ(conn->recv_buf.write(prefix, prefix_len), prefix_len);
+        if (body != nullptr && initial_body_len != 0)
+            REQUIRE_EQ(conn->recv_buf.write(body, initial_body_len), initial_body_len);
+        const u32 free_top_before = loop->free_top;
+        const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 backend_pending_before = loop->backend.pending;
+        const auto restore_ring = [&]() {
+            __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+            loop->backend.pending = backend_pending_before;
+        };
+
+        on_header_received<IoUringEventLoop>(
+            loop,
+            *conn,
+            {conn->id, static_cast<i32>(conn->recv_buf.len()), 0, 0, IoEventType::Recv, 1});
+        REQUIRE_EQ(conn->request_policy_id, static_cast<u16>(expected_policy));
+        REQUIRE_EQ(conn->response_read_deadline_profile, expected_profile);
+        if (body != nullptr && initial_body_len < sizeof(kBody)) {
+            REQUIRE(conn->request_policy_body_pending);
+            REQUIRE_EQ(conn->req_body_remaining, sizeof(kBody) - initial_body_len);
+            REQUIRE(conn->recv_armed);
+            REQUIRE_EQ(conn->pending_ops, 1u);
+            REQUIRE_EQ(conn->upstream_fd, -1);
+            REQUIRE_FALSE(conn->upstream_connect_armed);
+            REQUIRE_FALSE(conn->upstream_send_armed);
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
+            REQUIRE_EQ(
+                conn->recv_buf.write(body + initial_body_len, sizeof(kBody) - initial_body_len),
+                sizeof(kBody) - initial_body_len);
+            restore_ring();
+            loop->dispatch({conn->id,
+                            static_cast<i32>(sizeof(kBody) - initial_body_len),
+                            0,
+                            0,
+                            IoEventType::Recv,
+                            0,
+                            0,
+                            0});
+        }
+
+        REQUIRE_FALSE(conn->request_policy_body_pending);
+        REQUIRE(conn->upstream_connect_armed);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        const u32 body_len = body == nullptr ? 0u : static_cast<u32>(sizeof(kBody));
+        REQUIRE_EQ(conn->recv_buf.len(), expected_head_len + body_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected_head, expected_head_len), 0);
+        if (body != nullptr)
+            CHECK_EQ(__builtin_memcmp(conn->recv_buf.data() + expected_head_len, body, body_len),
+                     0);
+
+        const u32 episode = conn->upstream_episode;
+        restore_ring();
+        loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        const auto& send = loop->backend.upstream_send_state[conn->id];
+        REQUIRE_EQ(send.remaining, expected_head_len + body_len);
+        CHECK_EQ(__builtin_memcmp(send.src, conn->recv_buf.data(), send.remaining), 0);
+        loop->backend.upstream_send_state[conn->id].offset = send.remaining;
+        loop->backend.upstream_send_state[conn->id].remaining = 0;
+        restore_ring();
+        loop->dispatch({conn->id,
+                        static_cast<i32>(expected_head_len + body_len),
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        0,
+                        episode});
+        REQUIRE(conn->upstream_recv_armed);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+
+        const u32 conn_id = conn->id;
+        const bool downstream_recv_armed = conn->recv_armed;
+        const bool precise_timer_armed =
+            conn->response_read_timer_phase == ResponseReadTimerPhase::Armed;
+        const u32 precise_timer_generation = conn->response_read_timer_owner_generation;
+        loop->close_conn(*conn);
+        restore_ring();
+        loop->dispatch({conn_id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
+        loop->dispatch({conn_id,
+                        -ECANCELED,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamCloseCancelAux,
+                        episode});
+        if (downstream_recv_armed) {
+            loop->dispatch({conn_id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+            loop->dispatch({conn_id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+        }
+        if (precise_timer_armed) {
+            IoEvent target{};
+            target.conn_id = conn_id;
+            target.type = IoEventType::ResponseReadTimer;
+            target.result = -ECANCELED;
+            target.non_upstream_generation = precise_timer_generation;
+            loop->dispatch(target);
+            IoEvent cancel = target;
+            cancel.result = 0;
+            cancel.non_upstream_generation = precise_timer_generation | kResponseReadTimerCancelBit;
+            loop->dispatch(cancel);
+        }
+        REQUIRE_EQ(loop->conns[conn_id].pending_ops, 0u);
+        REQUIRE_EQ(loop->free_top, free_top_before + 1u);
+        close(downstream[1]);
+    };
+
+    run_runtime_case(kNoContentLengthRequest,
+                     sizeof(kNoContentLengthRequest) - 1u,
+                     nullptr,
+                     0,
+                     kNoContentLengthUpstream,
+                     sizeof(kNoContentLengthUpstream) - 1u,
+                     RequestPolicyId::Http11FixedStrip,
+                     ResponseReadDeadlineProfile::HeaderOnlyHead);
+    run_runtime_case(kContentLengthPrefix,
+                     sizeof(kContentLengthPrefix) - 1u,
+                     kBody,
+                     5,
+                     kContentLengthUpstream,
+                     sizeof(kContentLengthUpstream) - 1u,
+                     RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                     ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
+
+    program.rir.destroy();
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode,
+             ForwardPreflightMode::AfterRequestFramingSelection);
     program.destroy();
 }
 

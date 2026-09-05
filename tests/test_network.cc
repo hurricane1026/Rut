@@ -29676,6 +29676,110 @@ bool add_response_read_deadline_bundle(RouteConfig& config, u8 seconds = 5) {
            config.add_policy_bundle(1, 1, 2, seconds) == 2;
 }
 
+TEST(response_read_deadline_request_framing_selection,
+     distinct_runtime_gate_binds_selected_policy_to_actual_framing) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodHead, &response_read_deadline_fixed_upload_handler, false, 2));
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
+    const RouteEntry& route = config.routes[0];
+
+    auto check = [&](const char* request, RequestPolicyId expected_policy, bool valid) {
+        SmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 len = static_cast<u32>(__builtin_strlen(request));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), len), len);
+        capture_request_metadata(*conn);
+        conn->request_config = &config;
+        REQUIRE(
+            deferred_request_framing_selection_route_is_valid(*conn, &route, &config, route.fn));
+        REQUIRE(deferred_canonical_selection_state_is_neutral(*conn));
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.request_policy_id = static_cast<u16>(expected_policy);
+        outcome.policy_bundle_id = 2;
+        CHECK_EQ(deferred_request_framing_selection_outcome_is_valid(*conn, route, outcome), valid);
+        outcome.request_policy_id =
+            expected_policy == RequestPolicyId::Http11FixedStrip
+                ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
+                : static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        CHECK_FALSE(deferred_request_framing_selection_outcome_is_valid(*conn, route, outcome));
+        outcome.request_policy_id = static_cast<u16>(expected_policy);
+        outcome.policy_bundle_id = 1;
+        CHECK_FALSE(deferred_request_framing_selection_outcome_is_valid(*conn, route, outcome));
+        conn->response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        CHECK_FALSE(deferred_canonical_selection_state_is_neutral(*conn));
+    };
+
+    check("HEAD /one HTTP/1.1\r\nHost: client\r\nContent-Length: 12\r\n\r\nhello",
+          RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+          true);
+    check("HEAD /one HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n",
+          RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+          true);
+    check("HEAD /one HTTP/1.1\r\nHost: client\r\n\r\n", RequestPolicyId::Http11FixedStrip, true);
+    check("HEAD /one HTTP/1.1\r\nHost: client\r\nTransfer-Encoding: chunked\r\n\r\n",
+          RequestPolicyId::Http11FixedStrip,
+          false);
+
+    enum class DispatchForgery : u8 { SelectedPolicy, SelectedBundle, State };
+    for (const DispatchForgery forgery : {DispatchForgery::SelectedPolicy,
+                                          DispatchForgery::SelectedBundle,
+                                          DispatchForgery::State}) {
+        SmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 conn_id = conn->id;
+        static constexpr char kRequest[] = "HEAD /one HTTP/1.1\r\nHost: client\r\n\r\n";
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+            sizeof(kRequest) - 1u);
+        capture_request_metadata(*conn);
+        conn->request_config = &config;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        outcome.policy_bundle_id = 2;
+        if (forgery == DispatchForgery::SelectedPolicy)
+            outcome.request_policy_id =
+                static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+        if (forgery == DispatchForgery::SelectedBundle) outcome.policy_bundle_id = 1;
+        if (forgery == DispatchForgery::State)
+            conn->response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, route.fn, true, &route);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+        const Connection& closed = loop.conns[conn_id];
+        CHECK_EQ(closed.response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK(closed.response_read_timer_owner_is_neutral());
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_FALSE(closed.upstream_connect_armed);
+        CHECK_FALSE(closed.upstream_send_armed);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    }
+
+    config.routes[0].method = kRouteMethodAny;
+    Connection neutral{};
+    neutral.request_config = &config;
+    CHECK_FALSE(deferred_request_framing_selection_route_is_valid(
+        neutral, &config.routes[0], &config, config.routes[0].fn));
+    config.routes[0].method = kRouteMethodHead;
+    config.routes[0].preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(deferred_request_framing_selection_route_is_valid(
+        neutral, &config.routes[0], &config, config.routes[0].fn));
+}
+
 bool add_bodyless_non_head_response_read_deadline_bundle(
     RouteConfig& config,
     u8 seconds = 5,
