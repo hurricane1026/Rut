@@ -2106,6 +2106,11 @@ struct Recorder {
     // accepted origin episode stalls; the fresh second episode follows the
     // ordinary configured response path and remains open until peer retirement.
     bool zero_response_stall_first_only = false;
+    // Separate default-off two-request mode: request 1 waits for a test permit,
+    // publishes exactly response_fragment_bytes[0], and remains open until the
+    // proxy retires it. Request 2 follows the ordinary response path.
+    bool permit_gated_incomplete_first_response = false;
+    std::atomic<u64> incomplete_first_request_completed_ns{0};
     std::atomic<bool> zero_response_stall_ready{false};
     std::atomic<u64> zero_response_stall_started_ns{0};
     std::atomic<bool> zero_response_stall_peer_closed{false};
@@ -2218,13 +2223,24 @@ struct Recorder {
             if (complete) {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
+                const bool incomplete_progress_this_response =
+                    self->permit_gated_incomplete_first_response && self->history.size() == 1u;
+                if (incomplete_progress_this_response) {
+                    const u64 completed_ns =
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+                    self->incomplete_first_request_completed_ns.store(completed_ns,
+                                                                      std::memory_order_relaxed);
+                }
                 self->requests.fetch_add(1, std::memory_order_release);
                 const bool stall_this_response =
                     self->zero_response_stall ||
                     (self->zero_response_stall_first_only && self->history.size() == 1u);
                 const bool wait_complete_response_peer_close =
                     self->wait_response_peer_close ||
-                    (self->zero_response_stall_first_only && self->history.size() == 2u);
+                    (self->zero_response_stall_first_only && self->history.size() == 2u) ||
+                    (self->permit_gated_incomplete_first_response && self->history.size() <= 2u);
                 if (stall_this_response) {
                     const u64 started_ns =
                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2273,6 +2289,23 @@ struct Recorder {
                     if (!observed && self->running.load(std::memory_order_acquire)) {
                         self->zero_response_stall_observation_failed.store(
                             true, std::memory_order_release);
+                    }
+                } else if (incomplete_progress_this_response) {
+                    while (self->running.load(std::memory_order_acquire) &&
+                           self->response_fragment_permit.load(std::memory_order_acquire) == 0u)
+                        usleep(1000);
+                    response_sent = self->running.load(std::memory_order_acquire) &&
+                                    send_all(client,
+                                             self->response_fragment_bytes[0],
+                                             self->response_fragment_lengths[0]);
+                    if (response_sent) {
+                        const u64 sent_ns = static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+                        self->response_fragment_sent_ns[0].store(sent_ns,
+                                                                 std::memory_order_relaxed);
+                        self->response_fragments_sent.store(1u, std::memory_order_release);
                     }
                 } else if (self->permit_gated_complete_response) {
                     response_sent = true;
@@ -2425,6 +2458,9 @@ struct Recorder {
             (zero_response_stall && response_override != nullptr) ||
             ((zero_response_stall || zero_response_stall_first_only) &&
              (wait_response_peer_close || permit_gated_complete_response ||
+              gate_incomplete_response_close || permit_gated_incomplete_first_response)) ||
+            (permit_gated_incomplete_first_response &&
+             (wait_response_peer_close || permit_gated_complete_response ||
               gate_incomplete_response_close)))
             return false;
         expected_requests = expected;
@@ -2491,6 +2527,7 @@ struct Recorder {
             zero_response_stall_peer_closed_ns.store(0, std::memory_order_relaxed);
             zero_response_stall_unexpected_data.store(false, std::memory_order_relaxed);
             zero_response_stall_observation_failed.store(false, std::memory_order_relaxed);
+            incomplete_first_request_completed_ns.store(0, std::memory_order_relaxed);
             thread_alive.store(false, std::memory_order_relaxed);
             listener_failed.store(false, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
@@ -55295,6 +55332,498 @@ static bool run_fixed_upload_head_zero_response_timeout_differential(const char*
     return true;
 }
 
+static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const char* rut_path,
+                                                                           std::string& error) {
+    static constexpr char kIncompleteHeader[] =
+        "HTTP/1.1 200 OK\r\n"
+        "X-Progress: fixed-head\r\n";
+    static_assert(sizeof(kIncompleteHeader) - 1u == 41u);
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error =
+            "#270 fixed-upload HEAD incomplete-progress differential requires an executable RUT";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error =
+            "#270 fixed-upload HEAD incomplete-progress differential lacked isolated temp trees";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (u32 index = 0u; index < 4u; index++) {
+        if (!reservations.reserve(index, ports[index])) {
+            error =
+                "#270 fixed-upload HEAD incomplete-progress differential could not hold four ports";
+            return false;
+        }
+        for (u32 previous = 0u; previous < index; previous++) {
+            if (ports[index] == ports[previous]) {
+                error = "#270 fixed-upload HEAD incomplete-progress differential reused a port";
+                return false;
+            }
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    std::string generated_source;
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        !build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        generated_source.find("nginx.conf") != std::string::npos ||
+        generated_source.find("nginx::") != std::string::npos ||
+        generated_source.find("nginx_compat") != std::string::npos ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty())
+            error =
+                "#270 fixed-upload HEAD incomplete-progress differential could not persist inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    for (u32 side = 0u; side < 2u; side++) {
+        origins[side].read_exact_content_length_12_body = true;
+        origins[side].permit_gated_incomplete_first_response = true;
+        origins[side].response_fragment_bytes[0] = kIncompleteHeader;
+        origins[side].response_fragment_lengths[0] = sizeof(kIncompleteHeader) - 1u;
+        origins[side].observe_extra_requests_until_stop = true;
+        const u32 backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#270 fixed-upload HEAD incomplete-progress origin bind",
+                                        error) ||
+            !origins[side].setup(
+                ports[backend], 2u, kHeadBackendResponse, sizeof(kHeadBackendResponse) - 1u - 5u)) {
+            if (error.empty())
+                error = "#270 fixed-upload HEAD incomplete-progress origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#270 fixed-upload HEAD incomplete-progress origins were not live before handoff";
+        return false;
+    }
+
+    const std::string container_name =
+        "rut-nginx-270-fixed-upload-head-progress-" + std::to_string(getpid());
+    PinnedNginxDockerLifecycle nginx(container_name, temps[0], error);
+    ChildGuard rut;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#270 fixed-upload progress nginx bind", error) ||
+        !nginx.start(ports[0])) {
+        if (error.empty())
+            error = "#270 fixed-upload progress pinned nginx failed before readiness";
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#270 fixed-upload progress RUT bind", error) ||
+        !spawn_child(
+            {rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+            temps[1].rut_log,
+            rut.child) ||
+        !wait_ready(ports[2], rut.child, error)) {
+        if (error.empty())
+            error = "#270 fixed-upload progress generated RUT failed before readiness";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temps[1].source + " (opt O2)\n";
+    const std::string listening =
+        "Listening on port " + std::to_string(ports[2]) + " with 1 shard(s)\n";
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temps[1].rut_log, loaded.c_str()) ||
+            !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+            !log_contains(temps[1].rut_log, listening.c_str())) &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(rut.child)) {
+            error = "#270 fixed-upload progress generated RUT exited before O2/io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (nginx.cli().pid <= 0 || rut.child.pid <= 0 || nginx.cli().pid == rut.child.pid ||
+        !log_contains(temps[1].rut_log, loaded.c_str()) ||
+        !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+        !log_contains(temps[1].rut_log, listening.c_str())) {
+        error = "#270 fixed-upload progress lacked independent public frontend readiness";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(nginx.cli()) && !poll_child(rut.child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    clients.fds[0] = connect_once(ports[0]);
+    clients.fds[1] = connect_once(ports[2]);
+    const std::vector<char> request1_prefix = fixed_upload_head_timeout_request_prefix(false);
+    const std::vector<char> request_suffix = fixed_upload_head_request_suffix();
+    if (clients.fds[0] < 0 || clients.fds[1] < 0 || request1_prefix.empty() ||
+        request_suffix.empty() ||
+        !send_all(clients.fds[0], request1_prefix.data(), request1_prefix.size()) ||
+        !send_all(clients.fds[1], request1_prefix.data(), request1_prefix.size())) {
+        error = "#270 fixed-upload progress clients could not send request-1 five-byte prefixes";
+        return false;
+    }
+    const auto upload_gate_started = std::chrono::steady_clock::now();
+    const auto upload_gate_deadline = upload_gate_started + std::chrono::milliseconds(1200);
+    while (std::chrono::steady_clock::now() < upload_gate_deadline) {
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[0].requests.load(std::memory_order_acquire) != 0u ||
+            origins[1].requests.load(std::memory_order_acquire) != 0u ||
+            origins[0].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[1].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty() ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+            if (error.empty()) error = "#270 fixed-upload progress observed pre-completion effects";
+            return false;
+        }
+    }
+    if (!send_all(clients.fds[0], request_suffix.data(), request_suffix.size()) ||
+        !send_all(clients.fds[1], request_suffix.data(), request_suffix.size())) {
+        error = "#270 fixed-upload progress could not publish request-1 seven-byte suffixes";
+        return false;
+    }
+
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((origins[0].requests.load(std::memory_order_acquire) < 1u ||
+            origins[1].requests.load(std::memory_order_acquire) < 1u) &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload progress lost liveness before both requests completed";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 request_complete_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        request_complete_ns[side] =
+            origins[side].incomplete_first_request_completed_ns.load(std::memory_order_acquire);
+        const std::vector<char> expected =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], false);
+        if (request_complete_ns[side] == 0u ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].history.size() != 1u || origins[side].history[0] != expected ||
+            origins[side].request != expected ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[side].response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+            origins[side].response_send_succeeded.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload progress did not publish exact request 1 before response";
+            return false;
+        }
+    }
+
+    bool fragment_released[2]{};
+    while (!fragment_released[0] || !fragment_released[1]) {
+        const u64 now_ns = steady_now_ns();
+        for (u32 side = 0u; side < 2u; side++) {
+            if (!fragment_released[side] && now_ns >= request_complete_ns[side] + 400'000'000ull) {
+                origins[side].response_fragment_permit.store(1u, std::memory_order_release);
+                fragment_released[side] = true;
+            }
+        }
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload progress lost liveness before fragment release";
+            return false;
+        }
+        usleep(1000);
+    }
+    const auto fragment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while ((origins[0].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
+            origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u) &&
+           std::chrono::steady_clock::now() < fragment_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload progress lost liveness before fragment publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 fragment_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        fragment_sent_ns[side] =
+            origins[side].response_fragment_sent_ns[0].load(std::memory_order_acquire);
+        std::string detail;
+        if (origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            fragment_sent_ns[side] < request_complete_ns[side] ||
+            fragment_sent_ns[side] - request_complete_ns[side] < 350'000'000ull ||
+            fragment_sent_ns[side] - request_complete_ns[side] >= 650'000'000ull ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !origins[side].response_sent_open.load(std::memory_order_acquire) ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 100, detail)) {
+            error = "#270 fixed-upload progress fragment timing/quiet evidence failed: " + detail;
+            return false;
+        }
+    }
+
+    std::vector<char> first_response[2];
+    u64 first_byte_ns[2]{};
+    if (!read_paired_timed_head_responses(clients.fds, first_response, first_byte_ns, error)) {
+        if (error.empty()) error = "#270 fixed-upload progress could not read paired 504 responses";
+        return false;
+    }
+    std::vector<char> first_normalized[2] = {first_response[0], first_response[1]};
+    const std::vector<char> expected_504(kKeepAliveTimeoutHeadResponseNormalized,
+                                         kKeepAliveTimeoutHeadResponseNormalized +
+                                             sizeof(kKeepAliveTimeoutHeadResponseNormalized) - 1u);
+    u64 elapsed_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (first_byte_ns[side] < request_complete_ns[side]) {
+            error = "#270 fixed-upload progress downstream preceded its completed origin request";
+            return false;
+        }
+        elapsed_ns[side] = first_byte_ns[side] - request_complete_ns[side];
+        if (first_byte_ns[side] < fragment_sent_ns[side]) {
+            error = "#270 fixed-upload progress downstream preceded its origin fragment";
+            return false;
+        }
+        std::string detail;
+        const u64 fragment_elapsed_ns = first_byte_ns[side] - fragment_sent_ns[side];
+        const std::string response_text(first_response[side].begin(), first_response[side].end());
+        if (elapsed_ns[side] < 750'000'000ull || elapsed_ns[side] >= 1'250'000'000ull ||
+            fragment_elapsed_ns < 100'000'000ull || fragment_elapsed_ns >= 850'000'000ull ||
+            !validate_exact_normalized_response(
+                first_response[side], kKeepAliveTimeoutHeadResponseNormalized, detail) ||
+            !normalize_date(first_normalized[side]) || first_normalized[side] != expected_504 ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            response_text.find("X-Progress") != std::string::npos ||
+            response_text.find("fixed-head") != std::string::npos ||
+            response_text.find("502") != std::string::npos ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 150, detail)) {
+            error = "#270 fixed-upload progress timing/exact 162-byte keep-alive 504 mismatch: " +
+                    detail;
+            return false;
+        }
+    }
+    if (first_normalized[0] != first_normalized[1]) {
+        error = "#270 fixed-upload progress Date-normalized nginx/RUT 504 wires differed";
+        return false;
+    }
+    const u64 timeout_delta = elapsed_ns[0] > elapsed_ns[1] ? elapsed_ns[0] - elapsed_ns[1]
+                                                            : elapsed_ns[1] - elapsed_ns[0];
+    if (timeout_delta > 350'000'000ull) {
+        error = "#270 fixed-upload progress nginx/RUT timeout delta exceeded 350ms";
+        return false;
+    }
+
+    const auto retirement_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!origins[0].response_peer_closed.load(std::memory_order_acquire) ||
+            !origins[1].response_peer_closed.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < retirement_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload progress lost liveness before origin-1 retirement";
+            return false;
+        }
+        usleep(1000);
+    }
+    for (u32 side = 0u; side < 2u; side++) {
+        const u64 closed_ns = origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+        if (!origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+            origins[side].response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            closed_ns < request_complete_ns[side] ||
+            origins[side].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload progress did not retire exactly one fragmented origin";
+            return false;
+        }
+    }
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[0].requests.load(std::memory_order_acquire) != 1u ||
+            origins[1].requests.load(std::memory_order_acquire) != 1u) {
+            error = "#270 fixed-upload progress observed retry before request 2";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    const std::vector<char> request2_prefix = fixed_upload_head_timeout_request_prefix(true);
+    std::vector<char> request2 = request2_prefix;
+    request2.insert(request2.end(), request_suffix.begin(), request_suffix.end());
+    u64 request2_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (!send_all(clients.fds[side], request2.data(), request2.size())) {
+            error = "#270 fixed-upload progress could not send complete request 2";
+            return false;
+        }
+        request2_sent_ns[side] = steady_now_ns();
+    }
+    std::vector<char> second_response[2];
+    u64 second_first_byte_ns[2]{};
+    if (!read_paired_timed_head_responses(
+            clients.fds, second_response, second_first_byte_ns, error)) {
+        dump_log(temps[1].rut_log, "#270 fixed-upload progress generated RUT log");
+        if (error.empty()) error = "#270 fixed-upload progress could not read paired request-2 200";
+        return false;
+    }
+    const std::vector<char> expected_200(
+        kHeadKeepAliveResponseNormalized,
+        kHeadKeepAliveResponseNormalized + sizeof(kHeadKeepAliveResponseNormalized) - 1u);
+    static_assert(sizeof(kHeadKeepAliveResponseNormalized) - 1u == 121u);
+    for (u32 side = 0u; side < 2u; side++) {
+        std::vector<char> normalized = second_response[side];
+        std::string detail;
+        if (second_first_byte_ns[side] < request2_sent_ns[side] ||
+            second_first_byte_ns[side] - request2_sent_ns[side] >= 750'000'000ull ||
+            !validate_exact_normalized_response(
+                second_response[side], kHeadKeepAliveResponseNormalized, detail) ||
+            !normalize_date(normalized) || normalized != expected_200 ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 150, detail)) {
+            error = "#270 fixed-upload progress request-2 exact prompt keep-alive 200 mismatch: " +
+                    detail;
+            return false;
+        }
+    }
+
+    const auto second_origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((origins[0].requests.load(std::memory_order_acquire) < 2u ||
+            origins[1].requests.load(std::memory_order_acquire) < 2u) &&
+           std::chrono::steady_clock::now() < second_origin_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload progress lost liveness before request-2 origin publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    const auto final_quiet_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < final_quiet_deadline) {
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 2u ||
+                origin.requests.load(std::memory_order_acquire) != 2u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire)) {
+                error =
+                    "#270 fixed-upload progress observed third origin/retry or send-count drift";
+                return false;
+            }
+        }
+        usleep(1000);
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    const bool nginx_clean = nginx.shutdown();
+    const bool rut_clean = stop_child(rut.child) && rut.child.pid < 0 && rut.child.status_valid &&
+                           WIFEXITED(rut.child.status) && WEXITSTATUS(rut.child.status) == 0;
+    if (!nginx_clean || !rut_clean) {
+        error = "#270 fixed-upload progress frontends did not shut down cleanly";
+        return false;
+    }
+    std::string access[2];
+    if (!read_exact_return204_log(temps[0].nginx_access_log,
+                                  "#270 nginx fixed-upload progress access",
+                                  access[0],
+                                  error) ||
+        !read_exact_return204_log(
+            temps[1].rut_access_log, "#270 RUT fixed-upload progress access", access[1], error))
+        return false;
+
+    std::vector<char> canonical_upstream[2][2];
+    for (u32 side = 0u; side < 2u; side++) {
+        const bool live_before_stop =
+            origins[side].running.load(std::memory_order_acquire) &&
+            origins[side].thread_alive.load(std::memory_order_acquire) &&
+            !origins[side].listener_failed.load(std::memory_order_acquire);
+        origins[side].stop();
+        const auto expected_first =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], false);
+        const auto expected_second =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], true);
+        if (!live_before_stop || origins[side].thread_alive.load(std::memory_order_acquire) ||
+            origins[side].listen_fd >= 0 || origins[side].history.size() != 2u ||
+            origins[side].history[0] != expected_first ||
+            origins[side].history[1] != expected_second ||
+            origins[side].request != expected_first ||
+            origins[side].accepted.load(std::memory_order_acquire) != 2u ||
+            origins[side].requests.load(std::memory_order_acquire) != 2u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            !origins[side].response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origins[side].response_connection_closed.load(std::memory_order_acquire) ||
+            origins[side].response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].response_peer_observation_failed.load(std::memory_order_acquire) ||
+            origins[side].zero_response_stall_peer_close_count.load(std::memory_order_acquire) !=
+                0u) {
+            error =
+                "#270 fixed-upload progress final origin wire/count/lifecycle evidence differed";
+            return false;
+        }
+        canonical_upstream[side][0] = origins[side].history[0];
+        canonical_upstream[side][1] = origins[side].history[1];
+        if (!canonicalize_keepalive_timeout_upstream(canonical_upstream[side][0],
+                                                     ports[side * 2u + 1u]) ||
+            !canonicalize_keepalive_timeout_upstream(canonical_upstream[side][1],
+                                                     ports[side * 2u + 1u])) {
+            error = "#270 fixed-upload progress could not canonicalize exact upstream Host";
+            return false;
+        }
+    }
+    const std::string expected_access =
+        std::to_string(request1_prefix.size() + request_suffix.size()) + "\n" +
+        std::to_string(request2.size()) + "\n";
+    if (canonical_upstream[0][0] != canonical_upstream[1][0] ||
+        canonical_upstream[0][1] != canonical_upstream[1][1] || access[0] != expected_access ||
+        access[1] != expected_access || temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = "#270 fixed-upload progress cross-side wire/access/resource evidence differed";
+        return false;
+    }
+    std::cerr << "PASS: #270 fixed-upload HEAD incomplete-progress seconds nginx/RUT="
+              << static_cast<double>(elapsed_ns[0]) / 1e9 << "/"
+              << static_cast<double>(elapsed_ns[1]) / 1e9
+              << " delta=" << static_cast<double>(timeout_delta) / 1e9 << "\n";
+    return true;
+}
+
 static void configure_positive_get_default_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -56166,6 +56695,9 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--fixed-upload-head-success-differential") == 0;
     const bool fixed_upload_head_zero_response_timeout_differential =
         argc == 3 && strcmp(argv[1], "--fixed-upload-head-zero-response-timeout-differential") == 0;
+    const bool fixed_upload_head_incomplete_progress_timeout_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--fixed-upload-head-incomplete-progress-timeout-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -56373,6 +56905,7 @@ int main(int argc, char** argv) {
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
+         !fixed_upload_head_incomplete_progress_timeout_differential &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
@@ -56445,7 +56978,8 @@ int main(int argc, char** argv) {
          argv[2][0] != '/') ||
         ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential ||
           keepalive_timeout_head_differential || fixed_upload_head_success_differential ||
-          fixed_upload_head_zero_response_timeout_differential) &&
+          fixed_upload_head_zero_response_timeout_differential ||
+          fixed_upload_head_incomplete_progress_timeout_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
@@ -56546,6 +57080,9 @@ int main(int argc, char** argv) {
                "--fixed-upload-head-success-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--fixed-upload-head-zero-response-timeout-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--fixed-upload-head-incomplete-progress-timeout-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
@@ -57748,6 +58285,22 @@ int main(int argc, char** argv) {
                      "matched the bounded fixed-positive-CL HEAD zero-response 1s timeout, exact "
                      "header-only keep-alive 504, origin retirement/no retry, and same-downstream "
                      "fresh-origin HEAD 200 control (proxy_read_timeout remains PARTIAL)\n";
+        return 0;
+    }
+    if (fixed_upload_head_incomplete_progress_timeout_differential) {
+        std::string differential_error;
+        if (!run_fixed_upload_head_incomplete_progress_timeout_differential(argv[2],
+                                                                            differential_error)) {
+            std::cerr << "FAIL [#270 fixed-upload HEAD incomplete-progress timeout "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 pinned nginx 1.29.7 and converter-generated ordinary RUT "
+                     "matched the bounded fixed-positive-CL HEAD retained-incomplete-header "
+                     "initial 1s deadline, exact header-only keep-alive 504, origin retirement/no "
+                     "retry, and same-downstream fresh-origin HEAD 200 control "
+                     "(proxy_read_timeout remains PARTIAL)\n";
         return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
