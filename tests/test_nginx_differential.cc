@@ -55563,9 +55563,15 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
     }
     const auto fragment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while ((origins[0].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
-            origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u) &&
+            origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
+            !origins[0].response_sent_open.load(std::memory_order_acquire) ||
+            !origins[1].response_sent_open.load(std::memory_order_acquire) ||
+            !origins[0].response_send_succeeded.load(std::memory_order_acquire) ||
+            !origins[1].response_send_succeeded.load(std::memory_order_acquire)) &&
            std::chrono::steady_clock::now() < fragment_deadline) {
-        if (!frontends_live() || !origins_live()) {
+        if (!frontends_live() || !origins_live() ||
+            origins[0].response_send_failed.load(std::memory_order_acquire) ||
+            origins[1].response_send_failed.load(std::memory_order_acquire)) {
             error = "#270 fixed-upload progress lost liveness before fragment publication";
             return false;
         }
