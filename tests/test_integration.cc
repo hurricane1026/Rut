@@ -30145,6 +30145,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
         u32 health_fails_after_failure[2]{};
         u32 failure_pipeline_depth[2]{};
         u32 failure_pipeline_generation[2]{};
+        u32 failure_handler_generation[2]{};
         u32 failure_proof_generation[2]{};
         u16 failure_request_policy[2]{};
         bool failure_upstream_reused[2]{};
@@ -30235,6 +30236,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
                             self->failure_pipeline_depth[index] = failing.pipeline_depth;
                             self->failure_pipeline_generation[index] =
                                 failing.http1_pipeline_request_generation;
+                            self->failure_handler_generation[index] = failing.handler_gen;
                             self->failure_proof_generation[index] =
                                 failing.response_read_deadline_upload.handler_generation;
                             self->failure_request_policy[index] = failing.request_policy_id;
@@ -30470,7 +30472,10 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     REQUIRE_EQ(runner.health_fails_after_failure[0], 1u);
     REQUIRE_EQ(runner.failure_pipeline_depth[0], 0u);
     REQUIRE_EQ(runner.failure_pipeline_generation[0], 0u);
-    REQUIRE_EQ(runner.failure_proof_generation[0], 0u);
+    // Exact ID1 GET owns a handler-generation proof even without a pipeline
+    // generation; the late successor must later publish its own generation.
+    REQUIRE_NE(runner.failure_handler_generation[0], 0u);
+    REQUIRE_EQ(runner.failure_proof_generation[0], runner.failure_handler_generation[0]);
     REQUIRE_EQ(runner.failure_request_policy[0],
                static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     REQUIRE_FALSE(runner.failure_upstream_reused[0]);
@@ -30656,10 +30661,13 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     CHECK_EQ(runner.health_fails_after_failure[1], 2u);
     CHECK_EQ(runner.failure_pipeline_depth[0], 0u);
     CHECK_EQ(runner.failure_pipeline_generation[0], 0u);
-    CHECK_EQ(runner.failure_proof_generation[0], 0u);
+    CHECK_NE(runner.failure_handler_generation[0], 0u);
+    CHECK_EQ(runner.failure_proof_generation[0], runner.failure_handler_generation[0]);
     CHECK_EQ(runner.failure_pipeline_depth[1], 1u);
     CHECK_NE(runner.failure_pipeline_generation[1], 0u);
     CHECK_EQ(runner.failure_proof_generation[1], runner.failure_pipeline_generation[1]);
+    CHECK_EQ(runner.failure_proof_generation[1], runner.failure_handler_generation[1]);
+    CHECK_NE(runner.failure_proof_generation[0], runner.failure_proof_generation[1]);
     CHECK_EQ(runner.failure_request_policy[0], static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     CHECK_EQ(runner.failure_request_policy[1], static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     CHECK_FALSE(runner.failure_upstream_reused[0]);
