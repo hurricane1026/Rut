@@ -29864,10 +29864,16 @@ TEST(response_read_deadline_request_framing_selection,
         FreshTransport,
         FutureTombstone,
         ActiveConnectOwner,
+        ExcessAttempts,
+        QuarantinedEpisode,
+        ZeroCurrentEpisode,
     };
     for (const RejectedPredecessor predecessor : {RejectedPredecessor::FreshTransport,
                                                   RejectedPredecessor::FutureTombstone,
-                                                  RejectedPredecessor::ActiveConnectOwner}) {
+                                                  RejectedPredecessor::ActiveConnectOwner,
+                                                  RejectedPredecessor::ExcessAttempts,
+                                                  RejectedPredecessor::QuarantinedEpisode,
+                                                  RejectedPredecessor::ZeroCurrentEpisode}) {
         DeferredPreflightMockLoop rejected_loop;
         rejected_loop.setup();
         rejected_loop.config_ptr = &active;
@@ -29881,10 +29887,12 @@ TEST(response_read_deadline_request_framing_selection,
                    sizeof(kRequest) - 1u);
         rejected->upstream_attempts = 1;
         i32 active_upstream_fd = -1;
-        if (predecessor != RejectedPredecessor::FreshTransport)
+        if (predecessor != RejectedPredecessor::FreshTransport) {
             rejected->downstream_completed_request_count = 1;
-        if (predecessor == RejectedPredecessor::FutureTombstone) {
             rejected->upstream_episode = 2;
+            rejected->upstream_retiring_episode = 1;
+        }
+        if (predecessor == RejectedPredecessor::FutureTombstone) {
             rejected->upstream_retiring_episode = 3;
             REQUIRE_FALSE(http1_pipeline_successor_tombstone_is_safe(*rejected));
         } else if (predecessor == RejectedPredecessor::ActiveConnectOwner) {
@@ -29895,6 +29903,21 @@ TEST(response_read_deadline_request_framing_selection,
             rejected->on_upstream_send = &on_upstream_connected<DeferredPreflightMockLoop>;
             rejected->pending_ops = 1;
             REQUIRE_FALSE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::ExcessAttempts) {
+            rejected->upstream_attempts = 2;
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::QuarantinedEpisode) {
+            rejected->upstream_episode_quarantined = true;
+            REQUIRE(valid_upstream_episode(rejected->upstream_episode));
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        } else if (predecessor == RejectedPredecessor::ZeroCurrentEpisode) {
+            rejected->upstream_episode = 0;
+            rejected->upstream_retiring_episode = 0;
+            REQUIRE_FALSE(valid_upstream_episode(rejected->upstream_episode));
+            REQUIRE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+            REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
         }
 
         response_read_deadline_framing_selection_handler_calls = 0;

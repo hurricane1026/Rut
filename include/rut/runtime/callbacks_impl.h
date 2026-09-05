@@ -2090,7 +2090,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // predecessor's episode tombstone and every upstream transport owner are
     // settled.  Fresh transports and ambiguous predecessors retain the value so
     // deferred preflight rejects them as non-neutral.
-    if (conn.downstream_completed_request_count != 0 &&
+    if (conn.downstream_completed_request_count != 0 && conn.upstream_attempts == 1 &&
+        valid_upstream_episode(conn.upstream_episode) && !conn.upstream_episode_quarantined &&
         http1_pipeline_successor_tombstone_is_safe(conn) &&
         http1_pipeline_successor_upstream_owners_are_neutral(conn))
         conn.upstream_attempts = 0;
