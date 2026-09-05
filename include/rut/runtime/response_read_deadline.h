@@ -749,8 +749,12 @@ inline bool response_read_deadline_persistence_owner_is_stable(
 inline bool complete_content_length_request_policy_owner_is_stable(
     const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
     if (response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile)) {
-        return c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
-               proof.request_policy_id == c.request_policy_id;
+        const bool admitted =
+            c.response_read_deadline_profile ==
+                    ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
+                ? fixed_upload_head_request_policy_is_admitted(c.request_policy_id)
+                : c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        return admitted && proof.request_policy_id == c.request_policy_id;
     }
     if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
         return true;
@@ -774,7 +778,9 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
             profile, c.req_method, buffering) ||
         proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
         proof.route_index >= cfg->route_count || proof.upstream_id >= cfg->upstream_count ||
-        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        (profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
+             ? !fixed_upload_head_request_policy_is_admitted(c.request_policy_id)
+             : c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip)) ||
         proof.request_policy_id != c.request_policy_id || proof.route_fn == nullptr ||
         proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
         proof.raw_total_length <= proof.raw_header_end ||

@@ -33164,6 +33164,132 @@ route POST "/" {
     CHECK_FALSE(request_policy_is_supported(3));
 }
 
+TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
+    const auto source_for = [](const char* route) {
+        return std::string("upstream backend at \"127.0.0.1:9000\"\n") + route + R"rut( {
+    return forward(backend,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            content_length_position: "after_host",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current",
+            head_mode: "suppress_body", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", head_mode: "suppress_body", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", head_mode: "suppress_body", body: b"slow" },
+        response_read_timeout: 1s)
+}
+)rut";
+    };
+    constexpr auto kPolicy = RequestPolicyId::Http11FixedStripContentLengthAfterHost;
+
+    for (const auto& test : {
+             std::pair<const char*, u8>{"route HEAD \"/one\"", kRouteMethodHead},
+             std::pair<const char*, u8>{"route \"/one\"", kRouteMethodAny},
+         }) {
+        const std::string source = source_for(test.first);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].method, test.second);
+        CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        CHECK_EQ(mir->functions[0].method, test.second);
+        CHECK_EQ(mir->functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        CHECK_EQ(rir.module.functions[0].http_method, test.second);
+        CHECK_EQ(rir.module.functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::None);
+        rir.destroy();
+    }
+
+    for (const char* rejected_route : {"route POST \"/one\"", "route GET \"/one\""}) {
+        const std::string source = source_for(rejected_route);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+    {
+        std::string source = source_for("route HEAD \"/one\"");
+        const auto timeout = source.find("response_read_timeout: 1s");
+        REQUIRE_NE(timeout, std::string::npos);
+        source.insert(timeout, "response_buffering: \"complete_content_length\",\n        ");
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+
+    const std::string source = source_for("route HEAD \"/one\"");
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    hir->routes[0].method = kRouteMethodPost;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->routes[0].method = kRouteMethodHead;
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    mir->functions[0].method = kRouteMethodPost;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].method = kRouteMethodHead;
+    mir->functions[0].blocks[0].term.forward_request_policy_id = 3;
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].blocks[0].term.forward_request_policy_id = static_cast<u16>(kPolicy);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    auto* ret = find_first_op(fn, rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    const auto request_policy_value = ret->operand(1);
+    const auto& request_policy_def = fn.values[request_policy_value.id];
+    auto& request_policy_const =
+        fn.blocks[request_policy_def.def_block.id].insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    fn.http_method = kRouteMethodPost;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.http_method = kRouteMethodHead;
+    request_policy_const.imm.i32_val = 3;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.imm.i32_val = static_cast<i32>(kPolicy);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    CHECK(fixed_upload_head_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    CHECK(fixed_upload_head_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(0));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(3));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+}
+
 TEST(frontend, request_policy_rejects_response_mutation_combination) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"

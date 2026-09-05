@@ -3498,9 +3498,14 @@ void handle_jit_outcome(Loop* loop,
                         ? outcome.request_policy_id ==
                                   static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
                               request_body_state == RequestPolicyBodyState::Complete
-                    : fixed_upload ? outcome.request_policy_id ==
-                                             static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
-                                         request_body_state != RequestPolicyBodyState::Invalid
+                    : fixed_upload
+                        ? (outcome_profile == ResponseReadDeadlineProfile::
+                                                  FixedContentLengthUploadHeaderOnlyHead
+                               ? fixed_upload_head_request_policy_is_admitted(
+                                     outcome.request_policy_id)
+                               : outcome.request_policy_id ==
+                                     static_cast<u16>(RequestPolicyId::Http11FixedStrip)) &&
+                              request_body_state != RequestPolicyBodyState::Invalid
                     : complete_content_length_buffering
                         ? complete_content_length_request_policy_is_admitted(
                               outcome.request_policy_id) &&
@@ -3611,12 +3616,10 @@ void handle_jit_outcome(Loop* loop,
                 const bool fixed_upload_head_policies_admitted =
                     forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
                     forward_timeout_failure_policy_id != 0 &&
-                    config->response_policies[forward_response_policy_id - 1].head_mode ==
-                        ResponsePolicyHeadMode::SuppressBody &&
-                    config->failure_policies[forward_failure_policy_id - 1].head_mode ==
-                        FailurePolicyHeadMode::SuppressBody &&
-                    config->failure_policies[forward_timeout_failure_policy_id - 1].head_mode ==
-                        FailurePolicyHeadMode::SuppressBody;
+                    fixed_upload_head_timeout_policies_valid(
+                        config->response_policies[forward_response_policy_id - 1],
+                        config->failure_policies[forward_failure_policy_id - 1],
+                        config->failure_policies[forward_timeout_failure_policy_id - 1]);
                 fixed_upload_head_admitted =
                     fixed_upload_head_policies_admitted &&
                     (fixed_upload_head_initial_phase || staged_fixed_head_continuation);
@@ -7891,7 +7894,10 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
         (conn.req_body_mode != BodyMode::None && conn.req_body_mode != BodyMode::ContentLength) ||
         conn.recv_buf.len() != conn.req_initial_send_len)
         return false;
-    return conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    return conn.response_read_deadline_profile ==
+                   ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
+               ? fixed_upload_head_request_policy_is_admitted(conn.request_policy_id)
+               : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
 }
 
 // Check immediately before strict response headers are committed. The body
@@ -8680,7 +8686,10 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                     proof.rewritten_header_end + proof.raw_content_length ||
                 proof.expected_upload_length != proof.rewritten_total_length ||
                 proof.upload_episode != 0 || proof.downstream_close ||
-                conn.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                (fixed_upload_head
+                     ? !fixed_upload_head_request_policy_is_admitted(conn.request_policy_id)
+                     : conn.request_policy_id !=
+                           static_cast<u16>(RequestPolicyId::Http11FixedStrip)) ||
                 !inspect_response_read_deadline_fixed_upload_request(
                     conn,
                     conn.response_read_deadline_profile,

@@ -5051,14 +5051,34 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
     static constexpr char kRewrittenHead[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
         "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+    static constexpr char kRewrittenHeadAfterHost[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 12\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n";
 
-    for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
+    struct Case {
+        u8 route_method;
+        RequestPolicyId request_policy_id;
+    };
+    static constexpr Case kCases[] = {
+        {kRouteMethodHead, RequestPolicyId::Http11FixedStrip},
+        {kRouteMethodAny, RequestPolicyId::Http11FixedStrip},
+        {kRouteMethodHead, RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+        {kRouteMethodAny, RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+    };
+    for (const Case& test : kCases) {
+        const bool content_length_after_host =
+            test.request_policy_id == RequestPolicyId::Http11FixedStripContentLengthAfterHost;
         const std::string route =
-            route_method == kRouteMethodHead ? "route HEAD \"/one\"" : "route \"/one\"";
-        const std::string source = "upstream backend at \"127.0.0.1:9000\"\n" + route + R"rut( {
+            test.route_method == kRouteMethodHead ? "route HEAD \"/one\"" : "route \"/one\"";
+        const std::string content_length_position =
+            content_length_after_host ? "content_length_position: \"after_host\", " : "";
+        const std::string source =
+            "upstream backend at \"127.0.0.1:9000\"\n" + route + R"rut( {
     return forward(backend,
         request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+            )rut" +
+            content_length_position +
+            R"rut(strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
         response_policy: { version: "HTTP/1.1", framing: "content_length",
             connection: "request", server: "source-test", date: "current",
             head_mode: "suppress_body", hide_headers: [] },
@@ -5081,7 +5101,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
         REQUIRE_EQ(program.config.policy_bundle_count, 1u);
 
         const RouteEntry& route_entry = program.config.routes[0];
-        REQUIRE_EQ(route_entry.method, route_method);
+        REQUIRE_EQ(route_entry.method, test.route_method);
         REQUIRE_EQ(route_entry.upstream_id, 0u);
         REQUIRE_EQ(route_entry.action, RouteAction::JitHandler);
         REQUIRE(route_entry.fn != nullptr);
@@ -5120,7 +5140,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
                 }
             }
         }
-        REQUIRE_EQ(request_policy, static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+        REQUIRE_EQ(request_policy, static_cast<i32>(test.request_policy_id));
 
         for (const u32 initial_body_len : {5u, 12u}) {
             ScopedPublicIoUringLoop guard;
@@ -5152,8 +5172,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             REQUIRE_EQ(conn->response_read_deadline_profile,
                        ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead);
             REQUIRE_EQ(conn->response_read_deadline_upload.route_fn, route_entry.fn);
-            REQUIRE_EQ(conn->request_policy_id,
-                       static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+            REQUIRE_EQ(conn->request_policy_id, static_cast<u16>(test.request_policy_id));
             if (initial_body_len == 5u) {
                 REQUIRE(conn->request_policy_body_pending);
                 REQUIRE_EQ(conn->req_body_remaining, 7u);
@@ -5176,18 +5195,22 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             REQUIRE(conn->request_body_fully_buffered);
             REQUIRE(conn->upstream_connect_armed);
             REQUIRE_EQ(conn->pending_ops, 1u);
-            REQUIRE_EQ(conn->recv_buf.len(),
-                       static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
-            CHECK_EQ(__builtin_memcmp(
-                         conn->recv_buf.data(), kRewrittenHead, sizeof(kRewrittenHead) - 1u),
+            REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+            const char* rewritten_head =
+                content_length_after_host ? kRewrittenHeadAfterHost : kRewrittenHead;
+            const u32 rewritten_head_len =
+                static_cast<u32>(content_length_after_host ? sizeof(kRewrittenHeadAfterHost) - 1u
+                                                           : sizeof(kRewrittenHead) - 1u);
+            REQUIRE_EQ(conn->recv_buf.len(), rewritten_head_len + sizeof(kBody));
+            CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), rewritten_head, rewritten_head_len),
                      0);
-            CHECK_EQ(__builtin_memcmp(
-                         conn->recv_buf.data() + sizeof(kRewrittenHead) - 1u, kBody, sizeof(kBody)),
-                     0);
+            CHECK_EQ(
+                __builtin_memcmp(conn->recv_buf.data() + rewritten_head_len, kBody, sizeof(kBody)),
+                0);
             REQUIRE_EQ(conn->response_read_deadline_upload.expected_upload_length,
                        conn->recv_buf.len());
             REQUIRE_EQ(conn->response_read_deadline_upload.request_policy_id,
-                       static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+                       static_cast<u16>(test.request_policy_id));
 
             const u32 episode = conn->upstream_episode;
             REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
@@ -5195,6 +5218,7 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
             REQUIRE(conn->upstream_send_armed);
             REQUIRE_EQ(conn->pending_ops, 1u);
+            REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
             const auto proof = conn->response_read_deadline_upload;
             const auto& send = loop->backend.upstream_send_state[conn->id];
             REQUIRE_EQ(send.remaining, proof.expected_upload_length);

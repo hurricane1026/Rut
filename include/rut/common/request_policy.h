@@ -31,6 +31,13 @@ inline bool response_read_deadline_request_policy_is_admitted(u16 id) {
            id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
 }
 
+// Closed request-policy set for the positive fixed-upload HEAD deadline
+// profile.  ID2 is not admitted by the general deadline predicate above.
+inline bool fixed_upload_head_request_policy_is_admitted(u16 id) {
+    return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+           id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+}
+
 // Closed admission set for the bounded complete-content-length response
 // buffering profile. Keep this separate from request_policy_is_supported():
 // adding a future request policy must not silently widen this profile.

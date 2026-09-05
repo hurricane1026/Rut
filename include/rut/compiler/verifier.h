@@ -1194,11 +1194,28 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 const bool duration = response_read_timeout_seconds_valid(
                     mod.policy_bundles[bundle_id - 1].response_read_timeout_seconds);
                 if (!duration) continue;
+                const auto& policy_bundle = mod.policy_bundles[bundle_id - 1];
+                const bool fixed_upload_head_policy =
+                    policy_bundle.response_buffering == ForwardResponseBufferingMode::None &&
+                    fixed_upload_head_route_method_is_admitted(fn.http_method) &&
+                    fixed_upload_head_request_policy_is_admitted(
+                        static_cast<u16>(request_policy)) &&
+                    policy_bundle.response_policy_id != 0 &&
+                    policy_bundle.response_policy_id <= mod.response_policy_count &&
+                    policy_bundle.failure_policy_id != 0 &&
+                    policy_bundle.failure_policy_id <= mod.failure_policy_count &&
+                    policy_bundle.timeout_failure_policy_id != 0 &&
+                    policy_bundle.timeout_failure_policy_id <= mod.failure_policy_count &&
+                    fixed_upload_head_timeout_policies_valid(
+                        mod.response_policies[policy_bundle.response_policy_id - 1],
+                        mod.failure_policies[policy_bundle.failure_policy_id - 1],
+                        mod.failure_policies[policy_bundle.timeout_failure_policy_id - 1]);
                 if (!response_read_deadline_request_policy_is_admitted(
-                        static_cast<u16>(request_policy)))
+                        static_cast<u16>(request_policy)) &&
+                    !fixed_upload_head_policy)
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
-                const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
+                const auto buffering = policy_bundle.response_buffering;
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
                      !complete_content_length_route_method_is_admitted(fn.http_method) ||

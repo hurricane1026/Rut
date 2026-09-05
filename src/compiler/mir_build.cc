@@ -47,6 +47,26 @@ static Str match_default_label() {
     return {"match_default", 13};
 }
 
+static bool response_read_deadline_request_policy_is_admitted_for_term(const MirModule& module,
+                                                                       const MirFunction& function,
+                                                                       const MirTerminator& term) {
+    if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+        return true;
+    return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           fixed_upload_head_route_method_is_admitted(function.method) &&
+           fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
+           term.forward_response_policy_id != 0 &&
+           term.forward_response_policy_id <= module.response_policies.len &&
+           term.forward_failure_policy_id != 0 &&
+           term.forward_failure_policy_id <= module.failure_policies.len &&
+           term.forward_timeout_failure_policy_id != 0 &&
+           term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+           fixed_upload_head_timeout_policies_valid(
+               module.response_policies[term.forward_response_policy_id - 1],
+               module.failure_policies[term.forward_failure_policy_id - 1],
+               module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
+
 // HIR -> MIR trust boundary. Inspect the fully built MIR rather than trusting
 // the HIR marker, including every timeout-bearing terminal and every field of
 // the single admitted deferred selector.
@@ -66,8 +86,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
     if (preflight_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
     if (preflight_term_count != 1) return false;
-    if (!response_read_deadline_request_policy_is_admitted(
-            preflight_term->forward_request_policy_id))
+    if (!response_read_deadline_request_policy_is_admitted_for_term(
+            module, function, *preflight_term))
         return false;
 
     const bool complete_buffering = preflight_term->forward_response_buffering ==

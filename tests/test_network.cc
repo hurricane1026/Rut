@@ -40214,15 +40214,27 @@ TEST(response_read_deadline_fixed_upload_head_activation,
     }
 }
 
-bool stage_unreachable_fixed_upload_head_wait(IoUringEventLoop* loop,
-                                              RouteConfig& config,
-                                              u8 route_method,
-                                              PrebuiltD2Fixture* out) {
+bool stage_unreachable_fixed_upload_head_wait(
+    IoUringEventLoop* loop,
+    RouteConfig& config,
+    u8 route_method,
+    PrebuiltD2Fixture* out,
+    u16 request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip)) {
     static constexpr u8 kPrefix[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: binary-head\r\n"
         "Content-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+    static constexpr u8 kAfterHostPrefix[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: binary-head\r\n"
+        "Content-Type: application/octet-stream\r\nContent-Length:\t12 \t\r\n\r\n";
     static constexpr u8 kFirst[] = {0x00, 0x61, 0x0d, 0x0a, 0xff};
+    const bool content_length_after_host =
+        request_policy_id ==
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    const u8* prefix = content_length_after_host ? kAfterHostPrefix : kPrefix;
+    const u32 prefix_len = static_cast<u32>(
+        content_length_after_host ? sizeof(kAfterHostPrefix) - 1u : sizeof(kPrefix) - 1u);
     if (loop == nullptr || out == nullptr ||
+        !fixed_upload_head_request_policy_is_admitted(request_policy_id) ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !add_response_read_deadline_bundle(config) ||
         !config.add_jit_handler(
@@ -40238,13 +40250,13 @@ bool stage_unreachable_fixed_upload_head_wait(IoUringEventLoop* loop,
     out->peer_fd = downstream[1];
     out->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     out->backend_pending_before = loop->backend.pending;
-    if (conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u) != sizeof(kPrefix) - 1u ||
+    if (conn->recv_buf.write(prefix, prefix_len) != prefix_len ||
         conn->recv_buf.write(kFirst, sizeof(kFirst)) != sizeof(kFirst))
         return false;
     capture_request_metadata(*conn);
     if (conn->req_method != static_cast<u8>(LogHttpMethod::Head) ||
         conn->req_body_mode != BodyMode::ContentLength || conn->req_content_length != 12u ||
-        conn->req_body_remaining != 7u || conn->req_header_end != sizeof(kPrefix) - 1u)
+        conn->req_body_remaining != 7u || conn->req_header_end != prefix_len)
         return false;
     conn->handler_gen = 1;
     conn->handler_ctx = reinterpret_cast<void*>(conn->handler_ctx_storage);
@@ -40267,7 +40279,7 @@ bool stage_unreachable_fixed_upload_head_wait(IoUringEventLoop* loop,
     proof.raw_total_length = conn->req_header_end + conn->req_content_length;
     proof.route_index = 0;
     proof.upstream_id = 0;
-    proof.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    proof.request_policy_id = request_policy_id;
     proof.route_fn = &response_read_deadline_fixed_upload_handler;
     conn->request_policy_id = proof.request_policy_id;
     conn->request_policy_body_pending = true;
@@ -40532,6 +40544,141 @@ bool stage_unreachable_fixed_upload_head_timeout_candidate(IoUringEventLoop* loo
     conn.resp_body_sent = 0;
     conn.upstream_send_len = 0;
     return true;
+}
+
+TEST(response_read_deadline_fixed_upload_head_policy_id2,
+     partial_upload_preserves_exact_policy_wire_and_existing_success_timeout_failure_paths) {
+    static constexpr auto kPolicy = RequestPolicyId::Http11FixedStripContentLengthAfterHost;
+    static constexpr u8 kBody[] = {
+        0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+    static constexpr u8 kRewritten[] =
+        "HEAD /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nContent-Length: 12\r\n"
+        "X-Test: binary-head\r\nContent-Type: application/octet-stream\r\n\r\n";
+    static constexpr u8 kResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nX-Origin: head\r\n\r\nabc";
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(
+            loop, config, kRouteMethodHead, &fixture, static_cast<u16>(kPolicy)));
+        Connection& conn = *fixture.conn;
+        const auto partial_proof = conn.response_read_deadline_upload;
+        CHECK_EQ(conn.upstream_fd, -1);
+        CHECK_FALSE(conn.upstream_connect_armed);
+        CHECK_EQ(conn.send_buf.len(), 0u);
+        CHECK_EQ(conn.req_body_remaining, 7u);
+        CHECK_EQ(conn.pending_forward_request_policy_id, static_cast<u16>(kPolicy));
+        CHECK_EQ(partial_proof.request_policy_id, static_cast<u16>(kPolicy));
+        CHECK_EQ(partial_proof.raw_header_end, conn.req_header_end);
+        CHECK_EQ(partial_proof.raw_total_length,
+                 partial_proof.raw_header_end + partial_proof.raw_content_length);
+
+        REQUIRE(complete_unreachable_fixed_upload_head_to_preconnect(loop, fixture));
+        REQUIRE_EQ(conn.recv_buf.len(), sizeof(kRewritten) - 1u + sizeof(kBody));
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kRewritten, sizeof(kRewritten) - 1u), 0);
+        CHECK_EQ(
+            __builtin_memcmp(conn.recv_buf.data() + sizeof(kRewritten) - 1u, kBody, sizeof(kBody)),
+            0);
+        const auto& proof = conn.response_read_deadline_upload;
+        CHECK_EQ(proof.request_policy_id, static_cast<u16>(kPolicy));
+        CHECK_NE(proof.raw_header_end, proof.rewritten_header_end);
+        CHECK_EQ(proof.raw_total_length, proof.raw_header_end + sizeof(kBody));
+        CHECK_EQ(proof.rewritten_total_length, proof.rewritten_header_end + sizeof(kBody));
+        CHECK_EQ(proof.expected_upload_length, proof.rewritten_total_length);
+        const u32 episode = conn.upstream_episode;
+        loop->dispatch({conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn.upstream_send_armed);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        auto& send = loop->backend.upstream_send_state[conn.id];
+        CHECK_EQ(send.remaining, proof.expected_upload_length);
+        CHECK_EQ(__builtin_memcmp(send.src, kRewritten, sizeof(kRewritten) - 1u), 0);
+        CHECK_EQ(__builtin_memcmp(send.src + sizeof(kRewritten) - 1u, kBody, sizeof(kBody)), 0);
+        send.offset = send.remaining;
+        send.remaining = 0;
+        loop->dispatch({conn.id,
+                        static_cast<i32>(proof.expected_upload_length),
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        0,
+                        episode});
+        REQUIRE(conn.request_upload_complete);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE(deliver_unreachable_fixed_upload_head_response(
+            loop, fixture, kResponse, sizeof(kResponse) - 1u));
+        CHECK_EQ(conn.resp_status, 200u);
+        CHECK_EQ(conn.http1_prebuilt_response_layout, Http1PrebuiltResponseLayout::HeaderOnlyHead);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(
+            loop, config, kRouteMethodAny, &fixture, static_cast<u16>(kPolicy)));
+        REQUIRE(expire_unreachable_fixed_upload_head_timeout(loop, fixture, nullptr, 0));
+        CHECK_EQ(fixture.conn->resp_status, 504u);
+        CHECK_EQ(fixture.conn->http1_prebuilt_response_layout,
+                 Http1PrebuiltResponseLayout::HeaderOnlyHead);
+        CHECK_EQ(fixture.conn->http1_prebuilt_response_purpose,
+                 Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(
+            loop, config, kRouteMethodHead, &fixture, static_cast<u16>(kPolicy)));
+        REQUIRE(trigger_unreachable_fixed_upload_head_preconnect_failure(
+            loop, fixture, FixedUploadHeadPreconnectFailureSite::SocketCreate));
+        CHECK_EQ(fixture.conn->resp_status, 502u);
+        CHECK_EQ(fixture.conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    for (const bool forge_pending : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_unreachable_fixed_upload_head_wait(
+            loop, config, kRouteMethodAny, &fixture, static_cast<u16>(kPolicy)));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        if (forge_pending)
+            conn.pending_forward_request_policy_id =
+                static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        else
+            conn.response_read_deadline_upload.request_policy_id =
+                static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        static constexpr u8 kLast[] = {0x7f, 0x78, 0x00, 0x4e, 0x47, 0x49, 0x58};
+        REQUIRE_EQ(conn.recv_buf.write(kLast, sizeof(kLast)), sizeof(kLast));
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        conn.recv_armed = false;
+        conn.pending_ops = 0;
+        on_request_policy_body_recvd<IoUringEventLoop>(
+            loop, conn, {id, 7, 0, 0, IoEventType::Recv, 1});
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].upstream_fd, -1);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        if (fixture.peer_fd >= 0) close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
 }
 
 TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
