@@ -4,6 +4,7 @@
 
 #include "deferred_preflight_fixture.h"
 #include "framing_selection_preflight_fixture.h"
+#include "rut/compiler/lexer.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "rut/runtime/cache_table.h"
@@ -128,6 +129,39 @@ std::string make_653_slot_route_source() {
         source += "route \"/capacity/";
         source += std::to_string(i);
         source += "\" { return 202 }\n";
+    }
+    return source;
+}
+
+std::string make_above_legacy_token_bound_source() {
+    std::string source;
+    source.reserve(8u * 1024u);
+    for (u32 i = 0; i < 92u; ++i) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    for (u32 i = 92u; i < 96u; ++i) {
+        source += "route exact GET \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return local_response({ version: \"HTTP/1.1\", status: 204, ";
+        source += "reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", ";
+        source += "content_type: \"\", connection: \"request\", ";
+        source += "head_mode: \"suppress_body\", body: b\"\" }) }\n";
+    }
+    return source;
+}
+
+std::string make_ident_stream(u32 count) {
+    std::string source;
+    source.reserve(count * 2u);
+    for (u32 i = 0; i < count; ++i) {
+        if (i != 0u) source.push_back(' ');
+        source.push_back('a');
     }
     return source;
 }
@@ -500,6 +534,60 @@ TEST(serve_loader, six_hundred_fifty_three_slot_source_registers_owned_routes) {
     CHECK_EQ(last.path_len, 12u);
     CHECK(std::string(last.path, last.path_len) == "/capacity/92");
     program.destroy();
+}
+
+TEST(serve_loader, above_legacy_token_bound_source_registers_all_owned_routes) {
+    const std::string dir = "/tmp/rut_serve_loader_legacy_token_bound";
+    const std::string source = make_above_legacy_token_bound_source();
+    const auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 837u);
+    static_assert(837u > 768u);
+    REQUIRE_LE(lexed->tokens.len, LexedTokens::kMaxTokens);
+    const std::string path = write_file(dir, "app.rut", source.c_str());
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 92u);
+    CHECK(program.jit_inited);
+    CHECK_EQ(program.rir.module.func_count, 92u);
+    CHECK_EQ(program.config.routes[0].method, kRouteMethodGet);
+    CHECK_EQ(program.config.routes[91].method, kRouteMethodPost);
+    CHECK(std::string(program.config.routes[91].path, program.config.routes[91].path_len) ==
+          "/capacity/91");
+    REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 4u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 1u);
+    const auto exact = program.config.match_exact_strict_local_response_views(
+        lit_str("/capacity/95"), lit_str("/capacity/95"), kRouteMethodGet);
+    REQUIRE_EQ(exact.state, ExactStrictLocalResponseMatchState::Match);
+    CHECK(program.config.strict_local_response_policy_id_is_owned(exact.policy_id));
+    program.destroy();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(serve_loader, over_token_bound_fails_lex_without_partial_publication) {
+    const std::string dir = "/tmp/rut_serve_loader_over_token_bound";
+    const std::string source = make_ident_stream(LexedTokens::kMaxTokens);
+    const std::string path = write_file(dir, "app.rut", source.c_str());
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Lex);
+    CHECK(err.has_diag);
+    CHECK_EQ(err.diag.code, FrontendError::TooManyTokens);
+    CHECK_EQ(err.diag.span.start, static_cast<u32>(source.size()));
+    CHECK_EQ(err.diag.span.end, static_cast<u32>(source.size()));
+    CHECK_EQ(err.diag.span.line, 1u);
+    CHECK_EQ(err.diag.span.col, static_cast<u32>(source.size() + 1u));
+    CHECK_FALSE(program.jit_inited);
+    CHECK_EQ(program.rir.module.func_count, 0u);
+    CHECK_EQ(program.config.route_count, 0u);
+    CHECK_EQ(program.config.upstream_count, 0u);
+    CHECK_EQ(program.config.policy_bundle_count, 0u);
+    program.destroy();
+    std::filesystem::remove_all(dir);
 }
 
 TEST(serve_loader, source_listener_metadata_is_owned_by_loaded_program) {
