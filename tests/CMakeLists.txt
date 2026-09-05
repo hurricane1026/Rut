@@ -1281,6 +1281,17 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential
+        COMMAND test_nginx_differential --keepalive-timeout-get-initial-deadline-differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential PROPERTIES
+        LABELS "integration;io_uring;network;nginx;docker;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue270_fixed_upload_head_success_differential
         COMMAND test_nginx_differential --fixed-upload-head-success-differential $<TARGET_FILE:rut>
     )
