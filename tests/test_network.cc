@@ -46810,6 +46810,54 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime,
+     incomplete_complete_content_length_transition_retains_precise_timer_without_wheel) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    const u64 initial_progress_ns = conn.response_read_timer_last_progress_ns;
+    REQUIRE_NE(timer_generation, 0u);
+    REQUIRE_NE(initial_progress_ns, 0u);
+    REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    REQUIRE(conn.response_read_timer_target_owned);
+    REQUIRE_FALSE(conn.response_read_timer_cancel_owned);
+    REQUIRE_EQ(conn.timer_node.next, &conn.timer_node);
+    REQUIRE_EQ(conn.timer_node.prev, &conn.timer_node);
+
+    static constexpr u8 kPartial[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+               sizeof(kPartial) - 1u);
+    const IoEvent progress =
+        response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+    loop->dispatch_batch(&progress, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::Buffering);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+    CHECK_EQ(conn.response_read_deadline_progress_generation,
+             conn.response_read_deadline_generation);
+    CHECK_EQ(conn.response_read_deadline_progress_episode, conn.upstream_episode);
+    CHECK_EQ(conn.response_read_deadline_progress_bytes, 2u);
+    CHECK_GT(conn.response_read_timer_last_progress_ns, initial_progress_ns);
+    CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation);
+    CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    CHECK(conn.response_read_timer_target_owned);
+    CHECK_FALSE(conn.response_read_timer_cancel_owned);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+    CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime,
      complete_content_length_stays_quiet_until_full_body_then_drains_header_and_body) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
