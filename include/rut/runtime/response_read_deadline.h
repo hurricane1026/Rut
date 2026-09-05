@@ -1996,7 +1996,8 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
                ForwardResponseBufferingMode::CompleteContentLength &&
            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_route_method == kRouteMethodGet &&
-           c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
+           c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
            c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
            c.response_read_deadline_upload.request_policy_id == c.request_policy_id &&
            c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
