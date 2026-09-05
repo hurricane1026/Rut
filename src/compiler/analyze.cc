@@ -9782,8 +9782,16 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
          !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
         return frontend_error(
             FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
+    const bool fixed_upload_head_timeout_candidate =
+        stmt.forward_response_buffering == ForwardResponseBufferingMode::None &&
+        fixed_upload_head_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        response_policy != nullptr && failure_policy != nullptr &&
+        timeout_failure_policy != nullptr &&
+        fixed_upload_head_timeout_policies_valid(
+            *response_policy, *failure_policy, *timeout_failure_policy);
     if (stmt.has_forward_response_read_timeout &&
-        !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id))
+        !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        !fixed_upload_head_timeout_candidate)
         return frontend_error(FrontendError::UnsupportedSyntax,
                               stmt.span,
                               lit_str("request policy is not admitted to response read timeout"));
@@ -19237,6 +19245,25 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const HirTerminator& direct = route.control.direct_term;
             const bool complete_buffering = timeout_term->forward_response_buffering ==
                                             ForwardResponseBufferingMode::CompleteContentLength;
+            auto timeout_request_policy_is_admitted = [&](const HirTerminator& term) {
+                if (response_read_deadline_request_policy_is_admitted(
+                        term.forward_request_policy_id))
+                    return true;
+                return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       fixed_upload_head_route_method_is_admitted(route.method) &&
+                       fixed_upload_head_request_policy_is_admitted(
+                           term.forward_request_policy_id) &&
+                       term.forward_response_policy_id != 0 &&
+                       term.forward_response_policy_id <= mod.response_policies.len &&
+                       term.forward_failure_policy_id != 0 &&
+                       term.forward_failure_policy_id <= mod.failure_policies.len &&
+                       term.forward_timeout_failure_policy_id != 0 &&
+                       term.forward_timeout_failure_policy_id <= mod.failure_policies.len &&
+                       fixed_upload_head_timeout_policies_valid(
+                           mod.response_policies[term.forward_response_policy_id - 1],
+                           mod.failure_policies[term.forward_failure_policy_id - 1],
+                           mod.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+            };
             auto canonical_forward = [&](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
                        term.source_kind == HirTerminatorSourceKind::Literal &&
@@ -19280,6 +19307,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
                 direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
                 !direct.has_forward_target_transform && !direct.commit_response_mutations &&
+                timeout_request_policy_is_admitted(direct) &&
                 (!complete_buffering ||
                  (complete_content_length_route_method_is_admitted(route.method) &&
                   complete_content_length_request_policy_is_admitted(

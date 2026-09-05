@@ -120,6 +120,21 @@ inline bool complete_content_length_buffering_policies_valid(
            timeout.head_mode == FailurePolicyHeadMode::Reject;
 }
 
+// Complete static policy contract for the positive fixed-upload HEAD deadline
+// profile.  This deliberately does not admit any other request or response
+// shape; the request-policy and route-method closed sets are checked separately.
+inline bool fixed_upload_head_timeout_policies_valid(const ForwardResponsePolicySpec& response,
+                                                     const ForwardFailurePolicySpec& failure,
+                                                     const ForwardFailurePolicySpec& timeout) {
+    return response_policy_spec_valid(response) &&
+           response.connection == ResponsePolicyConnection::Request &&
+           response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+           forward_failure_policy_spec_valid(failure) &&
+           failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+           forward_timeout_failure_policy_spec_valid(timeout) &&
+           timeout.head_mode == FailurePolicyHeadMode::SuppressBody;
+}
+
 // Shared policy tables contain both roles; bundle validation applies the
 // stricter role-specific predicate to every referenced ID.
 inline bool forward_failure_policy_table_spec_valid(const ForwardFailurePolicySpec& policy) {

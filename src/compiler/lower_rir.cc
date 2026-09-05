@@ -8,6 +8,26 @@ namespace rut {
 
 namespace {
 
+static bool response_read_deadline_request_policy_is_admitted_for_term(const MirModule& module,
+                                                                       u8 route_method,
+                                                                       const MirTerminator& term) {
+    if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+        return true;
+    return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           fixed_upload_head_route_method_is_admitted(route_method) &&
+           fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
+           term.forward_response_policy_id != 0 &&
+           term.forward_response_policy_id <= module.response_policies.len &&
+           term.forward_failure_policy_id != 0 &&
+           term.forward_failure_policy_id <= module.failure_policies.len &&
+           term.forward_timeout_failure_policy_id != 0 &&
+           term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+           fixed_upload_head_timeout_policies_valid(
+               module.response_policies[term.forward_response_policy_id - 1],
+               module.failure_policies[term.forward_failure_policy_id - 1],
+               module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
+
 static u8 yield_kind_abi(WaitEventKind kind) {
     switch (kind) {
         case WaitEventKind::Timer:
@@ -3097,7 +3117,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (term.forward_response_read_timeout_seconds != 0 &&
-            !response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+            !response_read_deadline_request_policy_is_admitted_for_term(mir, fn->http_method, term))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
@@ -3310,7 +3330,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
     if (timeout_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
     if (timeout_count != 1) return false;
-    if (!response_read_deadline_request_policy_is_admitted(timeout_term->forward_request_policy_id))
+    if (!response_read_deadline_request_policy_is_admitted_for_term(
+            module, function.method, *timeout_term))
         return false;
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
