@@ -5351,6 +5351,8 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
     for (const Case& test : kCases) {
         const bool content_length_after_host =
             test.request_policy_id == RequestPolicyId::Http11FixedStripContentLengthAfterHost;
+        const bool precise_fixed_upload =
+            content_length_after_host && test.route_method == kRouteMethodHead;
         const std::string route =
             test.route_method == kRouteMethodHead ? "route HEAD \"/one\"" : "route \"/one\"";
         const std::string content_length_position =
@@ -5525,14 +5527,36 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
             REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
             REQUIRE_EQ(conn->response_read_deadline_upload.upload_episode, episode);
             REQUIRE_EQ(conn->pending_ops, 1u);
-            REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
+            REQUIRE_EQ(loop->backend.pending,
+                       backend_pending_before + (precise_fixed_upload ? 2u : 1u));
+            if (precise_fixed_upload) {
+                REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::Armed);
+                REQUIRE(conn->response_read_timer_target_owned);
+                REQUIRE_FALSE(conn->response_read_timer_cancel_owned);
+                REQUIRE_EQ(conn->response_read_timer_deadline_generation,
+                           conn->response_read_deadline_generation);
+                REQUIRE_EQ(conn->response_read_timer_upstream_episode, episode);
+                REQUIRE_EQ(conn->timer_node.next, &conn->timer_node);
+                REQUIRE_EQ(conn->timer_node.prev, &conn->timer_node);
+            } else {
+                REQUIRE(conn->response_read_timer_owner_is_neutral());
+                REQUIRE_NE(conn->timer_node.next, &conn->timer_node);
+                REQUIRE_NE(conn->timer_node.prev, &conn->timer_node);
+            }
+            const u32 conn_id = conn->id;
+            const u32 timer_generation = conn->response_read_timer_owner_generation;
             loop->close_conn(*conn);
             REQUIRE_EQ(conn->pending_ops, 2u);
             REQUIRE_EQ(conn->upstream_close_target_owned, kUpstreamOpRecv);
             REQUIRE_EQ(conn->upstream_close_cancel_owned, kUpstreamOpRecv);
+            if (precise_fixed_upload) {
+                REQUIRE_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+                REQUIRE(conn->response_read_timer_target_owned);
+                REQUIRE(conn->response_read_timer_cancel_owned);
+            }
             restore_ring();
-            loop->dispatch({conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
-            loop->dispatch({conn->id,
+            loop->dispatch({conn_id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
+            loop->dispatch({conn_id,
                             -ECANCELED,
                             0,
                             0,
@@ -5540,7 +5564,25 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
                             0,
                             kUpstreamCloseCancelAux,
                             episode});
-            REQUIRE_EQ(loop->conns[conn->id].pending_ops, 0u);
+            REQUIRE_EQ(loop->conns[conn_id].pending_ops, 0u);
+            if (precise_fixed_upload) {
+                REQUIRE_EQ(loop->pending_free_count, 1u);
+                REQUIRE_EQ(loop->free_top, free_top_before);
+                IoEvent timer_target{};
+                timer_target.conn_id = conn_id;
+                timer_target.type = IoEventType::ResponseReadTimer;
+                timer_target.result = -ECANCELED;
+                timer_target.non_upstream_generation = timer_generation;
+                loop->dispatch(timer_target);
+                REQUIRE_EQ(loop->pending_free_count, 1u);
+                REQUIRE_EQ(loop->free_top, free_top_before);
+                IoEvent timer_cancel = timer_target;
+                timer_cancel.result = 0;
+                timer_cancel.non_upstream_generation =
+                    timer_generation | kResponseReadTimerCancelBit;
+                loop->dispatch(timer_cancel);
+            }
+            REQUIRE(loop->conns[conn_id].response_read_timer_owner_is_neutral());
             REQUIRE_EQ(loop->pending_free_count, 0u);
             REQUIRE_EQ(loop->free_top, free_top_before + 1u);
             close(downstream[1]);

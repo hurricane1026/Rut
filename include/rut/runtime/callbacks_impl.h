@@ -10066,6 +10066,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
+    const bool precise_fixed_upload_head_candidate =
+        configured_head_candidate && explicit_route_method == kRouteMethodHead &&
+        conn.request_policy_id ==
+            static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
+        explicit_upload.request_policy_id == conn.request_policy_id;
     bool exact_terminal_response_recv = false;
     if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
                       candidate->current_terminal_response_recv_is_exact(
@@ -10127,6 +10132,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             // owner.  Incomplete headers cannot be reclassified as a configured
             // response and cannot continue from an inferred owner.
             if (exact_terminal_response_recv) {
+                disarm_explicit_deadline();
+                loop->close_conn(conn);
+                return;
+            }
+            // This precise fixed-upload slice has evidence only for a silent
+            // origin. Positive bytes that still do not complete the response
+            // header must not acquire progress, refresh, or a guessed 504.
+            if (precise_fixed_upload_head_candidate) {
                 disarm_explicit_deadline();
                 loop->close_conn(conn);
                 return;

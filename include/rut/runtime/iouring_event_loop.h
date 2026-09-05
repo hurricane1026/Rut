@@ -2590,7 +2590,8 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool response_read_deadline_uses_precise_timer(const Connection& c) const {
+    [[nodiscard]] bool response_read_deadline_uses_precise_timer(
+        const Connection& c, bool allow_consumed_terminal_episode = false) const {
         if (c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
             c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
@@ -2599,6 +2600,18 @@ public:
             return false;
         const RouteConfig* cfg = c.request_config;
         if (cfg == nullptr) return false;
+        if (c.response_read_deadline_profile ==
+                ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+            c.req_method == static_cast<u8>(LogHttpMethod::Head))
+            return fixed_upload_head_after_host_precise_arm_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                cfg,
+                c.response_read_deadline_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Self>,
+                allow_consumed_terminal_episode);
         if (c.response_read_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             c.response_read_deadline_buffering ==
@@ -4460,9 +4473,17 @@ public:
                             conn.response_read_deadline_buffering;
                         const ResponseReadDeadlineUploadProof first_upload =
                             conn.response_read_deadline_upload;
+                        const bool consumed_terminal =
+                            ev.result > 0 && !ev.more &&
+                            current_terminal_response_recv_is_exact(conn,
+                                                                    ev,
+                                                                    first_generation,
+                                                                    first_profile,
+                                                                    first_method,
+                                                                    first_upload.upload_episode);
                         const bool precise_positive =
-                            response_read_deadline_uses_precise_timer(conn) && ev.result > 0 &&
-                            ev.copy_witness == IoEventCopyWitness::Full;
+                            response_read_deadline_uses_precise_timer(conn, consumed_terminal) &&
+                            ev.result > 0 && ev.copy_witness == IoEventCopyWitness::Full;
                         if (!precise_positive) disarm_response_read_deadline(conn);
                         conn.response_read_deadline_first_batch = true;
                         conn.response_read_deadline_first_batch_profile = first_profile;
