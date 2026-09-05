@@ -659,6 +659,17 @@ static u64 response_read_deadline_fixed_upload_handler(
         .pack();
 }
 
+static u32 response_read_deadline_framing_selection_handler_calls = 0;
+static u64 response_read_deadline_framing_selection_handler(
+    void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++response_read_deadline_framing_selection_handler_calls;
+    const auto* conn = static_cast<const Connection*>(opaque);
+    const auto policy = conn != nullptr && conn->req_client_has_content_length
+                            ? RequestPolicyId::Http11FixedStripContentLengthAfterHost
+                            : RequestPolicyId::Http11FixedStrip;
+    return jit::HandlerResult::make_forward_with_bundle(0, static_cast<u16>(policy), 2).pack();
+}
+
 static u64 h1_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
@@ -29778,6 +29789,122 @@ TEST(response_read_deadline_request_framing_selection,
     config.routes[0].preflight_forward_policy_bundle_id = 1;
     CHECK_FALSE(deferred_request_framing_selection_route_is_valid(
         neutral, &config.routes[0], &config, config.routes[0].fn));
+}
+
+TEST(response_read_deadline_request_framing_selection,
+     completed_keepalive_boundary_starts_one_fresh_id1_episode_only_after_owner_settlement) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodHead, &response_read_deadline_framing_selection_handler, false, 2));
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
+    const RouteConfig* active = &config;
+    static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: client\r\n\r\n";
+
+    DeferredPreflightMockLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    conn->fd = dup(2);
+    REQUIRE_GE(conn->fd, 0);
+    const i32 downstream_fd = conn->fd;
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    conn->downstream_completed_request_count = 1;
+    conn->upstream_attempts = 1;
+    // Match the settled production retirement observed at request 2: request 1
+    // remains the older tombstone while request 2 owns the next episode token.
+    conn->upstream_episode = 2;
+    conn->upstream_retiring_episode = 1;
+    REQUIRE(http1_pipeline_successor_tombstone_is_safe(*conn));
+    REQUIRE(http1_pipeline_successor_upstream_owners_are_neutral(*conn));
+    REQUIRE(conn->response_read_deadline_owner_is_neutral());
+
+    const i32 fake_upstream_fd = dup(2);
+    REQUIRE_GE(fake_upstream_fd, 0);
+    ScopedFakeSocket fake_socket(fake_upstream_fd);
+    response_read_deadline_framing_selection_handler_calls = 0;
+    loop.backend.clear_ops();
+    on_header_received<DeferredPreflightMockLoop>(
+        &loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+
+    REQUIRE_EQ(response_read_deadline_framing_selection_handler_calls, 1u);
+    REQUIRE_EQ(loop.free_top, DeferredPreflightMockLoop::kMaxConns - 1u);
+    CHECK_EQ(conn->fd, downstream_fd);
+    CHECK_EQ(conn->request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_EQ(conn->upstream_episode, 2u);
+    CHECK_EQ(conn->upstream_retiring_episode, 1u);
+    CHECK_EQ(conn->upstream_fd, fake_upstream_fd);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<DeferredPreflightMockLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+
+    conn->upstream_fd = -1;
+    conn->clear_slots();
+    loop.close_conn(*conn);
+    close(fake_upstream_fd);
+    close(downstream_fd);
+
+    enum class RejectedPredecessor : u8 {
+        FreshTransport,
+        FutureTombstone,
+        ActiveConnectOwner,
+    };
+    for (const RejectedPredecessor predecessor : {RejectedPredecessor::FreshTransport,
+                                                  RejectedPredecessor::FutureTombstone,
+                                                  RejectedPredecessor::ActiveConnectOwner}) {
+        DeferredPreflightMockLoop rejected_loop;
+        rejected_loop.setup();
+        rejected_loop.config_ptr = &active;
+        Connection* rejected = rejected_loop.alloc_conn();
+        REQUIRE(rejected != nullptr);
+        const u32 rejected_id = rejected->id;
+        rejected->fd = dup(2);
+        REQUIRE_GE(rejected->fd, 0);
+        const i32 rejected_downstream_fd = rejected->fd;
+        REQUIRE_EQ(rejected->recv_buf.write(kRequest, sizeof(kRequest) - 1u),
+                   sizeof(kRequest) - 1u);
+        rejected->upstream_attempts = 1;
+        i32 active_upstream_fd = -1;
+        if (predecessor != RejectedPredecessor::FreshTransport)
+            rejected->downstream_completed_request_count = 1;
+        if (predecessor == RejectedPredecessor::FutureTombstone) {
+            rejected->upstream_episode = 2;
+            rejected->upstream_retiring_episode = 3;
+            REQUIRE_FALSE(http1_pipeline_successor_tombstone_is_safe(*rejected));
+        } else if (predecessor == RejectedPredecessor::ActiveConnectOwner) {
+            active_upstream_fd = dup(2);
+            REQUIRE_GE(active_upstream_fd, 0);
+            rejected->upstream_fd = active_upstream_fd;
+            rejected->upstream_connect_armed = true;
+            rejected->on_upstream_send = &on_upstream_connected<DeferredPreflightMockLoop>;
+            rejected->pending_ops = 1;
+            REQUIRE_FALSE(http1_pipeline_successor_upstream_owners_are_neutral(*rejected));
+        }
+
+        response_read_deadline_framing_selection_handler_calls = 0;
+        rejected_loop.backend.clear_ops();
+        on_header_received<DeferredPreflightMockLoop>(
+            &rejected_loop,
+            *rejected,
+            {rejected_id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+
+        CHECK_EQ(response_read_deadline_framing_selection_handler_calls, 0u);
+        CHECK_EQ(rejected_loop.free_top, DeferredPreflightMockLoop::kMaxConns);
+        const Connection& closed = rejected_loop.conns[rejected_id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(rejected_loop.backend.count_ops(MockOp::Recv), 0u);
+        if (active_upstream_fd >= 0) close(active_upstream_fd);
+        close(rejected_downstream_fd);
+    }
 }
 
 bool add_bodyless_non_head_response_read_deadline_bundle(
