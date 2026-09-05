@@ -35326,6 +35326,8 @@ bool stage_strict_read_timeout_method(IoUringEventLoop* loop,
                                                  request_len) != static_cast<u32>(request_len))
         return false;
     capture_request_metadata(*conn);
+    if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
+        conn->capture_access_log_target_snapshot();
     conn->req_initial_send_len = conn->recv_buf.len();
     conn->recv_buf.reset();
     if (late_downstream_len != 0 &&
@@ -46924,9 +46926,12 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime, incomplete_timeout_sends_only_pinned_success_header_then_closes) {
+    AccessLogRing access_log{};
+    access_log.init();
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->access_log = &access_log;
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -46961,18 +46966,35 @@ TEST(response_buffering_runtime, incomplete_timeout_sends_only_pinned_success_he
                   "Content-Length: 4\r\n"));
     CHECK_FALSE(
         buf_has(conn.response_read_deadline_send_src, conn.response_read_deadline_send_len, "504"));
+    const u32 expected_response_size = conn.response_header_buf.len();
+    CHECK_EQ(access_log.available(), 0u);
     IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
     const u32 id = conn.id;
     loop->dispatch_batch(&header_sent, 1);
     CHECK_EQ(loop->conns[id].fd, -1);
+    REQUIRE_EQ(access_log.available(), 1u);
+    AccessLogEntry access{};
+    REQUIRE(access_log.pop(access));
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.req_size, sizeof("POST /one HTTP/1.1\r\nHost: old.example\r\n\r\n") - 1u);
+    CHECK_EQ(access.resp_size, expected_response_size);
+    AccessLogEntry duplicate{};
+    CHECK_FALSE(access_log.pop(duplicate));
     release_closed_response_read_fixture(fixture);
 }
 
 TEST(response_buffering_runtime,
      incomplete_clean_eof_sends_pinned_header_and_exact_prefix_then_closes) {
+    AccessLogRing access_log{};
+    access_log.init();
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->access_log = &access_log;
+    loop->metrics = &metrics;
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -46982,6 +47004,13 @@ TEST(response_buffering_runtime,
         stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Post));
     REQUIRE(arm_staged_response_read_deadline(loop, fixture));
     Connection& conn = *fixture.conn;
+    static constexpr u32 kExpectedRequestSize =
+        sizeof("POST /one HTTP/1.1\r\nHost: old.example\r\n\r\n") - 1u;
+    REQUIRE_EQ(conn.downstream_req_size, kExpectedRequestSize);
+    REQUIRE_NE(conn.access_log_target_snapshot.episode, 0u);
+    REQUIRE_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
+    REQUIRE_EQ(conn.access_log_target_snapshot.target_length, 4u);
+    CHECK_EQ(__builtin_memcmp(conn.access_log_target_snapshot.path, "/one", 4), 0);
     static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
@@ -46990,6 +47019,7 @@ TEST(response_buffering_runtime,
     loop->dispatch_batch(&partial, 1);
     REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                ResponseReadDeadlinePostCommitPhase::Buffering);
+    CHECK_EQ(access_log.available(), 0u);
 
     IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
     loop->dispatch_batch(&eof, 1);
@@ -46997,25 +47027,59 @@ TEST(response_buffering_runtime,
                ResponseReadDeadlinePostCommitPhase::HeaderSend);
     CHECK(conn.response_read_deadline_post_commit_close_after_drain);
     CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 2u);
+    const u32 expected_response_size = conn.response_header_buf.len() + 2u;
+    CHECK_EQ(access_log.available(), 0u);
     IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
     loop->dispatch_batch(&header_sent, 1);
     REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                ResponseReadDeadlinePostCommitPhase::BodySend);
     CHECK_EQ(conn.response_read_deadline_send_len, 2u);
     CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "ab", 2), 0);
+    CHECK_EQ(access_log.available(), 0u);
     IoEvent body_sent = exact_response_deadline_send_event(loop, conn);
     const u32 id = conn.id;
     loop->dispatch_batch(&body_sent, 1);
     CHECK_EQ(loop->conns[id].fd, -1);
+    REQUIRE_EQ(access_log.available(), 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+
+    // A stale duplicate Send and the old retirement CQEs cannot consume the
+    // already-finalized request snapshot or publish a second record.
+    loop->dispatch_batch(&body_sent, 1);
+    if (loop->conns[id].upstream_retirement_active)
+        drain_prebuilt_d2_retirement(loop, loop->conns[id], kUpstreamOpRecv, false);
+    const IoEvent stale_timeout{id, 1, 0, 0, IoEventType::Timeout, 0};
+    loop->dispatch_batch(&stale_timeout, 1);
+    CHECK_EQ(access_log.available(), 1u);
     release_closed_response_read_fixture(fixture);
+
+    loop->shutdown();
+    guard.initialized = false;
+    REQUIRE_EQ(access_log.available(), 1u);
+    AccessLogEntry access{};
+    REQUIRE(access_log.pop(access));
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(access.req_size, kExpectedRequestSize);
+    CHECK_EQ(access.resp_size, expected_response_size);
+    CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
+    CHECK_EQ(access.target_length, 4u);
+    CHECK_EQ(__builtin_memcmp(access.path, "/one", 4), 0);
+    AccessLogEntry duplicate{};
+    CHECK_FALSE(access_log.pop(duplicate));
 }
 
 TEST(response_buffering_runtime,
      initial_prefix_and_clean_eof_select_pinned_prefix_despite_same_batch_timeout_order) {
     for (const bool timeout_before_eof : {false, true}) {
+        AccessLogRing access_log{};
+        access_log.init();
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->access_log = &access_log;
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -47044,6 +47108,10 @@ TEST(response_buffering_runtime,
         CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 2u);
         CHECK_FALSE(buf_has(
             conn.response_read_deadline_send_src, conn.response_read_deadline_send_len, "504"));
+        const u32 expected_response_size = conn.response_header_buf.len() + 2u;
+        CHECK_EQ(access_log.available(), 0u);
+        if (timeout_before_eof && conn.upstream_retirement_active)
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
         IoEvent header = exact_response_deadline_send_event(loop, conn);
         loop->dispatch_batch(&header, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
@@ -47054,6 +47122,16 @@ TEST(response_buffering_runtime,
         const u32 id = conn.id;
         loop->dispatch_batch(&body, 1);
         CHECK_EQ(loop->conns[id].fd, -1);
+        REQUIRE_EQ(access_log.available(), 1u);
+        if (loop->conns[id].upstream_retirement_active)
+            drain_prebuilt_d2_retirement(loop, loop->conns[id], kUpstreamOpRecv, true);
+        CHECK_EQ(access_log.available(), 1u);
+        AccessLogEntry access{};
+        REQUIRE(access_log.pop(access));
+        CHECK_EQ(access.status, 200u);
+        CHECK_EQ(access.resp_size, expected_response_size);
+        AccessLogEntry duplicate{};
+        CHECK_FALSE(access_log.pop(duplicate));
         release_closed_response_read_fixture(fixture);
     }
 }
@@ -47211,9 +47289,12 @@ TEST(response_buffering_runtime,
     enum class Fault : u8 { HeaderShort, HeaderError, BodyShort, BodyError };
     for (const Fault fault :
          {Fault::HeaderShort, Fault::HeaderError, Fault::BodyShort, Fault::BodyError}) {
+        AccessLogRing access_log{};
+        access_log.init();
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->access_log = &access_log;
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -47260,6 +47341,7 @@ TEST(response_buffering_runtime,
         terminal.non_upstream_generation = generation;
         loop->dispatch_batch(&terminal, 1);
         REQUIRE_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(access_log.available(), 0u);
         CHECK_FALSE(buf_has(loop->conns[id].response_header_buf.data(),
                             loop->conns[id].response_header_buf.len(),
                             "502"));
@@ -47269,6 +47351,7 @@ TEST(response_buffering_runtime,
         const u32 pending_after = loop->conns[id].pending_ops;
         loop->dispatch_batch(&terminal, 1);
         CHECK_EQ(loop->conns[id].pending_ops, pending_after);
+        CHECK_EQ(access_log.available(), 0u);
         release_closed_response_read_fixture(fixture);
     }
 }
