@@ -3,8 +3,11 @@
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/verifier.h"
+#include "rut/jit/codegen.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/io_event.h"
 #include "rut/serve_loader.h"
 #include "rut_iouring_gate.h"
@@ -2099,6 +2102,10 @@ struct Recorder {
     // Default-off origin mode for a complete request that intentionally emits
     // no response bytes and remains open until the peer closes it.
     bool zero_response_stall = false;
+    // Variant used by a two-request keep-alive differential: only the first
+    // accepted origin episode stalls; the fresh second episode follows the
+    // ordinary configured response path and remains open until peer retirement.
+    bool zero_response_stall_first_only = false;
     std::atomic<bool> zero_response_stall_ready{false};
     std::atomic<u64> zero_response_stall_started_ns{0};
     std::atomic<bool> zero_response_stall_peer_closed{false};
@@ -2212,7 +2219,13 @@ struct Recorder {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
-                if (self->zero_response_stall) {
+                const bool stall_this_response =
+                    self->zero_response_stall ||
+                    (self->zero_response_stall_first_only && self->history.size() == 1u);
+                const bool wait_complete_response_peer_close =
+                    self->wait_response_peer_close ||
+                    (self->zero_response_stall_first_only && self->history.size() == 2u);
+                if (stall_this_response) {
                     const u64 started_ns =
                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                              std::chrono::steady_clock::now().time_since_epoch())
@@ -2291,7 +2304,7 @@ struct Recorder {
                 }
                 if (response_sent)
                     self->response_send_succeeded.store(true, std::memory_order_release);
-                if (self->wait_response_peer_close || self->gate_incomplete_response_close) {
+                if (wait_complete_response_peer_close || self->gate_incomplete_response_close) {
                     if (!response_sent) {
                         self->response_send_failed.store(true, std::memory_order_release);
                     } else {
@@ -2341,7 +2354,7 @@ struct Recorder {
                             self->response_close_failed.store(true, std::memory_order_release);
                         }
                     }
-                } else if (response_sent && self->wait_response_peer_close) {
+                } else if (response_sent && wait_complete_response_peer_close) {
                     bool observed = false;
                     while (self->running.load(std::memory_order_acquire)) {
                         pollfd peer_poll{client, POLLIN | POLLHUP | POLLERR, 0};
@@ -2408,9 +2421,11 @@ struct Recorder {
         if ((response_override == nullptr) != (response_override_len == 0)) return false;
         if ((permit_gated_complete_response && gate_incomplete_response_close) ||
             (wait_response_peer_close && gate_incomplete_response_close) ||
+            (zero_response_stall && zero_response_stall_first_only) ||
             (zero_response_stall && response_override != nullptr) ||
-            (zero_response_stall && (wait_response_peer_close || permit_gated_complete_response ||
-                                     gate_incomplete_response_close)))
+            ((zero_response_stall || zero_response_stall_first_only) &&
+             (wait_response_peer_close || permit_gated_complete_response ||
+              gate_incomplete_response_close)))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -52792,6 +52807,210 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         error = "#270 generated AST did not contain exactly one exact GET forward";
         return false;
     }
+
+    const auto hir_result = rut::analyze_file(*ast);
+    if (!hir_result) {
+        error = "#270 generated explicit-timeout source did not analyze";
+        return false;
+    }
+    std::unique_ptr<rut::HirModule> hir(hir_result.value());
+    const rut::HirRoute* hir_head = nullptr;
+    for (u32 index = 0u; index < hir->routes.len; index++) {
+        const auto& route = hir->routes[index];
+        if (route.method != rut::kRouteMethodHead || !route.path.eq({"/", 1u})) continue;
+        if (hir_head != nullptr) {
+            error = "#270 generated HIR duplicated the exact HEAD root route";
+            return false;
+        }
+        hir_head = &route;
+    }
+    if (hir_head == nullptr ||
+        hir_head->forward_preflight_mode !=
+            rut::ForwardPreflightMode::AfterRequestFramingSelection ||
+        hir_head->control.kind != rut::HirControlKind::If ||
+        hir_head->control.cond.kind != rut::HirExprKind::ReqHasContentLength) {
+        error = "#270 generated HIR lost the exact HEAD framing selector";
+        return false;
+    }
+    const auto& hir_true = hir_head->control.then_term;
+    const auto& hir_false = hir_head->control.else_term;
+    const auto hir_forward_is = [](const rut::HirTerminator& term, rut::RequestPolicyId policy) {
+        return term.kind == rut::HirTerminatorKind::ForwardUpstream &&
+               term.forward_request_policy_id == static_cast<u16>(policy) &&
+               term.forward_response_read_timeout_seconds == 1u &&
+               term.forward_response_buffering == rut::ForwardResponseBufferingMode::None;
+    };
+    if (!hir_forward_is(hir_true, rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
+        !hir_forward_is(hir_false, rut::RequestPolicyId::Http11FixedStrip) ||
+        hir_true.upstream_index != hir_false.upstream_index ||
+        hir_true.forward_response_policy_id != hir_false.forward_response_policy_id ||
+        hir_true.forward_failure_policy_id != hir_false.forward_failure_policy_id ||
+        hir_true.forward_timeout_failure_policy_id != hir_false.forward_timeout_failure_policy_id) {
+        error = "#270 generated HIR did not bind ID2 true/ID1 false to one timeout bundle";
+        return false;
+    }
+
+    const auto mir_result = rut::build_mir(*hir);
+    if (!mir_result) {
+        error = "#270 generated explicit-timeout HIR did not build MIR";
+        return false;
+    }
+    std::unique_ptr<rut::MirModule> mir(mir_result.value());
+    const rut::MirFunction* mir_head = nullptr;
+    for (u32 index = 0u; index < mir->functions.len; index++) {
+        const auto& function = mir->functions[index];
+        if (function.method != rut::kRouteMethodHead || !function.path.eq({"/", 1u})) continue;
+        if (mir_head != nullptr) {
+            error = "#270 generated MIR duplicated the exact HEAD root function";
+            return false;
+        }
+        mir_head = &function;
+    }
+    if (mir_head == nullptr || mir_head->blocks.len != 3u ||
+        mir_head->forward_preflight_mode !=
+            rut::ForwardPreflightMode::AfterRequestFramingSelection ||
+        mir_head->blocks[0].term.kind != rut::MirTerminatorKind::Branch ||
+        mir_head->blocks[0].term.cond.kind != rut::MirValueKind::ReqHasContentLength ||
+        mir_head->blocks[0].term.then_block != 1u || mir_head->blocks[0].term.else_block != 2u) {
+        error = "#270 generated MIR lost the exact three-block framing selector";
+        return false;
+    }
+    const auto& mir_true = mir_head->blocks[1].term;
+    const auto& mir_false = mir_head->blocks[2].term;
+    const auto mir_forward_is = [](const rut::MirTerminator& term, rut::RequestPolicyId policy) {
+        return term.kind == rut::MirTerminatorKind::ForwardUpstream &&
+               term.forward_request_policy_id == static_cast<u16>(policy) &&
+               term.forward_response_read_timeout_seconds == 1u &&
+               term.forward_response_buffering == rut::ForwardResponseBufferingMode::None;
+    };
+    if (!mir_forward_is(mir_true, rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
+        !mir_forward_is(mir_false, rut::RequestPolicyId::Http11FixedStrip) ||
+        mir_true.upstream_index != mir_false.upstream_index ||
+        mir_true.forward_response_policy_id != mir_false.forward_response_policy_id ||
+        mir_true.forward_failure_policy_id != mir_false.forward_failure_policy_id ||
+        mir_true.forward_timeout_failure_policy_id != mir_false.forward_timeout_failure_policy_id) {
+        error = "#270 generated MIR did not retain ID2 true/ID1 false bundle identity";
+        return false;
+    }
+
+    struct RirOwner {
+        rut::FrontendRirModule value{};
+        ~RirOwner() { value.destroy(); }
+    } rir;
+    if (!rut::lower_to_rir(*mir, rir.value)) {
+        error = "#270 generated explicit-timeout MIR did not lower to RIR";
+        return false;
+    }
+    const auto verified = rut::rir::verify_module(rir.value.module);
+    const rut::rir::Function* rir_head = nullptr;
+    for (u32 index = 0u; index < rir.value.module.func_count; index++) {
+        const auto& function = rir.value.module.functions[index];
+        if (function.http_method != rut::kRouteMethodHead || !function.route_pattern.eq({"/", 1u}))
+            continue;
+        if (rir_head != nullptr) {
+            error = "#270 generated RIR duplicated the exact HEAD root function";
+            return false;
+        }
+        rir_head = &function;
+    }
+    if (!verified.ok || rir_head == nullptr || rir_head->block_count != 3u ||
+        rir_head->forward_preflight_mode !=
+            rut::ForwardPreflightMode::AfterRequestFramingSelection ||
+        rir_head->preflight_forward_policy_bundle_id == 0u ||
+        rir_head->preflight_forward_policy_bundle_id > rir.value.module.policy_bundle_count ||
+        rir_head->blocks[0].inst_count != 2u ||
+        rir_head->blocks[0].insts[0].op != rut::rir::Opcode::ReqHasContentLength ||
+        rir_head->blocks[0].insts[1].op != rut::rir::Opcode::Br ||
+        rir_head->blocks[0].insts[1].imm.block_targets[0].id != 1u ||
+        rir_head->blocks[0].insts[1].imm.block_targets[1].id != 2u) {
+        error = "#270 generated verified RIR lost the exact framing-selector topology";
+        return false;
+    }
+    const auto rir_forward_ids = [](const rut::rir::Block& block,
+                                    rut::i32& upstream,
+                                    rut::i32& request_policy,
+                                    rut::i32& bundle) {
+        if (block.inst_count != 4u || block.insts[0].op != rut::rir::Opcode::ConstI32 ||
+            block.insts[1].op != rut::rir::Opcode::ConstI32 ||
+            block.insts[2].op != rut::rir::Opcode::ConstI32 ||
+            block.insts[3].op != rut::rir::Opcode::RetForwardBundle)
+            return false;
+        upstream = block.insts[0].imm.i32_val;
+        request_policy = block.insts[1].imm.i32_val;
+        bundle = block.insts[2].imm.i32_val;
+        return true;
+    };
+    rut::i32 rir_true_upstream = -1, rir_true_policy = -1, rir_true_bundle = -1;
+    rut::i32 rir_false_upstream = -1, rir_false_policy = -1, rir_false_bundle = -1;
+    if (!rir_forward_ids(
+            rir_head->blocks[1], rir_true_upstream, rir_true_policy, rir_true_bundle) ||
+        !rir_forward_ids(
+            rir_head->blocks[2], rir_false_upstream, rir_false_policy, rir_false_bundle) ||
+        rir_true_policy !=
+            static_cast<rut::i32>(rut::RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
+        rir_false_policy != static_cast<rut::i32>(rut::RequestPolicyId::Http11FixedStrip) ||
+        rir_true_upstream != rir_false_upstream || rir_true_bundle != rir_false_bundle ||
+        rir_true_bundle != rir_head->preflight_forward_policy_bundle_id) {
+        error = "#270 generated verified RIR did not bind ID2 true/ID1 false to one bundle";
+        return false;
+    }
+    const auto& rir_bundle =
+        rir.value.module.policy_bundles[rir_head->preflight_forward_policy_bundle_id - 1u];
+    if (rir_bundle.response_read_timeout_seconds != 1u ||
+        rir_bundle.response_buffering != rut::ForwardResponseBufferingMode::None ||
+        rir_bundle.response_policy_id == 0u || rir_bundle.failure_policy_id == 0u ||
+        rir_bundle.timeout_failure_policy_id == 0u ||
+        rir_bundle.response_policy_id > rir.value.module.response_policy_count ||
+        rir_bundle.failure_policy_id > rir.value.module.failure_policy_count ||
+        rir_bundle.timeout_failure_policy_id > rir.value.module.failure_policy_count ||
+        !rut::fixed_upload_head_timeout_policies_valid(
+            rir.value.module.response_policies[rir_bundle.response_policy_id - 1u],
+            rir.value.module.failure_policies[rir_bundle.failure_policy_id - 1u],
+            rir.value.module.failure_policies[rir_bundle.timeout_failure_policy_id - 1u])) {
+        error = "#270 generated verified RIR lost the HEAD None/suppress-body timeout bundle";
+        return false;
+    }
+
+    const auto codegen = rut::jit::codegen(rir.value.module);
+    rut::jit::JitEngine engine;
+    if (!codegen.ok || engine.opt_level != rut::jit::OptLevel::O2 || !engine.init()) {
+        error = "#270 generated verified RIR did not initialize O2 JIT";
+        return false;
+    }
+    struct EngineGuard {
+        rut::jit::JitEngine& engine;
+        ~EngineGuard() { engine.shutdown(); }
+    } engine_guard{engine};
+    auto cfg = std::make_unique<rut::RouteConfig>();
+    if (!engine.compile(codegen.mod, codegen.ctx) ||
+        !rut::populate_route_config(*cfg, rir.value.module) ||
+        !rut::register_jit_routes(*cfg, rir.value.module, engine)) {
+        error = "#270 generated verified RIR did not publish O2 JIT/config";
+        return false;
+    }
+    const rut::RouteEntry* cfg_head = nullptr;
+    for (u32 index = 0u; index < cfg->route_count; index++) {
+        const auto& route = cfg->routes[index];
+        if (route.method != rut::kRouteMethodHead || route.path_len != 1u || route.path[0] != '/')
+            continue;
+        if (cfg_head != nullptr) {
+            error = "#270 generated config duplicated the exact HEAD root route";
+            return false;
+        }
+        cfg_head = &route;
+    }
+    if (cfg->upstream_count != 1u || cfg->upstreams[0].addr_count != 1u ||
+        cfg->upstreams[0].addrs[0].sin_family != AF_INET ||
+        ntohl(cfg->upstreams[0].addrs[0].sin_addr.s_addr) != 0x7f000001u ||
+        ntohs(cfg->upstreams[0].addrs[0].sin_port) != backend_port || cfg_head == nullptr ||
+        cfg_head->action != rut::RouteAction::JitHandler || cfg_head->fn == nullptr ||
+        cfg_head->forward_preflight_mode !=
+            rut::ForwardPreflightMode::AfterRequestFramingSelection ||
+        cfg_head->preflight_forward_policy_bundle_id !=
+            rir_head->preflight_forward_policy_bundle_id) {
+        error = "#270 generated O2 JIT/config lost exact route/upstream/preflight custody";
+        return false;
+    }
     return true;
 }
 
@@ -53698,6 +53917,61 @@ static bool read_timed_head_response(int fd,
     return read_timed_fixed_response(fd, 0u, bytes, first_byte_ns, error);
 }
 
+static bool read_paired_timed_head_responses(const int* fds,
+                                             std::vector<char>* bytes,
+                                             u64* first_byte_ns,
+                                             std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool complete[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        bytes[side].clear();
+        first_byte_ns[side] = 0u;
+    }
+    while ((!complete[0] || !complete[1]) && std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptors[2] = {
+            {complete[0] ? -1 : fds[0], POLLIN | POLLHUP | POLLERR, 0},
+            {complete[1] ? -1 : fds[1], POLLIN | POLLHUP | POLLERR, 0},
+        };
+        const int ready = poll(descriptors, 2, 25);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#270 paired HEAD response poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        for (u32 side = 0u; side < 2u; side++) {
+            if (complete[side] || descriptors[side].revents == 0) continue;
+            char buffer[512];
+            const ssize_t n = recv(fds[side], buffer, sizeof(buffer), 0);
+            if (n > 0) {
+                if (first_byte_ns[side] == 0u) first_byte_ns[side] = steady_now_ns();
+                bytes[side].insert(bytes[side].end(), buffer, buffer + n);
+                const size_t end = header_end(bytes[side]);
+                if (end != 0u) {
+                    if (bytes[side].size() != end) {
+                        error = "#270 paired HEAD response included body/trailing bytes";
+                        return false;
+                    }
+                    complete[side] = true;
+                } else if (bytes[side].size() > 4096u) {
+                    error = "#270 paired HEAD response exceeded bounded capacity";
+                    return false;
+                }
+                continue;
+            }
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            error = std::string("#270 paired HEAD response side ") + std::to_string(side) +
+                    (n == 0 ? " reached EOF before complete headers" : " recv failed");
+            return false;
+        }
+    }
+    if (!complete[0] || !complete[1]) {
+        error = "#270 paired HEAD responses exceeded their 3s deadline";
+        return false;
+    }
+    return true;
+}
+
 static bool wait_keepalive_timeout_origin_retired(KeepAlivePinnedRecorder& recorder,
                                                   std::string& error) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -54233,6 +54507,35 @@ static std::vector<char> expected_fixed_upload_head_upstream(u16 backend_port) {
     return request;
 }
 
+static std::vector<char> fixed_upload_head_timeout_request_prefix(bool second) {
+    const std::string head =
+        std::string("HEAD /buffered-head?q=") + (second ? "2" : "1") +
+        " HTTP/1.1\r\nHost: options-client.example\r\nX-Test: " +
+        (second ? "binary-head-second" : "binary-head-timeout") +
+        "\r\nContent-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n";
+    std::vector<char> request(head.begin(), head.end());
+    request.insert(request.end(),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                       kDefaultBufferingPostCompleteRequestPrefixBody);
+    return request;
+}
+
+static std::vector<char> expected_fixed_upload_head_timeout_upstream(u16 backend_port,
+                                                                     bool second) {
+    const std::string head = std::string("HEAD /buffered-head?q=") + (second ? "2" : "1") +
+                             " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+                             "\r\nContent-Length: 12\r\nX-Test: " +
+                             (second ? "binary-head-second" : "binary-head-timeout") +
+                             "\r\nContent-Type: application/octet-stream\r\n\r\n";
+    std::vector<char> request(head.begin(), head.end());
+    request.insert(request.end(),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+                   reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+                       sizeof(kDefaultBufferingPostCompleteRequestBody));
+    return request;
+}
+
 static void configure_fixed_upload_head_origin(Recorder& origin) {
     origin.read_exact_content_length_12_body = true;
     origin.wait_response_peer_close = true;
@@ -54559,6 +54862,436 @@ static bool run_fixed_upload_head_success_differential(const char* rut_path, std
         error = "#270 fixed-upload HEAD cross-side wire/access/resource evidence differed";
         return false;
     }
+    return true;
+}
+
+static bool run_fixed_upload_head_zero_response_timeout_differential(const char* rut_path,
+                                                                     std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#270 fixed-upload HEAD zero-response differential requires an executable RUT";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error = "#270 fixed-upload HEAD zero-response differential lacked isolated temp trees";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (u32 index = 0u; index < 4u; index++) {
+        if (!reservations.reserve(index, ports[index])) {
+            error = "#270 fixed-upload HEAD zero-response differential could not hold four ports";
+            return false;
+        }
+        for (u32 previous = 0u; previous < index; previous++) {
+            if (ports[index] == ports[previous]) {
+                error = "#270 fixed-upload HEAD zero-response differential reused a port";
+                return false;
+            }
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    std::string generated_source;
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        !build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        generated_source.find("nginx.conf") != std::string::npos ||
+        generated_source.find("nginx::") != std::string::npos ||
+        generated_source.find("nginx_compat") != std::string::npos ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty())
+            error = "#270 fixed-upload HEAD zero-response differential could not persist inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    for (u32 side = 0u; side < 2u; side++) {
+        origins[side].read_exact_content_length_12_body = true;
+        origins[side].zero_response_stall_first_only = true;
+        origins[side].observe_extra_requests_until_stop = true;
+        const u32 backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#270 fixed-upload HEAD zero-response origin bind",
+                                        error) ||
+            !origins[side].setup(
+                ports[backend], 2u, kHeadBackendResponse, sizeof(kHeadBackendResponse) - 1u - 5u)) {
+            if (error.empty()) error = "#270 fixed-upload HEAD zero-response origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#270 fixed-upload HEAD zero-response origins were not live before handoff";
+        return false;
+    }
+
+    const std::string container_name =
+        "rut-nginx-270-fixed-upload-head-zero-" + std::to_string(getpid());
+    PinnedNginxDockerLifecycle nginx(container_name, temps[0], error);
+    ChildGuard rut;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#270 fixed-upload zero nginx bind", error) ||
+        !nginx.start(ports[0])) {
+        if (error.empty()) error = "#270 fixed-upload zero pinned nginx failed before readiness";
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#270 fixed-upload zero RUT bind", error) ||
+        !spawn_child(
+            {rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"},
+            temps[1].rut_log,
+            rut.child) ||
+        !wait_ready(ports[2], rut.child, error)) {
+        if (error.empty()) error = "#270 fixed-upload zero generated RUT failed before readiness";
+        return false;
+    }
+    const std::string loaded = "Loaded program: " + temps[1].source + " (opt O2)\n";
+    const std::string listening =
+        "Listening on port " + std::to_string(ports[2]) + " with 1 shard(s)\n";
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!log_contains(temps[1].rut_log, loaded.c_str()) ||
+            !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+            !log_contains(temps[1].rut_log, listening.c_str())) &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(rut.child)) {
+            error = "#270 fixed-upload zero generated RUT exited before O2/io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (nginx.cli().pid <= 0 || rut.child.pid <= 0 || nginx.cli().pid == rut.child.pid ||
+        !log_contains(temps[1].rut_log, loaded.c_str()) ||
+        !log_contains(temps[1].rut_log, "Backend: io_uring\n") ||
+        !log_contains(temps[1].rut_log, listening.c_str())) {
+        error = "#270 fixed-upload zero lacked independent public frontend readiness";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(nginx.cli()) && !poll_child(rut.child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    clients.fds[0] = connect_once(ports[0]);
+    clients.fds[1] = connect_once(ports[2]);
+    const std::vector<char> request1_prefix = fixed_upload_head_timeout_request_prefix(false);
+    const std::vector<char> request_suffix = fixed_upload_head_request_suffix();
+    if (clients.fds[0] < 0 || clients.fds[1] < 0 || request1_prefix.empty() ||
+        request_suffix.empty() ||
+        !send_all(clients.fds[0], request1_prefix.data(), request1_prefix.size()) ||
+        !send_all(clients.fds[1], request1_prefix.data(), request1_prefix.size())) {
+        error = "#270 fixed-upload zero clients could not send request-1 five-byte prefixes";
+        return false;
+    }
+    const auto upload_gate_started = std::chrono::steady_clock::now();
+    const auto upload_gate_deadline = upload_gate_started + std::chrono::milliseconds(1200);
+    while (std::chrono::steady_clock::now() < upload_gate_deadline) {
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 0u ||
+            origins[0].requests.load(std::memory_order_acquire) != 0u ||
+            origins[1].requests.load(std::memory_order_acquire) != 0u ||
+            origins[0].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[1].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty() ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+            if (error.empty()) error = "#270 fixed-upload zero observed pre-completion effects";
+            return false;
+        }
+    }
+    if (!send_all(clients.fds[0], request_suffix.data(), request_suffix.size()) ||
+        !send_all(clients.fds[1], request_suffix.data(), request_suffix.size())) {
+        error = "#270 fixed-upload zero could not publish request-1 seven-byte suffixes";
+        return false;
+    }
+
+    const auto stall_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!origins[0].zero_response_stall_ready.load(std::memory_order_acquire) ||
+            !origins[1].zero_response_stall_ready.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < stall_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload zero lost liveness before both origins stalled";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 request_complete_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        request_complete_ns[side] =
+            origins[side].zero_response_stall_started_ns.load(std::memory_order_acquire);
+        const std::vector<char> expected =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], false);
+        if (!origins[side].zero_response_stall_ready.load(std::memory_order_acquire) ||
+            request_complete_ns[side] == 0u ||
+            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[side].requests.load(std::memory_order_acquire) != 1u ||
+            origins[side].history.size() != 1u || origins[side].history[0] != expected ||
+            origins[side].request != expected ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[side].response_send_succeeded.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload zero did not reach exact zero-response origin request 1";
+            return false;
+        }
+    }
+
+    while (steady_now_ns() < request_complete_ns[0] + 800'000'000ull ||
+           steady_now_ns() < request_complete_ns[1] + 800'000'000ull) {
+        if (!frontends_live() || !origins_live() ||
+            origins[0].zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+            origins[1].zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[0], 10, error) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[1], 10, error)) {
+            if (error.empty()) error = "#270 fixed-upload zero escaped the 800ms quiet gate";
+            return false;
+        }
+    }
+
+    std::vector<char> first_response[2];
+    u64 first_byte_ns[2]{};
+    if (!read_paired_timed_head_responses(clients.fds, first_response, first_byte_ns, error)) {
+        if (error.empty()) error = "#270 fixed-upload zero could not read paired 504 responses";
+        return false;
+    }
+    std::vector<char> first_normalized[2] = {first_response[0], first_response[1]};
+    const std::vector<char> expected_504(kKeepAliveTimeoutHeadResponseNormalized,
+                                         kKeepAliveTimeoutHeadResponseNormalized +
+                                             sizeof(kKeepAliveTimeoutHeadResponseNormalized) - 1u);
+    u64 elapsed_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (first_byte_ns[side] < request_complete_ns[side]) {
+            error = "#270 fixed-upload zero downstream preceded its completed origin request";
+            return false;
+        }
+        elapsed_ns[side] = first_byte_ns[side] - request_complete_ns[side];
+        std::string detail;
+        if (elapsed_ns[side] < 750'000'000ull || elapsed_ns[side] >= 1'700'000'000ull ||
+            !validate_exact_normalized_response(
+                first_response[side], kKeepAliveTimeoutHeadResponseNormalized, detail) ||
+            !normalize_date(first_normalized[side]) || first_normalized[side] != expected_504 ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 150, detail)) {
+            error =
+                "#270 fixed-upload zero timing/exact 162-byte keep-alive 504 mismatch: " + detail;
+            return false;
+        }
+    }
+    if (first_normalized[0] != first_normalized[1]) {
+        error = "#270 fixed-upload zero Date-normalized nginx/RUT 504 wires differed";
+        return false;
+    }
+    const u64 timeout_delta = elapsed_ns[0] > elapsed_ns[1] ? elapsed_ns[0] - elapsed_ns[1]
+                                                            : elapsed_ns[1] - elapsed_ns[0];
+    if (timeout_delta > 350'000'000ull) {
+        error = "#270 fixed-upload zero nginx/RUT timeout delta exceeded 350ms";
+        return false;
+    }
+
+    const auto retirement_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!origins[0].zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+            !origins[1].zero_response_stall_peer_closed.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < retirement_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload zero lost liveness before origin-1 retirement";
+            return false;
+        }
+        usleep(1000);
+    }
+    for (u32 side = 0u; side < 2u; side++) {
+        const u64 closed_ns =
+            origins[side].zero_response_stall_peer_closed_ns.load(std::memory_order_acquire);
+        if (!origins[side].zero_response_stall_peer_closed.load(std::memory_order_acquire) ||
+            origins[side].zero_response_stall_peer_close_count.load(std::memory_order_acquire) !=
+                1u ||
+            closed_ns < request_complete_ns[side] ||
+            origins[side].zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].zero_response_stall_observation_failed.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload zero did not retire exactly one silent origin episode";
+            return false;
+        }
+    }
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live() ||
+            origins[0].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[1].accepted.load(std::memory_order_acquire) != 1u ||
+            origins[0].requests.load(std::memory_order_acquire) != 1u ||
+            origins[1].requests.load(std::memory_order_acquire) != 1u) {
+            error = "#270 fixed-upload zero observed retry before request 2";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    const std::vector<char> request2_prefix = fixed_upload_head_timeout_request_prefix(true);
+    std::vector<char> request2 = request2_prefix;
+    request2.insert(request2.end(), request_suffix.begin(), request_suffix.end());
+    u64 request2_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (!send_all(clients.fds[side], request2.data(), request2.size())) {
+            error = "#270 fixed-upload zero could not send complete request 2";
+            return false;
+        }
+        request2_sent_ns[side] = steady_now_ns();
+    }
+    std::vector<char> second_response[2];
+    u64 second_first_byte_ns[2]{};
+    if (!read_paired_timed_head_responses(
+            clients.fds, second_response, second_first_byte_ns, error)) {
+        dump_log(temps[1].rut_log, "#270 fixed-upload zero generated RUT log");
+        if (error.empty()) error = "#270 fixed-upload zero could not read paired request-2 200";
+        return false;
+    }
+    const std::vector<char> expected_200(
+        kHeadKeepAliveResponseNormalized,
+        kHeadKeepAliveResponseNormalized + sizeof(kHeadKeepAliveResponseNormalized) - 1u);
+    static_assert(sizeof(kHeadKeepAliveResponseNormalized) - 1u == 121u);
+    for (u32 side = 0u; side < 2u; side++) {
+        std::vector<char> normalized = second_response[side];
+        std::string detail;
+        if (second_first_byte_ns[side] < request2_sent_ns[side] ||
+            second_first_byte_ns[side] - request2_sent_ns[side] >= 750'000'000ull ||
+            !validate_exact_normalized_response(
+                second_response[side], kHeadKeepAliveResponseNormalized, detail) ||
+            !normalize_date(normalized) || normalized != expected_200 ||
+            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 150, detail)) {
+            error =
+                "#270 fixed-upload zero request-2 exact prompt keep-alive 200 mismatch: " + detail;
+            return false;
+        }
+    }
+
+    const auto second_origin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((origins[0].requests.load(std::memory_order_acquire) < 2u ||
+            origins[1].requests.load(std::memory_order_acquire) < 2u) &&
+           std::chrono::steady_clock::now() < second_origin_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#270 fixed-upload zero lost liveness before request-2 origin publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    const auto final_quiet_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < final_quiet_deadline) {
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 2u ||
+                origin.requests.load(std::memory_order_acquire) != 2u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire)) {
+                error = "#270 fixed-upload zero observed third origin/retry or send-count drift";
+                return false;
+            }
+        }
+        usleep(1000);
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    const bool nginx_clean = nginx.shutdown();
+    const bool rut_clean = stop_child(rut.child) && rut.child.pid < 0 && rut.child.status_valid &&
+                           WIFEXITED(rut.child.status) && WEXITSTATUS(rut.child.status) == 0;
+    if (!nginx_clean || !rut_clean) {
+        error = "#270 fixed-upload zero frontends did not shut down cleanly";
+        return false;
+    }
+    std::string access[2];
+    if (!read_exact_return204_log(
+            temps[0].nginx_access_log, "#270 nginx fixed-upload zero access", access[0], error) ||
+        !read_exact_return204_log(
+            temps[1].rut_access_log, "#270 RUT fixed-upload zero access", access[1], error))
+        return false;
+
+    std::vector<char> canonical_upstream[2][2];
+    for (u32 side = 0u; side < 2u; side++) {
+        const bool live_before_stop =
+            origins[side].running.load(std::memory_order_acquire) &&
+            origins[side].thread_alive.load(std::memory_order_acquire) &&
+            !origins[side].listener_failed.load(std::memory_order_acquire);
+        origins[side].stop();
+        const auto expected_first =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], false);
+        const auto expected_second =
+            expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], true);
+        if (!live_before_stop || origins[side].thread_alive.load(std::memory_order_acquire) ||
+            origins[side].listen_fd >= 0 || origins[side].history.size() != 2u ||
+            origins[side].history[0] != expected_first ||
+            origins[side].history[1] != expected_second ||
+            origins[side].request != expected_first ||
+            origins[side].accepted.load(std::memory_order_acquire) != 2u ||
+            origins[side].requests.load(std::memory_order_acquire) != 2u ||
+            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+            !origins[side].response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origins[side].response_connection_closed.load(std::memory_order_acquire) ||
+            origins[side].zero_response_stall_peer_close_count.load(std::memory_order_acquire) !=
+                1u ||
+            origins[side].zero_response_stall_unexpected_data.load(std::memory_order_acquire) ||
+            origins[side].zero_response_stall_observation_failed.load(std::memory_order_acquire)) {
+            error = "#270 fixed-upload zero final origin wire/count/lifecycle evidence differed";
+            return false;
+        }
+        canonical_upstream[side][0] = origins[side].history[0];
+        canonical_upstream[side][1] = origins[side].history[1];
+        if (!canonicalize_keepalive_timeout_upstream(canonical_upstream[side][0],
+                                                     ports[side * 2u + 1u]) ||
+            !canonicalize_keepalive_timeout_upstream(canonical_upstream[side][1],
+                                                     ports[side * 2u + 1u])) {
+            error = "#270 fixed-upload zero could not canonicalize exact upstream Host";
+            return false;
+        }
+    }
+    const std::string expected_access =
+        std::to_string(request1_prefix.size() + request_suffix.size()) + "\n" +
+        std::to_string(request2.size()) + "\n";
+    if (canonical_upstream[0][0] != canonical_upstream[1][0] ||
+        canonical_upstream[0][1] != canonical_upstream[1][1] || access[0] != expected_access ||
+        access[1] != expected_access || temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = "#270 fixed-upload zero cross-side wire/access/resource evidence differed";
+        return false;
+    }
+    std::cerr << "PASS: #270 fixed-upload HEAD zero-response seconds nginx/RUT="
+              << static_cast<double>(elapsed_ns[0]) / 1e9 << "/"
+              << static_cast<double>(elapsed_ns[1]) / 1e9
+              << " delta=" << static_cast<double>(timeout_delta) / 1e9 << "\n";
     return true;
 }
 
@@ -55431,6 +56164,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--keepalive-timeout-get-initial-deadline-differential") == 0;
     const bool fixed_upload_head_success_differential =
         argc == 3 && strcmp(argv[1], "--fixed-upload-head-success-differential") == 0;
+    const bool fixed_upload_head_zero_response_timeout_differential =
+        argc == 3 && strcmp(argv[1], "--fixed-upload-head-zero-response-timeout-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -55636,7 +56371,9 @@ int main(int argc, char** argv) {
          !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
          !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
-         !fixed_upload_head_success_differential && !proxy_hide_header_generated_pair_self_check &&
+         !fixed_upload_head_success_differential &&
+         !fixed_upload_head_zero_response_timeout_differential &&
+         !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
@@ -55707,7 +56444,8 @@ int main(int argc, char** argv) {
           proxy_hide_header_generated_pair_self_check) &&
          argv[2][0] != '/') ||
         ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential ||
-          keepalive_timeout_head_differential || fixed_upload_head_success_differential) &&
+          keepalive_timeout_head_differential || fixed_upload_head_success_differential ||
+          fixed_upload_head_zero_response_timeout_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
@@ -55806,6 +56544,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--fixed-upload-head-success-differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--fixed-upload-head-zero-response-timeout-differential "
+               "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
                "<absolute-rut-executable>\n"
@@ -56993,6 +57734,20 @@ int main(int argc, char** argv) {
                      "complete upstream request, header-only 200, prompt origin retirement, and "
                      "retained downstream keep-alive (success boundary only; proxy_read_timeout "
                      "remains PARTIAL)\n";
+        return 0;
+    }
+    if (fixed_upload_head_zero_response_timeout_differential) {
+        std::string differential_error;
+        if (!run_fixed_upload_head_zero_response_timeout_differential(argv[2],
+                                                                      differential_error)) {
+            std::cerr << "FAIL [#270 fixed-upload HEAD zero-response timeout differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 pinned nginx 1.29.7 and converter-generated ordinary RUT "
+                     "matched the bounded fixed-positive-CL HEAD zero-response 1s timeout, exact "
+                     "header-only keep-alive 504, origin retirement/no retry, and same-downstream "
+                     "fresh-origin HEAD 200 control (proxy_read_timeout remains PARTIAL)\n";
         return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
