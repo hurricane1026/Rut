@@ -236,6 +236,7 @@ static constexpr char kDefaultBufferingTimeoutOrigin[] =
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 12\r\n\r\n"
     "hello";
+static_assert(sizeof(kDefaultBufferingTimeoutOrigin) - 1u == 103u);
 static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -320,6 +321,7 @@ static constexpr char kDefaultBufferingCloseCompleteResponseNormalized[] =
 static constexpr char kDefaultBufferingEofRequest[] =
     "GET /buffered-eof?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
+static_assert(sizeof(kDefaultBufferingEofRequest) - 1u == 56u);
 static constexpr char kDefaultBufferingCloseEofRequest[] =
     "GET /buffered-close-eof?case=explicit-close HTTP/1.1\r\n"
     "Host: close-eof-client.example\r\n"
@@ -331,6 +333,7 @@ static constexpr char kDefaultBufferingEofResponseNormalized[] =
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n"
     "hello";
+static_assert(sizeof(kDefaultBufferingEofResponseNormalized) - 1u == 127u);
 static constexpr char kDefaultBufferingCloseEofResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -56649,6 +56652,476 @@ static bool run_converter_default_buffering_positive_get_differential(
     return true;
 }
 
+static bool run_converter_default_buffering_incomplete_clean_eof_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#271 incomplete-clean-EOF differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0) {
+        error = "#271 incomplete-clean-EOF differential could not create isolated resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = "#271 incomplete-clean-EOF differential could not hold four distinct ports";
+            return false;
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty()) error = "#271 pinned nginx wrapper lost its one events block";
+        return false;
+    }
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty())
+            error = "#271 incomplete-clean-EOF differential could not persist exact inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    for (auto& origin : origins) {
+        origin.gate_incomplete_response_close = true;
+        origin.observe_extra_requests_until_stop = true;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#271 incomplete-clean-EOF origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend],
+                                 1u,
+                                 kDefaultBufferingTimeoutOrigin,
+                                 sizeof(kDefaultBufferingTimeoutOrigin) - 1u)) {
+            if (error.empty()) error = "#271 incomplete-clean-EOF origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#271 incomplete-clean-EOF origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#271 incomplete-clean-EOF nginx bind", error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child)) {
+        error = "#271 incomplete-clean-EOF could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = "#271 incomplete-clean-EOF pinned nginx readiness failed: " + error;
+        dump_log(temps[0].nginx_config, "#271 incomplete-clean-EOF nginx config");
+        dump_log(temps[0].nginx_log, "#271 incomplete-clean-EOF nginx log");
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#271 incomplete-clean-EOF RUT bind", error))
+        return false;
+    if (!spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child)) {
+        error = "#271 incomplete-clean-EOF could not spawn generated ordinary RUT";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = "#271 incomplete-clean-EOF generated RUT readiness failed: " + error;
+        dump_log(temps[1].source, "#271 incomplete-clean-EOF generated RUT source");
+        dump_log(temps[1].rut_log, "#271 incomplete-clean-EOF RUT log");
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    clients.fds[0] = connect_once(ports[0]);
+    clients.fds[1] = connect_once(ports[2]);
+    u64 request_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        if (clients.fds[side] < 0 || !send_all(clients.fds[side],
+                                               kDefaultBufferingEofRequest,
+                                               sizeof(kDefaultBufferingEofRequest) - 1u)) {
+            error = std::string("#271 incomplete-clean-EOF ") + (side == 0u ? "nginx" : "RUT") +
+                    " exact request send failed";
+            return false;
+        }
+        request_sent_ns[side] = steady_now_ns();
+    }
+
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        bool published = true;
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            if (origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                origin.accepted.load(std::memory_order_acquire) > 1u ||
+                origin.requests.load(std::memory_order_acquire) > 1u) {
+                error = "#271 incomplete-clean-EOF origin failed before gated publication";
+                return false;
+            }
+            published &= origin.response_sent_open.load(std::memory_order_acquire);
+        }
+        if (published) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= publication_deadline) {
+            error = "#271 incomplete-clean-EOF did not publish both open origin writes";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 origin_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        origin_sent_ns[side] = origin.response_sent_ns.load(std::memory_order_acquire);
+        if (origin_sent_ns[side] < request_sent_ns[side] ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_closed_by_gate.load(std::memory_order_acquire) ||
+            origin.response_close_failed.load(std::memory_order_acquire)) {
+            error = "#271 incomplete-clean-EOF did not retain one open 103-byte origin write";
+            return false;
+        }
+    }
+
+    // This witnesses one 103-byte application write per origin. It deliberately
+    // makes no claim about TCP packets, proxy recv calls, or io_uring CQEs.
+    bool quiet_complete[2] = {false, false};
+    while (!quiet_complete[0] || !quiet_complete[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (quiet_complete[side]) continue;
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string("#271 incomplete-clean-EOF ") + (side == 0u ? "nginx" : "RUT") +
+                        " exposed downstream before authorized EOF: " + detail;
+                return false;
+            }
+            // Complete a side only after a peek that itself reaches the
+            // boundary, so no pre-probe timestamp can skip the final
+            // non-consuming observation at 400 ms.
+            quiet_complete[side] = steady_now_ns() - origin_sent_ns[side] >= 400'000'000ull;
+        }
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty()) {
+            if (error.empty())
+                error = "#271 incomplete-clean-EOF quiet gate lost live/empty access custody";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_closed_by_gate.load(std::memory_order_acquire) ||
+                origin.response_close_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 incomplete-clean-EOF origin changed before EOF authorization";
+                return false;
+            }
+        }
+    }
+
+    u64 close_authorized_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        close_authorized_ns[side] = steady_now_ns();
+        if (close_authorized_ns[side] < origin_sent_ns[side] + 400'000'000ull ||
+            close_authorized_ns[side] - origin_sent_ns[side] >= 800'000'000ull) {
+            error = "#271 incomplete-clean-EOF authorization left the 400-800ms gate window";
+            return false;
+        }
+        origins[side].response_close_permit.store(true, std::memory_order_release);
+    }
+    const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    for (;;) {
+        bool closed = true;
+        for (const auto& origin : origins) {
+            if (origin.response_close_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 incomplete-clean-EOF peer changed instead of gate-owned EOF";
+                return false;
+            }
+            closed &= origin.response_closed_by_gate.load(std::memory_order_acquire);
+        }
+        if (closed) break;
+        if (!frontends_live() || std::chrono::steady_clock::now() >= close_deadline) {
+            error = "#271 incomplete-clean-EOF gate-owned origin shutdown timed out";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 origin_released_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        origin_released_ns[side] =
+            origins[side].response_close_released_ns.load(std::memory_order_acquire);
+        if (origin_released_ns[side] < close_authorized_ns[side] ||
+            origin_released_ns[side] - close_authorized_ns[side] >= 500'000'000ull) {
+            error = "#271 incomplete-clean-EOF gate release lacked prompt ordered custody";
+            return false;
+        }
+    }
+
+    std::vector<char> responses[2];
+    u64 first_downstream_ns[2]{};
+    u64 downstream_eof_ns[2]{};
+    bool downstream_done[2] = {false, false};
+    while (!downstream_done[0] || !downstream_done[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (downstream_done[side]) continue;
+            if (steady_now_ns() - origin_released_ns[side] >= 500'000'000ull) {
+                error = std::string("#271 incomplete-clean-EOF ") + (side == 0u ? "nginx" : "RUT") +
+                        " response/EOF missed the 500ms release budget";
+                return false;
+            }
+            pollfd poll_state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&poll_state, 1, 5);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                error = "#271 incomplete-clean-EOF downstream poll failed";
+                return false;
+            }
+            if (ready == 0) continue;
+            char bytes[512];
+            const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+            const u64 observed_ns = steady_now_ns();
+            if (count > 0) {
+                if (first_downstream_ns[side] == 0u) first_downstream_ns[side] = observed_ns;
+                responses[side].insert(responses[side].end(), bytes, bytes + count);
+                if (responses[side].size() > sizeof(kDefaultBufferingEofResponseNormalized) - 1u) {
+                    error = "#271 incomplete-clean-EOF downstream included trailing bytes";
+                    return false;
+                }
+                continue;
+            }
+            if (count == 0) {
+                downstream_eof_ns[side] = observed_ns;
+                downstream_done[side] = true;
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            error = "#271 incomplete-clean-EOF downstream recv failed";
+            return false;
+        }
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        if (first_downstream_ns[side] < origin_released_ns[side] ||
+            downstream_eof_ns[side] < first_downstream_ns[side] ||
+            first_downstream_ns[side] - origin_released_ns[side] >= 500'000'000ull ||
+            downstream_eof_ns[side] - origin_released_ns[side] >= 500'000'000ull ||
+            downstream_eof_ns[side] - origin_sent_ns[side] >= 900'000'000ull) {
+            error = "#271 incomplete-clean-EOF downstream left the prompt sub-timeout class";
+            return false;
+        }
+    }
+    std::vector<char> normalized[2] = {responses[0], responses[1]};
+    const std::vector<char> expected_response(kDefaultBufferingEofResponseNormalized,
+                                              kDefaultBufferingEofResponseNormalized +
+                                                  sizeof(kDefaultBufferingEofResponseNormalized) -
+                                                  1u);
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != expected_response || normalized[1] != expected_response ||
+        normalized[0] != normalized[1]) {
+        error = "#271 incomplete-clean-EOF exact Date-normalized response mismatch";
+        dump_wire("#271 incomplete-clean-EOF nginx response", responses[0]);
+        dump_wire("#271 incomplete-clean-EOF RUT response", responses[1]);
+        return false;
+    }
+    for (const auto& response : normalized) {
+        const std::string text(response.begin(), response.end());
+        if (text.find("502") != std::string::npos || text.find("504") != std::string::npos ||
+            text.find("Bad Gateway") != std::string::npos ||
+            text.find("Gateway Time-out") != std::string::npos) {
+            error = "#271 incomplete-clean-EOF response leaked failure/timeout bytes";
+            return false;
+        }
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#271 incomplete-clean-EOF lost process liveness during no-retry gate";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_close_failed.load(std::memory_order_acquire)) {
+                error = "#271 incomplete-clean-EOF observed reconnect/retry after origin EOF";
+                return false;
+            }
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    const std::string expected_upstream_text[2] = {
+        "GET /buffered-eof?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+            "\r\n\r\n",
+        "GET /buffered-eof?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[3]) +
+            "\r\n\r\n",
+    };
+    std::vector<char> upstream[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        const std::vector<char> expected(expected_upstream_text[side].begin(),
+                                         expected_upstream_text[side].end());
+        if (origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.history[0] != expected || origin.request != expected ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_closed_by_gate.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_close_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error = "#271 incomplete-clean-EOF exact origin wire/gate/cleanup evidence mismatch";
+            dump_wire("#271 expected incomplete-clean-EOF upstream", expected);
+            dump_wire("#271 actual incomplete-clean-EOF upstream", origin.request);
+            return false;
+        }
+        const std::string wire(origin.request.begin(), origin.request.end());
+        if (wire.find("client.example") != std::string::npos ||
+            wire.find("\r\nConnection:") != std::string::npos) {
+            error = "#271 incomplete-clean-EOF upstream leaked original Host/Connection";
+            return false;
+        }
+        upstream[side] = origin.history[0];
+    }
+    if (!origins_live_before_stop ||
+        !canonicalize_positive_get_default_upstream(upstream[0], ports[1]) ||
+        !canonicalize_positive_get_default_upstream(upstream[1], ports[3]) ||
+        upstream[0] != upstream[1]) {
+        error = "#271 incomplete-clean-EOF cross-side upstream/liveness evidence differed";
+        return false;
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    static constexpr char kExpectedAccess[] = "56\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access[2];
+        if (!read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error))
+            return false;
+        if (access[0] == kExpectedAccess && access[1] == kExpectedAccess) break;
+        const bool both_frontends_live = frontends_live();
+        if ((!access[0].empty() && access[0] != kExpectedAccess) ||
+            (!access[1].empty() && access[1] != kExpectedAccess) || !both_frontends_live ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            error =
+                "#271 incomplete-clean-EOF access custody was not one exact record reporting "
+                "56 request bytes; nginx=[" +
+                access[0] + "], RUT=[" + access[1] +
+                "], frontends_live=" + (both_frontends_live ? "true" : "false");
+            dump_log(temps[0].nginx_log, "#271 incomplete-clean-EOF nginx process log");
+            dump_log(temps[1].rut_log, "#271 incomplete-clean-EOF RUT process log");
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !rut_stopped || !container_removed ||
+        origins[0].thread_alive.load(std::memory_order_acquire) ||
+        origins[1].thread_alive.load(std::memory_order_acquire) || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = "#271 incomplete-clean-EOF final process/container/fd cleanup was incomplete";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #271 incomplete-clean-EOF send-to-release/"
+                 "release-to-first/release-to-EOF seconds nginx="
+              << static_cast<double>(origin_released_ns[0] - origin_sent_ns[0]) / 1e9 << "/"
+              << static_cast<double>(first_downstream_ns[0] - origin_released_ns[0]) / 1e9 << "/"
+              << static_cast<double>(downstream_eof_ns[0] - origin_released_ns[0]) / 1e9
+              << " RUT=" << static_cast<double>(origin_released_ns[1] - origin_sent_ns[1]) / 1e9
+              << "/" << static_cast<double>(first_downstream_ns[1] - origin_released_ns[1]) / 1e9
+              << "/" << static_cast<double>(downstream_eof_ns[1] - origin_released_ns[1]) / 1e9
+              << "\n";
+    return true;
+}
+
 static bool run_pinned_positive_cl_options_default_buffering_oracle(
     TempDir& temp,
     const std::string& container_name,
@@ -57099,6 +57572,9 @@ int main(int argc, char** argv) {
     const bool converter_default_buffering_positive_get_differential =
         argc == 3 &&
         strcmp(argv[1], "--converter-default-buffering-positive-get-differential") == 0;
+    const bool converter_default_buffering_incomplete_clean_eof_differential =
+        argc == 3 &&
+        strcmp(argv[1], "--converter-default-buffering-incomplete-clean-eof-differential") == 0;
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
@@ -57302,11 +57778,13 @@ int main(int argc, char** argv) {
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
          !zero_response_stall_self_check &&
-         !converter_default_buffering_positive_get_differential && !wildcard_listen_oracle &&
-         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
-         !request_length_oracle && !request_length_split_header_oracle &&
-         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
-         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
+         !converter_default_buffering_positive_get_differential &&
+         !converter_default_buffering_incomplete_clean_eof_differential &&
+         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
+         !exact_loopback_listen_oracle && !request_length_oracle &&
+         !request_length_split_header_oracle && !rut_initial_header_split_public &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -57374,7 +57852,9 @@ int main(int argc, char** argv) {
           fixed_upload_head_two_incomplete_header_fragments_timeout_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
-        (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
+        ((converter_default_buffering_positive_get_differential ||
+          converter_default_buffering_incomplete_clean_eof_differential) &&
+         argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
         (converter_request_length_fixed_body_differential && argv[2][0] != '/') ||
@@ -57489,6 +57969,9 @@ int main(int argc, char** argv) {
                "--converter-proxy-hide-header-differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-positive-get-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-incomplete-clean-eof-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
@@ -58816,6 +59299,33 @@ int main(int argc, char** argv) {
                "60s/complete-content-length custody; this does not expiry-test 60s or claim "
                "explicit directive lowering, broader methods/bodies/framing/status/protocols, "
                "retry, or upstream reuse.\n";
+        return 0;
+    }
+    if (converter_default_buffering_incomplete_clean_eof_differential) {
+        const std::string container_name = "rut-nginx-271-incomplete-eof-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_incomplete_clean_eof_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#271 converter default-buffering incomplete-clean-EOF "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #271 pinned nginx 1.29.7 and converter-generated ordinary RUT matched "
+               "one exact bodyless GET with explicit proxy_read_timeout 1s and omitted "
+               "proxy_buffering/proxy_request_buffering/proxy_http_version/proxy_set_header: "
+               "both withheld the exact 103-byte origin write containing a complete header "
+               "and five of twelve body bytes for at least 400ms, then after test-authorized "
+               "clean origin EOF emitted the same exact Date-normalized 127-byte 200/CL12/"
+               "keep-alive prefix and actual downstream EOF in the prompt sub-timeout class. "
+               "Each side emitted one exact authority-rewritten upstream request and one access "
+               "record reporting 56 request bytes with no retry. This proves only this "
+               "incomplete-positive-CL clean-EOF vector; it does not claim broad "
+               "CompleteContentLength/default buffering, "
+               "inactivity refresh, reset/chunked/close-delimited variants, reuse, TLS, or H2.\n";
         return 0;
     }
     if (request_length_oracle) {
