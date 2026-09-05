@@ -17567,8 +17567,15 @@ TEST(access_request_size,
         make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
-    const u32 response_len = conn->send_buf.len();
-    REQUIRE_GT(response_len, 0u);
+    const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    REQUIRE_EQ(kMockHttpResponseLen, 40u);
+    REQUIRE_EQ(downstream_send->fd, conn->fd);
+    REQUIRE_EQ(downstream_send->send_len, kMockHttpResponseLen);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kMockHttpResponse, kMockHttpResponseLen),
+               0);
+    REQUIRE_EQ(conn->send_buf.len(), 0u);
+    const u32 response_len = downstream_send->send_len;
     const u32 completed_id = conn->id;
     loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, response_len));
 
@@ -17745,8 +17752,15 @@ TEST(access_request_size,
         make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
-    const u32 response_len = conn->send_buf.len();
-    REQUIRE_GT(response_len, 0u);
+    const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    REQUIRE_EQ(kMockHttpResponseLen, 40u);
+    REQUIRE_EQ(downstream_send->fd, conn->fd);
+    REQUIRE_EQ(downstream_send->send_len, kMockHttpResponseLen);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kMockHttpResponse, kMockHttpResponseLen),
+               0);
+    REQUIRE_EQ(conn->send_buf.len(), 0u);
+    const u32 response_len = downstream_send->send_len;
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
     CHECK_EQ(access_request_size_fixed_body_handler_calls, 1u);
@@ -32900,6 +32914,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_EQ(metrics.requests_total, 0u);
         REQUIRE_EQ(metrics.requests_active, 1u);
         REQUIRE_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+        REQUIRE_EQ(conn.upstream_attempts, 1u);
 
         const u32 advanced_episode = conn.upstream_episode;
         const auto check_connect_completion_neutrality = [&] {
@@ -32939,7 +32954,7 @@ TEST(iouring_validated_failure_pipeline,
         CHECK_EQ(conn.pipeline_depth, 1u);
         CHECK_NE(conn.handler_gen, 0u);
         CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-        CHECK_EQ(conn.upstream_attempts, 1u);
+        CHECK_EQ(conn.upstream_attempts, 0u);
         CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
         CHECK(http1_pipeline_request_generation_provisional_is_stable(
             conn,
@@ -33063,6 +33078,7 @@ TEST(iouring_validated_failure_pipeline,
     // Publication of request1's configured response already owns Send. Only
     // now does request2 arrive through the still-live downstream Recv owner.
     REQUIRE(conn.send_armed);
+    REQUIRE_EQ(conn.upstream_attempts, 1u);
     REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending;
@@ -33075,7 +33091,7 @@ TEST(iouring_validated_failure_pipeline,
     CHECK_EQ(conn.pipeline_depth, 1u);
     CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
     CHECK_FALSE(conn.keep_alive);
-    CHECK_EQ(conn.upstream_attempts, 1u);
+    CHECK_EQ(conn.upstream_attempts, 0u);
     CHECK_EQ(conn.upstream_retiring_episode, failed_episode);
     CHECK_FALSE(conn.upstream_connect_armed);
     CHECK_FALSE(conn.upstream_send_armed);
@@ -33203,6 +33219,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE(config.add_static("/two", kRouteMethodGet, 205));
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
+        REQUIRE_EQ(conn.upstream_attempts, 1u);
         REQUIRE_EQ(conn.recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
         if (terminal_late_recv) {
             conn.recv_armed = false;
@@ -33228,6 +33245,7 @@ TEST(iouring_validated_failure_pipeline,
         CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), expected_tail);
         CHECK_EQ(metrics.requests_total, 1u);
         CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(conn.upstream_attempts, 1u);
 
         REQUIRE_EQ(conn.recv_buf.write(kRemainder, sizeof(kRemainder) - 1u),
                    sizeof(kRemainder) - 1u);
@@ -33240,7 +33258,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_GE(conn.fd, 0);
         CHECK_NE(conn.handler_gen, 0u);
         CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-        CHECK_EQ(conn.upstream_attempts, 1u);
+        CHECK_EQ(conn.upstream_attempts, 0u);
         CHECK_EQ(conn.resp_status, 205u);
         CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
         CHECK(conn.send_armed);
@@ -40197,11 +40215,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
                 REQUIRE_FALSE(conn->upstream_send_armed);
                 REQUIRE_FALSE(conn->upstream_recv_armed);
             }
-            if (initial_body_len < 12u)
-                REQUIRE_EQ(conn->send_buf.len(), 0u);
-            else
-                REQUIRE_EQ(conn->send_buf.len(),
-                           static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
             REQUIRE_EQ(conn->response_header_buf.len(), 0u);
             if (initial_body_len < 12u) {
                 REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
@@ -40230,6 +40244,10 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             REQUIRE_FALSE(conn->request_policy_body_pending);
             REQUIRE_EQ(conn->req_body_remaining, 0u);
             REQUIRE(conn->request_body_fully_buffered);
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
+            REQUIRE_EQ(conn->retry_req_send_len, 0u);
+            REQUIRE_EQ(conn->pipeline_stash_len, 0u);
+            REQUIRE_FALSE(conn->response_mutations_snapshotted);
             REQUIRE(conn->upstream_connect_armed);
             REQUIRE_FALSE(conn->upstream_send_armed);
             REQUIRE_FALSE(conn->upstream_recv_armed);
@@ -40265,6 +40283,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             const auto& send = loop->backend.upstream_send_state[id];
             REQUIRE_EQ(send.remaining, proof.expected_upload_length);
             REQUIRE_EQ(send.upstream_episode, episode);
+            REQUIRE_EQ(send.src, conn->recv_buf.data());
             REQUIRE_EQ(__builtin_memcmp(send.src, conn->recv_buf.data(), send.remaining), 0);
             REQUIRE_EQ(send.remaining,
                        static_cast<u32>(sizeof(kRewrittenHead) - 1u + sizeof(kBody)));
@@ -40290,6 +40309,11 @@ TEST(response_read_deadline_fixed_upload_head_activation,
             REQUIRE_EQ(conn->response_read_deadline_upload.upload_episode, episode);
             REQUIRE(conn->upstream_fd >= 0);
             REQUIRE_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+            REQUIRE_EQ(conn->recv_buf.len(), 0u);
+            REQUIRE_EQ(conn->send_buf.len(), 0u);
+            REQUIRE_EQ(conn->retry_req_send_len, 0u);
+            REQUIRE_EQ(conn->pipeline_stash_len, 0u);
+            REQUIRE_FALSE(conn->response_mutations_snapshotted);
             REQUIRE_EQ(conn->pending_ops, 1u);
             REQUIRE_EQ(loop->backend.pending, backend_pending_before + 1u);
             const u32 close_episode = conn->upstream_episode;
