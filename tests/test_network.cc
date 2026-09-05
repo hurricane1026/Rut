@@ -37408,32 +37408,33 @@ TEST(iouring_response_read_timer,
 
         REQUIRE_GE(conn.fd, 0);
         REQUIRE_EQ(conn.resp_status, 200u);
-        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
-        CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
         if (positive_body) {
+            REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+            CHECK_GT(conn.response_read_timer_last_progress_ns, deadline_origin);
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                      ResponseReadDeadlinePostCommitPhase::Buffering);
             CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
-            CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
-            CHECK_NE(conn.timer_node.next, &conn.timer_node);
-            CHECK_NE(conn.timer_node.prev, &conn.timer_node);
+            CHECK(loop->response_read_deadline_uses_precise_timer(conn));
+            CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+            CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
             CHECK_FALSE(conn.send_armed);
         } else {
+            REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+            CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
             CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
             CHECK_EQ(conn.state, ConnState::Sending);
             CHECK_EQ(conn.timer_node.next, &conn.timer_node);
             CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+            IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+            target.result = -ECANCELED;
+            IoEvent cancel = inert_response_read_timer_event(
+                conn.id, timer_generation | kResponseReadTimerCancelBit);
+            cancel.result = 0;
+            const IoEvent custody[2] = {target, cancel};
+            loop->dispatch_batch(custody, 2);
+            CHECK(conn.response_read_timer_owner_is_neutral());
+            CHECK_GE(conn.fd, 0);
         }
-
-        IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
-        target.result = -ECANCELED;
-        IoEvent cancel = inert_response_read_timer_event(
-            conn.id, timer_generation | kResponseReadTimerCancelBit);
-        cancel.result = 0;
-        const IoEvent custody[2] = {target, cancel};
-        loop->dispatch_batch(custody, 2);
-        CHECK(conn.response_read_timer_owner_is_neutral());
-        CHECK_GE(conn.fd, 0);
 
         neutralize_staged_precise_timer(loop, fixture);
         cleanup_prebuilt_d2(loop, fixture);
@@ -46828,8 +46829,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn.timer_node.next, &conn.timer_node);
     REQUIRE_EQ(conn.timer_node.prev, &conn.timer_node);
 
-    static constexpr u8 kPartial[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
     const IoEvent progress =
@@ -46855,6 +46855,61 @@ TEST(response_buffering_runtime,
     CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
 
     cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime,
+     precise_buffering_old_target_rearms_before_refreshed_deadline_and_expires_when_due) {
+    for (const bool due : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+
+        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent progress =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        loop->dispatch_batch(&progress, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        const u64 refreshed_origin = conn.response_read_timer_last_progress_ns;
+        REQUIRE_NE(refreshed_origin, 0u);
+        if (due) conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+
+        const IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+        loop->dispatch_batch(&target, 1);
+
+        REQUIRE_GE(conn.fd, 0);
+        if (due) {
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            CHECK(conn.response_read_deadline_post_commit_close_after_drain);
+            CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
+            CHECK_EQ(conn.resp_status, 200u);
+            CHECK(conn.response_read_timer_owner_is_neutral());
+            CHECK_FALSE(buf_has(conn.response_read_deadline_send_src,
+                                conn.response_read_deadline_send_len,
+                                "504 Gateway Time-out"));
+        } else {
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation + 1u);
+            CHECK_EQ(conn.response_read_timer_last_progress_ns, refreshed_origin);
+            CHECK(conn.response_read_timer_target_owned);
+            CHECK_FALSE(conn.response_read_timer_cancel_owned);
+            CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+            CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+        }
+
+        cleanup_prebuilt_d2(loop, fixture);
+    }
 }
 
 TEST(response_buffering_runtime,
