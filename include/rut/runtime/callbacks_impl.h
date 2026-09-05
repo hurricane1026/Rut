@@ -1231,6 +1231,15 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             !conn.req_client_keep_alive && conn.req_client_connection_close &&
             conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
         const bool downstream_close = preflight_downstream_close || header_only_head_explicit_close;
+        const bool exact_bodyless_get_precise_preflight =
+            profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+            bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+            conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+            route->method == kRouteMethodGet && !conn.req_client_has_content_length &&
+            conn.req_client_content_length_count == 0 &&
+            response_read_deadline_default_persistence_is_stable(conn) &&
+            conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
+            conn.recv_buf.len() == conn.req_initial_send_len;
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_provisional_is_stable(conn,
                                                                     profile,
@@ -1301,17 +1310,23 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         conn.response_read_deadline_upload.downstream_close = downstream_close;
         if (conn.recv_buf.len() > conn.req_initial_send_len ||
             (profile == ResponseReadDeadlineProfile::HeaderOnlyHead && conn.pipeline_depth == 0 &&
-             conn.http1_pipeline_request_generation == 0)) {
+             conn.http1_pipeline_request_generation == 0) ||
+            exact_bodyless_get_precise_preflight) {
             auto& proof = conn.response_read_deadline_upload;
             if (!response_read_deadline_route_index(*config, route, &route_index)) {
                 loop->close_conn(conn);
                 return false;
             }
             proof.handler_generation = conn.handler_gen;
-            proof.raw_header_end = conn.req_initial_send_len;
-            proof.raw_total_length = conn.req_initial_send_len;
             proof.route_index = route_index;
             proof.route_fn = route->fn;
+            // Exact GET cannot prove request-policy materialization until JIT
+            // selects ID1. Keep raw identity neutral until that admission. A
+            // coalesced GET already has an immutable request/suffix boundary.
+            if (!exact_bodyless_get_precise_preflight) {
+                proof.raw_header_end = conn.req_initial_send_len;
+                proof.raw_total_length = conn.req_initial_send_len;
+            }
         }
         if (fixed_upload) {
             auto& proof = conn.response_read_deadline_upload;
@@ -3557,6 +3572,30 @@ void handle_jit_outcome(Loop* loop,
                     deadline_proof.raw_header_end == conn.req_initial_send_len &&
                     deadline_proof.raw_total_length == conn.req_initial_send_len &&
                     deadline_proof.raw_content_length == 0;
+                const bool bodyless_get_materialization =
+                    outcome_profile ==
+                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                    forward_response_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                    conn.response_read_deadline_route_method == kRouteMethodGet &&
+                    !conn.req_client_has_content_length &&
+                    conn.req_client_content_length_count == 0 &&
+                    response_read_deadline_default_persistence_is_stable(conn) &&
+                    conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0 &&
+                    conn.recv_buf.len() == conn.req_initial_send_len &&
+                    outcome.request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                    fn != nullptr && deadline_proof.route_fn == fn &&
+                    deadline_proof.handler_generation == conn.handler_gen &&
+                    deadline_proof.route_index < config->route_count &&
+                    deadline_proof.raw_header_end == 0 && deadline_proof.raw_content_length == 0 &&
+                    deadline_proof.raw_total_length == 0 &&
+                    deadline_proof.rewritten_header_end == 0 &&
+                    deadline_proof.rewritten_total_length == 0 &&
+                    deadline_proof.expected_upload_length == 0 &&
+                    deadline_proof.upload_episode == 0 && deadline_proof.upstream_id == 0xffffu &&
+                    deadline_proof.request_policy_id == 0;
                 strict_pipeline_successor =
                     http1_pipeline_request_is_current_successor(conn) &&
                     http1_pipeline_request_generation_jit_candidate_is_stable(
@@ -3611,6 +3650,8 @@ void handle_jit_outcome(Loop* loop,
                     !response_read_deadline_route_method_matches(
                         conn.response_read_deadline_method,
                         conn.response_read_deadline_route_method) ||
+                    (coalesced_get && outcome.request_policy_id !=
+                                          static_cast<u16>(RequestPolicyId::Http11FixedStrip)) ||
                     !target_valid || !request_policy_valid || conn.target_transform_recorded ||
                     conn.req_path_overridden || conn.req_header_override_count != 0 ||
                     conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
@@ -3650,7 +3691,8 @@ void handle_jit_outcome(Loop* loop,
                 } else if (complete_content_length_buffering) {
                     auto& proof = conn.response_read_deadline_upload;
                     if (proof.request_policy_id != 0 ||
-                        (coalesced_get && proof.upstream_id != 0xffffu)) {
+                        ((coalesced_get || bodyless_get_materialization) &&
+                         proof.upstream_id != 0xffffu)) {
                         loop->close_conn(conn);
                         return;
                     }
@@ -3658,7 +3700,12 @@ void handle_jit_outcome(Loop* loop,
                     // exact Http11FixedStrip request has been materialized.
                     if (!strict_pipeline_successor) {
                         proof.request_policy_id = outcome.request_policy_id;
-                        if (coalesced_get) proof.upstream_id = outcome.upstream_id;
+                        if (coalesced_get || bodyless_get_materialization)
+                            proof.upstream_id = outcome.upstream_id;
+                        if (bodyless_get_materialization) {
+                            proof.raw_header_end = conn.req_initial_send_len;
+                            proof.raw_total_length = conn.req_initial_send_len;
+                        }
                     }
                 } else if (header_only_head_materialization) {
                     auto& proof = conn.response_read_deadline_upload;
@@ -3985,7 +4032,7 @@ void handle_jit_outcome(Loop* loop,
                             static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
                         conn.req_initial_send_len == 0 ||
                         conn.req_initial_send_len != conn.req_header_end ||
-                        conn.req_initial_send_len >= conn.recv_buf.len() ||
+                        conn.req_initial_send_len > conn.recv_buf.len() ||
                         rewritten_parser.parse(conn.recv_buf.data(),
                                                conn.req_initial_send_len,
                                                &rewritten_request) != ParseStatus::Complete ||
@@ -5596,7 +5643,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_recv_buf.len() != 0 || conn.upstream_recv_armed ||
             conn.request_upload_complete || req_src != conn.recv_buf.data() ||
             req_send_len != proof.expected_upload_length ||
-            req_send_len != conn.req_initial_send_len || req_send_len >= conn.recv_buf.len() ||
+            req_send_len != conn.req_initial_send_len || req_send_len > conn.recv_buf.len() ||
             !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof)) {
             loop->close_conn(conn);
             return;
@@ -5638,15 +5685,26 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     const bool fixed_upload =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
-    const bool coalesced_get =
+    const bool materialized_get =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         conn.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
         conn.response_read_deadline_upload.raw_total_length != 0;
+    // Classify while request 1 is still materialized in recv_buf.  After
+    // pipeline_stash/reset these lengths describe different ownership domains.
+    const bool exact_get = materialized_get && conn.recv_buf.len() == conn.req_initial_send_len;
+    const bool coalesced_get = materialized_get && conn.recv_buf.len() > conn.req_initial_send_len;
+    const bool invalid_materialized_get =
+        materialized_get && conn.recv_buf.len() < conn.req_initial_send_len;
     const bool pipeline_successor =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         http1_pipeline_request_is_current_successor(conn);
-    if (fixed_upload || coalesced_get || pipeline_successor) {
+    if (invalid_materialized_get) {
+        conn.upstream_request_incomplete = true;
+        loop->close_conn(conn);
+        return;
+    }
+    if (fixed_upload || materialized_get || pipeline_successor) {
         const auto& proof = conn.response_read_deadline_upload;
         bool send_owner_stable = false;
         if constexpr (requires(Loop* candidate) { candidate->backend.upstream_send_state[0]; }) {
@@ -5664,7 +5722,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_recv_armed ||
             (fixed_upload ? !response_read_deadline_fixed_upload_materialization_is_stable(
                                 conn, proof, /*require_upload_complete=*/false)
-             : coalesced_get
+             : materialized_get
                  ? !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof)
                  : !http1_pipeline_request_generation_upload_active_is_stable(
                        conn,
@@ -5778,9 +5836,20 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // req_body_remaining: that counter is advanced before asynchronous writes.
     conn.request_upload_complete = true;
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
-        conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
-        (conn.response_read_deadline_upload.downstream_close ||
-         header_only_head_keep_alive_precise_candidate(conn)) &&
+        ((conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+          (conn.response_read_deadline_upload.downstream_close ||
+           header_only_head_keep_alive_precise_candidate(conn))) ||
+         (conn.response_read_deadline_profile ==
+              ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+          conn.response_read_deadline_buffering ==
+              ForwardResponseBufferingMode::CompleteContentLength &&
+          conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+          conn.response_read_deadline_route_method == kRouteMethodGet &&
+          conn.response_read_deadline_upload.raw_header_end != 0 &&
+          conn.response_read_deadline_upload.raw_content_length == 0 &&
+          conn.response_read_deadline_upload.raw_total_length ==
+              conn.response_read_deadline_upload.raw_header_end &&
+          !conn.response_read_deadline_upload.downstream_close)) &&
         conn.pipeline_depth == 0 && conn.http1_pipeline_request_generation == 0)
         conn.response_read_deadline_upload.upload_episode = conn.upstream_episode;
 
@@ -5828,6 +5897,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.reset_request_receive_buffer();
         if (coalesced_get && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                  conn, conn.response_read_deadline_upload)) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (exact_get && conn.pipeline_stash_len != 0) {
             loop->close_conn(conn);
             return;
         }
@@ -6970,10 +7043,9 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight) {
-    // #277 phase 1 intentionally does not publish an origin response while the
-    // request-1 Send still owns its source prefix.  Closing here covers the
-    // Recv-before-Send ordering; Send-before-Recv first completes the upload,
-    // establishes the exact stash and moves to the ordinary strict recv slot.
+    // A generation-owned materialized GET cannot publish an origin response
+    // while request 1's Send still owns its recv_buf prefix. This covers both
+    // exact and coalesced layouts; only the latter later establishes a stash.
     if (send_in_flight &&
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         conn.response_read_deadline_upload.raw_total_length != 0 &&
@@ -8828,14 +8900,18 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 timeout.head_mode != FailurePolicyHeadMode::Reject)
                 return false;
             const auto& proof = conn.response_read_deadline_upload;
-            if (proof.raw_total_length != 0 &&
-                (!response_read_deadline_coalesced_get_phase1_proof_is_stable(
-                     conn,
-                     proof,
-                     /*allow_retired_episode=*/false,
-                     /*require_upload_episode=*/false) ||
-                 conn.recv_buf.len() <= conn.req_initial_send_len || conn.pipeline_stash_len != 0))
-                return false;
+            if (proof.raw_total_length != 0) {
+                const bool exact = conn.recv_buf.len() == conn.req_initial_send_len;
+                const bool coalesced = conn.recv_buf.len() > conn.req_initial_send_len;
+                if ((!exact && !coalesced) ||
+                    !response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                        conn,
+                        proof,
+                        /*allow_retired_episode=*/false,
+                        /*require_upload_episode=*/false) ||
+                    conn.pipeline_stash_len != 0)
+                    return false;
+            }
         } else {
             return false;
         }

@@ -639,6 +639,12 @@ static u64 response_coalesced_phase1_handler(
             conn.target_transform_recorded = true;
         }
     }
+    if (response_coalesced_phase1_mutation_kind == 4)
+        return jit::HandlerResult::make_forward_with_bundle(0, 0, 2).pack();
+    if (response_coalesced_phase1_mutation_kind == 5)
+        return jit::HandlerResult::make_forward_with_bundle(
+                   0, static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost), 2)
+            .pack();
     return jit::HandlerResult::make_forward_with_bundle(
                0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 2)
         .pack();
@@ -29525,16 +29531,26 @@ void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
 // The live HEAD path deliberately stages its SQEs without submitting them in
 // these focused tests. Keep the original ring position so synthetic CQEs
 // cannot leave a kernel-owned timespec behind at teardown.
-bool stage_live_precise_head(IoUringEventLoop* loop,
-                             RouteConfig& config,
-                             PrebuiltD2Fixture* out,
-                             bool downstream_close = true,
-                             bool force_initial_timer_sq_full = false) {
+bool add_bodyless_non_head_response_read_deadline_bundle(RouteConfig& config,
+                                                         u8 seconds,
+                                                         ForwardResponseBufferingMode buffering);
+
+bool stage_live_precise_request(IoUringEventLoop* loop,
+                                RouteConfig& config,
+                                PrebuiltD2Fixture* out,
+                                bool bodyless_get,
+                                bool downstream_close,
+                                bool force_initial_timer_sq_full) {
     if (loop == nullptr || out == nullptr ||
         !config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
-        !add_response_read_deadline_bundle(config, 5) ||
-        !config.add_jit_handler(
-            "/one", 'H', &response_read_deadline_handler, false, /*preflight bundle=*/2))
+        !(bodyless_get ? add_bodyless_non_head_response_read_deadline_bundle(
+                             config, 5, ForwardResponseBufferingMode::CompleteContentLength)
+                       : add_response_read_deadline_bundle(config, 5)) ||
+        !config.add_jit_handler("/one",
+                                bodyless_get ? kRouteMethodGet : kRouteMethodHead,
+                                &response_read_deadline_handler,
+                                false,
+                                /*preflight bundle=*/2))
         return false;
     Connection* conn = loop->alloc_conn();
     if (conn == nullptr) return false;
@@ -29572,12 +29588,17 @@ bool stage_live_precise_head(IoUringEventLoop* loop,
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     static constexpr u8 kKeepAliveRequest[] =
         "HEAD /one?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    const u8* request = downstream_close ? kCloseRequest : kKeepAliveRequest;
-    const u32 request_len =
-        downstream_close ? sizeof(kCloseRequest) - 1u : sizeof(kKeepAliveRequest) - 1u;
+    static constexpr u8 kGetRequest[] = "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    const u8* request = bodyless_get       ? kGetRequest
+                        : downstream_close ? kCloseRequest
+                                           : kKeepAliveRequest;
+    const u32 request_len = bodyless_get       ? sizeof(kGetRequest) - 1u
+                            : downstream_close ? sizeof(kCloseRequest) - 1u
+                                               : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
     capture_request_metadata(*conn);
     conn->keep_alive = !downstream_close;
+    if (bodyless_get) conn->req_start_us = monotonic_us();
     conn->handler_gen = 1;
     conn->request_config = &config;
     if (!prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config)) {
@@ -29635,6 +29656,22 @@ bool stage_live_precise_head(IoUringEventLoop* loop,
                         conn->response_read_deadline_state == ResponseReadDeadlineState::Armed &&
                         conn->response_read_timer_owner_is_valid();
     return staged ? true : fail();
+}
+
+bool stage_live_precise_head(IoUringEventLoop* loop,
+                             RouteConfig& config,
+                             PrebuiltD2Fixture* out,
+                             bool downstream_close = true,
+                             bool force_initial_timer_sq_full = false) {
+    return stage_live_precise_request(
+        loop, config, out, false, downstream_close, force_initial_timer_sq_full);
+}
+
+bool stage_live_precise_get(IoUringEventLoop* loop,
+                            RouteConfig& config,
+                            PrebuiltD2Fixture* out,
+                            bool force_initial_timer_sq_full = false) {
+    return stage_live_precise_request(loop, config, out, true, false, force_initial_timer_sq_full);
 }
 
 void neutralize_staged_precise_timer(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
@@ -30733,6 +30770,8 @@ TEST(response_read_deadline_coalesced_get_phase1,
         Reused,
         RetryPrefix,
         Mutation,
+        PolicyZero,
+        PolicyTwo,
         Http10,
         Tls,
         H2,
@@ -30750,6 +30789,8 @@ TEST(response_read_deadline_coalesced_get_phase1,
                               Shape::Reused,
                               Shape::RetryPrefix,
                               Shape::Mutation,
+                              Shape::PolicyZero,
+                              Shape::PolicyTwo,
                               Shape::Http10,
                               Shape::Tls,
                               Shape::H2}) {
@@ -30803,10 +30844,14 @@ TEST(response_read_deadline_coalesced_get_phase1,
         REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                    sizeof(kSuccessor) - 1u);
         if (shape == Shape::PipelineDepth) conn->pipeline_depth = 1;
-        if (shape == Shape::Reused || shape == Shape::RetryPrefix || shape == Shape::Mutation) {
+        if (shape == Shape::Reused || shape == Shape::RetryPrefix || shape == Shape::Mutation ||
+            shape == Shape::PolicyZero || shape == Shape::PolicyTwo) {
             response_coalesced_phase1_mutation_conn = conn;
-            response_coalesced_phase1_mutation_kind =
-                shape == Shape::Reused ? 1 : (shape == Shape::RetryPrefix ? 2 : 3);
+            response_coalesced_phase1_mutation_kind = shape == Shape::Reused        ? 1
+                                                      : shape == Shape::RetryPrefix ? 2
+                                                      : shape == Shape::Mutation    ? 3
+                                                      : shape == Shape::PolicyZero  ? 4
+                                                                                    : 5;
         }
         if (shape == Shape::Tls) conn->tls_active = true;
         response_coalesced_phase1_handler_calls = 0;
@@ -37174,6 +37219,247 @@ TEST(iouring_response_read_timer,
     conn.request_config = &config;
     config.upstreams[0].addr_count = 2;
     CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+
+    neutralize_staged_precise_timer(loop, fixture);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_get_classifier_and_arm_are_exact_without_wheel) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    CHECK(response_read_deadline_owner_is_stable(conn,
+                                                 &on_upstream_response<IoUringEventLoop>,
+                                                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy));
+    CHECK(bodyless_get_keep_alive_precise_arm_is_stable(
+        conn,
+        conn.response_read_deadline_upload,
+        &config,
+        2,
+        ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+        &on_upstream_response<IoUringEventLoop>));
+    REQUIRE(loop->response_read_deadline_uses_precise_timer(conn));
+    CHECK_EQ(conn.response_read_deadline_profile,
+             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+    CHECK_EQ(conn.response_read_deadline_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(conn.response_read_deadline_route_method, kRouteMethodGet);
+    CHECK_EQ(conn.req_client_content_length_count, 0u);
+    CHECK_FALSE(conn.req_client_has_content_length);
+    CHECK(response_read_deadline_default_persistence_is_stable(conn));
+    CHECK(conn.response_read_timer_owner_is_valid());
+    CHECK_EQ(conn.response_read_timer_deadline_generation, conn.response_read_deadline_generation);
+    CHECK_EQ(conn.response_read_timer_upstream_episode, conn.upstream_episode);
+    CHECK_EQ(conn.response_read_timer_timespec.tv_sec, 5);
+    CHECK_EQ(conn.response_read_timer_timespec.tv_nsec, 0);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+
+    const auto rejected_while = [&](auto mutate, auto restore) {
+        mutate();
+        CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+        restore();
+        CHECK(loop->response_read_deadline_uses_precise_timer(conn));
+    };
+    rejected_while([&] { conn.response_read_deadline_route_method = kRouteMethodAny; },
+                   [&] { conn.response_read_deadline_route_method = kRouteMethodGet; });
+    rejected_while([&] { config.routes[0].method = kRouteMethodAny; },
+                   [&] { config.routes[0].method = kRouteMethodGet; });
+    rejected_while([&] { conn.req_client_content_length_count = 1; },
+                   [&] { conn.req_client_content_length_count = 0; });
+    rejected_while([&] { conn.req_client_has_content_length = true; },
+                   [&] { conn.req_client_has_content_length = false; });
+    rejected_while(
+        [&] {
+            conn.request_policy_id =
+                static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+        },
+        [&] { conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip); });
+    rejected_while(
+        [&] { conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None; },
+        [&] {
+            conn.response_read_deadline_buffering =
+                ForwardResponseBufferingMode::CompleteContentLength;
+        });
+    rejected_while([&] { conn.pipeline_depth = 1; }, [&] { conn.pipeline_depth = 0; });
+    rejected_while([&] { conn.http1_pipeline_request_generation = conn.handler_gen; },
+                   [&] { conn.http1_pipeline_request_generation = 0; });
+    rejected_while([&] { conn.upstream_reused = true; }, [&] { conn.upstream_reused = false; });
+    rejected_while([&] { conn.upstream_attempts = 2; }, [&] { conn.upstream_attempts = 1; });
+    rejected_while([&] { conn.tls_active = true; }, [&] { conn.tls_active = false; });
+    rejected_while([&] { conn.h2 = reinterpret_cast<Http2Conn*>(1); }, [&] { conn.h2 = nullptr; });
+    rejected_while([&] { conn.response_mutations_snapshotted = true; },
+                   [&] { conn.response_mutations_snapshotted = false; });
+    rejected_while([&] { ++conn.response_read_deadline_upload.handler_generation; },
+                   [&] { --conn.response_read_deadline_upload.handler_generation; });
+    rejected_while([&] { config.upstreams[0].addr_count = 2; },
+                   [&] { config.upstreams[0].addr_count = 1; });
+
+    neutralize_staged_precise_timer(loop, fixture);
+    cleanup_prebuilt_d2(loop, fixture);
+
+    RouteConfig sq_full_config{};
+    PrebuiltD2Fixture sq_full_fixture{};
+    REQUIRE(stage_live_precise_get(loop, sq_full_config, &sq_full_fixture, true));
+    CHECK_EQ(sq_full_fixture.conn->fd, -1);
+    CHECK(sq_full_fixture.conn->response_read_timer_owner_is_neutral());
+    release_closed_response_read_fixture(sq_full_fixture);
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_get_due_uses_full_cl_504_in_both_progress_orders) {
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nX-Progress: one\r\n";
+    static constexpr u8 kTimeoutBody[] = {
+        't', 'i', 'm', 'e', 0, 'o', 'u', 't', '\r', '\n', '\r', '\n', 'b', 'o', 'd', 'y'};
+    for (const bool timer_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 logical_generation = conn.response_read_deadline_generation;
+        const u32 logical_episode = conn.upstream_episode;
+        neutralize_staged_precise_timer(loop, fixture);
+        REQUIRE(install_inert_response_read_timer_owner(
+            conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        conn.req_start_us = monotonic_us();
+        conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent progress =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
+        const IoEvent events[2] = {timer_first ? timer : progress, timer_first ? progress : timer};
+        loop->dispatch_batch(events, 2);
+
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.resp_status, 504u);
+        REQUIRE_EQ(conn.state, ConnState::Sending);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        CHECK_EQ(conn.http1_prebuilt_response_layout,
+                 Http1PrebuiltResponseLayout::FullContentLengthNonHead);
+        CHECK_EQ(conn.http1_prebuilt_body_len, sizeof(kTimeoutBody));
+        CHECK_EQ(conn.http1_prebuilt_total_len,
+                 conn.http1_prebuilt_header_end + sizeof(kTimeoutBody));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Connection: keep-alive\r\n"));
+        REQUIRE_GE(conn.response_header_buf.len(), sizeof(kTimeoutBody));
+        CHECK_EQ(__builtin_memcmp(conn.response_header_buf.data() + conn.response_header_buf.len() -
+                                      sizeof(kTimeoutBody),
+                                  kTimeoutBody,
+                                  sizeof(kTimeoutBody)),
+                 0);
+        CHECK(conn.upstream_retirement_active);
+        CHECK_FALSE(conn.http1_boundary_ready);
+
+        complete_prebuilt_d2_header(loop, conn);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        REQUIRE(conn.http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_EQ(conn.upstream_fd, -1);
+
+        const IoEvent stale = inert_response_read_timer_event(conn.id, timer_generation);
+        loop->dispatch_batch(&stale, 1);
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer,
+     precise_keep_alive_get_complete_headers_cancel_or_handoff_by_body_length) {
+    for (const bool positive_body : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u64 deadline_origin = conn.response_read_timer_last_progress_ns;
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        static constexpr u8 kCl0[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        static constexpr u8 kCl5[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        const u8* wire = positive_body ? kCl5 : kCl0;
+        const u32 wire_len = positive_body ? sizeof(kCl5) - 1u : sizeof(kCl0) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(wire, wire_len), wire_len);
+        const IoEvent response = response_read_copy_event(conn, wire_len, true, 0, wire_len);
+        loop->dispatch_batch(&response, 1);
+
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.resp_status, 200u);
+        REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+        if (positive_body) {
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            CHECK_FALSE(loop->response_read_deadline_uses_precise_timer(conn));
+            CHECK_NE(conn.timer_node.next, &conn.timer_node);
+            CHECK_NE(conn.timer_node.prev, &conn.timer_node);
+            CHECK_FALSE(conn.send_armed);
+        } else {
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_EQ(conn.state, ConnState::Sending);
+            CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+            CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+        }
+
+        IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
+        target.result = -ECANCELED;
+        IoEvent cancel = inert_response_read_timer_event(
+            conn.id, timer_generation | kResponseReadTimerCancelBit);
+        cancel.result = 0;
+        const IoEvent custody[2] = {target, cancel};
+        loop->dispatch_batch(custody, 2);
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        CHECK_GE(conn.fd, 0);
+
+        neutralize_staged_precise_timer(loop, fixture);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_response_read_timer, precise_keep_alive_get_early_expiry_rearms_from_pinned_origin) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 logical_generation = conn.response_read_deadline_generation;
+    const u32 logical_episode = conn.upstream_episode;
+    const u64 deadline_origin = conn.response_read_timer_last_progress_ns;
+    neutralize_staged_precise_timer(loop, fixture);
+    conn.response_read_timer_last_progress_ns = deadline_origin;
+    REQUIRE(install_inert_response_read_timer_owner(
+        conn, ResponseReadTimerPhase::Armed, logical_generation, logical_episode));
+    const u32 old_timer_generation = conn.response_read_timer_owner_generation;
+    const IoEvent early = inert_response_read_timer_event(conn.id, old_timer_generation);
+    loop->dispatch_batch(&early, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_timer_owner_generation, old_timer_generation + 1u);
+    CHECK_EQ(conn.response_read_timer_deadline_generation, logical_generation);
+    CHECK_EQ(conn.response_read_timer_upstream_episode, logical_episode);
+    CHECK_EQ(conn.response_read_timer_last_progress_ns, deadline_origin);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
 
     neutralize_staged_precise_timer(loop, fixture);
     cleanup_prebuilt_d2(loop, fixture);

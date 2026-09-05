@@ -703,6 +703,13 @@ inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
                                                       u16 bundle_id,
                                                       ResponseReadDeadlineOwnerPhase phase,
                                                       Connection::Callback expected_upstream_recv);
+inline bool bodyless_get_keep_alive_precise_arm_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineOwnerPhase phase,
+    Connection::Callback expected_upstream_recv);
 
 inline bool response_read_timeout_header_only_head_live_proof_is_stable(
     const Connection& c,
@@ -1001,10 +1008,10 @@ inline bool response_read_deadline_route_method_matches(u8 method, u8 route_meth
     return route_method == kRouteMethodAny || route_method == exact;
 }
 
-// #277 phase 1 deliberately reuses the fixed-upload proof as an immutable
-// identity for a bodyless GET whose successor was already present at initial
-// dispatch.  A legacy bodyless owner leaves these fields neutral, so this is
-// additive and cannot widen the established single-request profile.
+// A request-policy-materialized bodyless GET reuses the fixed-upload proof as
+// immutable request identity. Coalesced layouts additionally validate the
+// preserved successor stash; exact layouts keep it empty. A legacy ID0 owner
+// leaves these fields neutral, so it cannot enter this proof domain.
 inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
@@ -1669,6 +1676,57 @@ inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
     return c.response_read_deadline_bundle_id == bundle_id &&
            route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            route.method == c.response_read_deadline_route_method && !route.needs_req_body &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
+           route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
+           target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
+           config->match_canonical(c.req_path_canon,
+                                   route_method_key(static_cast<LogHttpMethod>(c.req_method)),
+                                   params,
+                                   &param_count,
+                                   kMaxRouteParams) == &route;
+}
+
+inline bool bodyless_get_keep_alive_precise_arm_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    const RouteConfig* config,
+    u16 bundle_id,
+    ResponseReadDeadlineOwnerPhase phase,
+    Connection::Callback expected_upstream_recv) {
+    if (config == nullptr || config != c.request_config ||
+        c.response_read_deadline_profile !=
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
+        c.response_read_deadline_route_method != kRouteMethodGet ||
+        c.req_method != c.response_read_deadline_method || proof.downstream_close ||
+        !response_read_deadline_default_persistence_is_stable(c) || c.pipeline_depth != 0 ||
+        c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
+        c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None ||
+        c.response_mutations_snapshotted || c.retry_req_send_len != 0 ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
+        proof.handler_generation != c.handler_gen || proof.route_index >= config->route_count ||
+        proof.route_fn == nullptr || proof.upstream_id >= config->upstream_count ||
+        proof.upstream_id != c.upstream_idx || proof.raw_header_end == 0 ||
+        proof.raw_content_length != 0 || proof.raw_total_length != proof.raw_header_end ||
+        proof.rewritten_header_end == 0 || proof.rewritten_header_end != c.req_header_end ||
+        proof.rewritten_total_length != c.req_initial_send_len ||
+        proof.rewritten_total_length != proof.rewritten_header_end ||
+        proof.expected_upload_length != proof.rewritten_total_length ||
+        !valid_upstream_episode(proof.upload_episode) ||
+        proof.upload_episode != c.upstream_episode || c.upstream_abandoned ||
+        c.req_client_content_length_count != 0 || c.req_client_has_content_length ||
+        !response_read_deadline_owner_is_stable(c, expected_upstream_recv, phase))
+        return false;
+    const RouteEntry& route = config->routes[proof.route_index];
+    const UpstreamTarget& target = config->upstreams[proof.upstream_id];
+    RouteParam params[kMaxRouteParams]{};
+    u32 param_count = 0;
+    return c.response_read_deadline_bundle_id == bundle_id &&
+           route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
+           route.method == kRouteMethodGet && !route.needs_req_body &&
            route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
            forward_preflight_mode_can_own_runtime_deadline(route.forward_preflight_mode) &&
            route.preflight_forward_policy_bundle_id == bundle_id && target.addr_count == 1 &&
