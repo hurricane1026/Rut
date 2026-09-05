@@ -2603,15 +2603,26 @@ public:
         if (c.response_read_deadline_profile ==
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
             c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-            c.req_method == static_cast<u8>(LogHttpMethod::Head))
-            return fixed_upload_head_after_host_precise_arm_is_stable(
+            c.req_method == static_cast<u8>(LogHttpMethod::Head)) {
+            if (fixed_upload_head_after_host_precise_arm_is_stable(
+                    c,
+                    c.response_read_deadline_upload,
+                    cfg,
+                    c.response_read_deadline_bundle_id,
+                    ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                    &on_upstream_response<Self>,
+                    allow_consumed_terminal_episode))
+                return true;
+            return fixed_upload_head_after_host_precise_progress_is_stable(
                 c,
                 c.response_read_deadline_upload,
                 cfg,
                 c.response_read_deadline_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Self>,
+                c.upstream_recv_buf.len(),
                 allow_consumed_terminal_episode);
+        }
         if (c.response_read_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             c.response_read_deadline_buffering ==
@@ -2645,6 +2656,68 @@ public:
             c.response_read_deadline_bundle_id,
             ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
             &on_upstream_response<Self>);
+    }
+
+    // Backend.wait has already appended a positive CQE before dispatch.  For
+    // retained fixed-upload HEAD progress, prove that this exact record extends
+    // the committed prefix before the batch ledger arbitrates it with a timer.
+    [[nodiscard]] bool current_positive_response_read_uses_precise_timer(
+        const Connection& c, const IoEvent& ev, bool allow_consumed_terminal_episode) const {
+        if (response_read_deadline_uses_precise_timer(c, allow_consumed_terminal_episode))
+            return true;
+        if (ev.type != IoEventType::UpstreamRecv || ev.result <= 0 || ev.aux != 0 ||
+            ev.upstream_episode != c.upstream_episode ||
+            ev.copy_witness != IoEventCopyWitness::Full || ev.copy_end < ev.copy_begin ||
+            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            ev.copy_end != c.upstream_recv_buf.len() ||
+            ev.copy_deadline_generation != c.response_read_deadline_generation ||
+            ev.copy_deadline_profile != static_cast<u8>(c.response_read_deadline_profile) ||
+            ev.copy_deadline_method != c.response_read_deadline_method)
+            return false;
+        const RouteConfig* cfg = c.request_config;
+        return cfg != nullptr &&
+               c.response_read_deadline_profile ==
+                   ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
+               c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+               c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+               fixed_upload_head_after_host_precise_progress_is_stable(
+                   c,
+                   c.response_read_deadline_upload,
+                   cfg,
+                   c.response_read_deadline_bundle_id,
+                   ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                   &on_upstream_response<Self>,
+                   ev.copy_begin,
+                   allow_consumed_terminal_episode);
+    }
+
+    // Settlement runs after callbacks have appended the whole wait batch.  A
+    // retained fixed-upload HEAD prefix therefore still names the pre-batch
+    // copy boundary until the transactional ledger is committed below.
+    [[nodiscard]] bool response_read_deadline_batch_uses_precise_timer(
+        const Connection& c, const ResponseReadBatchOwner& owner) const {
+        if (!owner.precise_timer_semantic || !owner.precise_timer_valid ||
+            !c.response_read_timer_owner_is_valid() ||
+            c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
+            c.response_read_timer_owner_generation != owner.precise_timer_generation ||
+            c.response_read_timer_deadline_generation != owner.deadline_generation ||
+            c.response_read_timer_upstream_episode != owner.upstream_episode)
+            return false;
+        if (response_read_deadline_uses_precise_timer(c)) return true;
+        if (!owner.saw_positive || owner.first_copy_begin == 0 || c.request_config == nullptr ||
+            c.response_read_deadline_profile !=
+                ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
+            c.req_method != static_cast<u8>(LogHttpMethod::Head))
+            return false;
+        return fixed_upload_head_after_host_precise_progress_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            c.request_config,
+            c.response_read_deadline_bundle_id,
+            ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+            &on_upstream_response<Self>,
+            owner.first_copy_begin);
     }
 
     [[nodiscard]] bool rearm_precise_response_read_timer(Connection& c, u64 now_ns) {
@@ -3339,6 +3412,12 @@ public:
             if (owner.conn_id >= kMaxConns) continue;
             Connection& c = conns[owner.conn_id];
             if (owner.saw_precise_timer) {
+                // Capture the complete logical+transport proof before timer
+                // CQEs consume their kernel custody. For a cross-batch prefix,
+                // this intentionally validates the committed pre-batch copy
+                // boundary; commit below advances it transactionally.
+                const bool precise_active =
+                    response_read_deadline_batch_uses_precise_timer(c, owner);
                 bool custody_ok = owner.valid;
                 bool saw_semantic_target = false;
                 bool saw_canceled_target = false;
@@ -3388,7 +3467,6 @@ public:
                 // custody-only CQE was harvested. No timer result can affect
                 // the successor/504 state; only the owner barrier is drained.
                 if (!owner.precise_timer_semantic) continue;
-                const bool precise_active = response_read_deadline_uses_precise_timer(c);
                 if (saw_canceled_target && precise_active) {
                     // A cancelled target can arrive before its cancel CQE.
                     // Keep the logical identity until the second owner drains;
