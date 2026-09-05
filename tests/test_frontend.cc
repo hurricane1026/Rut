@@ -1076,7 +1076,7 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
         const std::string source = make_ident_stream(767);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(result);
-        CHECK_EQ(result->tokens.len, 768u);  // 767 identifiers + EOF
+        CHECK_EQ(result->tokens.len, 768u);  // retained former-boundary regression
         CHECK(result->tokens[767].type == TokenType::Eof);
         CHECK_EQ(result->tokens[767].start, static_cast<u32>(source.size()));
         CHECK_EQ(result->tokens[767].end, static_cast<u32>(source.size()));
@@ -1085,7 +1085,19 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(768);
+        const std::string source = make_ident_stream(931);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 932u);  // 931 identifiers + EOF
+        CHECK(result->tokens[931].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[931].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].line, 1u);
+        CHECK_EQ(result->tokens[931].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(932);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
@@ -1097,16 +1109,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(769);
+        const std::string source = make_ident_stream(933);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
         CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 769th one-character identifier starts after 768 "a " pairs.
-        CHECK_EQ(result.error().span.start, 1536u);
-        CHECK_EQ(result.error().span.end, 1537u);
+        // The 933rd one-character identifier starts after 932 "a " pairs.
+        CHECK_EQ(result.error().span.start, 1864u);
+        CHECK_EQ(result.error().span.end, 1865u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 1537u);
+        CHECK_EQ(result.error().span.col, 1865u);
     }
 }
 
