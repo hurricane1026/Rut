@@ -2106,10 +2106,12 @@ struct Recorder {
     // accepted origin episode stalls; the fresh second episode follows the
     // ordinary configured response path and remains open until peer retirement.
     bool zero_response_stall_first_only = false;
-    // Separate default-off two-request mode: request 1 waits for a test permit,
-    // publishes exactly response_fragment_bytes[0], and remains open until the
-    // proxy retires it. Request 2 follows the ordinary response path.
+    // Separate default-off two-request mode: request 1 waits for test permits,
+    // publishes the bounded configured number of response fragments, and
+    // remains open until the proxy retires it. Request 2 follows the ordinary
+    // response path. The default preserves the original one-fragment mode.
     bool permit_gated_incomplete_first_response = false;
+    u32 incomplete_first_response_fragment_count = 1u;
     std::atomic<u64> incomplete_first_request_completed_ns{0};
     std::atomic<bool> zero_response_stall_ready{false};
     std::atomic<u64> zero_response_stall_started_ns{0};
@@ -2291,21 +2293,28 @@ struct Recorder {
                             true, std::memory_order_release);
                     }
                 } else if (incomplete_progress_this_response) {
-                    while (self->running.load(std::memory_order_acquire) &&
-                           self->response_fragment_permit.load(std::memory_order_acquire) == 0u)
-                        usleep(1000);
-                    response_sent = self->running.load(std::memory_order_acquire) &&
-                                    send_all(client,
-                                             self->response_fragment_bytes[0],
-                                             self->response_fragment_lengths[0]);
-                    if (response_sent) {
+                    response_sent = true;
+                    for (u32 part = 0u; part < self->incomplete_first_response_fragment_count;
+                         part++) {
+                        while (self->running.load(std::memory_order_acquire) &&
+                               self->response_fragment_permit.load(std::memory_order_acquire) <=
+                                   part) {
+                            usleep(1000);
+                        }
+                        if (!self->running.load(std::memory_order_acquire) ||
+                            !send_all(client,
+                                      self->response_fragment_bytes[part],
+                                      self->response_fragment_lengths[part])) {
+                            response_sent = false;
+                            break;
+                        }
                         const u64 sent_ns = static_cast<u64>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
-                        self->response_fragment_sent_ns[0].store(sent_ns,
-                                                                 std::memory_order_relaxed);
-                        self->response_fragments_sent.store(1u, std::memory_order_release);
+                        self->response_fragment_sent_ns[part].store(sent_ns,
+                                                                    std::memory_order_relaxed);
+                        self->response_fragments_sent.store(part + 1u, std::memory_order_release);
                     }
                 } else if (self->permit_gated_complete_response) {
                     response_sent = true;
@@ -2461,7 +2470,10 @@ struct Recorder {
               gate_incomplete_response_close || permit_gated_incomplete_first_response)) ||
             (permit_gated_incomplete_first_response &&
              (wait_response_peer_close || permit_gated_complete_response ||
-              gate_incomplete_response_close)))
+              gate_incomplete_response_close)) ||
+            (permit_gated_incomplete_first_response &&
+             (incomplete_first_response_fragment_count == 0u ||
+              incomplete_first_response_fragment_count > 4u)))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -55332,12 +55344,27 @@ static bool run_fixed_upload_head_zero_response_timeout_differential(const char*
     return true;
 }
 
-static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const char* rut_path,
-                                                                           std::string& error) {
-    static constexpr char kIncompleteHeader[] =
+static bool run_fixed_upload_head_incomplete_fragments_timeout_differential(
+    const char* rut_path, u32 configured_fragments, std::string& error) {
+    static constexpr char kFirstIncompleteHeader[] =
         "HTTP/1.1 200 OK\r\n"
         "X-Progress: fixed-head\r\n";
-    static_assert(sizeof(kIncompleteHeader) - 1u == 41u);
+    static constexpr char kSecondIncompleteHeader[] = "X-Second: still-incomplete\r\n";
+    static constexpr char kCombinedIncompleteHeader[] =
+        "HTTP/1.1 200 OK\r\n"
+        "X-Progress: fixed-head\r\n"
+        "X-Second: still-incomplete\r\n";
+    static_assert(sizeof(kFirstIncompleteHeader) - 1u == 41u);
+    static_assert(sizeof(kSecondIncompleteHeader) - 1u == 28u);
+    static_assert(sizeof(kCombinedIncompleteHeader) - 1u == 69u);
+    static_assert(sizeof(kFirstIncompleteHeader) - 1u + sizeof(kSecondIncompleteHeader) - 1u ==
+                  sizeof(kCombinedIncompleteHeader) - 1u);
+    static_assert(kCombinedIncompleteHeader[sizeof(kCombinedIncompleteHeader) - 4u] != '\n');
+    if (configured_fragments != 1u && configured_fragments != 2u) {
+        error = "#270 fixed-upload HEAD incomplete-fragment differential count was not bounded";
+        return false;
+    }
+    const bool two_fragments = configured_fragments == 2u;
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error =
             "#270 fixed-upload HEAD incomplete-progress differential requires an executable RUT";
@@ -55394,8 +55421,11 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
     for (u32 side = 0u; side < 2u; side++) {
         origins[side].read_exact_content_length_12_body = true;
         origins[side].permit_gated_incomplete_first_response = true;
-        origins[side].response_fragment_bytes[0] = kIncompleteHeader;
-        origins[side].response_fragment_lengths[0] = sizeof(kIncompleteHeader) - 1u;
+        origins[side].incomplete_first_response_fragment_count = configured_fragments;
+        origins[side].response_fragment_bytes[0] = kFirstIncompleteHeader;
+        origins[side].response_fragment_lengths[0] = sizeof(kFirstIncompleteHeader) - 1u;
+        origins[side].response_fragment_bytes[1] = kSecondIncompleteHeader;
+        origins[side].response_fragment_lengths[1] = sizeof(kSecondIncompleteHeader) - 1u;
         origins[side].observe_extra_requests_until_stop = true;
         const u32 backend = side * 2u + 1u;
         if (!handoff_held_loopback_port(&reservations.fds[backend],
@@ -55485,15 +55515,22 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
     const std::vector<char> request1_prefix = fixed_upload_head_timeout_request_prefix(false);
     const std::vector<char> request_suffix = fixed_upload_head_request_suffix();
     if (clients.fds[0] < 0 || clients.fds[1] < 0 || request1_prefix.empty() ||
-        request_suffix.empty() ||
-        !send_all(clients.fds[0], request1_prefix.data(), request1_prefix.size()) ||
-        !send_all(clients.fds[1], request1_prefix.data(), request1_prefix.size())) {
+        request_suffix.empty()) {
         error = "#270 fixed-upload progress clients could not send request-1 five-byte prefixes";
         return false;
     }
-    const auto upload_gate_started = std::chrono::steady_clock::now();
-    const auto upload_gate_deadline = upload_gate_started + std::chrono::milliseconds(1200);
-    while (std::chrono::steady_clock::now() < upload_gate_deadline) {
+    u64 partial_upload_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (!send_all(clients.fds[side], request1_prefix.data(), request1_prefix.size())) {
+            error =
+                "#270 fixed-upload progress clients could not send request-1 five-byte "
+                "prefixes";
+            return false;
+        }
+        partial_upload_sent_ns[side] = steady_now_ns();
+    }
+    while (steady_now_ns() < partial_upload_sent_ns[0] + 1'200'000'000ull ||
+           steady_now_ns() < partial_upload_sent_ns[1] + 1'200'000'000ull) {
         std::string access[2];
         if (!frontends_live() || !origins_live() ||
             origins[0].accepted.load(std::memory_order_acquire) != 0u ||
@@ -55502,6 +55539,12 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
             origins[1].requests.load(std::memory_order_acquire) != 0u ||
             origins[0].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
             origins[1].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origins[0].response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+            origins[1].response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+            origins[0].response_send_succeeded.load(std::memory_order_acquire) ||
+            origins[1].response_send_succeeded.load(std::memory_order_acquire) ||
+            origins[0].response_sent_open.load(std::memory_order_acquire) ||
+            origins[1].response_sent_open.load(std::memory_order_acquire) ||
             !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
             !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
             !access[0].empty() || !access[1].empty() ||
@@ -55511,10 +55554,18 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
             return false;
         }
     }
-    if (!send_all(clients.fds[0], request_suffix.data(), request_suffix.size()) ||
-        !send_all(clients.fds[1], request_suffix.data(), request_suffix.size())) {
-        error = "#270 fixed-upload progress could not publish request-1 seven-byte suffixes";
-        return false;
+    u64 complete_upload_sent_ns[2]{};
+    for (u32 side = 0u; side < 2u; side++) {
+        if (!send_all(clients.fds[side], request_suffix.data(), request_suffix.size())) {
+            error = "#270 fixed-upload progress could not publish request-1 seven-byte suffixes";
+            return false;
+        }
+        complete_upload_sent_ns[side] = steady_now_ns();
+        const u64 upload_gap_ns = complete_upload_sent_ns[side] - partial_upload_sent_ns[side];
+        if (upload_gap_ns < 1'200'000'000ull || upload_gap_ns >= 1'400'000'000ull) {
+            error = "#270 fixed-upload progress split-upload gap escaped [1.2,1.4)s";
+            return false;
+        }
     }
 
     const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -55534,6 +55585,7 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         const std::vector<char> expected =
             expected_fixed_upload_head_timeout_upstream(ports[side * 2u + 1u], false);
         if (request_complete_ns[side] == 0u ||
+            request_complete_ns[side] < complete_upload_sent_ns[side] ||
             origins[side].accepted.load(std::memory_order_acquire) != 1u ||
             origins[side].requests.load(std::memory_order_acquire) != 1u ||
             origins[side].history.size() != 1u || origins[side].history[0] != expected ||
@@ -55546,55 +55598,260 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         }
     }
 
-    bool fragment_released[2]{};
-    while (!fragment_released[0] || !fragment_released[1]) {
-        const u64 now_ns = steady_now_ns();
+    u64 fragment_sent_ns[2]{};
+    u64 second_fragment_sent_ns[2]{};
+    if (two_fragments) {
+        // The request-count acquire above publishes each origin's own
+        // request-complete timestamp. Schedule both writes independently from
+        // that initial response-read deadline origin.
+        bool first_released[2]{};
+        while (!first_released[0] || !first_released[1]) {
+            const u64 now_ns = steady_now_ns();
+            for (u32 side = 0u; side < 2u; side++) {
+                if (!first_released[side] && now_ns >= request_complete_ns[side] + 300'000'000ull) {
+                    origins[side].response_fragment_permit.store(1u, std::memory_order_release);
+                    first_released[side] = true;
+                }
+            }
+            if (!frontends_live() || !origins_live()) {
+                error = "#270 fixed-upload two-fragment lost liveness before F1 release";
+                return false;
+            }
+            usleep(1000);
+        }
+        const auto first_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+        while ((origins[0].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
+                origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u) &&
+               std::chrono::steady_clock::now() < first_deadline) {
+            if (!frontends_live() || !origins_live() ||
+                origins[0].response_send_failed.load(std::memory_order_acquire) ||
+                origins[1].response_send_failed.load(std::memory_order_acquire)) {
+                error = "#270 fixed-upload two-fragment failed before F1 publication";
+                return false;
+            }
+            usleep(1000);
+        }
         for (u32 side = 0u; side < 2u; side++) {
-            if (!fragment_released[side] && now_ns >= request_complete_ns[side] + 400'000'000ull) {
-                origins[side].response_fragment_permit.store(1u, std::memory_order_release);
-                fragment_released[side] = true;
+            // This acquire of count==1 is the publication witness for the
+            // relaxed F1 timestamp. Terminal success/open must still be false.
+            if (origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+                error = "#270 fixed-upload two-fragment did not publish exactly F1";
+                return false;
+            }
+            fragment_sent_ns[side] =
+                origins[side].response_fragment_sent_ns[0].load(std::memory_order_relaxed);
+            std::string detail;
+            if (fragment_sent_ns[side] < request_complete_ns[side] ||
+                fragment_sent_ns[side] - request_complete_ns[side] < 250'000'000ull ||
+                fragment_sent_ns[side] - request_complete_ns[side] >= 500'000'000ull ||
+                origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+                origins[side].requests.load(std::memory_order_acquire) != 1u ||
+                origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+                origins[side].response_sent_open.load(std::memory_order_acquire) ||
+                origins[side].response_send_failed.load(std::memory_order_acquire) ||
+                origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 1, detail)) {
+                error = "#270 fixed-upload two-fragment F1 timing/atomic/quiet evidence failed: " +
+                        detail;
+                return false;
             }
         }
-        if (!frontends_live() || !origins_live()) {
-            error = "#270 fixed-upload progress lost liveness before fragment release";
+
+        bool second_released[2]{};
+        while (!second_released[0] || !second_released[1]) {
+            const u64 now_ns = steady_now_ns();
+            for (u32 side = 0u; side < 2u; side++) {
+                if (second_released[side]) continue;
+                if (now_ns >= request_complete_ns[side] + 700'000'000ull) {
+                    origins[side].response_fragment_permit.store(2u, std::memory_order_release);
+                    second_released[side] = true;
+                    continue;
+                }
+                std::string access_log;
+                std::string detail;
+                if (origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                    origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+                    origins[side].requests.load(std::memory_order_acquire) != 1u ||
+                    origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                    origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+                    origins[side].response_sent_open.load(std::memory_order_acquire) ||
+                    origins[side].response_send_failed.load(std::memory_order_acquire) ||
+                    origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+                    !read_request_length_access_file(
+                        side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                        access_log,
+                        error) ||
+                    !access_log.empty() ||
+                    !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 1, detail)) {
+                    if (error.empty())
+                        error = "#270 fixed-upload two-fragment observed effects between F1/F2: " +
+                                detail;
+                    return false;
+                }
+            }
+            if (!frontends_live() || !origins_live()) {
+                error = "#270 fixed-upload two-fragment lost liveness before F2 release";
+                return false;
+            }
+            usleep(1000);
+        }
+
+        // Count==2 alone is not terminal evidence. Wait for the conjunction of
+        // the release-published count, send success, and sent-open state while
+        // treating send failure as terminal before reading F2's relaxed
+        // timestamp or continuing the schedule.
+        bool second_terminal[2]{};
+        const auto second_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+        while ((!second_terminal[0] || !second_terminal[1]) &&
+               std::chrono::steady_clock::now() < second_deadline) {
+            for (u32 side = 0u; side < 2u; side++) {
+                if (origins[side].response_send_failed.load(std::memory_order_acquire)) {
+                    error =
+                        "#270 fixed-upload two-fragment send failed before F2 terminal "
+                        "publication";
+                    return false;
+                }
+                const u32 count =
+                    origins[side].response_fragments_sent.load(std::memory_order_acquire);
+                const bool send_succeeded =
+                    origins[side].response_send_succeeded.load(std::memory_order_acquire);
+                const bool sent_open =
+                    origins[side].response_sent_open.load(std::memory_order_acquire);
+                if (count > 2u || ((send_succeeded || sent_open) && count != 2u)) {
+                    error = "#270 fixed-upload two-fragment terminal publication was incoherent";
+                    return false;
+                }
+                second_terminal[side] = count == 2u && send_succeeded && sent_open;
+            }
+            if ((!second_terminal[0] || !second_terminal[1]) &&
+                (!frontends_live() || !origins_live())) {
+                error = "#270 fixed-upload two-fragment lost liveness awaiting F2 conjunction";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!second_terminal[0] || !second_terminal[1]) {
+            error = "#270 fixed-upload two-fragment lacked F2 terminal conjunction";
             return false;
         }
-        usleep(1000);
-    }
-    const auto fragment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while ((origins[0].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
-            origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
-            !origins[0].response_sent_open.load(std::memory_order_acquire) ||
-            !origins[1].response_sent_open.load(std::memory_order_acquire) ||
-            !origins[0].response_send_succeeded.load(std::memory_order_acquire) ||
-            !origins[1].response_send_succeeded.load(std::memory_order_acquire)) &&
-           std::chrono::steady_clock::now() < fragment_deadline) {
-        if (!frontends_live() || !origins_live() ||
-            origins[0].response_send_failed.load(std::memory_order_acquire) ||
-            origins[1].response_send_failed.load(std::memory_order_acquire)) {
-            error = "#270 fixed-upload progress lost liveness before fragment publication";
-            return false;
+        for (u32 side = 0u; side < 2u; side++) {
+            second_fragment_sent_ns[side] =
+                origins[side].response_fragment_sent_ns[1].load(std::memory_order_relaxed);
+            if (second_fragment_sent_ns[side] < request_complete_ns[side] ||
+                second_fragment_sent_ns[side] - request_complete_ns[side] < 650'000'000ull ||
+                second_fragment_sent_ns[side] - request_complete_ns[side] >= 850'000'000ull ||
+                second_fragment_sent_ns[side] < fragment_sent_ns[side] ||
+                second_fragment_sent_ns[side] - fragment_sent_ns[side] < 250'000'000ull ||
+                second_fragment_sent_ns[side] - fragment_sent_ns[side] >= 600'000'000ull ||
+                origins[side].response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+                !origins[side].response_sent_open.load(std::memory_order_acquire) ||
+                origins[side].response_send_failed.load(std::memory_order_acquire)) {
+                error = "#270 fixed-upload two-fragment F2 timing/count evidence failed";
+                return false;
+            }
         }
-        usleep(1000);
-    }
-    u64 fragment_sent_ns[2]{};
-    for (u32 side = 0u; side < 2u; side++) {
-        fragment_sent_ns[side] =
-            origins[side].response_fragment_sent_ns[0].load(std::memory_order_acquire);
-        std::string detail;
-        if (origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
-            fragment_sent_ns[side] < request_complete_ns[side] ||
-            fragment_sent_ns[side] - request_complete_ns[side] < 350'000'000ull ||
-            fragment_sent_ns[side] - request_complete_ns[side] >= 650'000'000ull ||
-            origins[side].accepted.load(std::memory_order_acquire) != 1u ||
-            origins[side].requests.load(std::memory_order_acquire) != 1u ||
-            origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
-            !origins[side].response_sent_open.load(std::memory_order_acquire) ||
-            !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
-            origins[side].response_peer_closed.load(std::memory_order_acquire) ||
-            !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 100, detail)) {
-            error = "#270 fixed-upload progress fragment timing/quiet evidence failed: " + detail;
-            return false;
+
+        const u64 quiet_started_ns = steady_now_ns();
+        u64 quiet_finished_ns = quiet_started_ns;
+        while (quiet_finished_ns - quiet_started_ns < 50'000'000ull) {
+            for (u32 side = 0u; side < 2u; side++) {
+                std::string access_log;
+                std::string detail;
+                if (origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+                    origins[side].requests.load(std::memory_order_acquire) != 1u ||
+                    origins[side].response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                    origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                    !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+                    !origins[side].response_sent_open.load(std::memory_order_acquire) ||
+                    origins[side].response_send_failed.load(std::memory_order_acquire) ||
+                    origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+                    !read_request_length_access_file(
+                        side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                        access_log,
+                        error) ||
+                    !access_log.empty() ||
+                    !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 1, detail)) {
+                    if (error.empty())
+                        error =
+                            "#270 fixed-upload two-fragment post-F2 quiet gate failed: " + detail;
+                    return false;
+                }
+            }
+            if (!frontends_live() || !origins_live()) {
+                error = "#270 fixed-upload two-fragment lost liveness after F2";
+                return false;
+            }
+            usleep(1000);
+            quiet_finished_ns = steady_now_ns();
+        }
+        for (u32 side = 0u; side < 2u; side++) {
+            if (quiet_finished_ns >= request_complete_ns[side] + 900'000'000ull) {
+                error = "#270 fixed-upload two-fragment quiet gate ended at/after request+900ms";
+                return false;
+            }
+        }
+
+        // These are application-level send_all operations only. They do not
+        // prove TCP segment, recv, or CQE boundaries. External parity is
+        // intentionally scoped with #493's internal cross-batch/custody
+        // evidence and #498's public ordinary-RUT proof.
+    } else {
+        bool fragment_released[2]{};
+        while (!fragment_released[0] || !fragment_released[1]) {
+            const u64 now_ns = steady_now_ns();
+            for (u32 side = 0u; side < 2u; side++) {
+                if (!fragment_released[side] &&
+                    now_ns >= request_complete_ns[side] + 400'000'000ull) {
+                    origins[side].response_fragment_permit.store(1u, std::memory_order_release);
+                    fragment_released[side] = true;
+                }
+            }
+            if (!frontends_live() || !origins_live()) {
+                error = "#270 fixed-upload progress lost liveness before fragment release";
+                return false;
+            }
+            usleep(1000);
+        }
+        const auto fragment_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while ((origins[0].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
+                origins[1].response_fragments_sent.load(std::memory_order_acquire) < 1u ||
+                !origins[0].response_sent_open.load(std::memory_order_acquire) ||
+                !origins[1].response_sent_open.load(std::memory_order_acquire) ||
+                !origins[0].response_send_succeeded.load(std::memory_order_acquire) ||
+                !origins[1].response_send_succeeded.load(std::memory_order_acquire)) &&
+               std::chrono::steady_clock::now() < fragment_deadline) {
+            if (!frontends_live() || !origins_live() ||
+                origins[0].response_send_failed.load(std::memory_order_acquire) ||
+                origins[1].response_send_failed.load(std::memory_order_acquire)) {
+                error = "#270 fixed-upload progress lost liveness before fragment publication";
+                return false;
+            }
+            usleep(1000);
+        }
+        for (u32 side = 0u; side < 2u; side++) {
+            fragment_sent_ns[side] =
+                origins[side].response_fragment_sent_ns[0].load(std::memory_order_acquire);
+            std::string detail;
+            if (origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                fragment_sent_ns[side] < request_complete_ns[side] ||
+                fragment_sent_ns[side] - request_complete_ns[side] < 350'000'000ull ||
+                fragment_sent_ns[side] - request_complete_ns[side] >= 650'000'000ull ||
+                origins[side].accepted.load(std::memory_order_acquire) != 1u ||
+                origins[side].requests.load(std::memory_order_acquire) != 1u ||
+                origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                !origins[side].response_sent_open.load(std::memory_order_acquire) ||
+                !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
+                origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 100, detail)) {
+                error =
+                    "#270 fixed-upload progress fragment timing/quiet evidence failed: " + detail;
+                return false;
+            }
         }
     }
 
@@ -55619,19 +55876,36 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
             error = "#270 fixed-upload progress downstream preceded its origin fragment";
             return false;
         }
+        if (two_fragments && first_byte_ns[side] < second_fragment_sent_ns[side]) {
+            error = "#270 fixed-upload two-fragment downstream preceded F2";
+            return false;
+        }
         std::string detail;
         const u64 fragment_elapsed_ns = first_byte_ns[side] - fragment_sent_ns[side];
+        const u64 second_fragment_elapsed_ns =
+            two_fragments ? first_byte_ns[side] - second_fragment_sent_ns[side] : 0u;
         const std::string response_text(first_response[side].begin(), first_response[side].end());
-        if (elapsed_ns[side] < 750'000'000ull || elapsed_ns[side] >= 1'250'000'000ull ||
-            fragment_elapsed_ns < 100'000'000ull || fragment_elapsed_ns >= 850'000'000ull ||
+        const bool timing_mismatch =
+            two_fragments
+                ? (elapsed_ns[side] < 850'000'000ull || elapsed_ns[side] >= 1'250'000'000ull ||
+                   fragment_elapsed_ns < 350'000'000ull || fragment_elapsed_ns >= 950'000'000ull ||
+                   second_fragment_elapsed_ns < 50'000'000ull ||
+                   second_fragment_elapsed_ns >= 550'000'000ull)
+                : (elapsed_ns[side] < 750'000'000ull || elapsed_ns[side] >= 1'250'000'000ull ||
+                   fragment_elapsed_ns < 100'000'000ull || fragment_elapsed_ns >= 850'000'000ull);
+        if (timing_mismatch || first_response[side].size() != 162u ||
             !validate_exact_normalized_response(
                 first_response[side], kKeepAliveTimeoutHeadResponseNormalized, detail) ||
             !normalize_date(first_normalized[side]) || first_normalized[side] != expected_504 ||
             origins[side].response_send_all_calls.load(std::memory_order_acquire) != 0u ||
-            origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_fragments_sent.load(std::memory_order_acquire) !=
+                configured_fragments ||
             !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
             response_text.find("X-Progress") != std::string::npos ||
             response_text.find("fixed-head") != std::string::npos ||
+            response_text.find("X-Second") != std::string::npos ||
+            response_text.find("still-incomplete") != std::string::npos ||
+            response_text.find("slow") != std::string::npos ||
             response_text.find("502") != std::string::npos ||
             !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 150, detail)) {
             error = "#270 fixed-upload progress timing/exact 162-byte keep-alive 504 mismatch: " +
@@ -55665,6 +55939,7 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         if (!origins[side].response_peer_closed.load(std::memory_order_acquire) ||
             origins[side].response_peer_close_count.load(std::memory_order_acquire) != 1u ||
             closed_ns < request_complete_ns[side] ||
+            (two_fragments && closed_ns < second_fragment_sent_ns[side]) ||
             origins[side].response_peer_unexpected_data.load(std::memory_order_acquire) ||
             origins[side].response_peer_observation_failed.load(std::memory_order_acquire)) {
             error = "#270 fixed-upload progress did not retire exactly one fragmented origin";
@@ -55688,6 +55963,11 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
     const std::vector<char> request2_prefix = fixed_upload_head_timeout_request_prefix(true);
     std::vector<char> request2 = request2_prefix;
     request2.insert(request2.end(), request_suffix.begin(), request_suffix.end());
+    if (two_fragments &&
+        (request1_prefix.size() + request_suffix.size() != 167u || request2.size() != 166u)) {
+        error = "#270 fixed-upload two-fragment downstream request sizes were not 167/166";
+        return false;
+    }
     u64 request2_sent_ns[2]{};
     for (u32 side = 0u; side < 2u; side++) {
         if (!send_all(clients.fds[side], request2.data(), request2.size())) {
@@ -55713,6 +55993,7 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         std::string detail;
         if (second_first_byte_ns[side] < request2_sent_ns[side] ||
             second_first_byte_ns[side] - request2_sent_ns[side] >= 750'000'000ull ||
+            second_response[side].size() != 121u ||
             !validate_exact_normalized_response(
                 second_response[side], kHeadKeepAliveResponseNormalized, detail) ||
             !normalize_date(normalized) || normalized != expected_200 ||
@@ -55740,7 +56021,8 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
             if (origin.accepted.load(std::memory_order_acquire) != 2u ||
                 origin.requests.load(std::memory_order_acquire) != 2u ||
                 origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
-                origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) !=
+                    configured_fragments ||
                 !origin.response_send_succeeded.load(std::memory_order_acquire) ||
                 origin.listener_failed.load(std::memory_order_acquire)) {
                 error =
@@ -55790,7 +56072,8 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
             origins[side].accepted.load(std::memory_order_acquire) != 2u ||
             origins[side].requests.load(std::memory_order_acquire) != 2u ||
             origins[side].response_send_all_calls.load(std::memory_order_acquire) != 1u ||
-            origins[side].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origins[side].response_fragments_sent.load(std::memory_order_acquire) !=
+                configured_fragments ||
             !origins[side].response_send_succeeded.load(std::memory_order_acquire) ||
             !origins[side].response_clean_shutdown.load(std::memory_order_acquire) ||
             !origins[side].response_connection_closed.load(std::memory_order_acquire) ||
@@ -55813,8 +56096,9 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         }
     }
     const std::string expected_access =
-        std::to_string(request1_prefix.size() + request_suffix.size()) + "\n" +
-        std::to_string(request2.size()) + "\n";
+        two_fragments ? "167\n166\n"
+                      : std::to_string(request1_prefix.size() + request_suffix.size()) + "\n" +
+                            std::to_string(request2.size()) + "\n";
     if (canonical_upstream[0][0] != canonical_upstream[1][0] ||
         canonical_upstream[0][1] != canonical_upstream[1][1] || access[0] != expected_access ||
         access[1] != expected_access || temps[0].nginx_config == temps[1].source ||
@@ -55823,11 +56107,32 @@ static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const
         error = "#270 fixed-upload progress cross-side wire/access/resource evidence differed";
         return false;
     }
-    std::cerr << "PASS: #270 fixed-upload HEAD incomplete-progress seconds nginx/RUT="
-              << static_cast<double>(elapsed_ns[0]) / 1e9 << "/"
+    std::cerr << "PASS: #270 fixed-upload HEAD "
+              << (two_fragments ? "two-incomplete-fragments" : "incomplete-progress")
+              << " seconds nginx/RUT=" << static_cast<double>(elapsed_ns[0]) / 1e9 << "/"
               << static_cast<double>(elapsed_ns[1]) / 1e9
-              << " delta=" << static_cast<double>(timeout_delta) / 1e9 << "\n";
+              << " delta=" << static_cast<double>(timeout_delta) / 1e9;
+    if (two_fragments) {
+        std::cerr << " F1="
+                  << static_cast<double>(fragment_sent_ns[0] - request_complete_ns[0]) / 1e9 << "/"
+                  << static_cast<double>(fragment_sent_ns[1] - request_complete_ns[1]) / 1e9
+                  << " F2="
+                  << static_cast<double>(second_fragment_sent_ns[0] - request_complete_ns[0]) / 1e9
+                  << "/"
+                  << static_cast<double>(second_fragment_sent_ns[1] - request_complete_ns[1]) / 1e9;
+    }
+    std::cerr << "\n";
     return true;
+}
+
+static bool run_fixed_upload_head_incomplete_progress_timeout_differential(const char* rut_path,
+                                                                           std::string& error) {
+    return run_fixed_upload_head_incomplete_fragments_timeout_differential(rut_path, 1u, error);
+}
+
+static bool run_fixed_upload_head_two_incomplete_header_fragments_timeout_differential(
+    const char* rut_path, std::string& error) {
+    return run_fixed_upload_head_incomplete_fragments_timeout_differential(rut_path, 2u, error);
 }
 
 static void configure_positive_get_default_origin(Recorder& origin) {
@@ -56704,6 +57009,10 @@ int main(int argc, char** argv) {
     const bool fixed_upload_head_incomplete_progress_timeout_differential =
         argc == 3 &&
         strcmp(argv[1], "--fixed-upload-head-incomplete-progress-timeout-differential") == 0;
+    const bool fixed_upload_head_two_incomplete_header_fragments_timeout_differential =
+        argc == 3 &&
+        strcmp(argv[1],
+               "--fixed-upload-head-two-incomplete-header-fragments-timeout-differential") == 0;
     const bool proxy_hide_header_generated_side_self_check =
         argc == 3 &&
         strcmp(argv[1], "--converter-proxy-hide-header-generated-side-self-check") == 0;
@@ -56912,6 +57221,7 @@ int main(int argc, char** argv) {
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
          !fixed_upload_head_incomplete_progress_timeout_differential &&
+         !fixed_upload_head_two_incomplete_header_fragments_timeout_differential &&
          !proxy_hide_header_generated_pair_self_check &&
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
@@ -56985,7 +57295,8 @@ int main(int argc, char** argv) {
         ((explicit_timeout_head_generated_episode || explicit_timeout_head_phase_differential ||
           keepalive_timeout_head_differential || fixed_upload_head_success_differential ||
           fixed_upload_head_zero_response_timeout_differential ||
-          fixed_upload_head_incomplete_progress_timeout_differential) &&
+          fixed_upload_head_incomplete_progress_timeout_differential ||
+          fixed_upload_head_two_incomplete_header_fragments_timeout_differential) &&
          argv[2][0] != '/') ||
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         (converter_default_buffering_positive_get_differential && argv[2][0] != '/') ||
@@ -57089,6 +57400,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--fixed-upload-head-incomplete-progress-timeout-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--fixed-upload-head-two-incomplete-header-fragments-timeout-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-proxy-hide-header-generated-side-self-check "
@@ -58307,6 +58621,22 @@ int main(int argc, char** argv) {
                      "initial 1s deadline, exact header-only keep-alive 504, origin retirement/no "
                      "retry, and same-downstream fresh-origin HEAD 200 control "
                      "(proxy_read_timeout remains PARTIAL)\n";
+        return 0;
+    }
+    if (fixed_upload_head_two_incomplete_header_fragments_timeout_differential) {
+        std::string differential_error;
+        if (!run_fixed_upload_head_two_incomplete_header_fragments_timeout_differential(
+                argv[2], differential_error)) {
+            std::cerr << "FAIL [#270 fixed-upload HEAD two-incomplete-header-fragments timeout "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr << "PASS: #270 pinned nginx 1.29.7 and converter-generated ordinary RUT "
+                     "matched the two-valid-incomplete-response-header-fragment fixed-positive-"
+                     "CL HEAD initial 1s deadline, exact header-only keep-alive 504, origin "
+                     "retirement/no retry, and same-downstream fresh-origin HEAD 200 control "
+                     "(bounded schedule only; proxy_read_timeout remains PARTIAL)\n";
         return 0;
     }
     if (pinned_positive_cl_options_default_buffering_oracle) {
