@@ -2,10 +2,31 @@
 
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/route_method.h"
 
 namespace rut {
 
 namespace {
+
+static bool response_read_deadline_request_policy_is_admitted_for_term(const MirModule& module,
+                                                                       u8 route_method,
+                                                                       const MirTerminator& term) {
+    if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+        return true;
+    return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           fixed_upload_head_route_method_is_admitted(route_method) &&
+           fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
+           term.forward_response_policy_id != 0 &&
+           term.forward_response_policy_id <= module.response_policies.len &&
+           term.forward_failure_policy_id != 0 &&
+           term.forward_failure_policy_id <= module.failure_policies.len &&
+           term.forward_timeout_failure_policy_id != 0 &&
+           term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+           fixed_upload_head_timeout_policies_valid(
+               module.response_policies[term.forward_response_policy_id - 1],
+               module.failure_policies[term.forward_failure_policy_id - 1],
+               module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
 
 static u8 yield_kind_abi(WaitEventKind kind) {
     switch (kind) {
@@ -101,6 +122,57 @@ static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;
     return {s, n};
+}
+
+// Intern a compiler-only target transform into the RIR-owned arena.  The table
+// entry is published only after both literal copies succeed; an arena
+// allocation that fails may consume unreclaimable arena space, but cannot
+// leave a partially visible transform or advance the stable ID sequence.
+static FrontendResult<u16> intern_target_transform(rir::Module& mod,
+                                                   const ForwardTargetTransformSpec& spec,
+                                                   Span span) {
+    if (!forward_target_transform_spec_valid(spec))
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        if (forward_target_transform_spec_equal(mod.target_transforms[i], spec))
+            return static_cast<u16>(i + 1);
+    }
+    if (mod.target_transform_count >= kMaxForwardTargetTransforms)
+        return frontend_error(FrontendError::TooManyItems, span);
+
+    u32 used = 0;
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        const auto& existing = mod.target_transforms[i];
+        if (used > kForwardTargetTransformBytes ||
+            existing.strip_prefix.len > kForwardTargetTransformBytes - used)
+            return frontend_error(FrontendError::TooManyItems, span);
+        used += existing.strip_prefix.len;
+        if (existing.replace_prefix.len > kForwardTargetTransformBytes - used)
+            return frontend_error(FrontendError::TooManyItems, span);
+        used += existing.replace_prefix.len;
+    }
+    if (spec.strip_prefix.len > kForwardTargetTransformBytes - used)
+        return frontend_error(FrontendError::TooManyItems, span);
+    used += spec.strip_prefix.len;
+    if (spec.replace_prefix.len > kForwardTargetTransformBytes - used)
+        return frontend_error(FrontendError::TooManyItems, span);
+
+    auto copy = [&](Str src) -> Str {
+        char* dst = mod.arena->alloc_array<char>(src.len);
+        if (!dst) return {nullptr, 0xffffffffu};
+        for (u32 i = 0; i < src.len; i++) dst[i] = src.ptr[i];
+        return {dst, src.len};
+    };
+    const Str strip = copy(spec.strip_prefix);
+    if (strip.len == 0xffffffffu) return frontend_error(FrontendError::OutOfMemory, span);
+    const Str replace = copy(spec.replace_prefix);
+    if (replace.len == 0xffffffffu) return frontend_error(FrontendError::OutOfMemory, span);
+
+    const u32 index = mod.target_transform_count;
+    mod.target_transforms[index] = {strip, replace};
+    mod.target_transform_count++;
+    return static_cast<u16>(index + 1);
 }
 
 static Str payload_field_name(MirTypeKind kind) {
@@ -3031,7 +3103,41 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
+    if (term.kind == MirTerminatorKind::Redirect) {
+        if (term.commit_response_mutations || term.redirect_policy_id == 0 ||
+            term.redirect_policy_id > mir.redirect_policies.len ||
+            !redirect_policy_spec_valid(mir.redirect_policies[term.redirect_policy_id - 1]))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (!b.emit_ret_redirect(term.redirect_policy_id, {term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        return {};
+    }
     if (term.kind == MirTerminatorKind::ForwardUpstream) {
+        if (term.forward_response_read_timeout_seconds != 0 &&
+            !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (term.forward_response_read_timeout_seconds != 0 &&
+            !response_read_deadline_request_policy_is_admitted_for_term(mir, fn->http_method, term))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (term.forward_response_buffering != ForwardResponseBufferingMode::None) {
+            if (term.forward_response_buffering !=
+                    ForwardResponseBufferingMode::CompleteContentLength ||
+                term.forward_response_read_timeout_seconds == 0 ||
+                !complete_content_length_request_policy_is_admitted(
+                    term.forward_request_policy_id) ||
+                term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
+                term.forward_timeout_failure_policy_id == 0 ||
+                term.forward_response_policy_id > b.mod->response_policy_count ||
+                term.forward_failure_policy_id > b.mod->failure_policy_count ||
+                term.forward_timeout_failure_policy_id > b.mod->failure_policy_count ||
+                !complete_content_length_buffering_policies_valid(
+                    b.mod->response_policies[term.forward_response_policy_id - 1],
+                    b.mod->failure_policies[term.forward_failure_policy_id - 1],
+                    b.mod->failure_policies[term.forward_timeout_failure_policy_id - 1]))
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        }
         // forward(set_path: "..."): emit ReqSetPath(const-str) before the
         // terminator so the handler records the path override at runtime.
         if (term.forward_set_path.ptr != nullptr) {
@@ -3052,10 +3158,117 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
         if (!upstream) return frontend_error(FrontendError::OutOfMemory, term.span);
+        rir::ValueId policy = rir::kNoValue;
+        if (term.forward_request_policy_id != 0) {
+            auto p = b.emit_const_i32(static_cast<i32>(term.forward_request_policy_id),
+                                      {term.span.line, term.span.col});
+            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
+            policy = p.value();
+        }
+        if (term.forward_failure_policy_id != 0 || term.forward_timeout_failure_policy_id != 0 ||
+            term.forward_response_read_timeout_seconds != 0 ||
+            term.forward_response_buffering != ForwardResponseBufferingMode::None) {
+            if (term.forward_response_policy_id > b.mod->response_policy_count ||
+                term.forward_failure_policy_id > b.mod->failure_policy_count ||
+                term.forward_timeout_failure_policy_id > b.mod->failure_policy_count)
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            if (term.forward_failure_policy_id != 0 &&
+                !forward_failure_policy_spec_valid(
+                    b.mod->failure_policies[term.forward_failure_policy_id - 1]))
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            if (term.forward_timeout_failure_policy_id != 0 &&
+                (term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
+                 !forward_timeout_failure_policy_spec_valid(
+                     b.mod->failure_policies[term.forward_timeout_failure_policy_id - 1])))
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            u16 bundle_id = 0;
+            for (u32 i = 0; i < b.mod->policy_bundle_count; i++) {
+                const auto& existing = b.mod->policy_bundles[i];
+                if (existing.response_policy_id == term.forward_response_policy_id &&
+                    existing.failure_policy_id == term.forward_failure_policy_id &&
+                    existing.timeout_failure_policy_id == term.forward_timeout_failure_policy_id &&
+                    existing.response_read_timeout_seconds ==
+                        term.forward_response_read_timeout_seconds &&
+                    existing.response_buffering == term.forward_response_buffering) {
+                    bundle_id = static_cast<u16>(i + 1);
+                    break;
+                }
+            }
+            if (bundle_id == 0) {
+                if (b.mod->policy_bundle_count >= kMaxForwardFailurePolicies)
+                    return frontend_error(FrontendError::TooManyItems, term.span);
+                bundle_id = static_cast<u16>(++b.mod->policy_bundle_count);
+                b.mod->policy_bundles[bundle_id - 1] = {term.forward_response_policy_id,
+                                                        term.forward_failure_policy_id,
+                                                        term.forward_timeout_failure_policy_id,
+                                                        term.forward_response_read_timeout_seconds,
+                                                        term.forward_response_buffering};
+            }
+            auto bundle =
+                b.emit_const_i32(static_cast<i32>(bundle_id), {term.span.line, term.span.col});
+            if (!bundle) return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (policy == rir::kNoValue) {
+                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
+                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
+                policy = p0.value();
+            }
+            u16 target_transform_id = 0;
+            if (term.has_forward_target_transform) {
+                auto transform =
+                    intern_target_transform(*b.mod, term.forward_target_transform, term.span);
+                if (!transform) return core::make_unexpected(transform.error());
+                target_transform_id = transform.value();
+            }
+            if (term.commit_response_mutations &&
+                !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (target_transform_id != 0 &&
+                !b.emit_req_set_target_transform(target_transform_id,
+                                                 {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (term.forward_response_read_timeout_seconds != 0 ||
+                term.forward_response_buffering != ForwardResponseBufferingMode::None) {
+                if (fn == nullptr ||
+                    !forward_preflight_mode_can_own_runtime_deadline(fn->forward_preflight_mode) ||
+                    (fn->preflight_forward_policy_bundle_id != 0 &&
+                     (fn->forward_preflight_mode !=
+                          ForwardPreflightMode::AfterRequestFramingSelection ||
+                      fn->preflight_forward_policy_bundle_id != bundle_id)))
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                fn->preflight_forward_policy_bundle_id = bundle_id;
+            }
+            if (!b.emit_ret_forward_bundle(
+                    upstream.value(), policy, bundle.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            return {};
+        }
+        rir::ValueId response_policy = rir::kNoValue;
+        if (term.forward_response_policy_id != 0) {
+            if (policy == rir::kNoValue) {
+                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
+                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
+                policy = p0.value();
+            }
+            auto p = b.emit_const_i32(static_cast<i32>(term.forward_response_policy_id),
+                                      {term.span.line, term.span.col});
+            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
+            response_policy = p.value();
+        }
+        u16 target_transform_id = 0;
+        if (term.has_forward_target_transform) {
+            auto transform =
+                intern_target_transform(*b.mod, term.forward_target_transform, term.span);
+            if (!transform) return core::make_unexpected(transform.error());
+            target_transform_id = transform.value();
+        }
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
+        if (target_transform_id != 0 &&
+            !b.emit_req_set_target_transform(target_transform_id, {term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (!b.emit_ret_forward(
+                upstream.value(), policy, response_policy, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -3097,11 +3310,165 @@ bool FrontendRirModule::init(u32 func_cap, u32 struct_cap) {
 void FrontendRirModule::destroy() {
     arena.destroy();
     auto saved_source_name = source_name;
-    module = {};
+    module = rir::Module{};
     source_name = saved_source_name;
 }
 
-FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) {
+// MIR -> RIR trust boundary for forward-preflight timing. Keep this validator
+// independent from HIR -> MIR so forged MIR cannot inherit authorization from
+// an upstream marker.
+static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
+                                                       const MirFunction& function) {
+    if (!forward_preflight_mode_valid(function.forward_preflight_mode)) return false;
+    const MirTerminator* timeout_term = nullptr;
+    u32 timeout_count = 0;
+    for (u32 bi = 0; bi < function.blocks.len; bi++) {
+        const auto& term = function.blocks[bi].term;
+        if (term.forward_response_read_timeout_seconds == 0 &&
+            term.forward_response_buffering == ForwardResponseBufferingMode::None)
+            continue;
+        timeout_count++;
+        if (timeout_term == nullptr) timeout_term = &term;
+    }
+    if (timeout_term == nullptr)
+        return function.forward_preflight_mode == ForwardPreflightMode::None;
+    const bool framing_selection =
+        function.forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection;
+    if (timeout_count != (framing_selection ? 2u : 1u)) return false;
+    if (!response_read_deadline_request_policy_is_admitted_for_term(
+            module, function.method, *timeout_term))
+        return false;
+    const bool common = function.locals.len == 0 && function.waits.len == 0 &&
+                        !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
+                        function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
+                        !function.is_timer;
+    if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
+        const bool complete = timeout_term->forward_response_buffering ==
+                              ForwardResponseBufferingMode::CompleteContentLength;
+        return common && function.blocks.len == 1 && function.values.len == 0 &&
+               &function.blocks[0].term == timeout_term && function.blocks[0].effects.len == 0 &&
+               timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
+               timeout_term->forward_set_path.ptr == nullptr &&
+               timeout_term->forward_set_headers.len == 0 &&
+               !timeout_term->has_forward_target_transform &&
+               !timeout_term->commit_response_mutations &&
+               (!complete || (complete_content_length_route_method_is_admitted(function.method) &&
+                              complete_content_length_request_policy_is_admitted(
+                                  timeout_term->forward_request_policy_id)));
+    }
+    if (framing_selection) {
+        if (!common || function.method != kRouteMethodHead || function.blocks.len != 3 ||
+            function.values.len != 0)
+            return false;
+        const auto& entry = function.blocks[0];
+        const auto& after_host = function.blocks[1].term;
+        const auto& legacy = function.blocks[2].term;
+        if (entry.effects.len != 0 || function.blocks[1].effects.len != 0 ||
+            function.blocks[2].effects.len != 0 || entry.term.kind != MirTerminatorKind::Branch ||
+            entry.term.then_block != 1 || entry.term.else_block != 2 ||
+            entry.term.cond.kind != MirValueKind::ReqHasContentLength ||
+            entry.term.cond.type != MirTypeKind::Bool || entry.term.cond.lhs != nullptr ||
+            entry.term.cond.rhs != nullptr)
+            return false;
+        auto exact_forward = [&](const MirTerminator& term, RequestPolicyId policy) {
+            return term.kind == MirTerminatorKind::ForwardUpstream &&
+                   term.source_kind == MirTerminatorSourceKind::Literal &&
+                   term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                   !term.commit_response_mutations && term.response_body.ptr == nullptr &&
+                   term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
+                   term.upstream_index < module.upstreams.len &&
+                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
+                   !term.has_forward_target_transform &&
+                   term.forward_request_policy_id == static_cast<u16>(policy) &&
+                   response_read_timeout_seconds_valid(
+                       term.forward_response_read_timeout_seconds) &&
+                   term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                   response_read_deadline_request_policy_is_admitted_for_term(
+                       module, function.method, term);
+        };
+        return exact_forward(after_host, RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
+               exact_forward(legacy, RequestPolicyId::Http11FixedStrip) &&
+               after_host.upstream_index == legacy.upstream_index &&
+               after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
+               after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
+               after_host.forward_timeout_failure_policy_id ==
+                   legacy.forward_timeout_failure_policy_id &&
+               after_host.forward_response_read_timeout_seconds ==
+                   legacy.forward_response_read_timeout_seconds &&
+               after_host.forward_response_buffering == legacy.forward_response_buffering;
+    }
+    if (function.forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
+        !common || function.method == kRouteMethodAny ||
+        !complete_content_length_route_method_is_admitted(function.method) ||
+        function.blocks.len != 3 || function.values.len != 2)
+        return false;
+    const auto& entry = function.blocks[0];
+    const auto& redirect = function.blocks[1].term;
+    const auto& forward = function.blocks[2].term;
+    const auto& cond = entry.term.cond;
+    auto value_is_owned = [&](const MirValue* value) {
+        if (value == nullptr) return false;
+        for (u32 i = 0; i < function.values.len; i++) {
+            if (value == &function.values[i]) return true;
+        }
+        return false;
+    };
+    const bool owned = value_is_owned(cond.lhs) && value_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+    const bool policy_bundle_valid =
+        forward.forward_response_policy_id != 0 &&
+        forward.forward_response_policy_id <= module.response_policies.len &&
+        forward.forward_failure_policy_id != 0 &&
+        forward.forward_failure_policy_id <= module.failure_policies.len &&
+        forward.forward_timeout_failure_policy_id != 0 &&
+        forward.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+        response_policy_spec_valid(
+            module.response_policies[forward.forward_response_policy_id - 1]) &&
+        forward_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_failure_policy_id - 1]) &&
+        forward_timeout_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]) &&
+        complete_content_length_buffering_policies_valid(
+            module.response_policies[forward.forward_response_policy_id - 1],
+            module.failure_policies[forward.forward_failure_policy_id - 1],
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]);
+    return entry.effects.len == 0 && function.blocks[1].effects.len == 0 &&
+           function.blocks[2].effects.len == 0 && entry.term.kind == MirTerminatorKind::Branch &&
+           entry.term.then_block == 1 && entry.term.else_block == 2 && owned &&
+           cond.kind == MirValueKind::Eq && cond.type == MirTypeKind::Bool &&
+           cond.lhs->kind == MirValueKind::ReqPathOnly && cond.lhs->type == MirTypeKind::Str &&
+           cond.rhs->kind == MirValueKind::StrConst && cond.rhs->type == MirTypeKind::Str &&
+           (cond.rhs->str_value.len == 0 || cond.rhs->str_value.ptr != nullptr) &&
+           redirect.kind == MirTerminatorKind::Redirect &&
+           redirect.source_kind == MirTerminatorSourceKind::Literal &&
+           redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
+           !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
+           redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+           redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
+           redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
+           redirect.forward_timeout_failure_policy_id == 0 &&
+           redirect.forward_response_read_timeout_seconds == 0 &&
+           redirect.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           !redirect.has_forward_target_transform && redirect.redirect_policy_id != 0 &&
+           redirect.redirect_policy_id <= module.redirect_policies.len &&
+           redirect_policy_spec_valid(module.redirect_policies[redirect.redirect_policy_id - 1]) &&
+           &forward == timeout_term && forward.kind == MirTerminatorKind::ForwardUpstream &&
+           forward.source_kind == MirTerminatorSourceKind::Literal &&
+           forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
+           !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
+           forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
+           forward.upstream_index < module.upstreams.len &&
+           forward.forward_set_path.ptr == nullptr && forward.forward_set_headers.len == 0 &&
+           !forward.has_forward_target_transform &&
+           response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
+           forward.forward_response_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+           policy_bundle_valid;
+}
+
+static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
+                                              FrontendRirModule& out,
+                                              bool internal_strict_local_response_propagation) {
     if (!out.init(mir.functions.len == 0 ? 1 : mir.functions.len,
                   mir.variants.len * 2 + mir.structs.len + 8))
         return frontend_error(FrontendError::OutOfMemory);
@@ -3154,6 +3521,146 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
     }
     out.module.upstream_count = mir.upstreams.len;
+
+    // Copy validated response-policy metadata into the RIR arena. The
+    // compiler's source/HIR/MIR storage may be temporary; the RIR module is
+    // the owner that survives until RouteConfig activation.
+    if (mir.response_policies.len > kMaxResponsePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    auto copy_policy_str = [&](Str src, Str& dst) {
+        if (src.len > 0 && src.ptr == nullptr) return false;
+        char* buf = nullptr;
+        if (src.len > 0) {
+            buf = out.module.arena->alloc_array<char>(src.len);
+            if (!buf) return false;
+            for (u32 k = 0; k < src.len; k++) buf[k] = src.ptr[k];
+        }
+        dst = {buf, src.len};
+        return true;
+    };
+    for (u32 i = 0; i < mir.response_policies.len; i++) {
+        const auto& src = mir.response_policies[i];
+        if (!response_policy_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.response_policies[i];
+        dst.version = src.version;
+        dst.framing = src.framing;
+        dst.connection = src.connection;
+        dst.date = src.date;
+        dst.head_mode = src.head_mode;
+        if (!copy_policy_str(src.server, dst.server))
+            return frontend_error(FrontendError::OutOfMemory);
+        dst.hide_header_count = src.hide_header_count;
+        for (u32 h = 0; h < src.hide_header_count; h++) {
+            if (!copy_policy_str(src.hide_headers[h], dst.hide_headers[h]))
+                return frontend_error(FrontendError::OutOfMemory);
+        }
+    }
+    out.module.response_policy_count = mir.response_policies.len;
+
+    if (mir.failure_policies.len > kMaxForwardFailurePolicies)
+        return frontend_error(FrontendError::TooManyItems);
+    auto copy_failure_str = [&](Str src, Str& dst) {
+        if (src.len > 0 && src.ptr == nullptr) return false;
+        char* buf = nullptr;
+        if (src.len > 0) {
+            buf = out.module.arena->alloc_array<char>(src.len);
+            if (!buf) return false;
+            for (u32 k = 0; k < src.len; k++) buf[k] = src.ptr[k];
+        }
+        dst = {buf, src.len};
+        return true;
+    };
+    for (u32 i = 0; i < mir.failure_policies.len; i++) {
+        const auto& src = mir.failure_policies[i];
+        if (!forward_failure_policy_table_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.failure_policies[i];
+        dst.version = src.version;
+        dst.status_code = src.status_code;
+        dst.date = src.date;
+        dst.connection = src.connection;
+        dst.head_mode = src.head_mode;
+        if (!copy_failure_str(src.reason, dst.reason) ||
+            !copy_failure_str(src.content_type, dst.content_type) ||
+            !copy_failure_str(src.server, dst.server) || !copy_failure_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.failure_policy_count = mir.failure_policies.len;
+
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  mir.strict_local_response_policies.data,
+                  mir.strict_local_response_policies.len,
+                  mir.pre_route_policy_ids,
+                  mir.unmatched_policy_ids,
+                  mir.exact_strict_local_response_bindings.data,
+                  mir.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  mir.strict_local_response_policies.data,
+                  mir.strict_local_response_policies.len,
+                  mir.pre_route_policy_ids,
+                  mir.unmatched_policy_ids,
+                  mir.exact_strict_local_response_bindings.data,
+                  mir.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax);
+    for (u32 i = 0; i < mir.strict_local_response_policies.len; i++) {
+        const auto& src = mir.strict_local_response_policies[i];
+        auto& dst = out.module.strict_local_response_policies[i];
+        dst.version = src.version;
+        dst.reserved0 = src.reserved0;
+        dst.status_code = src.status_code;
+        dst.date = src.date;
+        dst.connection = src.connection;
+        dst.head_mode = src.head_mode;
+        dst.reserved1 = src.reserved1;
+        if (!copy_policy_str(src.reason, dst.reason) ||
+            !copy_policy_str(src.content_type, dst.content_type) ||
+            !copy_policy_str(src.server, dst.server) || !copy_policy_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.strict_local_response_policy_count = mir.strict_local_response_policies.len;
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        out.module.pre_route_policy_ids[i] = mir.pre_route_policy_ids[i];
+        out.module.unmatched_policy_ids[i] = mir.unmatched_policy_ids[i];
+    }
+    for (u32 i = 0; i < mir.exact_strict_local_response_bindings.len; i++)
+        out.module.exact_strict_local_response_bindings[i] =
+            mir.exact_strict_local_response_bindings[i];
+    out.module.exact_strict_local_response_binding_count =
+        mir.exact_strict_local_response_bindings.len;
+
+    if (mir.redirect_policies.len > kMaxRedirectPolicies)
+        return frontend_error(FrontendError::TooManyItems);
+    for (u32 i = 0; i < mir.redirect_policies.len; i++) {
+        const auto& src = mir.redirect_policies[i];
+        if (!redirect_policy_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.redirect_policies[i];
+        dst = src;
+        auto copy_redirect_str = [&](Str value, Str& out_str) {
+            if (value.len > 0 && value.ptr == nullptr) return false;
+            char* ptr = nullptr;
+            if (value.len > 0) {
+                ptr = out.module.arena->alloc_array<char>(value.len);
+                if (!ptr) return false;
+                for (u32 j = 0; j < value.len; j++) ptr[j] = value.ptr[j];
+            }
+            out_str = {ptr, value.len};
+            return true;
+        };
+        if (!copy_redirect_str(src.reason, dst.reason) ||
+            !copy_redirect_str(src.server, dst.server) ||
+            !copy_redirect_str(src.content_type, dst.content_type) ||
+            !copy_redirect_str(src.static_authority, dst.static_authority) ||
+            !copy_redirect_str(src.target_path, dst.target_path) ||
+            !copy_redirect_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.redirect_policy_count = mir.redirect_policies.len;
 
     // Cache instance descriptors, names arena-copied like upstream names.
     if (mir.caches.len > rir::Module::kMaxCacheInstances) {
@@ -3618,6 +4125,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     for (u32 i = 0; i < mir.functions.len; i++) {
+        if (!mir_forward_preflight_lowering_shape_valid(mir, mir.functions[i])) {
+            out.destroy();
+            return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
+        }
         Str name{};
         Str path{};
         if (!build_route_name(out.arena, i, &name) ||
@@ -3632,6 +4143,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
         fn.value()->rate_limit = mir.functions[i].rate_limit;
+        fn.value()->forward_preflight_mode = mir.functions[i].forward_preflight_mode;
         fn.value()->throttle_down_bps = mir.functions[i].throttle_down_bps;
         fn.value()->is_timer = mir.functions[i].is_timer;
         fn.value()->timer_interval_ms = mir.functions[i].timer_interval_ms;
@@ -4575,6 +5087,15 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     return {};
+}
+
+FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) {
+    return lower_to_rir_impl(mir, out, false);
+}
+
+FrontendResult<void> lower_to_rir_for_internal_propagation(const MirModule& mir,
+                                                           FrontendRirModule& out) {
+    return lower_to_rir_impl(mir, out, true);
 }
 
 }  // namespace rut

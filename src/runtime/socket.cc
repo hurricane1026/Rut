@@ -1,5 +1,7 @@
 #include "rut/runtime/socket.h"
 
+#include "rut/runtime/listener.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -18,7 +20,12 @@ core::Expected<void, Error> set_nonblocking(i32 fd) {
     return {};
 }
 
-core::Expected<i32, Error> create_listen_socket(u16 port) {
+core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared, u16 requested_port) {
+    if (!declared.valid())
+        return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
+    if (declared.port != 0u && declared.port != requested_port)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+
     i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Socket));
 
@@ -30,8 +37,15 @@ core::Expected<i32, Error> create_listen_socket(u16 port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = __builtin_bswap16(port);  // htons without stdlib
-    addr.sin_addr.s_addr = 0;                 // INADDR_ANY
+    addr.sin_port = htons(requested_port);
+    switch (declared.address) {
+        case ListenerAddress::IPv4Wildcard:
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            break;
+        case ListenerAddress::IPv4Exact:
+            addr.sin_addr.s_addr = htonl(declared.ipv4_host);
+            break;
+    }
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         auto err = Error::from_errno(Error::Source::Socket);
@@ -46,6 +60,12 @@ core::Expected<i32, Error> create_listen_socket(u16 port) {
     }
 
     return fd;
+}
+
+core::Expected<i32, Error> create_listen_socket(u16 port) {
+    ListenerSpec wildcard{};
+    wildcard.port = port;
+    return create_listen_socket(wildcard, port);
 }
 
 }  // namespace rut

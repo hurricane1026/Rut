@@ -52,6 +52,15 @@ struct EpochLoopF {
         loop.epoch = &ep;
     }
     void TearDown() {}
+
+    bool dispatch_complete_request(Connection& conn) {
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        if (conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u) !=
+            sizeof(kRequest) - 1u)
+            return false;
+        loop.dispatch(make_ev(conn.id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1u)));
+        return true;
+    }
 };
 
 // Shard<EpollEventLoop> with listen socket (non-spawned only).
@@ -326,7 +335,10 @@ TEST_F(EpochLoopF, odd_during_request) {
     REQUIRE(c != nullptr);
     CHECK_EQ(self.ep.epoch, 0u);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 1u);
     CHECK_EQ(c->state, ConnState::Sending);
 
@@ -342,13 +354,18 @@ TEST_F(EpochLoopF, across_keepalive) {
     auto* c = self.loop.find_fd(42);
     REQUIRE(c != nullptr);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 1u);
     self.loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
     CHECK_EQ(self.ep.epoch, 2u);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 3u);
     self.loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
@@ -362,7 +379,7 @@ TEST_F(EpochLoopF, on_error_close) {
     REQUIRE(c != nullptr);
     u32 cid = c->id;
 
-    self.loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(self.dispatch_complete_request(*c));
     CHECK_EQ(self.ep.epoch, 1u);
 
     self.loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));
@@ -834,7 +851,7 @@ TEST_F(EpochLoopF, leave_on_timer_close) {
     CHECK_EQ(self.ep.epoch, 0u);
 
     u32 cid = c->id;
-    self.loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 50));
+    REQUIRE(self.dispatch_complete_request(*c));
     CHECK_EQ(self.ep.epoch, 1u);
 
     // Move to current timer slot, then fire timer.tick() → close → epoch_leave.
@@ -856,9 +873,9 @@ TEST_F(EpochLoopF, concurrent_requests) {
 
     CHECK_EQ(self.ep.epoch, 0u);
 
-    self.loop.inject_and_dispatch(make_ev(c1->id, IoEventType::Recv, 50));
+    REQUIRE(self.dispatch_complete_request(*c1));
     CHECK_EQ(self.ep.epoch, 1u);
-    self.loop.inject_and_dispatch(make_ev(c2->id, IoEventType::Recv, 50));
+    REQUIRE(self.dispatch_complete_request(*c2));
     CHECK_EQ(self.ep.epoch, 2u);
 
     self.loop.inject_and_dispatch(
@@ -877,7 +894,7 @@ TEST_F(EpochLoopF, monotonic_under_load) {
         auto* c = self.loop.find_fd(fake_fd);
         REQUIRE(c != nullptr);
 
-        self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+        REQUIRE(self.dispatch_complete_request(*c));
         CHECK_EQ(self.ep.epoch, i * 2 + 1);
 
         self.loop.inject_and_dispatch(
@@ -1042,8 +1059,8 @@ TEST_F(EpochLoopF, leave_on_force_close_all) {
     REQUIRE(c1 != nullptr);
     REQUIRE(c2 != nullptr);
 
-    self.loop.inject_and_dispatch(make_ev(c1->id, IoEventType::Recv, 50));
-    self.loop.inject_and_dispatch(make_ev(c2->id, IoEventType::Recv, 50));
+    REQUIRE(self.dispatch_complete_request(*c1));
+    REQUIRE(self.dispatch_complete_request(*c2));
     CHECK_EQ(self.ep.epoch, 2u);
 
     self.loop.close_conn(*c1);

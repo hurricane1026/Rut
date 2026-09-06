@@ -206,7 +206,11 @@ struct MetricsLoopF {
         c = loop.find_fd(42);
         if (!c) return false;
         cid = c->id;
-        loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        if (c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1) !=
+            sizeof(kRequest) - 1)
+            return false;
+        loop.dispatch(make_ev(cid, IoEventType::Recv, sizeof(kRequest) - 1));
         return true;
     }
 
@@ -252,10 +256,16 @@ TEST(callback_metrics, no_crash_without_metrics) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1u));
     u32 send_len = c->send_buf.len();
+    REQUIRE_GT(send_len, 0u);
+    CHECK_EQ(c->resp_status, 200u);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
-    CHECK(true);  // no crash
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->fd, 42);
 }
 
 TEST_F(MetricsLoopF, requests_active_decremented_on_send_error) {

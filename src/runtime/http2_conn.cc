@@ -325,6 +325,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
     req->reset();
     req->version = HttpVersion::Http11;  // h2 maps to HTTP/1.1 semantics
     req->keep_alive = true;              // h2 connections persist
+    req->transfer_encoding = RequestTransferEncoding::None;
 
     bool have_method = false;
     bool have_path = false;
@@ -332,6 +333,15 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
     bool have_scheme = false;
     bool have_content_length = false;
     bool seen_regular = false;
+    // Publish the safety witness independently of semantic header order. Even
+    // when a later validation error makes the block malformed, exact routing
+    // must still see a fragment in any supplied :path value before a 400 can be
+    // staged. The values are HPACK-decoded bounded views owned by this block.
+    for (u32 i = 0; i < n; i++) {
+        if (!h2_str_eq(hs[i].name, ":path")) continue;
+        for (u32 byte = 0; byte < hs[i].value.len; byte++)
+            req->target_has_fragment |= hs[i].value.ptr[byte] == '#';
+    }
     for (u32 i = 0; i < n; i++) {
         const Str kName = hs[i].name;
         const Str kValue = hs[i].value;
@@ -381,6 +391,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
             have_content_length = true;
             req->content_length = cl;
             req->has_content_length = true;
+            req->content_length_count = 1;
         }
     }
     return have_method && have_path;

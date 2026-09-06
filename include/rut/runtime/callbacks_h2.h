@@ -34,8 +34,11 @@ namespace rut {
 bool h2_apply_forward_request_overrides(Connection& conn);
 
 inline void h2_reset_request_mutations(Connection& conn) {
+    conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.target_transform_id = 0;
+    conn.target_transform_recorded = false;
     conn.req_header_override_count = 0;
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
@@ -60,20 +63,24 @@ inline bool h2_prepare_forward_request(
     if (header_end == 0) return false;
 
     u8* saved_slice = conn.recv_slice;
+    const u32 saved_slice_capacity = conn.recv_slice_capacity;
     Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
     const u32 saved_header_end = conn.req_header_end;
     const u32 saved_initial_send_len = conn.req_initial_send_len;
-    conn.recv_slice = out;
-    conn.recv_buf.bind(out, out_cap);
+    const RequestTransferEncoding saved_transfer_encoding = conn.req_client_transfer_encoding;
+    conn.bind_request_receive_buffer(out, out_cap);
     conn.recv_buf.commit(synth_len);
     conn.req_header_end = header_end;
     conn.req_initial_send_len = synth_len;
+    conn.req_client_transfer_encoding = RequestTransferEncoding::None;
     const bool ok = h2_apply_forward_request_overrides(conn);
     if (ok) *out_len = conn.recv_buf.len();
     conn.recv_buf = static_cast<Buffer&&>(saved_buf);
     conn.recv_slice = saved_slice;
+    conn.recv_slice_capacity = saved_slice_capacity;
     conn.req_header_end = saved_header_end;
     conn.req_initial_send_len = saved_initial_send_len;
+    conn.req_client_transfer_encoding = saved_transfer_encoding;
     return ok;
 }
 
@@ -88,6 +95,10 @@ struct H2Dispatch {
     u32 resp_cap;
     u32 resp_len;
     bool overflow;
+    // Sticky for the duration of one Http2Conn::process() call. Callbacks may
+    // request connection close, but must not reclaim the connection while the
+    // engine is still walking coalesced frames on its stack.
+    bool close_after_process = false;
 };
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
@@ -724,6 +735,12 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool request_body_followed,
                     bool request_forwardable,
                     const ParsedRequest* open_request = nullptr) {
+    if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;
@@ -736,8 +753,37 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(
+    JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.policy_bundle_id != 0) {
+            if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(kOutcome.policy_bundle_id)) {
+                d.close_after_process = true;
+                return;
+            }
+            kOutcome.response_read_timeout_seconds =
+                cfg->policy_bundles[kOutcome.policy_bundle_id - 1].response_read_timeout_seconds;
+        }
+        if (kOutcome.response_read_timeout_seconds != 0) {
+            d.close_after_process = true;
+            return;
+        }
+    }
+    if (d.conn->target_transform_recorded) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Redirect) {
+        // Redirect serialization is deliberately unavailable in this
+        // increment. Validate the pinned table reference, then reject before
+        // creating any H2 proxy/async state or upstream work.
+        if (cfg == nullptr || !cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d,
                               stream_id,
@@ -753,6 +799,31 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        // Failure-policy serialization is not implemented in the H2 path;
+        // never reinterpret a bundle as transparent forwarding.
+        if (kOutcome.policy_bundle_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        if (kOutcome.response_policy_id != 0 &&
+            (cfg == nullptr || !cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
+             d.conn->resp_header_mutation_count != 0 ||
+             d.conn->resp_header_mutation_pending_count != 0 ||
+             d.conn->resp_header_mutation_pending_overflow ||
+             d.conn->resp_header_mutation_overflow)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        // Response serialization is not implemented yet. Never silently
+        // downgrade a valid non-zero policy to transparent forwarding.
+        if (kOutcome.response_policy_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        if (kOutcome.request_policy_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         if (request_body_followed && open_request == nullptr) {
             h2_emit_status(d, stream_id, 503);
             return;
@@ -807,6 +878,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
 // pending_body_len is used for Content-Length validation.
 template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
+    if (d.close_after_process) return;
     Http2Conn* h2 = d.conn->h2;
     if (h2->pending_overflow) {
         const bool kBuffered = h2->pending_buffer_body;
@@ -904,9 +976,56 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          const hpack::Header* headers,
                          u32 nheaders,
                          bool end_stream) {
+    if (d.close_after_process) return;
+    const RouteConfig* config = d.conn->request_config;
+    const bool has_strict_inventory =
+        config != nullptr && config->has_strict_local_response_table_inventory();
+    const bool has_exact_inventory =
+        config != nullptr && config->has_exact_strict_local_response_inventory();
+    const bool has_pre_route_inventory = config != nullptr && config->has_pre_route_metadata();
+    // Public metadata integrity is global and precedes malformed-header 400,
+    // firewall, or any frame publication. Exact H2 serialization is not yet an
+    // admitted capability: a valid raw match closes with zero bytes below,
+    // while an unambiguous nonmatch continues through the legacy selector.
+    if (has_strict_inventory && !config->strict_local_response_table_is_valid()) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
+    // Slash-normalized exact selection is currently admitted only for H1,
+    // where the strict parser supplies a checked full raw-target witness. H2
+    // must not silently ignore this inventory or reinterpret it as Raw.
+    if (has_exact_inventory &&
+        config->has_slash_normalized_exact_strict_local_response_inventory()) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {
+        // Classify the new stream through a local request only.  In particular,
+        // do not clear or consume the prepared stream's pending owner or the
+        // connection-owned mutation log while deciding whether pre-route must
+        // fence this method before the legacy prepared-forward 503.
+        ParsedRequest pending_req;
+        if (h2_headers_to_request(headers, nheaders, &pending_req)) {
+            const u8 pending_method_key = route_method_key(pending_req.method);
+            if (config != nullptr && config->pre_route_policy_id(pending_method_key) != 0) {
+                d.close_after_process = true;
+                d.resp_len = 0;
+                d.overflow = false;
+                return;
+            }
+        }
+        if (has_exact_inventory) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -916,7 +1035,21 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
+        if (has_exact_inventory && req.target_has_fragment) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         h2_emit_status(d, stream_id, 400);
+        return;
+    }
+    const u8 kMethodKey = route_method_key(req.method);
+    const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
+    if ((has_exact_inventory || pre_route_policy_id != 0) && req.target_has_fragment) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
         return;
     }
     if (end_stream && req.has_content_length && req.content_length != 0) {
@@ -924,7 +1057,6 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         return;
     }
 
-    const RouteConfig* config = d.conn->request_config;
     // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
     // firewall_allows_peer before route matching and 403s). Without this an h2
     // client bypasses a deny/default-deny rule and can reach a protected upstream
@@ -953,13 +1085,39 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         return;
     }
 
-    const u8 kMethodKey = route_method_key(req.method);
+    // Phase 1 has no H2 strict serializer. A concrete match is therefore a
+    // protocol fail-close with no staged frame; an unambiguous nonmatch retains
+    // the exact legacy route/unmatched behavior.
+    if (has_pre_route_inventory && pre_route_policy_id != 0) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
+    if (has_exact_inventory &&
+        config->match_exact_strict_local_response(req.path, kMethodKey) != 0) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;
     const RouteEntry* route =
         config->match_canonical(req.path_canon, kMethodKey, params, &param_count, kMaxRouteParams);
 
     if (!route) {
+        // H2 serialization for configured unmatched policies is intentionally
+        // outside the bounded capability. Presence (including forged partial
+        // public state) therefore makes a miss protocol-fail-close: discard any
+        // frames staged by this process batch and use the existing outer close
+        // path. Metadata-absent configs retain the exact legacy 200 behavior.
+        if (config->has_unmatched_metadata()) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         if (!end_stream && req.has_content_length) {
             h2_defer_until_data_end(d,
                                     stream_id,
@@ -976,6 +1134,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             return;
         }
         h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
+        return;
+    }
+
+    if (route_requires_response_read_timeout_preflight_close(route, config)) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
         return;
     }
 
@@ -1132,6 +1297,7 @@ template <typename Loop>
 void h2_on_headers_cb(
     void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1142,6 +1308,7 @@ template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
     if (c.pending_stream != stream_id) return;
     if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
@@ -1164,8 +1331,16 @@ void h2_on_data_cb(
 // cancelled. The timer/upstream are armed only AFTER process() returns, so at RST
 // time there is no in-flight I/O to undo; the config epoch pinned for the suspend
 // is released by the post-process path once async_stream is clear.
-inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+    (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+}
+
+template <typename Loop>
+void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
+    auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
+    h2_on_reset_cb(ctx, c, stream_id, err);
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
@@ -1279,12 +1454,12 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Response frames produced by the dispatch callback.
     static constexpr u32 kRespCap = 8192;
     u8 resp[kRespCap];
-    H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false};
+    H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false, false};
 
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
-    conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
-    conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
+    conn.h2->on_data = &h2_on_data_cb<Loop>;             // accumulates request bodies
+    conn.h2->on_reset = &h2_on_reset_dispatch_cb<Loop>;  // cancels a parked stream on RST_STREAM
     // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
     // hot reload (poll_command runs once per loop iteration, after this dispatch
     // batch) can't reclaim a RouteConfig/RouteEntry that a stream parks on —
@@ -1298,13 +1473,18 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     Http2Result r =
         conn.h2->process(conn.recv_buf.data(), conn.recv_buf.len(), ctrl, sizeof(ctrl), &ctrl_len);
 
+    if (d.close_after_process) {
+        loop->close_conn(conn);
+        return;
+    }
+
     // Compact unconsumed bytes (a partial trailing frame) to the front so the
     // next recv appends after them.
     const u32 kLen = conn.recv_buf.len();
     const u32 kRemaining = kLen - r.consumed;
     if (kRemaining > 0 && r.consumed > 0)
         memmove(conn.recv_slice, conn.recv_slice + r.consumed, kRemaining);
-    conn.recv_buf.reset();
+    conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
     const bool kClose = r.close || d.overflow;
@@ -1400,12 +1580,49 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
-                                                           static_cast<void*>(&conn),
-                                                           *ctx,
-                                                           h2->pending_synth,
-                                                           h2->async_synth_len,
-                                                           /*arena=*/nullptr);
+    JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
+                                                     static_cast<void*>(&conn),
+                                                     *ctx,
+                                                     h2->pending_synth,
+                                                     h2->async_synth_len,
+                                                     /*arena=*/nullptr);
+
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.policy_bundle_id != 0) {
+            if (h2->async_cfg == nullptr ||
+                !h2->async_cfg->policy_bundle_id_is_valid(kOutcome.policy_bundle_id)) {
+                loop->close_conn(conn);
+                return;
+            }
+            kOutcome.response_read_timeout_seconds =
+                h2->async_cfg->policy_bundles[kOutcome.policy_bundle_id - 1]
+                    .response_read_timeout_seconds;
+        }
+        if (kOutcome.response_read_timeout_seconds != 0) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+
+    if (conn.target_transform_recorded) {
+        u8 resp[8192];
+        H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+        h2_emit_status(d, kStreamId, 400);
+        conn.pending_handler_fn = nullptr;
+        h2_clear_async(*h2);
+        h2_async_epoch_leave(loop, conn);
+        if (d.resp_len == 0 || d.overflow) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_progress = 0;
+        conn.send_buf.reset();
+        conn.send_buf.write(resp, d.resp_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
@@ -1415,9 +1632,46 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         return;
     }
 
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Redirect) {
+        // The timer owns the async slot and config epoch. Reject the
+        // foundation-only action and release both before sending status.
+        u8 resp[8192];
+        H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+        // Resolve the pinned id even though both valid and invalid ids are
+        // rejected until H2 serialization exists.
+        const bool valid = h2->async_cfg != nullptr &&
+                           h2->async_cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id);
+        (void)valid;
+        h2_emit_status(d, kStreamId, 400);
+        conn.pending_handler_fn = nullptr;
+        h2_clear_async(*h2);
+        h2_async_epoch_leave(loop, conn);
+        if (d.resp_len == 0 || d.overflow) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_progress = 0;
+        conn.send_buf.reset();
+        conn.send_buf.write(resp, d.resp_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         u16 failure_status = 0;
-        if (h2->async_request_body_followed && !h2->async_request_stream_open) {
+        if (kOutcome.policy_bundle_id != 0) failure_status = 400;
+        if (kOutcome.response_policy_id != 0 &&
+            (h2->async_cfg == nullptr ||
+             !h2->async_cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
+             conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
+             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow))
+            failure_status = 400;
+        if (failure_status == 0 && kOutcome.response_policy_id != 0) failure_status = 400;
+        if (kOutcome.request_policy_id != 0) failure_status = 400;
+        if (failure_status == 0 && h2->async_request_body_followed &&
+            !h2->async_request_stream_open) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;
@@ -1447,6 +1701,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             ParsedRequest open_request;
             open_request.reset();
             open_request.has_content_length = h2->async_request_has_content_length;
+            open_request.content_length_count = h2->async_request_has_content_length ? 1 : 0;
             open_request.content_length = h2->async_request_content_length;
             u8 resp[8192];
             H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};

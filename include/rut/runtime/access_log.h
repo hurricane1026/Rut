@@ -4,6 +4,8 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include <atomic>
+#include <cstddef>
+#include <type_traits>
 
 #include <pthread.h>
 #include <time.h>
@@ -25,8 +27,48 @@ enum class LogHttpMethod : u8 {
     Other,
 };
 
+// Explicit entries preserve complete checked request targets only through 128 bytes. Longer
+// observed strict-H1 targets are represented by an over-limit marker, never by a prefix.
+inline constexpr u32 kAccessLogCompleteTargetMax = 128;
+inline constexpr u32 kAccessLogLegacyTargetWidth = 64;
+inline constexpr u32 kAccessLogObservedStrictH1TargetMax = 16367;
+inline constexpr u32 kAccessLogTextLineCapacity = 512;
+inline constexpr u32 kAccessLogDownstreamRequestBytesLineCapacity = 11;
+static_assert(kAccessLogObservedStrictH1TargetMax <= static_cast<u32>(~u16{0}));
+static_assert(kAccessLogDownstreamRequestBytesLineCapacity == sizeof("4294967295\n") - 1u);
+
+enum class AccessLogTargetState : u8 {
+    LegacyNullTerminated = 0,
+    Complete = 1,
+    OverLimit = 2,
+    Unavailable = 3,
+    Invalid = 4,
+};
+
+static_assert(std::is_same_v<std::underlying_type_t<AccessLogTargetState>, u8>);
+static_assert(static_cast<u8>(AccessLogTargetState::LegacyNullTerminated) == 0);
+static_assert(static_cast<u8>(AccessLogTargetState::Complete) == 1);
+static_assert(static_cast<u8>(AccessLogTargetState::OverLimit) == 2);
+static_assert(static_cast<u8>(AccessLogTargetState::Unavailable) == 3);
+static_assert(static_cast<u8>(AccessLogTargetState::Invalid) == 4);
+
+// Per-request owned copy captured while the checked strict-H1 target still
+// refers to the live receive slice.  The episode makes a stale snapshot fail
+// closed after keep-alive/pipeline successor capture or Connection reuse.
+struct AccessLogTargetSnapshot {
+    char path[kAccessLogCompleteTargetMax];
+    u32 episode;
+    u16 target_length;
+    AccessLogTargetState target_state;
+    u8 _pad;
+};
+
+static_assert(sizeof(AccessLogTargetSnapshot) == 136);
+static_assert(alignof(AccessLogTargetSnapshot) == 4);
+
 // Access log entry — fixed-size, written by shard thread on request completion.
-// 128 bytes: fits two per cache line pair, ~64KB for 512 entries.
+// State zero remains available only for legacy/manual callers. Access-enabled production
+// completions publish an explicit nonzero target state.
 struct AccessLogEntry {
     u64 timestamp_us;  // microseconds since epoch (clock_realtime)
     u32 duration_us;   // request processing time
@@ -37,12 +79,28 @@ struct AccessLogEntry {
     u16 status;        // HTTP status code
     u8 method;         // LogHttpMethod enum
     u8 shard_id;
-    char path[64];      // truncated if longer, null-terminated
+    char path[kAccessLogCompleteTargetMax];
     char upstream[24];  // upstream name, null-terminated
-    u8 _pad[8];         // pad to 128 bytes
+    u16 target_length;
+    AccessLogTargetState target_state;
+    u8 _pad[5];
 };
 
-static_assert(sizeof(AccessLogEntry) == 128, "AccessLogEntry must be 128 bytes");
+static_assert(offsetof(AccessLogEntry, timestamp_us) == 0);
+static_assert(offsetof(AccessLogEntry, duration_us) == 8);
+static_assert(offsetof(AccessLogEntry, req_size) == 12);
+static_assert(offsetof(AccessLogEntry, resp_size) == 16);
+static_assert(offsetof(AccessLogEntry, upstream_us) == 20);
+static_assert(offsetof(AccessLogEntry, addr) == 24);
+static_assert(offsetof(AccessLogEntry, status) == 28);
+static_assert(offsetof(AccessLogEntry, method) == 30);
+static_assert(offsetof(AccessLogEntry, shard_id) == 31);
+static_assert(offsetof(AccessLogEntry, path) == 32);
+static_assert(offsetof(AccessLogEntry, upstream) == 160);
+static_assert(offsetof(AccessLogEntry, target_length) == 184);
+static_assert(offsetof(AccessLogEntry, target_state) == 186);
+static_assert(sizeof(AccessLogEntry) == 192, "AccessLogEntry must be 192 bytes");
+static_assert(alignof(AccessLogEntry) == 8, "AccessLogEntry must retain scalar-prefix alignment");
 
 // Microsecond wall-clock timestamp (for access log timestamp field).
 // Returns 0 if CLOCK_REALTIME cannot be read.
@@ -70,7 +128,7 @@ u64 monotonic_ns();
 // Capacity must be power of 2 for fast modulo.
 
 struct AccessLogRing {
-    static constexpr u32 kCapacity = 512;  // 512 * 128 = 64KB
+    static constexpr u32 kCapacity = 512;
     static constexpr u32 kMask = kCapacity - 1;
 
     // Cache-line aligned to prevent false sharing between producer and consumer.
@@ -98,10 +156,20 @@ struct AccessLogRing {
     u32 available() const;
 };
 
+static_assert(sizeof(AccessLogRing) == 98432, "AccessLogRing layout must remain explicitly pinned");
+
 // Format an access log entry as a text line into buf.
 // Returns bytes written. Format: "ts method path status duration_us req_size resp_size addr
-// shard\n" Caller provides buf of at least 512 bytes.
+// shard\n". Formatting is transactional: a null or undersized output returns zero without
+// modifying caller storage. kAccessLogTextLineCapacity bounds every valid entry line.
 u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size);
+
+// Format only the downstream request byte count as unsigned decimal followed by '\n'.
+// Returns bytes written without a trailing NUL. Formatting is transactional: a null or
+// undersized output returns zero without modifying caller storage.
+u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
+                                                    char* buf,
+                                                    u32 buf_size);
 
 // Background flusher — reads from all shard rings, writes text entries to fd.
 // Optionally compresses output with zstd streaming compression.

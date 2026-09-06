@@ -31,6 +31,15 @@ static constexpr u32 kConnCloseLen = 19;
 // Length of the header terminator "\r\n\r\n".
 static constexpr u32 kHeaderEndLen = 4;
 
+// Result of attempting to admit one successor in the HTTP/1 pipeline.  The
+// limit case must remain distinct from an ordinary response with no leftover
+// bytes: callers close through the normal connection ledger on LimitExceeded.
+enum class PipelineTransitionResult : u8 {
+    NoSuccessor,
+    Advanced,
+    LimitExceeded,
+};
+
 static constexpr u32 kResponse200Len = sizeof(
                                            "HTTP/1.1 200 OK\r\n"
                                            "Content-Length: 2\r\n"
@@ -73,6 +82,18 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev);
 
+// Internal completion for a fully-built, header-only HTTP/1 response whose
+// downstream send races an exact old-upstream retirement. No production policy
+// path selects it until the broader reusable-failure contract is wired.
+template <typename Loop>
+void on_prebuilt_http1_header_sent(void* lp, Connection& conn, IoEvent ev);
+
+// Run the existing post-proxy-response HTTP/1 pipeline/header tail. io_uring
+// may invoke this at batch end after its old upstream recv episode retires;
+// other loops call it directly from on_proxy_response_sent.
+template <typename Loop>
+void continue_http1_request_boundary(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev);
 
@@ -81,6 +102,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
 void on_response_body_sent(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void pump_response_read_deadline_body(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev);
@@ -104,6 +127,9 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 // before responding — invoked from timer.tick. Defined in callbacks_impl.h.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
+
+template <typename Loop>
+bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
 // Answer a suspended HTTP/2 proxy stream with a synthetic status (e.g. 504 on
 // upstream timeout from the timer tick, 502 on failure) and tear down the
@@ -186,6 +212,8 @@ extern template void on_proxy_response_sent<IoUringEventLoop>(void*, Connection&
 extern template void on_response_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*,
+                                                                        Connection&);
 extern template void on_request_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);

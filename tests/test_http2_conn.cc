@@ -8,6 +8,7 @@
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "test.h"
+#include <memory>
 
 using namespace rut;
 
@@ -519,6 +520,7 @@ TEST(h2_request, basic_get_maps_method_path_authority) {
     CHECK(req.method == HttpMethod::GET);
     CHECK(req.version == HttpVersion::Http11);
     CHECK(req.keep_alive);
+    CHECK(req.transfer_encoding == RequestTransferEncoding::None);
     CHECK(req.path.eq(Str{"/", 1}));
     CHECK_EQ(req.path_canon.len, 0u);  // "/" canonicalizes to empty, non-null
     CHECK(req.path_canon.ptr != nullptr);
@@ -544,6 +546,7 @@ TEST(h2_request, content_length_parsed) {
     REQUIRE(h2_headers_to_request(hs, 3, &req));
     CHECK(req.method == HttpMethod::POST);
     CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 42u);
 }
 
@@ -556,6 +559,7 @@ TEST(h2_request, ten_digit_content_length_parsed) {
     ParsedRequest req;
     REQUIRE(h2_headers_to_request(hs, 3, &req));
     CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
 
     hpack::Header max[] = {
@@ -564,6 +568,7 @@ TEST(h2_request, ten_digit_content_length_parsed) {
         {{"content-length", 14}, {"4294967295", 10}},
     };
     REQUIRE(h2_headers_to_request(max, 3, &req));
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 4294967295u);
 }
 
@@ -1478,8 +1483,286 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 }
 
 namespace {
-struct FakeH2Loop {};
+struct FakeH2Loop {
+    u8 response_headers[4096]{};
+    bool alloc_response_header_buf(Connection& conn) {
+        conn.response_header_slice = response_headers;
+        conn.response_header_buf.bind(response_headers, sizeof(response_headers));
+        return true;
+    }
+    void epoch_enter() {}
+    void epoch_leave() {}
+};
 }  // namespace
+
+TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_are_unchanged) {
+    auto dispatch = [](RouteConfig* cfg, const char* path) {
+        struct Result {
+            u32 response_len;
+            bool close;
+        };
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = cfg;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                         {{":scheme", 7}, {"http", 4}},
+                                         {{":authority", 10}, {"x", 1}},
+                                         {{":path", 5}, {path, static_cast<u32>(strlen(path))}}};
+        h2_dispatch_request(d, 1, headers, 4, true);
+        return Result{d.resp_len, d.close_after_process};
+    };
+
+    auto omitted = std::make_unique<RouteConfig>();
+    const auto legacy = dispatch(omitted.get(), "/miss");
+    CHECK_GT(legacy.response_len, 0u);
+    CHECK_FALSE(legacy.close);
+
+    auto configured = std::make_unique<RouteConfig>();
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad", 3};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"bad", 3};
+    REQUIRE_EQ(configured->add_strict_local_response_policy(policy), 1u);
+    REQUIRE(configured->set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(configured->unmatched_policy_table_is_valid());
+    const auto configured_miss = dispatch(configured.get(), "/miss");
+    CHECK_EQ(configured_miss.response_len, 0u);
+    CHECK(configured_miss.close);
+
+    REQUIRE(configured->add_static("/hit", kRouteMethodGet, 204));
+    const auto matched = dispatch(configured.get(), "/hit");
+    CHECK_GT(matched.response_len, 0u);
+    CHECK_FALSE(matched.close);
+
+    auto partial = std::make_unique<RouteConfig>();
+    partial->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    const auto partial_miss = dispatch(partial.get(), "/miss");
+    CHECK_EQ(partial_miss.response_len, 0u);
+    CHECK(partial_miss.close);
+
+    // H2 exact matches fail closed until a strict H2 serializer exists. A raw
+    // nonmatch still reaches the existing prefix route, while invalid inventory
+    // and fragments close before staging a frame.
+    auto exact = std::make_unique<RouteConfig>();
+    StrictLocalResponsePolicySpec exact_policy = policy;
+    exact_policy.status_code = 200;
+    exact_policy.reason = {"OK", 2};
+    exact_policy.server = {"nginx/1.29.7", 12};
+    exact_policy.body = {"successor-static", 16};
+    exact_policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    u16 no_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(exact_bindings[0].path, "/static", 7);
+    exact_bindings[0].path_len = 7;
+    exact_bindings[0].method = kRouteMethodGet;
+    exact_bindings[0].policy_id = 1;
+    REQUIRE(exact->install_strict_local_response_table(
+        &exact_policy, 1, no_unmatched, exact_bindings, 1));
+    REQUIRE(exact->strict_local_response_table_is_valid());
+    REQUIRE(exact->add_static("/", kRouteMethodGet, 204));
+    const auto exact_match = dispatch(exact.get(), "/static");
+    CHECK_EQ(exact_match.response_len, 0u);
+    CHECK(exact_match.close);
+    const auto exact_nonmatch = dispatch(exact.get(), "/other");
+    CHECK_GT(exact_nonmatch.response_len, 0u);
+    CHECK_FALSE(exact_nonmatch.close);
+    const auto exact_child = dispatch(exact.get(), "/static/child");
+    CHECK_GT(exact_child.response_len, 0u);
+    CHECK_FALSE(exact_child.close);
+    const auto exact_fragment = dispatch(exact.get(), "/other?long=query#fragment");
+    CHECK_EQ(exact_fragment.response_len, 0u);
+    CHECK(exact_fragment.close);
+
+    // H2 has no checked H1 raw-target witness. Presence of normalized exact
+    // inventory is therefore terminal even for a nonmatching path; it may not
+    // be ignored in favor of Raw/prefix/unmatched routing.
+    auto normalized_exact = std::make_unique<RouteConfig>();
+    ExactStrictLocalResponseBinding normalized_bindings[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(normalized_bindings[0].path, "/health/check/", 14);
+    normalized_bindings[0].path_len = 14;
+    normalized_bindings[0].method = kRouteMethodGet;
+    normalized_bindings[0].path_view = ExactPathView::SlashNormalized;
+    normalized_bindings[0].policy_id = 1;
+    REQUIRE(normalized_exact->install_strict_local_response_table(
+        &exact_policy, 1, no_unmatched, normalized_bindings, 1));
+    REQUIRE(normalized_exact->add_static("/", kRouteMethodGet, 204));
+    REQUIRE(normalized_exact->has_slash_normalized_exact_strict_local_response_inventory());
+    const auto normalized_match = dispatch(normalized_exact.get(), "/health/check//");
+    CHECK_EQ(normalized_match.response_len, 0u);
+    CHECK(normalized_match.close);
+    const auto normalized_miss = dispatch(normalized_exact.get(), "/other");
+    CHECK_EQ(normalized_miss.response_len, 0u);
+    CHECK(normalized_miss.close);
+
+    auto exact_tail = std::make_unique<RouteConfig>();
+    exact_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
+    const auto tail_result = dispatch(exact_tail.get(), "/miss");
+    CHECK_EQ(tail_result.response_len, 0u);
+    CHECK(tail_result.close);
+
+    auto exact_count = std::make_unique<RouteConfig>();
+    exact_count->exact_strict_local_response_binding_count =
+        kMaxExactStrictLocalResponseBindings + 1;
+    const auto count_result = dispatch(exact_count.get(), "/miss");
+    CHECK_EQ(count_result.response_len, 0u);
+    CHECK(count_result.close);
+
+    auto dispatch_method = [](RouteConfig* cfg, const char* method, const char* path) {
+        struct Result {
+            u32 response_len;
+            bool close;
+        };
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = cfg;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        const hpack::Header headers[] = {
+            {{":method", 7}, {method, static_cast<u32>(strlen(method))}},
+            {{":scheme", 7}, {"http", 4}},
+            {{":authority", 10}, {"x", 1}},
+            {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+        };
+        h2_dispatch_request(d, 1, headers, 4, true);
+        return Result{d.resp_len, d.close_after_process};
+    };
+    auto pre_route = std::make_unique<RouteConfig>();
+    u16 pre_route_ids[kStrictLocalResponseMethodSlots]{};
+    pre_route_ids[kRouteMethodTrace] = 1;
+    u16 no_unmatched_pre[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding no_exact_pre[kMaxExactStrictLocalResponseBindings]{};
+    REQUIRE(pre_route->install_strict_local_response_table_with_pre_route(
+        &policy, 1, pre_route_ids, no_unmatched_pre, no_exact_pre, 0));
+    REQUIRE(pre_route->add_static("/hit", kRouteMethodGet, 204));
+    const auto pre_route_match = dispatch_method(pre_route.get(), "TRACE", "/static");
+    CHECK_EQ(pre_route_match.response_len, 0u);
+    CHECK(pre_route_match.close);
+    const auto pre_route_nonmatch = dispatch_method(pre_route.get(), "GET", "/other");
+    CHECK_GT(pre_route_nonmatch.response_len, 0u);
+    CHECK_FALSE(pre_route_nonmatch.close);
+    const auto pre_route_fragment = dispatch_method(pre_route.get(), "TRACE", "/static#x");
+    CHECK_EQ(pre_route_fragment.response_len, 0u);
+    CHECK(pre_route_fragment.close);
+
+    // A previously prepared Forward owns both the pending snapshot and the
+    // connection mutation log.  Classifying a concurrent stream for pre-route
+    // precedence must be read-only with respect to those owners: TRACE fences
+    // with no frame, while an unconfigured GET retains the legacy 503.
+    auto dispatch_while_forward_prepared = [&](const char* method, bool expect_pre_route_close) {
+        Http2Conn h2;
+        h2.init();
+        h2.pending_stream = 3;
+        h2.pending_body_start = 17;
+        h2.pending_synth_len = 23;
+        h2.pending_body_len = 6;
+        h2.pending_content_length = 6;
+        h2.pending_has_content_length = true;
+        h2.pending_buffer_body = true;
+        h2.pending_request_forwardable = true;
+        h2.pending_prepared_forward = true;
+        h2.pending_route_config = pre_route.get();
+        h2.pending_route_action = RouteAction::JitHandler;
+        h2.pending_static_status = 299;
+        h2.pending_forward_upstream_id = 7;
+        h2.pending_route_param_count = 1;
+        h2.pending_synth[0] = 0x5a;
+
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = pre_route.get();
+        conn.req_path_overridden = true;
+        conn.req_path_override = {"/owned", 6};
+        conn.target_transform_id = 9;
+        conn.target_transform_recorded = true;
+        conn.req_header_override_count = 1;
+        conn.req_header_overrides[0] = {{"X-Owned", 7}, {"yes", 3}};
+        conn.req_header_append_mask = 1;
+        conn.resp_header_mutation_pending_count = 1;
+        conn.resp_header_mutation_count = 1;
+
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        const hpack::Header headers[] = {
+            {{":method", 7}, {method, static_cast<u32>(strlen(method))}},
+            {{":scheme", 7}, {"http", 4}},
+            {{":authority", 10}, {"x", 1}},
+            {{":path", 5}, {"/next", 5}},
+        };
+        h2_dispatch_request(d, 5, headers, 4, true);
+
+        CHECK_EQ(d.close_after_process, expect_pre_route_close);
+        if (expect_pre_route_close)
+            CHECK_EQ(d.resp_len, 0u);
+        else
+            CHECK_GT(d.resp_len, 0u);
+        CHECK(h2.pending_prepared_forward);
+        CHECK_EQ(h2.pending_stream, 3u);
+        CHECK_EQ(h2.pending_body_start, 17u);
+        CHECK_EQ(h2.pending_synth_len, 23u);
+        CHECK_EQ(h2.pending_body_len, 6u);
+        CHECK_EQ(h2.pending_content_length, 6u);
+        CHECK(h2.pending_has_content_length);
+        CHECK(h2.pending_buffer_body);
+        CHECK(h2.pending_request_forwardable);
+        CHECK_EQ(h2.pending_route_config, pre_route.get());
+        CHECK_EQ(h2.pending_route_action, RouteAction::JitHandler);
+        CHECK_EQ(h2.pending_static_status, 299u);
+        CHECK_EQ(h2.pending_forward_upstream_id, 7u);
+        CHECK_EQ(h2.pending_route_param_count, 1u);
+        CHECK_EQ(h2.pending_synth[0], 0x5au);
+        CHECK(conn.req_path_overridden);
+        CHECK(conn.req_path_override.eq({"/owned", 6}));
+        CHECK_EQ(conn.target_transform_id, 9u);
+        CHECK(conn.target_transform_recorded);
+        CHECK_EQ(conn.req_header_override_count, 1u);
+        CHECK(conn.req_header_overrides[0].name.eq({"X-Owned", 7}));
+        CHECK(conn.req_header_overrides[0].value.eq({"yes", 3}));
+        CHECK_EQ(conn.req_header_append_mask, 1u);
+        CHECK_EQ(conn.resp_header_mutation_pending_count, 1u);
+        CHECK_EQ(conn.resp_header_mutation_count, 1u);
+    };
+    dispatch_while_forward_prepared("TRACE", true);
+    dispatch_while_forward_prepared("GET", false);
+
+    auto forged_pre_route = std::make_unique<RouteConfig>();
+    forged_pre_route->pre_route_policy_ids[kRouteMethodAny] = 1;
+    const auto forged_pre_route_result = dispatch_method(forged_pre_route.get(), "GET", "/other");
+    CHECK_EQ(forged_pre_route_result.response_len, 0u);
+    CHECK(forged_pre_route_result.close);
+
+    Http2Conn malformed_h2;
+    malformed_h2.init();
+    Connection malformed_conn;
+    malformed_conn.reset();
+    malformed_conn.h2 = &malformed_h2;
+    malformed_conn.request_config = exact.get();
+    FakeH2Loop malformed_loop;
+    u8 malformed_response[256]{};
+    H2Dispatch<FakeH2Loop> malformed_dispatch{
+        &malformed_loop, &malformed_conn, malformed_response, sizeof(malformed_response), 0, false};
+    const hpack::Header malformed_headers[] = {{{":method", 7}, {"GET", 3}}};
+    h2_dispatch_request(malformed_dispatch, 1, malformed_headers, 1, true);
+    CHECK_GT(malformed_dispatch.resp_len, 0u);
+    CHECK_FALSE(malformed_dispatch.close_after_process);
+}
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     // A deferred dynamic route's param VALUES point into hdr_scratch, which the
@@ -1507,6 +1790,7 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {path_buf, 9}}};
     ParsedRequest req{};
     req.has_content_length = true;
+    req.content_length_count = 1;
     req.content_length = 0;
 
     REQUIRE(h2_defer_until_data_end(d,

@@ -1,0 +1,184 @@
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <sys/types.h>
+
+namespace rut::test::fixture_identity_bundle {
+
+using u16 = std::uint16_t;
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
+
+constexpr u32 kMagic = 0x31424449u;  // "IDB1"
+constexpr u16 kVersion = 1;
+constexpr size_t kRoleCount = 2;
+constexpr size_t kFdsPerRole = 6;
+constexpr size_t kBundleFdCount = kRoleCount * kFdsPerRole;
+constexpr size_t kHeaderBytes = 16;
+constexpr size_t kRoleManifestBytes = 14 * sizeof(u64);
+constexpr size_t kPayloadBytes = kRoleCount * kRoleManifestBytes;
+constexpr size_t kWireBytes = kHeaderBytes + kPayloadBytes;
+constexpr int kTransportTimeoutMs = 1000;
+// Dropped is deliberately a separate, manifest-free six-FD record.  Its
+// magic/version and fixed header are independent from the Launcher+Root wire.
+constexpr u32 kDroppedMagic = 0x31444644u;  // "DDF1"
+constexpr u16 kDroppedVersion = 1;
+constexpr size_t kDroppedHeaderBytes = 16;
+constexpr size_t kDroppedFdCount = kFdsPerRole;
+static_assert(kDroppedFdCount == 6 && kDroppedHeaderBytes == kHeaderBytes);
+static_assert(kRoleCount == 2 && kFdsPerRole == 6 && kBundleFdCount == 12);
+static_assert(kRoleManifestBytes == 112 && kWireBytes == 240);
+
+enum class Role : u16 { Launcher = 1, Root = 2, Dropped = 3, Ancestry = 4 };
+static_assert(static_cast<u16>(Role::Launcher) == 1 && static_cast<u16>(Role::Root) == 2 &&
+              static_cast<u16>(Role::Dropped) == 3 && static_cast<u16>(Role::Ancestry) == 4);
+
+enum class FdSlot : size_t {
+    Stat = 0,
+    Status = 1,
+    Cmdline = 2,
+    Executable = 3,
+    Netns = 4,
+    Pidfd = 5,
+    Unknown = kFdsPerRole,
+};
+
+struct RoleManifest {
+    Role role = Role::Launcher;
+    pid_t pid = -1;
+    u64 start = 0;
+    pid_t ppid = -1;
+    pid_t pgid = -1;
+    pid_t sid = -1;
+    uid_t uid = static_cast<uid_t>(-1);
+    gid_t gid = static_cast<gid_t>(-1);
+    u64 netns = 0;
+    u64 exe_dev = 0;
+    u64 exe_ino = 0;
+    u64 argv_length = 0;
+    u64 argv_hash = 0;
+};
+
+struct DroppedStatusEvidence {
+    std::array<uid_t, 4> uid_values{};
+    std::array<gid_t, 4> gid_values{};
+    std::vector<gid_t> supplementary_groups;
+    bool no_new_privs = false;
+    u64 cap_inh = 0;
+    u64 cap_prm = 0;
+    u64 cap_eff = 0;
+    u64 cap_bnd = 0;
+    u64 cap_amb = 0;
+    bool cap_inh_clear = false;
+    bool cap_prm_clear = false;
+    bool cap_eff_clear = false;
+};
+
+struct DroppedIdentityEvidence {
+    RoleManifest identity;
+    char state = '\0';
+    DroppedStatusEvidence status;
+    std::string cmdline;
+    bool pidfd_live = false;
+};
+
+// Strict kernel-derived evidence shared by manifest-free tests-only transports.
+// It imposes no caller, root, stage, or ancestry policy.
+struct ProcessIdentityEvidence {
+    RoleManifest identity;
+    char state = '\0';
+    DroppedStatusEvidence status;
+    std::string cmdline;
+    bool pidfd_live = false;
+};
+
+// Safe, bounded diagnostics for callers that must identify the first failed
+// kernel descriptor without exposing paths, argv, or other process content.
+struct OpenRoleFailure {
+    FdSlot slot = FdSlot::Unknown;
+    std::string phase;
+    std::string operation;
+    int error_number = 0;
+};
+
+struct RoleBundle {
+    RoleManifest manifest;
+    std::array<int, kFdsPerRole> fds{};
+
+    RoleBundle();
+    ~RoleBundle();
+    RoleBundle(const RoleBundle&) = delete;
+    RoleBundle& operator=(const RoleBundle&) = delete;
+    RoleBundle(RoleBundle&& other) noexcept;
+    RoleBundle& operator=(RoleBundle&& other) noexcept;
+    void close();
+};
+
+struct IdentityBundle {
+    std::array<RoleBundle, kRoleCount> roles;
+
+    IdentityBundle() = default;
+    IdentityBundle(const IdentityBundle&) = delete;
+    IdentityBundle& operator=(const IdentityBundle&) = delete;
+    IdentityBundle(IdentityBundle&&) noexcept = default;
+    IdentityBundle& operator=(IdentityBundle&&) noexcept = default;
+    void close();
+};
+
+class ReceivedBundle {
+public:
+    ReceivedBundle() = default;
+    ~ReceivedBundle() = default;
+    ReceivedBundle(const ReceivedBundle&) = delete;
+    ReceivedBundle& operator=(const ReceivedBundle&) = delete;
+    ReceivedBundle(ReceivedBundle&&) noexcept = default;
+    ReceivedBundle& operator=(ReceivedBundle&&) noexcept = default;
+
+    IdentityBundle& bundle() { return bundle_; }
+    const IdentityBundle& bundle() const { return bundle_; }
+    void reset() { bundle_.close(); }
+
+private:
+    IdentityBundle bundle_;
+};
+
+bool open_role(pid_t pid, Role role, RoleBundle& role_bundle, std::string& error);
+bool open_role(
+    pid_t pid, Role role, RoleBundle& role_bundle, OpenRoleFailure& failure, std::string& error);
+bool adopt_role(Role role,
+                std::array<int, kFdsPerRole>& inherited_fds,
+                RoleBundle& role_bundle,
+                std::string& error);
+bool validate_bundle(const IdentityBundle& bundle, std::string& error);
+std::vector<unsigned char> encode_bundle(const IdentityBundle& bundle);
+bool send_bundle(int fd,
+                 const IdentityBundle& bundle,
+                 std::chrono::steady_clock::time_point deadline);
+bool receive_bundle(int fd,
+                    ReceivedBundle& bundle,
+                    std::chrono::steady_clock::time_point deadline,
+                    std::string& error);
+bool send_dropped_role(int fd,
+                       const RoleBundle& role,
+                       std::chrono::steady_clock::time_point deadline);
+bool receive_dropped_role(int fd,
+                          RoleBundle& role,
+                          std::chrono::steady_clock::time_point deadline,
+                          std::string& error);
+bool parse_dropped_status_evidence(const std::string& status,
+                                   DroppedStatusEvidence& evidence,
+                                   std::string& error);
+bool extract_dropped_identity_evidence(const RoleBundle& role,
+                                       DroppedIdentityEvidence& evidence,
+                                       std::string& error);
+bool extract_process_identity_evidence(const RoleBundle& role,
+                                       Role expected_role,
+                                       ProcessIdentityEvidence& evidence,
+                                       std::string& error);
+
+}  // namespace rut::test::fixture_identity_bundle

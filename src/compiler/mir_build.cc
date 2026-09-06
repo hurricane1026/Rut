@@ -1,5 +1,7 @@
 #include "rut/compiler/mir_build.h"
 
+#include "rut/runtime/route_method.h"
+#include <memory>
 #include <vector>
 
 namespace rut {
@@ -43,6 +45,190 @@ static Str match_case_label() {
 
 static Str match_default_label() {
     return {"match_default", 13};
+}
+
+static bool response_read_deadline_request_policy_is_admitted_for_term(const MirModule& module,
+                                                                       const MirFunction& function,
+                                                                       const MirTerminator& term) {
+    if (response_read_deadline_request_policy_is_admitted(term.forward_request_policy_id))
+        return true;
+    return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           fixed_upload_head_route_method_is_admitted(function.method) &&
+           fixed_upload_head_request_policy_is_admitted(term.forward_request_policy_id) &&
+           term.forward_response_policy_id != 0 &&
+           term.forward_response_policy_id <= module.response_policies.len &&
+           term.forward_failure_policy_id != 0 &&
+           term.forward_failure_policy_id <= module.failure_policies.len &&
+           term.forward_timeout_failure_policy_id != 0 &&
+           term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+           fixed_upload_head_timeout_policies_valid(
+               module.response_policies[term.forward_response_policy_id - 1],
+               module.failure_policies[term.forward_failure_policy_id - 1],
+               module.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+}
+
+// HIR -> MIR trust boundary. Inspect the fully built MIR rather than trusting
+// the HIR marker, including every timeout-bearing terminal and every field of
+// each exact admitted deferred selector.
+static bool forward_preflight_metadata_valid(const MirModule& module, const MirFunction& function) {
+    if (!forward_preflight_mode_valid(function.forward_preflight_mode)) return false;
+
+    const MirTerminator* preflight_term = nullptr;
+    u32 preflight_term_count = 0;
+    for (u32 bi = 0; bi < function.blocks.len; bi++) {
+        const auto& term = function.blocks[bi].term;
+        if (term.forward_response_read_timeout_seconds == 0 &&
+            term.forward_response_buffering == ForwardResponseBufferingMode::None)
+            continue;
+        preflight_term_count++;
+        if (preflight_term == nullptr) preflight_term = &term;
+    }
+    if (preflight_term == nullptr)
+        return function.forward_preflight_mode == ForwardPreflightMode::None;
+    const bool framing_selection =
+        function.forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection;
+    if (preflight_term_count != (framing_selection ? 2u : 1u)) return false;
+    if (!response_read_deadline_request_policy_is_admitted_for_term(
+            module, function, *preflight_term))
+        return false;
+
+    const bool complete_buffering = preflight_term->forward_response_buffering ==
+                                    ForwardResponseBufferingMode::CompleteContentLength;
+    const bool common = function.locals.len == 0 && function.waits.len == 0 &&
+                        !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
+                        function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
+                        !function.is_timer;
+    if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
+        return common && function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
+               preflight_term->kind == MirTerminatorKind::ForwardUpstream &&
+               function.values.len == 0 && function.blocks[0].effects.len == 0 &&
+               preflight_term->forward_set_path.ptr == nullptr &&
+               preflight_term->forward_set_headers.len == 0 &&
+               !preflight_term->has_forward_target_transform &&
+               !preflight_term->commit_response_mutations &&
+               (!complete_buffering ||
+                (complete_content_length_route_method_is_admitted(function.method) &&
+                 complete_content_length_request_policy_is_admitted(
+                     preflight_term->forward_request_policy_id)));
+    }
+    if (framing_selection) {
+        if (!common || function.method != kRouteMethodHead || function.blocks.len != 3 ||
+            function.values.len != 0)
+            return false;
+        const auto& entry = function.blocks[0];
+        const auto& then_block = function.blocks[1];
+        const auto& else_block = function.blocks[2];
+        if (entry.effects.len != 0 || then_block.effects.len != 0 || else_block.effects.len != 0 ||
+            entry.term.kind != MirTerminatorKind::Branch || entry.term.then_block != 1 ||
+            entry.term.else_block != 2 ||
+            entry.term.cond.kind != MirValueKind::ReqHasContentLength ||
+            entry.term.cond.type != MirTypeKind::Bool || entry.term.cond.lhs != nullptr ||
+            entry.term.cond.rhs != nullptr)
+            return false;
+        auto exact_forward = [&](const MirTerminator& term, RequestPolicyId policy) {
+            return term.kind == MirTerminatorKind::ForwardUpstream &&
+                   term.source_kind == MirTerminatorSourceKind::Literal &&
+                   term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                   !term.commit_response_mutations && term.response_body.ptr == nullptr &&
+                   term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
+                   term.upstream_index < module.upstreams.len &&
+                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
+                   !term.has_forward_target_transform &&
+                   term.forward_request_policy_id == static_cast<u16>(policy) &&
+                   response_read_timeout_seconds_valid(
+                       term.forward_response_read_timeout_seconds) &&
+                   term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                   response_read_deadline_request_policy_is_admitted_for_term(
+                       module, function, term);
+        };
+        const auto& after_host = then_block.term;
+        const auto& legacy = else_block.term;
+        return exact_forward(after_host, RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
+               exact_forward(legacy, RequestPolicyId::Http11FixedStrip) &&
+               after_host.upstream_index == legacy.upstream_index &&
+               after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
+               after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
+               after_host.forward_timeout_failure_policy_id ==
+                   legacy.forward_timeout_failure_policy_id &&
+               after_host.forward_response_read_timeout_seconds ==
+                   legacy.forward_response_read_timeout_seconds &&
+               after_host.forward_response_buffering == legacy.forward_response_buffering;
+    }
+    if (function.forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
+        !common || function.method == kRouteMethodAny ||
+        !complete_content_length_route_method_is_admitted(function.method) ||
+        function.blocks.len != 3 || function.values.len != 2)
+        return false;
+
+    const auto& entry = function.blocks[0];
+    const auto& then_block = function.blocks[1];
+    const auto& else_block = function.blocks[2];
+    if (entry.effects.len != 0 || then_block.effects.len != 0 || else_block.effects.len != 0 ||
+        entry.term.kind != MirTerminatorKind::Branch || entry.term.then_block != 1 ||
+        entry.term.else_block != 2 || &else_block.term != preflight_term)
+        return false;
+    const MirValue& cond = entry.term.cond;
+    auto value_is_owned = [&](const MirValue* value) {
+        if (value == nullptr) return false;
+        for (u32 i = 0; i < function.values.len; i++) {
+            if (value == &function.values[i]) return true;
+        }
+        return false;
+    };
+    const bool cond_owned =
+        value_is_owned(cond.lhs) && value_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+    if (!cond_owned || cond.kind != MirValueKind::Eq || cond.type != MirTypeKind::Bool ||
+        cond.lhs->kind != MirValueKind::ReqPathOnly || cond.lhs->type != MirTypeKind::Str ||
+        cond.rhs->kind != MirValueKind::StrConst || cond.rhs->type != MirTypeKind::Str ||
+        (cond.rhs->str_value.len != 0 && cond.rhs->str_value.ptr == nullptr))
+        return false;
+
+    const auto& redirect = then_block.term;
+    const bool redirect_valid =
+        redirect.kind == MirTerminatorKind::Redirect &&
+        redirect.source_kind == MirTerminatorSourceKind::Literal &&
+        redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
+        !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
+        redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+        redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
+        redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
+        redirect.forward_timeout_failure_policy_id == 0 &&
+        redirect.forward_response_read_timeout_seconds == 0 &&
+        redirect.forward_response_buffering == ForwardResponseBufferingMode::None &&
+        !redirect.has_forward_target_transform && redirect.redirect_policy_id != 0 &&
+        redirect.redirect_policy_id <= module.redirect_policies.len &&
+        redirect_policy_spec_valid(module.redirect_policies[redirect.redirect_policy_id - 1]);
+    const auto& forward = else_block.term;
+    const bool policy_bundle_valid =
+        forward.forward_response_policy_id != 0 &&
+        forward.forward_response_policy_id <= module.response_policies.len &&
+        forward.forward_failure_policy_id != 0 &&
+        forward.forward_failure_policy_id <= module.failure_policies.len &&
+        forward.forward_timeout_failure_policy_id != 0 &&
+        forward.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+        response_policy_spec_valid(
+            module.response_policies[forward.forward_response_policy_id - 1]) &&
+        forward_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_failure_policy_id - 1]) &&
+        forward_timeout_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]) &&
+        complete_content_length_buffering_policies_valid(
+            module.response_policies[forward.forward_response_policy_id - 1],
+            module.failure_policies[forward.forward_failure_policy_id - 1],
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]);
+    const bool forward_valid =
+        forward.kind == MirTerminatorKind::ForwardUpstream &&
+        forward.source_kind == MirTerminatorSourceKind::Literal &&
+        forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
+        !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
+        forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
+        forward.upstream_index < module.upstreams.len && forward.forward_set_path.ptr == nullptr &&
+        forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
+        response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
+        forward.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+        policy_bundle_valid;
+    return redirect_valid && forward_valid;
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
@@ -844,8 +1030,54 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 
 }  // namespace
 
-FrontendResult<MirModule*> build_mir(const HirModule& module) {
-    auto* mir = new MirModule{};
+static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
+                                                 bool internal_strict_local_response_propagation) {
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  module.strict_local_response_policies.data,
+                  module.strict_local_response_policies.len,
+                  module.pre_route_policy_ids,
+                  module.unmatched_policy_ids,
+                  module.exact_strict_local_response_bindings.data,
+                  module.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  module.strict_local_response_policies.data,
+                  module.strict_local_response_policies.len,
+                  module.pre_route_policy_ids,
+                  module.unmatched_policy_ids,
+                  module.exact_strict_local_response_bindings.data,
+                  module.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax, {});
+    auto mir = std::make_unique<MirModule>();
+
+    for (u32 i = 0; i < module.response_policies.len; i++) {
+        if (!mir->response_policies.push(module.response_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < module.failure_policies.len; i++) {
+        if (!mir->failure_policies.push(module.failure_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < module.strict_local_response_policies.len; i++) {
+        if (!mir->strict_local_response_policies.push(module.strict_local_response_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        mir->pre_route_policy_ids[i] = module.pre_route_policy_ids[i];
+        mir->unmatched_policy_ids[i] = module.unmatched_policy_ids[i];
+    }
+    for (u32 i = 0; i < module.exact_strict_local_response_bindings.len; i++) {
+        if (!mir->exact_strict_local_response_bindings.push(
+                module.exact_strict_local_response_bindings[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < module.redirect_policies.len; i++) {
+        if (!mir->redirect_policies.push(module.redirect_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
 
     for (u32 i = 0; i < module.type_shapes.len; i++) {
         MirTypeShape shape{};
@@ -1009,6 +1241,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             shape_carrier_ready(*mir, i, struct_ready, variant_ready);
     }
 
+    bool invalid_redirect_policy = false;
     for (u32 i = 0; i < module.routes.len; i++) {
 #if RUT_ENABLE_WEBSOCKET
         // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
@@ -1023,6 +1256,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.path = module.routes[i].path;
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
+        fn.forward_preflight_mode = module.routes[i].forward_preflight_mode;
         fn.rate_limit = module.routes[i].rate_limit;
         fn.throttle_down_bps = module.routes[i].throttle_down_bps;
         fn.is_timer = module.routes[i].is_timer;
@@ -1104,20 +1338,36 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
+            if (term.kind == HirTerminatorKind::Redirect &&
+                (term.redirect_policy_id == 0 ||
+                 term.redirect_policy_id > module.redirect_policies.len ||
+                 !redirect_policy_spec_valid(
+                     module.redirect_policies[term.redirect_policy_id - 1])))
+                invalid_redirect_policy = true;
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
             out->upstream_index = term.upstream_index;
-            out->kind = term.kind == HirTerminatorKind::ReturnStatus
-                            ? MirTerminatorKind::ReturnStatus
-                            : MirTerminatorKind::ForwardUpstream;
+            out->kind =
+                term.kind == HirTerminatorKind::ReturnStatus ? MirTerminatorKind::ReturnStatus
+                : term.kind == HirTerminatorKind::Redirect   ? MirTerminatorKind::Redirect
+                                                             : MirTerminatorKind::ForwardUpstream;
             out->source_kind = term.source_kind == HirTerminatorSourceKind::LocalRef
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
             out->forward_set_path = term.forward_set_path;
+            out->forward_request_policy_id = term.forward_request_policy_id;
+            out->forward_response_policy_id = term.forward_response_policy_id;
+            out->forward_failure_policy_id = term.forward_failure_policy_id;
+            out->forward_timeout_failure_policy_id = term.forward_timeout_failure_policy_id;
+            out->forward_response_read_timeout_seconds = term.forward_response_read_timeout_seconds;
+            out->forward_response_buffering = term.forward_response_buffering;
+            out->redirect_policy_id = term.redirect_policy_id;
+            out->has_forward_target_transform = term.has_forward_target_transform;
+            out->forward_target_transform = term.forward_target_transform;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a
             // straight copy cannot truncate. Static-assert the cap
@@ -1672,6 +1922,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2556,6 +2809,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2617,6 +2873,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -3146,10 +3405,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (!forward_preflight_metadata_valid(*mir, fn)) {
+            return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+        }
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
-    return mir;
+    if (invalid_redirect_policy) return frontend_error(FrontendError::UnsupportedSyntax);
+    return mir.release();
+}
+
+FrontendResult<MirModule*> build_mir(const HirModule& module) {
+    return build_mir_impl(module, false);
+}
+
+FrontendResult<MirModule*> build_mir_for_internal_propagation(const HirModule& module) {
+    return build_mir_impl(module, true);
 }
 
 }  // namespace rut

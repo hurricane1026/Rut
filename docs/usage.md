@@ -103,10 +103,17 @@ Notes:
 
 ## 3. Run it
 
-Pass the `.rut` path as a positional argument:
+Pass the `.rut` path as a positional argument. A source file may declare one
+cleartext IPv4 wildcard listener, for example `listen :8080`; port `0` is
+allowed for an ephemeral test listener:
+
+```swift
+listen :8080
+route GET "/health" { return 200 }
+```
 
 ```bash
-./build/src/rut 8080 app.rut
+./build/src/rut app.rut
 ```
 
 `rut` will:
@@ -114,7 +121,14 @@ Pass the `.rut` path as a positional argument:
 1. compile and JIT `app.rut` (prints `Loaded program: app.rut`),
 2. pick an I/O backend (io_uring if available, else epoll),
 3. spin up one share-nothing shard per CPU core,
-4. listen on the given port.
+4. listen on the source-declared port, or the explicit CLI port/default 8080
+   when the source has no listener declaration.
+
+An explicit CLI port may repeat an equivalent source declaration. If both are
+present and differ, startup fails rather than silently choosing one.
+Because a source listener is explicitly cleartext, `--tls-cert`/`--tls-key`
+cannot be combined with a source `listen` declaration; CLI-only TLS remains
+supported.
 
 Then:
 
@@ -133,6 +147,9 @@ gracefully before exiting.
 |---|---|---|
 | `<port>` (positional) | Listen port (`0` = ephemeral) | `8080` |
 | `<path.rut>` (positional) | Program to load and serve | none (route-less) |
+
+The positional CLI port is optional when the source declares `listen :<port>`;
+without either declaration the listener defaults to `:8080`.
 | `--shards N` | Number of per-core shards | auto (CPU count) |
 | `--no-pin` | Do not pin shard threads to CPUs | pin on |
 | `--drain N` | Graceful drain window, seconds | `30` |

@@ -22,9 +22,11 @@
 // hot path, so unlike the runtime it is free to use the compiler's
 // heap-allocating frontend APIs.
 
+#include "rut/common/access_log_sink.h"
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/listener.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
@@ -67,6 +69,13 @@ struct LoadedProgram {
     FrontendRirModule rir;  // owns the lowered module + its arena
     jit::JitEngine engine;  // owns the native handler code
     bool jit_inited = false;
+    // Immutable process-start listener metadata copied out of HIR before the
+    // temporary frontend modules are released. It is intentionally separate
+    // from RouteConfig, which participates in route hot reload.
+    bool has_listener = false;
+    ListenerSpec listener{};
+    // Owned but intentionally inert until the startup sink and reliable publisher increments.
+    AccessLogSinkSpec access_log{};
     RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();

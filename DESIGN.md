@@ -1092,6 +1092,12 @@ no allocation — pure compile-time code duplication.
 
 **Listening**
 
+The current compiler accepts one top-level `listen :<port>` declaration for a
+cleartext IPv4 wildcard listener; `<port>` is `0..65535` (`0` requests an
+ephemeral port). Listener metadata is fixed at process startup and is not part
+of hot-reloadable route state. Multiple listeners, concrete addresses, IPv6,
+TLS, and listener options remain future work.
+
 ```swift
 // Simple
 listen :80
@@ -3013,7 +3019,7 @@ bitwise.shiftRight(a, n)      // a >> n
 | Flat capture access | `req.id` for route param `:id` | "route captures live in req.params; use req.params.id" |
 | Param type | `get /users/:id(i64)` with non-numeric path | returns 404 at runtime; type-checked at use site |
 | Type error | `User(id: 123)` | "id expects string, got i32" |
-| Domain value | `listen :70000` | "port range 1-65535" |
+| Domain value | `listen :70000` | "port range 0-65535" |
 | Duration unit | `timeout: 30x` | "unknown Duration unit" |
 | StatusCode range | `return 999` | "invalid status code" |
 | Unreachable route | `_ { 404 }` then `get /after` | "unreachable route after catch-all" |

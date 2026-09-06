@@ -4,6 +4,8 @@
 #include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
 #include "test.h"
+#include <memory>
+#include <string>
 
 using namespace rut;
 using namespace rut::rir;
@@ -461,9 +463,98 @@ TEST(RirPrinter, OpcodeNames) {
     CHECK(got1.eq(lit("cmp.eq")));
 
     buf.len = 0;
+    print_opcode(buf, Opcode::ReqSetTargetTransform);
+    Str got_transform = {buf.data, buf.len};
+    CHECK(got_transform.eq(lit("req.set_target_transform")));
+
+    buf.len = 0;
     print_opcode(buf, Opcode::YieldHttpGet);
     Str got2 = {buf.data, buf.len};
     CHECK(got2.eq(lit("yield.http_get")));
+}
+
+TEST(RirPrinter, TargetTransformInstructionPrintsImmediateInFunction) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("target_transform"), lit("/api"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_req_set_target_transform(1));
+
+    char print_data[512];
+    PrintBuf pb;
+    pb.init(print_data, sizeof(print_data), -1);
+    print_function(pb, *fn);
+    Str output{pb.data, pb.len};
+    const Str expected = lit("req.set_target_transform 1");
+    bool found = false;
+    for (u32 i = 0; i + expected.len <= output.len; i++) {
+        if (output.slice(i, i + expected.len).eq(expected)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    // A directly forged negative immediate must remain visible in complete
+    // function output instead of being treated as an absent transform.
+    fn->entry()->insts[0].imm.i32_val = -1;
+    pb.len = 0;
+    print_function(pb, *fn);
+    output = {pb.data, pb.len};
+    const Str forged = lit("req.set_target_transform -1");
+    found = false;
+    for (u32 i = 0; i + forged.len <= output.len; i++) {
+        if (output.slice(i, i + forged.len).eq(forged)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+    ctx.destroy();
+}
+
+TEST(RirRedirect, BuilderVerifierAndPrinterRejectInvalidIds) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("redirect"), lit("/api"), 0));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    CHECK_FALSE(static_cast<bool>(b.emit_ret_redirect(0)));
+    VOK(b.emit_ret_redirect(65535));
+    auto verify = verify_function(fn);
+    REQUIRE(verify.ok);
+    CHECK_EQ(fn->entry()->terminator()->op, Opcode::RetRedirect);
+    CHECK_EQ(fn->entry()->terminator()->imm.i32_val, 65535);
+
+    char data[512];
+    PrintBuf pb;
+    pb.init(data, sizeof(data), -1);
+    print_function(pb, *fn);
+    const Str output{pb.data, pb.len};
+    const Str expected = lit("ret.redirect 65535");
+    bool found = false;
+    for (u32 i = 0; i + expected.len <= output.len; i++) {
+        if (output.slice(i, i + expected.len).eq(expected)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    fn->entry()->insts[fn->entry()->inst_count - 1].imm.i32_val = 0;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidRedirectPolicyId);
+    fn->entry()->insts[fn->entry()->inst_count - 1].imm.i32_val = -1;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidRedirectPolicyId);
+    ctx.destroy();
 }
 
 TEST(RirPrinter, TypeNames) {
@@ -1717,6 +1808,465 @@ TEST(RirBuilder, ResponseHeaderOperandsRequireStringShapes) {
     (void)V(b.emit_resp_header(lit("X-Test"), optional_string));
 
     ctx.destroy();
+}
+
+TEST(RirVerifier, StrictLocalResponseRejectsForgedCountsIdsMappingsAndPolicies) {
+    static constexpr char kReason[] = "Bad Request";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "x";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {kReason, sizeof(kReason) - 1};
+    policy.content_type = {kType, sizeof(kType) - 1};
+    policy.server = {kServer, sizeof(kServer) - 1};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    Module mod{};
+    mod.strict_local_response_policies[0] = policy;
+    mod.strict_local_response_policy_count = 1;
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    CHECK(verify_module(mod).ok);
+
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 0;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.strict_local_response_policy_count = 0;
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.strict_local_response_policy_count = 1;
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 2;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    mod.unmatched_policy_ids[kRouteMethodConnect] = 1;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.unmatched_policy_ids[kRouteMethodConnect] = 0;
+    mod.strict_local_response_policies[0].status_code = 399;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.strict_local_response_policies[0] = policy;
+    mod.strict_local_response_policies[0].head_mode = StrictLocalResponseHeadMode::Reject;
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 0;
+    mod.unmatched_policy_ids[kRouteMethodHead] = 1;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    mod.unmatched_policy_ids[kRouteMethodHead] = 0;
+    mod.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+
+    auto check_bad_policy = [&](const StrictLocalResponsePolicySpec& forged) {
+        Module candidate{};
+        candidate.strict_local_response_policies[0] = forged;
+        candidate.strict_local_response_policy_count = 1;
+        candidate.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        CHECK_EQ(verify_module(candidate).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    };
+    StrictLocalResponsePolicySpec forged = policy;
+    forged.reason = {nullptr, 1};
+    check_bad_policy(forged);
+    forged = policy;
+    forged.content_type = {nullptr, 1};
+    check_bad_policy(forged);
+    forged = policy;
+    forged.server = {nullptr, 1};
+    check_bad_policy(forged);
+    forged = policy;
+    forged.body = {nullptr, 1};
+    check_bad_policy(forged);
+    forged = policy;
+    forged.reason.len = kMaxStrictLocalResponseReasonLen + 1;
+    check_bad_policy(forged);
+    forged = policy;
+    forged.content_type.len = kMaxStrictLocalResponseContentTypeLen + 1;
+    check_bad_policy(forged);
+    forged = policy;
+    forged.server.len = kMaxStrictLocalResponseServerLen + 1;
+    check_bad_policy(forged);
+    forged = policy;
+    forged.body.len = kMaxStrictLocalResponseBodyLen + 1;
+    check_bad_policy(forged);
+    forged = policy;
+    forged.version = static_cast<StrictLocalResponseVersion>(255);
+    check_bad_policy(forged);
+    forged = policy;
+    forged.date = static_cast<StrictLocalResponseDate>(255);
+    check_bad_policy(forged);
+    forged = policy;
+    forged.connection = static_cast<StrictLocalResponseConnection>(255);
+    check_bad_policy(forged);
+    forged = policy;
+    forged.head_mode = static_cast<StrictLocalResponseHeadMode>(255);
+    check_bad_policy(forged);
+
+    {
+        Module multi_mod{};
+        multi_mod.strict_local_response_policies[0] = policy;
+        multi_mod.strict_local_response_policies[1] = policy;
+        multi_mod.strict_local_response_policy_count = 2;
+        multi_mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        CHECK_EQ(verify_module(multi_mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    }
+
+    std::string body(kMaxStrictLocalResponseBodyLen, 'x');
+    {
+        Module body_mod{};
+        body_mod.strict_local_response_policies[0] = policy;
+        body_mod.strict_local_response_policies[1] = policy;
+        body_mod.strict_local_response_policies[0].body = {body.data(),
+                                                           static_cast<u32>(body.size())};
+        body_mod.strict_local_response_policies[1].body = {body.data(),
+                                                           static_cast<u32>(body.size())};
+        body_mod.strict_local_response_policy_count = 2;
+        body_mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        body_mod.unmatched_policy_ids[kRouteMethodConnect] = 2;
+        CHECK_EQ(verify_module(body_mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    }
+}
+
+TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad Request", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"x", 1};
+    auto valid_module = [&]() {
+        Module mod{};
+        mod.strict_local_response_policies[0] = policy;
+        mod.strict_local_response_policy_count = 1;
+        auto& binding = mod.exact_strict_local_response_bindings[0];
+        const Str path{"/static", 7};
+        for (u32 i = 0; i < path.len; i++) binding.path[i] = path.ptr[i];
+        binding.path_len = static_cast<u8>(path.len);
+        binding.method = kRouteMethodGet;
+        binding.policy_id = 1;
+        mod.exact_strict_local_response_binding_count = 1;
+        return mod;
+    };
+    auto rejects = [&](const Module& candidate) {
+        CHECK_EQ(verify_module(candidate).issue.code,
+                 VerifyIssueCode::InvalidExactStrictLocalResponseBinding);
+    };
+    REQUIRE(verify_module(valid_module()).ok);
+
+    Module mod = valid_module();
+    mod.exact_strict_local_response_binding_count = kMaxExactStrictLocalResponseBindings + 1;
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].path[0] = 'x';
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].path[2] = '?';
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].path_len = 0;
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].method = kStrictLocalResponseMethodSlots;
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].policy_id = 0;
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].path_view = static_cast<ExactPathView>(255);
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].reserved1 = 1;
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_bindings[0].path[8] = 'x';
+    rejects(mod);
+    mod = valid_module();
+    mod.exact_strict_local_response_binding_count = 0;
+    rejects(mod);
+
+    mod = valid_module();
+    mod.strict_local_response_policies[1] = policy;
+    mod.strict_local_response_policy_count = 2;
+    mod.exact_strict_local_response_bindings[1] = mod.exact_strict_local_response_bindings[0];
+    mod.exact_strict_local_response_bindings[1].policy_id = 2;
+    mod.exact_strict_local_response_binding_count = 2;
+    rejects(mod);
+    mod.exact_strict_local_response_bindings[1].path[6] = 'x';
+    REQUIRE(verify_module(mod).ok);
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 2;
+    rejects(mod);
+
+    mod = valid_module();
+    mod.strict_local_response_policies[1] = policy;
+    mod.strict_local_response_policy_count = 2;
+    mod.exact_strict_local_response_bindings[1] = mod.exact_strict_local_response_bindings[0];
+    mod.exact_strict_local_response_bindings[1].path_view = ExactPathView::SlashNormalized;
+    mod.exact_strict_local_response_bindings[1].policy_id = 2;
+    mod.exact_strict_local_response_binding_count = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    Module non_fixed = mod;
+    non_fixed.exact_strict_local_response_bindings[1].path[2] = '/';
+    non_fixed.exact_strict_local_response_bindings[1].path[3] = '/';
+    rejects(non_fixed);
+    non_fixed = mod;
+    non_fixed.exact_strict_local_response_bindings[1].path[1] = '/';
+    rejects(non_fixed);
+    non_fixed = mod;
+    for (u32 i = 1; i < sizeof(non_fixed.exact_strict_local_response_bindings[1].path); i++)
+        non_fixed.exact_strict_local_response_bindings[1].path[i] = 0;
+    non_fixed.exact_strict_local_response_bindings[1].path_len = 1;
+    rejects(non_fixed);
+
+    mod.strict_local_response_policies[2] = policy;
+    mod.strict_local_response_policy_count = 3;
+    mod.exact_strict_local_response_bindings[2] = mod.exact_strict_local_response_bindings[1];
+    mod.exact_strict_local_response_bindings[2].policy_id = 3;
+    mod.exact_strict_local_response_binding_count = 3;
+    rejects(mod);
+}
+
+TEST(RirVerifier, PreRouteRejectsAnyBadIdsHeadModeAndCrossTableReuseBeforeIndexing) {
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad Request", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"x", 1};
+    auto valid = [&]() {
+        Module mod{};
+        mod.strict_local_response_policies[0] = policy;
+        mod.strict_local_response_policy_count = 1;
+        mod.pre_route_policy_ids[kRouteMethodTrace] = 1;
+        return mod;
+    };
+    REQUIRE(verify_module(valid()).ok);
+    auto rejects_id = [&](auto forge) {
+        Module mod = valid();
+        forge(mod);
+        CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidPreRoutePolicyId);
+    };
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodAny] = 1; });
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodTrace] = 2; });
+    rejects_id([](Module& mod) { mod.strict_local_response_policy_count = 0; });
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodOptions] = 1; });
+    rejects_id([](Module& mod) {
+        mod.pre_route_policy_ids[kRouteMethodTrace] = 0;
+        mod.pre_route_policy_ids[kRouteMethodHead] = 1;
+    });
+    rejects_id([](Module& mod) {
+        mod.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    });
+
+    Module cross = valid();
+    cross.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    CHECK_EQ(verify_module(cross).issue.code,
+             VerifyIssueCode::InvalidExactStrictLocalResponseBinding);
+}
+
+TEST(RirVerifier, StrictLocalResponseRepresentation200RejectsEveryForgedProfileField) {
+    static constexpr char kBody[] = "successor-static";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 200;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"OK", 2};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    auto module_with = [](const StrictLocalResponsePolicySpec& candidate) {
+        Module mod{};
+        mod.strict_local_response_policies[0] = candidate;
+        mod.strict_local_response_policy_count = 1;
+        mod.unmatched_policy_ids[kRouteMethodAny] = 1;
+        return mod;
+    };
+    REQUIRE(verify_module(module_with(policy)).ok);
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_EQ(verify_module(module_with(forged)).issue.code,
+                 VerifyIssueCode::InvalidUnmatchedPolicyId);
+    };
+
+    for (const u16 status : {199u, 201u, 204u, 205u, 206u, 304u}) {
+        auto forged = policy;
+        forged.status_code = status;
+        rejects(forged);
+    }
+    auto forged = policy;
+    forged.reason = {"Created", 7};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {"text/html", 9};
+    rejects(forged);
+    forged = policy;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = policy;
+    forged.body = {kBody, 0};
+    rejects(forged);
+    std::string oversized(kMaxStrictLocalResponseBodyLen + 1, 'x');
+    forged = policy;
+    forged.body = {oversized.data(), static_cast<u32>(oversized.size())};
+    rejects(forged);
+}
+
+TEST(RirVerifier, NoContent204PublicAndInternalVerificationRequireExactTuple) {
+    char empty_anchor = 0;
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"No Content", 10};
+    policy.content_type = {&empty_anchor, 0};
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = {nullptr, 0};
+
+    auto module_with = [](const StrictLocalResponsePolicySpec& candidate) {
+        Module mod{};
+        mod.strict_local_response_policies[0] = candidate;
+        mod.strict_local_response_policy_count = 1;
+        mod.unmatched_policy_ids[kRouteMethodAny] = 1;
+        return mod;
+    };
+    CHECK(verify_module(module_with(policy)).ok);
+    REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
+    policy.content_type = {nullptr, 0};
+    policy.body = {&empty_anchor, 0};
+    REQUIRE(verify_module(module_with(policy)).ok);
+    REQUIRE(verify_module_for_internal_propagation(module_with(policy)).ok);
+
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_FALSE(verify_module(module_with(forged)).ok);
+        CHECK_FALSE(verify_module_for_internal_propagation(module_with(forged)).ok);
+    };
+    auto forged = policy;
+    forged.version = StrictLocalResponseVersion::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.status_code = 205;
+    rejects(forged);
+    forged = policy;
+    forged.date = StrictLocalResponseDate::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.connection = StrictLocalResponseConnection::Invalid;
+    rejects(forged);
+    forged = policy;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = policy;
+    forged.reason = {"No content", 10};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {"x", 1};
+    rejects(forged);
+    forged = policy;
+    forged.server = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.body = {nullptr, 1};
+    rejects(forged);
+    forged = policy;
+    forged.reserved0 = 1;
+    rejects(forged);
+    forged = policy;
+    forged.reserved1 = 1;
+    rejects(forged);
+
+    auto bad_id = module_with(policy);
+    bad_id.unmatched_policy_ids[kRouteMethodAny] = 2;
+    CHECK_FALSE(verify_module(bad_id).ok);
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_id).ok);
+    auto bad_count = module_with(policy);
+    bad_count.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    CHECK_FALSE(verify_module(bad_count).ok);
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_count).ok);
+    auto bad_reference = module_with(policy);
+    bad_reference.unmatched_policy_ids[kRouteMethodGet] = 1;
+    CHECK_FALSE(verify_module(bad_reference).ok);
+    CHECK_FALSE(verify_module_for_internal_propagation(bad_reference).ok);
+}
+
+TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
+    static constexpr char kReason[] = "Bad Request";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "x";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {kReason, sizeof(kReason) - 1};
+    policy.content_type = {kType, sizeof(kType) - 1};
+    policy.server = {kServer, sizeof(kServer) - 1};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    auto check_marker = [&](const Module& mod) {
+        char data[256];
+        PrintBuf buf;
+        buf.init(data, sizeof(data), -1);
+        print_module(buf, mod);
+        CHECK_FALSE(buf.overflow);
+        const Str printed{buf.data, buf.len};
+        CHECK(printed.eq(lit("strict_local_response_table: <invalid>\n")));
+    };
+    auto valid_module = [&]() {
+        Module mod{};
+        mod.strict_local_response_policies[0] = policy;
+        mod.strict_local_response_policy_count = 1;
+        mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        return mod;
+    };
+
+    Module mod = valid_module();
+    mod.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].reason = {nullptr, 1};
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].content_type = {nullptr, 1};
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].server = {nullptr, 1};
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].body = {nullptr, 1};
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].head_mode = static_cast<StrictLocalResponseHeadMode>(255);
+    check_marker(mod);
+    mod = valid_module();
+    mod.strict_local_response_policies[0].reason.len = kMaxStrictLocalResponseReasonLen + 1;
+    check_marker(mod);
+    auto empty_forgery = std::make_unique<Module>();
+    empty_forgery->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->exact_strict_local_response_bindings[3].reserved1 = 1;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->exact_strict_local_response_bindings[3].path_view =
+        static_cast<ExactPathView>(255);
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->pre_route_policy_ids[kRouteMethodAny] = 0xffffu;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->pre_route_policy_ids[kRouteMethodTrace] = 0xffffu;
+    check_marker(*empty_forgery);
 }
 
 int main(int argc, char** argv) {

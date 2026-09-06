@@ -18,7 +18,9 @@
 
 using namespace rut;
 using rut::test_fault::fixed_clock_gettime;
+using rut::test_fault::HeldEpollEventError;
 using rut::test_fault::IoFaultConfig;
+using rut::test_fault::ScopedHeldEpollEvent;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::single_recv_eintr;
@@ -36,6 +38,48 @@ struct timespec* opaque_null_timespec() {
 #endif
     return reinterpret_cast<struct timespec*>(bits);
 }
+
+struct HeldEpollTestFds {
+    i32 epoll_fds[2] = {-1, -1};
+    i32 pipe_fds[2] = {-1, -1};
+
+    ~HeldEpollTestFds() {
+        for (i32& fd : pipe_fds) {
+            if (fd >= 0) close(fd);
+        }
+        for (i32& fd : epoll_fds) {
+            if (fd >= 0) close(fd);
+        }
+    }
+
+    bool init(u64 data) {
+        epoll_fds[0] = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fds[0] < 0) return false;
+        epoll_fds[1] = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fds[1] < 0) return false;
+        if (pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+        struct epoll_event registration{};
+        registration.events = EPOLLIN;
+        registration.data.u64 = data;
+        if (epoll_ctl(epoll_fds[0], EPOLL_CTL_ADD, pipe_fds[0], &registration) != 0) {
+            return false;
+        }
+        return epoll_ctl(epoll_fds[1], EPOLL_CTL_ADD, pipe_fds[0], &registration) == 0;
+    }
+
+    bool set_data(u64 data) const {
+        struct epoll_event registration{};
+        registration.events = EPOLLIN;
+        registration.data.u64 = data;
+        return epoll_ctl(epoll_fds[0], EPOLL_CTL_MOD, pipe_fds[0], &registration) == 0 &&
+               epoll_ctl(epoll_fds[1], EPOLL_CTL_MOD, pipe_fds[0], &registration) == 0;
+    }
+
+    bool make_ready() const {
+        const char byte = 'x';
+        return write(pipe_fds[1], &byte, 1) == 1;
+    }
+};
 
 }  // namespace
 
@@ -402,6 +446,336 @@ TEST(epoll_fault, wait_retries_injected_eintr) {
     backend.shutdown();
 }
 
+TEST(epoll_fault, held_raw_event_is_exact_one_shot_and_fails_closed) {
+    static constexpr u64 kRawData = 0x123456789abcdef0ull;
+    HeldEpollTestFds guard;
+    REQUIRE(guard.init(kRawData));
+    REQUIRE(guard.make_ready());
+
+    {
+        ScopedHeldEpollEvent invalid_target(-1);
+        CHECK_FALSE(invalid_target.owns_state());
+        CHECK(invalid_target.failed_closed());
+        CHECK_EQ(invalid_target.error(), HeldEpollEventError::InvalidTargetFd);
+    }
+    {
+        ScopedHeldEpollEvent owner(guard.epoll_fds[0]);
+        REQUIRE(owner.owns_state());
+        ScopedHeldEpollEvent nested(guard.epoll_fds[0]);
+        CHECK_FALSE(nested.owns_state());
+        CHECK(nested.failed_closed());
+        CHECK_EQ(nested.error(), HeldEpollEventError::AlreadyOwned);
+        CHECK_FALSE(owner.failed_closed());
+    }
+    {
+        ScopedHeldEpollEvent duplicate_arm(guard.epoll_fds[0]);
+        REQUIRE(duplicate_arm.arm_capture_once());
+        CHECK_FALSE(duplicate_arm.arm_capture_once());
+        CHECK_EQ(duplicate_arm.error(), HeldEpollEventError::DuplicateCaptureArm);
+        CHECK_FALSE(duplicate_arm.capture_armed());
+        CHECK_FALSE(duplicate_arm.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent missing_capture(guard.epoll_fds[0]);
+        CHECK_FALSE(missing_capture.replay_once());
+        CHECK_EQ(missing_capture.error(), HeldEpollEventError::ReplayWithoutCapture);
+        CHECK_FALSE(missing_capture.capture_armed());
+        CHECK_FALSE(missing_capture.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent wrong_fd(guard.epoll_fds[0]);
+        REQUIRE(wrong_fd.arm_capture_once());
+        struct epoll_event other_event{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[1], &other_event, 1, 0), 1);
+        CHECK_EQ(other_event.events & EPOLLIN, static_cast<u32>(EPOLLIN));
+        CHECK_EQ(other_event.data.u64, kRawData);
+        CHECK_EQ(wrong_fd.error(), HeldEpollEventError::WrongEpollFd);
+        CHECK_FALSE(wrong_fd.capture_armed());
+        CHECK_FALSE(wrong_fd.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent invalid_output(guard.epoll_fds[0]);
+        REQUIRE(invalid_output.arm_capture_once());
+        // Capture deliberately requires maxevents == 1, so the seam can never
+        // harvest or ambiguously suppress multiple real epoll records.
+        struct epoll_event events[2]{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 1);
+        CHECK_EQ(events[0].data.u64, kRawData);
+        CHECK_EQ(invalid_output.error(), HeldEpollEventError::InvalidWaitOutput);
+        CHECK_FALSE(invalid_output.capture_armed());
+        CHECK_FALSE(invalid_output.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent invalid_maxevents(guard.epoll_fds[0]);
+        REQUIRE(invalid_maxevents.arm_capture_once());
+        // Linux rejects maxevents == 0 with EINVAL even when the output
+        // pointer is valid; the seam must fail closed and disarm capture.
+        struct epoll_event event{};
+        errno = 0;
+        CHECK_EQ(epoll_wait(guard.epoll_fds[0], &event, 0, 0), -1);
+        CHECK_EQ(errno, EINVAL);
+        CHECK_EQ(invalid_maxevents.error(), HeldEpollEventError::InvalidWaitOutput);
+        CHECK_FALSE(invalid_maxevents.capture_armed());
+        CHECK_FALSE(invalid_maxevents.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent duplicate_capture(guard.epoll_fds[0]);
+        REQUIRE(duplicate_capture.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(duplicate_capture.captured());
+        CHECK_FALSE(duplicate_capture.arm_capture_once());
+        CHECK_EQ(duplicate_capture.error(), HeldEpollEventError::DuplicateCaptureArm);
+        CHECK_FALSE(duplicate_capture.capture_armed());
+        CHECK_FALSE(duplicate_capture.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent wrong_fd_replay(guard.epoll_fds[0]);
+        REQUIRE(wrong_fd_replay.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(wrong_fd_replay.replay_once());
+        struct epoll_event other_event{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[1], &other_event, 1, 0), 1);
+        CHECK_EQ(other_event.data.u64, kRawData);
+        CHECK_EQ(wrong_fd_replay.error(), HeldEpollEventError::WrongEpollFd);
+        CHECK_FALSE(wrong_fd_replay.capture_armed());
+        CHECK_FALSE(wrong_fd_replay.replay_armed());
+        CHECK_FALSE(wrong_fd_replay.replay_consumed());
+    }
+    {
+        ScopedHeldEpollEvent invalid_replay_output(guard.epoll_fds[0]);
+        REQUIRE(invalid_replay_output.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(invalid_replay_output.replay_once());
+        struct epoll_event events[2]{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 1);
+        CHECK_EQ(events[0].data.u64, kRawData);
+        CHECK_EQ(invalid_replay_output.error(), HeldEpollEventError::InvalidWaitOutput);
+        CHECK_FALSE(invalid_replay_output.capture_armed());
+        CHECK_FALSE(invalid_replay_output.replay_armed());
+        CHECK_FALSE(invalid_replay_output.replay_consumed());
+    }
+    {
+        ScopedHeldEpollEvent duplicate_replay(guard.epoll_fds[0]);
+        REQUIRE(duplicate_replay.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(duplicate_replay.captured());
+        REQUIRE(duplicate_replay.replay_once());
+        CHECK_FALSE(duplicate_replay.replay_once());
+        CHECK_EQ(duplicate_replay.error(), HeldEpollEventError::DuplicateReplayArm);
+        CHECK_FALSE(duplicate_replay.capture_armed());
+        CHECK_FALSE(duplicate_replay.replay_armed());
+        CHECK_FALSE(duplicate_replay.replay_consumed());
+
+        static constexpr u64 kAfterPoisonData = 0xaaaaaaaa55555555ull;
+        REQUIRE(guard.set_data(kAfterPoisonData));
+        struct epoll_event real_event{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &real_event, 1, 0), 1);
+        CHECK_EQ(real_event.data.u64, kAfterPoisonData);
+        CHECK_FALSE(duplicate_replay.replay_consumed());
+    }
+    {
+        REQUIRE(guard.set_data(kRawData));
+        ScopedHeldEpollEvent consumed_replay(guard.epoll_fds[0]);
+        REQUIRE(consumed_replay.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(consumed_replay.replay_once());
+        struct epoll_event replayed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &replayed, 1, 0), 1);
+        REQUIRE(consumed_replay.replay_consumed());
+        CHECK_FALSE(consumed_replay.replay_once());
+        CHECK_EQ(consumed_replay.error(), HeldEpollEventError::DuplicateReplayArm);
+        CHECK_FALSE(consumed_replay.capture_armed());
+        CHECK_FALSE(consumed_replay.replay_armed());
+    }
+    {
+        static constexpr u64 kCapturedData = 0x1111222233334444ull;
+        static constexpr u64 kRealData = 0x5555666677778888ull;
+        REQUIRE(guard.set_data(kCapturedData));
+        ScopedHeldEpollEvent mixed_sequence(guard.epoll_fds[0]);
+        REQUIRE(mixed_sequence.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(mixed_sequence.captured());
+        REQUIRE(mixed_sequence.replay_once());
+        CHECK_FALSE(mixed_sequence.arm_capture_once());
+        CHECK_EQ(mixed_sequence.error(), HeldEpollEventError::DuplicateCaptureArm);
+        CHECK_FALSE(mixed_sequence.capture_armed());
+        CHECK_FALSE(mixed_sequence.replay_armed());
+
+        // captured -> replay armed -> duplicate capture must poison and cancel
+        // replay. The next matching call therefore returns fresh kernel data.
+        REQUIRE(guard.set_data(kRealData));
+        struct epoll_event real_event{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &real_event, 1, 0), 1);
+        CHECK_EQ(real_event.data.u64, kRealData);
+        CHECK_FALSE(mixed_sequence.replay_consumed());
+    }
+    {
+        REQUIRE(guard.set_data(kRawData));
+        ScopedHeldEpollEvent held(guard.epoll_fds[0]);
+        REQUIRE(held.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(held.captured());
+        CHECK_FALSE(held.capture_armed());
+        const u32 captured_events = held.captured_events();
+        const u64 captured_data = held.captured_data();
+        CHECK_EQ(captured_events & EPOLLIN, static_cast<u32>(EPOLLIN));
+        CHECK_EQ(captured_data, kRawData);
+
+        REQUIRE(held.replay_once());
+        struct epoll_event replayed{};
+        {
+            SyscallFaultConfig fault_config;
+            fault_config.epoll_wait_eintrs = 1;
+            ScopedSyscallFault fault(fault_config);
+            errno = 0;
+            REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &replayed, 1, 0), -1);
+            CHECK_EQ(errno, EINTR);
+            CHECK(held.replay_armed());
+            CHECK_FALSE(held.replay_consumed());
+            CHECK_FALSE(held.failed_closed());
+        }
+        {
+            SyscallFaultConfig fault_config;
+            fault_config.epoll_wait_errno = EIO;
+            fault_config.epoll_wait_failures = 1;
+            ScopedSyscallFault fault(fault_config);
+            errno = 0;
+            REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &replayed, 1, 0), -1);
+            CHECK_EQ(errno, EIO);
+            CHECK(held.replay_armed());
+            CHECK_FALSE(held.replay_consumed());
+            CHECK_FALSE(held.failed_closed());
+        }
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &replayed, 1, 0), 1);
+        CHECK_EQ(replayed.events, captured_events);
+        CHECK_EQ(replayed.data.u64, captured_data);
+        CHECK(held.replay_consumed());
+        CHECK_FALSE(held.replay_armed());
+        CHECK_FALSE(held.failed_closed());
+    }
+
+    char observed = 0;
+    REQUIRE_EQ(read(guard.pipe_fds[0], &observed, 1), 1);
+    CHECK_EQ(observed, 'x');
+    REQUIRE(guard.make_ready());
+    struct epoll_event transparent{};
+    REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &transparent, 1, 0), 1);
+    CHECK_EQ(transparent.data.u64, kRawData);
+}
+
+TEST(epoll_fault, held_raw_capture_retries_after_zero_and_injected_wait_failures) {
+    static constexpr u64 kRawData = 0x1020304050607080ull;
+    HeldEpollTestFds guard;
+    REQUIRE(guard.init(kRawData));
+
+    ScopedHeldEpollEvent held(guard.epoll_fds[0]);
+    REQUIRE(held.arm_capture_once());
+    struct epoll_event output{};
+    REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &output, 1, 0), 0);
+    CHECK(held.capture_armed());
+    CHECK_FALSE(held.captured());
+
+    {
+        SyscallFaultConfig fault_config;
+        fault_config.epoll_wait_eintrs = 1;
+        ScopedSyscallFault fault(fault_config);
+        errno = 0;
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &output, 1, 0), -1);
+        CHECK_EQ(errno, EINTR);
+        CHECK(held.capture_armed());
+        CHECK_FALSE(held.captured());
+        CHECK_FALSE(held.failed_closed());
+    }
+    {
+        SyscallFaultConfig fault_config;
+        fault_config.epoll_wait_errno = EIO;
+        fault_config.epoll_wait_failures = 1;
+        ScopedSyscallFault fault(fault_config);
+        errno = 0;
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &output, 1, 0), -1);
+        CHECK_EQ(errno, EIO);
+        CHECK(held.capture_armed());
+        CHECK_FALSE(held.captured());
+        CHECK_FALSE(held.failed_closed());
+    }
+
+    REQUIRE(guard.make_ready());
+    REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &output, 1, 0), 0);
+    CHECK_FALSE(held.capture_armed());
+    CHECK(held.captured());
+    CHECK_EQ(held.captured_events() & EPOLLIN, static_cast<u32>(EPOLLIN));
+    CHECK_EQ(held.captured_data(), kRawData);
+}
+
+TEST(epoll_fault, held_raw_scope_destruction_resets_every_intermediate_state) {
+    static constexpr u64 kRawData = 0xfedcba9876543210ull;
+    HeldEpollTestFds guard;
+    REQUIRE(guard.init(kRawData));
+    REQUIRE(guard.make_ready());
+
+    {
+        ScopedHeldEpollEvent capture_armed(guard.epoll_fds[0]);
+        REQUIRE(capture_armed.arm_capture_once());
+        REQUIRE(capture_armed.capture_armed());
+    }
+    {
+        ScopedHeldEpollEvent fresh(guard.epoll_fds[0]);
+        REQUIRE(fresh.owns_state());
+        CHECK_FALSE(fresh.capture_armed());
+        CHECK_FALSE(fresh.captured());
+        CHECK_FALSE(fresh.replay_armed());
+        CHECK_FALSE(fresh.replay_consumed());
+        CHECK_FALSE(fresh.failed_closed());
+    }
+
+    {
+        ScopedHeldEpollEvent captured(guard.epoll_fds[0]);
+        REQUIRE(captured.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(captured.captured());
+        REQUIRE_FALSE(captured.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent fresh(guard.epoll_fds[0]);
+        REQUIRE(fresh.owns_state());
+        CHECK_FALSE(fresh.capture_armed());
+        CHECK_FALSE(fresh.captured());
+        CHECK_FALSE(fresh.replay_armed());
+        CHECK_FALSE(fresh.replay_consumed());
+        CHECK_FALSE(fresh.failed_closed());
+    }
+
+    {
+        ScopedHeldEpollEvent replay_armed(guard.epoll_fds[0]);
+        REQUIRE(replay_armed.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(replay_armed.replay_once());
+        REQUIRE(replay_armed.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent fresh(guard.epoll_fds[0]);
+        REQUIRE(fresh.owns_state());
+        CHECK_FALSE(fresh.capture_armed());
+        CHECK_FALSE(fresh.captured());
+        CHECK_FALSE(fresh.replay_armed());
+        CHECK_FALSE(fresh.replay_consumed());
+        CHECK_FALSE(fresh.failed_closed());
+    }
+
+    struct epoll_event transparent{};
+    REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &transparent, 1, 0), 1);
+    CHECK_EQ(transparent.data.u64, kRawData);
+}
+
 TEST(epoll_fault, accept4_failure_is_injected) {
     i32 fd = dup(2);
     REQUIRE(fd >= 0);
@@ -500,7 +874,7 @@ TEST(epoll_fault, add_connect_reports_injected_failure) {
     a.sin_port = __builtin_bswap16(19999);
     a.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
 
-    CHECK(backend.add_connect(fd, 0, &a, sizeof(a)));
+    CHECK(backend.add_connect(fd, 0, &a, sizeof(a), 1));
     REQUIRE_EQ(backend.pending_count, 1u);
     CHECK_EQ(backend.pending_completions[0].type, IoEventType::UpstreamConnect);
     CHECK_EQ(backend.pending_completions[0].result, -ECONNREFUSED);

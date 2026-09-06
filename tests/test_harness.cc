@@ -545,6 +545,11 @@ TEST(harness_connection, reports_and_resets_cleanup_invariants) {
     CHECK_EQ(execution.connection.idle_return_fd, -1);
     execution.reset(0x7f000001u, 8080, 3);
     CHECK_EQ(execution.invariant_violations(), 0u);
+    execution.connection.downstream_req_size = 123u;
+    execution.connection.req_size = 456u;
+    execution.reset(0x7f000001u, 8080, 3);
+    CHECK_EQ(execution.connection.downstream_req_size, 0u);
+    CHECK_EQ(execution.connection.req_size, 0u);
     execution.connection.pending_ops = 1;
     execution.connection.yield_armed = true;
     const u64 violations = execution.invariant_violations();

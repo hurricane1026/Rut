@@ -1,7 +1,13 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/redirect_policy.h"
+#include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -18,6 +24,30 @@
 #include <string.h>
 
 namespace rut {
+
+namespace rir {
+struct Module;
+}
+
+struct RouteConfig;
+bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
+bool register_jit_routes_for_internal_propagation(RouteConfig& cfg,
+                                                  const rir::Module& mod,
+                                                  jit::JitEngine& engine);
+namespace detail {
+bool register_verified_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
+}
+
+enum class ExactStrictLocalResponseMatchState : u8 {
+    InvalidInput = 0,
+    Miss = 1,
+    Match = 2,
+};
+
+struct ExactStrictLocalResponseMatchResult {
+    ExactStrictLocalResponseMatchState state = ExactStrictLocalResponseMatchState::InvalidInput;
+    u16 policy_id = 0;
+};
 
 // Action for a matched route.
 enum class RouteAction : u8 {
@@ -114,6 +144,10 @@ struct RouteEntry {
     u32 ws_max_message_size = 0;
     // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
     u16 ws_close_code = 1000;
+    // Nonzero only for the bounded static direct-forward timeout preflight.
+    // Resolves through the same pinned RouteConfig as this RouteEntry.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
+    u16 preflight_forward_policy_bundle_id = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -141,6 +175,18 @@ struct RouteConfig {
     static constexpr u32 kMaxResponseHeaderSets = 128;
     static constexpr u32 kMaxHeaderPoolEntries = 512;
     static constexpr u32 kResponseHeaderBytesPoolBytes = 8 * 1024;
+    // Response-policy metadata is copied into this config-owned pool so the
+    // compiler/RIR arena can be reclaimed after activation. IDs are 1-based;
+    // zero is transparent forwarding.
+    static constexpr u32 kMaxResponsePolicies = rut::kMaxResponsePolicies;
+    static constexpr u32 kResponsePolicyBytesPoolBytes = 4 * 1024;
+    static constexpr u32 kMaxForwardPolicyBundles = kMaxForwardFailurePolicies;
+    static constexpr u32 kFailurePolicyBytesPoolBytes = 8 * 1024;
+    static constexpr u32 kMaxRedirectPolicies = rut::kMaxRedirectPolicies;
+    static constexpr u32 kRedirectPolicyBytesPoolBytes = rut::kRedirectPolicyBytes;
+    static constexpr u32 kMaxStrictLocalResponsePolicies = rut::kMaxStrictLocalResponsePolicies;
+    static constexpr u32 kStrictLocalResponseBytesPoolBytes =
+        rut::kMaxStrictLocalResponsePolicyBytes;
     // Per-response cap for header count. Bigger than what the AST
     // permits (16) so hand-built RouteConfigs — tests, future
     // compile→config helper — have headroom, but small enough that the
@@ -471,6 +517,671 @@ struct RouteConfig {
     u32 response_header_set_count = 0;
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
+    ForwardResponsePolicySpec response_policies[kMaxResponsePolicies]{};
+    u32 response_policy_count = 0;
+    char response_policy_bytes[kResponsePolicyBytesPoolBytes];
+    u32 response_policy_bytes_used = 0;
+    ForwardFailurePolicySpec failure_policies[kMaxForwardFailurePolicies]{};
+    u32 failure_policy_count = 0;
+    char failure_policy_bytes[kFailurePolicyBytesPoolBytes];
+    u32 failure_policy_bytes_used = 0;
+    ForwardPolicyBundle policy_bundles[kMaxForwardPolicyBundles]{};
+    u32 policy_bundle_count = 0;
+    ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
+    u32 target_transform_count = 0;
+    char target_transform_bytes[kForwardTargetTransformBytes];
+    u32 target_transform_bytes_used = 0;
+    RedirectPolicySpec redirect_policies[kMaxRedirectPolicies]{};
+    u32 redirect_policy_count = 0;
+    char redirect_policy_bytes[kRedirectPolicyBytesPoolBytes];
+    u32 redirect_policy_bytes_used = 0;
+    StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
+    u32 strict_local_response_policy_count = 0;
+    // Concrete-method responses selected before exact/prefix/unmatched routing.
+    // Slot zero (ANY) is reserved and must remain neutral.
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding
+        exact_strict_local_response_bindings[kMaxExactStrictLocalResponseBindings]{};
+    u32 exact_strict_local_response_binding_count = 0;
+    char strict_local_response_bytes[kStrictLocalResponseBytesPoolBytes];
+    u32 strict_local_response_bytes_used = 0;
+
+    bool has_strict_local_response_policy_inventory() const {
+        return strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0;
+    }
+
+    bool has_pre_route_metadata() const {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (pre_route_policy_ids[i] != 0) return true;
+        return false;
+    }
+
+    // This is selector metadata, not the shared policy inventory. A policy
+    // pool owned solely by pre-route/exact selectors must not turn a route miss
+    // into a configured unmatched response.
+    bool has_unmatched_metadata() const {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (unmatched_policy_ids[i] != 0) return true;
+        return false;
+    }
+
+    bool has_exact_strict_local_response_inventory() const {
+        return exact_strict_local_response_inventory_present(
+            exact_strict_local_response_bindings, exact_strict_local_response_binding_count);
+    }
+
+    // A request-time caller may only branch on normalized selector metadata
+    // after the complete owned table has been validated.  In particular, do
+    // not trust the public count or path_view bytes before that validation has
+    // bounded the scan and admitted every enum value.
+    bool has_slash_normalized_exact_strict_local_response_inventory() const {
+        if (!strict_local_response_table_is_valid()) return false;
+        for (u32 i = 0; i < exact_strict_local_response_binding_count; i++)
+            if (exact_strict_local_response_bindings[i].path_view == ExactPathView::SlashNormalized)
+                return true;
+        return false;
+    }
+
+    bool has_strict_local_response_table_inventory() const {
+        return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
+               has_unmatched_metadata() || has_exact_strict_local_response_inventory();
+    }
+
+    bool strict_local_response_bytes_owned(Str value) const {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(strict_local_response_bytes);
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        if (value.len == 0)
+            return value.ptr != nullptr && ptr >= begin &&
+                   ptr - begin <= strict_local_response_bytes_used;
+        if (value.ptr == nullptr || value.len > strict_local_response_bytes_used) return false;
+        if (ptr < begin || ptr - begin >= strict_local_response_bytes_used) return false;
+        return value.len <= strict_local_response_bytes_used - static_cast<u32>(ptr - begin);
+    }
+
+    // Complete runtime validation. Source policy IDs may collapse under stable
+    // semantic dedup during installation, so runtime ownership requires every
+    // owned policy to be referenced at least once (rather than exactly once).
+    // Validate counts/mappings before indexing, then require every byte view
+    // and exact path to live inside this RouteConfig.
+    bool strict_local_response_table_is_valid() const {
+        if (strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes ||
+            exact_strict_local_response_binding_count > kMaxExactStrictLocalResponseBindings)
+            return false;
+        bool referenced[kMaxStrictLocalResponsePolicies]{};
+        for (u32 i = 0; i < strict_local_response_policy_count; i++) {
+            const auto& policy = strict_local_response_policies[i];
+            if (!strict_local_response_bytes_owned(policy.reason) ||
+                !strict_local_response_bytes_owned(policy.content_type) ||
+                !strict_local_response_bytes_owned(policy.server) ||
+                !strict_local_response_bytes_owned(policy.body))
+                return false;
+            if (!strict_local_response_policy_spec_valid_for_internal_propagation(policy))
+                return false;
+            for (u32 prior = 0; prior < i; prior++)
+                if (strict_local_response_policy_spec_equal(strict_local_response_policies[prior],
+                                                            policy))
+                    return false;
+        }
+        if (pre_route_policy_ids[kRouteMethodAny] != 0) return false;
+        for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = pre_route_policy_ids[slot];
+            if (id == 0) continue;
+            if (id > strict_local_response_policy_count) return false;
+            if (slot == kRouteMethodHead && strict_local_response_policies[id - 1].head_mode !=
+                                                StrictLocalResponseHeadMode::SuppressBody)
+                return false;
+            referenced[id - 1] = true;
+        }
+        for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = unmatched_policy_ids[slot];
+            if (id == 0) continue;
+            if (id > strict_local_response_policy_count) return false;
+            referenced[id - 1] = true;
+        }
+        const u16 any_id = unmatched_policy_ids[kRouteMethodAny];
+        if (any_id != 0 && strict_local_response_policies[any_id - 1].head_mode !=
+                               StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        const u16 head_id = unmatched_policy_ids[kRouteMethodHead];
+        if (head_id != 0 && strict_local_response_policies[head_id - 1].head_mode !=
+                                StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
+            const auto& binding = exact_strict_local_response_bindings[i];
+            if (i >= exact_strict_local_response_binding_count) {
+                if (!exact_strict_local_response_binding_is_neutral(binding)) return false;
+                continue;
+            }
+            if (!exact_strict_local_response_binding_shape_valid(binding) ||
+                binding.policy_id > strict_local_response_policy_count)
+                return false;
+            const u32 slot = route_method_slot_from_key(binding.method);
+            if (slot == kRouteMethodSlotInvalid) return false;
+            if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+                strict_local_response_policies[binding.policy_id - 1].head_mode !=
+                    StrictLocalResponseHeadMode::SuppressBody)
+                return false;
+            for (u32 prior = 0; prior < i; prior++) {
+                const auto& other = exact_strict_local_response_bindings[prior];
+                if (binding.method == other.method && binding.path_view == other.path_view &&
+                    binding.path_len == other.path_len &&
+                    __builtin_memcmp(binding.path, other.path, binding.path_len) == 0)
+                    return false;
+            }
+            referenced[binding.policy_id - 1] = true;
+        }
+        for (u32 i = 0; i < strict_local_response_policy_count; i++)
+            if (!referenced[i]) return false;
+        return true;
+    }
+
+    bool unmatched_policy_table_is_valid() const {
+        return !has_pre_route_metadata() && !has_exact_strict_local_response_inventory() &&
+               strict_local_response_table_is_valid();
+    }
+
+    u16 pre_route_policy_id(u8 method_key) const {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny ||
+            !strict_local_response_table_is_valid())
+            return 0;
+        return pre_route_policy_ids[slot];
+    }
+
+    // Raw origin-form exact lookup. Query bytes are outside the selector; no
+    // canonicalization is performed. Callers separately enforce the mandatory
+    // full-target fragment witness before invoking this helper.
+    u16 match_exact_strict_local_response(Str raw_target, u8 method_key) const {
+        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
+            raw_target.len == 0 || raw_target.ptr[0] != '/' || method_key == kRouteMethodInvalid ||
+            method_key == kRouteMethodAny ||
+            route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
+            return 0;
+        auto match_method = [&](u8 wanted) -> u16 {
+            for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
+                const auto& binding = exact_strict_local_response_bindings[i];
+                if (binding.path_view != ExactPathView::Raw || binding.method != wanted ||
+                    raw_target.len < binding.path_len)
+                    continue;
+                bool equal = true;
+                for (u32 byte = 0; byte < binding.path_len; byte++)
+                    equal &= raw_target.ptr[byte] == binding.path[byte];
+                if (!equal) continue;
+                if (raw_target.len == binding.path_len || raw_target.ptr[binding.path_len] == '?')
+                    return binding.policy_id;
+            }
+            return 0;
+        };
+        const u16 exact = match_method(method_key);
+        return exact != 0 ? exact : match_method(kRouteMethodAny);
+    }
+
+    // Exact strict-local lookup over two independently supplied selection
+    // views. The caller owns storage provenance for both ranges and must supply
+    // the complete raw target plus an already-computed slash-normalized,
+    // path-only fixed point. This helper never allocates, normalizes, or mutates
+    // either input. Invalid table/input state is distinct from a valid miss so a
+    // caller can fail closed rather than silently continue to prefix routing.
+    // Selection order is Raw concrete, SlashNormalized concrete, Raw ANY,
+    // SlashNormalized ANY.
+    ExactStrictLocalResponseMatchResult match_exact_strict_local_response_views(
+        Str raw_target, Str slash_normalized_path, u8 method_key) const {
+        const ExactStrictLocalResponseMatchResult invalid{
+            ExactStrictLocalResponseMatchState::InvalidInput, 0};
+        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
+            raw_target.len == 0 || slash_normalized_path.ptr == nullptr ||
+            slash_normalized_path.len == 0 ||
+            slash_normalized_path.len > kMaxExactStrictLocalResponsePathLen ||
+            method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
+            route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
+            return invalid;
+        const uintptr_t raw_address = reinterpret_cast<uintptr_t>(raw_target.ptr);
+        const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
+        if (raw_target.len > UINTPTR_MAX - raw_address ||
+            slash_normalized_path.len > UINTPTR_MAX - normalized_address)
+            return invalid;
+        if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
+        bool previous_slash = false;
+        for (u32 i = 0; i < slash_normalized_path.len; i++) {
+            const char byte = slash_normalized_path.ptr[i];
+            const u8 unsigned_byte = static_cast<u8>(byte);
+            if (byte == '?' || byte == '#' || unsigned_byte < 0x20 || unsigned_byte == 0x7f ||
+                (byte == '/' && previous_slash))
+                return invalid;
+            previous_slash = byte == '/';
+        }
+
+        auto match = [&](ExactPathView view, u8 wanted) -> u16 {
+            const Str target = view == ExactPathView::Raw ? raw_target : slash_normalized_path;
+            for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
+                const auto& binding = exact_strict_local_response_bindings[i];
+                if (binding.path_view != view || binding.method != wanted ||
+                    target.len < binding.path_len)
+                    continue;
+                bool equal = true;
+                for (u32 byte = 0; byte < binding.path_len; byte++)
+                    equal &= target.ptr[byte] == binding.path[byte];
+                if (!equal) continue;
+                if (view == ExactPathView::SlashNormalized) {
+                    if (target.len == binding.path_len) return binding.policy_id;
+                } else if (target.len == binding.path_len || target.ptr[binding.path_len] == '?') {
+                    return binding.policy_id;
+                }
+            }
+            return 0;
+        };
+        const ExactPathView views[] = {ExactPathView::Raw,
+                                       ExactPathView::SlashNormalized,
+                                       ExactPathView::Raw,
+                                       ExactPathView::SlashNormalized};
+        const u8 methods[] = {method_key, method_key, kRouteMethodAny, kRouteMethodAny};
+        for (u32 i = 0; i < 4; i++) {
+            const u16 id = match(views[i], methods[i]);
+            if (id != 0) return {ExactStrictLocalResponseMatchState::Match, id};
+        }
+        return {ExactStrictLocalResponseMatchState::Miss, 0};
+    }
+
+    bool strict_local_response_policy_id_is_owned(u16 id) const {
+        if (id == 0 || id > strict_local_response_policy_count ||
+            strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
+            return false;
+        const auto& policy = strict_local_response_policies[id - 1];
+        return strict_local_response_bytes_owned(policy.reason) &&
+               strict_local_response_bytes_owned(policy.content_type) &&
+               strict_local_response_bytes_owned(policy.server) &&
+               strict_local_response_bytes_owned(policy.body) &&
+               strict_local_response_policy_spec_valid_for_internal_propagation(policy);
+    }
+
+private:
+    u16 add_validated_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
+            return 0;
+        for (u32 i = 0; i < strict_local_response_policy_count; i++) {
+            if (!strict_local_response_policy_id_is_owned(static_cast<u16>(i + 1))) return 0;
+            if (strict_local_response_policy_spec_equal(strict_local_response_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (strict_local_response_policy_count == kMaxStrictLocalResponsePolicies) return 0;
+        u32 total = 0;
+        const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
+        for (Str field : fields) {
+            if (field.len > kStrictLocalResponseBytesPoolBytes - total) return 0;
+            total += field.len;
+        }
+        if (total > kStrictLocalResponseBytesPoolBytes - strict_local_response_bytes_used) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = strict_local_response_bytes + strict_local_response_bytes_used;
+            if (src.len != 0) __builtin_memcpy(out, src.ptr, src.len);
+            strict_local_response_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = strict_local_response_policies[strict_local_response_policy_count];
+        dst.version = policy.version;
+        dst.reserved0 = policy.reserved0;
+        dst.status_code = policy.status_code;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        dst.head_mode = policy.head_mode;
+        dst.reserved1 = policy.reserved1;
+        copy(policy.reason, dst.reason);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.server, dst.server);
+        copy(policy.body, dst.body);
+        return static_cast<u16>(++strict_local_response_policy_count);
+    }
+
+public:
+    // Incremental public builder. Dedup is semantic and stable (first insertion wins).
+    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
+    }
+
+    u16 add_strict_local_response_policy_for_internal_propagation(
+        const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid_for_internal_propagation(policy)) return 0;
+        return add_validated_strict_local_response_policy(policy);
+    }
+
+    bool set_unmatched_policy_id(u8 method_key, u16 policy_id) {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || policy_id == 0 ||
+            !strict_local_response_policy_id_is_owned(policy_id) || unmatched_policy_ids[slot] != 0)
+            return false;
+        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+            strict_local_response_policies[policy_id - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        unmatched_policy_ids[slot] = policy_id;
+        return true;
+    }
+
+    bool set_pre_route_policy_id(u8 method_key, u16 policy_id) {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny || policy_id == 0 ||
+            !strict_local_response_policy_id_is_owned(policy_id) || pre_route_policy_ids[slot] != 0)
+            return false;
+        if (slot == kRouteMethodHead && strict_local_response_policies[policy_id - 1].head_mode !=
+                                            StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        pre_route_policy_ids[slot] = policy_id;
+        return true;
+    }
+
+    bool append_exact_strict_local_response_binding(const ExactStrictLocalResponseBinding& source,
+                                                    u16 owned_policy_id) {
+        if (exact_strict_local_response_binding_count >= kMaxExactStrictLocalResponseBindings ||
+            !exact_strict_local_response_binding_shape_valid(source) || owned_policy_id == 0 ||
+            !strict_local_response_policy_id_is_owned(owned_policy_id))
+            return false;
+        const u32 slot = route_method_slot_from_key(source.method);
+        if (slot == kRouteMethodSlotInvalid ||
+            ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+             strict_local_response_policies[owned_policy_id - 1].head_mode !=
+                 StrictLocalResponseHeadMode::SuppressBody))
+            return false;
+        for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
+            const auto& prior = exact_strict_local_response_bindings[i];
+            if (prior.method == source.method && prior.path_view == source.path_view &&
+                prior.path_len == source.path_len &&
+                __builtin_memcmp(prior.path, source.path, source.path_len) == 0)
+                return false;
+        }
+        auto& destination =
+            exact_strict_local_response_bindings[exact_strict_local_response_binding_count];
+        for (u32 i = 0; i < sizeof(destination.path); i++) destination.path[i] = source.path[i];
+        destination.path_len = source.path_len;
+        destination.method = source.method;
+        destination.path_view = source.path_view;
+        destination.policy_id = owned_policy_id;
+        destination.reserved1 = source.reserved1;
+        ++exact_strict_local_response_binding_count;
+        return true;
+    }
+
+private:
+    bool copy_validated_strict_local_response_table_from_owned(const RouteConfig& source) {
+        if (has_strict_local_response_table_inventory()) return false;
+
+        // Convert every source view to a checked integer offset before the
+        // first destination write.  Public/forged views can carry an address
+        // numerically inside the source pool without C++ array provenance, so
+        // native pointer subtraction would itself be undefined even after the
+        // address-range validation above.
+        u32 offsets[kMaxStrictLocalResponsePolicies][4]{};
+        const uintptr_t source_base =
+            reinterpret_cast<uintptr_t>(source.strict_local_response_bytes);
+        auto checked_offset = [&](Str value, u32* out) {
+            if (out == nullptr || !source.strict_local_response_bytes_owned(value)) return false;
+            const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+            if (address < source_base) return false;
+            const uintptr_t wide_offset = address - source_base;
+            if (wide_offset > source.strict_local_response_bytes_used ||
+                wide_offset > kStrictLocalResponseBytesPoolBytes)
+                return false;
+            const u32 offset = static_cast<u32>(wide_offset);
+            if (value.len > source.strict_local_response_bytes_used - offset ||
+                value.len > kStrictLocalResponseBytesPoolBytes - offset)
+                return false;
+            *out = offset;
+            return true;
+        };
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++) {
+            const auto& src = source.strict_local_response_policies[i];
+            if (!checked_offset(src.reason, &offsets[i][0]) ||
+                !checked_offset(src.content_type, &offsets[i][1]) ||
+                !checked_offset(src.server, &offsets[i][2]) ||
+                !checked_offset(src.body, &offsets[i][3]))
+                return false;
+        }
+
+        if (source.strict_local_response_bytes_used != 0)
+            __builtin_memcpy(strict_local_response_bytes,
+                             source.strict_local_response_bytes,
+                             source.strict_local_response_bytes_used);
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++) {
+            const auto& src = source.strict_local_response_policies[i];
+            auto& dst = strict_local_response_policies[i];
+            dst.version = src.version;
+            dst.reserved0 = src.reserved0;
+            dst.status_code = src.status_code;
+            dst.date = src.date;
+            dst.connection = src.connection;
+            dst.head_mode = src.head_mode;
+            dst.reserved1 = src.reserved1;
+            dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
+            dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
+            dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};
+            dst.body = {strict_local_response_bytes + offsets[i][3], src.body.len};
+        }
+        strict_local_response_bytes_used = source.strict_local_response_bytes_used;
+        strict_local_response_policy_count = source.strict_local_response_policy_count;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = source.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = source.unmatched_policy_ids[i];
+        }
+        for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
+            const auto& src = source.exact_strict_local_response_bindings[i];
+            auto& dst = exact_strict_local_response_bindings[i];
+            for (u32 byte = 0; byte < sizeof(dst.path); byte++) dst.path[byte] = src.path[byte];
+            dst.path_len = src.path_len;
+            dst.method = src.method;
+            dst.path_view = src.path_view;
+            dst.policy_id = src.policy_id;
+            dst.reserved1 = src.reserved1;
+        }
+        exact_strict_local_response_binding_count =
+            source.exact_strict_local_response_binding_count;
+        return true;
+    }
+
+public:
+    // Copy a complete already-owned public table without allocation. Every check and
+    // every possible false return precedes the first destination write; once
+    // commit starts it only copies bounded arrays and rebases proven pool views.
+    bool copy_strict_local_response_table_from_owned(const RouteConfig& source) {
+        if (!source.strict_local_response_table_is_valid()) return false;
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++)
+            if (!strict_local_response_policy_spec_valid(source.strict_local_response_policies[i]))
+                return false;
+        return copy_validated_strict_local_response_table_from_owned(source);
+    }
+
+    bool copy_strict_local_response_table_from_owned_for_internal_propagation(
+        const RouteConfig& source) {
+        if (!source.strict_local_response_table_is_valid()) return false;
+        return copy_validated_strict_local_response_table_from_owned(source);
+    }
+
+    bool copy_unmatched_policy_table_from_owned(const RouteConfig& source) {
+        if (source.has_pre_route_metadata() || source.has_exact_strict_local_response_inventory())
+            return false;
+        return copy_strict_local_response_table_from_owned(source);
+    }
+
+    bool copy_unmatched_policy_table_from_owned_for_internal_propagation(
+        const RouteConfig& source) {
+        if (source.has_pre_route_metadata() || source.has_exact_strict_local_response_inventory())
+            return false;
+        return copy_strict_local_response_table_from_owned_for_internal_propagation(source);
+    }
+
+private:
+    bool install_validated_strict_local_response_table_with_pre_route(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (has_strict_local_response_table_inventory()) return false;
+
+        auto replay = [&](RouteConfig& target) {
+            u16 remap[kMaxStrictLocalResponsePolicies]{};
+            for (u32 i = 0; i < policy_count; i++) {
+                remap[i] = target.add_validated_strict_local_response_policy(policies[i]);
+                if (remap[i] == 0) return false;
+            }
+            for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = pre_route_ids[slot];
+                if (source_id != 0 &&
+                    !target.set_pre_route_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = method_policy_ids[slot];
+                if (source_id != 0 &&
+                    !target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            for (u32 i = 0; i < exact_binding_count; i++) {
+                const u16 source_id = exact_bindings[i].policy_id;
+                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
+                                                                       remap[source_id - 1]))
+                    return false;
+            }
+            return target.strict_local_response_table_is_valid();
+        };
+        RouteConfig* probe = new (std::nothrow) RouteConfig();
+        if (probe == nullptr) return false;
+        const bool staged = replay(*probe);
+        if (!staged) {
+            delete probe;
+            return false;
+        }
+        const bool committed = copy_validated_strict_local_response_table_from_owned(*probe);
+        delete probe;
+        return committed;
+    }
+
+public:
+    bool install_strict_local_response_table_with_pre_route(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (!strict_local_response_source_table_valid(policies,
+                                                      policy_count,
+                                                      pre_route_ids,
+                                                      method_policy_ids,
+                                                      exact_bindings,
+                                                      exact_binding_count))
+            return false;
+        return install_validated_strict_local_response_table_with_pre_route(policies,
+                                                                            policy_count,
+                                                                            pre_route_ids,
+                                                                            method_policy_ids,
+                                                                            exact_bindings,
+                                                                            exact_binding_count);
+    }
+
+    bool install_strict_local_response_table_with_pre_route_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (!strict_local_response_source_table_valid_for_internal_propagation(policies,
+                                                                               policy_count,
+                                                                               pre_route_ids,
+                                                                               method_policy_ids,
+                                                                               exact_bindings,
+                                                                               exact_binding_count))
+            return false;
+        return install_validated_strict_local_response_table_with_pre_route(policies,
+                                                                            policy_count,
+                                                                            pre_route_ids,
+                                                                            method_policy_ids,
+                                                                            exact_bindings,
+                                                                            exact_binding_count);
+    }
+
+    // Install one complete table transactionally. A fresh RouteConfig probes
+    // deterministic dedup/remap; no destination byte changes until that probe
+    // has accepted the whole input, after which commit is infallible.
+    bool install_strict_local_response_table(const StrictLocalResponsePolicySpec* policies,
+                                             u32 policy_count,
+                                             const u16* method_policy_ids,
+                                             const ExactStrictLocalResponseBinding* exact_bindings,
+                                             u32 exact_binding_count) {
+        if (has_strict_local_response_table_inventory()) return false;
+        if (!strict_local_response_source_table_valid(
+                policies, policy_count, method_policy_ids, exact_bindings, exact_binding_count))
+            return false;
+        auto replay = [&](RouteConfig& target) {
+            u16 remap[kMaxStrictLocalResponsePolicies]{};
+            for (u32 i = 0; i < policy_count; i++) {
+                remap[i] = target.add_validated_strict_local_response_policy(policies[i]);
+                if (remap[i] == 0) return false;
+            }
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = method_policy_ids[slot];
+                if (source_id == 0) continue;
+                if (!target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            for (u32 i = 0; i < exact_binding_count; i++) {
+                const u16 source_id = exact_bindings[i].policy_id;
+                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
+                                                                       remap[source_id - 1]))
+                    return false;
+            }
+            return target.strict_local_response_table_is_valid();
+        };
+        RouteConfig* probe = new (std::nothrow) RouteConfig();
+        if (probe == nullptr) return false;
+        const bool staged = replay(*probe);
+        if (!staged) {
+            delete probe;
+            return false;
+        }
+
+        const bool committed = copy_validated_strict_local_response_table_from_owned(*probe);
+        delete probe;
+        return committed;
+    }
+
+    bool install_strict_local_response_table_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        const u16 empty_pre_route[kStrictLocalResponseMethodSlots]{};
+        return install_strict_local_response_table_with_pre_route_for_internal_propagation(
+            policies,
+            policy_count,
+            empty_pre_route,
+            method_policy_ids,
+            exact_bindings,
+            exact_binding_count);
+    }
+
+    bool install_unmatched_policy_table(const StrictLocalResponsePolicySpec* policies,
+                                        u32 policy_count,
+                                        const u16* method_policy_ids) {
+        const ExactStrictLocalResponseBinding empty[kMaxExactStrictLocalResponseBindings]{};
+        return install_strict_local_response_table(
+            policies, policy_count, method_policy_ids, empty, 0);
+    }
+
+    bool install_unmatched_policy_table_for_internal_propagation(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* method_policy_ids) {
+        const ExactStrictLocalResponseBinding empty[kMaxExactStrictLocalResponseBindings]{};
+        return install_strict_local_response_table_for_internal_propagation(
+            policies, policy_count, method_policy_ids, empty, 0);
+    }
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:
@@ -535,6 +1246,8 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.forward_preflight_mode = ForwardPreflightMode::None;
+        r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
@@ -691,6 +1404,8 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.forward_preflight_mode = ForwardPreflightMode::None;
+        r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -698,20 +1413,53 @@ struct RouteConfig {
         return true;
     }
 
-    // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
-    // tells the runtime what to do next (return status, forward, or yield).
-    // Same failure modes as add_proxy() plus null-fn check.
-    bool add_jit_handler(const char* path,
-                         u8 method,
-                         jit::HandlerFn fn,
-                         bool needs_req_body = false) {
+private:
+    friend bool register_jit_routes(RouteConfig& cfg,
+                                    const rir::Module& mod,
+                                    jit::JitEngine& engine);
+    friend bool register_jit_routes_for_internal_propagation(RouteConfig& cfg,
+                                                             const rir::Module& mod,
+                                                             jit::JitEngine& engine);
+    friend bool detail::register_verified_jit_routes(RouteConfig& cfg,
+                                                     const rir::Module& mod,
+                                                     jit::JitEngine& engine);
+
+    // Verified-RIR publication entry. Deferred modes are inaccessible to native
+    // callers and admitted only after register_jit_routes verifies the module.
+    bool add_verified_jit_handler(const char* path,
+                                  u8 method,
+                                  jit::HandlerFn fn,
+                                  bool needs_req_body,
+                                  ForwardPreflightMode forward_preflight_mode,
+                                  u16 preflight_forward_policy_bundle_id) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
+        if (!forward_preflight_mode_valid(forward_preflight_mode) ||
+            !forward_preflight_metadata_is_verified_runtime_safe(
+                forward_preflight_mode, preflight_forward_policy_bundle_id))
+            return false;
+        if (forward_preflight_mode_can_own_runtime_deadline(forward_preflight_mode) &&
+            (!policy_bundle_id_is_valid(preflight_forward_policy_bundle_id) ||
+             !response_read_timeout_seconds_valid(
+                 policy_bundles[preflight_forward_policy_bundle_id - 1]
+                     .response_read_timeout_seconds)))
+            return false;
         if (!is_routable_path(path)) return false;
         if (!dispatch_accepts_path_shape(path)) return false;
         if (!param_count_fits(path)) return false;
         const u8 method_key = route_method_key_from_legacy_char(method);
         if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
+        if (forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection &&
+            (needs_req_body || method_key == kRouteMethodAny ||
+             !complete_content_length_route_method_is_admitted(method_key) ||
+             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                 ForwardResponseBufferingMode::CompleteContentLength))
+            return false;
+        if (forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection &&
+            (needs_req_body || method_key != kRouteMethodHead ||
+             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                 ForwardResponseBufferingMode::None))
+            return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -726,11 +1474,50 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         r.needs_req_body = needs_req_body;
+        r.forward_preflight_mode = forward_preflight_mode;
+        r.preflight_forward_policy_bundle_id = preflight_forward_policy_bundle_id;
         if (!populate_dispatch_state(r)) {
             return false;
         }
         route_count++;
         return true;
+    }
+
+public:
+    // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
+    // tells the runtime what to do next (return status, forward, or yield).
+    // Same failure modes as add_proxy() plus null-fn check. Native callers are
+    // intentionally limited to None/EagerDirect metadata.
+    bool add_jit_handler(const char* path,
+                         u8 method,
+                         jit::HandlerFn fn,
+                         bool needs_req_body,
+                         ForwardPreflightMode forward_preflight_mode,
+                         u16 preflight_forward_policy_bundle_id) {
+        if (!forward_preflight_metadata_is_eager_runtime_safe(forward_preflight_mode,
+                                                              preflight_forward_policy_bundle_id))
+            return false;
+        return add_verified_jit_handler(path,
+                                        method,
+                                        fn,
+                                        needs_req_body,
+                                        forward_preflight_mode,
+                                        preflight_forward_policy_bundle_id);
+    }
+
+    // Source-compatible legacy registration. A nonzero historical marker is
+    // always the already-supported eager-direct mode; it can never opt into
+    // deferred post-selection behavior.
+    bool add_jit_handler(const char* path,
+                         u8 method,
+                         jit::HandlerFn fn,
+                         bool needs_req_body = false,
+                         u16 preflight_forward_policy_bundle_id = 0) {
+        const ForwardPreflightMode mode = preflight_forward_policy_bundle_id == 0
+                                              ? ForwardPreflightMode::None
+                                              : ForwardPreflightMode::EagerDirect;
+        return add_jit_handler(
+            path, method, fn, needs_req_body, mode, preflight_forward_policy_bundle_id);
     }
 
     // Register a response body. Copies the bytes into body_pool so the
@@ -828,6 +1615,361 @@ struct RouteConfig {
         const u32 idx = response_header_set_count++;
         response_header_sets[idx] = {offset, static_cast<u16>(count)};
         return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    }
+
+    // Register a validated response-policy object. All string fields are
+    // copied into RouteConfig-owned storage; no compiler-arena pointer escapes
+    // into the active config. Returns a 1-based ID, or zero on rejection.
+    u16 add_response_policy(const ForwardResponsePolicySpec& policy) {
+        if (!response_policy_spec_valid(policy)) return 0;
+        for (u32 i = 0; i < response_policy_count; i++) {
+            if (response_policy_spec_equal(response_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (response_policy_count >= kMaxResponsePolicies) return 0;
+        u32 total = policy.server.len;
+        if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+        for (u32 i = 0; i < policy.hide_header_count; i++) {
+            if (policy.hide_headers[i].len > 0xffffffffu - total) return 0;
+            total += policy.hide_headers[i].len;
+        }
+        if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+
+        auto copy = [&](Str src, Str& dst) {
+            char* out = response_policy_bytes + response_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            response_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = response_policies[response_policy_count];
+        dst.version = policy.version;
+        dst.framing = policy.framing;
+        dst.connection = policy.connection;
+        dst.date = policy.date;
+        dst.head_mode = policy.head_mode;
+        copy(policy.server, dst.server);
+        dst.hide_header_count = policy.hide_header_count;
+        for (u32 i = 0; i < policy.hide_header_count; i++)
+            copy(policy.hide_headers[i], dst.hide_headers[i]);
+        response_policy_count++;
+        return static_cast<u16>(response_policy_count);
+    }
+
+    bool response_policy_id_is_valid(u16 id) const {
+        return id != 0 && id <= response_policy_count &&
+               response_policy_spec_valid(response_policies[id - 1]);
+    }
+
+    u16 add_failure_policy(const ForwardFailurePolicySpec& policy) {
+        if (!forward_failure_policy_table_spec_valid(policy)) return 0;
+        if (failure_policy_count > kMaxForwardFailurePolicies ||
+            failure_policy_bytes_used > kFailurePolicyBytesPoolBytes)
+            return 0;
+        for (u32 i = 0; i < failure_policy_count; i++)
+            if (forward_failure_policy_spec_equal(failure_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        if (failure_policy_count >= kMaxForwardFailurePolicies) return 0;
+        u32 total = policy.reason.len;
+        if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
+        if (policy.content_type.len > 0xffffffffu - total) return 0;
+        total += policy.content_type.len;
+        if (policy.server.len > 0xffffffffu - total) return 0;
+        total += policy.server.len;
+        if (policy.body.len > 0xffffffffu - total) return 0;
+        total += policy.body.len;
+        if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = failure_policy_bytes + failure_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            failure_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = failure_policies[failure_policy_count];
+        dst.version = policy.version;
+        dst.status_code = policy.status_code;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        dst.head_mode = policy.head_mode;
+        copy(policy.reason, dst.reason);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.server, dst.server);
+        copy(policy.body, dst.body);
+        failure_policy_count++;
+        return static_cast<u16>(failure_policy_count);
+    }
+
+    u16 add_policy_bundle(
+        u16 response_policy_id,
+        u16 failure_policy_id,
+        u16 timeout_failure_policy_id = 0,
+        u8 response_read_timeout_seconds = 0,
+        ForwardResponseBufferingMode response_buffering = ForwardResponseBufferingMode::None) {
+        if ((response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
+            (failure_policy_id != 0 && !failure_policy_id_is_valid(failure_policy_id)) ||
+            (response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(response_buffering) ||
+            (response_read_timeout_seconds == 0 && failure_policy_id == 0))
+            return 0;
+        if (timeout_failure_policy_id != 0) {
+            if (response_policy_id == 0 || failure_policy_id == 0 ||
+                !timeout_failure_policy_id_is_valid(timeout_failure_policy_id))
+                return 0;
+            const bool response_suppress = response_policies[response_policy_id - 1].head_mode ==
+                                           ResponsePolicyHeadMode::SuppressBody;
+            const bool failure_suppress = failure_policies[failure_policy_id - 1].head_mode ==
+                                          FailurePolicyHeadMode::SuppressBody;
+            const bool timeout_suppress =
+                failure_policies[timeout_failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
+                return 0;
+        }
+        if (response_buffering != ForwardResponseBufferingMode::None &&
+            (response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(response_read_timeout_seconds) ||
+             response_policy_id == 0 || failure_policy_id == 0 || timeout_failure_policy_id == 0 ||
+             !complete_content_length_buffering_policies_valid(
+                 response_policies[response_policy_id - 1],
+                 failure_policies[failure_policy_id - 1],
+                 failure_policies[timeout_failure_policy_id - 1])))
+            return 0;
+        if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
+        for (u32 i = 0; i < policy_bundle_count; i++) {
+            if (policy_bundles[i].response_policy_id == response_policy_id &&
+                policy_bundles[i].failure_policy_id == failure_policy_id &&
+                policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id &&
+                policy_bundles[i].response_read_timeout_seconds == response_read_timeout_seconds &&
+                policy_bundles[i].response_buffering == response_buffering)
+                return static_cast<u16>(i + 1);
+        }
+        if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
+        policy_bundles[policy_bundle_count] = {response_policy_id,
+                                               failure_policy_id,
+                                               timeout_failure_policy_id,
+                                               response_read_timeout_seconds,
+                                               response_buffering};
+        return static_cast<u16>(++policy_bundle_count);
+    }
+
+    bool failure_policy_id_is_valid(u16 id) const {
+        return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
+               id <= failure_policy_count &&
+               forward_failure_policy_spec_valid(failure_policies[id - 1]);
+    }
+
+    bool timeout_failure_policy_id_is_valid(u16 id) const {
+        return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
+               id <= failure_policy_count &&
+               forward_timeout_failure_policy_spec_valid(failure_policies[id - 1]);
+    }
+
+    bool policy_bundle_id_is_valid(u16 id) const {
+        if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
+            return false;
+        const auto& b = policy_bundles[id - 1];
+        if ((b.response_policy_id != 0 && !response_policy_id_is_valid(b.response_policy_id)) ||
+            (b.failure_policy_id != 0 && !failure_policy_id_is_valid(b.failure_policy_id)) ||
+            (b.response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(b.response_buffering) ||
+            (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
+            return false;
+        if (b.response_buffering != ForwardResponseBufferingMode::None &&
+            (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
+             b.response_policy_id == 0 || b.failure_policy_id == 0 ||
+             b.timeout_failure_policy_id == 0 ||
+             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id) ||
+             !complete_content_length_buffering_policies_valid(
+                 response_policies[b.response_policy_id - 1],
+                 failure_policies[b.failure_policy_id - 1],
+                 failure_policies[b.timeout_failure_policy_id - 1])))
+            return false;
+        if (b.timeout_failure_policy_id == 0) return true;
+        if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
+            !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
+            return false;
+        const bool response_suppress = response_policies[b.response_policy_id - 1].head_mode ==
+                                       ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress = failure_policies[b.failure_policy_id - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
+        const bool timeout_suppress = failure_policies[b.timeout_failure_policy_id - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
+        return response_suppress == failure_suppress && failure_suppress == timeout_suppress;
+    }
+
+    // Register foundation-only target-transform metadata. Strings are copied
+    // into RouteConfig-owned storage; no compiler/RIR pointer escapes here.
+    u16 add_target_transform(const ForwardTargetTransformSpec& spec) {
+        if (!forward_target_transform_spec_valid(spec)) return 0;
+        if (target_transform_count > kMaxForwardTargetTransforms ||
+            target_transform_bytes_used > kForwardTargetTransformBytes)
+            return 0;
+        for (u32 i = 0; i < target_transform_count; i++) {
+            if (forward_target_transform_spec_equal(target_transforms[i], spec))
+                return static_cast<u16>(i + 1);
+        }
+        if (target_transform_count >= kMaxForwardTargetTransforms) return 0;
+        if (spec.strip_prefix.len > kForwardTargetTransformBytes - target_transform_bytes_used)
+            return 0;
+        const u32 after_strip = target_transform_bytes_used + spec.strip_prefix.len;
+        if (spec.replace_prefix.len > kForwardTargetTransformBytes - after_strip) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = target_transform_bytes + target_transform_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            target_transform_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = target_transforms[target_transform_count];
+        copy(spec.strip_prefix, dst.strip_prefix);
+        copy(spec.replace_prefix, dst.replace_prefix);
+        target_transform_count++;
+        return static_cast<u16>(target_transform_count);
+    }
+
+    bool target_transform_id_is_valid(u16 id) const {
+        return forward_target_transform_id_is_valid(id, target_transform_count) &&
+               forward_target_transform_spec_valid(target_transforms[id - 1]);
+    }
+
+    // Register foundation-only redirect metadata. Strings are copied into
+    // RouteConfig-owned storage; no compiler/RIR pointer escapes here.
+    bool redirect_policy_string_is_owned(Str value) const {
+        if (value.len == 0) return true;
+        if (value.ptr == nullptr || redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes ||
+            value.len > redirect_policy_bytes_used)
+            return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
+        const uintptr_t end = begin + redirect_policy_bytes_used;
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr >= begin && ptr <= end && value.len <= end - ptr;
+    }
+
+    bool redirect_policy_strings_are_owned(const RedirectPolicySpec& policy) const {
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.static_authority,
+                              policy.target_path,
+                              policy.body};
+        for (const Str field : fields)
+            if (!redirect_policy_string_is_owned(field)) return false;
+        return true;
+    }
+
+    u16 add_redirect_policy(const RedirectPolicySpec& policy) {
+        if (redirect_policy_count > kMaxRedirectPolicies ||
+            redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes)
+            return 0;
+        if (!redirect_policy_spec_valid(policy)) return 0;
+        for (u32 i = 0; i < redirect_policy_count; i++) {
+            if (!redirect_policy_strings_are_owned(redirect_policies[i])) return 0;
+            if (redirect_policy_spec_equal(redirect_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (redirect_policy_count >= kMaxRedirectPolicies) return 0;
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.static_authority,
+                              policy.target_path,
+                              policy.body};
+        u32 total = 0;
+        for (const Str field : fields) {
+            if (field.len > kRedirectPolicyBytesPoolBytes - redirect_policy_bytes_used - total)
+                return 0;
+            total += field.len;
+        }
+        auto copy = [&](Str src, Str& dst) {
+            char* out = redirect_policy_bytes + redirect_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            redirect_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = redirect_policies[redirect_policy_count];
+        dst.scheme = policy.scheme;
+        dst.authority = policy.authority;
+        dst.port = policy.port;
+        dst.path = policy.path;
+        dst.query = policy.query;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        dst.header_order = policy.header_order;
+        dst.status_code = policy.status_code;
+        copy(policy.reason, dst.reason);
+        copy(policy.server, dst.server);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.static_authority, dst.static_authority);
+        copy(policy.target_path, dst.target_path);
+        copy(policy.body, dst.body);
+        redirect_policy_count++;
+        return static_cast<u16>(redirect_policy_count);
+    }
+
+    // Validate and publish a complete borrowed table. The count and byte
+    // watermark are committed only after every entry has been prevalidated,
+    // so a malformed table cannot become partially visible in cfg.
+    bool add_redirect_policy_table(const RedirectPolicySpec* specs, u32 count) {
+        if (redirect_policy_count != 0 || redirect_policy_bytes_used != 0 ||
+            !redirect_policy_table_valid(specs, count))
+            return false;
+        u32 total = 0;
+        for (u32 i = 0; i < count; i++) {
+            const Str fields[] = {specs[i].reason,
+                                  specs[i].server,
+                                  specs[i].content_type,
+                                  specs[i].static_authority,
+                                  specs[i].target_path,
+                                  specs[i].body};
+            for (const Str field : fields) {
+                if (field.len > kRedirectPolicyBytesPoolBytes - total) return false;
+                total += field.len;
+            }
+        }
+        u32 used = 0;
+        for (u32 i = 0; i < count; i++) {
+            const auto& src = specs[i];
+            auto& dst = redirect_policies[i];
+            dst.scheme = src.scheme;
+            dst.authority = src.authority;
+            dst.port = src.port;
+            dst.path = src.path;
+            dst.query = src.query;
+            dst.date = src.date;
+            dst.connection = src.connection;
+            dst.header_order = src.header_order;
+            dst.status_code = src.status_code;
+            const Str fields[] = {src.reason,
+                                  src.server,
+                                  src.content_type,
+                                  src.static_authority,
+                                  src.target_path,
+                                  src.body};
+            Str* destinations[] = {&dst.reason,
+                                   &dst.server,
+                                   &dst.content_type,
+                                   &dst.static_authority,
+                                   &dst.target_path,
+                                   &dst.body};
+            for (u32 field = 0; field < 6; field++) {
+                char* out = redirect_policy_bytes + used;
+                for (u32 j = 0; j < fields[field].len; j++) out[j] = fields[field].ptr[j];
+                *destinations[field] = {out, fields[field].len};
+                used += fields[field].len;
+            }
+        }
+        redirect_policy_bytes_used = used;
+        redirect_policy_count = count;
+        return true;
+    }
+
+    bool redirect_policy_id_is_valid(u16 id) const {
+        return redirect_policy_count <= kMaxRedirectPolicies &&
+               redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes && id != 0 &&
+               id <= redirect_policy_count &&
+               redirect_policy_strings_are_owned(redirect_policies[id - 1]) &&
+               redirect_policy_spec_valid(redirect_policies[id - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.
@@ -1476,5 +2618,25 @@ private:
     // use scalar fallback.
     jit::ArtJitMatchFn art_jit_fn_ = nullptr;
 };
+
+inline bool route_requires_response_read_timeout_preflight_close(const RouteEntry* route,
+                                                                 const RouteConfig* config) {
+    if (route == nullptr) return false;
+    if (route->forward_preflight_mode == ForwardPreflightMode::None &&
+        route->preflight_forward_policy_bundle_id == 0)
+        return false;
+    if (!forward_preflight_mode_valid(route->forward_preflight_mode) ||
+        route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+        route->preflight_forward_policy_bundle_id == 0)
+        return true;
+    const u16 id = route->preflight_forward_policy_bundle_id;
+    if (config == nullptr || !config->policy_bundle_id_is_valid(id)) return true;
+    const auto& bundle = config->policy_bundles[id - 1];
+    // A forged route marker that points at a legacy zero-duration bundle is
+    // invalid too. Both valid metadata and every invalid shape use the same
+    // zero-byte close boundary.
+    if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) return true;
+    return true;
+}
 
 }  // namespace rut

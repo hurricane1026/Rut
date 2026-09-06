@@ -124,7 +124,72 @@ jobs:
         run: ninja -C build
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -LE docker
+
+  nginx-required:
+    name: Required pinned nginx differentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install tools
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+
+      - name: Provision exact pinned nginx image
+        run: |
+          set -euo pipefail
+          mapfile -t pinned_images < tests/pinned-nginx-image.txt
+          if (( ${#pinned_images[@]} != 1 )); then
+            echo "tests/pinned-nginx-image.txt must contain exactly one image reference" >&2
+            exit 1
+          fi
+          image=${pinned_images[0]}
+          if [[ ! "$image" =~ ^nginx@sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid pinned nginx image reference" >&2
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "failed to pull the pinned nginx image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+          docker image inspect "$image" > /dev/null
+          if ! docker image inspect \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" | \
+              grep -Fqx -- "$image"; then
+            echo "pulled image does not expose the exact required RepoDigest" >&2
+            exit 1
+          fi
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUT_ENABLE_JIT=ON \
+            -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+
+      - name: Build nginx differential targets
+        run: ninja -C build test_nginx_parser test_nginx_differential
+
+      - name: Test required nginx differentials
+        run: |
+          RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+          ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -L nginx
 
   test-no-jit:
     name: Build & Test (no JIT)

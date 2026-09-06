@@ -1,14 +1,22 @@
+#include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
+#include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/listener.h"
+#include "rut/runtime/route_method.h"
 #include "test.h"
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 using namespace rut;
 
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
@@ -129,6 +137,12 @@ static HeapFrontendResult<HirModule> analyze_file_heap(const AstFile& file) {
     if (!hir) return {core::make_unexpected(hir.error())};
     return {hir.value()};
 }
+static HeapFrontendResult<HirModule> analyze_file_heap_for_internal_propagation(
+    const AstFile& file) {
+    auto hir = analyze_file_for_internal_propagation(file);
+    if (!hir) return {core::make_unexpected(hir.error())};
+    return {hir.value()};
+}
 static HeapFrontendResult<HirModule> analyze_file_heap_with_path(const AstFile& file,
                                                                  const std::string& source_path) {
     Str path{source_path.c_str(), static_cast<u32>(source_path.size())};
@@ -140,6 +154,511 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     auto mir = build_mir(module);
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
+}
+static HeapFrontendResult<MirModule> build_mir_heap_for_internal_propagation(
+    const HirModule& module) {
+    auto mir = build_mir_for_internal_propagation(module);
+    if (!mir) return {core::make_unexpected(mir.error())};
+    return {mir.value()};
+}
+
+TEST(frontend, listen_declaration_preserves_span_and_bounds) {
+    for (const char* source : {"listen :0\n", "listen : 0\n", "listen :00000\n"}) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        CHECK(ast->items[0].kind == AstItemKind::Listen);
+        CHECK(ast->items[0].listen.address == ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(ast->items[0].listen.port, 0u);
+        CHECK_EQ(ast->items[0].listen.ipv4_host, 0u);
+        CHECK_EQ(ast->items[0].listen.span.start, 0u);
+        CHECK_EQ(ast->items[0].listen.span.end, static_cast<u32>(strlen(source) - 1u));
+        CHECK_EQ(ast->items[0].listen.span.line, 1u);
+        CHECK_EQ(ast->items[0].listen.span.col, 1u);
+
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->has_listener);
+        CHECK(hir->listener.address == ListenerAddress::IPv4Wildcard);
+        CHECK_EQ(hir->listener.port, 0u);
+        CHECK_EQ(hir->listener.ipv4_host, 0u);
+        CHECK_EQ(hir->listener.span.start, 0u);
+        CHECK_EQ(hir->listener.span.end, static_cast<u32>(strlen(source) - 1u));
+        CHECK_EQ(hir->listener.span.line, 1u);
+        CHECK_EQ(hir->listener.span.col, 1u);
+    }
+}
+
+TEST(frontend, exact_ipv4_listen_reaches_hir_with_host_order_boundaries_and_complete_span) {
+    const struct {
+        const char* source;
+        u16 port;
+        u32 ipv4_host;
+    } cases[] = {
+        {"listen 127.0.0.1:0\n", 0u, 0x7f000001u},
+        {"listen 0.0.0.1:1\n", 1u, 0x00000001u},
+        {"listen 255.255.255.255:65535\n", 65535u, 0xffffffffu},
+        {"listen 1.255.0.255:00001\n", 1u, 0x01ff00ffu},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        const auto& listener = ast->items[0].listen;
+        CHECK(listener.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(listener.port, tc.port);
+        CHECK_EQ(listener.ipv4_host, tc.ipv4_host);
+        CHECK_EQ(listener.span.start, 0u);
+        CHECK_EQ(listener.span.end, static_cast<u32>(strlen(tc.source) - 1u));
+        CHECK_EQ(listener.span.line, 1u);
+        CHECK_EQ(listener.span.col, 1u);
+
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK(hir->has_listener);
+        CHECK(hir->listener.address == ListenerAddress::IPv4Exact);
+        CHECK_EQ(hir->listener.port, tc.port);
+        CHECK_EQ(hir->listener.ipv4_host, tc.ipv4_host);
+        CHECK_EQ(hir->listener.span.start, listener.span.start);
+        CHECK_EQ(hir->listener.span.end, listener.span.end);
+        CHECK_EQ(hir->listener.span.line, listener.span.line);
+        CHECK_EQ(hir->listener.span.col, listener.span.col);
+    }
+
+    const char separated[] = "listen // endpoint may follow the keyword\n  255.0.255.1:65535\n";
+    auto separated_tokens = lex(lit(separated));
+    REQUIRE(separated_tokens);
+    auto separated_ast = parse_file_heap(separated_tokens.value());
+    REQUIRE(separated_ast);
+    REQUIRE_EQ(separated_ast->items.len, 1u);
+    CHECK(separated_ast->items[0].listen.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(separated_ast->items[0].listen.ipv4_host, 0xff00ff01u);
+    CHECK_EQ(separated_ast->items[0].listen.port, 65535u);
+    CHECK_EQ(separated_ast->items[0].listen.span.start, 0u);
+    CHECK_EQ(separated_ast->items[0].listen.span.end, static_cast<u32>(sizeof(separated) - 2u));
+    CHECK_EQ(separated_ast->items[0].listen.span.line, 1u);
+    CHECK_EQ(separated_ast->items[0].listen.span.col, 1u);
+
+    auto separated_hir = analyze_file_heap(separated_ast.value());
+    REQUIRE(separated_hir);
+    CHECK(separated_hir->listener.address == ListenerAddress::IPv4Exact);
+    CHECK_EQ(separated_hir->listener.ipv4_host, 0xff00ff01u);
+    CHECK_EQ(separated_hir->listener.port, 65535u);
+
+    auto mir = build_mir_heap(separated_hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.func_count, 0u);
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
+    const struct {
+        const char* source;
+        FrontendError code;
+        u32 line;
+        u32 col;
+        const char* detail;
+    } parse_cases[] = {
+        {"listen 8080\n",
+         FrontendError::UnexpectedEof,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 256.0.0.1:80\n", FrontendError::InvalidInteger, 1u, 8u, "256"},
+        {"listen 127.00.0.1:80\n", FrontendError::InvalidInteger, 1u, 12u, "00"},
+        {"listen 127.0.0:80\n", FrontendError::UnexpectedToken, 1u, 15u, ":"},
+        {"listen 127.0.0.1.2:80\n", FrontendError::UnexpectedToken, 1u, 17u, "."},
+        {"listen -127.0.0.1:80\n", FrontendError::UnexpectedToken, 1u, 8u, "-"},
+        {"listen +127.0.0.1:80\n", FrontendError::UnexpectedToken, 1u, 8u, "+"},
+        {"listen localhost:80\n", FrontendError::UnexpectedToken, 1u, 8u, "localhost"},
+        {"listen unix:/tmp/listener\n", FrontendError::UnexpectedToken, 1u, 8u, "unix"},
+        {"listen [::1]:80\n", FrontendError::UnexpectedToken, 1u, 8u, "["},
+        {"listen 127 .0.0.1:80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         12u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127. 0.0.1:80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         13u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1 :80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         18u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1: 80\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         19u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.// gap\n1:80\n",
+         FrontendError::UnexpectedToken,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1:\n",
+         FrontendError::UnexpectedEof,
+         2u,
+         1u,
+         "numeric IPv4 listener endpoints must be byte-contiguous"},
+        {"listen 127.0.0.1:65536\n", FrontendError::InvalidInteger, 1u, 18u, "65536"},
+        {"listen 127.0.0.1:80 default_server\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         21u,
+         "default_server"},
+        {"listen 127.0.0.1:80, tls\n", FrontendError::UnexpectedToken, 1u, 20u, ","},
+        {"listen :65536\n", FrontendError::InvalidInteger, 1u, 9u, "65536"},
+        {"listen :8080 default_server\n",
+         FrontendError::UnexpectedToken,
+         1u,
+         14u,
+         "default_server"},
+        {"listen :8080, tls\n", FrontendError::UnexpectedToken, 1u, 13u, ","},
+    };
+    for (const auto& tc : parse_cases) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK(!ast);
+        if (!ast) {
+            CHECK_EQ(ast.error().code, tc.code);
+            CHECK_EQ(ast.error().span.line, tc.line);
+            CHECK_EQ(ast.error().span.col, tc.col);
+            CHECK_EQ(std::string(ast.error().detail.ptr, ast.error().detail.len),
+                     std::string(tc.detail));
+        }
+    }
+
+    const char wildcard_address[] = "listen 0.0.0.0:80\n";
+    auto wildcard_tokens = lex(lit(wildcard_address));
+    REQUIRE(wildcard_tokens);
+    auto wildcard_ast = parse_file_heap(wildcard_tokens.value());
+    REQUIRE_FALSE(wildcard_ast);
+    CHECK_EQ(wildcard_ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(wildcard_ast.error().span.start, 7u);
+    CHECK_EQ(wildcard_ast.error().span.end, 14u);
+    CHECK_EQ(wildcard_ast.error().span.line, 1u);
+    CHECK_EQ(wildcard_ast.error().span.col, 8u);
+    CHECK_EQ(std::string(wildcard_ast.error().detail.ptr, wildcard_ast.error().detail.len),
+             std::string("use `listen :PORT` for the IPv4 wildcard address"));
+
+    const char duplicate_source[] = "listen 127.0.0.1:8080\nlisten :8081\n";
+    auto lexed = lex(lit(duplicate_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+    if (!hir) {
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.line, 2u);
+        CHECK_EQ(hir.error().span.col, 1u);
+        CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+                 std::string("only one listen declaration is supported"));
+    }
+}
+
+TEST(frontend, listener_analyzer_revalidates_forged_ast_metadata_before_narrowing) {
+    const struct {
+        ListenerAddress address;
+        u32 port;
+        u32 ipv4_host;
+    } invalid[] = {
+        {ListenerAddress::IPv4Wildcard, 65536u, 0u},
+        {ListenerAddress::IPv4Wildcard, 80u, 0x7f000001u},
+        {ListenerAddress::IPv4Exact, 80u, 0u},
+        {static_cast<ListenerAddress>(0xff), 80u, 0u},
+    };
+    for (const auto& tc : invalid) {
+        auto ast = std::make_unique<AstFile>();
+        AstItem item{};
+        item.kind = AstItemKind::Listen;
+        item.span = {40u, 61u, 3u, 5u};
+        item.listen.span = item.span;
+        item.listen.address = tc.address;
+        item.listen.port = tc.port;
+        item.listen.ipv4_host = tc.ipv4_host;
+        REQUIRE(ast->items.push(item));
+
+        auto hir = analyze_file_heap(*ast);
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.start, 40u);
+        CHECK_EQ(hir.error().span.end, 61u);
+        CHECK_EQ(hir.error().span.line, 3u);
+        CHECK_EQ(hir.error().span.col, 5u);
+        CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+                 std::string("invalid listener endpoint metadata"));
+    }
+}
+
+TEST(frontend, access_log_declaration_preserves_exact_ast_and_hir_provenance) {
+    std::string source =
+        "accessLog {\n"
+        "    path: \"/var/log/rut/request-length.log\",\n"
+        "    format: downstreamRequestBytes,\n"
+        "    publication: live\n"
+        "}\n"
+        "route GET \"/\" { return 200 }\n";
+    const u32 path_start = static_cast<u32>(source.find("/var/log/rut/request-length.log"));
+    const u32 path_len = 31u;
+    const u32 path_field_start = static_cast<u32>(source.find("path:"));
+    const u32 format_field_start = static_cast<u32>(source.find("format:"));
+    const u32 format_value_start = static_cast<u32>(source.find("downstreamRequestBytes"));
+    const u32 publication_field_start = static_cast<u32>(source.find("publication:"));
+    const u32 publication_value_start =
+        static_cast<u32>(source.find("live", publication_field_start));
+    const u32 declaration_end = static_cast<u32>(source.find("}\n")) + 1u;
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE(ast->items[0].kind == AstItemKind::AccessLog);
+    const AstAccessLogDecl& decl = ast->items[0].access_log;
+    CHECK_EQ(decl.span.start, 0u);
+    CHECK_EQ(decl.span.end, declaration_end);
+    CHECK_EQ(decl.span.line, 1u);
+    CHECK_EQ(decl.span.col, 1u);
+    CHECK_EQ(decl.path.ptr, source.data() + path_start);
+    CHECK_EQ(decl.path.len, path_len);
+    CHECK_EQ(std::string(decl.path.ptr, decl.path.len), "/var/log/rut/request-length.log");
+    CHECK_EQ(decl.path_span.start, path_start);
+    CHECK_EQ(decl.path_span.end, path_start + path_len);
+    CHECK_EQ(decl.path_span.line, 2u);
+    CHECK_EQ(decl.path_span.col, 12u);
+    CHECK_EQ(decl.path_token_span.start, path_start - 1u);
+    CHECK_EQ(decl.path_token_span.end, path_start + path_len + 1u);
+    CHECK_EQ(decl.path_token_span.line, 2u);
+    CHECK_EQ(decl.path_token_span.col, 11u);
+    CHECK_EQ(decl.path_field_span.start, path_field_start);
+    CHECK_EQ(decl.path_field_span.end, decl.path_token_span.end);
+    CHECK_EQ(decl.format_field_span.start, format_field_start);
+    CHECK_EQ(decl.format_value_span.start, format_value_start);
+    CHECK_EQ(decl.format_value_span.end, format_value_start + 22u);
+    CHECK_EQ(decl.publication_field_span.start, publication_field_start);
+    CHECK_EQ(decl.publication_value_span.start, publication_value_start);
+    CHECK_EQ(decl.publication_value_span.end, publication_value_start + 4u);
+    CHECK(decl.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(decl.publication == AccessLogPublicationProfile::LiveEachRecord);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->has_access_log);
+    CHECK_EQ(hir->access_log.path.ptr, decl.path.ptr);
+    CHECK_EQ(hir->access_log.path.len, decl.path.len);
+    CHECK_EQ(hir->access_log.path_span.start, decl.path_span.start);
+    CHECK_EQ(hir->access_log.path_token_span.start, decl.path_token_span.start);
+    CHECK_EQ(hir->access_log.format_value_span.start, decl.format_value_span.start);
+    CHECK_EQ(hir->access_log.publication_value_span.start, decl.publication_value_span.start);
+    CHECK(hir->access_log.format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(hir->access_log.publication == AccessLogPublicationProfile::LiveEachRecord);
+}
+
+TEST(frontend, copied_access_log_scalars_and_spans_do_not_depend_on_borrowed_source) {
+    Span saved_path_span{};
+    Span saved_directive_span{};
+    AccessLogFormatProfile saved_format = AccessLogFormatProfile::None;
+    AccessLogPublicationProfile saved_publication = AccessLogPublicationProfile::None;
+    {
+        std::string source =
+            "accessLog { path: \"/a.log\", format: downstreamRequestBytes, publication: live }";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        saved_path_span = hir->access_log.path_span;
+        saved_directive_span = hir->access_log.span;
+        saved_format = hir->access_log.format;
+        saved_publication = hir->access_log.publication;
+        // HirAccessLogDecl::path is a source borrow and is intentionally not read after this scope.
+    }
+    CHECK_EQ(saved_path_span.start, 19u);
+    CHECK_EQ(saved_path_span.end, 25u);
+    CHECK_EQ(saved_directive_span.start, 0u);
+    CHECK_EQ(saved_directive_span.end, 79u);
+    CHECK(saved_format == AccessLogFormatProfile::DownstreamRequestBytesLine);
+    CHECK(saved_publication == AccessLogPublicationProfile::LiveEachRecord);
+}
+
+TEST(frontend, access_log_path_boundaries_and_invalid_inventory_fail_closed) {
+    const auto make_source = [](const std::string& path) {
+        return "accessLog { path: \"" + path +
+               "\", format: downstreamRequestBytes, publication: live }\n";
+    };
+
+    const std::string length255 = "/" + std::string(254u, 'a');
+    std::string source255 = make_source(length255);
+    auto tokens255 = lex({source255.data(), static_cast<u32>(source255.size())});
+    REQUIRE(tokens255);
+    auto ast255 = parse_file_heap(tokens255.value());
+    REQUIRE(ast255);
+    auto hir255 = analyze_file_heap(ast255.value());
+    REQUIRE(hir255);
+    REQUIRE(hir255->has_access_log);
+    CHECK_EQ(hir255->access_log.path.len, kAccessLogSinkPathMax);
+
+    const char with_comments[] =
+        "accessLog // process metadata\n"
+        "{ path // owned later\n"
+        ": \"/a.log\", format: downstreamRequestBytes, "
+        "publication: live }\n";
+    auto comment_tokens = lex(lit(with_comments));
+    REQUIRE(comment_tokens);
+    auto comment_ast = parse_file_heap(comment_tokens.value());
+    REQUIRE(comment_ast);
+    auto comment_hir = analyze_file_heap(comment_ast.value());
+    REQUIRE(comment_hir);
+    CHECK(comment_hir->has_access_log);
+
+    const std::string length256 = "/" + std::string(255u, 'b');
+    std::string source256 = make_source(length256);
+    auto tokens256 = lex({source256.data(), static_cast<u32>(source256.size())});
+    REQUIRE(tokens256);
+    auto ast256 = parse_file_heap(tokens256.value());
+    REQUIRE(ast256);
+    auto hir256 = analyze_file_heap(ast256.value());
+    REQUIRE_FALSE(hir256);
+    CHECK_EQ(hir256.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(hir256.error().span.start, 19u);
+    CHECK_EQ(hir256.error().span.end, 19u + 256u);
+
+    const std::vector<std::string> invalid = {
+        "/",
+        "/dev/stderr",
+        "/a//b",
+        "/a/./b",
+        "/a/../b",
+        "/a/",
+        "/a$b",
+        "/a:b",
+        "relative",
+        "stderr",
+        "off",
+        "syslog:",
+        "/a\tb",
+    };
+    for (const std::string& path : invalid) {
+        std::string source = make_source(path);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.start, 19u);
+        CHECK_EQ(hir.error().span.end, 19u + static_cast<u32>(path.size()));
+    }
+
+    const char embedded_nul[] = {'/', 'a', '\0', 'b'};
+    CHECK_FALSE(access_log_sink_path_valid({embedded_nul, sizeof(embedded_nul)}));
+}
+
+TEST(frontend, access_log_exact_field_inventory_and_profiles_reject_mutations) {
+    const struct {
+        const char* source;
+        const char* marker;
+    } invalid[] = {
+        {"accessLog { format: downstreamRequestBytes, path: \"/a\", publication: live }", "format"},
+        {"accessLog { path: \"/a\", path: \"/b\", publication: live }", "path: \"/b\""},
+        {"accessLog { path: \"/a\", publication: live }", "publication"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes }", "}"},
+        {"accessLog { destination: \"/a\", format: downstreamRequestBytes, publication: live }",
+         "destination"},
+        {"accessLog { path: \"/a\", format: defaultText, publication: live }", "defaultText"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: periodic }",
+         "periodic"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live, }", "live,"},
+        {"accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live, extra: x }",
+         "live,"},
+        {"accessLog { path: \"/a\" format: downstreamRequestBytes, publication: live }", "format"},
+        {"accessLog { path \"/a\", format: downstreamRequestBytes, publication: live }", "\"/a\""},
+        {"accessLog { path: \"/a\\b\", format: downstreamRequestBytes, publication: live }",
+         "/a\\b"},
+        {"accessLog path: \"/a\", format: downstreamRequestBytes, publication: live }", "path"},
+    };
+    for (const auto& tc : invalid) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        const u32 marker = static_cast<u32>(std::string(tc.source).find(tc.marker));
+        CHECK(ast.error().span.start >= marker);
+        CHECK(ast.error().span.start <= marker + static_cast<u32>(strlen(tc.marker)));
+    }
+
+    const char duplicate[] =
+        "accessLog { path: \"/a\", format: downstreamRequestBytes, publication: live }\n"
+        "accessLog { path: \"/b\", format: downstreamRequestBytes, publication: live }\n";
+    auto duplicate_tokens = lex(lit(duplicate));
+    REQUIRE(duplicate_tokens);
+    auto duplicate_ast = parse_file_heap(duplicate_tokens.value());
+    REQUIRE(duplicate_ast);
+    auto duplicate_hir = analyze_file_heap(duplicate_ast.value());
+    REQUIRE_FALSE(duplicate_hir);
+    CHECK_EQ(duplicate_hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(duplicate_hir.error().span.line, 2u);
+    CHECK_EQ(duplicate_hir.error().span.col, 1u);
+
+    auto forged = std::make_unique<AstFile>();
+    AstItem item{};
+    item.kind = AstItemKind::AccessLog;
+    item.span = {0u, 80u, 1u, 1u};
+    item.access_log.span = item.span;
+    item.access_log.path = {"/a", 2u};
+    item.access_log.path_span = {19u, 21u, 1u, 20u};
+    item.access_log.path_token_span = {18u, 22u, 1u, 19u};
+    item.access_log.path_field_span = {12u, 22u, 1u, 13u};
+    item.access_log.format_field_span = {24u, 54u, 1u, 25u};
+    item.access_log.format_value_span = {32u, 54u, 1u, 33u};
+    item.access_log.format = static_cast<AccessLogFormatProfile>(255u);
+    item.access_log.publication_field_span = {56u, 73u, 1u, 57u};
+    item.access_log.publication_value_span = {69u, 73u, 1u, 70u};
+    item.access_log.publication = AccessLogPublicationProfile::LiveEachRecord;
+    REQUIRE(forged->items.push(item));
+    auto forged_hir = analyze_file_heap(*forged);
+    REQUIRE_FALSE(forged_hir);
+    CHECK_EQ(forged_hir.error().span.start, item.access_log.format_value_span.start);
+    CHECK_EQ(forged_hir.error().span.end, item.access_log.format_value_span.end);
+}
+
+TEST(frontend, imported_access_log_declaration_is_rejected_at_main_import) {
+    const std::string dir = "/tmp/rut_frontend_access_log_import";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/dep.rut", std::ios::binary);
+        out << "accessLog { path: \"/var/log/import.log\", format: downstreamRequestBytes, "
+               "publication: live }\n";
+    }
+    const std::string main_source = "import \"dep.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex({main_source.data(), static_cast<u32>(main_source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(hir.error().span.line, 1u);
+    CHECK_EQ(hir.error().span.col, 1u);
+    CHECK_EQ(std::string(hir.error().detail.ptr, hir.error().detail.len),
+             "accessLog declarations must be in the main source");
+    std::filesystem::remove_all(dir);
 }
 
 static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {
@@ -528,6 +1047,177 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     REQUIRE(lexed);
     REQUIRE_EQ(lexed->tokens.len, 2u);  // wait, EOF
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
+}
+
+static std::string make_ident_stream(u32 count) {
+    std::string source;
+    source.reserve(count * 2u);
+    for (u32 i = 0; i < count; i++) {
+        if (i != 0) source.push_back(' ');
+        source.push_back('a');
+    }
+    return source;
+}
+
+TEST(frontend, lex_token_capacity_boundaries_are_exact) {
+    {
+        const std::string source = make_ident_stream(639);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 640u);  // legacy 639 identifiers + EOF
+        CHECK(result->tokens[639].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[639].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[639].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[639].line, 1u);
+        CHECK_EQ(result->tokens[639].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(767);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 768u);  // retained former-boundary regression
+        CHECK(result->tokens[767].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[767].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[767].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[767].line, 1u);
+        CHECK_EQ(result->tokens[767].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(931);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 932u);  // 931 identifiers + EOF
+        CHECK(result->tokens[931].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[931].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[931].line, 1u);
+        CHECK_EQ(result->tokens[931].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(932);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(!result);
+        CHECK_FALSE(result.has_value());
+        CHECK(result.error().code == FrontendError::TooManyTokens);
+        CHECK_EQ(result.error().span.start, static_cast<u32>(source.size()));
+        CHECK_EQ(result.error().span.end, static_cast<u32>(source.size()));
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(933);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(!result);
+        CHECK_FALSE(result.has_value());
+        CHECK(result.error().code == FrontendError::TooManyTokens);
+        // The 933rd one-character identifier starts after 932 "a " pairs.
+        CHECK_EQ(result.error().span.start, 1864u);
+        CHECK_EQ(result.error().span.end, 1865u);
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, 1865u);
+    }
+}
+
+static std::string make_eighty_route_source() {
+    std::string source;
+    source.reserve(80u * 40u);
+    for (u32 i = 0; i < 80; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    return source;
+}
+
+static std::string make_653_slot_route_source() {
+    std::string source = "listen :0\n";
+    source.reserve(4u * 1024u);
+    for (u32 i = 0; i < 91; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    for (u32 i = 91; i < 93; i++) {
+        source += "route \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return 202 }\n";
+    }
+    return source;
+}
+
+TEST(frontend, eighty_route_source_reaches_verified_rir_without_token_overflow) {
+    const std::string source = make_eighty_route_source();
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    // Each route contributes: route, method, path, {, return, status, }.
+    REQUIRE_EQ(lexed->tokens.len, 561u);  // 80 * 7 route tokens + EOF
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 80u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 80u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 80u);
+    const auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+    for (u32 i = 0; i < 80; i++) {
+        const auto& fn = rir.module.functions[i];
+        CHECK_EQ(fn.http_method, i % 2u == 0u ? kRouteMethodGet : kRouteMethodPost);
+        const std::string expected_path = "/capacity/" + std::to_string(i);
+        CHECK(fn.route_pattern.eq({expected_path.data(), static_cast<u32>(expected_path.size())}));
+    }
+    rir.destroy();
+}
+
+TEST(frontend, six_hundred_fifty_three_slot_source_reaches_verified_rir) {
+    const std::string source = make_653_slot_route_source();
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    // listen contributes 3 tokens, 91 method-specific routes contribute 7
+    // each, 2 method-omitted routes contribute 6 each, followed by EOF.
+    REQUIRE_EQ(lexed->tokens.len, 653u);
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 94u);  // listener + 93 routes
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->has_listener);
+    CHECK_EQ(hir->listener.port, 0u);
+    REQUIRE_EQ(hir->routes.len, 93u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 93u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 93u);
+    const auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+
+    const auto& first = rir.module.functions[0];
+    CHECK_EQ(first.http_method, kRouteMethodGet);
+    CHECK(first.route_pattern.eq({"/capacity/0", 11}));
+    const auto& last = rir.module.functions[92];
+    CHECK_EQ(last.http_method, kRouteMethodAny);
+    CHECK(last.route_pattern.eq({"/capacity/92", 12}));
+    rir.destroy();
 }
 
 TEST(frontend, lex_recognizes_downstream_keyword) {
@@ -4545,6 +5235,71 @@ TEST(frontend, parse_upstream_at_is_contextual_not_reserved) {
     CHECK(hir->upstreams[0].has_address);
 }
 
+TEST(frontend, omitted_route_method_is_explicit_any_method_through_rir) {
+    const char* src = "route \"/\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK(ast->items[0].route.method_is_any);
+    CHECK_EQ(ast->items[0].route.method, 0u);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].method, kRouteMethodAny);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].method, kRouteMethodAny);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].http_method, kRouteMethodAny);
+    rir.destroy();
+}
+
+TEST(frontend, route_any_keyword_is_rejected_with_omission_fix) {
+    const char* src = "route ANY \"/\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`ANY` is not a route keyword; omit the method")));
+}
+
+TEST(frontend, analyze_rejects_duplicate_route_keys_but_allows_any_plus_method) {
+    struct Case {
+        const char* src;
+        bool expect_success;
+    };
+    const Case cases[] = {
+        {"route \"/x\" { return 200 }\nroute \"/x\" { return 201 }\n", false},
+        {"route GET \"/x\" { return 200 }\nroute GET \"/x\" { return 201 }\n", false},
+        {"route \"/x\" { return 200 }\nroute GET \"/x\" { return 201 }\n", true},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (tc.expect_success) {
+            REQUIRE(hir);
+            REQUIRE_EQ(hir->routes.len, 2u);
+        } else {
+            REQUIRE(!hir);
+            CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+            CHECK(hir.error().detail.eq(lit("duplicate route path and method")));
+        }
+    }
+}
+
 TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
     const char* src =
         "upstream api { host: \"127.0.0.1\", port: 80, weight: 3 }\n"
@@ -6200,6 +6955,15 @@ TEST(frontend, parse_route_block_single_entry_no_decorators) {
     CHECK_EQ(ast->items[0].route.decorators.len, 0u);
 }
 
+TEST(frontend, parse_route_block_rejects_omitted_method) {
+    const char* src = "route { \"/users\" { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
 TEST(frontend, parse_route_block_multiple_entries) {
     const char* src =
         "route {\n  GET \"/users\" { return 200 }\n  POST \"/orders\" { return 201 }\n}\n";
@@ -6602,6 +7366,68 @@ route {
     CHECK_EQ(removes, 1u);
     CHECK_EQ(commits, 1u);
     rir.destroy();
+}
+
+TEST(frontend, chain_after_never_commits_on_guard_failure_shapes) {
+    const char source[] = R"rut(
+variant Result { ok, err }
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access {
+    guard false else { return 401 }
+    guard false else { let code = 402 return 402 }
+    guard false else { let code = 403 if code == 403 { return 403 } else { return 503 } }
+    let failed = error(.timeout)
+    guard match failed else { .timeout => return 404 _ => return 504 }
+    let state = Result.ok
+    match state {
+        .ok => {
+            guard false else { return 405 }
+            return 200
+        }
+        .err => return 204
+    }
+}
+)rut";
+
+    auto check_fail_terms = [&](const HirModule& module, const HirGuard& guard) {
+        if (guard.fail_kind == HirGuard::FailKind::Term) {
+            CHECK_FALSE(guard.fail_term.commit_response_mutations);
+        } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+            if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
+                CHECK_FALSE(guard.fail_body.then_term.commit_response_mutations);
+                CHECK_FALSE(guard.fail_body.else_term.commit_response_mutations);
+            } else {
+                CHECK_FALSE(guard.fail_body.direct_term.commit_response_mutations);
+            }
+        } else {
+            for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                CHECK_FALSE(module.guard_match_arms[guard.fail_match_start + ai]
+                                .direct_term.commit_response_mutations);
+        }
+    };
+
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 4u);
+    CHECK_EQ(route.guards[0].fail_kind, HirGuard::FailKind::Term);
+    CHECK_EQ(route.guards[1].fail_body.body_kind, HirGuardBody::BodyKind::Direct);
+    CHECK_EQ(route.guards[2].fail_body.body_kind, HirGuardBody::BodyKind::If);
+    CHECK_EQ(route.guards[3].fail_kind, HirGuard::FailKind::Match);
+    for (u32 gi = 0; gi < route.guards.len; gi++) check_fail_terms(hir.value(), route.guards[gi]);
+
+    REQUIRE_EQ(route.control.kind, HirControlKind::Match);
+    REQUIRE_EQ(route.control.match_arms.len, 2u);
+    REQUIRE_EQ(route.control.match_arms[0].guards.len, 1u);
+    check_fail_terms(hir.value(), route.control.match_arms[0].guards[0]);
+    CHECK(route.control.match_arms[0].direct_term.commit_response_mutations);
+    CHECK(route.control.match_arms[1].direct_term.commit_response_mutations);
 }
 
 TEST(frontend, response_builder_alias_is_not_the_chain_response_parameter) {
@@ -32203,6 +33029,5150 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, forward_request_policy_requires_exact_fixed_strip_contract) {
+    const char* valid = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* invalid[] = {
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.0\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"close\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", \"Foo\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }, set_path: \"/x\") "
+        "}\n",
+    };
+    for (const char* src : invalid) {
+        auto bad_lex = lex(lit(src));
+        REQUIRE(bad_lex);
+        auto bad_ast = parse_file_heap(bad_lex.value());
+        CHECK_FALSE(bad_ast.has_value());
+    }
+}
+
+TEST(frontend, request_policy_content_length_position_selects_id_after_complete_object) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route POST "/legacy" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+route POST "/after" {
+    return forward(backend, request_policy: {
+        content_length_position: "after_host", strip_headers: ["Connection", "Keep-Alive",
+            "TE", "Expect", "Upgrade"], connection: "omit", host: "upstream",
+        version: "HTTP/1.1"
+    })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(ast->items[2].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    for (u32 i = 0; i < 2; i++) {
+        const auto* ret = find_first_op(rir.module.functions[i], rir::Opcode::RetForward);
+        REQUIRE(ret != nullptr);
+        REQUIRE_EQ(ret->operand_count, 2u);
+        const auto policy = ret->operand(1);
+        const auto& value = rir.module.functions[i].values[policy.id];
+        auto& constant = rir.module.functions[i].blocks[value.def_block.id].insts[value.def_inst];
+        REQUIRE_EQ(constant.op, rir::Opcode::ConstI32);
+        CHECK_EQ(constant.imm.i32_val, static_cast<i32>(i + 1));
+    }
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    const char* invalid[] = {
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"before_host\" }) }\n",
+        "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
+        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
+        "content_length_position: \"after_host\", content_length_position: "
+        "\"after_host\" }) }\n",
+    };
+    for (const char* bad : invalid) {
+        lexed = lex(lit(bad));
+        REQUIRE(lexed);
+        auto rejected = parse_file_heap(lexed.value());
+        CHECK_FALSE(rejected.has_value());
+    }
+
+    const char timeout[] = R"rut(
+upstream b
+route POST "/" {
+    return forward(b, request_policy: { version: "HTTP/1.1", host: "upstream",
+        connection: "omit", content_length_position: "after_host",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_read_timeout: 1s)
+}
+)rut";
+    lexed = lex(lit(timeout));
+    REQUIRE(lexed);
+    auto timeout_ast = parse_file_heap(lexed.value());
+    REQUIRE(timeout_ast);
+    auto timeout_hir = analyze_file_heap(timeout_ast.value());
+    REQUIRE_FALSE(timeout_hir.has_value());
+    CHECK(timeout_hir.error().detail.eq(
+        lit("request policy is not admitted to response read timeout")));
+
+    CHECK(request_policy_is_supported(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(complete_content_length_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)));
+    CHECK_FALSE(request_policy_is_supported(3));
+}
+
+TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_profile) {
+    const auto source_for = [](const char* route) {
+        return std::string("upstream backend at \"127.0.0.1:9000\"\n") + route + R"rut( {
+    return forward(backend,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            content_length_position: "after_host",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current",
+            head_mode: "suppress_body", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", head_mode: "suppress_body", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", head_mode: "suppress_body", body: b"slow" },
+        response_read_timeout: 1s)
+}
+)rut";
+    };
+    constexpr auto kPolicy = RequestPolicyId::Http11FixedStripContentLengthAfterHost;
+
+    for (const auto& test : {
+             std::pair<const char*, u8>{"route HEAD \"/one\"", kRouteMethodHead},
+             std::pair<const char*, u8>{"route \"/one\"", kRouteMethodAny},
+         }) {
+        const std::string source = source_for(test.first);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].method, test.second);
+        CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        CHECK_EQ(mir->functions[0].method, test.second);
+        CHECK_EQ(mir->functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+                 static_cast<u16>(kPolicy));
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        CHECK_EQ(rir.module.functions[0].http_method, test.second);
+        CHECK_EQ(rir.module.functions[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+        CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::None);
+        rir.destroy();
+    }
+
+    for (const char* rejected_route : {"route POST \"/one\"", "route GET \"/one\""}) {
+        const std::string source = source_for(rejected_route);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+    {
+        std::string source = source_for("route HEAD \"/one\"");
+        const auto timeout = source.find("response_read_timeout: 1s");
+        REQUIRE_NE(timeout, std::string::npos);
+        source.insert(timeout, "response_buffering: \"complete_content_length\",\n        ");
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+
+    const std::string source = source_for("route HEAD \"/one\"");
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    hir->routes[0].method = kRouteMethodPost;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->routes[0].method = kRouteMethodHead;
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    mir->functions[0].method = kRouteMethodPost;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].method = kRouteMethodHead;
+    mir->functions[0].blocks[0].term.forward_request_policy_id = 3;
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].blocks[0].term.forward_request_policy_id = static_cast<u16>(kPolicy);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    auto* ret = find_first_op(fn, rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    const auto request_policy_value = ret->operand(1);
+    const auto& request_policy_def = fn.values[request_policy_value.id];
+    auto& request_policy_const =
+        fn.blocks[request_policy_def.def_block.id].insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    fn.http_method = kRouteMethodPost;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.http_method = kRouteMethodHead;
+    request_policy_const.imm.i32_val = 3;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.imm.i32_val = static_cast<i32>(kPolicy);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::Reject;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.response_policies[0].head_mode = ResponsePolicyHeadMode::SuppressBody;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+
+    CHECK(fixed_upload_head_request_policy_is_admitted(
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    CHECK(fixed_upload_head_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(0));
+    CHECK_FALSE(fixed_upload_head_request_policy_is_admitted(3));
+    CHECK_FALSE(response_read_deadline_request_policy_is_admitted(static_cast<u16>(kPolicy)));
+}
+
+TEST(frontend, request_policy_rejects_response_mutation_combination) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+func add_header(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request_policy cannot be combined with response header mutations")));
+}
+
+TEST(frontend, response_policy_metadata_is_bounded_and_carried_to_rir) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "nginx",
+        date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_response_policy_id, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->response_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->response_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    CHECK(rir.module.response_policies[0].server.eq(lit("nginx")));
+    CHECK(rir.module.response_policies[0].head_mode == ResponsePolicyHeadMode::Reject);
+    const auto& block = rir.module.functions[0].blocks[0];
+    const auto& ret = block.insts[block.inst_count - 1];
+    CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForward));
+    CHECK_EQ(ret.operand_count, 3u);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    rir.destroy();
+}
+
+TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
+    char server[] = "server";
+    char hidden[] = "Date";
+    ForwardResponsePolicySpec reject{};
+    reject.version = ResponsePolicyVersion::Http11;
+    reject.framing = ResponsePolicyFraming::ContentLength;
+    reject.connection = ResponsePolicyConnection::Request;
+    reject.date = ResponsePolicyDate::Current;
+    reject.server = {server, 6};
+    reject.hide_headers[0] = {hidden, 4};
+    reject.hide_header_count = 1;
+    CHECK(response_policy_spec_valid(reject));
+    CHECK_EQ(reject.head_mode, ResponsePolicyHeadMode::Reject);
+
+    auto suppress = reject;
+    suppress.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    CHECK(response_policy_spec_valid(suppress));
+    auto invalid = reject;
+    invalid.head_mode = ResponsePolicyHeadMode::Invalid;
+    CHECK_FALSE(response_policy_spec_valid(invalid));
+    invalid.head_mode = static_cast<ResponsePolicyHeadMode>(3);
+    CHECK_FALSE(response_policy_spec_valid(invalid));
+
+    auto ast = std::make_unique<AstFile>();
+    CHECK_EQ(ast->add_response_policy(reject), 1u);
+    CHECK_EQ(ast->add_response_policy(reject), 1u);
+    CHECK_EQ(ast->add_response_policy(suppress), 2u);
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = reject;
+    module.response_policies[1] = suppress;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "response_policies: 2\n"
+        "  response_policy#1: head_mode=reject\n"
+        "  response_policy#2: head_mode=suppress_body\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+}
+
+TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"chunked\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", "
+        "hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [\"Date\", \"date\"] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", hide_headers: "
+        "[] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"bad\rvalue\", date: "
+        "\"current\", hide_headers: [] }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, public_head_mode_pair_lowers_with_modes_and_bundle) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/head" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "suppress_body", server: "nginx", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "nginx", date: "current",
+            connection: "request", head_mode: "suppress_body", body: b"x"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_failure_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    const auto& block = rir.module.functions[0].blocks[0];
+    CHECK_EQ(block.insts[block.inst_count - 1].op, rir::Opcode::RetForwardBundle);
+    rir.destroy();
+}
+
+TEST(frontend, public_head_mode_omission_and_explicit_reject_preserve_legacy) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "reject", server: "s", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", head_mode: "reject", body: b"x"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char omitted[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            server: "s", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"x"
+        })
+}
+)rut";
+    lexed = lex(lit(omitted));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
+    const char* forward =
+        "return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", "
+        "hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad "
+        "Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
+        "\"request\", head_mode: \"suppress_body\", body: b\"x\" })";
+    const std::string prefix = "upstream b at \"127.0.0.1:9000\"\n";
+    const std::string sources[] = {
+        prefix + "route \"/\" { if req.method == GET { " + forward + " } else { return 404 } }\n",
+        prefix + "route \"/\" { match req.http11 { true => " + forward + " _ => return 404 } }\n",
+        prefix + "route \"/\" { guard req.http11 else { " + forward + " } return 404 }\n",
+    };
+    for (const std::string& source : sources) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+        CHECK_EQ(hir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    }
+}
+
+TEST(frontend, public_head_mode_analyzer_defends_forged_policy_id) {
+    const char source[] =
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* term = ast->items[1].route.statements[0];
+    REQUIRE(term != nullptr);
+    term->has_forward_response_policy = true;
+    term->forward_response_policy_id = 99;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char policy_source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "reject", server: "s", date: "current", hide_headers: []
+        })
+}
+)rut";
+    lexed = lex(lit(policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    ast->response_policies[0].head_mode = ResponsePolicyHeadMode::Invalid;
+    auto malformed = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK_EQ(malformed.error().code, FrontendError::UnsupportedSyntax);
+
+    const char failure_policy_source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"x"
+        })
+}
+)rut";
+    lexed = lex(lit(failure_policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* failure_term = ast->items[1].route.statements[0];
+    REQUIRE(failure_term != nullptr);
+    failure_term->has_forward_failure_policy = true;
+    failure_term->forward_failure_policy_id = 99;
+    auto forged_failure_id = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(forged_failure_id.has_value());
+    CHECK_EQ(forged_failure_id.error().code, FrontendError::UnsupportedSyntax);
+
+    lexed = lex(lit(failure_policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    ast->failure_policies[0].head_mode = FailurePolicyHeadMode::Invalid;
+    auto malformed_failure = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(malformed_failure.has_value());
+    CHECK_EQ(malformed_failure.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"bogus\", server: "
+        "\"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: "
+        "\"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
+        "head_mode: \"reject\", server: \"s\", date: \"current\", hide_headers: [] }, "
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", "
+        "head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", nope: "
+        "\"x\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
+        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: "
+        "b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
+        "server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
+        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: \"current\", connection: \"request\", head_mode: \"bogus\", body: b\"x\" }) "
+        "}\n",
+    };
+    for (const char* source : invalid) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code,
+                 strstr(source, "bogus") != nullptr ? FrontendError::UnsupportedSyntax
+                                                    : FrontendError::UnexpectedToken);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+    }
+}
+
+TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
+    auto make_source = [](bool response,
+                          const char* response_connection,
+                          const char* response_mode,
+                          bool failure,
+                          const char* failure_mode,
+                          bool target_transform) {
+        std::string source =
+            "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, ";
+        bool comma = false;
+        if (response) {
+            source +=
+                "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+                "connection: \"";
+            source += response_connection;
+            source += "\", head_mode: \"";
+            source += response_mode;
+            source += "\", server: \"s\", date: \"current\", hide_headers: [] }";
+            comma = true;
+        }
+        if (failure) {
+            if (comma) source += ", ";
+            source +=
+                "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+                "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
+                "\"request\", head_mode: \"";
+            source += failure_mode;
+            source += "\", body: b\"x\" }";
+            comma = true;
+        }
+        if (target_transform) {
+            if (comma) source += ", ";
+            source += "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }";
+        }
+        source += ") }\n";
+        return source;
+    };
+    const std::string cases[] = {
+        make_source(true, "request", "suppress_body", false, "reject", false),
+        make_source(false, "request", "reject", true, "suppress_body", false),
+        make_source(true, "request", "suppress_body", true, "reject", false),
+        make_source(true, "request", "reject", true, "suppress_body", false),
+        make_source(true, "keep_alive", "suppress_body", true, "suppress_body", false),
+        make_source(true, "request", "suppress_body", true, "suppress_body", true),
+    };
+    for (const std::string& source : cases) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_GT(hir.error().span.line, 0u);
+        CHECK_GT(hir.error().span.col, 0u);
+    }
+}
+
+TEST(frontend, public_head_mode_conditional_keeps_legacy_forward_sibling) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route "/" {
+    if req.method == HEAD && req.pathOnly == "/head" {
+        return forward(backend,
+            response_policy: {
+                version: "HTTP/1.1", framing: "content_length", connection: "request",
+                head_mode: "suppress_body", server: "s", date: "current", hide_headers: []
+            },
+            failure_policy: {
+                version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+                content_type: "text/plain", server: "s", date: "current",
+                connection: "request", head_mode: "suppress_body", body: b"x"
+            })
+    } else {
+        return forward(backend)
+    }
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.kind, HirControlKind::If);
+    CHECK_EQ(hir->routes[0].control.then_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.then_term.forward_failure_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.else_term.forward_response_policy_id, 0u);
+    CHECK_EQ(hir->routes[0].control.else_term.forward_failure_policy_id, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    u32 forwards = 0;
+    u32 bundles = 0;
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        const auto& fn = rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op == rir::Opcode::RetForward) forwards++;
+                if (block.insts[ii].op == rir::Opcode::RetForwardBundle) bundles++;
+            }
+        }
+    }
+    CHECK_EQ(forwards, 1u);
+    CHECK_EQ(bundles, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) {
+    struct InvalidCase {
+        const char* source;
+        FrontendError code;
+    };
+    static constexpr InvalidCase kCases[] = {
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+         "\"HTTP/1.1\", framing: \"content_length\", connection: \"close\", server: \"nginx\", "
+         "date: \"current\", hide_headers: [] }) }\n",
+         FrontendError::UnsupportedSyntax},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+         "\"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", connection: "
+         "\"request\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+         FrontendError::UnexpectedToken},
+    };
+    for (const InvalidCase& test : kCases) {
+        auto lexed = lex(lit(test.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, test.code);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+    }
+}
+
+TEST(frontend, response_policy_rejects_response_mutation_combination) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+func add_header(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
+        server: "nginx", date: "current", hide_headers: ["Date"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response_policy cannot be combined with response header mutations")));
+}
+
+TEST(frontend, failure_policy_bundle_is_carried_and_route_owned) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "rut",
+        date: "current",
+        hide_headers: ["Date", "Server"]
+    }, failure_policy: {
+        version: "HTTP/1.1",
+        status: 502,
+        reason: "Bad Gateway",
+        content_type: "text/plain",
+        server: "rut",
+        date: "current",
+        connection: "request",
+        body: b"unavailable"
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_failure_policy_id, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->failure_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_failure_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->failure_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK(rir.module.failure_policies[0].body.eq(lit("unavailable")));
+    const auto& block = rir.module.functions[0].blocks[0];
+    const auto& ret = block.insts[block.inst_count - 1];
+    CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
+    CHECK_EQ(ret.operand_count, 3u);
+    rir.destroy();
+}
+
+TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_through_sixty_three) {
+    struct Accepted {
+        const char* literal;
+        u8 seconds;
+    } accepted[] = {{"1s", 1}, {"63s", 63}, {"1m", 60}, {"1000ms", 1}};
+    for (const auto& test : accepted) {
+        const std::string source = std::string("upstream b\nroute GET \"/\" { return forward(b, ") +
+                                   "response_read_timeout: " + test.literal + ") }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        const auto* stmt = ast->items[1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        CHECK(stmt->has_forward_response_read_timeout);
+        CHECK_EQ(stmt->forward_response_read_timeout_seconds, test.seconds);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].control.direct_term.forward_response_read_timeout_seconds,
+                 test.seconds);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_read_timeout_seconds,
+                 test.seconds);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+        CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, test.seconds);
+        rir.destroy();
+    }
+
+    struct Rejected {
+        const char* literal;
+        FrontendError code;
+    } rejected[] = {
+        {"0s", FrontendError::UnsupportedSyntax},
+        {"1ms", FrontendError::UnsupportedSyntax},
+        {"500ms", FrontendError::UnsupportedSyntax},
+        {"1500ms", FrontendError::UnsupportedSyntax},
+        {"64s", FrontendError::UnsupportedSyntax},
+        {"2m", FrontendError::UnsupportedSyntax},
+        {"184467440737095516160s", FrontendError::UnsupportedSyntax},
+        {"1", FrontendError::UnexpectedToken},
+        {"1d", FrontendError::UnexpectedToken},
+    };
+    for (const auto& test : rejected) {
+        const std::string source = std::string("upstream b\nroute GET \"/\" { return forward(b, ") +
+                                   "response_read_timeout: " + test.literal + ") }\n";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, test.code);
+    }
+
+    const char duplicate[] =
+        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "response_read_timeout: 2s) }\n";
+    auto lexed = lex(lit(duplicate));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("response_read_timeout")));
+
+    const char valid[] =
+        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s) }\n";
+    for (const u8 forged_seconds : {static_cast<u8>(0), static_cast<u8>(64)}) {
+        lexed = lex(lit(valid));
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto* stmt = ast->items[1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        stmt->forward_response_read_timeout_seconds = forged_seconds;
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("invalid response read timeout")));
+    }
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    ast->items[1].route.statements[0]->has_forward_response_read_timeout = false;
+    auto mismatched = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(mismatched.has_value());
+    CHECK_EQ(mismatched.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(mismatched.error().detail.eq(lit("invalid response read timeout")));
+}
+
+TEST(frontend, response_buffering_parses_propagates_deduplicates_and_preserves_packed_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/one" {
+    return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+route GET "/same" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+route GET "/stream" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s)
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    for (u32 i = 0; i < 2; i++) {
+        const auto* stmt = ast->items[i + 1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        CHECK(stmt->has_forward_response_buffering);
+        CHECK_EQ(stmt->forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+    }
+    const auto* omitted = ast->items[3].route.statements[0];
+    REQUIRE(omitted != nullptr);
+    CHECK_FALSE(omitted->has_forward_response_buffering);
+    CHECK_EQ(omitted->forward_response_buffering, ForwardResponseBufferingMode::None);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id, 0u);
+    CHECK_EQ(hir->routes[2].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::None);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(hir->routes[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(mir->functions[2].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::None);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(mir->functions[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 2u);
+    CHECK_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[1].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[2].preflight_forward_policy_bundle_id, 2u);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(rir.module.functions[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(rir.module.policy_bundles[1].response_buffering, ForwardResponseBufferingMode::None);
+    const auto* policy_ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(policy_ret != nullptr);
+    REQUIRE_EQ(policy_ret->operand_count, 3u);
+    const auto policy_value = policy_ret->operand(1);
+    REQUIRE_LT(policy_value.id, rir.module.functions[0].value_count);
+    const auto& policy_def = rir.module.functions[0].values[policy_value.id];
+    const auto& policy_const =
+        rir.module.functions[0].blocks[policy_def.def_block.id].insts[policy_def.def_inst];
+    REQUIRE_EQ(policy_const.op, rir::Opcode::ConstI32);
+    CHECK_EQ(policy_const.imm.i32_val, 1);
+
+    const auto packed = jit::HandlerResult::make_forward_with_bundle(7, 1, 1).pack();
+    static_assert(sizeof(packed) == sizeof(u64));
+    static_assert(sizeof(ForwardPolicyBundle) == 8);
+    const auto unpacked = jit::HandlerResult::unpack(packed);
+    CHECK_EQ(unpacked.action, jit::HandlerAction::ForwardBundle);
+    CHECK_EQ(unpacked.upstream_id, 7u);
+    CHECK_EQ(unpacked.status_code, 1u);
+    CHECK_EQ(unpacked.next_state, 1u);
+    CHECK_EQ(
+        jit::HandlerResult::unpack(jit::HandlerResult::make_forward_with_bundle(7, 0, 1).pack())
+            .status_code,
+        0u);
+    rir.destroy();
+}
+
+TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) {
+    struct InvalidSyntax {
+        const char* source;
+        FrontendError code;
+        const char* detail;
+    } invalid_syntax[] = {
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: 1) }\n",
+         FrontendError::UnexpectedToken,
+         "1"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: \"stream\") }\n",
+         FrontendError::UnsupportedSyntax,
+         "stream"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering:) }\n",
+         FrontendError::UnexpectedToken,
+         nullptr},
+    };
+    for (const auto& test : invalid_syntax) {
+        auto lexed = lex(lit(test.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, test.code);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+        if (test.detail != nullptr) CHECK(ast.error().detail.eq(lit(test.detail)));
+    }
+    const char duplicate[] =
+        "upstream b\nroute GET \"/\" { return forward(b, "
+        "response_buffering: \"complete_content_length\", "
+        "response_buffering: \"complete_content_length\") }\n";
+    auto lexed = lex(lit(duplicate));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("response_buffering")));
+
+    const char incomplete_bundle[] =
+        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "response_buffering: \"complete_content_length\") }\n";
+    lexed = lex(lit(incomplete_bundle));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("response_buffering requires a complete strict timeout policy bundle")));
+
+    const char valid[] = R"rut(
+upstream b
+route GET "/" {
+    return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+)rut";
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->has_forward_request_policy = false;
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid request policy")));
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->forward_request_policy_id = 0;
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid request policy")));
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid response buffering")));
+
+    for (const char* rejected_method : {"HEAD"}) {
+        std::string wrong_method(valid);
+        const auto method = wrong_method.find("route GET");
+        REQUIRE_NE(method, std::string::npos);
+        wrong_method.replace(
+            method, sizeof("route GET") - 1u, std::string("route ") + rejected_method);
+        lexed = lex({wrong_method.data(), static_cast<u32>(wrong_method.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        rejected_hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(rejected_hir.has_value());
+        CHECK(rejected_hir.error().detail.eq(
+            lit("response_buffering currently requires an effect-free direct admitted bodyless "
+                "non-HEAD Forward route")));
+    }
+
+    std::string effectful(valid);
+    const auto forward_stmt = effectful.find("    return forward");
+    REQUIRE_NE(forward_stmt, std::string::npos);
+    effectful.insert(forward_stmt, "    let observed = req.path\n");
+    lexed = lex({effectful.data(), static_cast<u32>(effectful.size())});
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("response_buffering currently requires an effect-free direct admitted bodyless "
+            "non-HEAD Forward route")));
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    for (const u8 forged_method : {kRouteMethodHead,
+                                   kRouteMethodConnect,
+                                   kRouteMethodTrace,
+                                   kRouteMethodInvalid,
+                                   static_cast<u8>(10)}) {
+        mir->functions[0].method = forged_method;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].method = kRouteMethodGet;
+    for (const u16 forged_policy : {static_cast<u16>(2), static_cast<u16>(0xffffu)}) {
+        mir->functions[0].blocks[0].term.forward_request_policy_id = forged_policy;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].blocks[0].term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    mir->functions[0].blocks[0].term.forward_response_buffering =
+        static_cast<ForwardResponseBufferingMode>(2);
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].blocks[0].term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 0;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 1;
+    for (const u8 admitted : {kRouteMethodAny,
+                              kRouteMethodGet,
+                              kRouteMethodPost,
+                              kRouteMethodPut,
+                              kRouteMethodDelete,
+                              kRouteMethodPatch,
+                              kRouteMethodOptions}) {
+        rir.module.functions[0].http_method = admitted;
+        CHECK(rir::verify_module(rir.module).ok);
+    }
+    for (const u8 rejected_method : {kRouteMethodHead,
+                                     kRouteMethodConnect,
+                                     kRouteMethodTrace,
+                                     kRouteMethodInvalid,
+                                     static_cast<u8>(10)}) {
+        rir.module.functions[0].http_method = rejected_method;
+        CHECK_FALSE(rir::verify_module(rir.module).ok);
+    }
+    rir.module.functions[0].http_method = kRouteMethodGet;
+    auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    const auto request_policy = ret->operand(1);
+    auto& request_policy_def = rir.module.functions[0].values[request_policy.id];
+    auto& request_policy_const = rir.module.functions[0]
+                                     .blocks[request_policy_def.def_block.id]
+                                     .insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    for (const i32 forged_policy : {-1, 2, 65535, 65537}) {
+        request_policy_const.imm.i32_val = forged_policy;
+        CHECK_FALSE(rir::verify_module(rir.module).ok);
+    }
+    request_policy_const.imm.i32_val = 1;
+    CHECK(rir::verify_module(rir.module).ok);
+    request_policy_const.op = rir::Opcode::Add;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.op = rir::Opcode::ConstI32;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, response_buffering_admits_closed_bodyless_non_head_static_route_method_set) {
+    static constexpr const char kRequestPolicy[] =
+        "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+        "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\"] }, ";
+    static constexpr const char kPolicies[] =
+        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", server: \"s\", date: \"current\", hide_headers: [] }, "
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", body: b\"bad\" }, "
+        "timeout_failure_policy: { version: \"HTTP/1.1\", status: 504, "
+        "reason: \"Gateway Time-out\", content_type: \"text/plain\", server: \"s\", "
+        "date: \"current\", connection: \"request\", body: b\"slow\" }, "
+        "response_read_timeout: 1s, response_buffering: \"complete_content_length\") }\n";
+    struct MethodCase {
+        const char* source_method;
+        u8 route_method;
+    };
+    const MethodCase methods[] = {{"", kRouteMethodAny},
+                                  {"GET ", kRouteMethodGet},
+                                  {"POST ", kRouteMethodPost},
+                                  {"PUT ", kRouteMethodPut},
+                                  {"DELETE ", kRouteMethodDelete},
+                                  {"PATCH ", kRouteMethodPatch},
+                                  {"OPTIONS ", kRouteMethodOptions}};
+    for (const auto& method : methods) {
+        for (const bool request_policy : {false, true}) {
+            std::string source = "upstream b at \"127.0.0.1:9000\"\nroute ";
+            source += method.source_method;
+            source += "\"/\" { return forward(b, ";
+            if (request_policy) source += kRequestPolicy;
+            source += kPolicies;
+            auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(lexed);
+            auto ast = parse_file_heap(lexed.value());
+            REQUIRE(ast);
+            auto hir = analyze_file_heap(ast.value());
+            REQUIRE(hir);
+            REQUIRE_EQ(hir->routes.len, 1u);
+            CHECK_EQ(hir->routes[0].method, method.route_method);
+            CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+                     request_policy ? static_cast<u16>(RequestPolicyId::Http11FixedStrip) : 0u);
+            auto mir = build_mir_heap(hir.value());
+            REQUIRE(mir);
+            CHECK_EQ(mir->functions[0].method, method.route_method);
+            FrontendRirModule rir{};
+            REQUIRE(lower_to_rir(mir.value(), rir));
+            REQUIRE(rir::verify_module(rir.module).ok);
+            CHECK_EQ(rir.module.functions[0].http_method, method.route_method);
+            REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+            CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                     ForwardResponseBufferingMode::CompleteContentLength);
+            rir.destroy();
+        }
+    }
+
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodHead));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodConnect));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodTrace));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodInvalid));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(10));
+}
+
+TEST(frontend, response_read_timeout_bundle_shapes_deduplicate_and_reach_config_exactly) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/one" { return forward(b, response_read_timeout: 1s) }
+route GET "/same" { return forward(b, response_read_timeout: 1000ms) }
+route GET "/different" { return forward(b, response_read_timeout: 2s) }
+route GET "/response" {
+    return forward(b, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "s", date: "current", hide_headers: []
+    }, response_read_timeout: 2s)
+}
+route GET "/triple" {
+    return forward(b, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "s", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: "current",
+        connection: "request", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "s", date: "current",
+        connection: "request", body: b"slow"
+    }, response_read_timeout: 3s)
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const u8 expected[] = {1, 1, 2, 2, 3};
+    for (u32 i = 0; i < 5; i++) {
+        const auto* stmt = ast->items[i + 1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        CHECK(stmt->has_forward_response_read_timeout);
+        CHECK_EQ(stmt->forward_response_read_timeout_seconds, expected[i]);
+    }
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    for (u32 i = 0; i < 5; i++)
+        CHECK_EQ(hir->routes[i].control.direct_term.forward_response_read_timeout_seconds,
+                 expected[i]);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    for (u32 i = 0; i < 5; i++)
+        CHECK_EQ(mir->functions[i].blocks[0].term.forward_response_read_timeout_seconds,
+                 expected[i]);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 4u);
+    const u16 expected_preflight_ids[] = {1, 1, 2, 3, 4};
+    for (u32 i = 0; i < 5; i++)
+        CHECK_EQ(rir.module.functions[i].preflight_forward_policy_bundle_id,
+                 expected_preflight_ids[i]);
+    CHECK(rir::verify_module(rir.module).ok);
+    const ForwardPolicyBundle expected_bundles[] = {
+        {0, 0, 0, 1}, {0, 0, 0, 2}, {1, 0, 0, 2}, {1, 1, 2, 3}};
+    for (u32 i = 0; i < 4; i++) {
+        CHECK_EQ(rir.module.policy_bundles[i].response_policy_id,
+                 expected_bundles[i].response_policy_id);
+        CHECK_EQ(rir.module.policy_bundles[i].failure_policy_id,
+                 expected_bundles[i].failure_policy_id);
+        CHECK_EQ(rir.module.policy_bundles[i].timeout_failure_policy_id,
+                 expected_bundles[i].timeout_failure_policy_id);
+        CHECK_EQ(rir.module.policy_bundles[i].response_read_timeout_seconds,
+                 expected_bundles[i].response_read_timeout_seconds);
+    }
+    rir.destroy();
+}
+
+TEST(frontend, response_read_timeout_rejects_noncanonical_or_effectful_routes) {
+    const char* rejected[] = {
+        R"rut(upstream b
+route GET "/" { let x = 1 return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { req.set("X-Test", "v") return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { wait(1ms) return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { if true { return forward(b, response_read_timeout: 5s) } else { return 200 } }
+)rut",
+        R"rut(upstream b
+route GET "/" { guard true else { return 400 } return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { return forward(b, set_path: "/x", response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { return forward(b, set_header: { "X-Test": "v" }, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+route GET "/" { return forward(b, target_transform: { strip_prefix: "/", replace_prefix: "/x/" }, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+@rateLimit(limit: 2, window: 1m)
+route GET "/" { return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+@throttle(downstream: 5mb, window: 1s)
+route GET "/" { return forward(b, response_read_timeout: 5s) }
+)rut",
+        R"rut(upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain mutate { after add_header(resp) }
+route GET "/" use chain mutate { return forward(b, response_read_timeout: 5s) }
+)rut",
+    };
+    for (const char* source : rejected) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(
+            lit("response_read_timeout currently requires an effect-free direct Forward route")));
+    }
+}
+
+TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismatches) {
+    const char source[] =
+        "upstream b at \"127.0.0.1:9000\"\n"
+        "route GET \"/\" { return forward(b, response_read_timeout: 5s) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    HirRoute copied_hir_route = hir->routes[0];
+    CHECK_EQ(copied_hir_route.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    HirRoute moved_hir_route = static_cast<HirRoute&&>(copied_hir_route);
+    CHECK_EQ(moved_hir_route.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    for (const ForwardPreflightMode forged_mode : {
+             ForwardPreflightMode::None,
+             ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
+             static_cast<ForwardPreflightMode>(0xff),
+         }) {
+        hir->routes[0].forward_preflight_mode = forged_mode;
+        CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    }
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    MirFunction copied_mir_function = mir->functions[0];
+    CHECK_EQ(copied_mir_function.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    MirFunction moved_mir_function = static_cast<MirFunction&&>(copied_mir_function);
+    CHECK_EQ(moved_mir_function.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    for (const ForwardPreflightMode forged_mode : {
+             ForwardPreflightMode::None,
+             ForwardPreflightMode::AfterCanonicalSelection,
+             ForwardPreflightMode::AfterRequestFramingSelection,
+             static_cast<ForwardPreflightMode>(0xff),
+         }) {
+        mir->functions[0].forward_preflight_mode = forged_mode;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+
+    mir->functions[0].state_zero_enters_entry = true;
+    FrontendRirModule rejected{};
+    auto lowered = lower_to_rir(mir.value(), rejected);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    mir->functions[0].state_zero_enters_entry = false;
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    auto* ret = find_first_op(fn, rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 3u);
+
+    fn.preflight_forward_policy_bundle_id = 0;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::None;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = static_cast<ForwardPreflightMode>(0xff);
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    fn.preflight_forward_policy_bundle_id = 99;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.preflight_forward_policy_bundle_id = 1;
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 0;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 5;
+
+    rir.module.policy_bundle_count = 2;
+    rir.module.policy_bundles[1] = {0, 0, 0, 6};
+    fn.preflight_forward_policy_bundle_id = 2;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.preflight_forward_policy_bundle_id = 1;
+    rir.module.policy_bundle_count = 1;
+
+    const rir::ValueId bundle_value = ret->operand(2);
+    REQUIRE_LT(bundle_value.id, fn.value_count);
+    const auto& value = fn.values[bundle_value.id];
+    REQUIRE_LT(value.def_block.id, fn.block_count);
+    auto& bundle_const = fn.blocks[value.def_block.id].insts[value.def_inst];
+    REQUIRE_EQ(bundle_const.op, rir::Opcode::ConstI32);
+    bundle_const.imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    bundle_const.imm.i32_val = 1;
+    CHECK(rir::verify_module(rir.module).ok);
+
+    const rir::ValueId request_policy_value = ret->operand(1);
+    REQUIRE_LT(request_policy_value.id, fn.value_count);
+    const auto& request_policy_def = fn.values[request_policy_value.id];
+    REQUIRE_LT(request_policy_def.def_block.id, fn.block_count);
+    auto& request_policy_const =
+        fn.blocks[request_policy_def.def_block.id].insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    request_policy_const.imm.i32_val = 65537;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.imm.i32_val = 1;
+    CHECK(rir::verify_module(rir.module).ok);
+    char printed_data[4096];
+    rir::PrintBuf printed;
+    printed.init(printed_data, sizeof(printed_data), -1);
+    rir::print_function(printed, fn);
+    REQUIRE_FALSE(printed.overflow);
+    CHECK_NE(
+        std::string(printed.data, printed.len).find("forward_preflight: eager_direct bundle=1"),
+        std::string::npos);
+    rir.destroy();
+}
+
+TEST(frontend, forward_preflight_none_zero_pair_propagates_and_forged_eager_rejects) {
+    const char source[] = "route GET \"/\" { return 204 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::None);
+
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::None;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].forward_preflight_mode, ForwardPreflightMode::None);
+
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::None;
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::None);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 0u);
+
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::None;
+    fn.preflight_forward_policy_bundle_id = 0;
+    CHECK(rir::verify_module(rir.module).ok);
+
+    rir.destroy();
+}
+
+TEST(frontend, timeout_failure_policy_is_carried_as_a_deduplicated_triple_bundle) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/one" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"slow"
+    })
+}
+route GET "/two" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"slow"
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 2u);
+    for (u32 i = 1; i < 3; i++) {
+        const auto* stmt = ast->items[i].route.statements[0];
+        CHECK_EQ(stmt->forward_failure_policy_id, 1u);
+        CHECK_EQ(stmt->forward_timeout_failure_policy_id, 2u);
+    }
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_timeout_failure_policy_id, 2u);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_timeout_failure_policy_id, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_timeout_failure_policy_id, 2u);
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_timeout_failure_policy_id, 2u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.failure_policies[0].status_code, 502u);
+    CHECK_EQ(rir.module.failure_policies[1].status_code, 504u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and_head_mismatch) {
+    const char* response =
+        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", "
+        "date: \"current\", hide_headers: [] }";
+    const char* failure =
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", head_mode: \"suppress_body\", body: b\"bad\" }";
+    auto timeout = [](u32 status, const char* head) {
+        return std::string("timeout_failure_policy: { version: \"HTTP/1.1\", status: ") +
+               std::to_string(status) +
+               ", reason: \"Gateway Time-out\", content_type: \"text/plain\", "
+               "server: \"s\", date: \"current\", connection: \"request\", head_mode: \"" +
+               head + "\", body: b\"slow\" }";
+    };
+    const std::string prefix = "upstream b\nroute GET \"/\" { return forward(b, ";
+    const std::string suffix = ") }\n";
+    const std::string valid_timeout = timeout(504, "suppress_body");
+    const std::string invalid[] = {
+        prefix + valid_timeout + suffix,
+        prefix + response + ", " + valid_timeout + suffix,
+        prefix + response + ", " + failure + ", " + timeout(399, "suppress_body") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(600, "suppress_body") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(504, "reject") + suffix,
+        prefix + response + ", " + failure + ", " + valid_timeout + ", " + valid_timeout + suffix,
+    };
+    for (const auto& source : invalid) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) continue;
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
+TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 500, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\xGG\" }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+    const char* independent =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+    auto independent_lexed = lex(lit(independent));
+    REQUIRE(independent_lexed);
+    auto independent_ast = parse_file_heap(independent_lexed.value());
+    REQUIRE(independent_ast);
+    REQUIRE_EQ(independent_ast->failure_policies.len, 1u);
+    CHECK(independent_ast->failure_policies[0].body.eq(lit("x")));
+    CHECK_EQ(independent_ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+
+    const char* bytes =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\x00\\n\\xff\" }) }\n";
+    auto bytes_lexed = lex(lit(bytes));
+    REQUIRE(bytes_lexed);
+    auto bytes_ast = parse_file_heap(bytes_lexed.value());
+    REQUIRE(bytes_ast);
+    REQUIRE_EQ(bytes_ast->failure_policies[0].body.len, 3u);
+    CHECK(static_cast<u8>(bytes_ast->failure_policies[0].body.ptr[0]) == 0);
+    CHECK(bytes_ast->failure_policies[0].body.ptr[1] == '\n');
+    CHECK(static_cast<u8>(bytes_ast->failure_policies[0].body.ptr[2]) == 0xff);
+
+    const char* empty =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\" }) }\n";
+    auto empty_lexed = lex(lit(empty));
+    REQUIRE(empty_lexed);
+    auto empty_ast = parse_file_heap(empty_lexed.value());
+    REQUIRE(empty_ast);
+    CHECK_EQ(empty_ast->failure_policies[0].body.len, 0u);
+    auto empty_copy = std::make_unique<AstFile>(empty_ast.value());
+    CHECK(empty_copy->failure_policies[0].body.ptr != empty_ast->failure_policies[0].body.ptr);
+    CHECK_EQ(empty_copy->failure_policies[0].body.len, 0u);
+
+    std::string oversized =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"";
+    oversized.append(kMaxFailurePolicyBodyLen + 1, 'x');
+    oversized += "\" }) }\n";
+    auto oversized_lexed = lex({oversized.data(), static_cast<u32>(oversized.size())});
+    REQUIRE(oversized_lexed);
+    CHECK_FALSE(parse_file_heap(oversized_lexed.value()).has_value());
+    char long_reason[kMaxFailurePolicyReasonLen + 2];
+    for (u32 i = 0; i < sizeof(long_reason) - 1; i++) long_reason[i] = 'x';
+    long_reason[sizeof(long_reason) - 1] = '\0';
+    ForwardFailurePolicySpec spec{};
+    spec.version = ForwardFailurePolicyVersion::Http11;
+    spec.status_code = 502;
+    spec.reason = {long_reason, sizeof(long_reason) - 1};
+    spec.content_type = lit("text/plain");
+    spec.server = lit("nginx");
+    spec.date = ForwardFailurePolicyDate::Current;
+    spec.connection = ForwardFailurePolicyConnection::Request;
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.reason = lit("Bad Gateway");
+    spec.head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK(forward_failure_policy_spec_valid(spec));
+    spec.head_mode = FailurePolicyHeadMode::Invalid;
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.head_mode = static_cast<FailurePolicyHeadMode>(3);
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.reason = lit("Bad\rGateway");
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+}
+
+TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
+    const char* src =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"A\\x00\\nB\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // Source has no head_mode key, but a valid internal SuppressBody value
+    // must survive every compiler representation for the later runtime slice.
+    hir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK_EQ(hir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    const Str body = rir.module.failure_policies[0].body;
+    REQUIRE_EQ(body.len, 4u);
+    CHECK(static_cast<u8>(body.ptr[0]) == 'A');
+    CHECK(static_cast<u8>(body.ptr[1]) == 0);
+    CHECK(static_cast<u8>(body.ptr[2]) == '\n');
+    CHECK(static_cast<u8>(body.ptr[3]) == 'B');
+    rir.destroy();
+}
+
+TEST(frontend, failure_policy_head_mode_is_owned_deduplicated_and_printed) {
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "unavailable";
+    ForwardFailurePolicySpec reject{};
+    reject.version = ForwardFailurePolicyVersion::Http11;
+    reject.status_code = 502;
+    reject.date = ForwardFailurePolicyDate::Current;
+    reject.connection = ForwardFailurePolicyConnection::Request;
+    reject.reason = {kReason, sizeof(kReason) - 1};
+    reject.content_type = {kType, sizeof(kType) - 1};
+    reject.server = {kServer, sizeof(kServer) - 1};
+    reject.body = {kBody, sizeof(kBody) - 1};
+    auto suppress = reject;
+    suppress.head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK(forward_failure_policy_spec_valid(reject));
+    CHECK(forward_failure_policy_spec_valid(suppress));
+    auto ast = std::make_unique<AstFile>();
+    CHECK_EQ(ast->add_failure_policy(reject), 1u);
+    CHECK_EQ(ast->add_failure_policy(reject), 1u);
+    CHECK_EQ(ast->add_failure_policy(suppress), 2u);
+
+    rir::Module module{};
+    module.failure_policy_count = 2;
+    module.failure_policies[0] = reject;
+    module.failure_policies[1] = suppress;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "failure_policies: 2\n"
+        "  failure_policy#1: head_mode=reject\n"
+        "  failure_policy#2: head_mode=suppress_body\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+}
+
+TEST(frontend, target_transform_internal_metadata_reaches_rir_and_preserves_policy) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    auto& hir_term = hir->routes[0].control.direct_term;
+    hir_term.has_forward_target_transform = true;
+    hir_term.forward_target_transform = {{strip, 5}, {replace, 4}};
+    hir_term.forward_request_policy_id = 1;
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const auto& mir_term = mir->functions[0].blocks[0].term;
+    CHECK(mir_term.has_forward_target_transform);
+    CHECK(mir_term.forward_target_transform.strip_prefix.eq({strip, 5}));
+    CHECK(mir_term.forward_target_transform.replace_prefix.eq({replace, 4}));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    CHECK(rir.module.target_transforms[0].strip_prefix.ptr != strip);
+    CHECK(rir.module.target_transforms[0].replace_prefix.ptr != replace);
+    CHECK(rir.module.target_transforms[0].strip_prefix.eq({strip, 5}));
+    CHECK(rir.module.target_transforms[0].replace_prefix.eq({replace, 4}));
+
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_EQ(block.inst_count, 4u);
+    CHECK(block.insts[0].op == rir::Opcode::ConstI32);
+    CHECK(block.insts[1].op == rir::Opcode::ConstI32);
+    CHECK(block.insts[2].op == rir::Opcode::ReqSetTargetTransform);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    CHECK(block.insts[3].op == rir::Opcode::RetForward);
+    CHECK_EQ(block.insts[3].operand_count, 2u);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_source_reaches_rir_and_preserves_all_forward_policies) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/api" {
+    return forward(backend,
+        target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
+        request_policy: {
+            version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
+            server: "rut", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "rut", date: "current",
+            connection: "request", body: b"unavailable"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    REQUIRE(stmt->has_forward_target_transform);
+    CHECK(stmt->forward_target_transform.strip_prefix.eq(lit("/api/")));
+    CHECK(stmt->forward_target_transform.replace_prefix.eq(lit("/")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& hterm = hir->routes[0].control.direct_term;
+    REQUIRE(hterm.has_forward_target_transform);
+    CHECK(hterm.forward_target_transform.strip_prefix.eq(lit("/api/")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const auto& mterm = mir->functions[0].blocks[0].term;
+    REQUIRE(mterm.has_forward_target_transform);
+    CHECK_EQ(mterm.forward_request_policy_id, 1u);
+    CHECK_EQ(mterm.forward_response_policy_id, 1u);
+    CHECK_EQ(mterm.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+    CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit("/")));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    const auto& fn = rir.module.functions[0];
+    const auto& block = fn.blocks[0];
+    REQUIRE_EQ(block.inst_count, 5u);
+    const rir::Opcode expected_ops[] = {rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ReqSetTargetTransform,
+                                        rir::Opcode::RetForwardBundle};
+    for (u32 i = 0; i < block.inst_count; i++) CHECK_EQ(block.insts[i].op, expected_ops[i]);
+    CHECK_EQ(block.insts[3].imm.i32_val, 1);
+    const auto& ret = block.insts[4];
+    CHECK_EQ(ret.op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(ret.operand_count, 3u);
+    const i32 expected_operand_constants[] = {0, 1, 1};
+    for (u32 i = 0; i < ret.operand_count; i++) {
+        const auto operand = ret.operand(i);
+        REQUIRE_LT(operand.id, fn.value_count);
+        const auto& value = fn.values[operand.id];
+        CHECK_EQ(value.def_block.id, 0u);
+        CHECK_EQ(value.def_inst, i);
+        const auto& defining_const = block.insts[value.def_inst];
+        CHECK_EQ(defining_const.op, rir::Opcode::ConstI32);
+        CHECK_EQ(defining_const.result.id, operand.id);
+        CHECK_EQ(defining_const.imm.i32_val, expected_operand_constants[i]);
+    }
+    rir.destroy();
+}
+
+TEST(frontend, query_prefix_variants_reach_owned_config_after_source_destruction) {
+    struct Variant {
+        const char* replace_prefix;
+        u32 replace_prefix_len;
+    } variants[] = {{"/v1/?fixed=1", 12}, {"/v1/?", 5}};
+
+    for (const auto& variant : variants) {
+        auto config = std::make_unique<RouteConfig>();
+        {
+            std::string source =
+                "upstream backend at \"127.0.0.1:9000\"\n"
+                "route GET \"/api\" { return forward(backend, target_transform: { strip_prefix: "
+                "\"/api/\", replace_prefix: \"" +
+                std::string(variant.replace_prefix, variant.replace_prefix_len) + "\" }) }\n";
+            auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(lexed);
+            auto ast = parse_file_heap(lexed.value());
+            REQUIRE(ast);
+            auto* statement = ast->items[1].route.statements[0];
+            REQUIRE(statement != nullptr);
+            REQUIRE(statement->has_forward_target_transform);
+            CHECK(statement->forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(statement->forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
+
+            auto hir = analyze_file_heap(ast.value());
+            REQUIRE(hir);
+            const auto& hir_term = hir->routes[0].control.direct_term;
+            REQUIRE(hir_term.has_forward_target_transform);
+            CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(hir_term.forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
+
+            auto mir = build_mir_heap(hir.value());
+            REQUIRE(mir);
+            const auto& mir_term = mir->functions[0].blocks[0].term;
+            REQUIRE(mir_term.has_forward_target_transform);
+            CHECK(mir_term.forward_target_transform.strip_prefix.eq(lit("/api/")));
+            CHECK(mir_term.forward_target_transform.replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
+
+            FrontendRirModule rir{};
+            REQUIRE(lower_to_rir(mir.value(), rir));
+            REQUIRE(rir::verify_module(rir.module).ok);
+            REQUIRE_EQ(rir.module.target_transform_count, 1u);
+            CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+            CHECK(rir.module.target_transforms[0].replace_prefix.eq(
+                {variant.replace_prefix, variant.replace_prefix_len}));
+            REQUIRE(populate_route_config(*config, rir.module));
+            memset(source.data(), 'x', source.size());
+            rir.destroy();
+        }
+
+        REQUIRE_EQ(config->target_transform_count, 1u);
+        REQUIRE_EQ(config->target_transform_bytes_used, 5u + variant.replace_prefix_len);
+        CHECK(config->target_transforms[0].strip_prefix.eq(lit("/api/")));
+        CHECK(config->target_transforms[0].replace_prefix.eq(
+            {variant.replace_prefix, variant.replace_prefix_len}));
+        const uintptr_t pool_begin = reinterpret_cast<uintptr_t>(config->target_transform_bytes);
+        const uintptr_t pool_end = pool_begin + config->target_transform_bytes_used;
+        for (Str value : {config->target_transforms[0].strip_prefix,
+                          config->target_transforms[0].replace_prefix}) {
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+            CHECK(ptr >= pool_begin);
+            CHECK(ptr + value.len <= pool_end);
+        }
+    }
+}
+
+TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: {}) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { replace_prefix: \"/\" "
+        "}) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", strip_prefix: \"/x/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\", extra: \"/x/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: 1, "
+        "replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/?fixed=1\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/v1/?bad#\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", "
+        "replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { "
+        "strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_header: { \"X-Test\": \"v\" }, "
+        "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
+    };
+    for (const char* source : invalid) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+        if (!ast) CHECK_GT(ast.error().span.line, 0u);
+    }
+}
+
+TEST(frontend, target_transform_analyzer_defends_forged_spec) {
+    const char source[] =
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }) }\n";
+    const char query_strip[] = "/api/?fixed=1";
+    const char invalid_query[] = "/v1/?bad#";
+    const ForwardTargetTransformSpec forgeries[] = {
+        {{nullptr, 5}, {"/", 1}},
+        {{query_strip, sizeof(query_strip) - 1}, {"/", 1}},
+        {{"/api/", 5}, {invalid_query, sizeof(invalid_query) - 1}},
+    };
+    for (const auto& forgery : forgeries) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto* stmt = ast->items[1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        stmt->forward_target_transform = forgery;
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, target_transform_rejects_response_mutations_in_direct_and_if_control) {
+    const char* sources[] = {
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access { return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" }) }
+)rut",
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    if req.http11 {
+        return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+    } else { return 200 }
+}
+)rut",
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    match req.http11 {
+        true => {
+            return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+        }
+        _ => return 200
+    }
+}
+)rut"};
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir.has_value());
+        if (!hir)
+            CHECK(hir.error().detail.eq(
+                lit("target_transform cannot be combined with response header mutations")));
+    }
+}
+
+TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
+    std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
+    for (u32 i = 0; i < 3; i++) {
+        source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
+    }
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char strip_a[] = "/api/";
+    char replace_a[] = "/v1/";
+    char strip_b[] = "/web/";
+    char replace_b[] = "/edge/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{strip_a, 5}, {replace_a, 4}};
+    hir->routes[1].control.direct_term.has_forward_target_transform = true;
+    hir->routes[1].control.direct_term.forward_target_transform = {{strip_a, 5}, {replace_a, 4}};
+    hir->routes[2].control.direct_term.has_forward_target_transform = true;
+    hir->routes[2].control.direct_term.forward_target_transform = {{strip_b, 5}, {replace_b, 6}};
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 2u);
+    for (u32 i = 0; i < 3; i++) {
+        const auto* effect =
+            find_first_op(rir.module.functions[i], rir::Opcode::ReqSetTargetTransform);
+        REQUIRE(effect != nullptr);
+        CHECK_EQ(effect->imm.i32_val, i == 2 ? 2 : 1);
+    }
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_precedes_forward_bundle_and_preserves_operands) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/api" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "rut",
+        date: "current",
+        hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1",
+        status: 502,
+        reason: "Bad Gateway",
+        content_type: "text/plain",
+        server: "rut",
+        date: "current",
+        connection: "request",
+        body: b"unavailable"
+    })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{strip, 5}, {replace, 4}};
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    const auto& fn = rir.module.functions[0];
+    const auto& block = fn.blocks[0];
+    REQUIRE_EQ(block.inst_count, 5u);
+    const rir::Opcode expected_ops[] = {rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ReqSetTargetTransform,
+                                        rir::Opcode::RetForwardBundle};
+    for (u32 i = 0; i < block.inst_count; i++) CHECK_EQ(block.insts[i].op, expected_ops[i]);
+    const auto& ret = block.insts[4];
+    REQUIRE_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
+    REQUIRE_EQ(ret.operand_count, 3u);
+    const auto& transform = block.insts[3];
+    CHECK_EQ(static_cast<u8>(transform.op), static_cast<u8>(rir::Opcode::ReqSetTargetTransform));
+    CHECK_EQ(transform.imm.i32_val, 1);
+    // No response-policy dead value is emitted. The bundle is interned before
+    // the explicit zero request-policy value, while RetForwardBundle retains
+    // the ABI operand order upstream/request-policy/bundle.
+    const u32 expected_def_insts[] = {0, 2, 1};
+    const i32 expected_operand_constants[] = {0, 0, 1};
+    for (u32 i = 0; i < ret.operand_count; i++) {
+        const auto operand = ret.operand(i);
+        REQUIRE_LT(operand.id, fn.value_count);
+        const auto& value = fn.values[operand.id];
+        CHECK_EQ(value.def_block.id, 0u);
+        CHECK_EQ(value.def_inst, expected_def_insts[i]);
+        const auto& defining_const = block.insts[value.def_inst];
+        CHECK_EQ(defining_const.op, rir::Opcode::ConstI32);
+        CHECK_EQ(defining_const.result.id, operand.id);
+        CHECK_EQ(defining_const.imm.i32_val, expected_operand_constants[i]);
+    }
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_count_and_aggregate_boundaries_are_atomic) {
+    auto make_source = [](u32 count) {
+        std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
+        for (u32 i = 0; i < count; i++)
+            source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
+        return source;
+    };
+
+    {
+        std::string source = make_source(16);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        std::vector<std::string> strips(16), replaces(16);
+        for (u32 i = 0; i < 16; i++) {
+            strips[i] = "/" + std::string(1, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(1, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), static_cast<u32>(strips[i].size())},
+                {replaces[i].data(), static_cast<u32>(replaces[i].size())}};
+        }
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK_EQ(rir.module.target_transform_count, 16u);
+        CHECK(rir.module.target_transforms[15].replace_prefix.eq({replaces[15].data(), 3}));
+        rir.destroy();
+
+        source = make_source(17);
+        lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        strips.assign(17, {});
+        replaces.assign(17, {});
+        for (u32 i = 0; i < 17; i++) {
+            strips[i] = "/" + std::string(1, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(1, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), static_cast<u32>(strips[i].size())},
+                {replaces[i].data(), static_cast<u32>(replaces[i].size())}};
+        }
+        mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir_overflow{};
+        auto lowered = lower_to_rir(mir.value(), rir_overflow);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::TooManyItems);
+        CHECK_GT(lowered.error().span.line, 0u);
+        CHECK_EQ(rir_overflow.module.target_transform_count, 0u);
+        rir_overflow.destroy();
+    }
+
+    {
+        std::string source = make_source(8);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        std::vector<std::string> strips(8), replaces(8);
+        for (u32 i = 0; i < 8; i++) {
+            strips[i] = "/" + std::string(126, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(126, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), 128}, {replaces[i].data(), 128}};
+        }
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule exact{};
+        REQUIRE(lower_to_rir(mir.value(), exact));
+        REQUIRE_EQ(exact.module.target_transform_count, 8u);
+        u32 exact_bytes = 0;
+        for (u32 i = 0; i < exact.module.target_transform_count; i++) {
+            exact_bytes += exact.module.target_transforms[i].strip_prefix.len;
+            exact_bytes += exact.module.target_transforms[i].replace_prefix.len;
+        }
+        CHECK_EQ(exact_bytes, kForwardTargetTransformBytes);
+        exact.destroy();
+
+        source = make_source(9);
+        lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        strips.assign(9, {});
+        replaces.assign(9, {});
+        for (u32 i = 0; i < 9; i++) {
+            strips[i] = "/" + std::string(126, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(126, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), 128}, {replaces[i].data(), 128}};
+        }
+        mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::TooManyItems);
+        CHECK_GT(lowered.error().span.line, 0u);
+        CHECK_EQ(rir.module.target_transform_count, 0u);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transparent) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char replace[] = "/v1/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1}, {replace, 4}};
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rejected{};
+    auto lowered = lower_to_rir(mir.value(), rejected);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(rejected.module.target_transform_count, 0u);
+    rejected.destroy();
+
+    auto ast_plain = parse_file_heap(lexed.value());
+    REQUIRE(ast_plain);
+    auto hir_plain = analyze_file_heap(ast_plain.value());
+    REQUIRE(hir_plain);
+    hir_plain->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1},
+                                                                         {replace, 4}};
+    auto mir_plain = build_mir_heap(hir_plain.value());
+    REQUIRE(mir_plain);
+    FrontendRirModule plain{};
+    REQUIRE(lower_to_rir(mir_plain.value(), plain));
+    CHECK_EQ(plain.module.target_transform_count, 0u);
+    CHECK_FALSE(function_has_op(plain.module.functions[0], rir::Opcode::ReqSetTargetTransform));
+    const auto* ret = find_first_op(plain.module.functions[0], rir::Opcode::RetForward);
+    REQUIRE(ret != nullptr);
+    CHECK_EQ(ret->operand_count, 1u);
+    plain.destroy();
+}
+
+TEST(frontend, target_transform_lowering_defends_forged_query_specs) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    const char query_strip[] = "/api/?fixed=1";
+    const char invalid_query[] = "/v1/?bad#";
+    const ForwardTargetTransformSpec forgeries[] = {
+        {{query_strip, sizeof(query_strip) - 1}, {"/", 1}},
+        {{"/api/", 5}, {invalid_query, sizeof(invalid_query) - 1}},
+    };
+
+    for (const auto& forgery : forgeries) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto& term = hir->routes[0].control.direct_term;
+        term.has_forward_target_transform = true;
+        term.forward_target_transform = forgery;
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rir.module.target_transform_count, 0u);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" {\n"
+        "  return redirect({"
+        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
+        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
+        "body: b\"OK\\n\\x00\"})\n"
+        "}\n"
+        "route POST \"/other\" { return redirect({"
+        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
+        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
+        "body: b\"OK\\n\\x00\"})\n"
+        "}\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].status_code, 301u);
+    CHECK_EQ(ast->redirect_policies[0].body.len, 4u);
+    CHECK_EQ(static_cast<unsigned char>(ast->redirect_policies[0].body.ptr[3]), 0u);
+    auto* ast_copy = new AstFile(ast.value());
+    CHECK(ast_copy->redirect_policies[0].body.ptr != ast->redirect_policies[0].body.ptr);
+    CHECK_EQ(ast_copy->redirect_policies[0].body.ptr[0], 'O');
+    delete ast_copy;
+    auto* ast_stmt = ast->items[1].route.statements[0];
+    ast_stmt->redirect_policy_id = 2;
+    auto forged_hir = analyze_file_heap(ast.value());
+    CHECK_FALSE(forged_hir.has_value());
+    ast_stmt->redirect_policy_id = 1;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.direct_term.redirect_policy_id, 1u);
+    hir->routes[0].control.direct_term.redirect_policy_id = 2;
+    auto forged_mir = build_mir_heap(hir.value());
+    CHECK_FALSE(forged_mir.has_value());
+    hir->routes[0].control.direct_term.redirect_policy_id = 1;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.kind, MirTerminatorKind::Redirect);
+    CHECK_EQ(mir->functions[0].blocks[0].term.redirect_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    CHECK_EQ(rir.module.redirect_policies[0].body.len, 4u);
+    auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetRedirect);
+    REQUIRE(ret != nullptr);
+    CHECK_EQ(ret->operand_count, 0u);
+    CHECK_EQ(ret->imm.i32_val, 1);
+    auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    ret->imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    ret->imm.i32_val = 1;
+    rir.destroy();
+}
+
+TEST(frontend, fixed_redirect_source_is_complete_and_reaches_rir) {
+    // Object fields are intentionally far from declaration order: redirect
+    // objects are name-based and must not gain an accidental positional ABI.
+    const char source[] =
+        "route GET \"/old\" { return redirect({"
+        "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
+        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
+        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
+        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
+        "path: \"static\", authority: \"static\"}) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].authority, RedirectPolicyAuthority::Static);
+    CHECK(ast->redirect_policies[0].static_authority.eq(lit_str("redirect.example")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    CHECK(redirect_policy_spec_valid(rir.module.redirect_policies[0]));
+    CHECK_EQ(rir.module.redirect_policies[0].scheme, RedirectPolicyScheme::Http);
+    CHECK_EQ(rir.module.redirect_policies[0].port, RedirectPolicyPort::Omit);
+    CHECK_EQ(rir.module.redirect_policies[0].path, RedirectPolicyPath::Static);
+    CHECK_EQ(rir.module.redirect_policies[0].query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(rir.module.redirect_policies[0].date, RedirectPolicyDate::Current);
+    CHECK_EQ(rir.module.redirect_policies[0].connection, RedirectPolicyConnection::Close);
+    CHECK_EQ(rir.module.redirect_policies[0].status_code, 301u);
+    CHECK_NE(rir.module.redirect_policies[0].static_authority.ptr,
+             ast->redirect_policies[0].static_authority.ptr);
+    CHECK(rir.module.redirect_policies[0].static_authority.eq(lit_str("redirect.example")));
+    CHECK_EQ(rir.module.redirect_policies[0].header_order,
+             RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    rir.destroy();
+}
+
+TEST(frontend, build_mir_releases_provisional_module_on_post_allocation_errors) {
+    const char source[] =
+        "route GET \"/old\" {\n"
+        "  let observed = req.path\n"
+        "  return redirect({"
+        "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
+        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
+        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
+        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
+        "path: \"static\", authority: \"static\"})\n"
+        "}\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    REQUIRE(redirect_policy_spec_valid(hir->redirect_policies[0]));
+
+    {
+        auto forged = std::make_unique<HirModule>(hir.value());
+        forged->redirect_policies[0].status_code = 303;
+        REQUIRE_FALSE(redirect_policy_spec_valid(forged->redirect_policies[0]));
+        auto rejected = build_mir(*forged);
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rejected.error().span.start, 0u);
+        CHECK_EQ(rejected.error().span.end, 0u);
+        CHECK_EQ(rejected.error().span.line, 1u);
+        CHECK_EQ(rejected.error().span.col, 1u);
+        CHECK_EQ(rejected.error().detail.ptr, nullptr);
+        CHECK_EQ(rejected.error().detail.len, 0u);
+    }
+
+    {
+        auto forged = std::make_unique<HirModule>(hir.value());
+        auto& init = forged->routes[0].locals[0].init;
+        const Span init_span = init.span;
+        init.kind = HirExprKind::ArrayLit;
+        auto rejected = build_mir(*forged);
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(rejected.error().span.start, init_span.start);
+        CHECK_EQ(rejected.error().span.end, init_span.end);
+        CHECK_EQ(rejected.error().span.line, init_span.line);
+        CHECK_EQ(rejected.error().span.col, init_span.col);
+        CHECK_EQ(rejected.error().detail.ptr, nullptr);
+        CHECK_EQ(rejected.error().detail.len, 0u);
+    }
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->redirect_policies[0].status_code, 301u);
+}
+
+TEST(frontend, fixed_302_redirect_crosses_all_frontend_boundaries_and_forgery_fails_closed) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 302,
+      reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
+      target_path: "/new", body: b"fixed-302"})
+  } else { return forward(backend) }
+}
+)rut";
+
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].status_code, 302u);
+    CHECK(ast->redirect_policies[0].reason.eq(lit_str("Moved Temporarily")));
+    CHECK_EQ(ast->redirect_policies[0].authority, RedirectPolicyAuthority::Static);
+
+    auto forged_ast = parse_file_heap(lexed.value());
+    REQUIRE(forged_ast);
+    forged_ast->redirect_policies[0].status_code = 303;
+    CHECK_FALSE(analyze_file_heap(forged_ast.value()).has_value());
+    forged_ast->redirect_policies[0].status_code = 302;
+    forged_ast->redirect_policies[0].port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(analyze_file_heap(forged_ast.value()).has_value());
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    CHECK_EQ(hir->redirect_policies[0].status_code, 302u);
+    CHECK_EQ(hir->routes[0].control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto forged_hir = analyze_file_heap(ast.value());
+    REQUIRE(forged_hir);
+    forged_hir->redirect_policies[0].status_code = 303;
+    CHECK_FALSE(build_mir_heap(forged_hir.value()).has_value());
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->redirect_policies[0].status_code, 302u);
+
+    auto forged_mir = build_mir_heap(hir.value());
+    REQUIRE(forged_mir);
+    forged_mir->redirect_policies[0].status_code = 303;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(forged_mir.value(), rejected).has_value());
+    CHECK_EQ(rejected.module.redirect_policy_count, 0u);
+    rejected.destroy();
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    const auto& policy = rir.module.redirect_policies[0];
+    CHECK_EQ(policy.status_code, 302u);
+    CHECK_EQ(policy.scheme, RedirectPolicyScheme::Http);
+    CHECK_EQ(policy.authority, RedirectPolicyAuthority::Static);
+    CHECK_EQ(policy.port, RedirectPolicyPort::Omit);
+    CHECK_EQ(policy.path, RedirectPolicyPath::Static);
+    CHECK_EQ(policy.query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(policy.date, RedirectPolicyDate::Current);
+    CHECK_EQ(policy.connection, RedirectPolicyConnection::Close);
+    CHECK_EQ(policy.header_order, RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK(policy.static_authority.eq(lit_str("redirect.example")));
+    CHECK(policy.reason.eq(lit_str("Moved Temporarily")));
+    CHECK(policy.body.eq(lit_str("fixed-302")));
+
+    char printed_bytes[4096];
+    rir::PrintBuf printed;
+    printed.init(printed_bytes, sizeof(printed_bytes), -1);
+    rir::Module printed_module{};
+    printed_module.redirect_policy_count = 1;
+    printed_module.redirect_policies[0] = policy;
+    rir::print_module(printed, printed_module);
+    REQUIRE_FALSE(printed.overflow);
+    const std::string text(printed.data, printed.len);
+    CHECK(text.find("header_order=connection_then_location, status=302") != std::string::npos);
+    CHECK(text.find("reason=\"Moved Temporarily\"") != std::string::npos);
+    CHECK(text.find("static_authority=\"redirect.example\"") != std::string::npos);
+
+    rir.module.redirect_policies[0].status_code = 303;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.redirect_policies[0].status_code = 302;
+    rir.module.redirect_policies[0].port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
+    const char* sources[] = {
+        "route GET \"/\" { return redirect({scheme: \"http\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: "
+        "\"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", "
+        "date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\", extra: 1}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: \"301\", reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x?y=1\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"omit\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"discard\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
+        "\"current\", connection: \"close\", header_order: \"connection_then_location\", "
+        "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
+        "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
+        "query: \"discard\", date: \"current\", connection: \"close\", status: 301, "
+        "reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", "
+        "target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
+        "query: \"discard\", date: \"current\", connection: \"close\", header_order: "
+        "\"connection_then_location\", status: 303, reason: \"See Other\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
+        "\"current\", connection: \"close\", header_order: \"location_then_connection\", "
+        "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
+        "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", static_authority: \"other.example\", port: "
+        "\"omit\", path: \"static\", query: \"discard\", date: \"current\", connection: "
+        "\"close\", header_order: \"connection_then_location\", status: 301, reason: "
+        "\"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: "
+        "\"/x\", body: b\"\"}) }",
+    };
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, inline_redirect_duplicate_policy_is_transactional_and_stable) {
+    const char source[] = R"rut(
+route GET "/a" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/b" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/c" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"unique"}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 2u);
+    CHECK_EQ(ast->items[0].route.statements[0]->redirect_policy_id, 1u);
+    CHECK_EQ(ast->items[1].route.statements[0]->redirect_policy_id, 1u);
+    CHECK_EQ(ast->items[2].route.statements[0]->redirect_policy_id, 2u);
+    CHECK_EQ(ast->redirect_policy_body_pool.len, 10u);
+    CHECK(ast->redirect_policies[0].body.eq(lit_str("same")));
+    CHECK(ast->redirect_policies[1].body.eq(lit_str("unique")));
+}
+
+TEST(frontend, inline_redirect_chain_after_rejects_selected_control_paths) {
+    const char* sources[] = {
+        R"rut(
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) }
+)rut",
+        R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { if req.method == GET { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b) } }
+)rut",
+        R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { match req.method { GET => return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
+)rut",
+    };
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
+TEST(frontend, inline_redirect_chain_after_guard_failure_does_not_commit) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access {
+    guard req.http11 else {
+        return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""})
+    }
+    return forward(b)
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    const auto& guard_redirect = hir->routes[0].guards[0].fail_term;
+    CHECK_EQ(guard_redirect.kind, HirTerminatorKind::Redirect);
+    CHECK_FALSE(guard_redirect.commit_response_mutations);
+    CHECK_EQ(hir->routes[0].control.direct_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const MirTerminator* mir_redirect = nullptr;
+    const MirTerminator* mir_forward = nullptr;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::Redirect) mir_redirect = &term;
+        if (term.kind == MirTerminatorKind::ForwardUpstream) mir_forward = &term;
+    }
+    REQUIRE(mir_redirect != nullptr);
+    REQUIRE(mir_forward != nullptr);
+    CHECK_FALSE(mir_redirect->commit_response_mutations);
+    CHECK(mir_forward->commit_response_mutations);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 redirects = 0;
+    u32 forwards = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            redirects += block.insts[ii].op == rir::Opcode::RetRedirect;
+            forwards += block.insts[ii].op == rir::Opcode::RetForward;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(redirects, 1u);
+    CHECK_EQ(forwards, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_sibling) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route "/" {
+  if req.method == GET && req.pathOnly == "/api" {
+    return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
+      path: "static", query: "preserve_raw", date: "current", connection: "close",
+      status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html",
+      target_path: "/api/", body: b"redirect"})
+  } else {
+    return forward(backend,
+      target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length",
+        connection: "keep_alive", server: "s", date: "current", hide_headers: [] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: "current", connection: "request",
+        body: b"unavailable" })
+  }
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.kind, HirControlKind::If);
+    CHECK_EQ(hir->routes[0].control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.then_term.redirect_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.kind, MirTerminatorKind::Branch);
+    auto* mir_redirect = static_cast<MirTerminator*>(nullptr);
+    auto* mir_forward = static_cast<MirTerminator*>(nullptr);
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::Redirect) mir_redirect = &term;
+        if (term.kind == MirTerminatorKind::ForwardUpstream) mir_forward = &term;
+    }
+    REQUIRE(mir_redirect != nullptr);
+    REQUIRE(mir_forward != nullptr);
+    CHECK_EQ(mir_redirect->redirect_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_request_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_response_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_failure_policy_id, 1u);
+    CHECK(mir_forward->has_forward_target_transform);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    bool saw_redirect = false;
+    bool saw_forward = false;
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        const auto& fn = rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::RetRedirect) {
+                    saw_redirect = true;
+                    CHECK_EQ(inst.imm.i32_val, 1);
+                    CHECK_EQ(inst.operand_count, 0u);
+                }
+                if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                saw_forward = true;
+                CHECK_EQ(inst.operand_count, 3u);
+                CHECK_EQ(const_i32_value(block, inst.operands[1]), 1);
+                CHECK_EQ(const_i32_value(block, inst.operands[2]), 1);
+                REQUIRE(ii > 0);
+                CHECK_EQ(block.insts[ii - 1].op, rir::Opcode::ReqSetTargetTransform);
+                CHECK_EQ(block.insts[ii - 1].imm.i32_val, 1);
+            }
+        }
+    }
+    CHECK(saw_redirect);
+    CHECK(saw_forward);
+    REQUIRE(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, unmatched_local_response_metadata_reaches_rir_with_canonical_ids) {
+    const char source[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"options"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"connect"
+}) }
+unmatched TRACE { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"trace"
+}) }
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"A\x00\nB"
+}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 4u);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 4u);
+    CHECK_EQ(ast->items[0].unmatched.method_slot, kRouteMethodOptions);
+    CHECK_EQ(ast->items[0].unmatched.policy_id, 1u);
+    CHECK_EQ(ast->items[1].unmatched.method_slot, kRouteMethodConnect);
+    CHECK_EQ(ast->items[1].unmatched.policy_id, 2u);
+    CHECK_EQ(ast->items[2].unmatched.method_slot, kRouteMethodTrace);
+    CHECK_EQ(ast->items[2].unmatched.policy_id, 3u);
+    CHECK(ast->items[3].unmatched.method_is_any);
+    CHECK_EQ(ast->items[3].unmatched.policy_id, 4u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodAny], 4u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodTrace], 3u);
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    REQUIRE_EQ(ast_copy->strict_local_response_policies[3].body.len, 4u);
+    CHECK(ast_copy->strict_local_response_policies[3].body.ptr !=
+          ast->strict_local_response_policies[3].body.ptr);
+    CHECK(static_cast<u8>(ast_copy->strict_local_response_policies[3].body.ptr[1]) == 0);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 4u);
+    CHECK_EQ(hir->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 4u);
+    CHECK_EQ(mir->unmatched_policy_ids[kRouteMethodTrace], 3u);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 4u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodAny], 4u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq(lit("Bad Request")));
+    const Str body = lowered.module.strict_local_response_policies[3].body;
+    REQUIRE_EQ(body.len, 4u);
+    CHECK(static_cast<u8>(body.ptr[0]) == 'A');
+    CHECK(static_cast<u8>(body.ptr[1]) == 0);
+    CHECK(body.ptr[2] == '\n');
+    CHECK(static_cast<u8>(body.ptr[3]) == 'B');
+
+    char output[4096];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    CHECK_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    const std::string expected =
+        "strict_local_response_policies: 4\n"
+        "  local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+        "server=\"rut\", content_type=\"text/html\", date=current, connection=request, "
+        "head_mode=reject, body=b\"options\" (len=7)\n"
+        "  local_response#2: version=HTTP/1.1, status=405, reason=\"Not Allowed\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=reject, body=b\"connect\" (len=7)\n"
+        "  local_response#3: version=HTTP/1.1, status=403, reason=\"Forbidden\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"trace\" (len=5)\n"
+        "  local_response#4: version=HTTP/1.1, status=404, reason=\"Not Found\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"A\\x00\\nB\" (len=4)\n"
+        "unmatched:\n"
+        "  ANY -> local_response#4\n"
+        "  OPTIONS -> local_response#1\n"
+        "  CONNECT -> local_response#2\n"
+        "  TRACE -> local_response#3\n";
+    CHECK(printed == expected);
+    lowered.destroy();
+}
+
+TEST(frontend, exact_local_response_metadata_is_lossless_without_executable_routes) {
+    static constexpr char kSource[] = R"rut(
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+route exact GET "/health" { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"missing"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::ExactStrictLocalResponse);
+    CHECK_EQ(ast->items[1].kind, AstItemKind::ExactStrictLocalResponse);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 2u);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 2u);
+    const auto& any = ast->exact_strict_local_response_bindings[0];
+    const auto& get = ast->exact_strict_local_response_bindings[1];
+    CHECK_EQ(any.method, kRouteMethodAny);
+    CHECK_EQ(any.policy_id, 1u);
+    CHECK((Str{any.path, any.path_len}.eq(lit("/static"))));
+    CHECK_EQ(get.method, kRouteMethodGet);
+    CHECK_EQ(get.policy_id, 2u);
+    CHECK((Str{get.path, get.path_len}.eq(lit("/health"))));
+    for (u32 i = any.path_len; i < sizeof(any.path); i++) CHECK_EQ(any.path[i], 0);
+
+    auto copied = std::make_unique<AstFile>(ast.value());
+    CHECK_EQ(copied->exact_strict_local_response_bindings.len, 2u);
+    CHECK((Str{copied->exact_strict_local_response_bindings[0].path,
+               copied->exact_strict_local_response_bindings[0].path_len}
+               .eq(lit("/static"))));
+    auto moved = std::make_unique<AstFile>(std::move(*copied));
+    REQUIRE_EQ(moved->exact_strict_local_response_bindings.len, 2u);
+    CHECK((Str{moved->exact_strict_local_response_bindings[1].path,
+               moved->exact_strict_local_response_bindings[1].path_len}
+               .eq(lit("/health"))));
+    auto forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->exact_strict_local_response_bindings[0].reserved1 = 1;
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+    forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->exact_strict_local_response_bindings[0].path_view = static_cast<ExactPathView>(255);
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+    forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
+    forged_ast->exact_strict_local_response_bindings[0].path[2] = '/';
+    forged_ast->exact_strict_local_response_bindings[0].path[3] = '/';
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+    forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->items[1].exact_strict_local_response.method = static_cast<u8>(TokenType::KwPost);
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 2u);
+    auto forged_hir = std::make_unique<HirModule>(hir.value());
+    forged_hir->exact_strict_local_response_bindings[0].policy_id = 2;
+    CHECK_FALSE(build_mir_heap(*forged_hir).has_value());
+    forged_hir = std::make_unique<HirModule>(hir.value());
+    forged_hir->exact_strict_local_response_bindings[0].path_view = ExactPathView::SlashNormalized;
+    forged_hir->exact_strict_local_response_bindings[0].path[2] = '/';
+    forged_hir->exact_strict_local_response_bindings[0].path[3] = '/';
+    CHECK_FALSE(build_mir_heap(*forged_hir).has_value());
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 2u);
+    auto forged_mir = std::make_unique<MirModule>(mir.value());
+    forged_mir->exact_strict_local_response_bindings.data[5].path_view =
+        static_cast<ExactPathView>(255);
+    FrontendRirModule forged_lowered{};
+    CHECK_FALSE(lower_to_rir(*forged_mir, forged_lowered).has_value());
+    forged_lowered.destroy();
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 2u);
+    CHECK((Str{lowered.module.exact_strict_local_response_bindings[0].path,
+               lowered.module.exact_strict_local_response_bindings[0].path_len}
+               .eq(lit("/static"))));
+
+    char output[2048];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    CHECK_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    CHECK(printed.find("exact:\n  ANY \"/static\" -> local_response#1\n"
+                       "  GET \"/health\" -> local_response#2\n") != std::string::npos);
+    lowered.destroy();
+}
+
+TEST(frontend, slash_normalized_exact_metadata_is_owned_lossless_and_view_distinct) {
+    static_assert(sizeof(ExactStrictLocalResponseBinding) == 72);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, path) == 0);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, path_len) == 63);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, method) == 64);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, path_view) == 65);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, policy_id) == 66);
+    static_assert(offsetof(ExactStrictLocalResponseBinding, reserved1) == 68);
+
+    FrontendRirModule lowered{};
+    {
+        std::string source = R"rut(
+route exact GET "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Raw Get", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"raw-get"
+}) }
+route exact slash_normalized GET "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 401, reason: "Normalized Get", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"normalized-get"
+}) }
+route exact "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 402, reason: "Raw Any", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"raw-any"
+}) }
+route exact slash_normalized "/health/check" { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Normalized Any", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"normalized-any"
+}) }
+)rut";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 4u);
+        CHECK_EQ(ast->items[1].exact_strict_local_response.binding.path_view,
+                 ExactPathView::SlashNormalized);
+        CHECK_EQ(ast->items[3].exact_strict_local_response.binding.path_view,
+                 ExactPathView::SlashNormalized);
+        CHECK_FALSE(ast->items[1].exact_strict_local_response.method_is_any);
+        CHECK(ast->items[3].exact_strict_local_response.method_is_any);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[1].path_view,
+                 ExactPathView::SlashNormalized);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[2].path_view, ExactPathView::Raw);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[3].path_view,
+                 ExactPathView::SlashNormalized);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[1].method, kRouteMethodGet);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[2].method, kRouteMethodAny);
+        CHECK_EQ(ast->exact_strict_local_response_bindings[3].method, kRouteMethodAny);
+
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 4u);
+        CHECK_EQ(hir->exact_strict_local_response_bindings[1].path_view,
+                 ExactPathView::SlashNormalized);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 4u);
+        CHECK_EQ(mir->exact_strict_local_response_bindings[3].path_view,
+                 ExactPathView::SlashNormalized);
+        REQUIRE(lower_to_rir(mir.value(), lowered));
+        source.assign(source.size(), 'x');
+    }
+
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 4u);
+    for (u32 i = 0; i < 4; i++) {
+        const auto& binding = lowered.module.exact_strict_local_response_bindings[i];
+        CHECK((Str{binding.path, binding.path_len}.eq(lit("/health/check"))));
+        CHECK_EQ(binding.reserved1, 0u);
+    }
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[0].path_view, ExactPathView::Raw);
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[1].path_view,
+             ExactPathView::SlashNormalized);
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[2].path_view, ExactPathView::Raw);
+    CHECK_EQ(lowered.module.exact_strict_local_response_bindings[3].path_view,
+             ExactPathView::SlashNormalized);
+
+    char output[4096];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    CHECK_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    const std::string expected =
+        "strict_local_response_policies: 4\n"
+        "  local_response#1: version=HTTP/1.1, status=400, reason=\"Raw Get\", server=\"rut\", "
+        "content_type=\"text/plain\", date=current, connection=request, head_mode=reject, "
+        "body=b\"raw-get\" (len=7)\n"
+        "  local_response#2: version=HTTP/1.1, status=401, reason=\"Normalized Get\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=reject, body=b\"normalized-get\" (len=14)\n"
+        "  local_response#3: version=HTTP/1.1, status=402, reason=\"Raw Any\", server=\"rut\", "
+        "content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"raw-any\" (len=7)\n"
+        "  local_response#4: version=HTTP/1.1, status=403, reason=\"Normalized Any\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"normalized-any\" (len=14)\n"
+        "unmatched:\n"
+        "exact:\n"
+        "  GET \"/health/check\" -> local_response#1\n"
+        "  GET slash_normalized \"/health/check\" -> local_response#2\n"
+        "  ANY \"/health/check\" -> local_response#3\n"
+        "  ANY slash_normalized \"/health/check\" -> local_response#4\n";
+    CHECK(printed == expected);
+    lowered.destroy();
+}
+
+TEST(frontend, exact_local_response_accepts_the_62_byte_path_boundary_losslessly) {
+    const std::string path = "/" + std::string(kMaxExactStrictLocalResponsePathLen - 1, 'x');
+    REQUIRE_EQ(path.size(), static_cast<std::size_t>(kMaxExactStrictLocalResponsePathLen));
+    const std::string source =
+        "route exact GET \"" + path +
+        "\" { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+        "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+        "body: b\"boundary\" }) }\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::ExactStrictLocalResponse);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 1u);
+    const auto& ast_binding = ast->exact_strict_local_response_bindings[0];
+    CHECK_EQ(ast_binding.path_len, kMaxExactStrictLocalResponsePathLen);
+    CHECK_EQ(ast_binding.path[kMaxExactStrictLocalResponsePathLen], '\0');
+    CHECK_EQ(ast_binding.path_view, ExactPathView::Raw);
+    CHECK_EQ(ast_binding.reserved1, 0u);
+    CHECK_EQ(ast_binding.method, kRouteMethodGet);
+    CHECK_EQ(ast_binding.policy_id, 1u);
+    CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(
+        {path.data(), static_cast<u32>(path.size())})));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 1u);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 1u);
+    const auto& rir_binding = lowered.module.exact_strict_local_response_bindings[0];
+    CHECK_EQ(rir_binding.path_len, kMaxExactStrictLocalResponsePathLen);
+    CHECK_EQ(rir_binding.path[kMaxExactStrictLocalResponsePathLen], '\0');
+    CHECK_EQ(rir_binding.path_view, ExactPathView::Raw);
+    CHECK_EQ(rir_binding.reserved1, 0u);
+    CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(
+        {path.data(), static_cast<u32>(path.size())})));
+    for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
+        CHECK(exact_strict_local_response_binding_is_neutral(
+            lowered.module.exact_strict_local_response_bindings[i]));
+    lowered.destroy();
+}
+
+TEST(frontend, exact_and_unmatched_source_tables_coexist_with_same_path_any_and_get) {
+    static constexpr char kSource[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"unmatched"
+}) }
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"any"
+}) }
+route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"get"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 3u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 2u);
+    const auto check_bindings = [&](const auto& bindings) {
+        const auto& any = bindings[0];
+        const auto& get = bindings[1];
+        CHECK_EQ(any.method, kRouteMethodAny);
+        CHECK_EQ(any.policy_id, 2u);
+        CHECK((Str{any.path, any.path_len}.eq(lit("/static"))));
+        CHECK_EQ(get.method, kRouteMethodGet);
+        CHECK_EQ(get.policy_id, 3u);
+        CHECK((Str{get.path, get.path_len}.eq(lit("/static"))));
+    };
+    check_bindings(ast->exact_strict_local_response_bindings);
+    CHECK(strict_local_response_source_table_valid(ast->strict_local_response_policies.data,
+                                                   ast->strict_local_response_policies.len,
+                                                   ast->unmatched_policy_ids,
+                                                   ast->exact_strict_local_response_bindings.data,
+                                                   ast->exact_strict_local_response_bindings.len));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    CHECK_EQ(hir->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 2u);
+    check_bindings(hir->exact_strict_local_response_bindings);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    CHECK_EQ(mir->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 2u);
+    check_bindings(mir->exact_strict_local_response_bindings);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 2u);
+    check_bindings(lowered.module.exact_strict_local_response_bindings);
+    lowered.destroy();
+}
+
+TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
+    auto source_for = [](const std::string& selector, const char* head_mode = "suppress_body") {
+        return "route exact " + selector +
+               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
+               head_mode + "\", body: b\"x\" }) }\n";
+    };
+    const std::string too_long = "/" + std::string(kMaxExactStrictLocalResponsePathLen, 'x');
+    const std::string invalid_selectors[] = {
+        "ANY \"/static\"",
+        "FOO \"/static\"",
+        "\"\"",
+        "\"static\"",
+        "\"/a?b\"",
+        "\"/a#b\"",
+        "\"/a:b\"",
+        "\"/a*b\"",
+        "\"/a$var\"",
+        "\"/a{b}\"",
+        "\"/a\\\\b\"",
+        "\"" + too_long + "\"",
+    };
+    for (const auto& selector : invalid_selectors) {
+        const std::string source = source_for(selector);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) continue;
+        CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    }
+    for (const std::string& source : {
+             source_for("\"/static\"", "reject"),
+             source_for("HEAD \"/static\"", "reject"),
+         }) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    }
+    const std::string duplicate =
+        source_for("GET \"/static\"", "reject") + source_for("GET \"/static\"", "reject");
+    auto duplicate_lexed = lex({duplicate.data(), static_cast<u32>(duplicate.size())});
+    REQUIRE(duplicate_lexed);
+    CHECK_FALSE(parse_file_heap(duplicate_lexed.value()).has_value());
+
+    const std::string generic = "route exact GET \"/static\" { return 200 }\n";
+    auto generic_lexed = lex({generic.data(), static_cast<u32>(generic.size())});
+    REQUIRE(generic_lexed);
+    CHECK_FALSE(parse_file_heap(generic_lexed.value()).has_value());
+
+    const std::string normalized_invalid[] = {
+        "slash_normalized \"/\"",
+        "slash_normalized \"//health\"",
+        "slash_normalized \"/health//check\"",
+        "slash_normalized \"/health///\"",
+        "slash_normalized \"health\"",
+        "slash_normalized \"/a?b\"",
+        "slash_normalized \"/a#b\"",
+        "slash_normalized \"/a:b\"",
+        "slash_normalized \"/a*b\"",
+        "slash_normalized \"/a$var\"",
+        "slash_normalized \"/a{b}\"",
+        "slash_normalized \"/a\\\\b\"",
+        "slash_normalized \"" + too_long + "\"",
+    };
+    for (const std::string& selector : normalized_invalid) {
+        const std::string source = source_for(selector);
+        auto normalized_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(normalized_lexed);
+        auto rejected = parse_file_heap(normalized_lexed.value());
+        REQUIRE_FALSE(rejected);
+        CHECK_EQ(rejected.error().code, FrontendError::UnsupportedSyntax);
+        const std::size_t quote = source.find('"');
+        REQUIRE(quote != std::string::npos);
+        CHECK_EQ(rejected.error().span.start, static_cast<u32>(quote + 1u));
+        CHECK_EQ(rejected.error().span.line, 1u);
+        CHECK_EQ(rejected.error().span.col, static_cast<u32>(quote + 2u));
+    }
+
+    const std::string exact_boundary =
+        "/" + std::string(kMaxExactStrictLocalResponsePathLen - 1, 'x');
+    const std::string normalized_valid[] = {
+        "slash_normalized GET \"/health/check/\"",
+        "slash_normalized GET \"/a/./b\"",
+        "slash_normalized GET \"/a/%2F/b\"",
+        "slash_normalized GET \"" + exact_boundary + "\"",
+    };
+    for (const std::string& selector : normalized_valid) {
+        const std::string source = source_for(selector, "reject");
+        auto valid_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(valid_lexed);
+        auto valid = parse_file_heap(valid_lexed.value());
+        REQUIRE(valid);
+        REQUIRE_EQ(valid->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(valid->exact_strict_local_response_bindings[0].path_view,
+                 ExactPathView::SlashNormalized);
+    }
+
+    const std::string normalized_duplicate =
+        source_for("slash_normalized GET \"/static\"", "reject") +
+        source_for("slash_normalized GET \"/static\"", "reject");
+    auto normalized_duplicate_lexed =
+        lex({normalized_duplicate.data(), static_cast<u32>(normalized_duplicate.size())});
+    REQUIRE(normalized_duplicate_lexed);
+    CHECK_FALSE(parse_file_heap(normalized_duplicate_lexed.value()).has_value());
+
+    std::string capacity;
+    auto capacity_source_for = [](u32 i) {
+        return "route exact slash_normalized GET \"/n" + std::to_string(i) +
+               "\" { return local_response({ version: \"HTTP/1.1\" status: 400 "
+               "reason: \"Bad\" server: \"rut\" date: \"current\" content_type: \"x\" "
+               "connection: \"request\" head_mode: \"reject\" body: b\"x\" }) }\n";
+    };
+    for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++)
+        capacity += capacity_source_for(i);
+    auto capacity_lexed = lex({capacity.data(), static_cast<u32>(capacity.size())});
+    REQUIRE(capacity_lexed);
+    auto capacity_ast = parse_file_heap(capacity_lexed.value());
+    REQUIRE(capacity_ast);
+    CHECK_EQ(capacity_ast->exact_strict_local_response_bindings.len,
+             kMaxExactStrictLocalResponseBindings);
+    capacity += capacity_source_for(kMaxExactStrictLocalResponseBindings);
+    auto overflow_lexed = lex({capacity.data(), static_cast<u32>(capacity.size())});
+    REQUIRE(overflow_lexed);
+    CHECK_FALSE(parse_file_heap(overflow_lexed.value()).has_value());
+}
+
+TEST(frontend, strict_local_response_representation200_profile_is_exact_and_reaches_rir) {
+    static_assert(strict_local_response_profile(200) ==
+                  StrictLocalResponseProfile::Representation200);
+    static_assert(strict_local_response_profile(400) == StrictLocalResponseProfile::LegacyError);
+    static_assert(strict_local_response_profile(599) == StrictLocalResponseProfile::LegacyError);
+    static_assert(strict_local_response_profile(199) == StrictLocalResponseProfile::Invalid);
+    static_assert(strict_local_response_profile(201) == StrictLocalResponseProfile::Invalid);
+    static_assert(strict_local_response_profile(600) == StrictLocalResponseProfile::Invalid);
+
+    static constexpr char kSource[] = R"rut(
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 1u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodAny], 1u);
+    const auto& ast_policy = ast->strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_profile(ast_policy.status_code),
+             StrictLocalResponseProfile::Representation200);
+    CHECK_EQ(ast_policy.reserved0, 0u);
+    CHECK_EQ(ast_policy.reserved1, 0u);
+    CHECK(ast_policy.reason.eq(lit("OK")));
+    CHECK(ast_policy.content_type.eq(lit("text/plain")));
+    CHECK(ast_policy.server.eq(lit("nginx/1.29.7")));
+    CHECK(ast_policy.body.eq(lit("successor-static")));
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    CHECK(ast_copy->strict_local_response_policies[0].body.ptr != ast_policy.body.ptr);
+    CHECK(ast_copy->strict_local_response_policies[0].body.eq(lit("successor-static")));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(hir->strict_local_response_policies[0].reserved0, 0u);
+    CHECK_EQ(hir->strict_local_response_policies[0].reserved1, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(mir->strict_local_response_policies[0].reserved0, 0u);
+    CHECK_EQ(mir->strict_local_response_policies[0].reserved1, 0u);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& rir_policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(rir_policy.reserved0, 0u);
+    CHECK_EQ(rir_policy.reserved1, 0u);
+    CHECK(strict_local_response_policy_spec_valid(rir_policy));
+    CHECK(rir_policy.reason.eq(lit("OK")));
+    CHECK(rir_policy.content_type.eq(lit("text/plain")));
+    CHECK(rir_policy.server.eq(lit("nginx/1.29.7")));
+    CHECK(rir_policy.body.eq(lit("successor-static")));
+    CHECK(rir_policy.reason.ptr != ast_policy.reason.ptr);
+    CHECK(rir_policy.content_type.ptr != ast_policy.content_type.ptr);
+    CHECK(rir_policy.server.ptr != ast_policy.server.ptr);
+    CHECK(rir_policy.body.ptr != ast_policy.body.ptr);
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and_public) {
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::Invalid) == 0);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::Representation200) == 1);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::LegacyError) == 2);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::NoContent204) == 3);
+    static_assert(sizeof(StrictLocalResponsePolicySpec) == 72);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, version) == 0);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reserved0) == 1);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, status_code) == 2);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, date) == 4);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, connection) == 5);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, head_mode) == 6);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reserved1) == 7);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, reason) == 8);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, content_type) == 24);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, server) == 40);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, body) == 56);
+
+    StrictLocalResponsePolicySpec representation{};
+    CHECK_EQ(representation.reserved0, 0u);
+    CHECK_EQ(representation.reserved1, 0u);
+    representation.version = StrictLocalResponseVersion::Http11;
+    representation.status_code = 200;
+    representation.date = StrictLocalResponseDate::Current;
+    representation.connection = StrictLocalResponseConnection::Request;
+    representation.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    representation.reason = {"OK", 2};
+    representation.content_type = {"text/plain", 10};
+    representation.server = {"rut", 3};
+    representation.body = {"body", 4};
+    REQUIRE_EQ(strict_local_response_policy_profile(representation),
+               StrictLocalResponseProfile::Representation200);
+    REQUIRE(strict_local_response_policy_spec_valid(representation));
+
+    StrictLocalResponsePolicySpec legacy = representation;
+    legacy.status_code = 400;
+    legacy.reason = {"Bad Request", 11};
+    legacy.content_type = {"text/html", 9};
+    legacy.head_mode = StrictLocalResponseHeadMode::Reject;
+    legacy.body = {};
+    CHECK_EQ(strict_local_response_policy_profile(legacy), StrictLocalResponseProfile::LegacyError);
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+
+    std::string max_reason(kMaxStrictLocalResponseReasonLen, 'r');
+    std::string max_content_type(kMaxStrictLocalResponseContentTypeLen, 't');
+    std::string max_server(kMaxStrictLocalResponseServerLen, 's');
+    std::string max_body(kMaxStrictLocalResponseBodyLen, '\0');
+    StrictLocalResponsePolicySpec boundary = legacy;
+    boundary.status_code = 599;
+    boundary.reason = {max_reason.data(), static_cast<u32>(max_reason.size())};
+    boundary.content_type = {max_content_type.data(), static_cast<u32>(max_content_type.size())};
+    boundary.server = {max_server.data(), static_cast<u32>(max_server.size())};
+    boundary.body = {max_body.data(), static_cast<u32>(max_body.size())};
+    CHECK_EQ(strict_local_response_policy_profile(boundary),
+             StrictLocalResponseProfile::LegacyError);
+    CHECK(strict_local_response_policy_spec_valid(boundary));
+
+    StrictLocalResponsePolicySpec no_content{};
+    no_content.version = StrictLocalResponseVersion::Http11;
+    no_content.status_code = 204;
+    no_content.date = StrictLocalResponseDate::Current;
+    no_content.connection = StrictLocalResponseConnection::Request;
+    no_content.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    no_content.reason = {"No Content", 10};
+    no_content.server = {"nginx/1.29.7", 12};
+    char empty_anchor = 0;
+    const Str empty_views[] = {{nullptr, 0}, {&empty_anchor + 1, 0}};
+    for (const Str content_type : empty_views) {
+        for (const Str body : empty_views) {
+            no_content.content_type = content_type;
+            no_content.body = body;
+            CHECK_EQ(strict_local_response_policy_profile(no_content),
+                     StrictLocalResponseProfile::NoContent204);
+            CHECK(strict_local_response_policy_spec_valid(no_content));
+        }
+    }
+    no_content.content_type = {};
+    no_content.body = {};
+
+    CHECK_EQ(strict_local_response_profile(204), StrictLocalResponseProfile::Invalid);
+    CHECK(strict_local_response_status_supported(204));
+    StrictLocalResponsePolicySpec status_only{};
+    status_only.status_code = 204;
+    CHECK_EQ(strict_local_response_policy_profile(status_only),
+             StrictLocalResponseProfile::Invalid);
+
+    auto rejects_derivation = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_EQ(strict_local_response_policy_profile(forged), StrictLocalResponseProfile::Invalid);
+    };
+    auto forged = no_content;
+    forged.version = StrictLocalResponseVersion::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.date = StrictLocalResponseDate::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.connection = StrictLocalResponseConnection::Invalid;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reason = {"Not Content", 11};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.content_type = {"text/plain", 10};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.body = {"x", 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reserved0 = 1;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reserved1 = 1;
+    rejects_derivation(forged);
+
+    char control[] = {'x', '\r'};
+    forged = no_content;
+    forged.reason = {control, 2};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {control, 2};
+    rejects_derivation(forged);
+    max_reason.push_back('r');
+    forged = no_content;
+    forged.reason = {max_reason.data(), static_cast<u32>(max_reason.size())};
+    rejects_derivation(forged);
+    max_server.push_back('s');
+    forged = no_content;
+    forged.server = {max_server.data(), static_cast<u32>(max_server.size())};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.reason = {nullptr, 10};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.content_type = {nullptr, 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.server = {nullptr, 1};
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.body = {nullptr, 1};
+    rejects_derivation(forged);
+
+    for (const u16 status :
+         {100u, 199u, 201u, 202u, 203u, 205u, 206u, 299u, 304u, 399u, 600u, 65535u}) {
+        forged = no_content;
+        forged.status_code = status;
+        rejects_derivation(forged);
+    }
+
+    u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
+    method_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
+    CHECK(strict_local_response_policy_table_valid(
+        &no_content, 1, method_policy_ids, kStrictLocalResponseMethodSlots));
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    unmatched_policy_ids[kStrictLocalResponseAnyMethodSlot] = 1;
+    ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
+    CHECK(strict_local_response_source_table_valid(
+        &no_content, 1, pre_route_policy_ids, unmatched_policy_ids, exact_bindings, 0));
+
+    const char public_204[] = R"rut(route exact GET "/static" { return local_response({
+      version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
+      date: "current", content_type: "", connection: "request",
+      head_mode: "suppress_body", body: b""
+    }) })rut";
+    auto public_204_lexed = lex(lit(public_204));
+    REQUIRE(public_204_lexed);
+    CHECK(parse_file_heap(public_204_lexed.value()).has_value());
+
+    for (const bool first_reserved : {true, false}) {
+        auto representation_forged = representation;
+        auto legacy_forged = legacy;
+        if (first_reserved) {
+            representation_forged.reserved0 = 1;
+            legacy_forged.reserved0 = 1;
+        } else {
+            representation_forged.reserved1 = 1;
+            legacy_forged.reserved1 = 1;
+        }
+        const auto copied_forgery = representation_forged;
+        CHECK_EQ(copied_forgery.reserved0, representation_forged.reserved0);
+        CHECK_EQ(copied_forgery.reserved1, representation_forged.reserved1);
+        CHECK_FALSE(strict_local_response_policy_spec_valid(representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_valid(legacy_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(representation, representation_forged));
+        CHECK_FALSE(
+            strict_local_response_policy_spec_equal(representation_forged, representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(legacy, legacy_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(legacy_forged, legacy_forged));
+    }
+}
+
+TEST(frontend, strict_local_response_no_content_public_source_reaches_normal_owned_rir) {
+    std::string source = R"rut(route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
+  date: "current", content_type: "", connection: "request",
+  head_mode: "suppress_body", body: b""
+}) })rut";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 1u);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(ast->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(ast->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+    CHECK((Str{ast->exact_strict_local_response_bindings[0].path,
+               ast->exact_strict_local_response_bindings[0].path_len}
+               .eq({"/static", 7})));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_policy_profile(policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK(policy.reason.eq({"No Content", 10}));
+    CHECK(policy.server.eq({"nginx/1.29.7", 12}));
+    CHECK_EQ(policy.content_type.ptr, nullptr);
+    CHECK_EQ(policy.content_type.len, 0u);
+    CHECK_EQ(policy.body.ptr, nullptr);
+    CHECK_EQ(policy.body.len, 0u);
+
+    ast.reset();
+    hir.reset();
+    mir.reset();
+    source.assign(source.size(), 'x');
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq({"No Content", 10}));
+    CHECK(lowered.module.strict_local_response_policies[0].server.eq({"nginx/1.29.7", 12}));
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_no_content_public_source_rejects_neighbors_and_mutations) {
+    const std::string base =
+        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", "
+        "content_type: \"\", connection: \"request\", head_mode: \"suppress_body\", "
+        "body: b\"\" }) }";
+    auto replace_once = [&](std::string value, const std::string& from, const std::string& to) {
+        const auto pos = value.find(from);
+        CHECK(pos != std::string::npos);
+        if (pos == std::string::npos) return std::string{};
+        value.replace(pos, from.size(), to);
+        return value;
+    };
+    auto parse_rejects = [&](const std::string& source, FrontendError code) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, code);
+        CHECK_GT(ast.error().span.end, ast.error().span.start);
+    };
+
+    for (const char* status : {"199", "201", "205", "206", "304", "100"}) {
+        parse_rejects(replace_once(base, "status: 204", std::string("status: ") + status),
+                      FrontendError::InvalidStatusCode);
+    }
+    const std::string mutations[] = {
+        replace_once(base, "reason: \"No Content\"", "reason: \"Not Content\""),
+        replace_once(base, "reason: \"No Content\", ", ""),
+        replace_once(base, "server: \"nginx/1.29.7\"", "server: \"\""),
+        replace_once(base, "HTTP/1.1", "HTTP/1.0"),
+        replace_once(base, "date: \"current\"", "date: \"static\""),
+        replace_once(base, "content_type: \"\"", "content_type: \"text/plain\""),
+        replace_once(base, "connection: \"request\"", "connection: \"close\""),
+        replace_once(base, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(base, "body: b\"\"", "body: b\"x\""),
+    };
+    for (const auto& mutation : mutations)
+        parse_rejects(mutation, FrontendError::UnsupportedSyntax);
+
+    auto valid_lexed = lex({base.data(), static_cast<u32>(base.size())});
+    REQUIRE(valid_lexed);
+    auto valid_ast = parse_file_heap(valid_lexed.value());
+    REQUIRE(valid_ast);
+    auto forged = valid_ast->strict_local_response_policies[0];
+    forged.content_type = {nullptr, 1};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.body = {nullptr, 1};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.reserved0 = 1;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+    forged = valid_ast->strict_local_response_policies[0];
+    forged.reserved1 = 1;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+}
+
+TEST(frontend, strict_local_response_no_content_synthetic_pipeline_is_explicit_and_owned) {
+    std::string reason = "No Content";
+    std::string server = "nginx/1.29.7";
+    char empty_anchor = 0;
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 204;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {&empty_anchor, 0};
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {&empty_anchor, 0};
+
+    auto public_ast = std::make_unique<AstFile>();
+    CHECK_EQ(public_ast->add_strict_local_response_policy(policy), 1u);
+
+    auto ast = std::make_unique<AstFile>();
+    REQUIRE_EQ(ast->add_strict_local_response_policy_for_internal_propagation(policy), 1u);
+    ast->unmatched_policy_ids[kRouteMethodAny] = 1;
+    AstItem item{};
+    item.kind = AstItemKind::Unmatched;
+    item.unmatched.method_is_any = true;
+    item.unmatched.method_slot = kRouteMethodAny;
+    item.unmatched.policy_id = 1;
+    REQUIRE(ast->items.push(item));
+    REQUIRE_EQ(ast->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    REQUIRE_EQ(ast->strict_local_response_policies[0].body.ptr, &empty_anchor);
+    CHECK(analyze_file_heap(*ast).has_value());
+
+    auto hir = analyze_file_heap_for_internal_propagation(*ast);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(hir->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(hir->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    CHECK_EQ(hir->strict_local_response_policies[0].body.ptr, &empty_anchor);
+    CHECK(build_mir_heap(hir.value()).has_value());
+
+    auto mir = build_mir_heap_for_internal_propagation(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
+    CHECK_EQ(strict_local_response_policy_profile(mir->strict_local_response_policies[0]),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(mir->strict_local_response_policies[0].content_type.ptr, &empty_anchor);
+    CHECK_EQ(mir->strict_local_response_policies[0].body.ptr, &empty_anchor);
+
+    FrontendRirModule rejected{};
+    REQUIRE(lower_to_rir(mir.value(), rejected));
+    CHECK(rir::verify_module(rejected.module).ok);
+    rejected.destroy();
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir_for_internal_propagation(mir.value(), lowered));
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& rir_policy = lowered.module.strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_policy_profile(rir_policy),
+             StrictLocalResponseProfile::NoContent204);
+    CHECK_EQ(rir_policy.content_type.ptr, nullptr);
+    CHECK_EQ(rir_policy.content_type.len, 0u);
+    CHECK_EQ(rir_policy.body.ptr, nullptr);
+    CHECK_EQ(rir_policy.body.len, 0u);
+    CHECK(rir::verify_module(lowered.module).ok);
+    REQUIRE(rir::verify_module_for_internal_propagation(lowered.module).ok);
+
+    char public_text[512]{};
+    rir::PrintBuf public_buf{};
+    public_buf.init(public_text, sizeof(public_text), -1);
+    rir::print_module(public_buf, lowered.module);
+    CHECK(std::string(public_text, public_buf.len).find("status=204") != std::string::npos);
+    char internal_text[1024]{};
+    rir::PrintBuf internal_buf{};
+    internal_buf.init(internal_text, sizeof(internal_text), -1);
+    rir::print_module_for_internal_propagation(internal_buf, lowered.module);
+    const std::string printed(internal_text, internal_buf.len);
+    CHECK(printed.find("status=204") != std::string::npos);
+    CHECK(printed.find("reason=\"No Content\"") != std::string::npos);
+    CHECK(printed.find("content_type=\"\"") != std::string::npos);
+    CHECK(printed.find("body=b\"\"") != std::string::npos);
+
+    ast.reset();
+    reason.assign(reason.size(), 'x');
+    server.assign(server.size(), 'x');
+    REQUIRE(rir::verify_module_for_internal_propagation(lowered.module).ok);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq(lit("No Content")));
+    CHECK(lowered.module.strict_local_response_policies[0].server.eq(lit("nginx/1.29.7")));
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_representation200_rejection_matrix_is_central) {
+    std::string body(kMaxStrictLocalResponseBodyLen, 'x');
+    StrictLocalResponsePolicySpec representation{};
+    representation.version = StrictLocalResponseVersion::Http11;
+    representation.status_code = 200;
+    representation.date = StrictLocalResponseDate::Current;
+    representation.connection = StrictLocalResponseConnection::Request;
+    representation.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    representation.reason = {"OK", 2};
+    representation.content_type = {"text/plain", 10};
+    representation.server = {"nginx/1.29.7", 12};
+    representation.body = {body.data(), static_cast<u32>(body.size())};
+    REQUIRE(strict_local_response_policy_spec_valid(representation));
+
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+        auto ast = std::make_unique<AstFile>();
+        CHECK_EQ(ast->add_strict_local_response_policy(forged), 0u);
+    };
+    for (const u16 status : {199u, 201u, 204u, 205u, 206u, 304u}) {
+        auto forged = representation;
+        forged.status_code = status;
+        rejects(forged);
+    }
+    auto forged = representation;
+    forged.reason = {"Created", 7};
+    rejects(forged);
+    forged = representation;
+    forged.content_type = {"text/html", 9};
+    rejects(forged);
+    forged = representation;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = representation;
+    forged.body = {body.data(), 0};
+    rejects(forged);
+    body.push_back('x');
+    forged = representation;
+    forged.body = {body.data(), static_cast<u32>(body.size())};
+    rejects(forged);
+    body.pop_back();
+
+    // The legacy error profile remains byte-for-byte permissive about its
+    // representation fields: empty bodies and both historical HEAD modes are
+    // still accepted at both status boundaries.
+    StrictLocalResponsePolicySpec legacy = representation;
+    legacy.status_code = 400;
+    legacy.reason = {"Bad", 3};
+    legacy.content_type = {"text/html", 9};
+    legacy.head_mode = StrictLocalResponseHeadMode::Reject;
+    legacy.body = {};
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+    legacy.status_code = 599;
+    legacy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+
+    const u16 invalid_statuses[] = {199, 201, 204, 205, 206, 304};
+    for (const u16 status : invalid_statuses) {
+        const std::string source =
+            "unmatched { return local_response({ version: \"HTTP/1.1\", status: " +
+            std::to_string(status) +
+            ", reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", "
+            "content_type: \"text/plain\", connection: \"request\", "
+            "head_mode: \"suppress_body\", body: b\"successor-static\" }) }\n";
+        auto invalid_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(invalid_lexed);
+        CHECK_FALSE(parse_file_heap(invalid_lexed.value()).has_value());
+    }
+
+    const std::string valid_source =
+        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 200, "
+        "reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"suppress_body\", "
+        "body: b\"successor-static\" }) }\n";
+    auto replace_once = [&](std::string value, const char* from, const std::string& to) {
+        const auto pos = value.find(from);
+        CHECK(pos != std::string::npos);
+        if (pos == std::string::npos) return value;
+        value.replace(pos, std::char_traits<char>::length(from), to);
+        return value;
+    };
+    const std::string oversized_body(kMaxStrictLocalResponseBodyLen + 1, 'x');
+    const std::string invalid_profiles[] = {
+        replace_once(valid_source, "reason: \"OK\"", "reason: \"Created\""),
+        replace_once(valid_source, "content_type: \"text/plain\"", "content_type: \"text/html\""),
+        replace_once(valid_source, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(valid_source, "body: b\"successor-static\"", "body: b\"\""),
+        replace_once(valid_source,
+                     "body: b\"successor-static\"",
+                     std::string("body: b\"") + oversized_body + "\""),
+    };
+    for (const auto& source : invalid_profiles) {
+        auto invalid_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(invalid_lexed);
+        CHECK_FALSE(parse_file_heap(invalid_lexed.value()).has_value());
+    }
+
+    std::string aggregate;
+    for (const char* method : {"OPTIONS", "CONNECT"}) {
+        aggregate += "unmatched ";
+        aggregate += method;
+        aggregate +=
+            " { return local_response({ version: \"HTTP/1.1\", status: 200, reason: \"OK\", "
+            "server: \"nginx/1.29.7\", date: \"current\", content_type: \"text/plain\", "
+            "connection: \"request\", head_mode: \"suppress_body\", body: b\"";
+        aggregate.append(4080, method[0]);
+        aggregate += "\" }) }\n";
+    }
+    auto aggregate_lexed = lex({aggregate.data(), static_cast<u32>(aggregate.size())});
+    REQUIRE(aggregate_lexed);
+    CHECK_FALSE(parse_file_heap(aggregate_lexed.value()).has_value());
+
+    const char malformed_escape[] = R"rut(unmatched { return local_response({
+      version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "suppress_body", body: b"bad\q"
+    }) })rut";
+    auto malformed_lexed = lex(lit(malformed_escape));
+    REQUIRE(malformed_lexed);
+    CHECK_FALSE(parse_file_heap(malformed_lexed.value()).has_value());
+}
+
+TEST(frontend, strict_local_response_ast_copy_move_owns_nonempty_and_empty_bodies) {
+    const char source[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"A\x00B"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b""
+}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto original = parse_file_heap(lexed.value());
+    REQUIRE(original);
+
+    auto check_owned = [&](const AstFile& file, const AstFile& stale_source) {
+        REQUIRE_EQ(file.strict_local_response_policies.len, 2u);
+        REQUIRE_EQ(file.strict_local_response_body_pool.len, 3u);
+        const Str nonempty = file.strict_local_response_policies[0].body;
+        const Str empty = file.strict_local_response_policies[1].body;
+        REQUIRE_EQ(nonempty.len, 3u);
+        REQUIRE_EQ(empty.len, 0u);
+        CHECK(nonempty.ptr ==
+              reinterpret_cast<const char*>(&file.strict_local_response_body_pool.data[0]));
+        CHECK(empty.ptr ==
+              reinterpret_cast<const char*>(&file.strict_local_response_body_pool.data[3]));
+        CHECK(nonempty.ptr != stale_source.strict_local_response_policies[0].body.ptr);
+        CHECK(empty.ptr != stale_source.strict_local_response_policies[1].body.ptr);
+        CHECK(static_cast<u8>(nonempty.ptr[0]) == 'A');
+        CHECK(static_cast<u8>(nonempty.ptr[1]) == 0);
+        CHECK(static_cast<u8>(nonempty.ptr[2]) == 'B');
+    };
+
+    auto copy_constructed = std::make_unique<AstFile>(original.value());
+    check_owned(*copy_constructed, original.value());
+
+    const AstFile& copy_source = *copy_constructed;
+    auto move_constructed = std::make_unique<AstFile>(std::move(*copy_constructed));
+    check_owned(*move_constructed, copy_source);
+    check_owned(*move_constructed, original.value());
+
+    auto copy_assigned = std::make_unique<AstFile>();
+    *copy_assigned = original.value();
+    check_owned(*copy_assigned, original.value());
+
+    const AstFile& assignment_source = *copy_assigned;
+    auto move_assigned = std::make_unique<AstFile>();
+    *move_assigned = std::move(*copy_assigned);
+    check_owned(*move_assigned, assignment_source);
+    check_owned(*move_assigned, original.value());
+}
+
+TEST(frontend, strict_local_response_body_parse_failures_are_transactional) {
+    const char source[] = R"rut(unmatched OPTIONS { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"ok"
+    }) })rut";
+    auto lexed_result = lex(lit(source));
+    REQUIRE(lexed_result);
+    auto& tokens = lexed_result.value().tokens;
+    u32 body_token = tokens.len;
+    u32 final_rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++) {
+        if (tokens[i].type == TokenType::StringLit && tokens[i].text.eq(lit("ok"))) body_token = i;
+        if (tokens[i].type == TokenType::RParen) final_rparen = i;
+    }
+    REQUIRE(body_token < tokens.len);
+    REQUIRE(final_rparen < tokens.len);
+    const Token original_body = tokens[body_token];
+    const Token original_rparen = tokens[final_rparen];
+
+    const char escape_at_end[] = {'a', '\\'};
+    const char short_hex[] = {'\\', 'x'};
+    const char short_hex_digit[] = {'\\', 'x', '0'};
+    const char invalid_hex[] = {'\\', 'x', '0', 'g'};
+    const char unknown_escape[] = {'\\', 'q'};
+    const Str malformed[] = {
+        {escape_at_end, sizeof(escape_at_end)},
+        {short_hex, sizeof(short_hex)},
+        {short_hex_digit, sizeof(short_hex_digit)},
+        {invalid_hex, sizeof(invalid_hex)},
+        {unknown_escape, sizeof(unknown_escape)},
+    };
+    auto check_valid_after_failure = [&]() {
+        tokens[body_token] = original_body;
+        tokens[final_rparen] = original_rparen;
+        auto parsed = parse_file_heap(lexed_result.value());
+        REQUIRE(parsed);
+        REQUIRE_EQ(parsed->strict_local_response_body_pool.len, 2u);
+        REQUIRE_EQ(parsed->strict_local_response_policies.len, 1u);
+        CHECK_EQ(parsed->unmatched_policy_ids[kRouteMethodOptions], 1u);
+        CHECK(parsed->strict_local_response_policies[0].body.eq(lit("ok")));
+    };
+    for (const Str raw : malformed) {
+        tokens[body_token].text = raw;
+        CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+        check_valid_after_failure();
+    }
+
+    // The body is allocated before this forged closing token is consumed.
+    // The declaration must still fail, and the same token stream must then
+    // parse to exactly one policy/ID after the token is restored.
+    tokens[final_rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+    check_valid_after_failure();
+}
+
+TEST(frontend, exact_local_response_body_parse_failures_are_transactional) {
+    const char source[] = R"rut(route exact slash_normalized GET "/static" { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"ok"
+    }) })rut";
+    auto lexed_result = lex(lit(source));
+    REQUIRE(lexed_result);
+    auto& tokens = lexed_result.value().tokens;
+    u32 body_token = tokens.len;
+    u32 final_rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++) {
+        if (tokens[i].type == TokenType::StringLit && tokens[i].text.eq(lit("ok"))) body_token = i;
+        if (tokens[i].type == TokenType::RParen) final_rparen = i;
+    }
+    REQUIRE(body_token < tokens.len);
+    REQUIRE(final_rparen < tokens.len);
+    const Token original_body = tokens[body_token];
+    const Token original_rparen = tokens[final_rparen];
+    const char unknown_escape[] = {'\\', 'q'};
+    tokens[body_token].text = {unknown_escape, sizeof(unknown_escape)};
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+
+    tokens[body_token] = original_body;
+    tokens[final_rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+
+    tokens[final_rparen] = original_rparen;
+    auto parsed = parse_file_heap(lexed_result.value());
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed->strict_local_response_body_pool.len, 2u);
+    REQUIRE_EQ(parsed->strict_local_response_policies.len, 1u);
+    REQUIRE_EQ(parsed->exact_strict_local_response_bindings.len, 1u);
+    CHECK_EQ(parsed->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(parsed->exact_strict_local_response_bindings[0].path_view,
+             ExactPathView::SlashNormalized);
+    CHECK(parsed->strict_local_response_policies[0].body.eq(lit("ok")));
+}
+
+TEST(frontend, unmatched_connect_trace_are_contextual_and_source_shape_is_strict) {
+    const char identifiers[] =
+        "func CONNECT() -> i32 => 1\n"
+        "func TRACE() -> i32 => 2\n";
+    auto lexed = lex(lit(identifiers));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    CHECK(ast->items[0].func.name.eq(lit("CONNECT")));
+    CHECK(ast->items[1].func.name.eq(lit("TRACE")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK(hir->functions[0].name.eq(lit("CONNECT")));
+    CHECK(hir->functions[1].name.eq(lit("TRACE")));
+
+    const char* invalid[] = {
+        "unmatched FOO { return local_response({}) }\n",
+        "unmatched ANY { return local_response({}) }\n",
+        "unmatched OPTIONS { return 400 }\n",
+        "unmatched OPTIONS { return local_response({}) return 500 }\n",
+    };
+    for (const char* source : invalid) {
+        auto bad_lexed = lex(lit(source));
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+}
+
+TEST(frontend, unmatched_local_response_rejects_fields_selectors_and_aggregate_overflow) {
+    const std::string prefix =
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\"";
+    const std::string suffix = " }) }\n";
+    auto replace_once = [](std::string value, const char* from, const char* to) {
+        const auto pos = value.find(from);
+        if (pos != std::string::npos) value.replace(pos, std::char_traits<char>::length(from), to);
+        return value;
+    };
+    const std::string bad_version = replace_once(prefix + suffix, "HTTP/1.1", "HTTP/1.0");
+    const std::string bad_date = replace_once(prefix + suffix, "current", "static");
+    const std::string bad_connection = replace_once(prefix + suffix, "request", "close");
+    const std::string bad_head = replace_once(prefix + suffix, "reject", "invalid");
+    const std::string invalid[] = {
+        prefix + ", status: 401" + suffix,
+        prefix + ", extra: \"x\"" + suffix,
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 399, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 600, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched HEAD { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        prefix + suffix + prefix + suffix,
+        bad_version,
+        bad_date,
+        bad_connection,
+        bad_head,
+    };
+    for (const auto& source : invalid) {
+        auto bad_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+
+    std::string aggregate;
+    const char* methods[] = {"OPTIONS", "CONNECT"};
+    for (const char* method : methods) {
+        aggregate += "unmatched ";
+        aggregate += method;
+        aggregate +=
+            " { return local_response({ version: \"HTTP/1.1\", status: 400, reason: \"r\", "
+            "server: \"s\", date: \"current\", content_type: \"t\", connection: \"request\", "
+            "head_mode: \"reject\", body: b\"";
+        aggregate.append(kMaxStrictLocalResponseBodyLen, 'x');
+        aggregate += "\" }) }\n";
+    }
+    auto aggregate_lexed = lex({aggregate.data(), static_cast<u32>(aggregate.size())});
+    REQUIRE(aggregate_lexed);
+    CHECK_FALSE(parse_file_heap(aggregate_lexed.value()).has_value());
+}
+
+TEST(frontend, strict_local_response_policy_bounds_and_forged_compiler_metadata_reject) {
+    std::string reason(kMaxStrictLocalResponseReasonLen, 'r');
+    std::string type(kMaxStrictLocalResponseContentTypeLen, 't');
+    std::string server(kMaxStrictLocalResponseServerLen, 's');
+    std::string body(kMaxStrictLocalResponseBodyLen, '\0');
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 599;
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 399;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 600;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 400;
+    reason.push_back('r');
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    reason.pop_back();
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    type.push_back('t');
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    type.pop_back();
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    server.push_back('s');
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    server.pop_back();
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    body.push_back('x');
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    body.pop_back();
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    reason[0] = '\r';
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    reason[0] = 'r';
+    policy.reason = {reason.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {type.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    type[0] = '\r';
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    type[0] = 't';
+    policy.server = {server.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {};
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    policy.version = StrictLocalResponseVersion::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.date = StrictLocalResponseDate::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+
+    const char valid[] = R"rut(unmatched OPTIONS { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"x"
+    }) })rut";
+    auto valid_lexed = lex(lit(valid));
+    REQUIRE(valid_lexed);
+    auto ast = parse_file_heap(valid_lexed.value());
+    REQUIRE(ast);
+    ast->unmatched_policy_ids[kRouteMethodOptions] = 2;
+    CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    ast->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    hir->unmatched_policy_ids[kRouteMethodConnect] = 1;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+}
+
+TEST(frontend, pre_route_contextual_source_survives_every_ir_and_combines_three_selectors) {
+    static constexpr char kSource[] = R"rut(
+pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"trace-pre"
+}) }
+pre_route OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"options-pre"
+}) }
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"exact"
+}) }
+route GET "/" { return 204 }
+unmatched TRACE { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"trace-miss"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 5u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::PreRoute);
+    CHECK_EQ(ast->items[1].kind, AstItemKind::PreRoute);
+    CHECK_EQ(ast->items[2].kind, AstItemKind::ExactStrictLocalResponse);
+    CHECK_EQ(ast->items[3].kind, AstItemKind::Route);
+    CHECK_EQ(ast->items[4].kind, AstItemKind::Unmatched);
+    CHECK_EQ(ast->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(ast->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodTrace], 4u);
+    CHECK_EQ(ast->exact_strict_local_response_bindings[0].policy_id, 3u);
+    CHECK(strict_local_response_source_table_valid(ast->strict_local_response_policies.data,
+                                                   ast->strict_local_response_policies.len,
+                                                   ast->pre_route_policy_ids,
+                                                   ast->unmatched_policy_ids,
+                                                   ast->exact_strict_local_response_bindings.data,
+                                                   ast->exact_strict_local_response_bindings.len));
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    CHECK_EQ(ast_copy->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK(ast_copy->strict_local_response_policies[0].body.eq(lit("trace-pre")));
+    CHECK(ast_copy->strict_local_response_policies[0].body.ptr !=
+          ast->strict_local_response_policies[0].body.ptr);
+    auto ast_move = std::make_unique<AstFile>(std::move(*ast_copy));
+    CHECK_EQ(ast_move->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK(ast_move->strict_local_response_policies[1].body.eq(lit("options-pre")));
+    auto ast_assigned = std::make_unique<AstFile>();
+    *ast_assigned = ast.value();
+    CHECK_EQ(ast_assigned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto ast_move_assigned = std::make_unique<AstFile>();
+    *ast_move_assigned = std::move(*ast_assigned);
+    CHECK_EQ(ast_move_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(hir->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto hir_copy = std::make_unique<HirModule>(hir.value());
+    CHECK_EQ(hir_copy->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto hir_assigned = std::make_unique<HirModule>();
+    *hir_assigned = hir.value();
+    CHECK_EQ(hir_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(mir->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir_copy = std::make_unique<MirModule>(mir.value());
+    CHECK_EQ(mir_copy->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir_move = std::make_unique<MirModule>(std::move(*mir_copy));
+    CHECK_EQ(mir_move->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto mir_assigned = std::make_unique<MirModule>();
+    *mir_assigned = mir.value();
+    CHECK_EQ(mir_assigned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto mir_move_assigned = std::make_unique<MirModule>();
+    *mir_move_assigned = std::move(*mir_assigned);
+    CHECK_EQ(mir_move_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(lowered.module.pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodTrace], 4u);
+    CHECK_EQ(lowered.module.exact_strict_local_response_binding_count, 1u);
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (slot != kRouteMethodTrace && slot != kRouteMethodOptions)
+            CHECK_EQ(lowered.module.pre_route_policy_ids[slot], 0u);
+    }
+    char output[4096];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    REQUIRE_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    CHECK(printed.find("pre_route:\n  OPTIONS -> local_response#2\n"
+                       "  TRACE -> local_response#1\n") != std::string::npos);
+    CHECK(printed.find("unmatched:\n  TRACE -> local_response#4\n") != std::string::npos);
+    CHECK(printed.find("exact:\n  ANY \"/static\" -> local_response#3\n") != std::string::npos);
+    lowered.destroy();
+}
+
+TEST(frontend, pre_route_shape_head_and_parser_transaction_fail_closed) {
+    auto source_for = [](const char* selector, const char* head_mode = "reject") {
+        return std::string("pre_route ") + selector +
+               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
+               head_mode + "\", body: b\"ok\" }) }\n";
+    };
+    for (const std::string& source : {
+             source_for(""),
+             source_for("ANY"),
+             source_for("FOO"),
+             source_for("HEAD", "reject"),
+             std::string("pre_route TRACE { return 405 }\n"),
+             std::string("pre_route TRACE { return local_response({}) return 405 }\n"),
+             source_for("TRACE") + source_for("TRACE"),
+         }) {
+        auto bad_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+    const std::string head = source_for("HEAD", "suppress_body");
+    auto head_lexed = lex({head.data(), static_cast<u32>(head.size())});
+    REQUIRE(head_lexed);
+    auto head_ast = parse_file_heap(head_lexed.value());
+    REQUIRE(head_ast);
+    CHECK_EQ(head_ast->pre_route_policy_ids[kRouteMethodHead], 1u);
+
+    const std::string connect = source_for("CONNECT");
+    auto connect_lexed = lex({connect.data(), static_cast<u32>(connect.size())});
+    REQUIRE(connect_lexed);
+    auto connect_ast = parse_file_heap(connect_lexed.value());
+    REQUIRE(connect_ast);
+    CHECK_EQ(connect_ast->pre_route_policy_ids[kRouteMethodConnect], 1u);
+
+    const std::string valid = source_for("TRACE");
+    auto lexed = lex({valid.data(), static_cast<u32>(valid.size())});
+    REQUIRE(lexed);
+    auto& tokens = lexed.value().tokens;
+    u32 rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++)
+        if (tokens[i].type == TokenType::RParen) rparen = i;
+    REQUIRE(rparen < tokens.len);
+    const Token original = tokens[rparen];
+    tokens[rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    tokens[rparen] = original;
+    auto recovered = parse_file_heap(lexed.value());
+    REQUIRE(recovered);
+    CHECK_EQ(recovered->strict_local_response_policies.len, 1u);
+    CHECK_EQ(recovered->strict_local_response_body_pool.len, 2u);
+    CHECK_EQ(recovered->pre_route_policy_ids[kRouteMethodTrace], 1u);
+
+    auto forged_item = std::make_unique<AstFile>(recovered.value());
+    forged_item->items[0].pre_route.method_slot = kRouteMethodConnect;
+    CHECK_FALSE(analyze_file_heap(*forged_item).has_value());
+    auto forged_table = std::make_unique<AstFile>(recovered.value());
+    forged_table->pre_route_policy_ids[kRouteMethodTrace] = 0;
+    forged_table->pre_route_policy_ids[kRouteMethodAny] = 1;
+    CHECK_FALSE(analyze_file_heap(*forged_table).has_value());
+}
+
+TEST(frontend, imported_pre_route_declaration_and_table_only_forgery_are_rejected) {
+    const std::string dir = "/tmp/rut_import_pre_route_frontend";
+    std::filesystem::create_directories(dir);
+    const std::string declaration =
+        "pre_route TRACE { return local_response({ version: \"HTTP/1.1\", status: 405, "
+        "reason: \"Not Allowed\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+        "}) }\n";
+    {
+        std::ofstream out(dir + "/pre.rut", std::ios::binary);
+        out << declaration;
+    }
+    const char main_source[] = "import \"pre.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+
+    auto declaration_lexed = lex({declaration.data(), static_cast<u32>(declaration.size())});
+    REQUIRE(declaration_lexed);
+    auto table_only = parse_file_heap(declaration_lexed.value());
+    REQUIRE(table_only);
+    table_only->items.len = 0;
+    CHECK_FALSE(analyze_file_heap(table_only.value()).has_value());
+}
+
+TEST(frontend, imported_unmatched_declaration_is_rejected) {
+    const std::string dir = "/tmp/rut_import_unmatched_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/fallback.rut", std::ios::binary);
+        out << "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+               "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+               "}) }\n";
+    }
+    const char main_source[] = "import \"fallback.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+}
+
+TEST(frontend, imported_exact_local_response_declaration_is_rejected) {
+    const std::string dir = "/tmp/rut_import_exact_local_response_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/exact.rut", std::ios::binary);
+        out << "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+               "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+               "body: b\"x\" }) }\n";
+    }
+    const char main_source[] = "import \"exact.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+}
+
+TEST(frontend, deferred_forward_preflight_admits_only_exact_path_redirect_selector) {
+    auto lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::Eq);
+    REQUIRE(route.control.cond.lhs != nullptr);
+    REQUIRE(route.control.cond.rhs != nullptr);
+    CHECK_EQ(route.control.cond.lhs->kind, HirExprKind::ReqPathOnly);
+    CHECK_EQ(route.control.cond.rhs->kind, HirExprKind::StrLit);
+    CHECK_EQ(route.control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(route.control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& mf = mir->functions[0];
+    CHECK_EQ(mf.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(mf.blocks.len, 3u);
+    CHECK_EQ(mf.blocks[0].term.kind, MirTerminatorKind::Branch);
+    CHECK_EQ(mf.blocks[0].term.then_block, 1u);
+    CHECK_EQ(mf.blocks[0].term.else_block, 2u);
+    CHECK_EQ(mf.blocks[1].term.kind, MirTerminatorKind::Redirect);
+    CHECK_EQ(mf.blocks[2].term.kind, MirTerminatorKind::ForwardUpstream);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    REQUIRE_EQ(fn.blocks[0].inst_count, 4u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqPathOnly);
+    CHECK_EQ(fn.blocks[0].insts[1].op, rir::Opcode::ConstStr);
+    CHECK_EQ(fn.blocks[0].insts[2].op, rir::Opcode::CmpEq);
+    CHECK_EQ(fn.blocks[0].insts[3].op, rir::Opcode::Br);
+    REQUIRE_EQ(fn.blocks[1].inst_count, 1u);
+    CHECK_EQ(fn.blocks[1].insts[0].op, rir::Opcode::RetRedirect);
+    REQUIRE_EQ(fn.blocks[2].inst_count, 4u);
+    CHECK_EQ(fn.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+
+    char printed[4096]{};
+    rir::PrintBuf print_buf;
+    print_buf.init(printed, sizeof(printed), -1);
+    rir::print_module(print_buf, lowered.module);
+    CHECK_FALSE(print_buf.overflow);
+    CHECK(std::string(printed, print_buf.len)
+              .find("forward_preflight: after_canonical_selection bundle=1") != std::string::npos);
+
+    // RIR verifier independently rejects representative trust-boundary
+    // forgeries and succeeds again after each exact restoration.
+    auto expect_invalid_preflight = [&]() {
+        const auto verified = rir::verify_module(lowered.module);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+    };
+    const u32 saved_block_cap = fn.block_cap;
+    fn.block_cap = fn.block_count - 1;
+    expect_invalid_preflight();
+    fn.block_cap = saved_block_cap;
+    const u32 saved_value_cap = fn.value_cap;
+    fn.value_cap = fn.value_count - 1;
+    expect_invalid_preflight();
+    fn.value_cap = saved_value_cap;
+
+    const rir::ValueId canonical_results[] = {fn.blocks[0].insts[0].result,
+                                              fn.blocks[0].insts[1].result,
+                                              fn.blocks[0].insts[2].result,
+                                              fn.blocks[2].insts[0].result,
+                                              fn.blocks[2].insts[1].result,
+                                              fn.blocks[2].insts[2].result};
+    const rir::Type* str_type = fn.values[canonical_results[0].id].type;
+    const rir::Type* bool_type = fn.values[canonical_results[2].id].type;
+    const rir::Type* i32_type = fn.values[canonical_results[3].id].type;
+    REQUIRE(str_type != nullptr);
+    REQUIRE(bool_type != nullptr);
+    REQUIRE(i32_type != nullptr);
+    for (u32 i = 0; i < sizeof(canonical_results) / sizeof(canonical_results[0]); i++) {
+        auto& value = fn.values[canonical_results[i].id];
+        const rir::Type* saved_type = value.type;
+        value.type = nullptr;
+        expect_invalid_preflight();
+        value.type = i < 2 ? bool_type : str_type;
+        expect_invalid_preflight();
+        value.type = saved_type;
+    }
+    auto* forged_primitive = const_cast<rir::Type*>(str_type);
+    const rir::Type* saved_inner = forged_primitive->inner;
+    forged_primitive->inner = i32_type;
+    expect_invalid_preflight();
+    forged_primitive->inner = saved_inner;
+    CHECK(rir::verify_module(lowered.module).ok);
+
+    fn.blocks[0].insts[3].imm.block_targets[0].id = 2;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[0].insts[3].imm.block_targets[0].id = 1;
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqPath;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqPathOnly;
+    fn.blocks[2].insts[2].imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[2].insts[2].imm.i32_val = 1;
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    CHECK(rir::verify_module(lowered.module).ok);
+    lowered.destroy();
+
+    // HIR and MIR independently reject branch reversal, condition direction,
+    // extra effects, and forged timing metadata.
+    auto expect_hir_rejection = [&]() { CHECK_FALSE(build_mir_heap(hir.value()).has_value()); };
+    auto& hir_forward = route.control.else_term;
+    auto reject_hir_policy_id = [&](u16& id, u16 valid, u16 out_of_range) {
+        id = 0;
+        expect_hir_rejection();
+        id = out_of_range;
+        expect_hir_rejection();
+        id = valid;
+    };
+    reject_hir_policy_id(hir_forward.forward_response_policy_id,
+                         1,
+                         static_cast<u16>(hir->response_policies.len + 1));
+    reject_hir_policy_id(
+        hir_forward.forward_failure_policy_id, 1, static_cast<u16>(hir->failure_policies.len + 1));
+    reject_hir_policy_id(hir_forward.forward_timeout_failure_policy_id,
+                         2,
+                         static_cast<u16>(hir->failure_policies.len + 1));
+    const auto saved_hir_response = hir->response_policies[0];
+    hir->response_policies[0].version = static_cast<ResponsePolicyVersion>(0xff);
+    expect_hir_rejection();
+    hir->response_policies[0] = saved_hir_response;
+    hir->response_policies[0].connection = ResponsePolicyConnection::KeepAlive;
+    expect_hir_rejection();
+    hir->response_policies[0] = saved_hir_response;
+    const auto saved_hir_failure = hir->failure_policies[0];
+    hir->failure_policies[0].status_code = 200;
+    expect_hir_rejection();
+    hir->failure_policies[0] = saved_hir_failure;
+    hir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_hir_rejection();
+    hir->failure_policies[0] = saved_hir_failure;
+    const auto saved_hir_timeout = hir->failure_policies[1];
+    hir->failure_policies[1].status_code = 200;
+    expect_hir_rejection();
+    hir->failure_policies[1] = saved_hir_timeout;
+    hir->failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_hir_rejection();
+    hir->failure_policies[1] = saved_hir_timeout;
+
+    auto saved_then = route.control.then_term;
+    route.control.then_term = route.control.else_term;
+    route.control.else_term = saved_then;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    route.control.else_term = route.control.then_term;
+    route.control.then_term = saved_then;
+    auto* saved_lhs = route.control.cond.lhs;
+    route.control.cond.lhs = route.control.cond.rhs;
+    route.control.cond.rhs = saved_lhs;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    route.control.cond.rhs = route.control.cond.lhs;
+    route.control.cond.lhs = saved_lhs;
+    route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+
+    lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& forged_mir = mir->functions[0];
+    auto expect_mir_rejection = [&]() {
+        FrontendRirModule rejected{};
+        CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    };
+    auto& mir_forward = forged_mir.blocks[2].term;
+    auto reject_mir_policy_id = [&](u16& id, u16 valid, u16 out_of_range) {
+        id = 0;
+        expect_mir_rejection();
+        id = out_of_range;
+        expect_mir_rejection();
+        id = valid;
+    };
+    reject_mir_policy_id(mir_forward.forward_response_policy_id,
+                         1,
+                         static_cast<u16>(mir->response_policies.len + 1));
+    reject_mir_policy_id(
+        mir_forward.forward_failure_policy_id, 1, static_cast<u16>(mir->failure_policies.len + 1));
+    reject_mir_policy_id(mir_forward.forward_timeout_failure_policy_id,
+                         2,
+                         static_cast<u16>(mir->failure_policies.len + 1));
+    const auto saved_mir_response = mir->response_policies[0];
+    mir->response_policies[0].version = static_cast<ResponsePolicyVersion>(0xff);
+    expect_mir_rejection();
+    mir->response_policies[0] = saved_mir_response;
+    mir->response_policies[0].connection = ResponsePolicyConnection::KeepAlive;
+    expect_mir_rejection();
+    mir->response_policies[0] = saved_mir_response;
+    const auto saved_mir_failure = mir->failure_policies[0];
+    mir->failure_policies[0].status_code = 200;
+    expect_mir_rejection();
+    mir->failure_policies[0] = saved_mir_failure;
+    mir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_mir_rejection();
+    mir->failure_policies[0] = saved_mir_failure;
+    const auto saved_mir_timeout = mir->failure_policies[1];
+    mir->failure_policies[1].status_code = 200;
+    expect_mir_rejection();
+    mir->failure_policies[1] = saved_mir_timeout;
+    mir->failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_mir_rejection();
+    mir->failure_policies[1] = saved_mir_timeout;
+
+    forged_mir.blocks[0].term.then_block = 2;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    forged_mir.blocks[0].term.then_block = 1;
+    MirBlock::Effect effect{};
+    effect.value_index = 0;
+    REQUIRE(forged_mir.blocks[1].effects.push(effect));
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+}
+
+TEST(frontend, deferred_forward_preflight_rejects_alternate_source_conditions) {
+    const std::string canonical(kDeferredPreflightSource);
+    struct Replacement {
+        const char* from;
+        const char* to;
+    } cases[] = {
+        {"req.pathOnly == \"/old\"", "\"/old\" == req.pathOnly"},
+        {"req.pathOnly == \"/old\"", "req.path == \"/old\""},
+        {"req.pathOnly == \"/old\"", "req.pathOnly.matches(re\"^/old$\")"},
+    };
+    for (const auto& test : cases) {
+        std::string source = canonical;
+        const auto pos = source.find(test.from);
+        REQUIRE_NE(pos, std::string::npos);
+        source.replace(pos, __builtin_strlen(test.from), test.to);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, request_framing_selection_preflight_is_exact_and_verified_at_each_boundary) {
+    for (const char* method : {"GET", "POST", ""}) {
+        std::string rejected_source(kFramingSelectionPreflightSource);
+        const auto pos = rejected_source.find("route HEAD");
+        REQUIRE_NE(pos, std::string::npos);
+        rejected_source.replace(pos, 10, std::string("route ") + method);
+        auto rejected_lexed =
+            lex({rejected_source.data(), static_cast<u32>(rejected_source.size())});
+        REQUIRE(rejected_lexed);
+        auto rejected_ast = parse_file_heap(rejected_lexed.value());
+        REQUIRE(rejected_ast);
+        CHECK_FALSE(analyze_file_heap(rejected_ast.value()).has_value());
+    }
+    auto lexed = lex(lit(kFramingSelectionPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodHead);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_hir_rejection = [&]() { CHECK_FALSE(build_mir_heap(hir.value()).has_value()); };
+    route.control.cond.kind = HirExprKind::ReqChunked;
+    expect_hir_rejection();
+    route.control.cond.kind = HirExprKind::ReqHasContentLength;
+    route.method = kRouteMethodAny;
+    expect_hir_rejection();
+    route.method = kRouteMethodHead;
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    expect_hir_rejection();
+    route.control.then_term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost);
+    route.control.else_term.upstream_index = 1;
+    expect_hir_rejection();
+    route.control.else_term.upstream_index = route.control.then_term.upstream_index;
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& mf = mir->functions[0];
+    CHECK_EQ(mf.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(mf.blocks.len, 3u);
+    CHECK_EQ(mf.blocks[0].term.cond.kind, MirValueKind::ReqHasContentLength);
+    CHECK_EQ(mf.blocks[1].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost));
+    CHECK_EQ(mf.blocks[2].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+
+    auto expect_mir_rejection = [&]() {
+        FrontendRirModule rejected{};
+        CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    };
+    mf.blocks[0].term.then_block = 2;
+    expect_mir_rejection();
+    mf.blocks[0].term.then_block = 1;
+    mf.blocks[0].effects.len = 1;
+    expect_mir_rejection();
+    mf.blocks[0].effects.len = 0;
+    mf.blocks[2].term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_buffering = ForwardResponseBufferingMode::None;
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 2;
+    expect_mir_rejection();
+    mf.blocks[2].term.forward_response_read_timeout_seconds = 1;
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(lowered.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(fn.blocks[0].insts[1].op, rir::Opcode::Br);
+    CHECK_EQ(fn.blocks[1].insts[3].op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(fn.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+
+    auto expect_rir_rejection = [&]() {
+        const auto verified = rir::verify_module(lowered.module);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+    };
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 2;
+    expect_rir_rejection();
+    fn.blocks[0].insts[1].imm.block_targets[0].id = 1;
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqChunked;
+    expect_rir_rejection();
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqHasContentLength;
+    fn.http_method = kRouteMethodAny;
+    expect_rir_rejection();
+    fn.http_method = kRouteMethodHead;
+    fn.blocks[2].insts[2].imm.i32_val = 2;
+    expect_rir_rejection();
+    fn.blocks[2].insts[2].imm.i32_val = 1;
+    CHECK(rir::verify_module(lowered.module).ok);
+
+    char printed[4096]{};
+    rir::PrintBuf print_buf;
+    print_buf.init(printed, sizeof(printed), -1);
+    rir::print_module(print_buf, lowered.module);
+    CHECK_FALSE(print_buf.overflow);
+    CHECK(std::string(printed, print_buf.len)
+              .find("forward_preflight: after_request_framing_selection bundle=1") !=
+          std::string::npos);
+    lowered.destroy();
 }
 
 int main(int argc, char** argv) {

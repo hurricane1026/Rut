@@ -213,6 +213,47 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
     }
 }
 
+static inline bool is_transfer_coding_token_char(u8 c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '!' ||
+           c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
+           c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+// Classify one complete Transfer-Encoding field.  Parameters and duplicate
+// fields are deliberately unsupported: local-response connection reuse needs
+// one exact, unambiguous request boundary.  The legacy `chunked` bit is parsed
+// separately below so this metadata addition does not alter proxy behaviour.
+static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, u32 vlen) {
+    if (vlen == 0) return RequestTransferEncoding::Unsupported;
+    bool saw_token = false;
+    bool saw_chunked = false;
+    u32 i = 0;
+    for (;;) {
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == vlen || val[i] == ',') return RequestTransferEncoding::Unsupported;
+
+        const u32 start = i;
+        while (i < vlen && is_transfer_coding_token_char(val[i])) i++;
+        if (i == start) return RequestTransferEncoding::Unsupported;
+        saw_token = true;
+        const bool is_chunked = i - start == 7 && str_ci_eq(val + start, "chunked", 7);
+        if (is_chunked) {
+            if (saw_chunked) return RequestTransferEncoding::Unsupported;
+            saw_chunked = true;
+        }
+
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == vlen)
+            return saw_token && saw_chunked ? RequestTransferEncoding::FinalChunked
+                                            : RequestTransferEncoding::Unsupported;
+        if (val[i] != ',') return RequestTransferEncoding::Unsupported;
+        // `chunked` must be the final coding, and a comma must introduce a
+        // non-empty next token.
+        if (is_chunked) return RequestTransferEncoding::Unsupported;
+        i++;
+    }
+}
+
 // Check and apply semantic headers inline.
 // Returns quickly for non-semantic headers via first-byte + length dispatch.
 static inline ParseStatus apply_semantic_header(
@@ -224,6 +265,8 @@ static inline ParseStatus apply_semantic_header(
         if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
             auto cl = parse_uint(val, vlen);
             if (UNLIKELY(!cl)) return ParseStatus::Error;
+            if (UNLIKELY(req->content_length_count == 255)) return ParseStatus::Error;
+            req->content_length_count++;
             if (UNLIKELY(req->has_content_length)) {
                 // Duplicate Content-Length with different value → reject
                 if (req->content_length != cl.value()) return ParseStatus::Error;
@@ -239,6 +282,11 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
+            if (req->transfer_encoding != RequestTransferEncoding::Unparsed) {
+                req->transfer_encoding = RequestTransferEncoding::Unsupported;
+            } else {
+                req->transfer_encoding = classify_transfer_encoding(val, vlen);
+            }
             // Parse as comma-separated token list, match full "chunked" token
             u32 ti = 0;
             while (ti < vlen) {
@@ -291,6 +339,7 @@ static inline ParseStatus apply_semantic_header(
 
 ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     header_end = 0;  // Clear on entry so stale values are never exposed on Incomplete/Error.
+    req->reset();
 
     // Quick check: need at least 4 bytes to try method matching.
     if (UNLIKELY(len < 4)) {
@@ -299,7 +348,6 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     // Single-pass: parse directly without find_header_end pre-scan.
     // We check bounds at each step and return Incomplete if needed.
-    req->reset();
     u32 pos = 0;
     // Declare loop variables here so goto doesn't jump over them.
     u32 hdr_count = 0;
@@ -334,6 +382,7 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         if (UNLIKELY(uri_end >= len)) goto maybe_incomplete;
         if (UNLIKELY(uri_end == uri_start)) return ParseStatus::Error;
         req->path = {reinterpret_cast<const char*>(buf + uri_start), uri_end - uri_start};
+        for (u32 i = uri_start; i < uri_end; i++) req->target_has_fragment |= buf[i] == '#';
         if (buf[uri_start] == '/') {
             req->path_canon = finalize_path_canonical(
                 reinterpret_cast<const char*>(buf + uri_start), canon_end - uri_start);
@@ -383,6 +432,7 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
         u32 name_len = colon_pos - name_start;
         pos = colon_pos + 1;
+        const u32 raw_value_start = pos;
 
         // Skip OWS — hot path: single space after colon
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
@@ -415,6 +465,8 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
             headers[hdr_count].name = {reinterpret_cast<const char*>(buf + name_start), name_len};
             headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                         value_end - value_start};
+            headers[hdr_count].raw_value = {reinterpret_cast<const char*>(buf + raw_value_start),
+                                            cr_pos - raw_value_start};
             hdr_count++;
 
             // Semantic header detection
@@ -428,6 +480,9 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     req->header_count = hdr_count;
     header_end = pos;
+
+    if (req->transfer_encoding == RequestTransferEncoding::Unparsed)
+        req->transfer_encoding = RequestTransferEncoding::None;
 
     // Reject requests with both Content-Length and Transfer-Encoding: chunked
     // to prevent request-smuggling attacks (RFC 7230 §3.3.3).
@@ -545,8 +600,10 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
 
         u8 ver_digit = buf[pos + 7];
         if (LIKELY(ver_digit == '1')) {
+            resp->version = HttpVersion::Http11;
             resp->keep_alive = true;  // HTTP/1.1 default
         } else if (ver_digit == '0') {
+            resp->version = HttpVersion::Http10;
             resp->keep_alive = false;  // HTTP/1.0 default
         } else {
             return ParseStatus::Error;
@@ -571,15 +628,16 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
     }
     pos += 3;
 
-    // Skip reason phrase until \r\n
-    // After the 3-digit status code, there should be a SP or \r
+    // Require the RFC status-line separator, then retain the exact reason phrase.
     if (UNLIKELY(pos >= len)) return ParseStatus::Incomplete;
-    // Allow SP before reason phrase, or \r for missing reason
+    if (buf[pos] != ' ' && buf[pos] != '\r') return ParseStatus::Error;
     {
+        const u32 reason_start = (buf[pos] == ' ') ? pos + 1 : pos;
         u32 scan = pos;
         while (scan < len && buf[scan] != '\r') scan++;
         if (UNLIKELY(scan + 1 >= len)) return ParseStatus::Incomplete;
         if (UNLIKELY(buf[scan + 1] != '\n')) return ParseStatus::Error;
+        resp->reason = {reinterpret_cast<const char*>(buf + reason_start), scan - reason_start};
         pos = scan + 2;  // past \r\n
     }
 
@@ -605,6 +663,7 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
         if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
         u32 name_len = colon_pos - name_start;
         pos = colon_pos + 1;
+        const u32 raw_value_start = pos;
 
         // Skip OWS
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
@@ -639,6 +698,8 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
                                            name_len};
                 headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                             value_end - value_start};
+                headers[hdr_count].raw_value = {
+                    reinterpret_cast<const char*>(buf + raw_value_start), cr_pos - raw_value_start};
                 hdr_count++;
             } else {
                 // Beyond capacity: keep parsing (semantic headers still apply
@@ -650,6 +711,9 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             ParseStatus sem = apply_semantic_header_response(
                 buf + name_start, name_len, buf + value_start, value_end - value_start, resp);
             if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
+            if (name_len == 14 && str_ci_eq(buf + name_start + 1, "ontent-length", 13)) {
+                if (resp->content_length_count != 255) resp->content_length_count++;
+            }
         }
 
         pos += 2;  // skip \r\n

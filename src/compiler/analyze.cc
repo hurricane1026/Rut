@@ -1457,6 +1457,8 @@ static FrontendResult<void> validate_import_namespace_bindings(
         for (u32 i = 0; i < file.items.len; i++) {
             const auto& item = file.items[i];
             switch (item.kind) {
+                case AstItemKind::Listen:
+                    break;
                 case AstItemKind::Func:
                     if (item.func.name.eq(ns))
                         return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, ns);
@@ -9709,11 +9711,161 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
 
+    if (stmt.kind == AstStmtKind::Redirect) {
+        if (!stmt.has_redirect_policy || stmt.redirect_policy_id == 0 ||
+            stmt.redirect_policy_id > mod.redirect_policies.len ||
+            !redirect_policy_spec_valid(mod.redirect_policies[stmt.redirect_policy_id - 1]))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid redirect policy"));
+        if (stmt.response_headers.len != 0 || stmt.forward_set_path.len != 0 ||
+            stmt.forward_set_headers.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("redirect cannot carry response or request mutations"));
+        term.kind = HirTerminatorKind::Redirect;
+        term.redirect_policy_id = stmt.redirect_policy_id;
+        return term;
+    }
+
+    // Public source may select the bounded paired HEAD disposition only when
+    // both policy objects explicitly select SuppressBody.  Keep this source
+    // contract separate from the internal response-only capability used by
+    // direct RIR/runtime tests.
+    const ForwardResponsePolicySpec* response_policy = nullptr;
+    const ForwardFailurePolicySpec* failure_policy = nullptr;
+    const ForwardFailurePolicySpec* timeout_failure_policy = nullptr;
+    if (stmt.has_forward_request_policy != (stmt.forward_request_policy_id != 0) ||
+        (stmt.has_forward_request_policy &&
+         !request_policy_is_supported(stmt.forward_request_policy_id)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid request policy"));
+    if (stmt.has_forward_response_policy) {
+        if (stmt.forward_response_policy_id == 0 ||
+            stmt.forward_response_policy_id > mod.response_policies.len)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
+        response_policy = &mod.response_policies[stmt.forward_response_policy_id - 1];
+        if (!response_policy_spec_valid(*response_policy))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
+    }
+    if (stmt.has_forward_failure_policy) {
+        if (stmt.forward_failure_policy_id == 0 ||
+            stmt.forward_failure_policy_id > mod.failure_policies.len)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid failure policy"));
+        failure_policy = &mod.failure_policies[stmt.forward_failure_policy_id - 1];
+        if (!forward_failure_policy_spec_valid(*failure_policy))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid failure policy"));
+    }
+    if (stmt.has_forward_timeout_failure_policy) {
+        if (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy ||
+            stmt.forward_timeout_failure_policy_id == 0 ||
+            stmt.forward_timeout_failure_policy_id > mod.failure_policies.len)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid timeout failure policy bundle"));
+        timeout_failure_policy = &mod.failure_policies[stmt.forward_timeout_failure_policy_id - 1];
+        if (!forward_timeout_failure_policy_spec_valid(*timeout_failure_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid timeout failure policy"));
+        if (timeout_failure_policy->head_mode != failure_policy->head_mode)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("timeout and default failure HEAD modes must match"));
+    }
+    if (stmt.has_forward_response_read_timeout !=
+            (stmt.forward_response_read_timeout_seconds != 0) ||
+        (stmt.has_forward_response_read_timeout &&
+         !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
+    const bool fixed_upload_head_timeout_candidate =
+        stmt.forward_response_buffering == ForwardResponseBufferingMode::None &&
+        fixed_upload_head_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        response_policy != nullptr && failure_policy != nullptr &&
+        timeout_failure_policy != nullptr &&
+        fixed_upload_head_timeout_policies_valid(
+            *response_policy, *failure_policy, *timeout_failure_policy);
+    if (stmt.has_forward_response_read_timeout &&
+        !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id) &&
+        !fixed_upload_head_timeout_candidate)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("request policy is not admitted to response read timeout"));
+    const bool has_response_buffering =
+        stmt.forward_response_buffering != ForwardResponseBufferingMode::None;
+    if (stmt.has_forward_response_buffering != has_response_buffering ||
+        !forward_response_buffering_mode_valid(stmt.forward_response_buffering))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response buffering"));
+    if (has_response_buffering &&
+        (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
+         failure_policy == nullptr || timeout_failure_policy == nullptr ||
+         !complete_content_length_request_policy_is_admitted(stmt.forward_request_policy_id) ||
+         !complete_content_length_buffering_policies_valid(
+             *response_policy, *failure_policy, *timeout_failure_policy)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("response_buffering requires a complete strict timeout policy bundle"));
+    const bool response_suppress =
+        response_policy != nullptr &&
+        response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
+    const bool failure_suppress = failure_policy != nullptr &&
+                                  failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
+    const bool timeout_failure_suppress =
+        timeout_failure_policy != nullptr &&
+        timeout_failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
+    if (response_suppress || failure_suppress || timeout_failure_suppress) {
+        if (!response_suppress || !failure_suppress ||
+            (timeout_failure_policy != nullptr && !timeout_failure_suppress))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression requires paired response and failure policies"));
+        if (response_policy->connection != ResponsePolicyConnection::Request)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression requires response connection request"));
+        if (stmt.has_forward_target_transform)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression cannot be combined with target_transform"));
+    }
+
     auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    if (stmt.has_forward_request_policy)
+        term.forward_request_policy_id = stmt.forward_request_policy_id;
+    if (stmt.has_forward_response_policy)
+        term.forward_response_policy_id = stmt.forward_response_policy_id;
+    if (stmt.has_forward_failure_policy)
+        term.forward_failure_policy_id = stmt.forward_failure_policy_id;
+    if (stmt.has_forward_timeout_failure_policy)
+        term.forward_timeout_failure_policy_id = stmt.forward_timeout_failure_policy_id;
+    if (stmt.has_forward_response_read_timeout)
+        term.forward_response_read_timeout_seconds = stmt.forward_response_read_timeout_seconds;
+    if (stmt.has_forward_response_buffering)
+        term.forward_response_buffering = stmt.forward_response_buffering;
+    if (stmt.has_forward_target_transform) {
+        if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
+            stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str(
+                    "target_transform cannot be combined with request target or header overrides"));
+        term.has_forward_target_transform = true;
+        term.forward_target_transform = stmt.forward_target_transform;
+    }
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
         const auto& p = stmt.forward_set_headers[i];
@@ -9725,7 +9877,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
 
 static bool is_ast_hir_terminator(const AstStatement& stmt) {
     return stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus ||
-           stmt.kind == AstStmtKind::ForwardUpstream;
+           stmt.kind == AstStmtKind::ForwardUpstream || stmt.kind == AstStmtKind::Redirect;
 }
 
 static bool terminator_reads_any_local(const HirTerminator& term,
@@ -11565,7 +11717,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
     const std::vector<Str>& external_decorator_names,
-    SourceBudget* source_budget);
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation);
 
 static bool contains_str(const std::vector<Str>& names, Str needle) {
     for (const auto& name : names) {
@@ -12622,7 +12775,8 @@ static FrontendResult<void> load_imported_modules(
     std::vector<std::string>& import_stack,
     std::vector<std::unique_ptr<HirModule>>& imported_storage,
     const std::vector<Str>& route_decorator_names,
-    SourceBudget* source_budget) {
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation) {
     if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
     auto collect_imported_decorator_names =
@@ -12733,9 +12887,24 @@ static FrontendResult<void> load_imported_modules(
                                               import_stack,
                                               &owned_strings,
                                               imported_decorator_names,
-                                              source_budget);
+                                              source_budget,
+                                              internal_strict_local_response_propagation);
         if (!imported) return core::make_unexpected(imported.error());
-        imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
+        std::unique_ptr<HirModule> imported_module(imported.value());
+        if (imported_module->has_listener)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("listen declarations must be in the main source"));
+        if (imported_module->has_access_log)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("accessLog declarations must be in the main source"));
+        if (imported_module->strict_local_response_policies.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                item.import_decl.span,
+                lit_str("strict local-response declarations must be in the main source"));
+        imported_storage.push_back(std::move(imported_module));
         ImportedModuleInfo info{};
         info.span = item.import_decl.span;
         info.path = kept_path;
@@ -14245,7 +14414,7 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         return {};
     };
     auto check_term = [&](const HirTerminator& t) -> FrontendResult<void> {
-        if (t.kind == HirTerminatorKind::ForwardUpstream)
+        if (t.kind == HirTerminatorKind::ForwardUpstream || t.kind == HirTerminatorKind::Redirect)
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
         return {};
     };
@@ -14510,12 +14679,223 @@ static FrontendResult<HirModule*> analyze_file_internal(
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
     const std::vector<Str>& external_decorator_names,
-    SourceBudget* source_budget) {
+    SourceBudget* source_budget,
+    bool internal_strict_local_response_propagation) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;
+    if (file.response_policies.len > kMaxResponsePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.response_policies.len; i++) {
+        if (!response_policy_spec_valid(file.response_policies[i]) ||
+            !mod.response_policies.push(file.response_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
+    if (file.failure_policies.len > kMaxForwardFailurePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.failure_policies.len; i++) {
+        if (!forward_failure_policy_table_spec_valid(file.failure_policies[i]) ||
+            !mod.failure_policies.push(file.failure_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
+    static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
+    const bool strict_table_valid =
+        internal_strict_local_response_propagation
+            ? strict_local_response_source_table_valid_for_internal_propagation(
+                  file.strict_local_response_policies.data,
+                  file.strict_local_response_policies.len,
+                  file.pre_route_policy_ids,
+                  file.unmatched_policy_ids,
+                  file.exact_strict_local_response_bindings.data,
+                  file.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings)
+            : strict_local_response_source_table_valid(
+                  file.strict_local_response_policies.data,
+                  file.strict_local_response_policies.len,
+                  file.pre_route_policy_ids,
+                  file.unmatched_policy_ids,
+                  file.exact_strict_local_response_bindings.data,
+                  file.exact_strict_local_response_bindings.len,
+                  kMaxExactStrictLocalResponseBindings);
+    if (!strict_table_valid) return frontend_error(FrontendError::UnsupportedSyntax, {});
+    auto concrete_ast_method_matches = [](u8 method, u8 slot) {
+        const TokenType token = static_cast<TokenType>(method);
+        if (token == TokenType::KwGet) return slot == kRouteMethodGet;
+        if (token == TokenType::KwPost) return slot == kRouteMethodPost;
+        if (token == TokenType::KwPut) return slot == kRouteMethodPut;
+        if (token == TokenType::KwDelete) return slot == kRouteMethodDelete;
+        if (token == TokenType::KwPatch) return slot == kRouteMethodPatch;
+        if (token == TokenType::KwHead) return slot == kRouteMethodHead;
+        if (token == TokenType::KwOptions) return slot == kRouteMethodOptions;
+        return token == TokenType::Ident &&
+               (slot == kRouteMethodConnect || slot == kRouteMethodTrace);
+    };
+    bool pre_route_slots_seen[kStrictLocalResponseMethodSlots]{};
+    u32 pre_route_item_count = 0;
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::PreRoute) continue;
+        const u32 slot = item.pre_route.method_slot;
+        if (slot == kRouteMethodAny || slot >= kStrictLocalResponseMethodSlots ||
+            pre_route_slots_seen[slot] || item.pre_route.policy_id == 0 ||
+            item.pre_route.policy_id != file.pre_route_policy_ids[slot] ||
+            !concrete_ast_method_matches(item.pre_route.method, static_cast<u8>(slot)))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.pre_route.span);
+        const auto& policy = file.strict_local_response_policies[item.pre_route.policy_id - 1];
+        if (slot == kRouteMethodHead &&
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.pre_route.span);
+        pre_route_slots_seen[slot] = true;
+        pre_route_item_count++;
+    }
+    bool unmatched_slots_seen[kStrictLocalResponseMethodSlots]{};
+    u32 unmatched_item_count = 0;
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Unmatched) continue;
+        const u32 slot = item.unmatched.method_slot;
+        if (slot >= kStrictLocalResponseMethodSlots || unmatched_slots_seen[slot] ||
+            item.unmatched.policy_id == 0 ||
+            item.unmatched.policy_id != file.unmatched_policy_ids[slot] ||
+            item.unmatched.method_is_any != (slot == kRouteMethodAny))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.unmatched.span);
+        const auto& policy = file.strict_local_response_policies[item.unmatched.policy_id - 1];
+        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.unmatched.span);
+        unmatched_slots_seen[slot] = true;
+        unmatched_item_count++;
+    }
+    u32 exact_item_count = 0;
+    auto exact_ast_method_matches = [](const AstExactStrictLocalResponseDecl& decl) {
+        if (decl.method_is_any) return decl.method == 0 && decl.binding.method == kRouteMethodAny;
+        const TokenType method = static_cast<TokenType>(decl.method);
+        if (method == TokenType::KwGet) return decl.binding.method == kRouteMethodGet;
+        if (method == TokenType::KwPost) return decl.binding.method == kRouteMethodPost;
+        if (method == TokenType::KwPut) return decl.binding.method == kRouteMethodPut;
+        if (method == TokenType::KwDelete) return decl.binding.method == kRouteMethodDelete;
+        if (method == TokenType::KwPatch) return decl.binding.method == kRouteMethodPatch;
+        if (method == TokenType::KwHead) return decl.binding.method == kRouteMethodHead;
+        if (method == TokenType::KwOptions) return decl.binding.method == kRouteMethodOptions;
+        return method == TokenType::Ident && (decl.binding.method == kRouteMethodConnect ||
+                                              decl.binding.method == kRouteMethodTrace);
+    };
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::ExactStrictLocalResponse) continue;
+        if (exact_item_count >= file.exact_strict_local_response_bindings.len)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.exact_strict_local_response.span);
+        const auto& expected = file.exact_strict_local_response_bindings[exact_item_count];
+        const auto& actual = item.exact_strict_local_response.binding;
+        bool path_equal = expected.path_len == actual.path_len;
+        for (u32 k = 0; path_equal && k < sizeof(expected.path); k++)
+            path_equal = expected.path[k] == actual.path[k];
+        if (!path_equal || expected.method != actual.method ||
+            expected.policy_id != actual.policy_id || expected.path_view != actual.path_view ||
+            expected.reserved1 != actual.reserved1 ||
+            item.exact_strict_local_response.method_is_any !=
+                (actual.method == kStrictLocalResponseAnyMethodSlot) ||
+            !exact_ast_method_matches(item.exact_strict_local_response))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.exact_strict_local_response.span);
+        exact_item_count++;
+    }
+    if (pre_route_item_count + unmatched_item_count + exact_item_count !=
+            file.strict_local_response_policies.len ||
+        exact_item_count != file.exact_strict_local_response_bindings.len)
+        return frontend_error(FrontendError::UnsupportedSyntax, {});
+    for (u32 i = 0; i < file.strict_local_response_policies.len; i++) {
+        if (!mod.strict_local_response_policies.push(file.strict_local_response_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        mod.pre_route_policy_ids[i] = file.pre_route_policy_ids[i];
+        mod.unmatched_policy_ids[i] = file.unmatched_policy_ids[i];
+    }
+    for (u32 i = 0; i < file.exact_strict_local_response_bindings.len; i++) {
+        if (!mod.exact_strict_local_response_bindings.push(
+                file.exact_strict_local_response_bindings[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    if (file.redirect_policies.len > kMaxRedirectPolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.redirect_policies.len; i++) {
+        if (!redirect_policy_spec_valid(file.redirect_policies[i]) ||
+            !mod.redirect_policies.push(file.redirect_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
+
+    // Listener declarations are startup metadata, not route declarations. A
+    // program has one process listener in this slice; imported modules cannot
+    // contribute one because their declarations do not own process startup.
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Listen) continue;
+        if (mod.has_listener)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.listen.span,
+                                  lit_str("only one listen declaration is supported"));
+        if (item.listen.port > 65535u ||
+            !listener_address_valid(item.listen.address, item.listen.ipv4_host))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.listen.span,
+                                  lit_str("invalid listener endpoint metadata"));
+        mod.has_listener = true;
+        mod.listener.span = item.listen.span;
+        mod.listener.address = item.listen.address;
+        mod.listener.port = static_cast<u16>(item.listen.port);
+        mod.listener.ipv4_host = item.listen.ipv4_host;
+    }
+
+    // Like the listener, the access sink is immutable process-start metadata. It remains
+    // borrowed through HIR and is copied into LoadedProgram only after the complete load succeeds.
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::AccessLog) continue;
+        const AstAccessLogDecl& decl = item.access_log;
+        if (mod.has_access_log)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  decl.span,
+                                  lit_str("only one accessLog declaration is supported"));
+        if (decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine)
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.format_value_span);
+        if (decl.publication != AccessLogPublicationProfile::LiveEachRecord)
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.publication_value_span);
+        if (!access_log_sink_path_valid(decl.path))
+            return frontend_error(FrontendError::UnsupportedSyntax, decl.path_span, decl.path);
+
+        const auto contains = [](Span outer, Span inner) {
+            return outer.start <= inner.start && inner.start <= inner.end && inner.end <= outer.end;
+        };
+        const bool spans_valid = decl.path.ptr != nullptr &&
+                                 decl.path_span.start <= decl.path_span.end &&
+                                 decl.path_span.end - decl.path_span.start == decl.path.len &&
+                                 decl.path_token_span.start + 1u == decl.path_span.start &&
+                                 decl.path_span.end + 1u == decl.path_token_span.end &&
+                                 contains(decl.span, decl.path_field_span) &&
+                                 contains(decl.path_field_span, decl.path_token_span) &&
+                                 contains(decl.span, decl.format_field_span) &&
+                                 contains(decl.format_field_span, decl.format_value_span) &&
+                                 contains(decl.span, decl.publication_field_span) &&
+                                 contains(decl.publication_field_span, decl.publication_value_span);
+        if (!spans_valid) return frontend_error(FrontendError::UnsupportedSyntax, decl.span);
+
+        mod.has_access_log = true;
+        mod.access_log.span = decl.span;
+        mod.access_log.path_field_span = decl.path_field_span;
+        mod.access_log.path_token_span = decl.path_token_span;
+        mod.access_log.path_span = decl.path_span;
+        mod.access_log.path = decl.path;
+        mod.access_log.format_field_span = decl.format_field_span;
+        mod.access_log.format_value_span = decl.format_value_span;
+        mod.access_log.format = decl.format;
+        mod.access_log.publication_field_span = decl.publication_field_span;
+        mod.access_log.publication_value_span = decl.publication_value_span;
+        mod.access_log.publication = decl.publication;
+    }
     std::string normalized_source;
     if (source_path.len != 0) {
         normalized_source =
@@ -14766,7 +15146,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                 import_stack,
                                                 imported_storage,
                                                 route_decorator_names,
-                                                source_budget);
+                                                source_budget,
+                                                internal_strict_local_response_propagation);
     if (!loaded_imports) return core::make_unexpected(loaded_imports.error());
     auto validated_namespaces = validate_import_namespaces(imported_modules);
     if (!validated_namespaces) return core::make_unexpected(validated_namespaces.error());
@@ -17954,8 +18335,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirRoute route{};
         route.span = route_decl.span;
         route.path = route_decl.path;
-        route.method = route_method_key_from_token(route_decl.method);
-        if (route.method == 0)
+        route.method = route_decl.method_is_any ? kRouteMethodAny
+                                                : route_method_key_from_token(route_decl.method);
+        if (!route_decl.method_is_any && route.method == kRouteMethodAny)
             return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
         route.is_timer = is_timer_item;
         if (is_timer_item) {
@@ -18737,6 +19119,268 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
             }
+
+            // Request-policy rewriting changes recv_buf before response-header
+            // mutation pointers are snapshotted.  Keep this unsupported at the
+            // source boundary; the runtime has a matching fail-closed guard for
+            // direct-RIR callers.
+            auto policy_mutation_conflict = [](const HirTerminator& term) {
+                if (term.kind == HirTerminatorKind::Redirect && term.commit_response_mutations)
+                    return true;
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       ((term.has_forward_target_transform && term.commit_response_mutations) ||
+                        (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
+                        (term.forward_response_policy_id != 0 && term.commit_response_mutations));
+            };
+            const HirTerminator* conflict = nullptr;
+            if (route.control.kind == HirControlKind::Direct) {
+                if (policy_mutation_conflict(route.control.direct_term))
+                    conflict = &route.control.direct_term;
+            } else if (route.control.kind == HirControlKind::If) {
+                if (policy_mutation_conflict(route.control.then_term))
+                    conflict = &route.control.then_term;
+                else if (policy_mutation_conflict(route.control.else_term))
+                    conflict = &route.control.else_term;
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    const auto& arm = route.control.match_arms[ai];
+                    if (policy_mutation_conflict(arm.direct_term)) {
+                        conflict = &arm.direct_term;
+                        break;
+                    }
+                    if (policy_mutation_conflict(arm.then_term)) {
+                        conflict = &arm.then_term;
+                        break;
+                    }
+                    if (policy_mutation_conflict(arm.else_term)) {
+                        conflict = &arm.else_term;
+                        break;
+                    }
+                }
+            }
+            if (conflict != nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    conflict->span,
+                    conflict->kind == HirTerminatorKind::Redirect
+                        ? lit_str("redirect cannot be combined with response header mutations")
+                    : conflict->has_forward_target_transform
+                        ? lit_str(
+                              "target_transform cannot be combined with response header mutations")
+                    : conflict->forward_response_policy_id != 0
+                        ? lit_str(
+                              "response_policy cannot be combined with response header mutations")
+                        : lit_str(
+                              "request_policy cannot be combined with response header mutations"));
+        }
+
+        // Response-read-deadline routes are deliberately narrower than the
+        // general Forward grammar. Count every timeout/buffering terminal,
+        // including hidden control bodies, and admit either the established
+        // effect-free direct route or one exact pure path selector.
+        const HirTerminator* timeout_term = nullptr;
+        u32 timeout_term_count = 0;
+        auto note_timeout = [&](const HirTerminator& term) {
+            if (term.forward_response_read_timeout_seconds == 0 &&
+                term.forward_response_buffering == ForwardResponseBufferingMode::None)
+                return;
+            timeout_term_count++;
+            if (timeout_term == nullptr) timeout_term = &term;
+        };
+        auto note_guard = [&](const HirGuard& guard) {
+            if (guard.fail_kind == HirGuard::FailKind::Term) {
+                note_timeout(guard.fail_term);
+            } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                if (guard.fail_body.body_kind == HirGuardBody::BodyKind::Direct)
+                    note_timeout(guard.fail_body.direct_term);
+                else {
+                    note_timeout(guard.fail_body.then_term);
+                    note_timeout(guard.fail_body.else_term);
+                }
+            } else {
+                for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                    note_timeout(mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+            }
+        };
+        if (route.control.kind == HirControlKind::Direct) {
+            note_timeout(route.control.direct_term);
+        } else if (route.control.kind == HirControlKind::If) {
+            note_timeout(route.control.then_term);
+            note_timeout(route.control.else_term);
+        } else {
+            for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                const auto& arm = route.control.match_arms[ai];
+                for (u32 gi = 0; gi < arm.guards.len; gi++) note_guard(arm.guards[gi]);
+                if (arm.body_kind == HirMatchArm::BodyKind::Direct)
+                    note_timeout(arm.direct_term);
+                else {
+                    note_timeout(arm.then_term);
+                    note_timeout(arm.else_term);
+                }
+            }
+        }
+        for (u32 gi = 0; gi < route.guards.len; gi++) note_guard(route.guards[gi]);
+        for (u32 fi = 0; fi < route.for_loops.len; fi++) {
+            const auto& body = route.for_loops[fi].body;
+            if (body.has_term) note_timeout(body.term);
+            for (u32 gi = 0; gi < body.guards.len; gi++) note_guard(body.guards[gi]);
+            for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                note_timeout(body.ifs[ii].then_term);
+                note_timeout(body.ifs[ii].else_term);
+            }
+            for (u32 mi = 0; mi < body.matches.len; mi++) {
+                for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                    const auto& arm = body.matches[mi].arms[ai];
+                    for (u32 gi = 0; gi < arm.guards.len; gi++) note_guard(arm.guards[gi]);
+                    if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
+                        note_timeout(arm.direct_term);
+                    else {
+                        note_timeout(arm.then_term);
+                        note_timeout(arm.else_term);
+                    }
+                }
+            }
+        }
+        if (timeout_term != nullptr) {
+            const HirTerminator& direct = route.control.direct_term;
+            const bool complete_buffering = timeout_term->forward_response_buffering ==
+                                            ForwardResponseBufferingMode::CompleteContentLength;
+            auto timeout_request_policy_is_admitted = [&](const HirTerminator& term) {
+                if (response_read_deadline_request_policy_is_admitted(
+                        term.forward_request_policy_id))
+                    return true;
+                return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       fixed_upload_head_route_method_is_admitted(route.method) &&
+                       fixed_upload_head_request_policy_is_admitted(
+                           term.forward_request_policy_id) &&
+                       term.forward_response_policy_id != 0 &&
+                       term.forward_response_policy_id <= mod.response_policies.len &&
+                       term.forward_failure_policy_id != 0 &&
+                       term.forward_failure_policy_id <= mod.failure_policies.len &&
+                       term.forward_timeout_failure_policy_id != 0 &&
+                       term.forward_timeout_failure_policy_id <= mod.failure_policies.len &&
+                       fixed_upload_head_timeout_policies_valid(
+                           mod.response_policies[term.forward_response_policy_id - 1],
+                           mod.failure_policies[term.forward_failure_policy_id - 1],
+                           mod.failure_policies[term.forward_timeout_failure_policy_id - 1]);
+            };
+            auto canonical_forward = [&](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
+                       !term.commit_response_mutations &&
+                       term.forward_response_read_timeout_seconds != 0 &&
+                       response_read_timeout_seconds_valid(
+                           term.forward_response_read_timeout_seconds) &&
+                       term.forward_response_buffering ==
+                           ForwardResponseBufferingMode::CompleteContentLength &&
+                       complete_content_length_request_policy_is_admitted(
+                           term.forward_request_policy_id);
+            };
+            auto canonical_redirect = [&](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::Redirect &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       !term.commit_response_mutations && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
+                       term.forward_response_policy_id == 0 &&
+                       term.forward_failure_policy_id == 0 &&
+                       term.forward_timeout_failure_policy_id == 0 &&
+                       term.forward_response_read_timeout_seconds == 0 &&
+                       term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       !term.has_forward_target_transform && term.redirect_policy_id != 0 &&
+                       term.redirect_policy_id <= mod.redirect_policies.len &&
+                       redirect_policy_spec_valid(
+                           mod.redirect_policies[term.redirect_policy_id - 1]);
+            };
+            const bool structural_common =
+                route.locals.len == 0 && route.guards.len == 0 && route.waits.len == 0 &&
+                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
+                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
+                route.throttle_down_bps == 0 && !route.is_timer;
+            const bool direct_canonical =
+                structural_common && timeout_term_count == 1 &&
+                route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
+                route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
+                direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
+                !direct.has_forward_target_transform && !direct.commit_response_mutations &&
+                timeout_request_policy_is_admitted(direct) &&
+                (!complete_buffering ||
+                 (complete_content_length_route_method_is_admitted(route.method) &&
+                  complete_content_length_request_policy_is_admitted(
+                      direct.forward_request_policy_id)));
+            const HirExpr& cond = route.control.cond;
+            auto expression_is_owned = [&](const HirExpr* expression) {
+                if (expression == nullptr) return false;
+                for (u32 i = 0; i < route.exprs.len; i++) {
+                    if (expression == &route.exprs[i]) return true;
+                }
+                return false;
+            };
+            const bool cond_ptrs_owned = route.exprs.len == 2 && expression_is_owned(cond.lhs) &&
+                                         expression_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+            const bool deferred_canonical =
+                structural_common && timeout_term_count == 1 &&
+                route.control.kind == HirControlKind::If &&
+                timeout_term == &route.control.else_term && route.method != kRouteMethodAny &&
+                complete_content_length_route_method_is_admitted(route.method) && cond_ptrs_owned &&
+                cond.kind == HirExprKind::Eq && cond.type == HirTypeKind::Bool &&
+                cond.lhs->kind == HirExprKind::ReqPathOnly && cond.lhs->type == HirTypeKind::Str &&
+                cond.rhs->kind == HirExprKind::StrLit && cond.rhs->type == HirTypeKind::Str &&
+                (cond.rhs->str_value.len == 0 || cond.rhs->str_value.ptr != nullptr) &&
+                canonical_redirect(route.control.then_term) &&
+                canonical_forward(route.control.else_term);
+            auto framing_forward = [&](const HirTerminator& term, RequestPolicyId policy) {
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
+                       !term.commit_response_mutations &&
+                       term.forward_request_policy_id == static_cast<u16>(policy) &&
+                       term.forward_response_read_timeout_seconds != 0 &&
+                       response_read_timeout_seconds_valid(
+                           term.forward_response_read_timeout_seconds) &&
+                       term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       timeout_request_policy_is_admitted(term);
+            };
+            auto same_framing_bundle = [](const HirTerminator& lhs, const HirTerminator& rhs) {
+                return lhs.upstream_index == rhs.upstream_index &&
+                       lhs.forward_response_policy_id == rhs.forward_response_policy_id &&
+                       lhs.forward_failure_policy_id == rhs.forward_failure_policy_id &&
+                       lhs.forward_timeout_failure_policy_id ==
+                           rhs.forward_timeout_failure_policy_id &&
+                       lhs.forward_response_read_timeout_seconds ==
+                           rhs.forward_response_read_timeout_seconds &&
+                       lhs.forward_response_buffering == rhs.forward_response_buffering;
+            };
+            const bool deferred_framing =
+                structural_common && timeout_term_count == 2 &&
+                route.control.kind == HirControlKind::If && route.method == kRouteMethodHead &&
+                route.exprs.len == 0 && cond.kind == HirExprKind::ReqHasContentLength &&
+                cond.type == HirTypeKind::Bool && cond.lhs == nullptr && cond.rhs == nullptr &&
+                framing_forward(route.control.then_term,
+                                RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
+                framing_forward(route.control.else_term, RequestPolicyId::Http11FixedStrip) &&
+                same_framing_bundle(route.control.then_term, route.control.else_term);
+            if (!direct_canonical && !deferred_canonical && !deferred_framing)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    timeout_term->span,
+                    complete_buffering
+                        ? lit_str("response_buffering currently requires an effect-free direct "
+                                  "admitted bodyless non-HEAD Forward route")
+                        : lit_str("response_read_timeout currently requires an effect-free direct "
+                                  "Forward route"));
+            route.forward_preflight_mode = direct_canonical ? ForwardPreflightMode::EagerDirect
+                                           : deferred_canonical
+                                               ? ForwardPreflightMode::AfterCanonicalSelection
+                                               : ForwardPreflightMode::AfterRequestFramingSelection;
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
@@ -19355,6 +19999,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // (and mod.routes.len counts both, so track HTTP routes separately).
         if (!route.is_timer && http_route_count >= HirModule::kMaxRoutes)
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        if (!route.is_timer) {
+            for (u32 ri = 0; ri < mod.routes.len; ri++) {
+                const HirRoute& existing = mod.routes[ri];
+                if (!existing.is_timer && existing.method == route.method &&
+                    existing.path.eq(route.path))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route_decl.span,
+                                          lit_str("duplicate route path and method"));
+            }
+        }
         if (!route.is_timer) http_route_count++;
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
@@ -19374,11 +20028,18 @@ FrontendResult<HirModule*> analyze_file(const AstFile& file,
     std::vector<std::string> import_stack;
     const std::vector<Str> external_decorator_names;
     return analyze_file_internal(
-        file, source_path, import_stack, nullptr, external_decorator_names, source_budget);
+        file, source_path, import_stack, nullptr, external_decorator_names, source_budget, false);
 }
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file) {
     return analyze_file(file, {});
+}
+
+FrontendResult<HirModule*> analyze_file_for_internal_propagation(const AstFile& file) {
+    std::vector<std::string> import_stack;
+    const std::vector<Str> external_decorator_names;
+    return analyze_file_internal(
+        file, {}, import_stack, nullptr, external_decorator_names, nullptr, true);
 }
 
 void reset_import_analysis_counter() {

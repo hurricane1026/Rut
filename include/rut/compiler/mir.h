@@ -1,6 +1,13 @@
 #pragma once
 
+#include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/redirect_policy.h"
+#include "rut/common/request_policy.h"
+#include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -14,6 +21,7 @@ enum class MirTerminatorKind : u8 {
     Branch,
     ReturnStatus,
     ForwardUpstream,
+    Redirect,
     YieldTimer,
 };
 
@@ -278,6 +286,17 @@ struct MirTerminator {
     // Request-header overrides for forward(set_header:) — carried verbatim from
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
+    u16 forward_request_policy_id = 0;
+    u16 forward_response_policy_id = 0;
+    u16 forward_failure_policy_id = 0;
+    u16 forward_timeout_failure_policy_id = 0;
+    u8 forward_response_read_timeout_seconds = 0;
+    ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;
+    u16 redirect_policy_id = 0;
+    // Internal compiler-only target transform metadata copied losslessly from
+    // HIR. Presence is explicit; lowering validates the complete descriptor.
+    bool has_forward_target_transform = false;
+    ForwardTargetTransformSpec forward_target_transform{};
 };
 
 struct MirBlock {
@@ -318,6 +337,7 @@ struct MirFunction {
     bool has_explicit_resume_blocks = false;
     u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     // @rateLimit per-route limit, copied from HirRoute → carried to RIR Function.
     // @rateLimit decorators -> stacked fixed-window rules (empty = no limit).
     RateLimitRuleSet rate_limit{};
@@ -344,6 +364,7 @@ struct MirFunction {
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
@@ -367,6 +388,7 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_timer = other.is_timer;
@@ -388,6 +410,7 @@ struct MirFunction {
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
@@ -411,6 +434,7 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_timer = other.is_timer;
@@ -494,6 +518,15 @@ struct MirModule {
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
+    FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
+        strict_local_response_policies;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
+        exact_strict_local_response_bindings;
+    FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
@@ -503,14 +536,33 @@ struct MirModule {
     MirModule() = default;
     MirModule(const MirModule& other)
         : upstreams(other.upstreams),
+          response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
+          redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
+    }
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
+        redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;
@@ -520,14 +572,33 @@ struct MirModule {
     }
     MirModule(MirModule&& other) noexcept
         : upstreams(other.upstreams),
+          response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
+          redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
+    }
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
+        redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;

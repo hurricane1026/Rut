@@ -1,7 +1,13 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/redirect_policy.h"
+#include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -169,17 +175,18 @@ enum class Opcode : u8 {
     ReqCookie,            // %r = req.cookie "name"        → Optional(str)
 
     // ── Request mutation ──
-    ReqSetHeader,       // req.set_header "Name", %val
-    ReqAddHeader,       // req.add_header "Name", %val
-    RespHeader,         // %opt = resp.header "Name", %fallback_opt
-    RespSetHeader,      // resp.set_header "Name", %val
-    RespAddHeader,      // resp.add_header "Name", %val
-    RespRemoveHeader,   // resp.remove_header "Name"
-    RespCommitHeaders,  // publish pending Response-builder mutations
-    ReqSetPath,         // req.set_path %path
-    CtxStoreSlotI32,    // if i < ctx.slot_count: ctx.slot[i] = %val
-                        // Stored as a zero-extended i64 slot. If no slot
-                        // is available, the write is ignored.
+    ReqSetHeader,           // req.set_header "Name", %val
+    ReqAddHeader,           // req.add_header "Name", %val
+    RespHeader,             // %opt = resp.header "Name", %fallback_opt
+    RespSetHeader,          // resp.set_header "Name", %val
+    RespAddHeader,          // resp.add_header "Name", %val
+    RespRemoveHeader,       // resp.remove_header "Name"
+    RespCommitHeaders,      // publish pending Response-builder mutations
+    ReqSetPath,             // req.set_path %path
+    ReqSetTargetTransform,  // req.set_target_transform <1-based transform id>
+    CtxStoreSlotI32,        // if i < ctx.slot_count: ctx.slot[i] = %val
+                            // Stored as a zero-extended i64 slot. If no slot
+                            // is available, the write is ignored.
 
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
@@ -248,25 +255,30 @@ enum class Opcode : u8 {
     AccessLogWrite,
 
     // ── Terminators ── (must be last instruction in a block)
-    Br,          // br %cond, then_block, else_block
-    Jmp,         // jmp target_block
-    RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
-                 //   operand_count == 0 (literal form): imm.i64_val holds
-                 //     a packed (status | body_idx<<16 | headers_idx<<32):
-                 //       bits [ 0:16): HTTP status code (0..65535)
-                 //       bits [16:32): 1-based response_bodies index,
-                 //                     0 = no custom body
-                 //       bits [32:48): 1-based response header_sets index,
-                 //                     0 = no custom headers
-                 //       bits [48:64): reserved (must be 0)
-                 //   operand_count >  0 (value form):   operands[0] is an
-                 //     SSA i32 status code; imm is unused and both
-                 //     body_idx and headers_idx are implicitly 0.
-                 //   Printers/decoders MUST branch on operand_count before
-                 //   reading imm.i64_val — doing otherwise will print
-                 //   garbage for the value form and miss body/header idx
-                 //   in the literal form.
-    RetForward,  // ret.forward upstream [, options]
+    Br,         // br %cond, then_block, else_block
+    Jmp,        // jmp target_block
+    RetStatus,  // ret.status — two encodings, disambiguated by operand_count:
+                //   operand_count == 0 (literal form): imm.i64_val holds
+                //     a packed (status | body_idx<<16 | headers_idx<<32):
+                //       bits [ 0:16): HTTP status code (0..65535)
+                //       bits [16:32): 1-based response_bodies index,
+                //                     0 = no custom body
+                //       bits [32:48): 1-based response header_sets index,
+                //                     0 = no custom headers
+                //       bits [48:64): reserved (must be 0)
+                //   operand_count >  0 (value form):   operands[0] is an
+                //     SSA i32 status code; imm is unused and both
+                //     body_idx and headers_idx are implicitly 0.
+                //   Printers/decoders MUST branch on operand_count before
+                //   reading imm.i64_val — doing otherwise will print
+                //   garbage for the value form and miss body/header idx
+                //   in the literal form.
+    // ret.forward upstream [, request_policy_id [, response_policy_id]].
+    // The optional policy operands are contiguous; a response policy with no
+    // request policy uses an explicit zero request operand.
+    RetForward,
+    RetForwardBundle,
+    RetRedirect,  // ret.redirect policy_id (1-based redirect policy table id)
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldTimer,     // yield.timer ms, next_state
@@ -336,7 +348,8 @@ struct Instruction {
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
         return op == Opcode::Br || op == Opcode::Jmp || op == Opcode::RetStatus ||
-               op == Opcode::RetForward || is_yield();
+               op == Opcode::RetForward || op == Opcode::RetForwardBundle ||
+               op == Opcode::RetRedirect || is_yield();
     }
 };
 
@@ -410,6 +423,12 @@ struct Function {
     u8* yield_kinds;
     u8* yield_arm_masks;
 
+    // Compiler-verified preflight timing for the bounded response-read-timeout
+    // slice. A nonzero value is the exact 1-based ForwardPolicyBundle id
+    // returned by every admitted timeout-bearing RetForwardBundle.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
+    u16 preflight_forward_policy_bundle_id = 0;
+
     Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }
     const Block* entry() const { return block_count > 0 ? &blocks[0] : nullptr; }
 };
@@ -461,6 +480,36 @@ struct Module {
     u32 header_pool_used = 0;
     HeaderSetRef header_sets[kMaxHeaderSets];
     u32 header_set_count = 0;
+
+    // Validated response-policy metadata. IDs are 1-based in the RIR module
+    // and are copied into RouteConfig before the compiler arena is released.
+    ForwardResponsePolicySpec response_policies[kMaxResponsePolicies]{};
+    u32 response_policy_count = 0;
+    ForwardFailurePolicySpec failure_policies[kMaxForwardFailurePolicies]{};
+    u32 failure_policy_count = 0;
+    ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
+    u32 policy_bundle_count = 0;
+
+    // Program-scoped strict local responses for route misses. IDs are 1-based;
+    // zero in a canonical method slot means no configured action.
+    StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
+    u32 strict_local_response_policy_count = 0;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding
+        exact_strict_local_response_bindings[kMaxExactStrictLocalResponseBindings]{};
+    u32 exact_strict_local_response_binding_count = 0;
+
+    // Foundation-only target transforms. Strings are borrowed by the RIR module
+    // and copied into RouteConfig during activation; no runtime materializer
+    // consumes them in this increment.
+    ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
+    u32 target_transform_count = 0;
+
+    // Redirect metadata. Strings are borrowed by the RIR module and copied
+    // into RouteConfig during activation; RetRedirect carries a 1-based ID.
+    RedirectPolicySpec redirect_policies[kMaxRedirectPolicies]{};
+    u32 redirect_policy_count = 0;
 
     // Upstream declarations carried verbatim from the DSL so a
     // compile→config helper can translate them into

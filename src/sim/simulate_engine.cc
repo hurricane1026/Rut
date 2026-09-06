@@ -16,6 +16,7 @@
 #include "rut/runtime/sim_engine.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/traffic_replay.h"
+#include <memory>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -25,6 +26,11 @@
 namespace rut::sim {
 
 namespace {
+
+static void reset_module(rir::Module& module) {
+    std::destroy_at(&module);
+    std::construct_at(&module);
+}
 
 static u32 cstr_len(const char* s) {
     u32 n = 0;
@@ -329,6 +335,10 @@ static const char* action_str(jit::HandlerAction action) {
             return "status";
         case jit::HandlerAction::Forward:
             return "forward";
+        case jit::HandlerAction::ForwardBundle:
+            return "forward_bundle";
+        case jit::HandlerAction::Redirect:
+            return "redirect";
         case jit::HandlerAction::Yield:
             return "yield";
     }
@@ -385,14 +395,14 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
     next.functions = arena.alloc_array<rir::Function>(next.func_cap);
     if (!next.functions) {
         arena.destroy();
-        module = {};
+        reset_module(module);
         return false;
     }
     next.struct_cap = struct_cap == 0 ? 1 : struct_cap;
     next.struct_defs = arena.alloc_array<rir::StructDef*>(next.struct_cap);
     if (!next.struct_defs) {
         arena.destroy();
-        module = {};
+        reset_module(module);
         return false;
     }
 
@@ -402,7 +412,7 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
 
 void ModuleContext::destroy() {
     arena.destroy();
-    module = {};
+    reset_module(module);
 }
 
 bool load_manifest(const char* path, Manifest& out) {
@@ -642,6 +652,11 @@ static SimulateResult finalize_handler_result(const Engine& engine,
         return result;
     }
 
+    if (unpacked.action == jit::HandlerAction::Redirect) {
+        result.verdict = Verdict::Unsupported;
+        return result;
+    }
+
     result.verdict = Verdict::Unsupported;
     return result;
 }
@@ -701,12 +716,15 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.tls_active = src.tls_active;
     dst.tls_handshake_complete = src.tls_handshake_complete;
     dst.tls = src.tls;
-    dst.pipeline_depth = src.pipeline_depth;
-    dst.pipeline_stash_len = src.pipeline_stash_len;
+    dst.copy_downstream_transport_state_from(src);
+    dst.copy_http1_pipeline_state_from(src);
     dst.req_header_end = src.req_header_end;
     dst.req_content_length = src.req_content_length;
     dst.req_initial_send_len = src.req_initial_send_len;
     dst.req_malformed = src.req_malformed;
+    dst.req_client_has_content_length = src.req_client_has_content_length;
+    dst.req_client_content_length_count = src.req_client_content_length_count;
+    dst.req_client_transfer_encoding = src.req_client_transfer_encoding;
     dst.req_body_mode = src.req_body_mode;
     dst.req_body_remaining = src.req_body_remaining;
     dst.req_chunk_parser = src.req_chunk_parser;
@@ -723,11 +741,14 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.yield_timeout_armed = src.yield_timeout_armed;
     dst.resp_status = src.resp_status;
     dst.req_method = src.req_method;
+    dst.downstream_req_size = src.downstream_req_size;
     dst.req_size = src.req_size;
     dst.peer_addr = src.peer_addr;
     dst.peer_port = src.peer_port;
     copy_char_array(dst.req_path, src.req_path);
     dst.req_path_canon = copy_req_path_canon(src, dst);
+    dst.target_transform_id = src.target_transform_id;
+    dst.target_transform_recorded = src.target_transform_recorded;
     dst.upstream_us = src.upstream_us;
     copy_char_array(dst.upstream_name, src.upstream_name);
     dst.upstream_start_us = src.upstream_start_us;
@@ -780,6 +801,10 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
     for (u32 iter = result.yield_count; iter < max_yields; iter++) {
         execution.connection = &conn;
         unpacked = execution.invoke();
+        if (conn.target_transform_recorded) {
+            result.verdict = Verdict::Unsupported;
+            return result;
+        }
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
 

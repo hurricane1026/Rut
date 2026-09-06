@@ -317,6 +317,18 @@ struct Ctx {
         return fn_req_set_path;
     }
 
+    // void rut_helper_req_set_target_transform(ptr conn, i32 id)
+    LLVMValueRef fn_req_set_target_transform = nullptr;
+    LLVMValueRef get_req_set_target_transform() {
+        if (!fn_req_set_target_transform) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_req_set_target_transform =
+                LLVMAddFunction(llvm_mod, "rut_helper_req_set_target_transform", ft);
+        }
+        return fn_req_set_target_transform;
+    }
+
     // void rut_helper_req_set_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
     LLVMValueRef fn_req_set_header = nullptr;
     LLVMValueRef get_req_set_header() {
@@ -999,6 +1011,21 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            c.get_req_set_path(),
                            args,
                            3,
+                           "");
+            break;
+        }
+        case rir::Opcode::ReqSetTargetTransform: {
+            // Preserve forged negative i32 immediates as unsigned bits; the
+            // helper records them as a fail-closed sentinel rather than
+            // collapsing them into the no-effect state.
+            LLVMValueRef id =
+                LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*SignExtend=*/0);
+            LLVMValueRef args[] = {c.param_conn, id};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_target_transform()),
+                           c.get_req_set_target_transform(),
+                           args,
+                           2,
                            "");
             break;
         }
@@ -1759,8 +1786,22 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
-        case rir::Opcode::RetForward: {
-            // Pack: action=Forward, upstream_id from operand or immediate.
+        case rir::Opcode::RetRedirect: {
+            // The verifier rejects malformed redirect immediates. Keep the
+            // codegen boundary fail-closed too: an unverified zero/negative/
+            // wide value produces a Redirect with id 0, which dispatch rejects.
+            const i64 raw_id = inst.imm.i32_val;
+            const u64 policy_id = (raw_id > 0 && raw_id <= 0xffff) ? static_cast<u64>(raw_id) : 0;
+            const u64 packed = static_cast<u64>(HandlerAction::Redirect) | (policy_id << 24);
+            c.emit_parse_unprime();
+            LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, packed, 0));
+            break;
+        }
+        case rir::Opcode::RetForward:
+        case rir::Opcode::RetForwardBundle: {
+            // Pack: action=Forward, upstream_id from operand. For the explicit
+            // request-policy slice, operand 1 carries the compact policy id in
+            // the otherwise-unused status slot.
             LLVMValueRef upstream;
             if (inst.operand_count > 0) {
                 upstream = c.get_value(inst.operands[0]);
@@ -1770,12 +1811,124 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             } else {
                 upstream = LLVMConstInt(c.i32_ty, 0, 0);
             }
-            LLVMValueRef action =
-                LLVMConstInt(c.i64_ty, static_cast<u64>(HandlerAction::Forward), 0);
+            const bool is_bundle = inst.op == rir::Opcode::RetForwardBundle;
+            LLVMValueRef action = LLVMConstInt(
+                c.i64_ty,
+                static_cast<u64>(is_bundle ? HandlerAction::ForwardBundle : HandlerAction::Forward),
+                0);
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");
             LLVMValueRef result = LLVMBuildOr(c.builder, action, shifted, "result");
+            if (inst.operand_count > 1) {
+                // The policy occupies the full 16-bit status slot. Direct RIR
+                // callers may provide signed or wider integer values, so do
+                // not truncate before validating the range: 256 must remain
+                // 256 (unsupported), and negative/wider values become the
+                // invalid sentinel rather than transparent policy 0.
+                LLVMValueRef policy_raw = c.get_value(inst.operands[1]);
+                LLVMValueRef policy_ext = nullptr;
+                const rir::Type* policy_ty =
+                    c.cur_fn ? c.cur_fn->values[inst.operands[1].id].type : nullptr;
+                if (policy_ty) {
+                    switch (policy_ty->kind) {
+                        case rir::TypeKind::I32:
+                            policy_ext =
+                                LLVMBuildSExt(c.builder, policy_raw, c.i64_ty, "policy.sext");
+                            break;
+                        case rir::TypeKind::U32:
+                            policy_ext =
+                                LLVMBuildZExt(c.builder, policy_raw, c.i64_ty, "policy.zext");
+                            break;
+                        case rir::TypeKind::I64:
+                        case rir::TypeKind::U64:
+                            policy_ext = policy_raw;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (!policy_ext) {
+                    policy_ext = LLVMConstInt(c.i64_ty, 0xffffu, 0);
+                }
+                LLVMValueRef at_least_zero = LLVMBuildICmp(
+                    c.builder, LLVMIntSGE, policy_ext, LLVMConstInt(c.i64_ty, 0, 0), "policy.ge0");
+                LLVMValueRef at_most_u16 = LLVMBuildICmp(c.builder,
+                                                         LLVMIntSLE,
+                                                         policy_ext,
+                                                         LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                         "policy.le16");
+                LLVMValueRef in_range =
+                    LLVMBuildAnd(c.builder, at_least_zero, at_most_u16, "policy.range");
+                LLVMValueRef safe_policy = LLVMBuildSelect(c.builder,
+                                                           in_range,
+                                                           policy_ext,
+                                                           LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                           "policy.clamped");
+                // Keep the policy confined to the 16-bit status slot before
+                // shifting it.  The range select above makes this redundant
+                // for well-typed values, but the explicit mask is an ABI
+                // boundary: no direct-RIR policy bits may reach upstream_id.
+                safe_policy = LLVMBuildAnd(
+                    c.builder, safe_policy, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.mask");
+                LLVMValueRef policy_shifted = LLVMBuildShl(
+                    c.builder, safe_policy, LLVMConstInt(c.i64_ty, 8, 0), "policy.shl");
+                result = LLVMBuildOr(c.builder, result, policy_shifted, "result.policy");
+            }
+            if (inst.operand_count > 2) {
+                // Forward response policy occupies the ABI next_state slot.
+                // Direct RIR callers may provide signed or wider integers; an
+                // out-of-range value becomes the unsupported sentinel rather
+                // than truncating to transparent policy 0 or spilling into a
+                // different ABI field.
+                LLVMValueRef response_raw = c.get_value(inst.operands[2]);
+                LLVMValueRef response_ext = nullptr;
+                const rir::Type* response_ty =
+                    c.cur_fn ? c.cur_fn->values[inst.operands[2].id].type : nullptr;
+                if (response_ty) {
+                    switch (response_ty->kind) {
+                        case rir::TypeKind::I32:
+                            response_ext = LLVMBuildSExt(
+                                c.builder, response_raw, c.i64_ty, "response_policy.sext");
+                            break;
+                        case rir::TypeKind::U32:
+                            response_ext = LLVMBuildZExt(
+                                c.builder, response_raw, c.i64_ty, "response_policy.zext");
+                            break;
+                        case rir::TypeKind::I64:
+                        case rir::TypeKind::U64:
+                            response_ext = response_raw;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (!response_ext) response_ext = LLVMConstInt(c.i64_ty, 0xffffu, 0);
+                LLVMValueRef response_ge_zero = LLVMBuildICmp(c.builder,
+                                                              LLVMIntSGE,
+                                                              response_ext,
+                                                              LLVMConstInt(c.i64_ty, 0, 0),
+                                                              "response_policy.ge0");
+                LLVMValueRef response_le_u16 = LLVMBuildICmp(c.builder,
+                                                             LLVMIntSLE,
+                                                             response_ext,
+                                                             LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                             "response_policy.le16");
+                LLVMValueRef response_in_range = LLVMBuildAnd(
+                    c.builder, response_ge_zero, response_le_u16, "response_policy.range");
+                LLVMValueRef safe_response = LLVMBuildSelect(c.builder,
+                                                             response_in_range,
+                                                             response_ext,
+                                                             LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                             "response_policy.clamped");
+                safe_response = LLVMBuildAnd(c.builder,
+                                             safe_response,
+                                             LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                             "response_policy.mask");
+                LLVMValueRef response_shifted = LLVMBuildShl(
+                    c.builder, safe_response, LLVMConstInt(c.i64_ty, 40, 0), "response_policy.shl");
+                result = LLVMBuildOr(c.builder, result, response_shifted, "result.response_policy");
+            }
             c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;

@@ -1,3 +1,5 @@
+#include "deferred_preflight_fixture.h"
+#include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -10,6 +12,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -18,6 +21,7 @@
 #include "test.h"
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 #include <pthread.h>
 #include <stdio.h>
@@ -34,6 +38,16 @@ static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;
     return {s, n};
+}
+
+static u64 invalid_redirect_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    auto result = HandlerResult::make_redirect(1);
+    result.status_code = 1;
+    return result.pack();
+}
+
+static u64 invalid_action_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return 0xffu;
 }
 
 struct TestHandlerCtxFrame {
@@ -261,6 +275,61 @@ TEST(jit, return_200) {
     CHECK(result.action == HandlerAction::ReturnStatus);
     CHECK(result.status_code == 200);
 
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, redirect_abi_and_compiled_action_are_fail_closed) {
+    for (u16 id : {static_cast<u16>(1), static_cast<u16>(65535)}) {
+        const auto packed = HandlerResult::make_redirect(id).pack();
+        const auto decoded = HandlerResult::unpack(packed);
+        CHECK(HandlerResult::redirect_fields_valid(decoded));
+        CHECK_EQ(decoded.upstream_id, id);
+        CHECK_EQ(decoded.status_code, 0u);
+        CHECK_EQ(decoded.next_state, 0u);
+        CHECK_EQ(decoded.yield_kind, YieldKind::HttpGet);
+    }
+    auto zero = HandlerResult::make_redirect(0);
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(zero));
+    auto bad_status = HandlerResult::make_redirect(1);
+    bad_status.status_code = 1;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_status));
+    auto bad_next = HandlerResult::make_redirect(1);
+    bad_next.next_state = 1;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_next));
+    auto bad_kind = HandlerResult::make_redirect(1);
+    bad_kind.yield_kind = YieldKind::Timer;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_kind));
+    HandlerCtx invalid_ctx{};
+    const u8 request[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    auto invalid_outcome = invoke_jit_handler(
+        &invalid_redirect_handler, nullptr, invalid_ctx, request, sizeof(request) - 1, nullptr);
+    CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
+    invalid_outcome = invoke_jit_handler(
+        &invalid_action_handler, nullptr, invalid_ctx, request, sizeof(request) - 1, nullptr);
+    CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
+
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("redirect"), lit("/api"), 0));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_ret_redirect(65535));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_redirect"));
+    REQUIRE(handler != nullptr);
+    HandlerCtx ctx{};
+    const u8 redirect_request[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    const auto outcome = invoke_jit_handler(
+        handler, nullptr, ctx, redirect_request, sizeof(redirect_request) - 1, nullptr);
+    CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Redirect);
+    CHECK_EQ(outcome.redirect_policy_id, 65535u);
     engine.shutdown();
     tc.destroy();
 }
@@ -8167,6 +8236,285 @@ TEST(result, pack_unpack_forward) {
     CHECK(r2.status_code == 0);
 }
 
+TEST(result, pack_unpack_forward_bundle_preserves_16bit_ids) {
+    auto r = HandlerResult::make_forward_with_bundle(0xFFFFu, 0xFFFFu, 0xFFFFu);
+    auto r2 = HandlerResult::unpack(r.pack());
+    CHECK(r2.action == HandlerAction::ForwardBundle);
+    CHECK(r2.upstream_id == 0xFFFFu);
+    CHECK(r2.status_code == 0xFFFFu);
+    CHECK(r2.next_state == 0xFFFFu);
+    auto legacy = HandlerResult::make_forward_with_policies(0xFFFFu, 0xFFFFu, 0xFFFFu);
+    auto legacy2 = HandlerResult::unpack(legacy.pack());
+    CHECK(legacy2.action == HandlerAction::Forward);
+    CHECK(legacy2.upstream_id == 0xFFFFu);
+    CHECK(legacy2.status_code == 0xFFFFu);
+    CHECK(legacy2.next_state == 0xFFFFu);
+}
+
+static u64 test_forward_bundle_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return HandlerResult::make_forward_with_bundle(7, 9, 11).pack();
+}
+
+TEST(jit_dispatch, forward_bundle_keeps_request_and_bundle_ids_independent) {
+    HandlerCtx ctx{};
+    auto out = invoke_jit_handler(&test_forward_bundle_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK(out.upstream_id == 7);
+    CHECK(out.request_policy_id == 9);
+    CHECK(out.policy_bundle_id == 11);
+    CHECK(out.response_policy_id == 0);
+}
+
+TEST(jit, compiled_failure_only_forward_bundle_preserves_zero_response_id) {
+    const char* src =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(raw.action == HandlerAction::ForwardBundle);
+    CHECK(raw.status_code == 0);
+    CHECK(raw.next_state == 1);
+    HandlerCtx ctx{};
+    auto out = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK(out.request_policy_id == 0);
+    CHECK(out.policy_bundle_id == 1);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, compiled_timeout_failure_policy_preserves_single_packed_bundle_id) {
+    const char* src = R"rut(
+upstream b
+route GET "/" {
+    return forward(b, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "s", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: "current",
+        connection: "request", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "s", date: "current",
+        connection: "request", body: b"slow"
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 2u);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(raw.action == HandlerAction::ForwardBundle);
+    CHECK_EQ(raw.next_state, 1u);
+    HandlerCtx ctx{};
+    const auto out = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(out.policy_bundle_id, 1u);
+    CHECK_EQ(out.timeout_failure_policy_id, 0u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, compiled_response_read_timeout_preserves_single_bundle_and_request_policy_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b, request_policy: {
+        version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "rut", date: "current", hide_headers: []
+    }, response_read_timeout: 7s)
+}
+route GET "/later" { return 204 }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(rir.module.func_count, 2u);
+    CHECK_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[1].preflight_forward_policy_bundle_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 7u);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(raw.action == HandlerAction::ForwardBundle);
+    CHECK_EQ(raw.status_code, 1u);
+    CHECK_EQ(raw.next_state, 1u);
+    HandlerCtx ctx{};
+    const auto out = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(out.request_policy_id, 1u);
+    CHECK_EQ(out.policy_bundle_id, 1u);
+    CHECK_EQ(out.response_read_timeout_seconds, 0u);
+
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*config, rir.module));
+    REQUIRE_EQ(config->response_policy_count, 1u);
+    config->response_policy_count = 0;
+    REQUIRE(config->use_segment_trie());
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    CHECK(config->dispatch_kind() == RouteConfig::DispatchKind::SegmentTrie);
+    config->response_policy_count = 1;
+    REQUIRE(config->use_art());
+
+    config->policy_bundles[0].response_read_timeout_seconds = 6;
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    config->policy_bundles[0].response_read_timeout_seconds = 7;
+
+    const Str saved_pattern = rir.module.functions[1].route_pattern;
+    rir.module.functions[1].route_pattern = {"/bad?x", 6};
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    rir.module.functions[1].route_pattern = saved_pattern;
+    REQUIRE(register_jit_routes(*config, rir.module, engine));
+    REQUIRE_EQ(config->route_count, 2u);
+    CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(config->routes[1].preflight_forward_policy_bundle_id, 0u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_result_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route POST "/" {
+    return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+)rut";
+    for (const bool any_route : {false, true}) {
+        std::string selected(source);
+        if (any_route) {
+            const auto method = selected.find("route POST");
+            REQUIRE_NE(method, std::string::npos);
+            selected.replace(method, sizeof("route POST") - 1u, "route");
+        }
+        const u8 expected_method = any_route ? kRouteMethodAny : kRouteMethodPost;
+        auto lexed = lex({selected.data(), static_cast<u32>(selected.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        CHECK_EQ(rir.module.functions[0].http_method, expected_method);
+        REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+        static_assert(sizeof(ForwardPolicyBundle) == 8);
+        static_assert(sizeof(HandlerResult::make_forward_with_bundle(0, 1, 1).pack()) ==
+                      sizeof(u64));
+        CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+        const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(raw.action, HandlerAction::ForwardBundle);
+        CHECK_EQ(raw.status_code, 1u);
+        CHECK_EQ(raw.upstream_id, 0u);
+        CHECK_EQ(raw.next_state, 1u);
+        HandlerCtx ctx{};
+        const auto outcome = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+        CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Forward);
+        CHECK_EQ(outcome.request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(outcome.policy_bundle_id, 1u);
+
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(populate_route_config(*config, rir.module));
+        REQUIRE_EQ(config->policy_bundle_count, 1u);
+        CHECK_EQ(config->policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        config->policy_bundles[0].response_buffering = ForwardResponseBufferingMode::None;
+        CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+        CHECK_EQ(config->route_count, 0u);
+        config->policy_bundles[0].response_buffering =
+            ForwardResponseBufferingMode::CompleteContentLength;
+        REQUIRE(register_jit_routes(*config, rir.module, engine));
+        REQUIRE_EQ(config->route_count, 1u);
+        CHECK_EQ(config->routes[0].method, expected_method);
+        CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
 TEST(result, pack_unpack_yield) {
     auto r = HandlerResult::make_yield(3, YieldKind::Forward);
     u64 packed = r.pack();
@@ -9618,6 +9966,209 @@ TEST(jit, ret_forward) {
     CHECK(r.upstream_id == 3);
 
     engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, target_transform_effect_records_and_fails_closed) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+
+    auto add = [&](const char* name, i32 encoded_id, bool duplicate) {
+        auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        VOK(b.emit_req_set_target_transform(1));
+        fn->entry()->insts[0].imm.i32_val = encoded_id;
+        if (duplicate) VOK(b.emit_req_set_target_transform(1));
+        auto upstream = V(b.emit_const_i32(3));
+        VOK(b.emit_ret_forward(upstream));
+    };
+    add("proxy_transform_valid", 1, false);
+    add("proxy_transform_zero", 0, false);
+    add("proxy_transform_wide", static_cast<i32>(kMaxForwardTargetTransforms + 1), false);
+    add("proxy_transform_duplicate", 1, true);
+
+    auto* bounds = V(b.create_function(lit("proxy_transform_bounds"), lit("/"), 'G'));
+    auto bounds_entry = V(b.create_block(bounds, lit("entry")));
+    b.set_insert_point(bounds, bounds_entry);
+    CHECK_FALSE(b.emit_req_set_target_transform(0));
+    CHECK_FALSE(b.emit_req_set_target_transform(kMaxForwardTargetTransforms + 1));
+    auto upstream = V(b.emit_const_i32(3));
+    VOK(b.emit_ret_forward(upstream));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const char* names[] = {"handler_proxy_transform_valid",
+                           "handler_proxy_transform_zero",
+                           "handler_proxy_transform_wide",
+                           "handler_proxy_transform_duplicate"};
+    const u16 ids[] = {1,
+                       kInvalidForwardTargetTransformId,
+                       kInvalidForwardTargetTransformId,
+                       kInvalidForwardTargetTransformId};
+    for (u32 i = 0; i < 4; i++) {
+        Connection conn;
+        conn.reset();
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
+        REQUIRE(handler != nullptr);
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
+        CHECK(result.action == HandlerAction::Forward);
+        CHECK(conn.target_transform_recorded);
+        CHECK_EQ(conn.target_transform_id, ids[i]);
+    }
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, ret_forward_request_policy_abi_fails_closed) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto add = [&](const char* name, bool wide, i64 value) {
+        auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto upstream = V(b.emit_const_i32(7));
+        auto policy =
+            wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
+        VOK(b.emit_ret_forward(upstream, policy));
+    };
+    add("proxy_policy_valid", false, 1);
+    add("proxy_policy_u16_overflow", false, 256);
+    add("proxy_policy_negative", false, -1);
+    add("proxy_policy_i64_overflow", true, 65536);
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const char* names[] = {"handler_proxy_policy_valid",
+                           "handler_proxy_policy_u16_overflow",
+                           "handler_proxy_policy_negative",
+                           "handler_proxy_policy_i64_overflow"};
+    const u16 policies[] = {1, 256, 0xffffu, 0xffffu};
+    for (u32 i = 0; i < 4; i++) {
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
+        REQUIRE(handler != nullptr);
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
+        CHECK(result.action == HandlerAction::Forward);
+        CHECK_EQ(result.upstream_id, 7u);
+        CHECK_EQ(result.status_code, policies[i]);
+    }
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, ret_forward_response_policy_abi_uses_next_state_and_fails_closed) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto add = [&](const char* name, i32 request_value, bool wide, i64 value) {
+        auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto upstream = V(b.emit_const_i32(7));
+        auto request = V(b.emit_const_i32(request_value));
+        auto response =
+            wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
+        VOK(b.emit_ret_forward(upstream, request, response));
+    };
+    add("proxy_response_policy_valid", 7, false, 1);
+    add("proxy_response_policy_u16_boundary", 9, false, 256);
+    add("proxy_response_policy_u16_overflow", 11, false, 65536);
+    add("proxy_response_policy_negative", 13, false, -1);
+    add("proxy_response_policy_i64_overflow", 15, true, 0x100000000LL);
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const char* names[] = {"handler_proxy_response_policy_valid",
+                           "handler_proxy_response_policy_u16_boundary",
+                           "handler_proxy_response_policy_u16_overflow",
+                           "handler_proxy_response_policy_negative",
+                           "handler_proxy_response_policy_i64_overflow"};
+    const u16 request_policies[] = {7, 9, 11, 13, 15};
+    const u16 response_policies[] = {1, 256, 0xffffu, 0xffffu, 0xffffu};
+    for (u32 i = 0; i < 5; i++) {
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
+        REQUIRE(handler != nullptr);
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
+        CHECK(result.action == HandlerAction::Forward);
+        CHECK_EQ(result.upstream_id, 7u);
+        CHECK_EQ(result.status_code, request_policies[i]);
+        CHECK_EQ(result.next_state, response_policies[i]);
+    }
+    auto dispatch_handler = reinterpret_cast<HandlerFn>(engine.lookup(names[0]));
+    jit::HandlerCtx dispatch_ctx{};
+    auto dispatch = invoke_jit_handler(dispatch_handler,
+                                       nullptr,
+                                       dispatch_ctx,
+                                       reinterpret_cast<const u8*>(kGetApiRequest),
+                                       sizeof(kGetApiRequest) - 1,
+                                       nullptr);
+    CHECK(dispatch.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(dispatch.request_policy_id, 7u);
+    CHECK_EQ(dispatch.response_policy_id, 1u);
+
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, ret_forward_response_policy_builder_rejects_noncontiguous_and_invalid_atomically) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("proxy_response_policy_builder"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto upstream = V(b.emit_const_i32(7));
+    auto request = V(b.emit_const_i32(1));
+    auto response = V(b.emit_const_i32(1));
+    const u32 before = fn->blocks[entry.id].inst_count;
+
+    auto response_only = b.emit_ret_forward(upstream, rir::kNoValue, response);
+    CHECK_FALSE(response_only.has_value());
+    CHECK_EQ(fn->blocks[entry.id].inst_count, before);
+
+    const u32 before_invalid = fn->blocks[entry.id].inst_count;
+    auto invalid = b.emit_ret_forward(upstream, request, ValueId{0xfffffffeu});
+    CHECK_FALSE(invalid.has_value());
+    CHECK_EQ(fn->blocks[entry.id].inst_count, before_invalid);
+
     tc.destroy();
 }
 
@@ -19416,6 +19967,179 @@ TEST(jit_dispatch, timer_seconds_rounds_up_from_ms) {
     CHECK_EQ(timer_seconds_from_ms(1000), 1);  // 1000ms → 1s (exact)
     CHECK_EQ(timer_seconds_from_ms(1001), 2);  // 1001ms → 2s
     CHECK_EQ(timer_seconds_from_ms(2500), 3);  // 2500ms → 3s
+}
+
+TEST(jit, deferred_preflight_selector_returns_only_exact_redirect_or_bundle_identity) {
+    auto lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.functions[0].forward_preflight_mode,
+               ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct Case {
+        const char* request;
+        HandlerAction action;
+    } cases[] = {
+        {"GET /old HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::Redirect},
+        {"GET /old?x=1 HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::Redirect},
+        {"GET /old/ HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::ForwardBundle},
+        {"GET / HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::ForwardBundle},
+    };
+    for (const auto& test : cases) {
+        const u32 len = static_cast<u32>(__builtin_strlen(test.request));
+        const auto raw = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(test.request), len, nullptr));
+        CHECK_EQ(raw.action, test.action);
+        if (test.action == HandlerAction::Redirect) {
+            CHECK_EQ(raw.status_code, 0u);
+            CHECK_EQ(raw.upstream_id, 1u);
+            CHECK_EQ(raw.next_state, 0u);
+        } else {
+            CHECK_EQ(raw.status_code, 1u);
+            CHECK_EQ(raw.upstream_id, 0u);
+            CHECK_EQ(raw.next_state, 1u);
+        }
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, request_framing_preflight_selects_literal_policy_identity_by_content_length) {
+    auto lexed = lex(lit(kFramingSelectionPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.functions[0].forward_preflight_mode,
+               ForwardPreflightMode::AfterRequestFramingSelection);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct Case {
+        const char* request;
+        RequestPolicyId expected;
+    } cases[] = {
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\nContent-Length: 12\r\n\r\nhello world!",
+         RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n",
+         RequestPolicyId::Http11FixedStripContentLengthAfterHost},
+        {"HEAD /one HTTP/1.1\r\nHost: test\r\n\r\n", RequestPolicyId::Http11FixedStrip},
+    };
+    for (const auto& test : cases) {
+        const u32 len = static_cast<u32>(__builtin_strlen(test.request));
+        const auto result = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(test.request), len, nullptr));
+        CHECK_EQ(result.action, HandlerAction::ForwardBundle);
+        CHECK_EQ(result.status_code, static_cast<u16>(test.expected));
+        CHECK_EQ(result.upstream_id, 0u);
+        CHECK_EQ(result.next_state, 1u);
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, fixed_302_conditional_returns_redirect_identity_and_neighbor_bundle) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 302,
+      reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
+      target_path: "/new", body: b"fixed-302"})
+  } else {
+    return forward(backend,
+      response_policy: {version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "rut", date: "current", hide_headers: []},
+      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", body: b"bad"})
+  }
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(rir.module.redirect_policies[0].status_code, 302u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    const auto redirect = HandlerResult::unpack(
+        handler(nullptr,
+                nullptr,
+                reinterpret_cast<const u8*>("GET /old?x=1 HTTP/1.1\r\nHost: alternate\r\n\r\n"),
+                sizeof("GET /old?x=1 HTTP/1.1\r\nHost: alternate\r\n\r\n") - 1,
+                nullptr));
+    CHECK_EQ(redirect.action, HandlerAction::Redirect);
+    CHECK(HandlerResult::redirect_fields_valid(redirect));
+    CHECK_EQ(redirect.upstream_id, 1u);
+    CHECK_EQ(redirect.status_code, 0u);
+    CHECK_EQ(redirect.next_state, 0u);
+    CHECK_EQ(redirect.yield_kind, YieldKind::HttpGet);
+
+    const auto forward = HandlerResult::unpack(
+        handler(nullptr,
+                nullptr,
+                reinterpret_cast<const u8*>("GET /old/ HTTP/1.1\r\nHost: alternate\r\n\r\n"),
+                sizeof("GET /old/ HTTP/1.1\r\nHost: alternate\r\n\r\n") - 1,
+                nullptr));
+    CHECK_EQ(forward.action, HandlerAction::ForwardBundle);
+    CHECK_EQ(forward.status_code, 0u);
+    CHECK_EQ(forward.upstream_id, 0u);
+    CHECK_EQ(forward.next_state, 1u);
+    CHECK_EQ(forward.yield_kind, YieldKind::HttpGet);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {
