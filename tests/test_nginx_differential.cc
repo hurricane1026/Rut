@@ -57856,6 +57856,587 @@ static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_di
     return true;
 }
 
+static bool run_converter_default_buffering_second_body_progress_refresh_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#271 second-body-progress differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].nginx_config || temps[0].nginx_log == temps[1].rut_log ||
+        temps[0].nginx_access_log == temps[1].rut_access_log) {
+        error = "#271 second-body-progress differential could not create isolated resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = "#271 second-body-progress differential could not hold four distinct ports";
+            return false;
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty()) error = "#271 second-body-progress nginx wrapper was not exact";
+        return false;
+    }
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !validate_explicit_timeout_get_generated_provenance(
+            generated_source, ports[2], ports[3], temps[1].rut_access_log, error) ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty()) error = "#271 second-body-progress could not persist exact inputs";
+        return false;
+    }
+
+    static constexpr char kSecondBodyFragment[] = {'!'};
+    Recorder origins[2];
+    for (auto& origin : origins) {
+        origin.permit_gated_incomplete_first_response = true;
+        origin.incomplete_first_response_fragment_count = 2u;
+        origin.response_fragment_bytes[0] = kDefaultBufferingTimeoutOrigin;
+        origin.response_fragment_lengths[0] = sizeof(kDefaultBufferingTimeoutOrigin) - 1u;
+        origin.response_fragment_bytes[1] = kSecondBodyFragment;
+        origin.response_fragment_lengths[1] = sizeof(kSecondBodyFragment);
+        origin.observe_extra_requests_until_stop = true;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#271 second-body-progress origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend])) {
+            if (error.empty()) error = "#271 second-body-progress origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#271 second-body-progress origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#271 second-body-progress nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child)) {
+        error = "#271 second-body-progress could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = "#271 second-body-progress pinned nginx readiness failed: " + error;
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#271 second-body-progress RUT bind", error) ||
+        !spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child)) {
+        error = "#271 second-body-progress could not spawn generated ordinary RUT";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = "#271 second-body-progress generated RUT readiness failed: " + error;
+        dump_log(temps[1].source, "#271 second-body-progress generated RUT source");
+        dump_log(temps[1].rut_log, "#271 second-body-progress RUT log");
+        return false;
+    }
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temps[1].rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = "#271 second-body-progress RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (poll_child(frontends[1].child) || !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = "#271 second-body-progress generated RUT lacked io_uring readiness";
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    u64 request_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        clients.fds[side] = connect_once(ports[side * 2u]);
+        if (clients.fds[side] < 0 || !send_all(clients.fds[side],
+                                               kDefaultBufferingTimeoutRequest,
+                                               sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
+            error = std::string("#271 second-body-progress ") + (side == 0u ? "nginx" : "RUT") +
+                    " exact request send failed";
+            return false;
+        }
+        request_sent_ns[side] = steady_now_ns();
+    }
+
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        bool requested = true;
+        for (const auto& origin : origins) {
+            const u32 accepted = origin.accepted.load(std::memory_order_acquire);
+            const u32 requests = origin.requests.load(std::memory_order_acquire);
+            if (accepted > 1u || requests > 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress invalid origin state before W1";
+                return false;
+            }
+            requested &= accepted == 1u && requests == 1u;
+        }
+        if (requested) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= request_deadline) {
+            error = "#271 second-body-progress lost liveness awaiting upstream requests";
+            return false;
+        }
+        usleep(1000);
+    }
+    for (const auto& origin : origins) {
+        if (origin.response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire)) {
+            error = "#271 second-body-progress W1 gates were not closed after requests";
+            return false;
+        }
+    }
+
+    for (auto& origin : origins)
+        origin.response_fragment_permit.store(1u, std::memory_order_release);
+    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        bool first_published = true;
+        for (const auto& origin : origins) {
+            const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+            if (count > 1u || origin.response_send_failed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress invalid origin state during W1 publication";
+                return false;
+            }
+            first_published &= count == 1u;
+        }
+        if (first_published) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= first_deadline) {
+            error = "#271 second-body-progress failed before both W1 publications";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 first_write_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+        first_write_ns[side] = origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed);
+        if (count != 1u || first_write_ns[side] < request_sent_ns[side] ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire)) {
+            error = "#271 second-body-progress W1 publication was incoherent";
+            return false;
+        }
+    }
+
+    bool second_released[2] = {false, false};
+    while (!second_released[0] || !second_released[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (!second_released[side] &&
+                steady_now_ns() >= first_write_ns[side] + 600'000'000ull) {
+                origins[side].response_fragment_permit.store(2u, std::memory_order_release);
+                second_released[side] = true;
+            }
+        }
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty()) {
+            if (error.empty()) error = "#271 second-body-progress pre-W2 custody failed";
+            return false;
+        }
+        for (size_t side = 0u; side < 2u; side++) {
+            const u32 count = origins[side].response_fragments_sent.load(std::memory_order_acquire);
+            std::string detail;
+            if ((!second_released[side] && count != 1u) || count > 2u ||
+                origins[side].response_peer_closed.load(std::memory_order_acquire) ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string("#271 second-body-progress ") + (side == 0u ? "nginx" : "RUT") +
+                        " observed effects before W2: " + detail;
+                return false;
+            }
+        }
+    }
+
+    const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        bool second_published = true;
+        for (const auto& origin : origins) {
+            if (origin.response_send_failed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress W2 send failed";
+                return false;
+            }
+            const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+            const bool succeeded = origin.response_send_succeeded.load(std::memory_order_acquire);
+            const bool open = origin.response_sent_open.load(std::memory_order_acquire);
+            if (count > 2u || ((succeeded || open) && count != 2u)) {
+                error = "#271 second-body-progress W2 publication was incoherent";
+                return false;
+            }
+            second_published &= count == 2u && succeeded && open;
+        }
+        if (second_published) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= second_deadline) {
+            error = "#271 second-body-progress lost liveness awaiting W2";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 second_write_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+        second_write_ns[side] = origin.response_fragment_sent_ns[1].load(std::memory_order_relaxed);
+        if (count != 2u || second_write_ns[side] < first_write_ns[side] ||
+            second_write_ns[side] - first_write_ns[side] < 550'000'000ull ||
+            second_write_ns[side] - first_write_ns[side] >= 750'000'000ull ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire)) {
+            error = "#271 second-body-progress W1/W2 timing or open-origin evidence mismatch";
+            return false;
+        }
+    }
+
+    bool quiet_complete[2] = {false, false};
+    u64 quiet_probe_ns[2]{};
+    while (!quiet_complete[0] || !quiet_complete[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (quiet_complete[side]) continue;
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string("#271 second-body-progress ") + (side == 0u ? "nginx" : "RUT") +
+                        " post-W2 quiet gate failed: " + detail;
+                return false;
+            }
+            quiet_probe_ns[side] = steady_now_ns();
+            quiet_complete[side] = quiet_probe_ns[side] - second_write_ns[side] >= 700'000'000ull &&
+                                   quiet_probe_ns[side] - first_write_ns[side] >= 1'250'000'000ull;
+        }
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty()) {
+            if (error.empty()) error = "#271 second-body-progress quiet custody failed";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                origin.response_peer_closed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress origin changed during quiet gate";
+                return false;
+            }
+        }
+    }
+
+    std::vector<char> responses[2];
+    u64 first_downstream_ns[2]{};
+    u64 downstream_eof_ns[2]{};
+    bool downstream_done[2] = {false, false};
+    while (!downstream_done[0] || !downstream_done[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (downstream_done[side]) continue;
+            if (steady_now_ns() - second_write_ns[side] >= 2'000'000'000ull) {
+                error = std::string("#271 second-body-progress ") + (side == 0u ? "nginx" : "RUT") +
+                        " downstream missed W2+2s budget";
+                return false;
+            }
+            pollfd poll_state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&poll_state, 1, 5);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                error = "#271 second-body-progress downstream poll failed";
+                return false;
+            }
+            if (ready == 0) continue;
+            char bytes[512];
+            const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+            const u64 observed_ns = steady_now_ns();
+            if (count > 0) {
+                if (first_downstream_ns[side] == 0u) first_downstream_ns[side] = observed_ns;
+                responses[side].insert(responses[side].end(), bytes, bytes + count);
+                if (responses[side].size() >
+                    sizeof(kDefaultBufferingTimeoutResponseNormalized) - 1u) {
+                    error = "#271 second-body-progress downstream included body/trailing bytes";
+                    return false;
+                }
+            } else if (count == 0) {
+                downstream_eof_ns[side] = observed_ns;
+                downstream_done[side] = true;
+            } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                error = "#271 second-body-progress downstream recv failed";
+                return false;
+            }
+        }
+    }
+
+    const auto peer_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        bool peers_closed = true;
+        for (const auto& origin : origins) {
+            if (origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress peer-close observation failed";
+                return false;
+            }
+            peers_closed &= origin.response_peer_closed.load(std::memory_order_acquire);
+        }
+        if (peers_closed) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= peer_close_deadline) {
+            error = "#271 second-body-progress origins were not actively closed";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 first_elapsed[2]{};
+    u64 eof_elapsed[2]{};
+    u64 peer_elapsed[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const u64 origin_closed_ns =
+            origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+        if (first_downstream_ns[side] < second_write_ns[side] ||
+            downstream_eof_ns[side] < first_downstream_ns[side] ||
+            origin_closed_ns < second_write_ns[side]) {
+            error = "#271 second-body-progress terminal timestamp ordering was invalid";
+            return false;
+        }
+        first_elapsed[side] = first_downstream_ns[side] - second_write_ns[side];
+        eof_elapsed[side] = downstream_eof_ns[side] - second_write_ns[side];
+        peer_elapsed[side] = origin_closed_ns - second_write_ns[side];
+        if (quiet_probe_ns[side] - second_write_ns[side] < 700'000'000ull ||
+            quiet_probe_ns[side] - first_write_ns[side] < 1'250'000'000ull ||
+            first_elapsed[side] < 750'000'000ull || first_elapsed[side] >= 1'700'000'000ull ||
+            eof_elapsed[side] < 750'000'000ull || eof_elapsed[side] >= 2'000'000'000ull ||
+            peer_elapsed[side] < 750'000'000ull || peer_elapsed[side] >= 2'000'000'000ull) {
+            error = std::string("#271 second-body-progress ") + (side == 0u ? "nginx" : "RUT") +
+                    " did not prove W2-relative refresh: " +
+                    std::to_string(second_write_ns[side] - first_write_ns[side]) + "/" +
+                    std::to_string(first_elapsed[side]) + "/" + std::to_string(eof_elapsed[side]) +
+                    "/" + std::to_string(peer_elapsed[side]) + "ns";
+            return false;
+        }
+    }
+    const u64 first_delta = first_elapsed[0] > first_elapsed[1]
+                                ? first_elapsed[0] - first_elapsed[1]
+                                : first_elapsed[1] - first_elapsed[0];
+    if (first_delta > 350'000'000ull) {
+        error = "#271 second-body-progress W2-relative first-byte delta exceeded 350ms";
+        return false;
+    }
+
+    std::vector<char> normalized[2] = {responses[0], responses[1]};
+    const std::vector<char> expected_response(
+        kDefaultBufferingTimeoutResponseNormalized,
+        kDefaultBufferingTimeoutResponseNormalized +
+            sizeof(kDefaultBufferingTimeoutResponseNormalized) - 1u);
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != expected_response || normalized[1] != expected_response ||
+        normalized[0] != normalized[1]) {
+        error = "#271 second-body-progress exact normalized 122-byte response mismatch";
+        dump_wire("#271 second-body-progress nginx response", responses[0]);
+        dump_wire("#271 second-body-progress RUT response", responses[1]);
+        return false;
+    }
+    for (const auto& response : normalized) {
+        const std::string text(response.begin(), response.end());
+        if (text.find("hello") != std::string::npos || text.find('!') != std::string::npos ||
+            text.find("502") != std::string::npos || text.find("504") != std::string::npos ||
+            text.find("Bad Gateway") != std::string::npos ||
+            text.find("Gateway Time-out") != std::string::npos ||
+            text.find("configured deadline") != std::string::npos) {
+            error = "#271 second-body-progress leaked buffered body/failure bytes";
+            return false;
+        }
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = "#271 second-body-progress lost liveness during no-retry gate";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 second-body-progress observed retry or close multiplicity";
+                return false;
+            }
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    static constexpr char kExpectedAccess[] = "60\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access[2];
+        if (!read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error))
+            return false;
+        if (access[0] == kExpectedAccess && access[1] == kExpectedAccess) break;
+        if ((!access[0].empty() && access[0] != kExpectedAccess) ||
+            (!access[1].empty() && access[1] != kExpectedAccess) || !frontends_live() ||
+            !origins_live() || std::chrono::steady_clock::now() >= access_deadline) {
+            error =
+                "#271 second-body-progress access was not one exact record reporting 60 "
+                "request bytes per side";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const u64 access_stability_deadline_ns =
+        std::max(second_write_ns[0], second_write_ns[1]) + 2'100'000'000ull;
+    while (steady_now_ns() < access_stability_deadline_ns) {
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            access[0] != kExpectedAccess || access[1] != kExpectedAccess) {
+            if (error.empty()) error = "#271 second-body-progress access changed past horizon";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    std::vector<char> upstream[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string expected_text = "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                          std::to_string(ports[side * 2u + 1u]) + "\r\n\r\n";
+        const std::vector<char> expected(expected_text.begin(), expected_text.end());
+        const auto& origin = origins[side];
+        if (expected.size() != 60u || origin.thread_alive.load(std::memory_order_acquire) ||
+            origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.history[0] != expected || origin.request != expected ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error = "#271 second-body-progress exact origin wire/lifecycle evidence mismatch";
+            dump_wire("#271 expected second-body-progress upstream", expected);
+            dump_wire("#271 actual second-body-progress upstream", origin.request);
+            return false;
+        }
+        upstream[side] = origin.history[0];
+    }
+    if (!origins_live_before_stop ||
+        !canonicalize_positive_get_default_upstream(upstream[0], ports[1]) ||
+        !canonicalize_positive_get_default_upstream(upstream[1], ports[3]) ||
+        upstream[0] != upstream[1]) {
+        error = "#271 second-body-progress cross-side upstream/liveness evidence differed";
+        return false;
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    std::string final_access[2];
+    if (!nginx_stopped || !rut_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+        final_access[0] != kExpectedAccess || final_access[1] != kExpectedAccess) {
+        if (error.empty()) error = "#271 second-body-progress final cleanup/access failed";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #271 second-body-progress W1-to-W2/W2-to-first/"
+                 "W2-to-EOF/W2-to-peer-close seconds nginx="
+              << static_cast<double>(second_write_ns[0] - first_write_ns[0]) / 1e9 << "/"
+              << static_cast<double>(first_elapsed[0]) / 1e9 << "/"
+              << static_cast<double>(eof_elapsed[0]) / 1e9 << "/"
+              << static_cast<double>(peer_elapsed[0]) / 1e9
+              << " RUT=" << static_cast<double>(second_write_ns[1] - first_write_ns[1]) / 1e9 << "/"
+              << static_cast<double>(first_elapsed[1]) / 1e9 << "/"
+              << static_cast<double>(eof_elapsed[1]) / 1e9 << "/"
+              << static_cast<double>(peer_elapsed[1]) / 1e9
+              << " W2-first-delta=" << static_cast<double>(first_delta) / 1e9 << "\n";
+    return true;
+}
+
 static bool run_pinned_positive_cl_options_default_buffering_oracle(
     TempDir& temp,
     const std::string& container_name,
@@ -58313,6 +58894,10 @@ int main(int argc, char** argv) {
         argc == 3 &&
         strcmp(argv[1],
                "--converter-default-buffering-incomplete-body-inactivity-expiry-differential") == 0;
+    const bool converter_default_buffering_second_body_progress_refresh_differential =
+        argc == 3 && strcmp(argv[1],
+                            "--converter-default-buffering-second-body-progress-refresh-"
+                            "differential") == 0;
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
@@ -58519,6 +59104,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
+         !converter_default_buffering_second_body_progress_refresh_differential &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
          !request_length_split_header_oracle && !rut_initial_header_split_public &&
@@ -58593,7 +59179,8 @@ int main(int argc, char** argv) {
         (converter_proxy_hide_header_differential && argv[2][0] != '/') ||
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
-          converter_default_buffering_incomplete_body_inactivity_expiry_differential) &&
+          converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
+          converter_default_buffering_second_body_progress_refresh_differential) &&
          argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
@@ -58715,6 +59302,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-incomplete-body-inactivity-expiry-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-second-body-progress-refresh-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
@@ -60098,6 +60688,31 @@ int main(int argc, char** argv) {
                "custody for ID1/1s/CompleteContentLength and its 200/502/504 policy bundle. This "
                "does not claim body-progress refresh, other schedules/framing/status/methods, "
                "complete buffering, reset/error, retry/reuse, TLS, H2, or broad #271 support.\n";
+        return 0;
+    }
+    if (converter_default_buffering_second_body_progress_refresh_differential) {
+        const std::string container_name = "rut-nginx-271-second-body-progress-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_second_body_progress_refresh_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#271 converter default-buffering second-body-progress refresh "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #271 pinned nginx 1.29.7 and converter-generated ordinary RUT matched "
+               "one exact default-buffered 60-byte GET schedule: 103-byte header-plus-hello W1, "
+               "one-byte W2 at W1+600ms, at least 700ms post-W2 byte/access quiet past W1+1.25s, "
+               "then W2-relative inactivity expiry with exact equal 122-byte header-only 200 and "
+               "actual downstream EOF. Each side actively closed one still-open origin, emitted "
+               "one exact authority-rewritten upstream request and one access record reporting 60 "
+               "request bytes, without body/failure bytes or retry. Generated ordinary source "
+               "passed GET AST/HIR/MIR/RIR/O2/config custody and ran through the public io_uring "
+               "CLI. This proves only the one-second second-positive-body-progress refresh "
+               "schedule; broader #271 remains unsupported.\n";
         return 0;
     }
     if (request_length_oracle) {
