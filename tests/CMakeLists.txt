@@ -1458,6 +1458,22 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+        COMMAND test_nginx_differential
+                --converter-default-buffering-third-body-progress-expiry-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(
+        test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+        PROPERTIES
+        LABELS "integration;nginx;docker;io_uring;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 180
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue271_converter_default_buffering_three_publication_completion_differential
         COMMAND test_nginx_differential
                 --converter-default-buffering-three-publication-completion-differential

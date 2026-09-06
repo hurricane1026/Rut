@@ -58550,8 +58550,11 @@ static bool run_pinned_nginx_default_buffering_third_body_progress_expiry_oracle
         temp, container_name, true, error);
 }
 
-static bool run_converter_default_buffering_three_publication_completion_differential(
-    const char* rut_path, const std::string& container_name, std::string& error) {
+static bool run_converter_default_buffering_three_publication_differential_impl(
+    const char* rut_path,
+    const std::string& container_name,
+    bool expire_after_third_progress,
+    std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "#271 three-publication differential requires an executable absolute RUT path";
         return false;
@@ -58600,9 +58603,17 @@ static bool run_converter_default_buffering_three_publication_completion_differe
     }
 
     static constexpr char kSecondBodyFragment[] = {'!'};
-    static constexpr char kThirdBodyFragment[] = "world!";
+    static constexpr char kThirdIncompleteBodyFragment[] = "world";
+    static constexpr char kThirdCompleteBodyFragment[] = "world!";
     static_assert(sizeof(kSecondBodyFragment) == 1u);
-    static_assert(sizeof(kThirdBodyFragment) - 1u == 6u);
+    static_assert(sizeof(kThirdIncompleteBodyFragment) - 1u == 5u);
+    static_assert(sizeof(kThirdCompleteBodyFragment) - 1u == 6u);
+    static_assert((sizeof(kDefaultBufferingTimeoutOrigin) - 1u) + sizeof(kSecondBodyFragment) +
+                      (sizeof(kThirdIncompleteBodyFragment) - 1u) ==
+                  109u);
+    static_assert((sizeof(kDefaultBufferingTimeoutOrigin) - 1u) + sizeof(kSecondBodyFragment) +
+                      (sizeof(kThirdCompleteBodyFragment) - 1u) ==
+                  110u);
     Recorder origins[2];
     for (auto& origin : origins) {
         origin.permit_gated_incomplete_first_response = true;
@@ -58611,8 +58622,11 @@ static bool run_converter_default_buffering_three_publication_completion_differe
         origin.response_fragment_lengths[0] = sizeof(kDefaultBufferingTimeoutOrigin) - 1u;
         origin.response_fragment_bytes[1] = kSecondBodyFragment;
         origin.response_fragment_lengths[1] = sizeof(kSecondBodyFragment);
-        origin.response_fragment_bytes[2] = kThirdBodyFragment;
-        origin.response_fragment_lengths[2] = sizeof(kThirdBodyFragment) - 1u;
+        origin.response_fragment_bytes[2] =
+            expire_after_third_progress ? kThirdIncompleteBodyFragment : kThirdCompleteBodyFragment;
+        origin.response_fragment_lengths[2] = expire_after_third_progress
+                                                  ? sizeof(kThirdIncompleteBodyFragment) - 1u
+                                                  : sizeof(kThirdCompleteBodyFragment) - 1u;
         origin.observe_extra_requests_until_stop = true;
     }
     for (size_t side = 0u; side < 2u; side++) {
@@ -58951,6 +58965,321 @@ static bool run_converter_default_buffering_three_publication_completion_differe
         }
     }
 
+    // Recorder timestamps delimit application publications only. They do not
+    // establish TCP packet, frontend read, or io_uring CQE boundaries.
+    if (expire_after_third_progress) {
+        bool quiet_complete[2] = {false, false};
+        u64 quiet_probe_ns[2]{};
+        while (!quiet_complete[0] || !quiet_complete[1]) {
+            for (size_t side = 0u; side < 2u; side++) {
+                if (quiet_complete[side]) continue;
+                std::string detail;
+                if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                    error = std::string("#271 third-body-progress differential ") +
+                            (side == 0u ? "nginx" : "RUT") +
+                            " post-W3 quiet gate failed: " + detail;
+                    return false;
+                }
+                quiet_probe_ns[side] = steady_now_ns();
+                quiet_complete[side] =
+                    quiet_probe_ns[side] - third_write_ns[side] >= 700'000'000ull &&
+                    quiet_probe_ns[side] - second_write_ns[side] >= 1'250'000'000ull;
+            }
+            std::string access[2];
+            if (!frontends_live() || !origins_live() ||
+                !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+                !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+                !access[0].empty() || !access[1].empty()) {
+                if (error.empty())
+                    error = "#271 third-body-progress differential quiet custody failed";
+                return false;
+            }
+            for (const auto& origin : origins) {
+                if (origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                    origin.response_peer_closed.load(std::memory_order_acquire)) {
+                    error =
+                        "#271 third-body-progress differential origin changed during quiet gate";
+                    return false;
+                }
+            }
+        }
+
+        std::vector<char> responses[2];
+        u64 first_downstream_ns[2]{};
+        u64 downstream_eof_ns[2]{};
+        bool downstream_done[2] = {false, false};
+        while (!downstream_done[0] || !downstream_done[1]) {
+            for (size_t side = 0u; side < 2u; side++) {
+                if (downstream_done[side]) continue;
+                if (!frontends_live() || !origins_live() ||
+                    steady_now_ns() - third_write_ns[side] >= 2'000'000'000ull) {
+                    error = std::string("#271 third-body-progress differential ") +
+                            (side == 0u ? "nginx" : "RUT") + " downstream missed W3+2s budget";
+                    return false;
+                }
+                pollfd poll_state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+                const int ready = poll(&poll_state, 1, 5);
+                if (ready < 0) {
+                    if (errno == EINTR) continue;
+                    error = "#271 third-body-progress differential downstream poll failed";
+                    return false;
+                }
+                if (ready == 0) continue;
+                char bytes[512];
+                const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+                const u64 observed_ns = steady_now_ns();
+                if (count > 0) {
+                    if (first_downstream_ns[side] == 0u) first_downstream_ns[side] = observed_ns;
+                    responses[side].insert(responses[side].end(), bytes, bytes + count);
+                    if (responses[side].size() >
+                        sizeof(kDefaultBufferingTimeoutResponseNormalized) - 1u) {
+                        error =
+                            "#271 third-body-progress differential downstream included body/tail";
+                        return false;
+                    }
+                } else if (count == 0) {
+                    downstream_eof_ns[side] = observed_ns;
+                    downstream_done[side] = true;
+                } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    error = "#271 third-body-progress differential downstream recv failed";
+                    return false;
+                }
+            }
+        }
+
+        const auto peer_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        for (;;) {
+            bool peers_closed = true;
+            for (const auto& origin : origins) {
+                if (origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                    error = "#271 third-body-progress differential peer-close observation failed";
+                    return false;
+                }
+                peers_closed &= origin.response_peer_closed.load(std::memory_order_acquire);
+            }
+            if (peers_closed) break;
+            if (!frontends_live() || !origins_live() ||
+                std::chrono::steady_clock::now() >= peer_close_deadline) {
+                error = "#271 third-body-progress differential origins were not actively closed";
+                return false;
+            }
+            usleep(1000);
+        }
+
+        u64 first_elapsed[2]{};
+        u64 eof_elapsed[2]{};
+        u64 peer_elapsed[2]{};
+        for (size_t side = 0u; side < 2u; side++) {
+            const u64 origin_closed_ns =
+                origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+            if (first_downstream_ns[side] < third_write_ns[side] ||
+                downstream_eof_ns[side] < first_downstream_ns[side] ||
+                origin_closed_ns < third_write_ns[side]) {
+                error = "#271 third-body-progress differential terminal timestamps were invalid";
+                return false;
+            }
+            first_elapsed[side] = first_downstream_ns[side] - third_write_ns[side];
+            eof_elapsed[side] = downstream_eof_ns[side] - third_write_ns[side];
+            peer_elapsed[side] = origin_closed_ns - third_write_ns[side];
+            if (quiet_probe_ns[side] - third_write_ns[side] < 700'000'000ull ||
+                quiet_probe_ns[side] - second_write_ns[side] < 1'250'000'000ull ||
+                first_elapsed[side] < 750'000'000ull || first_elapsed[side] >= 1'700'000'000ull ||
+                eof_elapsed[side] < 750'000'000ull || eof_elapsed[side] >= 2'000'000'000ull ||
+                peer_elapsed[side] < 750'000'000ull || peer_elapsed[side] >= 2'000'000'000ull) {
+                error = std::string("#271 third-body-progress differential ") +
+                        (side == 0u ? "nginx" : "RUT") + " did not prove W3-relative refresh: " +
+                        std::to_string(third_write_ns[side] - second_write_ns[side]) + "/" +
+                        std::to_string(first_elapsed[side]) + "/" +
+                        std::to_string(eof_elapsed[side]) + "/" +
+                        std::to_string(peer_elapsed[side]) + "ns";
+                return false;
+            }
+        }
+        const u64 first_delta = first_elapsed[0] > first_elapsed[1]
+                                    ? first_elapsed[0] - first_elapsed[1]
+                                    : first_elapsed[1] - first_elapsed[0];
+        if (first_delta > 350'000'000ull) {
+            error =
+                "#271 third-body-progress differential W3-relative first-byte delta exceeded 350ms";
+            return false;
+        }
+
+        std::vector<char> normalized[2] = {responses[0], responses[1]};
+        const std::vector<char> expected_response(
+            kDefaultBufferingTimeoutResponseNormalized,
+            kDefaultBufferingTimeoutResponseNormalized +
+                sizeof(kDefaultBufferingTimeoutResponseNormalized) - 1u);
+        if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+            normalized[0] != expected_response || normalized[1] != expected_response ||
+            normalized[0] != normalized[1]) {
+            error =
+                "#271 third-body-progress differential exact normalized 122-byte response mismatch";
+            dump_wire("#271 third-body-progress nginx response", responses[0]);
+            dump_wire("#271 third-body-progress RUT response", responses[1]);
+            return false;
+        }
+        for (const auto& response : normalized) {
+            const std::string text(response.begin(), response.end());
+            if (text.find("hello") != std::string::npos || text.find('!') != std::string::npos ||
+                text.find("world") != std::string::npos || text.find("502") != std::string::npos ||
+                text.find("504") != std::string::npos ||
+                text.find("Bad Gateway") != std::string::npos ||
+                text.find("Gateway Time-out") != std::string::npos ||
+                text.find("configured deadline") != std::string::npos) {
+                error = "#271 third-body-progress differential leaked buffered body/failure bytes";
+                return false;
+            }
+        }
+
+        const auto no_retry_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+        while (std::chrono::steady_clock::now() < no_retry_deadline) {
+            if (!frontends_live() || !origins_live()) {
+                error = "#271 third-body-progress differential lost liveness during no-retry gate";
+                return false;
+            }
+            for (const auto& origin : origins) {
+                if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                    origin.requests.load(std::memory_order_acquire) != 1u ||
+                    origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                    origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                    origin.response_send_failed.load(std::memory_order_acquire) ||
+                    origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                    origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                    error =
+                        "#271 third-body-progress differential observed retry/close multiplicity";
+                    return false;
+                }
+            }
+            poll(nullptr, 0, 5);
+        }
+
+        static constexpr char kExpectedAccess[] = "60\n";
+        const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::string access[2];
+            if (!read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+                !read_request_length_access_file(temps[1].rut_access_log, access[1], error))
+                return false;
+            if (access[0] == kExpectedAccess && access[1] == kExpectedAccess) break;
+            if ((!access[0].empty() && access[0] != kExpectedAccess) ||
+                (!access[1].empty() && access[1] != kExpectedAccess) || !frontends_live() ||
+                !origins_live() || std::chrono::steady_clock::now() >= access_deadline) {
+                error =
+                    "#271 third-body-progress differential access was not one exact record "
+                    "reporting 60 request bytes per side";
+                return false;
+            }
+            usleep(5000);
+        }
+
+        const u64 access_stability_deadline_ns =
+            std::max(third_write_ns[0], third_write_ns[1]) + 2'100'000'000ull;
+        while (steady_now_ns() < access_stability_deadline_ns) {
+            std::string access[2];
+            if (!frontends_live() || !origins_live() ||
+                !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+                !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+                access[0] != kExpectedAccess || access[1] != kExpectedAccess) {
+                if (error.empty())
+                    error = "#271 third-body-progress differential access changed past horizon";
+                return false;
+            }
+            usleep(5000);
+        }
+
+        for (int& fd : clients.fds) {
+            close(fd);
+            fd = -1;
+        }
+        std::string post_client_access[2];
+        if (!read_request_length_access_file(
+                temps[0].nginx_access_log, post_client_access[0], error) ||
+            !read_request_length_access_file(
+                temps[1].rut_access_log, post_client_access[1], error) ||
+            post_client_access[0] != kExpectedAccess || post_client_access[1] != kExpectedAccess) {
+            if (error.empty())
+                error = "#271 third-body-progress differential access changed after client close";
+            return false;
+        }
+
+        const bool origins_live_before_stop = origins_live();
+        origins[0].stop();
+        origins[1].stop();
+        std::vector<char> upstream[2];
+        for (size_t side = 0u; side < 2u; side++) {
+            const std::string expected_text =
+                "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                std::to_string(ports[side * 2u + 1u]) + "\r\n\r\n";
+            const std::vector<char> expected(expected_text.begin(), expected_text.end());
+            const auto& origin = origins[side];
+            const std::string observed(origin.request.begin(), origin.request.end());
+            if (expected.size() != 60u || origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+                origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.history.size() != 1u || origin.history[0] != expected ||
+                origin.request != expected ||
+                observed.find("Host: client.example") != std::string::npos ||
+                observed.find("\r\nConnection:") != std::string::npos ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                !origin.response_sent_open.load(std::memory_order_acquire) ||
+                !origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+                !origin.response_connection_closed.load(std::memory_order_acquire)) {
+                error =
+                    "#271 third-body-progress differential exact origin wire/lifecycle mismatch";
+                dump_wire("#271 expected third-body-progress upstream", expected);
+                dump_wire("#271 actual third-body-progress upstream", origin.request);
+                return false;
+            }
+            upstream[side] = origin.history[0];
+        }
+        if (!origins_live_before_stop ||
+            !canonicalize_positive_get_default_upstream(upstream[0], ports[1]) ||
+            !canonicalize_positive_get_default_upstream(upstream[1], ports[3]) ||
+            upstream[0] != upstream[1]) {
+            error = "#271 third-body-progress differential cross-side upstream/liveness differed";
+            return false;
+        }
+
+        const bool nginx_stopped = stop_child(frontends[0].child);
+        const bool rut_stopped = stop_child(frontends[1].child);
+        const bool container_removed = docker.remove();
+        std::string final_access[2];
+        if (!nginx_stopped || !rut_stopped || !container_removed || reservations.fds[0] >= 0 ||
+            reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+            !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+            final_access[0] != kExpectedAccess || final_access[1] != kExpectedAccess) {
+            if (error.empty())
+                error = "#271 third-body-progress differential final cleanup/access failed";
+            return false;
+        }
+
+        std::cerr << "PASS evidence: #271 third-body-progress W1-to-W2/W2-to-W3/"
+                     "W3-to-first/W3-to-EOF/W3-to-peer-close seconds nginx="
+                  << static_cast<double>(second_write_ns[0] - first_write_ns[0]) / 1e9 << "/"
+                  << static_cast<double>(third_write_ns[0] - second_write_ns[0]) / 1e9 << "/"
+                  << static_cast<double>(first_elapsed[0]) / 1e9 << "/"
+                  << static_cast<double>(eof_elapsed[0]) / 1e9 << "/"
+                  << static_cast<double>(peer_elapsed[0]) / 1e9
+                  << " RUT=" << static_cast<double>(second_write_ns[1] - first_write_ns[1]) / 1e9
+                  << "/" << static_cast<double>(third_write_ns[1] - second_write_ns[1]) / 1e9 << "/"
+                  << static_cast<double>(first_elapsed[1]) / 1e9 << "/"
+                  << static_cast<double>(eof_elapsed[1]) / 1e9 << "/"
+                  << static_cast<double>(peer_elapsed[1]) / 1e9
+                  << " W3-first-delta=" << static_cast<double>(first_delta) / 1e9 << "\n";
+        return true;
+    }
+
     std::vector<char> responses[2];
     u64 first_downstream_ns[2]{};
     u64 full_response_ns[2]{};
@@ -59216,6 +59545,18 @@ static bool run_converter_default_buffering_three_publication_completion_differe
               << static_cast<double>(peer_elapsed[1]) / 1e9
               << " W3-first-delta=" << static_cast<double>(first_delta) / 1e9 << "\n";
     return true;
+}
+
+static bool run_converter_default_buffering_three_publication_completion_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    return run_converter_default_buffering_three_publication_differential_impl(
+        rut_path, container_name, false, error);
+}
+
+static bool run_converter_default_buffering_third_body_progress_expiry_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    return run_converter_default_buffering_three_publication_differential_impl(
+        rut_path, container_name, true, error);
 }
 
 static bool run_converter_default_buffering_second_body_progress_refresh_differential(
@@ -60264,6 +60605,10 @@ int main(int argc, char** argv) {
         argc == 3 &&
         strcmp(argv[1],
                "--converter-default-buffering-three-publication-completion-differential") == 0;
+    const bool converter_default_buffering_third_body_progress_expiry_differential =
+        argc == 3 && strcmp(argv[1],
+                            "--converter-default-buffering-third-body-progress-expiry-"
+                            "differential") == 0;
     const bool pinned_nginx_default_buffering_three_publication_completion_oracle =
         argc == 2 && strcmp(argv[1],
                             "--pinned-nginx-default-buffering-three-publication-completion-"
@@ -60480,6 +60825,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_second_body_progress_refresh_differential &&
          !converter_default_buffering_three_publication_completion_differential &&
+         !converter_default_buffering_third_body_progress_expiry_differential &&
          !pinned_nginx_default_buffering_three_publication_completion_oracle &&
          !pinned_nginx_default_buffering_third_body_progress_expiry_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
@@ -60558,7 +60904,8 @@ int main(int argc, char** argv) {
           converter_default_buffering_incomplete_clean_eof_differential ||
           converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
           converter_default_buffering_second_body_progress_refresh_differential ||
-          converter_default_buffering_three_publication_completion_differential) &&
+          converter_default_buffering_three_publication_completion_differential ||
+          converter_default_buffering_third_body_progress_expiry_differential) &&
          argv[2][0] != '/') ||
         (converter_request_length_differential && argv[2][0] != '/') ||
         (converter_request_length_split_header_differential && argv[2][0] != '/') ||
@@ -60686,6 +61033,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-three-publication-completion-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-third-body-progress-expiry-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-three-publication-completion-oracle\n"
@@ -62157,6 +62507,33 @@ int main(int argc, char** argv) {
                "passed GET AST/HIR/MIR/RIR/O2/config custody and ran through the public io_uring "
                "CLI. This proves only the one-second second-positive-body-progress refresh "
                "schedule; broader #271 remains unsupported.\n";
+        return 0;
+    }
+    if (converter_default_buffering_third_body_progress_expiry_differential) {
+        const std::string container_name = "rut-nginx-271-third-body-progress-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_third_body_progress_expiry_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#271 converter default-buffering third-body-progress expiry "
+                         "differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #271 pinned nginx 1.29.7 and converter-generated ordinary RUT matched "
+               "one exact default-buffered 60-byte GET schedule: 103-byte header-plus-hello W1, "
+               "one-byte W2 about 600ms later, and five-byte incomplete W3 about another 600ms "
+               "later left 11/12 bytes buffered. Both stayed downstream-open and byte/access "
+               "quiet past W3+700ms and W2+1.25s, then expired W3-relative with the same exact "
+               "Date-normalized 122-byte header-only 200 and real EOF. Each side actively closed "
+               "one application-open origin, emitted one exact authority-rewritten 60-byte "
+               "upstream request, three publications and one access record reporting 60 request "
+               "bytes, without body/failure bytes or retry. Generated ordinary source passed GET "
+               "AST/HIR/MIR/RIR/O2/config custody and ran through the public io_uring CLI. This "
+               "proves only this third-incomplete-progress expiry schedule; broader #271 remains "
+               "unsupported.\n";
         return 0;
     }
     if (converter_default_buffering_three_publication_completion_differential) {
