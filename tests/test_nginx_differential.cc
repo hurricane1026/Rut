@@ -63636,6 +63636,929 @@ static bool run_converter_default_buffering_206_range_delayed_completion_differe
     return true;
 }
 
+static bool run_converter_default_buffering_206_range_three_publication_completion_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    static constexpr char kDiagnostic[] = "#253 paired three-publication 206 range completion";
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = std::string(kDiagnostic) + " differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = std::string(kDiagnostic) + " could not create isolated side resources";
+        return false;
+    }
+
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = std::string(kDiagnostic) +
+                    " differential could not hold four distinct four-digit ports";
+            return false;
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty()) error = std::string(kDiagnostic) + " lost its exact nginx inputs";
+        return false;
+    }
+
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !validate_explicit_timeout_get_generated_provenance(
+            generated_source, ports[2], ports[3], temps[1].rut_access_log, error)) {
+        if (error.empty())
+            error =
+                std::string(kDiagnostic) + " did not produce exact owned ordinary-RUT provenance";
+        return false;
+    }
+    static constexpr const char* kForbiddenGeneratedMarkers[] = {
+        "nginx.conf",
+        "nginx::",
+        "nginx_compat",
+        "proxy_pass",
+        "workaround",
+        "issue534",
+        "issue253",
+        "status: 206",
+        "Partial Content",
+        "Content-Range",
+        "Range: bytes=0-4",
+    };
+    for (const char* marker : kForbiddenGeneratedMarkers) {
+        if (generated_source.find(marker) != std::string::npos) {
+            error = std::string(kDiagnostic) +
+                    " generated source embedded forbidden converter/runtime marker `" + marker +
+                    "`";
+            return false;
+        }
+    }
+    if (!write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        error = std::string(kDiagnostic) + " could not persist its exact independent inputs";
+        return false;
+    }
+
+    static constexpr char kSecondFragment[] = {'l'};
+    static constexpr char kThirdFragment[] = {'l', 'o'};
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+    static_assert(kDefaultBuffering206RangeOrigin[139] == 'h');
+    static_assert(kDefaultBuffering206RangeOrigin[140] == 'e');
+    static_assert(kDefaultBuffering206RangeOrigin[141] == 'l');
+    static_assert(kDefaultBuffering206RangeOrigin[142] == 'l');
+    static_assert(kDefaultBuffering206RangeOrigin[143] == 'o');
+    static_assert(sizeof(kSecondFragment) == 1u);
+    static_assert(sizeof(kThirdFragment) == 2u);
+
+    Recorder origins[2];
+    for (auto& origin : origins) {
+        origin.permit_gated_incomplete_first_response = true;
+        origin.probe_before_gated_fragment = true;
+        origin.incomplete_first_response_fragment_count = 3u;
+        origin.response_fragment_bytes[0] = kDefaultBuffering206RangeOrigin;
+        origin.response_fragment_lengths[0] = 141u;
+        origin.response_fragment_bytes[1] = kSecondFragment;
+        origin.response_fragment_lengths[1] = sizeof(kSecondFragment);
+        origin.response_fragment_bytes[2] = kThirdFragment;
+        origin.response_fragment_lengths[2] = sizeof(kThirdFragment);
+        origin.observe_extra_requests_until_stop = true;
+    }
+    const auto probe_is_neutral = [](const Recorder& origin) {
+        return origin.gated_fragment_probe_request.load(std::memory_order_acquire) == 0u &&
+               origin.gated_fragment_probe_ack.load(std::memory_order_acquire) == 0u &&
+               origin.gated_fragment_probe_ns.load(std::memory_order_acquire) == 0u &&
+               origin.gated_fragment_probe_result.load(std::memory_order_acquire) ==
+                   GatedFragmentPeerProbeResult::None;
+    };
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(
+                &reservations.fds[backend], ports[backend], kDiagnostic, error) ||
+            !origins[side].setup(ports[backend])) {
+            if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = std::string(kDiagnostic) + " origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], kDiagnostic, error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child)) {
+        error = std::string(kDiagnostic) + " could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = std::string(kDiagnostic) + " pinned nginx readiness failed: " + error;
+        return false;
+    }
+    if (!handoff_held_loopback_port(&reservations.fds[2], ports[2], kDiagnostic, error))
+        return false;
+    if (!spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child)) {
+        error = std::string(kDiagnostic) + " could not spawn generated ordinary RUT";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = std::string(kDiagnostic) + " generated RUT readiness failed: " + error;
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temps[1].rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = std::string(kDiagnostic) + " RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!frontends_live() || !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = std::string(kDiagnostic) + " generated RUT lacked exact io_uring readiness";
+        return false;
+    }
+
+    std::string pre_request_access[2];
+    if (!read_request_length_access_file(temps[0].nginx_access_log, pre_request_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, pre_request_access[1], error) ||
+        !pre_request_access[0].empty() || !pre_request_access[1].empty()) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " access was not empty before request";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    u64 request_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        clients.fds[side] = connect_once(ports[side * 2u]);
+        request_sent_ns[side] = steady_now_ns();
+        if (clients.fds[side] < 0 || !send_all(clients.fds[side],
+                                               kDefaultBuffering206RangeRequest,
+                                               sizeof(kDefaultBuffering206RangeRequest) - 1u)) {
+            error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                    " could not send the exact 78-byte request";
+            return false;
+        }
+    }
+
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        bool requests_ready = true;
+        for (size_t side = 0u; side < 2u; side++) {
+            auto& origin = origins[side];
+            std::string access;
+            std::string detail;
+            const u32 accepted = origin.accepted.load(std::memory_order_acquire);
+            const u32 requests = origin.requests.load(std::memory_order_acquire);
+            if (accepted > 1u || requests > 1u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 0u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+                !probe_is_neutral(origin) ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.response_sent_open.load(std::memory_order_acquire) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                !read_request_length_access_file(
+                    side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                    access,
+                    error) ||
+                !access.empty() ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                if (error.empty())
+                    error = std::string(kDiagnostic) + " pre-W1 custody failed: " + detail;
+                return false;
+            }
+            requests_ready &= accepted == 1u && requests == 1u;
+        }
+        if (requests_ready) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= request_deadline) {
+            error = std::string(kDiagnostic) + " origins did not receive both exact requests";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    for (auto& origin : origins)
+        origin.response_fragment_permit.store(1u, std::memory_order_release);
+    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        bool first_published = true;
+        for (const auto& origin : origins) {
+            const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+            if (count > 1u || origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.response_sent_open.load(std::memory_order_acquire)) {
+                error = std::string(kDiagnostic) + " W1 publication state was invalid";
+                return false;
+            }
+            first_published &= count == 1u;
+        }
+        if (first_published) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= first_deadline) {
+            error = std::string(kDiagnostic) + " lost liveness awaiting both W1 publications";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 first_write_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        first_write_ns[side] = origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed);
+        if (first_write_ns[side] < request_sent_ns[side] ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            !probe_is_neutral(origin) ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire)) {
+            error = std::string(kDiagnostic) + " W1 timestamp/publication evidence was incoherent";
+            return false;
+        }
+    }
+
+    u64 quiet_ns[2][4]{};
+    u64 origin_probe_ns[2][4]{};
+    u64 downstream_probe_ns[2][4]{};
+    u64 write_ns[2][4]{};
+    for (size_t side = 0u; side < 2u; side++) write_ns[side][1] = first_write_ns[side];
+
+    const auto release_followup = [&](u32 ordinal) {
+        const u32 prior = ordinal - 1u;
+        bool quiet_complete[2] = {false, false};
+        while (!quiet_complete[0] || !quiet_complete[1]) {
+            for (size_t side = 0u; side < 2u; side++) {
+                if (quiet_complete[side]) continue;
+                const u64 prior_write_ns = write_ns[side][prior];
+                const u64 target_ns = prior_write_ns + 600'000'000ull;
+                const u64 deadline_ns = prior_write_ns + 750'000'000ull;
+                std::string detail;
+                if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                    error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                            " pre-W" + std::to_string(ordinal) +
+                            " downstream quiet gate failed: " + detail;
+                    return false;
+                }
+                quiet_ns[side][ordinal] = steady_now_ns();
+                std::string access;
+                const auto& origin = origins[side];
+                const u32 expected_ack = ordinal == 2u ? 0u : prior;
+                if (!frontends_live() || !origins_live() ||
+                    origin.accepted.load(std::memory_order_acquire) != 1u ||
+                    origin.requests.load(std::memory_order_acquire) != 1u ||
+                    origin.response_fragment_permit.load(std::memory_order_acquire) != prior ||
+                    origin.response_fragments_sent.load(std::memory_order_acquire) != prior ||
+                    origin.gated_fragment_probe_request.load(std::memory_order_acquire) !=
+                        expected_ack ||
+                    origin.gated_fragment_probe_ack.load(std::memory_order_acquire) !=
+                        expected_ack ||
+                    origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                    origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                    origin.response_sent_open.load(std::memory_order_acquire) ||
+                    origin.response_send_failed.load(std::memory_order_acquire) ||
+                    origin.response_peer_closed.load(std::memory_order_acquire) ||
+                    !read_request_length_access_file(
+                        side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                        access,
+                        error) ||
+                    !access.empty()) {
+                    if (error.empty())
+                        error = std::string(kDiagnostic) + " pre-W" + std::to_string(ordinal) +
+                                " custody failed";
+                    return false;
+                }
+                if (quiet_ns[side][ordinal] >= deadline_ns) {
+                    error = std::string(kDiagnostic) + " pre-W" + std::to_string(ordinal) +
+                            " quiet witness missed its timing window";
+                    return false;
+                }
+                const bool crossed_prior_target = quiet_ns[side][ordinal] >= target_ns;
+                const bool crossed_w1_horizon =
+                    ordinal != 3u ||
+                    quiet_ns[side][ordinal] > first_write_ns[side] + 1'100'000'000ull;
+                quiet_complete[side] = crossed_prior_target && crossed_w1_horizon;
+            }
+        }
+
+        for (size_t side = 0u; side < 2u; side++) {
+            auto& origin = origins[side];
+            const u64 deadline_ns = write_ns[side][prior] + 750'000'000ull;
+            origin.gated_fragment_probe_request.store(ordinal, std::memory_order_release);
+            for (;;) {
+                const u32 ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+                if (ack == ordinal) break;
+                if (ack > ordinal || !frontends_live() || !origins_live() ||
+                    origin.response_fragment_permit.load(std::memory_order_acquire) != prior ||
+                    origin.response_fragments_sent.load(std::memory_order_acquire) != prior ||
+                    origin.response_send_failed.load(std::memory_order_acquire) ||
+                    steady_now_ns() >= deadline_ns) {
+                    error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                            " pre-W" + std::to_string(ordinal) +
+                            " worker probe missed its timing window";
+                    return false;
+                }
+                usleep(1000);
+            }
+            const u32 acquired_ack =
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+            origin_probe_ns[side][ordinal] =
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+            const GatedFragmentPeerProbeResult result =
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed);
+            if (acquired_ack != ordinal || result != GatedFragmentPeerProbeResult::Open ||
+                origin_probe_ns[side][ordinal] < quiet_ns[side][ordinal] ||
+                origin_probe_ns[side][ordinal] >= deadline_ns ||
+                (ordinal == 3u &&
+                 origin_probe_ns[side][ordinal] <= first_write_ns[side] + 1'100'000'000ull) ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != ordinal ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != ordinal ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != prior ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != prior ||
+                origin.response_send_failed.load(std::memory_order_acquire)) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") + " pre-W" +
+                        std::to_string(ordinal) + " worker-owned peer-open evidence failed";
+                return false;
+            }
+
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                        " post-ack/pre-W" + std::to_string(ordinal) +
+                        " downstream gate failed: " + detail;
+                return false;
+            }
+            downstream_probe_ns[side][ordinal] = steady_now_ns();
+            std::string access;
+            if (downstream_probe_ns[side][ordinal] < origin_probe_ns[side][ordinal] ||
+                downstream_probe_ns[side][ordinal] >= deadline_ns || !frontends_live() ||
+                !origins_live() || origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != prior ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != prior ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != ordinal ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != ordinal ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    origin_probe_ns[side][ordinal] ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) != result ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.response_sent_open.load(std::memory_order_acquire) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                !read_request_length_access_file(
+                    side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                    access,
+                    error) ||
+                !access.empty()) {
+                if (error.empty())
+                    error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                            " post-ack/pre-W" + std::to_string(ordinal) +
+                            " zero-byte/open custody failed";
+                return false;
+            }
+            // This final downstream observation follows the immutable Open ack. Release
+            // this side immediately; do not wait for the other side after this probe.
+            origin.response_fragment_permit.store(ordinal, std::memory_order_release);
+        }
+
+        bool published[2] = {false, false};
+        while (!published[0] || !published[1]) {
+            for (size_t side = 0u; side < 2u; side++) {
+                const auto& origin = origins[side];
+                const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+                if (count > ordinal ||
+                    origin.response_send_failed.load(std::memory_order_acquire) ||
+                    (!published[side] &&
+                     steady_now_ns() >= write_ns[side][prior] + 750'000'000ull)) {
+                    error = std::string(kDiagnostic) + " W" + std::to_string(ordinal) +
+                            " publication state/timing was invalid";
+                    return false;
+                }
+                published[side] = count == ordinal;
+            }
+            if (!frontends_live() || !origins_live()) {
+                error = std::string(kDiagnostic) + " lost liveness awaiting W" +
+                        std::to_string(ordinal) + " publications";
+                return false;
+            }
+            if (!published[0] || !published[1]) usleep(1000);
+        }
+
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+            write_ns[side][ordinal] =
+                origin.response_fragment_sent_ns[ordinal - 1u].load(std::memory_order_relaxed);
+            if (count != ordinal || write_ns[side][ordinal] <= write_ns[side][prior] ||
+                write_ns[side][ordinal] - write_ns[side][prior] < 550'000'000ull ||
+                write_ns[side][ordinal] - write_ns[side][prior] >= 750'000'000ull ||
+                quiet_ns[side][ordinal] < write_ns[side][prior] + 600'000'000ull ||
+                origin_probe_ns[side][ordinal] < quiet_ns[side][ordinal] ||
+                downstream_probe_ns[side][ordinal] < origin_probe_ns[side][ordinal] ||
+                downstream_probe_ns[side][ordinal] > write_ns[side][ordinal] ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != ordinal ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != ordinal ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    origin_probe_ns[side][ordinal] ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::Open ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != ordinal ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                (ordinal == 2u && (origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                                   origin.response_sent_open.load(std::memory_order_acquire)))) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") + " W" +
+                        std::to_string(prior) + "-to-W" + std::to_string(ordinal) +
+                        " timing/publication evidence mismatch";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!release_followup(2u) || !release_followup(3u)) return false;
+    u64 second_write_ns[2]{};
+    u64 third_write_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        second_write_ns[side] = write_ns[side][2];
+        third_write_ns[side] = write_ns[side][3];
+        if (!(first_write_ns[side] + 1'100'000'000ull < quiet_ns[side][3] &&
+              quiet_ns[side][3] <= origin_probe_ns[side][3] &&
+              origin_probe_ns[side][3] <= downstream_probe_ns[side][3] &&
+              downstream_probe_ns[side][3] <= third_write_ns[side])) {
+            error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                    " W3 did not cross its W1 original horizon";
+            return false;
+        }
+    }
+
+    // Recorder write times delimit application publications, while probe times delimit
+    // observations. Neither establishes emission, TCP/read, or io_uring CQE boundaries.
+    std::vector<char> responses[2];
+    u64 first_downstream_ns[2]{};
+    u64 full_downstream_ns[2]{};
+    bool response_complete[2] = {false, false};
+    while (!response_complete[0] || !response_complete[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (response_complete[side]) continue;
+            if (!frontends_live() || !origins_live() ||
+                steady_now_ns() >= third_write_ns[side] + 750'000'000ull) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                        " response missed its W3+750ms prompt budget";
+                return false;
+            }
+            pollfd poll_state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&poll_state, 1, 5);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                error = std::string(kDiagnostic) + " downstream poll failed";
+                return false;
+            }
+            if (ready == 0) continue;
+            char bytes[512];
+            const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+            const u64 observed_ns = steady_now_ns();
+            if (count > 0) {
+                if (first_downstream_ns[side] == 0u) first_downstream_ns[side] = observed_ns;
+                responses[side].insert(responses[side].end(), bytes, bytes + count);
+                if (responses[side].size() >
+                    sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u) {
+                    error = std::string(kDiagnostic) + " downstream included tail bytes";
+                    return false;
+                }
+                if (responses[side].size() ==
+                    sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u) {
+                    full_downstream_ns[side] = observed_ns;
+                    response_complete[side] = true;
+                }
+                continue;
+            }
+            if (count == 0) {
+                error =
+                    std::string(kDiagnostic) + " downstream closed instead of remaining keep-alive";
+                return false;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            error = std::string(kDiagnostic) + " downstream recv failed";
+            return false;
+        }
+    }
+
+    for (;;) {
+        bool peers_closed = true;
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            if (origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = std::string(kDiagnostic) + " origin peer-close observation failed";
+                return false;
+            }
+            if (!origin.response_peer_closed.load(std::memory_order_acquire) &&
+                steady_now_ns() >= third_write_ns[side] + 750'000'000ull) {
+                error =
+                    std::string(kDiagnostic) + " origin was not actively retired before W3+750ms";
+                return false;
+            }
+            peers_closed &= origin.response_peer_closed.load(std::memory_order_acquire);
+        }
+        if (peers_closed) break;
+        if (!frontends_live() || !origins_live()) {
+            error = std::string(kDiagnostic) + " lost process liveness before origin retirement";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    u64 peer_close_ns[2]{};
+    u64 first_elapsed[2]{};
+    u64 full_elapsed[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        peer_close_ns[side] = origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+        first_elapsed[side] = first_downstream_ns[side] - third_write_ns[side];
+        full_elapsed[side] = full_downstream_ns[side] - third_write_ns[side];
+        if (first_downstream_ns[side] < third_write_ns[side] ||
+            full_downstream_ns[side] < first_downstream_ns[side] ||
+            first_elapsed[side] >= 750'000'000ull || full_elapsed[side] >= 750'000'000ull ||
+            peer_close_ns[side] < third_write_ns[side] ||
+            peer_close_ns[side] - third_write_ns[side] >= 750'000'000ull) {
+            error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                    " prompt response/origin-close timing left the W3-relative budget";
+            return false;
+        }
+    }
+    const u64 first_delta = first_elapsed[0] > first_elapsed[1]
+                                ? first_elapsed[0] - first_elapsed[1]
+                                : first_elapsed[1] - first_elapsed[0];
+    if (first_delta > 350'000'000ull) {
+        error = std::string(kDiagnostic) +
+                " W3-relative first-byte timings differed by over 350ms: " +
+                std::to_string(first_elapsed[0]) + "/" + std::to_string(first_elapsed[1]) + "ns";
+        return false;
+    }
+
+    std::vector<char> normalized[2] = {responses[0], responses[1]};
+    const std::vector<char> expected_response(
+        kDefaultBuffering206RangeResponseNormalized,
+        kDefaultBuffering206RangeResponseNormalized +
+            sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u);
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != expected_response || normalized[1] != expected_response ||
+        normalized[0] != normalized[1]) {
+        error = std::string(kDiagnostic) + " exact Date-normalized 168-byte response mismatch";
+        dump_wire("#253 paired three-publication 206 range completion nginx response",
+                  responses[0]);
+        dump_wire("#253 paired three-publication 206 range completion RUT response", responses[1]);
+        return false;
+    }
+    for (const auto& response : normalized) {
+        const std::string text(response.begin(), response.end());
+        const size_t response_header_end = header_end(response);
+        if (response_header_end + 5u != response.size() ||
+            count_text(text, "HTTP/1.1 206 Partial Content\r\n") != 1u ||
+            count_text(text, "Content-Range: bytes 0-4/12\r\n") != 1u ||
+            count_text(text, "Content-Length: 5\r\n") != 1u ||
+            count_text(text, "Connection: keep-alive\r\n") != 1u ||
+            text.compare(response_header_end, 5u, "hello") != 0 ||
+            text.find("tail") != std::string::npos ||
+            text.find("HTTP/1.1 200") != std::string::npos ||
+            text.find("HTTP/1.1 201") != std::string::npos ||
+            text.find("HTTP/1.1 202") != std::string::npos ||
+            text.find("HTTP/1.1 203") != std::string::npos ||
+            text.find("HTTP/1.1 204") != std::string::npos ||
+            text.find("HTTP/1.1 304") != std::string::npos ||
+            text.find("502") != std::string::npos || text.find("504") != std::string::npos ||
+            text.find("Bad Gateway") != std::string::npos ||
+            text.find("Gateway Time-out") != std::string::npos) {
+            error = std::string(kDiagnostic) + " response lost exact bodyful 206 custody";
+            return false;
+        }
+    }
+
+    static constexpr char kExpectedAccess[] = "78\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access_records[2];
+        if (!read_request_length_access_file(temps[0].nginx_access_log, access_records[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access_records[1], error))
+            return false;
+        if (access_records[0] == kExpectedAccess && access_records[1] == kExpectedAccess) break;
+        if ((!access_records[0].empty() && access_records[0] != kExpectedAccess) ||
+            (!access_records[1].empty() && access_records[1] != kExpectedAccess) ||
+            !frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            error = std::string(kDiagnostic) +
+                    " live access was not one exact record reporting 78 request bytes per side";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        for (size_t side = 0u; side < 2u; side++) {
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                        " downstream changed during no-retry gate: " + detail;
+                return false;
+            }
+        }
+        if (!frontends_live() || !origins_live()) {
+            error =
+                std::string(kDiagnostic) + " lost listener/process liveness during no-retry gate";
+            return false;
+        }
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 3u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    origin_probe_ns[side][3] ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::Open ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                !origin.response_sent_open.load(std::memory_order_acquire) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = std::string(kDiagnostic) + " observed retry or lifecycle multiplicity";
+                return false;
+            }
+        }
+    }
+
+    bool horizon_complete[2] = {false, false};
+    u64 horizon_probe_ns[2]{};
+    while (!horizon_complete[0] || !horizon_complete[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (horizon_complete[side]) continue;
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                        " downstream changed before W3+1.25s: " + detail;
+                return false;
+            }
+            horizon_probe_ns[side] = steady_now_ns();
+            horizon_complete[side] =
+                horizon_probe_ns[side] >= third_write_ns[side] + 1'250'000'000ull;
+        }
+        std::string access_records[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access_records[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access_records[1], error) ||
+            access_records[0] != kExpectedAccess || access_records[1] != kExpectedAccess) {
+            if (error.empty())
+                error = std::string(kDiagnostic) + " lost exact access/process custody at horizon";
+            return false;
+        }
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 3u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    origin_probe_ns[side][3] ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::Open ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u) {
+                error =
+                    std::string(kDiagnostic) + " origin state changed before keep-alive horizon";
+                return false;
+            }
+        }
+    }
+    u64 final_quiet_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+            error = std::string(kDiagnostic) + " " + (side == 0u ? "nginx" : "RUT") +
+                    " final keep-alive probe failed: " + detail;
+            return false;
+        }
+        final_quiet_ns[side] = steady_now_ns();
+        if (final_quiet_ns[side] < third_write_ns[side] + 1'250'000'000ull) {
+            error = std::string(kDiagnostic) + " final keep-alive probe preceded its W3 horizon";
+            return false;
+        }
+    }
+    std::string final_live_access[2];
+    if (!frontends_live() || !origins_live() ||
+        !read_request_length_access_file(temps[0].nginx_access_log, final_live_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_live_access[1], error) ||
+        final_live_access[0] != kExpectedAccess || final_live_access[1] != kExpectedAccess) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " final keep-alive/access boundary failed";
+        return false;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        if (origin.response_fragment_permit.load(std::memory_order_acquire) != 3u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+            origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
+            origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                origin_probe_ns[side][3] ||
+            origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                GatedFragmentPeerProbeResult::Open ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u) {
+            error = std::string(kDiagnostic) + " final live origin custody changed";
+            return false;
+        }
+    }
+
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    std::vector<char> canonical_upstream[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        const u16 backend_port = ports[side * 2u + 1u];
+        const std::string expected_text = "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                          std::to_string(backend_port) +
+                                          "\r\nRange: bytes=0-4\r\n\r\n";
+        const std::vector<char> expected(expected_text.begin(), expected_text.end());
+        const auto& origin = origins[side];
+        if (expected.size() != 78u || origin.thread_alive.load(std::memory_order_acquire) ||
+            origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.history[0] != expected || origin.request != expected ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 3u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 3u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 3u ||
+            origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 3u ||
+            origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                origin_probe_ns[side][3] ||
+            origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                GatedFragmentPeerProbeResult::Open ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error = std::string(kDiagnostic) + " exact upstream/origin cleanup evidence mismatch";
+            dump_wire("#253 paired three-publication 206 range completion expected upstream",
+                      expected);
+            dump_wire("#253 paired three-publication 206 range completion observed upstream",
+                      origin.request);
+            return false;
+        }
+        const std::string observed(origin.request.begin(), origin.request.end());
+        if (observed.find("Host: client.example") != std::string::npos ||
+            observed.find("\r\nConnection:") != std::string::npos ||
+            count_text(observed, "Range: bytes=0-4\r\n") != 1u) {
+            error = std::string(kDiagnostic) + " upstream lost Range/authority policy";
+            return false;
+        }
+        canonical_upstream[side] = origin.history[0];
+        const std::string authority = "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n";
+        static constexpr char kCanonicalAuthority[] = "Host: 127.0.0.1:<backend>\r\n";
+        const auto at = std::search(canonical_upstream[side].begin(),
+                                    canonical_upstream[side].end(),
+                                    authority.begin(),
+                                    authority.end());
+        if (at == canonical_upstream[side].end() ||
+            std::search(at + authority.size(),
+                        canonical_upstream[side].end(),
+                        authority.begin(),
+                        authority.end()) != canonical_upstream[side].end()) {
+            error =
+                std::string(kDiagnostic) + " upstream authority was not uniquely canonicalizable";
+            return false;
+        }
+        const size_t offset = static_cast<size_t>(at - canonical_upstream[side].begin());
+        canonical_upstream[side].erase(
+            canonical_upstream[side].begin() + static_cast<std::ptrdiff_t>(offset),
+            canonical_upstream[side].begin() +
+                static_cast<std::ptrdiff_t>(offset + authority.size()));
+        canonical_upstream[side].insert(
+            canonical_upstream[side].begin() + static_cast<std::ptrdiff_t>(offset),
+            kCanonicalAuthority,
+            kCanonicalAuthority + sizeof(kCanonicalAuthority) - 1u);
+    }
+    if (!origins_live_before_stop || canonical_upstream[0] != canonical_upstream[1]) {
+        error = std::string(kDiagnostic) + " cross-side upstream/liveness evidence differed";
+        return false;
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    std::string post_client_access[2];
+    if (!read_request_length_access_file(temps[0].nginx_access_log, post_client_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, post_client_access[1], error) ||
+        post_client_access[0] != kExpectedAccess || post_client_access[1] != kExpectedAccess) {
+        if (error.empty()) error = std::string(kDiagnostic) + " access changed after client close";
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    std::string final_access[2];
+    if (!nginx_stopped || !rut_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+        final_access[0] != kExpectedAccess || final_access[1] != kExpectedAccess) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " final process/fd/access cleanup failed";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #253 paired three-publication 206 range completion "
+                 "W1-to-W2/W2-to-W3/W3-to-first/full/peer-close seconds nginx="
+              << static_cast<double>(second_write_ns[0] - first_write_ns[0]) / 1e9 << "/"
+              << static_cast<double>(third_write_ns[0] - second_write_ns[0]) / 1e9 << "/"
+              << static_cast<double>(first_elapsed[0]) / 1e9 << "/"
+              << static_cast<double>(full_elapsed[0]) / 1e9 << "/"
+              << static_cast<double>(peer_close_ns[0] - third_write_ns[0]) / 1e9
+              << " RUT=" << static_cast<double>(second_write_ns[1] - first_write_ns[1]) / 1e9 << "/"
+              << static_cast<double>(third_write_ns[1] - second_write_ns[1]) / 1e9 << "/"
+              << static_cast<double>(first_elapsed[1]) / 1e9 << "/"
+              << static_cast<double>(full_elapsed[1]) / 1e9 << "/"
+              << static_cast<double>(peer_close_ns[1] - third_write_ns[1]) / 1e9
+              << " W3-first-delta=" << static_cast<double>(first_delta) / 1e9 << "\n";
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_three_publication_oracle_impl(
     TempDir& temp,
     const std::string& container_name,
@@ -66379,6 +67302,10 @@ int main(int argc, char** argv) {
         argc == 3 &&
         strcmp(argv[1],
                "--converter-default-buffering-206-range-delayed-completion-differential") == 0;
+    const bool converter_default_buffering_206_range_three_publication_completion_differential =
+        argc == 3 && strcmp(argv[1],
+                            "--converter-default-buffering-206-range-three-publication-completion-"
+                            "differential") == 0;
     const bool converter_default_buffering_second_body_progress_refresh_differential =
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-second-body-progress-refresh-"
@@ -66637,6 +67564,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_304_content_length_metadata_differential &&
          !converter_default_buffering_206_range_completion_differential &&
          !converter_default_buffering_206_range_delayed_completion_differential &&
+         !converter_default_buffering_206_range_three_publication_completion_differential &&
          !converter_default_buffering_second_body_progress_refresh_differential &&
          !converter_default_buffering_three_publication_completion_differential &&
          !converter_default_buffering_third_body_progress_expiry_differential &&
@@ -66727,6 +67655,7 @@ int main(int argc, char** argv) {
           converter_default_buffering_304_content_length_metadata_differential ||
           converter_default_buffering_206_range_completion_differential ||
           converter_default_buffering_206_range_delayed_completion_differential ||
+          converter_default_buffering_206_range_three_publication_completion_differential ||
           converter_default_buffering_second_body_progress_refresh_differential ||
           converter_default_buffering_three_publication_completion_differential ||
           converter_default_buffering_third_body_progress_expiry_differential) &&
@@ -66867,6 +67796,9 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential "
                "--converter-default-buffering-206-range-delayed-completion-differential "
                "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-206-range-three-publication-completion-"
+               "differential <absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-second-body-progress-refresh-differential "
                "<absolute-rut-executable>\n"
@@ -68438,6 +69370,39 @@ int main(int argc, char** argv) {
                "timestamps are not TCP/read/CQE boundaries. This claims no other Range/status/"
                "framing schedule, incomplete response, retry/reuse/pipeline/successor, TLS/H2/"
                "epoll, or broad #253/#271 support.\n";
+        return 0;
+    }
+    if (converter_default_buffering_206_range_three_publication_completion_differential) {
+        const std::string container_name = "rut-nginx-253-three-pub-206-range-completion-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_206_range_three_publication_completion_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#253 converter default-buffering three-publication 206 range "
+                         "completion differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #253 pinned nginx 1.29.7 and independently converter-generated ordinary "
+               "RUT matched one exact 78-byte Range GET through root no-URI proxying with "
+               "explicit proxy_read_timeout 1s and omitted buffering/request-buffering/http-"
+               "version/header overrides. Each application-open origin published the coherent "
+               "206/Content-Range bytes 0-4/12/CL5 response as an exact 141-byte header-plus-he "
+               "prefix, one-byte l, then two-byte lo completion, with both adjacent gaps in "
+               "550-750ms. Both frontends withheld all downstream bytes through independent "
+               "worker-owned peer-open and final post-ack/pre-permit zero-byte observations; W3 "
+               "crossed each side's W1+1.1s horizon. They then promptly emitted the exact equal "
+               "Date-normalized 168-byte bodyful response, actively retired one origin, and kept "
+               "downstream open and byte-quiet past W3+1.25s. Each emitted one exact authority-"
+               "rewritten 78-byte upstream request preserving Range and one access record "
+               "reporting 78 request bytes, with no retry. Generated ordinary source passed "
+               "semantic source/lexer/AST/HIR/MIR/verified-RIR/O2/config custody and ran through "
+               "the public io_uring CLI. Application-publication and observation timestamps are "
+               "not emission, TCP/read, or CQE boundaries. This claims no arbitrary progress "
+               "schedule, incomplete 206, other Range/status/framing, retry/reuse/pipeline, TLS/"
+               "H2/epoll, or broad #253/#271 support.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_206_range_completion_oracle) {
