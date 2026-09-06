@@ -232,6 +232,11 @@ static constexpr char kDefaultBuffering304MetadataRequest[] =
     "Host: client.example\r\n"
     "If-None-Match: \"v1\"\r\n\r\n";
 static_assert(sizeof(kDefaultBuffering304MetadataRequest) - 1u == 81u);
+static constexpr char kDefaultBuffering206RangeRequest[] =
+    "GET /buffered-timeout?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Range: bytes=0-4\r\n\r\n";
+static_assert(sizeof(kDefaultBuffering206RangeRequest) - 1u == 78u);
 static constexpr char kDefaultBuffering304HypotheticalRepresentation[] = "hello!world!";
 static_assert(sizeof(kDefaultBuffering304HypotheticalRepresentation) - 1u == 12u);
 static constexpr char kDefaultBufferingCloseTimeoutRequest[] =
@@ -268,6 +273,15 @@ static constexpr char kDefaultBuffering304MetadataOrigin[] =
     "ETag: \"v1\"\r\n"
     "Content-Length: 12\r\n\r\n";
 static_assert(sizeof(kDefaultBuffering304MetadataOrigin) - 1u == 120u);
+static constexpr char kDefaultBuffering206RangeOrigin[] =
+    "HTTP/1.1 206 Partial Content\r\n"
+    "Server: stall-origin\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "Content-Range: bytes 0-4/12\r\n"
+    "Content-Length: 5\r\n\r\n"
+    "hello";
+static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
 static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -297,6 +311,15 @@ static constexpr char kDefaultBuffering304MetadataResponseNormalized[] =
     "Connection: keep-alive\r\n"
     "ETag: \"v1\"\r\n\r\n";
 static_assert(sizeof(kDefaultBuffering304MetadataResponseNormalized) - 1u == 144u);
+static constexpr char kDefaultBuffering206RangeResponseNormalized[] =
+    "HTTP/1.1 206 Partial Content\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 5\r\n"
+    "Connection: keep-alive\r\n"
+    "Content-Range: bytes 0-4/12\r\n\r\n"
+    "hello";
+static_assert(sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u == 168u);
 static constexpr char kDefaultBufferingThreePublicationResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -59544,6 +59567,355 @@ static bool run_pinned_nginx_default_buffering_304_content_length_metadata_oracl
     return true;
 }
 
+static bool run_pinned_nginx_default_buffering_206_range_completion_oracle(
+    TempDir& temp, const std::string& container_name, std::string& error) {
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = "#253 206 range completion oracle could not hold two distinct four-digit ports";
+            return false;
+        }
+    }
+
+    const std::string profile =
+        make_explicit_timeout_head_profile(ports[0], ports[1], temp.nginx_access_log);
+    const std::string nginx_config = "events {}\n" + profile;
+    if (!validate_explicit_timeout_head_profile(
+            profile, ports[0], ports[1], temp.nginx_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        !write_file(temp.nginx_config, nginx_config.data(), nginx_config.size())) {
+        if (error.empty()) error = "#253 206 range completion oracle nginx input was not exact";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], ports[1], "#253 206 range completion origin bind", error) ||
+        !origin.setup(ports[1],
+                      1u,
+                      kDefaultBuffering206RangeOrigin,
+                      sizeof(kDefaultBuffering206RangeOrigin) - 1u)) {
+        if (error.empty()) error = "#253 206 range completion origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#253 206 range completion origin was not live before nginx handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#253 206 range completion nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temp.nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "#253 206 range completion oracle could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], nginx.child, error)) {
+        error = "#253 206 range completion pinned nginx readiness failed: " + error;
+        return false;
+    }
+    const auto frontend_live = [&]() { return !poll_child(nginx.child); };
+
+    std::string pre_request_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, pre_request_access, error) ||
+        !pre_request_access.empty()) {
+        if (error.empty())
+            error = "#253 206 range completion access was not empty before the request";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    client.fd = connect_once(ports[0]);
+    const u64 request_send_ns = steady_now_ns();
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBuffering206RangeRequest,
+                                   sizeof(kDefaultBuffering206RangeRequest) - 1u)) {
+        error = "#253 206 range completion client could not send the exact 78-byte request";
+        return false;
+    }
+
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin.response_sent_open.load(std::memory_order_acquire)) {
+        if (!frontend_live() || !origin_live() ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) > 1u ||
+            origin.requests.load(std::memory_order_acquire) > 1u ||
+            std::chrono::steady_clock::now() >= publication_deadline) {
+            error = "#253 206 range completion origin failed before its one open publication";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 origin_sent_ns = origin.response_sent_ns.load(std::memory_order_acquire);
+    if (origin_sent_ns < request_send_ns || origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire)) {
+        error = "#253 206 range completion one 144-byte open publication was incoherent";
+        return false;
+    }
+
+    // This timestamps one complete 144-byte application publication only. It is
+    // not a TCP packet or nginx read boundary.
+    std::vector<char> response;
+    u64 first_downstream_ns = 0u;
+    u64 full_downstream_ns = 0u;
+    const u64 prompt_deadline_ns = request_send_ns + 750'000'000ull;
+    while (response.size() < sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u) {
+        if (!frontend_live() || !origin_live() || steady_now_ns() >= prompt_deadline_ns) {
+            error = "#253 206 range completion response missed the request+750ms prompt budget";
+            origin.stop();
+            dump_wire("#253 206 range completion raw nginx response", response);
+            return false;
+        }
+        pollfd poll_state{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&poll_state, 1, 5);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "#253 206 range completion downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[512];
+        const ssize_t count = recv(client.fd, bytes, sizeof(bytes), 0);
+        const u64 observed_ns = steady_now_ns();
+        if (count > 0) {
+            if (first_downstream_ns == 0u) first_downstream_ns = observed_ns;
+            response.insert(response.end(), bytes, bytes + count);
+            if (response.size() > sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u) {
+                error = "#253 206 range completion downstream included tail bytes";
+                return false;
+            }
+            if (response.size() == sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u)
+                full_downstream_ns = observed_ns;
+        } else if (count == 0) {
+            error = "#253 206 range completion downstream closed instead of staying keep-alive";
+            return false;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            error = "#253 206 range completion downstream recv failed";
+            return false;
+        }
+    }
+
+    while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+        if (!frontend_live() || !origin_live() ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            steady_now_ns() >= prompt_deadline_ns) {
+            error = "#253 206 range completion origin was not actively closed before request+750ms";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 peer_close_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+
+    const auto fail_observation = [&](const std::string& message) {
+        origin.stop();
+        error = message;
+        dump_wire("#253 206 range completion raw nginx response", response);
+        std::vector<char> normalized = response;
+        if (normalize_date(normalized))
+            dump_wire("#253 206 range completion Date-normalized nginx response", normalized);
+        if (!origin.history.empty())
+            dump_wire("#253 206 range completion raw upstream history", origin.history[0]);
+        std::cerr
+            << "#253 206 range completion timestamps request/publication/first/full/peer(ns): "
+            << request_send_ns << "/" << origin_sent_ns << "/" << first_downstream_ns << "/"
+            << full_downstream_ns << "/" << peer_close_ns << "\n";
+        return false;
+    };
+    if (first_downstream_ns < request_send_ns || full_downstream_ns < first_downstream_ns ||
+        peer_close_ns < origin_sent_ns || first_downstream_ns >= prompt_deadline_ns ||
+        full_downstream_ns >= prompt_deadline_ns || peer_close_ns >= prompt_deadline_ns) {
+        return fail_observation(
+            "#253 206 range completion prompt timing missed its strict windows");
+    }
+
+    std::vector<char> normalized = response;
+    const std::vector<char> expected_response(
+        kDefaultBuffering206RangeResponseNormalized,
+        kDefaultBuffering206RangeResponseNormalized +
+            sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u);
+    if (!normalize_date(normalized) || normalized != expected_response ||
+        header_end(normalized) + 5u != normalized.size()) {
+        return fail_observation(
+            "#253 206 range completion exact normalized 168-byte response mismatch");
+    }
+    const std::string response_text(normalized.begin(), normalized.end());
+    if (count_text(response_text, "HTTP/1.1 206 Partial Content\r\n") != 1u ||
+        count_text(response_text, "Content-Range: bytes 0-4/12\r\n") != 1u ||
+        count_text(response_text, "Content-Length: 5\r\n") != 1u ||
+        count_text(response_text, "Connection: keep-alive\r\n") != 1u ||
+        response_text.compare(header_end(normalized), 5u, "hello") != 0 ||
+        response_text.find("HTTP/1.1 200") != std::string::npos ||
+        response_text.find("HTTP/1.1 201") != std::string::npos ||
+        response_text.find("HTTP/1.1 202") != std::string::npos ||
+        response_text.find("HTTP/1.1 204") != std::string::npos ||
+        response_text.find("HTTP/1.1 304") != std::string::npos ||
+        response_text.find("502") != std::string::npos ||
+        response_text.find("504") != std::string::npos ||
+        response_text.find("Bad Gateway") != std::string::npos ||
+        response_text.find("Gateway Time-out") != std::string::npos) {
+        return fail_observation("#253 206 range completion response lost metadata or leaked bytes");
+    }
+
+    static constexpr char kExpectedAccess[] = "78\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access;
+        if (!read_request_length_access_file(temp.nginx_access_log, access, error)) return false;
+        if (access == kExpectedAccess) break;
+        if ((!access.empty() && access != kExpectedAccess) || !frontend_live() || !origin_live() ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#253 206 range completion live access was not exact `78\\n`";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        std::string access;
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != kExpectedAccess) {
+            if (error.empty()) error = "#253 206 range completion no-retry gate failed";
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    const u64 keepalive_horizon_ns = request_send_ns + 1'250'000'000ull;
+    for (;;) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, detail)) {
+            return fail_observation(
+                "#253 206 range completion downstream changed before request+1.25s: " + detail);
+        }
+        const u64 post_probe_ns = steady_now_ns();
+        std::string access;
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != kExpectedAccess) {
+            if (error.empty())
+                error = "#253 206 range completion keep-alive/no-retry custody failed";
+            return false;
+        }
+        if (post_probe_ns >= keepalive_horizon_ns) break;
+    }
+    std::string final_quiet_detail;
+    if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, final_quiet_detail)) {
+        return fail_observation("#253 206 range completion final keep-alive probe failed: " +
+                                final_quiet_detail);
+    }
+
+    close(client.fd);
+    client.fd = -1;
+    std::string post_client_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, post_client_access, error) ||
+        post_client_access != kExpectedAccess) {
+        if (error.empty()) error = "#253 206 range completion access changed after client close";
+        return false;
+    }
+
+    const bool origin_live_before_stop = origin_live();
+    origin.stop();
+    const std::string expected_upstream_text =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\nRange: bytes=0-4\r\n\r\n";
+    const std::vector<char> expected_upstream(expected_upstream_text.begin(),
+                                              expected_upstream_text.end());
+    const std::string observed_upstream(origin.request.begin(), origin.request.end());
+    if (!origin_live_before_stop || expected_upstream.size() != 78u ||
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.history[0] != expected_upstream || origin.request != expected_upstream ||
+        observed_upstream.find("Host: client.example") != std::string::npos ||
+        observed_upstream.find("\r\nConnection:") != std::string::npos ||
+        count_text(observed_upstream, "Range: bytes=0-4\r\n") != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire)) {
+        error = "#253 206 range completion exact upstream/origin lifecycle evidence mismatch";
+        dump_wire("#253 206 range completion expected upstream", expected_upstream);
+        dump_wire("#253 206 range completion observed upstream", origin.request);
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    std::string final_access;
+    if (!nginx_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 ||
+        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
+        final_access != kExpectedAccess) {
+        if (error.empty()) error = "#253 206 range completion final cleanup/access failed";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #253 pinned 206 range request-to-first/full/peer-close seconds="
+              << static_cast<double>(first_downstream_ns - request_send_ns) / 1e9 << "/"
+              << static_cast<double>(full_downstream_ns - request_send_ns) / 1e9 << "/"
+              << static_cast<double>(peer_close_ns - request_send_ns) / 1e9 << "\n";
+    return true;
+}
+
 static bool run_converter_default_buffering_304_content_length_metadata_differential(
     const char* rut_path, const std::string& container_name, std::string& error) {
     static constexpr char kDiagnostic[] = "#529 paired 304 metadata";
@@ -62897,6 +63269,9 @@ int main(int argc, char** argv) {
     const bool pinned_nginx_default_buffering_304_content_length_metadata_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-default-buffering-304-content-length-metadata-oracle") == 0;
+    const bool pinned_nginx_default_buffering_206_range_completion_oracle =
+        argc == 2 &&
+        strcmp(argv[1], "--pinned-nginx-default-buffering-206-range-completion-oracle") == 0;
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
@@ -63114,11 +63489,11 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
-         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
-         !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_split_header_oracle && !rut_initial_header_split_public &&
-         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
-         !converter_request_length_differential &&
+         !pinned_nginx_default_buffering_206_range_completion_oracle && !wildcard_listen_oracle &&
+         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
+         !request_length_oracle && !request_length_split_header_oracle &&
+         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
+         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -63344,6 +63719,8 @@ int main(int argc, char** argv) {
                "--pinned-nginx-default-buffering-202-incomplete-body-inactivity-expiry-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-304-content-length-metadata-oracle\n"
+               "   or: test_nginx_differential "
+               "--pinned-nginx-default-buffering-206-range-completion-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
                "   or: test_nginx_differential "
@@ -64815,6 +65192,37 @@ int main(int argc, char** argv) {
                "io_uring CLI. Application-publication timestamps are not TCP/read/CQE boundaries. "
                "This claims no other status/framing/conditional schedule, buffering/timeout "
                "behavior, retry/reuse/pipeline, TLS/H2/epoll, or broad #253/#271 support.\n";
+        return 0;
+    }
+    if (pinned_nginx_default_buffering_206_range_completion_oracle) {
+        const std::string container_name = "rut-nginx-253-206-range-oracle-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string oracle_error;
+        if (!run_pinned_nginx_default_buffering_206_range_completion_oracle(
+                temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#253 pinned nginx default-buffering 206 range completion "
+                         "oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#253 206 range nginx config");
+            dump_log(temp.nginx_access_log, "#253 206 range nginx access log");
+            dump_log(temp.nginx_log, "#253 206 range nginx process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #253 pinned nginx 1.29.7 nginx-only oracle proves one exact 78-byte "
+               "single Range GET through a root no-URI proxy with explicit proxy_read_timeout "
+               "1s and omitted buffering/request-buffering/http-version/header overrides. The "
+               "application-open origin makes one exact 144-byte publication containing a "
+               "coherent 206 Partial Content, Content-Range bytes 0-4/12, Content-Length 5 and "
+               "the complete body hello. nginx promptly emits the exact Date-normalized 168-byte "
+               "206/Content-Range/CL5/body keep-alive response and actively retires the origin, "
+               "while downstream remains open and byte-quiet past request+1.25s until the client "
+               "closes. One exact authority-rewritten 78-byte upstream request preserving Range, "
+               "one publication, exact `78\\n` access and no retry are proven. The application-"
+               "publication timestamp is not a TCP/read boundary. This pins nginx semantics "
+               "only; it makes no generated-RUT, converter-equivalence, runtime-capability, "
+               "incomplete/other Range, retry/reuse/pipeline, TLS/H2/epoll, or broad #253 claim.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_304_content_length_metadata_oracle) {
