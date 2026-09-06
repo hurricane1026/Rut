@@ -71,6 +71,12 @@ enum class ResponseReadDeadlinePostCommitPhase : u8 {
     OriginComplete,
 };
 
+enum class CompleteContentLengthResponseClass : u8 {
+    Unsupported,
+    BoundedPositiveBody,
+    CoherentSingleRange206,
+};
+
 enum class ResponseReadDeadlineSendKind : u8 {
     None,
     Header,
@@ -650,6 +656,10 @@ struct ConnectionBase {
     u32 response_read_deadline_post_commit_episode;
     u32 response_read_deadline_post_commit_raw_header_end;
     u32 response_read_deadline_post_commit_declared_body;
+    CompleteContentLengthResponseClass response_read_deadline_post_commit_response_class;
+    u64 response_read_deadline_post_commit_range_first;
+    u64 response_read_deadline_post_commit_range_last;
+    u64 response_read_deadline_post_commit_range_total;
     u32 response_read_deadline_post_commit_origin_received;
     u32 response_read_deadline_post_commit_downstream_submitted;
     u32 response_read_deadline_post_commit_downstream_completed;
@@ -831,6 +841,11 @@ struct ConnectionBase {
         visit(c.response_read_deadline_post_commit_episode, u32{0});
         visit(c.response_read_deadline_post_commit_raw_header_end, u32{0});
         visit(c.response_read_deadline_post_commit_declared_body, u32{0});
+        visit(c.response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        visit(c.response_read_deadline_post_commit_range_first, u64{0});
+        visit(c.response_read_deadline_post_commit_range_last, u64{0});
+        visit(c.response_read_deadline_post_commit_range_total, u64{0});
         visit(c.response_read_deadline_post_commit_origin_received, u32{0});
         visit(c.response_read_deadline_post_commit_downstream_submitted, u32{0});
         visit(c.response_read_deadline_post_commit_downstream_completed, u32{0});
@@ -891,6 +906,11 @@ struct ConnectionBase {
         check(response_read_deadline_post_commit_episode, u32{0});
         check(response_read_deadline_post_commit_raw_header_end, u32{0});
         check(response_read_deadline_post_commit_declared_body, u32{0});
+        check(response_read_deadline_post_commit_response_class,
+              CompleteContentLengthResponseClass::Unsupported);
+        check(response_read_deadline_post_commit_range_first, u64{0});
+        check(response_read_deadline_post_commit_range_last, u64{0});
+        check(response_read_deadline_post_commit_range_total, u64{0});
         check(response_read_deadline_post_commit_origin_received, u32{0});
         check(response_read_deadline_post_commit_downstream_submitted, u32{0});
         check(response_read_deadline_post_commit_downstream_completed, u32{0});

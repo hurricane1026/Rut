@@ -10352,11 +10352,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             strict_response_upload_ready(conn);
         const u32 raw_header_end = resp_parser.header_end;
         const u32 raw_total = conn.upstream_recv_buf.len();
+        const CompleteContentLengthResponseClassification complete_content_length_classification =
+            classify_complete_content_length_response(resp);
         const bool strict_cl0 = strict_common && !fixed_upload_head && resp.status_code == 200 &&
                                 resp.content_length == 0 && raw_header_end == raw_total;
         const bool strict_positive_complete_buffering =
             strict_common &&
-            complete_content_length_response_status_is_admitted(resp.status_code) &&
+            complete_content_length_classification.response_class !=
+                CompleteContentLengthResponseClass::Unsupported &&
             explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
             (fixed_upload
                  ? complete_content_length_fixed_upload_materialization_is_stable(
