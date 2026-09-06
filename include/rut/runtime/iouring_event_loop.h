@@ -179,6 +179,12 @@ public:
     bool response_read_deadline_expiry_pending;
     bool response_read_deadline_body_pump_pending;
 
+    enum class CompleteContentLengthTerminalDisposition : u8 {
+        CompleteBody,
+        CleanUpstreamEof,
+        InactivityExpiry,
+    };
+
     struct ResponseReadBatchOwner {
         u32 conn_id = 0;
         u32 deadline_generation = 0;
@@ -3390,9 +3396,70 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool start_complete_content_length_send(Connection& c,
-                                                          u32 body_to_send,
-                                                          bool close_after_drain) {
+    [[nodiscard]] bool complete_content_length_clean_eof_owner_is_valid(
+        const Connection& c, const ResponseReadBatchOwner& owner) const {
+        bool current_batch_member = false;
+        if (response_read_batch_events != nullptr && response_read_batch_event_count != 0 &&
+            response_read_batch_event_count <= kMaxEventsPerWait &&
+            response_read_batch_owner_count != 0 &&
+            response_read_batch_owner_count <= kMaxEventsPerWait) {
+            for (u32 i = 0; i < response_read_batch_owner_count; ++i)
+                current_batch_member =
+                    current_batch_member || &response_read_batch_owners[i] == &owner;
+        }
+        if (!current_batch_member || !owner.valid || owner.conn_id != c.id ||
+            owner.deadline_generation == 0 ||
+            owner.deadline_generation != c.response_read_deadline_generation ||
+            owner.upstream_episode != c.upstream_episode ||
+            owner.profile != c.response_read_deadline_profile ||
+            owner.method != c.response_read_deadline_method || !owner.saw_relevant ||
+            !owner.saw_terminal || !owner.terminal_fault || !owner.clean_eof ||
+            owner.terminal_error)
+            return false;
+
+        const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (header == 0 || header > 0xFFFFFFFFu - received ||
+            header + received != c.upstream_recv_buf.len())
+            return false;
+        CompleteContentLengthResponseClassification raw_classification{};
+        if (!complete_content_length_raw_origin_matches_pinned(
+                c, header, c.response_read_deadline_post_commit_declared_body, &raw_classification))
+            return false;
+        const CompleteContentLengthResponseClassification saved{
+            c.response_read_deadline_post_commit_response_class,
+            c.response_read_deadline_post_commit_range_first,
+            c.response_read_deadline_post_commit_range_last,
+            c.response_read_deadline_post_commit_range_total};
+        if (!complete_content_length_response_classification_equal(raw_classification, saved))
+            return false;
+        // prepare_response_read_deadline_batch authenticated any retained
+        // pre-batch header prefix before begin_complete_content_length_buffering
+        // consumed that progress identity. The genuine active owner therefore
+        // needs to prove only one contiguous current suffix ending at the exact
+        // parsed header plus selected body extent.
+        if (!owner.post_commit_at_start)
+            return owner.saw_positive && owner.first_copy_begin <= header &&
+                   owner.first_copy_begin <= 0xFFFFFFFFu - owner.positive_bytes &&
+                   owner.first_copy_begin + owner.positive_bytes == header + received &&
+                   owner.expected_copy_end == header + received;
+
+        if (c.response_read_deadline_progress_generation != owner.deadline_generation ||
+            c.response_read_deadline_progress_episode != owner.upstream_episode ||
+            c.response_read_deadline_progress_bytes != received)
+            return false;
+        if (!owner.saw_positive)
+            return owner.positive_bytes == 0 && owner.first_copy_begin == 0 &&
+                   owner.expected_copy_end == 0;
+        return owner.positive_bytes <= received &&
+               owner.first_copy_begin == header + received - owner.positive_bytes &&
+               owner.expected_copy_end == header + received;
+    }
+
+    [[nodiscard]] bool start_complete_content_length_send(
+        Connection& c,
+        CompleteContentLengthTerminalDisposition disposition,
+        const ResponseReadBatchOwner* clean_eof_owner = nullptr) {
         if (c.response_read_deadline_buffering !=
                 ForwardResponseBufferingMode::CompleteContentLength ||
             c.response_read_deadline_post_commit_phase !=
@@ -3401,13 +3468,41 @@ public:
              c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete &&
              c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending &&
              c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending) ||
-            !response_read_deadline_post_commit_is_stable(c) ||
-            body_to_send > c.response_read_deadline_post_commit_origin_received ||
-            (c.response_read_deadline_post_commit_response_class ==
+            !response_read_deadline_post_commit_is_stable(c))
+            return false;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 declared = c.response_read_deadline_post_commit_declared_body;
+        u32 body_to_send = 0;
+        bool close_after_drain = true;
+        switch (disposition) {
+            case CompleteContentLengthTerminalDisposition::CompleteBody:
+                if (clean_eof_owner != nullptr || received != declared) return false;
+                body_to_send = declared;
+                close_after_drain = c.response_read_deadline_upload.downstream_close;
+                break;
+            case CompleteContentLengthTerminalDisposition::CleanUpstreamEof:
+                if (clean_eof_owner == nullptr || received >= declared ||
+                    (received == 0 &&
+                     c.response_read_deadline_post_commit_response_class ==
+                         CompleteContentLengthResponseClass::CoherentSingleRange206) ||
+                    !complete_content_length_clean_eof_owner_is_valid(c, *clean_eof_owner))
+                    return false;
+                body_to_send = received;
+                break;
+            case CompleteContentLengthTerminalDisposition::InactivityExpiry:
+                if (clean_eof_owner != nullptr || received >= declared ||
+                    c.response_read_deadline_post_commit_response_class ==
+                        CompleteContentLengthResponseClass::CoherentSingleRange206)
+                    return false;
+                break;
+            default:
+                return false;
+        }
+        if (body_to_send > c.response_read_deadline_post_commit_origin_received ||
+            (disposition == CompleteContentLengthTerminalDisposition::CleanUpstreamEof &&
+             c.response_read_deadline_post_commit_response_class ==
                  CompleteContentLengthResponseClass::CoherentSingleRange206 &&
-             (body_to_send != c.response_read_deadline_post_commit_declared_body ||
-              c.response_read_deadline_post_commit_origin_received !=
-                  c.response_read_deadline_post_commit_declared_body)) ||
+             !bodyless_get_complete_content_length_precise_buffering_is_stable(c)) ||
             (!close_after_drain &&
              (body_to_send != c.response_read_deadline_post_commit_declared_body ||
               body_to_send != c.response_read_deadline_post_commit_origin_received)))
@@ -3435,6 +3530,9 @@ public:
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
         }
+        // BodyComplete is the settled terminal state. The typed disposition,
+        // selected length, and close-after-drain bit distinguish a complete
+        // body from an authenticated clean-EOF prefix during asynchronous Send.
         c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
         c.response_read_deadline_post_commit_send_body = body_to_send;
         c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
@@ -3548,13 +3646,15 @@ public:
             return false;
         }
 
-        if (received == declared || owner.clean_eof) {
+        if (received == declared) {
             c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
             return start_complete_content_length_send(
-                c,
-                received,
-                /*close_after_drain=*/
-                received != declared || c.response_read_deadline_upload.downstream_close);
+                c, CompleteContentLengthTerminalDisposition::CompleteBody);
+        }
+        if (owner.clean_eof) {
+            c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+            return start_complete_content_length_send(
+                c, CompleteContentLengthTerminalDisposition::CleanUpstreamEof, &owner);
         }
         if (owner.terminal_fault) return false;
         if (owner.saw_terminal && !c.upstream_recv_armed) {
@@ -3734,9 +3834,9 @@ public:
                         (!complete && !owner.clean_eof) ||
                         !start_complete_content_length_send(
                             c,
-                            complete ? declared : received,
-                            /*close_after_drain=*/
-                            !complete || c.response_read_deadline_upload.downstream_close))
+                            complete ? CompleteContentLengthTerminalDisposition::CompleteBody
+                                     : CompleteContentLengthTerminalDisposition::CleanUpstreamEof,
+                            complete ? nullptr : &owner))
                         close_conn(c);
                 }
             } else if (key_stable && owner.body_complete_at_start &&
@@ -3773,19 +3873,14 @@ public:
                 if (c.response_read_deadline_post_commit_origin_received == declared) {
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (!start_complete_content_length_send(
-                            c,
-                            declared,
-                            /*close_after_drain=*/
-                            c.response_read_deadline_upload.downstream_close))
+                            c, CompleteContentLengthTerminalDisposition::CompleteBody))
                         close_conn(c);
                     continue;
                 }
                 if (owner.clean_eof) {
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (!start_complete_content_length_send(
-                            c,
-                            c.response_read_deadline_post_commit_origin_received,
-                            /*close_after_drain=*/true))
+                            c, CompleteContentLengthTerminalDisposition::CleanUpstreamEof, &owner))
                         close_conn(c);
                     continue;
                 }
@@ -3902,7 +3997,7 @@ public:
                 c.response_read_deadline_buffering ==
                     ForwardResponseBufferingMode::CompleteContentLength) {
                 if (!start_complete_content_length_send(
-                        c, /*body_to_send=*/0, /*close_after_drain=*/true))
+                        c, CompleteContentLengthTerminalDisposition::InactivityExpiry))
                     close_conn(c);
                 continue;
             }
