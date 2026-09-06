@@ -2222,6 +2222,21 @@ enum class GatedFragmentPeerProbeResult : unsigned char {
     Error,
 };
 
+enum class GatedResponseWriteEofResult : unsigned char {
+    None,
+    WriteShutdownSucceeded,
+    AbortedPeerNotOpen,
+    ShutdownError,
+    StoppedBeforeAuthorization,
+};
+
+enum class GatedResponseWriteEofPeerTerminal : unsigned char {
+    None,
+    Fin,
+    Reset,
+    Error,
+};
+
 struct Recorder {
     int listen_fd = -1;
     u16 port = 0;
@@ -2293,6 +2308,25 @@ struct Recorder {
     std::atomic<u64> gated_fragment_probe_ns{0};
     std::atomic<GatedFragmentPeerProbeResult> gated_fragment_probe_result{
         GatedFragmentPeerProbeResult::None};
+    // Default-off generic fixture mode: after one permit-gated response prefix,
+    // the worker publishes terminal ordinal-2 peer-open evidence, waits for the
+    // existing close permit, re-probes, and performs exactly one SHUT_WR. The
+    // read half remains live so FIN and reset are independently observable.
+    bool gate_response_write_eof_after_prefix = false;
+    std::atomic<GatedFragmentPeerProbeResult> response_write_eof_reprobe_result{
+        GatedFragmentPeerProbeResult::None};
+    std::atomic<u64> response_write_eof_reprobe_ns{0};
+    std::atomic<u32> response_write_eof_shutdown_calls{0};
+    std::atomic<u64> response_write_eof_shutdown_begin_ns{0};
+    std::atomic<u64> response_write_eof_shutdown_end_ns{0};
+    std::atomic<int> response_write_eof_shutdown_errno{0};
+    // The worker stores every action payload above before release-publishing
+    // this result. Readers acquire the result before consuming that payload.
+    std::atomic<GatedResponseWriteEofResult> response_write_eof_result{
+        GatedResponseWriteEofResult::None};
+    std::atomic<u64> response_write_eof_peer_terminal_ns{0};
+    std::atomic<GatedResponseWriteEofPeerTerminal> response_write_eof_peer_terminal{
+        GatedResponseWriteEofPeerTerminal::None};
     // Separate default-off mode for the incomplete clean-EOF baseline. The
     // origin sends its configured prefix, stays application-open behind this
     // gate, and only the test may authorize the clean close.
@@ -2405,11 +2439,14 @@ struct Recorder {
                                    (has_exact_single_content_length_12(wire, request_header_end) &&
                                     wire.size() == request_header_end + 12));
             bool response_sent = false;
+            bool write_eof_this_response = false;
             if (complete) {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 const bool incomplete_progress_this_response =
                     self->permit_gated_incomplete_first_response && self->history.size() == 1u;
+                write_eof_this_response =
+                    incomplete_progress_this_response && self->gate_response_write_eof_after_prefix;
                 if (incomplete_progress_this_response) {
                     const u64 completed_ns =
                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2425,7 +2462,8 @@ struct Recorder {
                 const bool wait_complete_response_peer_close =
                     self->wait_response_peer_close ||
                     (self->zero_response_stall_first_only && self->history.size() == 2u) ||
-                    (self->permit_gated_incomplete_first_response && self->history.size() <= 2u);
+                    (self->permit_gated_incomplete_first_response &&
+                     !self->gate_response_write_eof_after_prefix && self->history.size() <= 2u);
                 if (stall_this_response) {
                     const u64 started_ns =
                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2569,9 +2607,185 @@ struct Recorder {
                     response_sent =
                         send_all(client, self->response_bytes, self->response_bytes_len);
                 }
-                if (response_sent)
+                if (write_eof_this_response) {
+                    if (!response_sent) {
+                        self->response_send_failed.store(true, std::memory_order_release);
+                    } else {
+                        while (self->running.load(std::memory_order_acquire) &&
+                               self->gated_fragment_probe_ack.load(std::memory_order_acquire) !=
+                                   2u) {
+                            const u32 requested =
+                                self->gated_fragment_probe_request.load(std::memory_order_acquire);
+                            if (requested == 2u) {
+                                const GatedFragmentPeerProbeResult result =
+                                    probe_gated_fragment_peer(client);
+                                const u64 probe_ns = static_cast<u64>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+                                self->gated_fragment_probe_result.store(result,
+                                                                        std::memory_order_relaxed);
+                                self->gated_fragment_probe_ns.store(probe_ns,
+                                                                    std::memory_order_relaxed);
+                                self->gated_fragment_probe_ack.store(2u, std::memory_order_release);
+                                break;
+                            }
+                            usleep(1000);
+                        }
+
+                        if (!self->running.load(std::memory_order_acquire)) {
+                            self->response_write_eof_result.store(
+                                GatedResponseWriteEofResult::StoppedBeforeAuthorization,
+                                std::memory_order_release);
+                        } else {
+                            const GatedFragmentPeerProbeResult acknowledged =
+                                self->gated_fragment_probe_result.load(std::memory_order_relaxed);
+                            if (acknowledged != GatedFragmentPeerProbeResult::Open) {
+                                self->response_send_failed.store(true, std::memory_order_release);
+                                self->response_write_eof_result.store(
+                                    GatedResponseWriteEofResult::AbortedPeerNotOpen,
+                                    std::memory_order_release);
+                            } else {
+                                while (self->running.load(std::memory_order_acquire) &&
+                                       !self->response_close_permit.load(std::memory_order_acquire))
+                                    usleep(1000);
+                                if (!self->running.load(std::memory_order_acquire)) {
+                                    self->response_write_eof_result.store(
+                                        GatedResponseWriteEofResult::StoppedBeforeAuthorization,
+                                        std::memory_order_release);
+                                } else {
+                                    const GatedFragmentPeerProbeResult reprobe =
+                                        probe_gated_fragment_peer(client);
+                                    const u64 reprobe_ns = static_cast<u64>(
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+                                    self->response_write_eof_reprobe_result.store(
+                                        reprobe, std::memory_order_relaxed);
+                                    self->response_write_eof_reprobe_ns.store(
+                                        reprobe_ns, std::memory_order_relaxed);
+                                    if (reprobe != GatedFragmentPeerProbeResult::Open) {
+                                        self->response_send_failed.store(true,
+                                                                         std::memory_order_release);
+                                        self->response_write_eof_result.store(
+                                            GatedResponseWriteEofResult::AbortedPeerNotOpen,
+                                            std::memory_order_release);
+                                    } else {
+                                        const u64 begin_ns = static_cast<u64>(
+                                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+                                        self->response_write_eof_shutdown_begin_ns.store(
+                                            begin_ns, std::memory_order_relaxed);
+                                        errno = 0;
+                                        const int shutdown_result = shutdown(client, SHUT_WR);
+                                        const int shutdown_error = shutdown_result == 0 ? 0 : errno;
+                                        const u64 end_ns = static_cast<u64>(
+                                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+                                        self->response_write_eof_shutdown_end_ns.store(
+                                            end_ns, std::memory_order_relaxed);
+                                        self->response_write_eof_shutdown_errno.store(
+                                            shutdown_error, std::memory_order_relaxed);
+                                        self->response_write_eof_shutdown_calls.store(
+                                            1u, std::memory_order_relaxed);
+                                        const GatedResponseWriteEofResult action =
+                                            shutdown_result == 0
+                                                ? GatedResponseWriteEofResult::
+                                                      WriteShutdownSucceeded
+                                                : GatedResponseWriteEofResult::ShutdownError;
+                                        if (shutdown_result != 0)
+                                            self->response_send_failed.store(
+                                                true, std::memory_order_release);
+                                        self->response_write_eof_result.store(
+                                            action, std::memory_order_release);
+
+                                        if (shutdown_result == 0) {
+                                            while (self->running.load(std::memory_order_acquire)) {
+                                                pollfd peer_poll{
+                                                    client, POLLIN | POLLHUP | POLLERR, 0};
+                                                const int peer_ready = poll(&peer_poll, 1, 50);
+                                                if (peer_ready < 0) {
+                                                    if (errno == EINTR) continue;
+                                                    self->response_peer_observation_failed.store(
+                                                        true, std::memory_order_relaxed);
+                                                    const u64 terminal_ns = static_cast<u64>(
+                                                        std::chrono::duration_cast<
+                                                            std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now()
+                                                                .time_since_epoch())
+                                                            .count());
+                                                    self->response_write_eof_peer_terminal_ns.store(
+                                                        terminal_ns, std::memory_order_relaxed);
+                                                    self->response_write_eof_peer_terminal.store(
+                                                        GatedResponseWriteEofPeerTerminal::Error,
+                                                        std::memory_order_release);
+                                                    break;
+                                                }
+                                                if (peer_ready == 0) continue;
+                                                GatedResponseWriteEofPeerTerminal terminal =
+                                                    GatedResponseWriteEofPeerTerminal::None;
+                                                char unexpected[64];
+                                                const ssize_t n =
+                                                    recv(client, unexpected, sizeof(unexpected), 0);
+                                                if (n == 0) {
+                                                    terminal =
+                                                        GatedResponseWriteEofPeerTerminal::Fin;
+                                                } else if (n < 0 && errno == ECONNRESET) {
+                                                    terminal =
+                                                        GatedResponseWriteEofPeerTerminal::Reset;
+                                                } else if (n > 0) {
+                                                    self->response_peer_unexpected_data.store(
+                                                        true, std::memory_order_relaxed);
+                                                    terminal =
+                                                        GatedResponseWriteEofPeerTerminal::Error;
+                                                } else if (n < 0 &&
+                                                           (errno == EINTR || errno == EAGAIN ||
+                                                            errno == EWOULDBLOCK)) {
+                                                    // POLLHUP alone is not EOF; only recv()==0 is
+                                                    // classified as FIN.
+                                                    continue;
+                                                } else {
+                                                    self->response_peer_observation_failed.store(
+                                                        true, std::memory_order_relaxed);
+                                                    terminal =
+                                                        GatedResponseWriteEofPeerTerminal::Error;
+                                                }
+                                                const u64 terminal_ns = static_cast<u64>(
+                                                    std::chrono::duration_cast<
+                                                        std::chrono::nanoseconds>(
+                                                        std::chrono::steady_clock::now()
+                                                            .time_since_epoch())
+                                                        .count());
+                                                if (terminal ==
+                                                        GatedResponseWriteEofPeerTerminal::Fin ||
+                                                    terminal ==
+                                                        GatedResponseWriteEofPeerTerminal::Reset) {
+                                                    self->response_peer_closed_ns.store(
+                                                        terminal_ns, std::memory_order_relaxed);
+                                                    self->response_peer_closed.store(
+                                                        true, std::memory_order_release);
+                                                    self->response_peer_close_count.fetch_add(
+                                                        1u, std::memory_order_release);
+                                                }
+                                                self->response_write_eof_peer_terminal_ns.store(
+                                                    terminal_ns, std::memory_order_relaxed);
+                                                self->response_write_eof_peer_terminal.store(
+                                                    terminal, std::memory_order_release);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (response_sent && !write_eof_this_response)
                     self->response_send_succeeded.store(true, std::memory_order_release);
-                if (wait_complete_response_peer_close || self->gate_incomplete_response_close) {
+                if (!write_eof_this_response &&
+                    (wait_complete_response_peer_close || self->gate_incomplete_response_close)) {
                     if (!response_sent) {
                         self->response_send_failed.store(true, std::memory_order_release);
                     } else {
@@ -2664,7 +2878,14 @@ struct Recorder {
                     }
                 }
             }
-            const bool clean_shutdown = shutdown(client, SHUT_RDWR) == 0;
+            const bool write_eof_cleanly_completed =
+                write_eof_this_response &&
+                self->response_write_eof_result.load(std::memory_order_acquire) ==
+                    GatedResponseWriteEofResult::WriteShutdownSucceeded &&
+                self->response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                    GatedResponseWriteEofPeerTerminal::Fin;
+            const bool clean_shutdown =
+                write_eof_cleanly_completed || shutdown(client, SHUT_RDWR) == 0;
             const bool connection_closed = close(client) == 0;
             if (response_sent) {
                 self->response_clean_shutdown.store(clean_shutdown, std::memory_order_release);
@@ -2688,6 +2909,11 @@ struct Recorder {
         if ((response_override == nullptr) != (response_override_len == 0)) return false;
         if ((permit_gated_complete_response && gate_incomplete_response_close) ||
             (wait_response_peer_close && gate_incomplete_response_close) ||
+            (gate_response_write_eof_after_prefix &&
+             (!permit_gated_incomplete_first_response || !probe_before_gated_fragment ||
+              incomplete_first_response_fragment_count != 1u || gate_incomplete_response_close ||
+              wait_response_peer_close || permit_gated_complete_response || zero_response_stall ||
+              zero_response_stall_first_only)) ||
             (zero_response_stall && zero_response_stall_first_only) ||
             (zero_response_stall && response_override != nullptr) ||
             ((zero_response_stall || zero_response_stall_first_only) &&
@@ -2700,7 +2926,8 @@ struct Recorder {
              (incomplete_first_response_fragment_count == 0u ||
               incomplete_first_response_fragment_count > 4u)) ||
             (probe_before_gated_fragment && (!permit_gated_incomplete_first_response ||
-                                             incomplete_first_response_fragment_count < 2u)))
+                                             (incomplete_first_response_fragment_count < 2u &&
+                                              !gate_response_write_eof_after_prefix))))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -2760,6 +2987,18 @@ struct Recorder {
             gated_fragment_probe_ns.store(0u, std::memory_order_relaxed);
             gated_fragment_probe_result.store(GatedFragmentPeerProbeResult::None,
                                               std::memory_order_relaxed);
+            response_write_eof_reprobe_result.store(GatedFragmentPeerProbeResult::None,
+                                                    std::memory_order_relaxed);
+            response_write_eof_reprobe_ns.store(0u, std::memory_order_relaxed);
+            response_write_eof_shutdown_calls.store(0u, std::memory_order_relaxed);
+            response_write_eof_shutdown_begin_ns.store(0u, std::memory_order_relaxed);
+            response_write_eof_shutdown_end_ns.store(0u, std::memory_order_relaxed);
+            response_write_eof_shutdown_errno.store(0, std::memory_order_relaxed);
+            response_write_eof_result.store(GatedResponseWriteEofResult::None,
+                                            std::memory_order_relaxed);
+            response_write_eof_peer_terminal_ns.store(0u, std::memory_order_relaxed);
+            response_write_eof_peer_terminal.store(GatedResponseWriteEofPeerTerminal::None,
+                                                   std::memory_order_relaxed);
             response_close_permit.store(false, std::memory_order_relaxed);
             response_closed_by_gate.store(false, std::memory_order_relaxed);
             response_close_failed.store(false, std::memory_order_relaxed);
@@ -2824,6 +3063,71 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
     if (incompatible_count.setup()) {
         incompatible_count.stop();
         error = "gated-fragment peer probe accepted a one-fragment response";
+        return false;
+    }
+
+    Recorder incompatible_write_eof_mode;
+    incompatible_write_eof_mode.gate_response_write_eof_after_prefix = true;
+    if (incompatible_write_eof_mode.setup()) {
+        incompatible_write_eof_mode.stop();
+        error = "gated response write EOF accepted a non-gated response mode";
+        return false;
+    }
+
+    const auto configure_write_eof = [&](Recorder& recorder) {
+        recorder.permit_gated_incomplete_first_response = true;
+        recorder.probe_before_gated_fragment = true;
+        recorder.gate_response_write_eof_after_prefix = true;
+        recorder.incomplete_first_response_fragment_count = 1u;
+        recorder.response_fragment_bytes[0] = kFirst;
+        recorder.response_fragment_lengths[0] = sizeof(kFirst) - 1u;
+        recorder.observe_extra_requests_until_stop = true;
+    };
+    const auto write_eof_evidence_is_neutral = [](const Recorder& recorder) {
+        return recorder.response_write_eof_reprobe_result.load(std::memory_order_acquire) ==
+                   GatedFragmentPeerProbeResult::None &&
+               recorder.response_write_eof_reprobe_ns.load(std::memory_order_acquire) == 0u &&
+               recorder.response_write_eof_shutdown_calls.load(std::memory_order_acquire) == 0u &&
+               recorder.response_write_eof_shutdown_begin_ns.load(std::memory_order_acquire) ==
+                   0u &&
+               recorder.response_write_eof_shutdown_end_ns.load(std::memory_order_acquire) == 0u &&
+               recorder.response_write_eof_shutdown_errno.load(std::memory_order_acquire) == 0 &&
+               recorder.response_write_eof_result.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofResult::None &&
+               recorder.response_write_eof_peer_terminal_ns.load(std::memory_order_acquire) == 0u &&
+               recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofPeerTerminal::None;
+    };
+    Recorder incompatible_write_eof_count;
+    configure_write_eof(incompatible_write_eof_count);
+    incompatible_write_eof_count.incomplete_first_response_fragment_count = 2u;
+    if (incompatible_write_eof_count.setup()) {
+        incompatible_write_eof_count.stop();
+        error = "gated response write EOF accepted a fragmented response";
+        return false;
+    }
+    Recorder incompatible_write_eof_full_close;
+    configure_write_eof(incompatible_write_eof_full_close);
+    incompatible_write_eof_full_close.gate_incomplete_response_close = true;
+    if (incompatible_write_eof_full_close.setup()) {
+        incompatible_write_eof_full_close.stop();
+        error = "gated response write EOF accepted the full-close mode";
+        return false;
+    }
+    Recorder incompatible_write_eof_peer_wait;
+    configure_write_eof(incompatible_write_eof_peer_wait);
+    incompatible_write_eof_peer_wait.wait_response_peer_close = true;
+    if (incompatible_write_eof_peer_wait.setup()) {
+        incompatible_write_eof_peer_wait.stop();
+        error = "gated response write EOF accepted the peer-wait mode";
+        return false;
+    }
+    Recorder incompatible_write_eof_stall;
+    configure_write_eof(incompatible_write_eof_stall);
+    incompatible_write_eof_stall.zero_response_stall = true;
+    if (incompatible_write_eof_stall.setup()) {
+        incompatible_write_eof_stall.stop();
+        error = "gated response write EOF accepted the stall mode";
         return false;
     }
 
@@ -2961,7 +3265,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
             recorder.gated_fragment_probe_ns.load(std::memory_order_acquire) != 0u ||
             recorder.gated_fragment_probe_result.load(std::memory_order_acquire) !=
-                GatedFragmentPeerProbeResult::None) {
+                GatedFragmentPeerProbeResult::None ||
+            !write_eof_evidence_is_neutral(recorder)) {
             close(client);
             error = "gated-fragment peer probe did not begin from neutral state";
             return false;
@@ -3063,7 +3368,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                 recorder.gated_fragment_probe_request.load(std::memory_order_acquire) == 2u &&
                 recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
                 recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
-                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) == result;
+                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) == result &&
+                write_eof_evidence_is_neutral(recorder);
             close(client);
             recorder.stop();
             const std::vector<char> exact_request(kRequest, kRequest + sizeof(kRequest) - 1u);
@@ -3092,7 +3398,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
             recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
             recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) ==
-                GatedFragmentPeerProbeResult::Open;
+                GatedFragmentPeerProbeResult::Open &&
+            write_eof_evidence_is_neutral(recorder);
         (void)shutdown(client, SHUT_RDWR);
         close(client);
         const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -3160,7 +3467,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             usleep(1000);
         if (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
             recorder.gated_fragment_probe_request.load(std::memory_order_acquire) != 0u ||
-            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u) {
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
+            !write_eof_evidence_is_neutral(recorder)) {
             close(client);
             error = "gated-fragment ordinal-3 peer probe did not begin from neutral state";
             return false;
@@ -3304,7 +3612,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
                 recorder.gated_fragment_probe_request.load(std::memory_order_acquire) == 3u &&
                 recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 3u &&
                 recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
-                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) == result;
+                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) == result &&
+                write_eof_evidence_is_neutral(recorder);
             close(client);
             recorder.stop();
             const std::vector<char> exact_request(kRequest, kRequest + sizeof(kRequest) - 1u);
@@ -3333,7 +3642,8 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
             recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 3u &&
             recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
             recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) ==
-                GatedFragmentPeerProbeResult::Open;
+                GatedFragmentPeerProbeResult::Open &&
+            write_eof_evidence_is_neutral(recorder);
         (void)shutdown(client, SHUT_RDWR);
         close(client);
         const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -3354,10 +3664,358 @@ static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
         return true;
     };
 
+    enum class WriteEofSelfCheckCase {
+        PermitWithheldThenLive,
+        ClosedAtAck,
+        CloseAfterOpenAck,
+        LiveAuthorization,
+        StopBeforeAuthorization,
+    };
+    const auto run_write_eof_case = [&](WriteEofSelfCheckCase test_case) {
+        Recorder recorder;
+        configure_write_eof(recorder);
+        // setup() must clear every prior episode's result and payload while
+        // preserving this default-off mode selection.
+        recorder.response_write_eof_reprobe_result.store(GatedFragmentPeerProbeResult::Error,
+                                                         std::memory_order_relaxed);
+        recorder.response_write_eof_reprobe_ns.store(7u, std::memory_order_relaxed);
+        recorder.response_write_eof_shutdown_calls.store(7u, std::memory_order_relaxed);
+        recorder.response_write_eof_shutdown_begin_ns.store(7u, std::memory_order_relaxed);
+        recorder.response_write_eof_shutdown_end_ns.store(7u, std::memory_order_relaxed);
+        recorder.response_write_eof_shutdown_errno.store(EIO, std::memory_order_relaxed);
+        recorder.response_write_eof_result.store(GatedResponseWriteEofResult::ShutdownError,
+                                                 std::memory_order_relaxed);
+        recorder.response_write_eof_peer_terminal_ns.store(7u, std::memory_order_relaxed);
+        recorder.response_write_eof_peer_terminal.store(GatedResponseWriteEofPeerTerminal::Error,
+                                                        std::memory_order_relaxed);
+        recorder.response_close_permit.store(true, std::memory_order_relaxed);
+        if (!recorder.setup() || !write_eof_evidence_is_neutral(recorder) ||
+            recorder.response_close_permit.load(std::memory_order_acquire)) {
+            error = "gated response write EOF setup/reset failed";
+            return false;
+        }
+
+        const auto live = [&]() {
+            return recorder.running.load(std::memory_order_acquire) &&
+                   recorder.thread_alive.load(std::memory_order_acquire) &&
+                   !recorder.listener_failed.load(std::memory_order_acquire);
+        };
+        const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!live() && std::chrono::steady_clock::now() < live_deadline) usleep(1000);
+        if (!live()) {
+            error = "gated response write EOF recorder was not live";
+            return false;
+        }
+
+        int client = connect_once(recorder.port);
+        if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+            if (client >= 0) close(client);
+            error = "gated response write EOF client connect/send failed";
+            return false;
+        }
+        recorder.response_fragment_permit.store(1u, std::memory_order_release);
+        if (!receive_exact(client, kFirst, sizeof(kFirst) - 1u, "gated response write EOF W1")) {
+            close(client);
+            return false;
+        }
+        const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u &&
+               std::chrono::steady_clock::now() < first_deadline)
+            usleep(1000);
+        if (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            recorder.response_fragment_sent_ns[0].load(std::memory_order_relaxed) == 0u ||
+            recorder.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            recorder.gated_fragment_probe_request.load(std::memory_order_acquire) != 0u ||
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
+            !write_eof_evidence_is_neutral(recorder) ||
+            recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+            recorder.response_sent_open.load(std::memory_order_acquire)) {
+            close(client);
+            error = "gated response write EOF lost neutral post-prefix custody";
+            return false;
+        }
+
+        if (test_case == WriteEofSelfCheckCase::ClosedAtAck && shutdown(client, SHUT_WR) != 0) {
+            close(client);
+            error = "gated response write EOF Closed-at-ack control could not half-close";
+            return false;
+        }
+        const u64 requested_ns =
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+        recorder.gated_fragment_probe_request.store(2u, std::memory_order_release);
+        const auto probe_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u &&
+               std::chrono::steady_clock::now() < probe_deadline) {
+            if (!live() || recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+                close(client);
+                error = "gated response write EOF lost custody before Open acknowledgment";
+                return false;
+            }
+            usleep(1000);
+        }
+        const u32 ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 probe_ns = recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult probe_result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult expected_probe =
+            test_case == WriteEofSelfCheckCase::ClosedAtAck ? GatedFragmentPeerProbeResult::Closed
+                                                            : GatedFragmentPeerProbeResult::Open;
+        if (ack != 2u || probe_ns < requested_ns || probe_result != expected_probe ||
+            recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            recorder.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+            recorder.response_sent_open.load(std::memory_order_acquire)) {
+            close(client);
+            error = "gated response write EOF terminal acknowledgment was incoherent";
+            return false;
+        }
+
+        if (test_case == WriteEofSelfCheckCase::StopBeforeAuthorization) {
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(client, 25, detail) ||
+                recorder.response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                !write_eof_evidence_is_neutral(recorder)) {
+                close(client);
+                error =
+                    "gated response write EOF stop control acted before authorization: " + detail;
+                return false;
+            }
+            recorder.stop();
+            const GatedResponseWriteEofResult action =
+                recorder.response_write_eof_result.load(std::memory_order_acquire);
+            if (action != GatedResponseWriteEofResult::StoppedBeforeAuthorization ||
+                recorder.response_write_eof_shutdown_calls.load(std::memory_order_relaxed) != 0u ||
+                recorder.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                    0u ||
+                recorder.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) != 0u ||
+                recorder.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::None ||
+                recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+                recorder.response_sent_open.load(std::memory_order_acquire) ||
+                !observe_real_zero_tail_eof(client, "gated response write EOF stopped control")) {
+                close(client);
+                if (error.empty())
+                    error = "gated response write EOF stop manufactured an authorized action";
+                return false;
+            }
+            close(client);
+            const std::vector<char> exact_request(kRequest, kRequest + sizeof(kRequest) - 1u);
+            if (recorder.thread_alive.load(std::memory_order_acquire) || recorder.listen_fd >= 0 ||
+                recorder.history.size() != 1u || recorder.request != exact_request ||
+                recorder.history[0] != exact_request) {
+                error = "gated response write EOF stop control lost cleanup custody";
+                return false;
+            }
+            return true;
+        }
+
+        if (test_case == WriteEofSelfCheckCase::CloseAfterOpenAck) {
+            if (shutdown(client, SHUT_WR) != 0) {
+                close(client);
+                error = "gated response write EOF post-Open control could not half-close";
+                return false;
+            }
+            poll(nullptr, 0, 10);
+        }
+
+        if (test_case == WriteEofSelfCheckCase::PermitWithheldThenLive) {
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(client, 50, detail) || !live() ||
+                recorder.response_close_permit.load(std::memory_order_acquire) ||
+                recorder.response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                recorder.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 0u ||
+                recorder.response_write_eof_reprobe_result.load(std::memory_order_acquire) !=
+                    GatedFragmentPeerProbeResult::None ||
+                recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofPeerTerminal::None) {
+                close(client);
+                error = "gated response write EOF acted while permit was withheld: " + detail;
+                return false;
+            }
+        }
+
+        if (test_case != WriteEofSelfCheckCase::ClosedAtAck)
+            recorder.response_close_permit.store(true, std::memory_order_release);
+        const auto action_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (recorder.response_write_eof_result.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofResult::None &&
+               std::chrono::steady_clock::now() < action_deadline)
+            usleep(1000);
+        const GatedResponseWriteEofResult action =
+            recorder.response_write_eof_result.load(std::memory_order_acquire);
+
+        if (test_case == WriteEofSelfCheckCase::ClosedAtAck ||
+            test_case == WriteEofSelfCheckCase::CloseAfterOpenAck) {
+            const bool closed_after_ack = test_case == WriteEofSelfCheckCase::ClosedAtAck;
+            const GatedFragmentPeerProbeResult expected_reprobe =
+                closed_after_ack ? GatedFragmentPeerProbeResult::None
+                                 : GatedFragmentPeerProbeResult::Closed;
+            if (action != GatedResponseWriteEofResult::AbortedPeerNotOpen ||
+                recorder.response_write_eof_shutdown_calls.load(std::memory_order_relaxed) != 0u ||
+                recorder.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                    0u ||
+                recorder.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) != 0u ||
+                recorder.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                    expected_reprobe ||
+                (closed_after_ack
+                     ? recorder.response_write_eof_reprobe_ns.load(std::memory_order_relaxed) != 0u
+                     : recorder.response_write_eof_reprobe_ns.load(std::memory_order_relaxed) <
+                           probe_ns) ||
+                recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != ack ||
+                recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns ||
+                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    probe_result ||
+                recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+                recorder.response_sent_open.load(std::memory_order_acquire) ||
+                !recorder.response_send_failed.load(std::memory_order_acquire) ||
+                !observe_real_zero_tail_eof(client, "gated response write EOF abort control")) {
+                close(client);
+                if (error.empty())
+                    error = "gated response write EOF abort control lost causal evidence";
+                return false;
+            }
+            close(client);
+            const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!recorder.response_connection_closed.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < close_deadline)
+                usleep(1000);
+            const bool closed = recorder.response_connection_closed.load(std::memory_order_acquire);
+            recorder.stop();
+            if (!closed || recorder.thread_alive.load(std::memory_order_acquire) ||
+                recorder.listen_fd >= 0) {
+                error = "gated response write EOF abort control lost cleanup evidence";
+                return false;
+            }
+            return true;
+        }
+
+        const u64 reprobe_ns =
+            recorder.response_write_eof_reprobe_ns.load(std::memory_order_relaxed);
+        const u64 shutdown_begin_ns =
+            recorder.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed);
+        const u64 shutdown_end_ns =
+            recorder.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed);
+        if (action != GatedResponseWriteEofResult::WriteShutdownSucceeded ||
+            recorder.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                GatedFragmentPeerProbeResult::Open ||
+            reprobe_ns < probe_ns || shutdown_begin_ns < reprobe_ns ||
+            shutdown_end_ns < shutdown_begin_ns ||
+            recorder.response_write_eof_shutdown_calls.load(std::memory_order_relaxed) != 1u ||
+            recorder.response_write_eof_shutdown_errno.load(std::memory_order_relaxed) != 0 ||
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != ack ||
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns ||
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) != probe_result ||
+            recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+            recorder.response_sent_open.load(std::memory_order_acquire) ||
+            !observe_real_zero_tail_eof(client, "gated response write EOF live control")) {
+            close(client);
+            if (error.empty()) error = "gated response write EOF live action evidence mismatch";
+            return false;
+        }
+
+        poll(nullptr, 0, 25);
+        if (!live() ||
+            recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                GatedResponseWriteEofPeerTerminal::None ||
+            recorder.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 1u) {
+            close(client);
+            error = "gated response write EOF did not retain its read half";
+            return false;
+        }
+        if (shutdown(client, SHUT_WR) != 0) {
+            close(client);
+            error = "gated response write EOF live control could not publish peer FIN";
+            return false;
+        }
+        const auto terminal_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofPeerTerminal::None &&
+               std::chrono::steady_clock::now() < terminal_deadline)
+            usleep(1000);
+        const GatedResponseWriteEofPeerTerminal terminal =
+            recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire);
+        const u64 terminal_ns =
+            recorder.response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed);
+        if (terminal != GatedResponseWriteEofPeerTerminal::Fin || terminal_ns < shutdown_end_ns ||
+            !recorder.response_peer_closed.load(std::memory_order_relaxed) ||
+            recorder.response_peer_close_count.load(std::memory_order_relaxed) != 1u ||
+            recorder.response_peer_closed_ns.load(std::memory_order_relaxed) != terminal_ns ||
+            recorder.response_peer_unexpected_data.load(std::memory_order_relaxed) ||
+            recorder.response_peer_observation_failed.load(std::memory_order_relaxed) ||
+            recorder.response_write_eof_result.load(std::memory_order_acquire) != action ||
+            recorder.response_write_eof_shutdown_calls.load(std::memory_order_relaxed) != 1u ||
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != ack ||
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns ||
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) != probe_result) {
+            close(client);
+            error = "gated response write EOF did not classify the retained-read peer FIN";
+            return false;
+        }
+        close(client);
+        const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!recorder.response_connection_closed.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < close_deadline)
+            usleep(1000);
+        // Snapshot only atomics while the observe-extra-requests worker can
+        // still accept and append. history/request are inspected only after
+        // stop() has joined their sole writer.
+        const bool atomic_evidence_before_join =
+            recorder.response_connection_closed.load(std::memory_order_acquire) &&
+            recorder.response_clean_shutdown.load(std::memory_order_acquire) &&
+            recorder.response_fragments_sent.load(std::memory_order_acquire) == 1u &&
+            recorder.response_fragment_sent_ns[0].load(std::memory_order_relaxed) != 0u &&
+            recorder.response_send_all_calls.load(std::memory_order_acquire) == 0u &&
+            !recorder.response_send_succeeded.load(std::memory_order_acquire) &&
+            !recorder.response_sent_open.load(std::memory_order_acquire) &&
+            !recorder.response_send_failed.load(std::memory_order_acquire);
+        recorder.stop();
+        const std::vector<char> exact_request(kRequest, kRequest + sizeof(kRequest) - 1u);
+        const bool joined_evidence =
+            !recorder.thread_alive.load(std::memory_order_acquire) && recorder.listen_fd < 0 &&
+            recorder.accepted.load(std::memory_order_acquire) == 1u &&
+            recorder.requests.load(std::memory_order_acquire) == 1u &&
+            recorder.history.size() == 1u && recorder.request == exact_request &&
+            recorder.history[0] == exact_request &&
+            recorder.response_write_eof_result.load(std::memory_order_acquire) == action &&
+            recorder.response_write_eof_peer_terminal.load(std::memory_order_acquire) == terminal &&
+            recorder.response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed) ==
+                terminal_ns;
+        if (!atomic_evidence_before_join || !joined_evidence) {
+            error =
+                "gated response write EOF live control lost final cleanup custody: closed=" +
+                std::to_string(
+                    recorder.response_connection_closed.load(std::memory_order_acquire)) +
+                " clean=" +
+                std::to_string(recorder.response_clean_shutdown.load(std::memory_order_acquire)) +
+                " history=" + std::to_string(recorder.history.size()) + " fragments=" +
+                std::to_string(recorder.response_fragments_sent.load(std::memory_order_acquire)) +
+                " send_all=" +
+                std::to_string(recorder.response_send_all_calls.load(std::memory_order_acquire)) +
+                " succeeded=" +
+                std::to_string(recorder.response_send_succeeded.load(std::memory_order_acquire)) +
+                " open=" +
+                std::to_string(recorder.response_sent_open.load(std::memory_order_acquire)) +
+                " failed=" +
+                std::to_string(recorder.response_send_failed.load(std::memory_order_acquire));
+            return false;
+        }
+        return true;
+    };
+
     return run_case(SelfCheckCase::ClosedAtAck) && run_case(SelfCheckCase::CloseAfterOpenAck) &&
            run_case(SelfCheckCase::Open) && run_ordinal3_case(SelfCheckCase::ClosedAtAck) &&
            run_ordinal3_case(SelfCheckCase::CloseAfterOpenAck) &&
-           run_ordinal3_case(SelfCheckCase::Open);
+           run_ordinal3_case(SelfCheckCase::Open) &&
+           run_write_eof_case(WriteEofSelfCheckCase::PermitWithheldThenLive) &&
+           run_write_eof_case(WriteEofSelfCheckCase::ClosedAtAck) &&
+           run_write_eof_case(WriteEofSelfCheckCase::CloseAfterOpenAck) &&
+           run_write_eof_case(WriteEofSelfCheckCase::LiveAuthorization) &&
+           run_write_eof_case(WriteEofSelfCheckCase::StopBeforeAuthorization);
 }
 
 enum class TimeoutHeadPhase {
@@ -68128,7 +68786,10 @@ int main(int argc, char** argv) {
                "close-after-Open-ack controls with real zero-tail EOF and no W2, and published "
                "the exact W2 only for the live Open control; after a successful W2 it likewise "
                "rejected both ordinal-3 close controls with no W3 and published exact W3 only "
-               "for the live Open control\n";
+               "for the live Open control; the generic one-prefix write-EOF gate remained inert "
+               "without authorization or after stop, aborted both peer-close races without "
+               "SHUT_WR, and on live authorization performed one SHUT_WR, exposed real "
+               "zero-tail EOF, retained its read half, and classified the peer FIN\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
