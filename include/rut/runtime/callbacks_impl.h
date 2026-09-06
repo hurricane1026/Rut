@@ -9519,17 +9519,24 @@ inline bool stage_redirect_response(Connection& conn, const RouteConfig& config,
     return conn.send_buf.write(scratch, len) == len;
 }
 
-inline bool build_strict_response_headers(Connection& conn,
-                                          const RouteConfig& config,
-                                          const ParsedResponse& resp) {
+inline bool build_strict_response_headers(
+    Connection& conn,
+    const RouteConfig& config,
+    const ParsedResponse& resp,
+    Http1PrebuiltResponsePurpose purpose = Http1PrebuiltResponsePurpose::None) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
     const auto& policy = config.response_policies[conn.response_policy_id - 1];
-    if (!response_policy_spec_valid(policy) || resp.version != HttpVersion::Http11 ||
+    const bool strict_no_body_metadata =
+        purpose == Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
+    if ((purpose != Http1PrebuiltResponsePurpose::None && !strict_no_body_metadata) ||
+        !response_policy_spec_valid(policy) || resp.version != HttpVersion::Http11 ||
         resp.status_code < 200 || resp.status_code > 599 || resp.status_code == 204 ||
-        resp.status_code == 205 || resp.status_code == 304 || resp.headers_truncated ||
-        resp.content_length_count != 1 || !resp.has_content_length || resp.chunked ||
-        resp.reason.len == 0)
+        resp.status_code == 205 ||
+        (strict_no_body_metadata ? resp.status_code != 304 || resp.content_length == 0
+                                 : resp.status_code == 304) ||
+        resp.headers_truncated || resp.content_length_count != 1 || !resp.has_content_length ||
+        resp.chunked || resp.reason.len == 0)
         return false;
     for (u32 i = 0; i < resp.reason.len; i++) {
         const u8 c = static_cast<u8>(resp.reason.ptr[i]);
@@ -10379,8 +10386,34 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             explicit_buffering == ForwardResponseBufferingMode::None && resp.status_code == 200 &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
             raw_total - raw_header_end <= resp.content_length;
+        bool strict_no_body_metadata_origin_open = true;
+        if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                          candidate->current_response_read_batch_keeps_origin_open(c, event);
+                      }) {
+            strict_no_body_metadata_origin_open =
+                loop->current_response_read_batch_keeps_origin_open(conn, ev);
+        }
+        // This runtime seam proves only the 304 response shape and transport
+        // owners. Conditional request/ETag correlation remains origin-owned.
+        const bool strict_no_body_metadata_304 =
+            strict_common && strict_no_body_metadata_origin_open && !fixed_upload &&
+            resp.status_code == 304 &&
+            explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+            explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+            explicit_method == static_cast<u8>(LogHttpMethod::Get) &&
+            explicit_route_method == kRouteMethodGet && resp.content_length > 0 &&
+            raw_header_end == raw_total && conn.pipeline_depth == 0 &&
+            conn.http1_pipeline_request_generation == 0 && conn.pipeline_stash_len == 0 &&
+            conn.retry_req_send_len == 0 && !conn.upstream_reused && conn.upstream_attempts == 1 &&
+            bodyless_get_keep_alive_precise_arm_is_stable(
+                conn,
+                explicit_upload,
+                config,
+                explicit_bundle_id,
+                ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
+                &on_upstream_response<Loop>);
         if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get &&
-            !strict_positive_head) {
+            !strict_positive_head && !strict_no_body_metadata_304) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
@@ -10393,7 +10426,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // The origin frame is fully proven before any downstream response
         // status/header/persistence byte is materialized.
         conn.resp_status = resp.status_code;
-        if (!build_strict_response_headers(conn, *config, resp)) {
+        const Http1PrebuiltResponsePurpose strict_response_purpose =
+            strict_no_body_metadata_304 ? Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess
+                                        : Http1PrebuiltResponsePurpose::None;
+        if (!build_strict_response_headers(conn, *config, resp, strict_response_purpose)) {
             if (try_configured_head_failure(
                     ConfiguredForwardFailureDomain::CompleteUnsupportedResponse))
                 return;
@@ -10478,11 +10514,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
 
         conn.http1_prebuilt_response_layout =
-            strict_positive_head ? Http1PrebuiltResponseLayout::HeaderOnlyHead
-                                 : Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+            strict_positive_head          ? Http1PrebuiltResponseLayout::HeaderOnlyHead
+            : strict_no_body_metadata_304 ? Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus
+                                          : Http1PrebuiltResponseLayout::FullContentLengthNonHead;
         conn.http1_prebuilt_response_purpose =
             strict_positive_head ? Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly
-                                 : Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
+            : strict_no_body_metadata_304
+                ? Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess
+                : Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
         conn.http1_prebuilt_deadline_profile = explicit_profile;
         conn.http1_prebuilt_deadline_method = explicit_method;
         conn.http1_prebuilt_deadline_route_method = explicit_route_method;
@@ -10492,8 +10531,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_prebuilt_deadline_upload = explicit_upload;
         conn.http1_prebuilt_header_end = output_parser.header_end;
         conn.http1_prebuilt_total_len = output_len;
-        conn.http1_prebuilt_body_len = strict_positive_head ? resp.content_length : 0;
-        conn.http1_prebuilt_status = 200;
+        conn.http1_prebuilt_body_len =
+            strict_positive_head || strict_no_body_metadata_304 ? resp.content_length : 0;
+        conn.http1_prebuilt_status = resp.status_code;
         record_reused_response_health();
         conn.resp_body_mode = BodyMode::None;
         conn.resp_body_remaining = 0;
