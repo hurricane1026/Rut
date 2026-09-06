@@ -57892,6 +57892,560 @@ static bool run_converter_default_buffering_incomplete_body_inactivity_expiry_di
     return true;
 }
 
+static bool run_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "#271 201 paired inactivity differential requires an executable absolute RUT path";
+        return false;
+    }
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].nginx_config || temps[0].nginx_log == temps[1].rut_log ||
+        temps[0].nginx_access_log == temps[1].rut_access_log) {
+        error = "#271 201 paired inactivity differential could not create isolated side resources";
+        return false;
+    }
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error =
+                "#271 201 paired inactivity differential could not hold four distinct four-digit "
+                "ports";
+            return false;
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty())
+            error = "#271 201 paired inactivity pinned nginx wrapper lost its one events block";
+        return false;
+    }
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !validate_explicit_timeout_get_generated_provenance(
+            generated_source, ports[2], ports[3], temps[1].rut_access_log, error) ||
+        !write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        if (error.empty())
+            error = "#271 201 paired inactivity differential could not persist exact inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    for (auto& origin : origins) {
+        origin.wait_response_peer_close = true;
+        origin.observe_extra_requests_until_stop = true;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(&reservations.fds[backend],
+                                        ports[backend],
+                                        "#271 201 paired inactivity origin bind",
+                                        error) ||
+            !origins[side].setup(ports[backend],
+                                 1u,
+                                 kDefaultBuffering201TimeoutOrigin,
+                                 sizeof(kDefaultBuffering201TimeoutOrigin) - 1u)) {
+            if (error.empty()) error = "#271 201 paired inactivity origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = "#271 201 paired inactivity origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#271 201 paired inactivity nginx bind", error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child)) {
+        error = "#271 201 paired inactivity could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = "#271 201 paired inactivity pinned nginx readiness failed: " + error;
+        dump_log(temps[0].nginx_config, "#271 201 paired inactivity nginx config");
+        dump_log(temps[0].nginx_log, "#271 201 paired inactivity nginx log");
+        return false;
+    }
+    if (!handoff_held_loopback_port(
+            &reservations.fds[2], ports[2], "#271 201 paired inactivity RUT bind", error))
+        return false;
+    if (!spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child)) {
+        error = "#271 201 paired inactivity could not spawn generated ordinary RUT";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = "#271 201 paired inactivity generated RUT readiness failed: " + error;
+        dump_log(temps[1].source, "#271 201 paired inactivity generated RUT source");
+        dump_log(temps[1].rut_log, "#271 201 paired inactivity RUT log");
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temps[1].rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = "#271 201 paired inactivity RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (poll_child(frontends[1].child) || !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = "#271 201 paired inactivity generated RUT lacked exact io_uring readiness";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    u64 request_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        clients.fds[side] = connect_once(ports[side * 2u]);
+        if (clients.fds[side] < 0 || !send_all(clients.fds[side],
+                                               kDefaultBufferingTimeoutRequest,
+                                               sizeof(kDefaultBufferingTimeoutRequest) - 1u)) {
+            error = std::string("#271 201 paired inactivity ") + (side == 0u ? "nginx" : "RUT") +
+                    " exact request send failed";
+            return false;
+        }
+        request_sent_ns[side] = steady_now_ns();
+    }
+
+    const auto publication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        bool published = true;
+        for (const auto& origin : origins) {
+            if (origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                origin.accepted.load(std::memory_order_acquire) > 1u ||
+                origin.requests.load(std::memory_order_acquire) > 1u) {
+                error =
+                    "#271 201 paired inactivity origin failed before publishing its open response";
+                return false;
+            }
+            published &= origin.response_sent_open.load(std::memory_order_acquire);
+        }
+        if (published) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= publication_deadline) {
+            error = "#271 201 paired inactivity did not publish both open origin writes";
+            return false;
+        }
+        usleep(1000);
+    }
+    u64 origin_sent_ns[2]{};
+    for (size_t side = 0u; side < 2u; side++) {
+        const auto& origin = origins[side];
+        origin_sent_ns[side] = origin.response_sent_ns.load(std::memory_order_acquire);
+        if (origin_sent_ns[side] < request_sent_ns[side] ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_sent_open.load(std::memory_order_acquire)) {
+            error = "#271 201 paired inactivity did not retain one open 108-byte origin write";
+            return false;
+        }
+    }
+
+    // Each origin performed one 108-byte application write. This does not
+    // establish a TCP packet, proxy read, or io_uring CQE boundary.
+    bool quiet_complete[2] = {false, false};
+    u64 quiet_probe_ns[2]{};
+    while (!quiet_complete[0] || !quiet_complete[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (quiet_complete[side]) continue;
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail)) {
+                error = std::string("#271 201 paired inactivity ") +
+                        (side == 0u ? "nginx" : "RUT") +
+                        " exposed bytes/EOF before 800ms: " + detail;
+                return false;
+            }
+            quiet_probe_ns[side] = steady_now_ns();
+            quiet_complete[side] = quiet_probe_ns[side] - origin_sent_ns[side] >= 800'000'000ull;
+        }
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            !access[0].empty() || !access[1].empty()) {
+            if (error.empty())
+                error = "#271 201 paired inactivity quiet gate lost live/empty access custody";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 201 paired inactivity origin changed during the 800ms quiet gate";
+                return false;
+            }
+        }
+    }
+
+    std::vector<char> responses[2];
+    u64 first_downstream_ns[2]{};
+    u64 downstream_eof_ns[2]{};
+    bool downstream_done[2] = {false, false};
+    while (!downstream_done[0] || !downstream_done[1]) {
+        for (size_t side = 0u; side < 2u; side++) {
+            if (downstream_done[side]) continue;
+            if (steady_now_ns() - origin_sent_ns[side] >= 2'000'000'000ull) {
+                error = std::string("#271 201 paired inactivity ") +
+                        (side == 0u ? "nginx" : "RUT") +
+                        " downstream missed the 2s terminal budget";
+                return false;
+            }
+            pollfd poll_state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&poll_state, 1, 5);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                error = "#271 201 paired inactivity downstream poll failed";
+                return false;
+            }
+            if (ready == 0) continue;
+            char bytes[512];
+            const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+            const u64 observed_ns = steady_now_ns();
+            if (count > 0) {
+                if (first_downstream_ns[side] == 0u) first_downstream_ns[side] = observed_ns;
+                responses[side].insert(responses[side].end(), bytes, bytes + count);
+                if (responses[side].size() >
+                    sizeof(kDefaultBuffering201TimeoutResponseNormalized) - 1u) {
+                    error = "#271 201 paired inactivity downstream included body or trailing bytes";
+                    return false;
+                }
+                continue;
+            }
+            if (count == 0) {
+                downstream_eof_ns[side] = observed_ns;
+                downstream_done[side] = true;
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            error = "#271 201 paired inactivity downstream recv failed";
+            return false;
+        }
+    }
+
+    const auto peer_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        bool peers_closed = true;
+        for (const auto& origin : origins) {
+            if (origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 201 paired inactivity origin peer-close observation failed";
+                return false;
+            }
+            peers_closed &= origin.response_peer_closed.load(std::memory_order_acquire);
+        }
+        if (peers_closed) break;
+        if (!frontends_live() || !origins_live() ||
+            std::chrono::steady_clock::now() >= peer_close_deadline) {
+            error =
+                "#271 201 paired inactivity origins were not retired after terminal finalization";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    for (size_t side = 0u; side < 2u; side++) {
+        const u64 origin_closed_ns =
+            origins[side].response_peer_closed_ns.load(std::memory_order_acquire);
+        const u64 first_elapsed = first_downstream_ns[side] - origin_sent_ns[side];
+        const u64 eof_elapsed = downstream_eof_ns[side] - origin_sent_ns[side];
+        const u64 peer_elapsed = origin_closed_ns - origin_sent_ns[side];
+        if (quiet_probe_ns[side] - origin_sent_ns[side] < 800'000'000ull ||
+            first_downstream_ns[side] < origin_sent_ns[side] || first_elapsed < 750'000'000ull ||
+            first_elapsed >= 1'700'000'000ull ||
+            downstream_eof_ns[side] < first_downstream_ns[side] || eof_elapsed < 750'000'000ull ||
+            eof_elapsed >= 2'000'000'000ull || origin_closed_ns < origin_sent_ns[side] ||
+            peer_elapsed < 750'000'000ull || peer_elapsed >= 2'000'000'000ull) {
+            error = std::string("#271 201 paired inactivity ") + (side == 0u ? "nginx" : "RUT") +
+                    " events left the bounded one-second terminal class: quiet/first/EOF/peer " +
+                    std::to_string(quiet_probe_ns[side] - origin_sent_ns[side]) + "/" +
+                    std::to_string(first_elapsed) + "/" + std::to_string(eof_elapsed) + "/" +
+                    std::to_string(peer_elapsed) + "ns";
+            return false;
+        }
+    }
+    const u64 first_elapsed[2] = {first_downstream_ns[0] - origin_sent_ns[0],
+                                  first_downstream_ns[1] - origin_sent_ns[1]};
+    const u64 first_delta = first_elapsed[0] > first_elapsed[1]
+                                ? first_elapsed[0] - first_elapsed[1]
+                                : first_elapsed[1] - first_elapsed[0];
+    if (first_delta > 350'000'000ull) {
+        error =
+            "#271 201 paired inactivity W1-relative first-byte timings differed by over 350ms: " +
+            std::to_string(first_elapsed[0]) + "/" + std::to_string(first_elapsed[1]) + "ns";
+        return false;
+    }
+
+    std::vector<char> normalized[2] = {responses[0], responses[1]};
+    const std::vector<char> expected_response(
+        kDefaultBuffering201TimeoutResponseNormalized,
+        kDefaultBuffering201TimeoutResponseNormalized +
+            sizeof(kDefaultBuffering201TimeoutResponseNormalized) - 1u);
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        normalized[0] != expected_response || normalized[1] != expected_response ||
+        normalized[0] != normalized[1]) {
+        error = "#271 201 paired inactivity exact 127-byte Date-normalized response mismatch";
+        dump_wire("#271 201 paired inactivity nginx response", responses[0]);
+        dump_wire("#271 201 paired inactivity RUT response", responses[1]);
+        return false;
+    }
+    for (const auto& response : normalized) {
+        const std::string text(response.begin(), response.end());
+        if (header_end(response) != response.size() ||
+            count_text(text, "HTTP/1.1 201 Created\r\n") != 1u ||
+            text.find("HTTP/1.1 200 OK\r\n") != std::string::npos ||
+            text.find("hello") != std::string::npos || text.find("502") != std::string::npos ||
+            text.find("504") != std::string::npos ||
+            text.find("Bad Gateway") != std::string::npos ||
+            text.find("Gateway Time-out") != std::string::npos ||
+            text.find("configured deadline") != std::string::npos) {
+            error =
+                "#271 201 paired inactivity response lost exact 201 Created header-only custody";
+            return false;
+        }
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error =
+                "#271 201 paired inactivity lost process/listener liveness during no-retry gate";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 201 paired inactivity observed retry or peer-close multiplicity";
+                return false;
+            }
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    static constexpr char kExpectedAccess[] = "60\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access[2];
+        if (!read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error))
+            return false;
+        if (access[0] == kExpectedAccess && access[1] == kExpectedAccess) break;
+        if ((!access[0].empty() && access[0] != kExpectedAccess) ||
+            (!access[1].empty() && access[1] != kExpectedAccess) || !frontends_live() ||
+            !origins_live() || std::chrono::steady_clock::now() >= access_deadline) {
+            error =
+                "#271 201 paired inactivity access custody was not one exact record reporting 60 "
+                "request "
+                "bytes per side";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    for (;;) {
+        std::string access[2];
+        if (!frontends_live() || !origins_live() ||
+            !read_request_length_access_file(temps[0].nginx_access_log, access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, access[1], error) ||
+            access[0] != kExpectedAccess || access[1] != kExpectedAccess) {
+            if (error.empty())
+                error = "#271 201 paired inactivity access changed past the timeout horizon";
+            return false;
+        }
+        for (const auto& origin : origins) {
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                !origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = "#271 201 paired inactivity terminal state changed past the horizon";
+                return false;
+            }
+        }
+        const u64 post_read_ns = steady_now_ns();
+        bool crossed_both_horizons = true;
+        for (size_t side = 0u; side < 2u; side++)
+            crossed_both_horizons &= post_read_ns >= origin_sent_ns[side] + 2'100'000'000ull;
+        if (crossed_both_horizons) break;
+        usleep(5000);
+    }
+
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    std::vector<char> upstream[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string expected_text = "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                          std::to_string(ports[side * 2u + 1u]) + "\r\n\r\n";
+        const std::vector<char> expected(expected_text.begin(), expected_text.end());
+        const auto& origin = origins[side];
+        if (expected.size() != 60u || origin.thread_alive.load(std::memory_order_acquire) ||
+            origin.listen_fd >= 0 || origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.history[0] != expected || origin.request != expected ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error =
+                "#271 201 paired inactivity exact origin wire/retirement/cleanup evidence mismatch";
+            dump_wire("#271 expected inactivity upstream", expected);
+            dump_wire("#271 actual inactivity upstream", origin.request);
+            return false;
+        }
+        const std::string wire(origin.request.begin(), origin.request.end());
+        if (wire.find("client.example") != std::string::npos ||
+            wire.find("\r\nConnection:") != std::string::npos) {
+            error = "#271 201 paired inactivity upstream leaked original Host/Connection";
+            return false;
+        }
+        upstream[side] = origin.history[0];
+    }
+    const auto canonicalize = [](std::vector<char>& wire, u16 backend_port) {
+        const std::string authority = "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n";
+        static constexpr char kCanonical[] = "Host: 127.0.0.1:<backend>\r\n";
+        const auto at = std::search(wire.begin(), wire.end(), authority.begin(), authority.end());
+        if (at == wire.end() ||
+            std::search(at + authority.size(), wire.end(), authority.begin(), authority.end()) !=
+                wire.end())
+            return false;
+        const size_t offset = static_cast<size_t>(at - wire.begin());
+        wire.erase(wire.begin() + static_cast<std::ptrdiff_t>(offset),
+                   wire.begin() + static_cast<std::ptrdiff_t>(offset + authority.size()));
+        wire.insert(wire.begin() + static_cast<std::ptrdiff_t>(offset),
+                    kCanonical,
+                    kCanonical + sizeof(kCanonical) - 1u);
+        return true;
+    };
+    if (!origins_live_before_stop || !canonicalize(upstream[0], ports[1]) ||
+        !canonicalize(upstream[1], ports[3]) || upstream[0] != upstream[1]) {
+        error = "#271 201 paired inactivity cross-side upstream/liveness evidence differed";
+        return false;
+    }
+
+    for (int& fd : clients.fds) {
+        close(fd);
+        fd = -1;
+    }
+    std::string post_client_access[2];
+    if (!read_request_length_access_file(temps[0].nginx_access_log, post_client_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, post_client_access[1], error) ||
+        post_client_access[0] != kExpectedAccess || post_client_access[1] != kExpectedAccess) {
+        if (error.empty())
+            error = "#271 201 paired inactivity access changed after local client close";
+        return false;
+    }
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !rut_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0) {
+        error = "#271 201 paired inactivity final process/container/fd cleanup was incomplete";
+        return false;
+    }
+    std::string final_access[2];
+    if (!read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+        final_access[0] != kExpectedAccess || final_access[1] != kExpectedAccess) {
+        if (error.empty())
+            error = "#271 201 paired inactivity access changed during frontend shutdown";
+        return false;
+    }
+
+    std::cerr
+        << "PASS evidence: #271 201 paired inactivity origin-send-to-first/EOF/peer-close seconds "
+           "nginx="
+        << static_cast<double>(first_downstream_ns[0] - origin_sent_ns[0]) / 1e9 << "/"
+        << static_cast<double>(downstream_eof_ns[0] - origin_sent_ns[0]) / 1e9 << "/"
+        << static_cast<double>(origins[0].response_peer_closed_ns.load(std::memory_order_acquire) -
+                               origin_sent_ns[0]) /
+               1e9
+        << " RUT=" << static_cast<double>(first_downstream_ns[1] - origin_sent_ns[1]) / 1e9 << "/"
+        << static_cast<double>(downstream_eof_ns[1] - origin_sent_ns[1]) / 1e9 << "/"
+        << static_cast<double>(origins[1].response_peer_closed_ns.load(std::memory_order_acquire) -
+                               origin_sent_ns[1]) /
+               1e9
+        << " W1-first-delta=" << static_cast<double>(first_delta) / 1e9 << "\n";
+    return true;
+}
+
 static bool run_pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle(
     TempDir& temp, const std::string& container_name, std::string& error) {
     HeldLoopbackPorts reservations;
@@ -60961,6 +61515,12 @@ int main(int argc, char** argv) {
         argc == 3 &&
         strcmp(argv[1],
                "--converter-default-buffering-incomplete-body-inactivity-expiry-differential") == 0;
+    const bool converter_default_buffering_201_incomplete_body_inactivity_expiry_differential =
+        argc == 3 &&
+        strcmp(
+            argv[1],
+            "--converter-default-buffering-201-incomplete-body-inactivity-expiry-differential") ==
+            0;
     const bool converter_default_buffering_second_body_progress_refresh_differential =
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-second-body-progress-refresh-"
@@ -61192,6 +61752,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
+         !converter_default_buffering_201_incomplete_body_inactivity_expiry_differential &&
          !converter_default_buffering_second_body_progress_refresh_differential &&
          !converter_default_buffering_three_publication_completion_differential &&
          !converter_default_buffering_third_body_progress_expiry_differential &&
@@ -61273,6 +61834,7 @@ int main(int argc, char** argv) {
         ((converter_default_buffering_positive_get_differential ||
           converter_default_buffering_incomplete_clean_eof_differential ||
           converter_default_buffering_incomplete_body_inactivity_expiry_differential ||
+          converter_default_buffering_201_incomplete_body_inactivity_expiry_differential ||
           converter_default_buffering_second_body_progress_refresh_differential ||
           converter_default_buffering_three_publication_completion_differential ||
           converter_default_buffering_third_body_progress_expiry_differential) &&
@@ -61397,6 +61959,9 @@ int main(int argc, char** argv) {
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-incomplete-body-inactivity-expiry-differential "
+               "<absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-201-incomplete-body-inactivity-expiry-differential "
                "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-second-body-progress-refresh-differential "
@@ -62795,6 +63360,36 @@ int main(int argc, char** argv) {
                "custody for ID1/1s/CompleteContentLength and its 200/502/504 policy bundle. This "
                "does not claim body-progress refresh, other schedules/framing/status/methods, "
                "complete buffering, reset/error, retry/reuse, TLS, H2, or broad #271 support.\n";
+        return 0;
+    }
+    if (converter_default_buffering_201_incomplete_body_inactivity_expiry_differential) {
+        const std::string container_name = "rut-nginx-271-201-incomplete-expiry-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#271 converter default-buffering 201 incomplete-body "
+                         "inactivity-expiry differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #271 pinned nginx 1.29.7 and independently converter-generated ordinary "
+               "RUT matched one exact 60-byte bodyless keep-alive GET with explicit "
+               "proxy_read_timeout 1s and omitted buffering/request-buffering/http-version/header "
+               "overrides. Each application-open origin made one exact 108-byte publication "
+               "containing the complete 103-byte 201 Created/CL12 header plus hello (5/12); both "
+               "frontends withheld every downstream byte through W1+800ms, then emitted the "
+               "strictly equal Date-normalized 127-byte header-only 201 Created response and real "
+               "EOF in the W1-relative inactivity windows, without status/body/failure leakage. "
+               "Each actively retired one origin, emitted one exact authority-rewritten 60-byte "
+               "upstream request and one access record reporting 60 request bytes, with no retry. "
+               "Generated ordinary source passed exact GET AST/HIR/MIR/RIR/O2/config custody and "
+               "ran through the public io_uring CLI. Application-publication timestamps are not "
+               "TCP/read/CQE boundaries. This claims no other status/schedule/framing, "
+               "retry/reuse, "
+               "TLS/H2/epoll, or broad #271 support.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle) {
