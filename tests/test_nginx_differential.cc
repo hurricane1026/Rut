@@ -2214,6 +2214,14 @@ struct DeadPort {
     }
 };
 
+enum class GatedFragmentPeerProbeResult : unsigned char {
+    None,
+    Open,
+    Closed,
+    UnexpectedData,
+    Error,
+};
+
 struct Recorder {
     int listen_fd = -1;
     u16 port = 0;
@@ -2276,6 +2284,15 @@ struct Recorder {
     std::atomic<u32> response_fragment_permit{0};
     std::atomic<u32> response_fragments_sent{0};
     std::atomic<u64> response_fragment_sent_ns[4]{};
+    // Default-off worker-owned socket evidence for a parent-gated follow-up
+    // fragment. The parent publishes an ordinal request and may consume the
+    // result/timestamp only after the matching release-store acknowledgment.
+    bool probe_before_gated_fragment = false;
+    std::atomic<u32> gated_fragment_probe_request{0};
+    std::atomic<u32> gated_fragment_probe_ack{0};
+    std::atomic<u64> gated_fragment_probe_ns{0};
+    std::atomic<GatedFragmentPeerProbeResult> gated_fragment_probe_result{
+        GatedFragmentPeerProbeResult::None};
     // Separate default-off mode for the incomplete clean-EOF baseline. The
     // origin sends its configured prefix, stays application-open behind this
     // gate, and only the test may authorize the clean close.
@@ -2301,6 +2318,19 @@ struct Recorder {
     std::atomic<bool> response_connection_closed{false};
     pthread_t thread{};
     bool thread_started = false;
+
+    static GatedFragmentPeerProbeResult probe_gated_fragment_peer(int client) {
+        for (u32 attempt = 0u; attempt < 8u; attempt++) {
+            char byte = 0;
+            const ssize_t count = recv(client, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (count > 0) return GatedFragmentPeerProbeResult::UnexpectedData;
+            if (count == 0) return GatedFragmentPeerProbeResult::Closed;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return GatedFragmentPeerProbeResult::Open;
+            if (errno == ECONNRESET) return GatedFragmentPeerProbeResult::Closed;
+            if (errno != EINTR) return GatedFragmentPeerProbeResult::Error;
+        }
+        return GatedFragmentPeerProbeResult::Error;
+    }
 
     static void* run(void* opaque) {
         auto* self = static_cast<Recorder*>(opaque);
@@ -2452,9 +2482,51 @@ struct Recorder {
                         while (self->running.load(std::memory_order_acquire) &&
                                self->response_fragment_permit.load(std::memory_order_acquire) <=
                                    part) {
+                            if (self->probe_before_gated_fragment && part > 0u) {
+                                const u32 ordinal = part + 1u;
+                                const u32 requested = self->gated_fragment_probe_request.load(
+                                    std::memory_order_acquire);
+                                if (requested == ordinal &&
+                                    self->gated_fragment_probe_ack.load(std::memory_order_acquire) <
+                                        ordinal) {
+                                    const GatedFragmentPeerProbeResult result =
+                                        probe_gated_fragment_peer(client);
+                                    const u64 probe_ns = static_cast<u64>(
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+                                    self->gated_fragment_probe_result.store(
+                                        result, std::memory_order_relaxed);
+                                    self->gated_fragment_probe_ns.store(probe_ns,
+                                                                        std::memory_order_relaxed);
+                                    self->gated_fragment_probe_ack.store(ordinal,
+                                                                         std::memory_order_release);
+                                    if (result != GatedFragmentPeerProbeResult::Open) {
+                                        response_sent = false;
+                                        self->response_send_failed.store(true,
+                                                                         std::memory_order_release);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!response_sent) break;
                             usleep(1000);
                         }
-                        if (!self->running.load(std::memory_order_acquire) ||
+                        if (!response_sent) break;
+                        bool peer_open = true;
+                        if (self->probe_before_gated_fragment && part > 0u) {
+                            const u32 ordinal = part + 1u;
+                            peer_open =
+                                self->gated_fragment_probe_request.load(
+                                    std::memory_order_acquire) == ordinal &&
+                                self->gated_fragment_probe_ack.load(std::memory_order_acquire) ==
+                                    ordinal &&
+                                self->gated_fragment_probe_result.load(std::memory_order_relaxed) ==
+                                    GatedFragmentPeerProbeResult::Open &&
+                                probe_gated_fragment_peer(client) ==
+                                    GatedFragmentPeerProbeResult::Open;
+                        }
+                        if (!self->running.load(std::memory_order_acquire) || !peer_open ||
                             !send_all(client,
                                       self->response_fragment_bytes[part],
                                       self->response_fragment_lengths[part])) {
@@ -2626,7 +2698,9 @@ struct Recorder {
               gate_incomplete_response_close)) ||
             (permit_gated_incomplete_first_response &&
              (incomplete_first_response_fragment_count == 0u ||
-              incomplete_first_response_fragment_count > 4u)))
+              incomplete_first_response_fragment_count > 4u)) ||
+            (probe_before_gated_fragment && (!permit_gated_incomplete_first_response ||
+                                             incomplete_first_response_fragment_count < 2u)))
             return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
@@ -2681,6 +2755,11 @@ struct Recorder {
             response_fragments_sent.store(0, std::memory_order_relaxed);
             for (auto& sent_ns : response_fragment_sent_ns)
                 sent_ns.store(0, std::memory_order_relaxed);
+            gated_fragment_probe_request.store(0u, std::memory_order_relaxed);
+            gated_fragment_probe_ack.store(0u, std::memory_order_relaxed);
+            gated_fragment_probe_ns.store(0u, std::memory_order_relaxed);
+            gated_fragment_probe_result.store(GatedFragmentPeerProbeResult::None,
+                                              std::memory_order_relaxed);
             response_close_permit.store(false, std::memory_order_relaxed);
             response_closed_by_gate.store(false, std::memory_order_relaxed);
             response_close_failed.store(false, std::memory_order_relaxed);
@@ -2723,6 +2802,320 @@ struct Recorder {
 
     ~Recorder() { stop(); }
 };
+
+static bool run_gated_fragment_peer_probe_self_check(std::string& error) {
+    static constexpr char kRequest[] =
+        "GET /gated-fragment-probe HTTP/1.1\r\n"
+        "Host: fixture.example\r\n\r\n";
+    static constexpr char kFirst[] = "first";
+    static constexpr char kSecond[] = "second";
+
+    Recorder incompatible_mode;
+    incompatible_mode.probe_before_gated_fragment = true;
+    if (incompatible_mode.setup()) {
+        incompatible_mode.stop();
+        error = "gated-fragment peer probe accepted a non-gated response mode";
+        return false;
+    }
+    Recorder incompatible_count;
+    incompatible_count.permit_gated_incomplete_first_response = true;
+    incompatible_count.probe_before_gated_fragment = true;
+    incompatible_count.incomplete_first_response_fragment_count = 1u;
+    if (incompatible_count.setup()) {
+        incompatible_count.stop();
+        error = "gated-fragment peer probe accepted a one-fragment response";
+        return false;
+    }
+
+    const auto receive_exact =
+        [&](int fd, const char* expected, size_t expected_size, const char* label) {
+            std::vector<char> observed;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (observed.size() < expected_size) {
+                pollfd state{fd, POLLIN | POLLHUP | POLLERR, 0};
+                const int ready = poll(&state, 1, 10);
+                if (ready < 0) {
+                    if (errno == EINTR) continue;
+                    error = std::string(label) + " poll failed";
+                    return false;
+                }
+                if (ready == 0) {
+                    if (std::chrono::steady_clock::now() < deadline) continue;
+                    error = std::string(label) + " receive timed out";
+                    return false;
+                }
+                char bytes[32];
+                const ssize_t count = recv(fd, bytes, sizeof(bytes), 0);
+                if (count > 0) {
+                    observed.insert(observed.end(), bytes, bytes + count);
+                    if (observed.size() > expected_size) {
+                        error = std::string(label) + " received a tail";
+                        return false;
+                    }
+                    continue;
+                }
+                if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                    continue;
+                error = std::string(label) + " closed or failed before the exact bytes";
+                return false;
+            }
+            const std::vector<char> exact(expected, expected + expected_size);
+            if (observed != exact) {
+                error = std::string(label) + " bytes mismatched";
+                return false;
+            }
+            return true;
+        };
+
+    const auto observe_real_zero_tail_eof = [&](int fd, const char* label) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        u32 interrupted = 0u;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pollfd state{fd, POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&state, 1, 10);
+            if (ready < 0) {
+                if (errno == EINTR && interrupted++ < 8u) continue;
+                error = std::string(label) + " poll failed";
+                return false;
+            }
+            if (ready == 0) continue;
+            if ((state.revents & (POLLERR | POLLNVAL)) != 0) {
+                error = std::string(label) + " observed poll error instead of real EOF";
+                return false;
+            }
+            char byte = 0;
+            const ssize_t count = recv(fd, &byte, 1, MSG_DONTWAIT);
+            if (count == 0) return true;
+            if (count > 0) {
+                error = std::string(label) + " observed a response tail before EOF";
+                return false;
+            }
+            if (errno == EINTR && interrupted++ < 8u) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if ((state.revents & POLLHUP) != 0) {
+                    error = std::string(label) + " observed POLLHUP without recv EOF";
+                    return false;
+                }
+                continue;
+            }
+            if (errno == ECONNRESET) {
+                error = std::string(label) + " observed reset instead of real EOF";
+                return false;
+            }
+            error = std::string(label) + " recv failed before real EOF";
+            return false;
+        }
+        error = std::string(label) + " timed out before real EOF";
+        return false;
+    };
+
+    enum class SelfCheckCase {
+        ClosedAtAck,
+        CloseAfterOpenAck,
+        Open,
+    };
+    const auto run_case = [&](SelfCheckCase test_case) {
+        Recorder recorder;
+        recorder.permit_gated_incomplete_first_response = true;
+        recorder.probe_before_gated_fragment = true;
+        recorder.incomplete_first_response_fragment_count = 2u;
+        recorder.response_fragment_bytes[0] = kFirst;
+        recorder.response_fragment_lengths[0] = sizeof(kFirst) - 1u;
+        recorder.response_fragment_bytes[1] = kSecond;
+        recorder.response_fragment_lengths[1] = sizeof(kSecond) - 1u;
+        recorder.observe_extra_requests_until_stop = true;
+        if (!recorder.setup()) {
+            error = "gated-fragment peer probe recorder setup failed";
+            return false;
+        }
+
+        const auto live = [&]() {
+            return recorder.running.load(std::memory_order_acquire) &&
+                   recorder.thread_alive.load(std::memory_order_acquire) &&
+                   !recorder.listener_failed.load(std::memory_order_acquire);
+        };
+        const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!live() && std::chrono::steady_clock::now() < live_deadline) usleep(1000);
+        if (!live()) {
+            error = "gated-fragment peer probe recorder was not live";
+            return false;
+        }
+
+        int client = connect_once(recorder.port);
+        if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
+            if (client >= 0) close(client);
+            error = "gated-fragment peer probe client connect/send failed";
+            return false;
+        }
+        recorder.response_fragment_permit.store(1u, std::memory_order_release);
+        if (!receive_exact(client, kFirst, sizeof(kFirst) - 1u, "gated-fragment W1")) {
+            close(client);
+            return false;
+        }
+        const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u &&
+               std::chrono::steady_clock::now() < first_deadline)
+            usleep(1000);
+        if (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            recorder.gated_fragment_probe_request.load(std::memory_order_acquire) != 0u ||
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
+            recorder.gated_fragment_probe_ns.load(std::memory_order_acquire) != 0u ||
+            recorder.gated_fragment_probe_result.load(std::memory_order_acquire) !=
+                GatedFragmentPeerProbeResult::None) {
+            close(client);
+            error = "gated-fragment peer probe did not begin from neutral state";
+            return false;
+        }
+
+        if (test_case == SelfCheckCase::ClosedAtAck && shutdown(client, SHUT_WR) != 0) {
+            close(client);
+            error = "gated-fragment peer probe Closed-at-ack control could not half-close";
+            return false;
+        }
+        const u64 requested_ns =
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+        recorder.gated_fragment_probe_request.store(2u, std::memory_order_release);
+        const auto probe_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u &&
+               std::chrono::steady_clock::now() < probe_deadline) {
+            if (!live() || recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+                close(client);
+                error = "gated-fragment peer probe lost custody before acknowledgment";
+                return false;
+            }
+            usleep(1000);
+        }
+        const u32 ack = recorder.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        const u64 probe_ns = recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        const GatedFragmentPeerProbeResult result =
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        if (ack != 2u || probe_ns < requested_ns ||
+            recorder.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+            close(client);
+            error = "gated-fragment peer probe acknowledgment was incoherent";
+            return false;
+        }
+
+        if (test_case == SelfCheckCase::ClosedAtAck) {
+            if (result != GatedFragmentPeerProbeResult::Closed) {
+                close(client);
+                error = "gated-fragment peer probe did not classify the half-close as Closed";
+                return false;
+            }
+        } else if (result != GatedFragmentPeerProbeResult::Open) {
+            close(client);
+            error = "gated-fragment peer probe did not classify the live peer as Open";
+            return false;
+        }
+
+        if (test_case == SelfCheckCase::CloseAfterOpenAck) {
+            if (shutdown(client, SHUT_WR) != 0) {
+                close(client);
+                error = "gated-fragment peer probe post-Open control could not half-close";
+                return false;
+            }
+            poll(nullptr, 0, 10);
+        }
+        if (test_case != SelfCheckCase::ClosedAtAck)
+            recorder.response_fragment_permit.store(2u, std::memory_order_release);
+
+        if (test_case != SelfCheckCase::Open) {
+            const auto failure_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!recorder.response_send_failed.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < failure_deadline) {
+                if (recorder.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                    recorder.response_fragment_sent_ns[1].load(std::memory_order_acquire) != 0u ||
+                    recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+                    recorder.response_sent_open.load(std::memory_order_acquire)) {
+                    close(client);
+                    error = "gated-fragment peer probe failure control published W2";
+                    return false;
+                }
+                usleep(1000);
+            }
+            if (!recorder.response_send_failed.load(std::memory_order_acquire)) {
+                close(client);
+                error = "gated-fragment peer probe failure control did not settle";
+                return false;
+            }
+            if (!observe_real_zero_tail_eof(client, "gated-fragment failure control")) {
+                close(client);
+                return false;
+            }
+
+            const bool settled =
+                recorder.accepted.load(std::memory_order_acquire) == 1u &&
+                recorder.requests.load(std::memory_order_acquire) == 1u &&
+                recorder.response_fragment_permit.load(std::memory_order_acquire) ==
+                    (test_case == SelfCheckCase::ClosedAtAck ? 1u : 2u) &&
+                recorder.response_fragments_sent.load(std::memory_order_acquire) == 1u &&
+                recorder.response_fragment_sent_ns[0].load(std::memory_order_acquire) != 0u &&
+                recorder.response_fragment_sent_ns[1].load(std::memory_order_acquire) == 0u &&
+                recorder.response_send_all_calls.load(std::memory_order_acquire) == 0u &&
+                recorder.response_send_failed.load(std::memory_order_acquire) &&
+                !recorder.response_send_succeeded.load(std::memory_order_acquire) &&
+                !recorder.response_sent_open.load(std::memory_order_acquire) &&
+                recorder.gated_fragment_probe_request.load(std::memory_order_acquire) == 2u &&
+                recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
+                recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
+                recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) == result;
+            close(client);
+            recorder.stop();
+            const std::vector<char> exact_request(kRequest, kRequest + sizeof(kRequest) - 1u);
+            if (!settled || recorder.thread_alive.load(std::memory_order_acquire) ||
+                recorder.listen_fd >= 0 || recorder.history.size() != 1u ||
+                recorder.request != exact_request || recorder.history[0] != exact_request) {
+                error = "gated-fragment peer probe failure control lost settled evidence";
+                return false;
+            }
+            return true;
+        }
+
+        if (!receive_exact(client, kSecond, sizeof(kSecond) - 1u, "gated-fragment W2")) {
+            close(client);
+            return false;
+        }
+        const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while ((!recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+                !recorder.response_sent_open.load(std::memory_order_acquire)) &&
+               std::chrono::steady_clock::now() < second_deadline)
+            usleep(1000);
+        const bool completed =
+            recorder.response_fragments_sent.load(std::memory_order_acquire) == 2u &&
+            recorder.response_send_succeeded.load(std::memory_order_acquire) &&
+            recorder.response_sent_open.load(std::memory_order_acquire) &&
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) == 2u &&
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) == probe_ns &&
+            recorder.gated_fragment_probe_result.load(std::memory_order_relaxed) ==
+                GatedFragmentPeerProbeResult::Open;
+        (void)shutdown(client, SHUT_RDWR);
+        close(client);
+        const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!recorder.response_peer_closed.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < close_deadline)
+            usleep(1000);
+        const bool closed =
+            recorder.response_peer_closed.load(std::memory_order_acquire) &&
+            recorder.response_peer_close_count.load(std::memory_order_acquire) == 1u;
+        recorder.stop();
+        if (!completed || !closed || recorder.thread_alive.load(std::memory_order_acquire) ||
+            recorder.listen_fd >= 0 ||
+            recorder.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+            recorder.gated_fragment_probe_ns.load(std::memory_order_relaxed) != probe_ns) {
+            error = "gated-fragment peer probe open control lost completion/custody evidence";
+            return false;
+        }
+        return true;
+    };
+
+    return run_case(SelfCheckCase::ClosedAtAck) && run_case(SelfCheckCase::CloseAfterOpenAck) &&
+           run_case(SelfCheckCase::Open);
+}
 
 enum class TimeoutHeadPhase {
     ZeroProgressHold,
@@ -59916,6 +60309,490 @@ static bool run_pinned_nginx_default_buffering_206_range_completion_oracle(
     return true;
 }
 
+static bool run_pinned_nginx_default_buffering_206_range_delayed_completion_oracle(
+    TempDir& temp, const std::string& container_name, std::string& error) {
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+    static_assert(kDefaultBuffering206RangeOrigin[139] == 'h');
+    static_assert(kDefaultBuffering206RangeOrigin[140] == 'e');
+    static_assert(kDefaultBuffering206RangeOrigin[141] == 'l');
+    static_assert(kDefaultBuffering206RangeOrigin[142] == 'l');
+    static_assert(kDefaultBuffering206RangeOrigin[143] == 'o');
+
+    HeldLoopbackPorts reservations;
+    u16 ports[2]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = "#253 delayed 206 range oracle could not hold two distinct four-digit ports";
+            return false;
+        }
+    }
+
+    const std::string profile =
+        make_explicit_timeout_head_profile(ports[0], ports[1], temp.nginx_access_log);
+    const std::string nginx_config = "events {}\n" + profile;
+    if (!validate_explicit_timeout_head_profile(
+            profile, ports[0], ports[1], temp.nginx_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u ||
+        !write_file(temp.nginx_config, nginx_config.data(), nginx_config.size())) {
+        if (error.empty()) error = "#253 delayed 206 range oracle nginx input was not exact";
+        return false;
+    }
+
+    Recorder origin;
+    origin.permit_gated_incomplete_first_response = true;
+    origin.probe_before_gated_fragment = true;
+    origin.incomplete_first_response_fragment_count = 2u;
+    origin.response_fragment_bytes[0] = kDefaultBuffering206RangeOrigin;
+    origin.response_fragment_lengths[0] = 141u;
+    origin.response_fragment_bytes[1] = kDefaultBuffering206RangeOrigin + 141u;
+    origin.response_fragment_lengths[1] = 3u;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[1], ports[1], "#253 delayed 206 range origin bind", error) ||
+        !origin.setup(ports[1])) {
+        if (error.empty()) error = "#253 delayed 206 range origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = "#253 delayed 206 range origin was not live before nginx handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!handoff_held_loopback_port(
+            &reservations.fds[0], ports[0], "#253 delayed 206 range nginx bind", error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temp.nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "#253 delayed 206 range oracle could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], nginx.child, error)) {
+        error = "#253 delayed 206 range pinned nginx readiness failed: " + error;
+        return false;
+    }
+    const auto frontend_live = [&]() { return !poll_child(nginx.child); };
+
+    std::string pre_request_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, pre_request_access, error) ||
+        !pre_request_access.empty()) {
+        if (error.empty()) error = "#253 delayed 206 range access was not empty before the request";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    client.fd = connect_once(ports[0]);
+    const u64 request_send_ns = steady_now_ns();
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBuffering206RangeRequest,
+                                   sizeof(kDefaultBuffering206RangeRequest) - 1u)) {
+        error = "#253 delayed 206 range client could not send the exact 78-byte request";
+        return false;
+    }
+
+    const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access;
+        const u32 accepted = origin.accepted.load(std::memory_order_acquire);
+        const u32 requests = origin.requests.load(std::memory_order_acquire);
+        if (accepted > 1u || requests > 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_closed.load(std::memory_order_acquire) || !frontend_live() ||
+            !origin_live() ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty() || !observe_client_open_and_quiet_nonconsuming(client.fd, 5, error)) {
+            if (error.empty()) error = "#253 delayed 206 range pre-W1 custody failed";
+            return false;
+        }
+        if (accepted == 1u && requests == 1u) break;
+        if (std::chrono::steady_clock::now() >= request_deadline) {
+            error = "#253 delayed 206 range origin did not receive the exact request";
+            return false;
+        }
+        usleep(1000);
+    }
+
+    origin.response_fragment_permit.store(1u, std::memory_order_release);
+    const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (origin.response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+        if (origin.response_fragments_sent.load(std::memory_order_acquire) > 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) || !frontend_live() ||
+            !origin_live() || std::chrono::steady_clock::now() >= first_deadline) {
+            error = "#253 delayed 206 range W1 publication failed";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 first_write_ns = origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed);
+    if (first_write_ns < request_send_ns ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        origin.response_sent_open.load(std::memory_order_acquire)) {
+        error = "#253 delayed 206 range W1 timestamp/publication evidence was incoherent";
+        return false;
+    }
+
+    u64 pre_second_quiet_ns = 0u;
+    for (;;) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, detail)) {
+            error = "#253 delayed 206 range pre-W2 downstream quiet gate failed: " + detail;
+            return false;
+        }
+        pre_second_quiet_ns = steady_now_ns();
+        std::string access;
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            !access.empty()) {
+            if (error.empty()) error = "#253 delayed 206 range pre-W2 custody failed";
+            return false;
+        }
+        if (pre_second_quiet_ns >= first_write_ns + 750'000'000ull) {
+            error = "#253 delayed 206 range pre-W2 quiet witness missed its timing window";
+            return false;
+        }
+        if (pre_second_quiet_ns >= first_write_ns + 600'000'000ull) break;
+    }
+
+    origin.gated_fragment_probe_request.store(2u, std::memory_order_release);
+    for (;;) {
+        const u32 ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        if (ack == 2u) break;
+        if (ack > 2u || !frontend_live() || !origin_live() ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            steady_now_ns() >= first_write_ns + 750'000'000ull) {
+            error = "#253 delayed 206 range pre-W2 worker probe was not acknowledged in time";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 pre_second_origin_probe_ns =
+        origin.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+    const GatedFragmentPeerProbeResult pre_second_origin_probe_result =
+        origin.gated_fragment_probe_result.load(std::memory_order_relaxed);
+    if (pre_second_origin_probe_result != GatedFragmentPeerProbeResult::Open ||
+        pre_second_origin_probe_ns < pre_second_quiet_ns ||
+        pre_second_origin_probe_ns >= first_write_ns + 750'000'000ull ||
+        origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+        origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+        origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire)) {
+        error = "#253 delayed 206 range pre-W2 worker-owned peer-open evidence failed";
+        return false;
+    }
+
+    origin.response_fragment_permit.store(2u, std::memory_order_release);
+    const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        const u32 count = origin.response_fragments_sent.load(std::memory_order_acquire);
+        if (count > 2u || origin.response_send_failed.load(std::memory_order_acquire)) {
+            error = "#253 delayed 206 range W2 publication state was invalid";
+            return false;
+        }
+        if (count == 2u && origin.response_send_succeeded.load(std::memory_order_acquire) &&
+            origin.response_sent_open.load(std::memory_order_acquire))
+            break;
+        if (!frontend_live() || !origin_live() ||
+            std::chrono::steady_clock::now() >= second_deadline) {
+            error = "#253 delayed 206 range lost liveness awaiting W2";
+            return false;
+        }
+        usleep(1000);
+    }
+    const u64 second_write_ns = origin.response_fragment_sent_ns[1].load(std::memory_order_relaxed);
+    if (second_write_ns <= first_write_ns || second_write_ns - first_write_ns < 550'000'000ull ||
+        second_write_ns - first_write_ns >= 750'000'000ull ||
+        pre_second_quiet_ns - first_write_ns < 500'000'000ull ||
+        pre_second_origin_probe_ns < pre_second_quiet_ns ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 0u) {
+        error = "#253 delayed 206 range W1-to-W2 timing/publication evidence mismatch";
+        return false;
+    }
+
+    // Recorder timestamps delimit application publications only. They do not
+    // establish TCP packet, nginx read, or io_uring CQE boundaries.
+    std::vector<char> response;
+    u64 first_downstream_ns = 0u;
+    u64 full_downstream_ns = 0u;
+    u64 peer_close_ns = 0u;
+    const auto fail_observation = [&](const std::string& message) {
+        origin.stop();
+        error = message;
+        dump_wire("#253 delayed 206 range raw nginx response", response);
+        std::vector<char> normalized = response;
+        if (normalize_date(normalized))
+            dump_wire("#253 delayed 206 range Date-normalized nginx response", normalized);
+        if (!origin.history.empty())
+            dump_wire("#253 delayed 206 range raw upstream history", origin.history[0]);
+        std::cerr << "#253 delayed 206 range timestamps request/W1/pre-W2/probe/W2/first/full/"
+                     "peer(ns): "
+                  << request_send_ns << "/" << first_write_ns << "/" << pre_second_quiet_ns << "/"
+                  << pre_second_origin_probe_ns << "/" << second_write_ns << "/"
+                  << first_downstream_ns << "/" << full_downstream_ns << "/" << peer_close_ns
+                  << "\n";
+        return false;
+    };
+
+    const u64 prompt_deadline_ns = second_write_ns + 750'000'000ull;
+    while (response.size() < sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u) {
+        if (!frontend_live() || !origin_live() || steady_now_ns() >= prompt_deadline_ns) {
+            return fail_observation(
+                "#253 delayed 206 range response missed the W2+750ms prompt budget");
+        }
+        pollfd poll_state{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&poll_state, 1, 5);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return fail_observation("#253 delayed 206 range downstream poll failed");
+        }
+        if (ready == 0) continue;
+        char bytes[512];
+        const ssize_t count = recv(client.fd, bytes, sizeof(bytes), 0);
+        const u64 observed_ns = steady_now_ns();
+        if (count > 0) {
+            if (first_downstream_ns == 0u) first_downstream_ns = observed_ns;
+            response.insert(response.end(), bytes, bytes + count);
+            if (response.size() > sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u)
+                return fail_observation("#253 delayed 206 range downstream included tail bytes");
+            if (response.size() == sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u)
+                full_downstream_ns = observed_ns;
+        } else if (count == 0) {
+            return fail_observation(
+                "#253 delayed 206 range downstream closed instead of staying keep-alive");
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return fail_observation("#253 delayed 206 range downstream recv failed");
+        }
+    }
+
+    while (!origin.response_peer_closed.load(std::memory_order_acquire)) {
+        if (!frontend_live() || !origin_live() ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            steady_now_ns() >= prompt_deadline_ns) {
+            return fail_observation(
+                "#253 delayed 206 range origin was not actively closed before W2+750ms");
+        }
+        usleep(1000);
+    }
+    peer_close_ns = origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (first_downstream_ns < second_write_ns || full_downstream_ns < first_downstream_ns ||
+        peer_close_ns < second_write_ns || first_downstream_ns >= prompt_deadline_ns ||
+        full_downstream_ns >= prompt_deadline_ns || peer_close_ns >= prompt_deadline_ns) {
+        return fail_observation("#253 delayed 206 range prompt timing missed its strict windows");
+    }
+
+    std::vector<char> normalized = response;
+    const std::vector<char> expected_response(
+        kDefaultBuffering206RangeResponseNormalized,
+        kDefaultBuffering206RangeResponseNormalized +
+            sizeof(kDefaultBuffering206RangeResponseNormalized) - 1u);
+    if (!normalize_date(normalized) || normalized != expected_response ||
+        header_end(normalized) + 5u != normalized.size()) {
+        return fail_observation(
+            "#253 delayed 206 range exact normalized 168-byte response mismatch");
+    }
+    const std::string response_text(normalized.begin(), normalized.end());
+    if (count_text(response_text, "HTTP/1.1 206 Partial Content\r\n") != 1u ||
+        count_text(response_text, "Content-Range: bytes 0-4/12\r\n") != 1u ||
+        count_text(response_text, "Content-Length: 5\r\n") != 1u ||
+        count_text(response_text, "Connection: keep-alive\r\n") != 1u ||
+        response_text.compare(header_end(normalized), 5u, "hello") != 0 ||
+        response_text.find("HTTP/1.1 200") != std::string::npos ||
+        response_text.find("HTTP/1.1 201") != std::string::npos ||
+        response_text.find("HTTP/1.1 202") != std::string::npos ||
+        response_text.find("HTTP/1.1 204") != std::string::npos ||
+        response_text.find("HTTP/1.1 304") != std::string::npos ||
+        response_text.find("502") != std::string::npos ||
+        response_text.find("504") != std::string::npos ||
+        response_text.find("Bad Gateway") != std::string::npos ||
+        response_text.find("Gateway Time-out") != std::string::npos) {
+        return fail_observation("#253 delayed 206 range response lost metadata or leaked bytes");
+    }
+
+    static constexpr char kExpectedAccess[] = "78\n";
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        std::string access;
+        if (!read_request_length_access_file(temp.nginx_access_log, access, error)) return false;
+        if (access == kExpectedAccess) break;
+        if ((!access.empty() && access != kExpectedAccess) || !frontend_live() || !origin_live() ||
+            std::chrono::steady_clock::now() >= access_deadline) {
+            error = "#253 delayed 206 range live access was not exact `78\\n`";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        std::string access;
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != kExpectedAccess) {
+            if (error.empty()) error = "#253 delayed 206 range no-retry gate failed";
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    const u64 keepalive_horizon_ns = second_write_ns + 1'250'000'000ull;
+    for (;;) {
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, detail)) {
+            return fail_observation("#253 delayed 206 range downstream changed before W2+1.25s: " +
+                                    detail);
+        }
+        const u64 post_probe_ns = steady_now_ns();
+        std::string access;
+        if (!frontend_live() || !origin_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != kExpectedAccess) {
+            if (error.empty()) error = "#253 delayed 206 range keep-alive/no-retry custody failed";
+            return false;
+        }
+        if (post_probe_ns >= keepalive_horizon_ns) break;
+    }
+    std::string final_quiet_detail;
+    if (!observe_client_open_and_quiet_nonconsuming(client.fd, 5, final_quiet_detail)) {
+        return fail_observation("#253 delayed 206 range final keep-alive probe failed: " +
+                                final_quiet_detail);
+    }
+    const u64 final_quiet_ns = steady_now_ns();
+    std::string final_live_access;
+    if (final_quiet_ns < keepalive_horizon_ns || !frontend_live() || !origin_live() ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !read_request_length_access_file(temp.nginx_access_log, final_live_access, error) ||
+        final_live_access != kExpectedAccess) {
+        if (error.empty()) error = "#253 delayed 206 range final keep-alive/access boundary failed";
+        return false;
+    }
+
+    close(client.fd);
+    client.fd = -1;
+    std::string post_client_access;
+    if (!read_request_length_access_file(temp.nginx_access_log, post_client_access, error) ||
+        post_client_access != kExpectedAccess) {
+        if (error.empty()) error = "#253 delayed 206 range access changed after client close";
+        return false;
+    }
+
+    const bool origin_live_before_stop = origin_live();
+    origin.stop();
+    const std::string expected_upstream_text =
+        "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(ports[1]) +
+        "\r\nRange: bytes=0-4\r\n\r\n";
+    const std::vector<char> expected_upstream(expected_upstream_text.begin(),
+                                              expected_upstream_text.end());
+    const std::string observed_upstream(origin.request.begin(), origin.request.end());
+    if (!origin_live_before_stop || expected_upstream.size() != 78u ||
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        origin.listener_failed.load(std::memory_order_acquire) ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.history[0] != expected_upstream || origin.request != expected_upstream ||
+        observed_upstream.find("Host: client.example") != std::string::npos ||
+        observed_upstream.find("\r\nConnection:") != std::string::npos ||
+        count_text(observed_upstream, "Range: bytes=0-4\r\n") != 1u ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+        origin.response_fragments_sent.load(std::memory_order_acquire) != 2u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_sent_open.load(std::memory_order_acquire) ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire)) {
+        error = "#253 delayed 206 range exact upstream/origin lifecycle evidence mismatch";
+        dump_wire("#253 delayed 206 range expected upstream", expected_upstream);
+        dump_wire("#253 delayed 206 range observed upstream", origin.request);
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    std::string final_access;
+    if (!nginx_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 ||
+        !read_request_length_access_file(temp.nginx_access_log, final_access, error) ||
+        final_access != kExpectedAccess) {
+        if (error.empty()) error = "#253 delayed 206 range final cleanup/access failed";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #253 pinned delayed 206 range W1-to-W2/"
+                 "W2-to-first/full/peer-close seconds="
+              << static_cast<double>(second_write_ns - first_write_ns) / 1e9 << "/"
+              << static_cast<double>(first_downstream_ns - second_write_ns) / 1e9 << "/"
+              << static_cast<double>(full_downstream_ns - second_write_ns) / 1e9 << "/"
+              << static_cast<double>(peer_close_ns - second_write_ns) / 1e9 << "\n";
+    return true;
+}
+
 static bool run_converter_default_buffering_304_content_length_metadata_differential(
     const char* rut_path, const std::string& container_name, std::string& error) {
     static constexpr char kDiagnostic[] = "#529 paired 304 metadata";
@@ -63840,6 +64717,10 @@ int main(int argc, char** argv) {
     const bool pinned_nginx_default_buffering_206_range_completion_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-default-buffering-206-range-completion-oracle") == 0;
+    const bool pinned_nginx_default_buffering_206_range_delayed_completion_oracle =
+        argc == 2 &&
+        strcmp(argv[1], "--pinned-nginx-default-buffering-206-range-delayed-completion-oracle") ==
+            0;
     const bool pinned_positive_cl_options_default_buffering_oracle =
         argc == 2 &&
         strcmp(argv[1], "--pinned-nginx-positive-cl-options-default-buffering-oracle") == 0;
@@ -63850,6 +64731,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
     const bool zero_response_stall_self_check =
         argc == 2 && strcmp(argv[1], "--zero-response-stall-self-check") == 0;
+    const bool gated_fragment_peer_probe_self_check =
+        argc == 2 && strcmp(argv[1], "--gated-fragment-peer-probe-self-check") == 0;
     const bool wildcard_listen_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-wildcard-listen-oracle") == 0;
     const bool asterisk_wildcard_listen_oracle =
@@ -64042,7 +64925,7 @@ int main(int argc, char** argv) {
          !converter_proxy_hide_header_differential &&
          !pinned_positive_cl_options_default_buffering_oracle &&
          !pinned_positive_cl_head_default_buffering_oracle && !pinned_nginx_lifecycle_self_check &&
-         !zero_response_stall_self_check &&
+         !zero_response_stall_self_check && !gated_fragment_peer_probe_self_check &&
          !converter_default_buffering_positive_get_differential &&
          !converter_default_buffering_incomplete_clean_eof_differential &&
          !converter_default_buffering_incomplete_body_inactivity_expiry_differential &&
@@ -64058,11 +64941,13 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_201_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_202_incomplete_body_inactivity_expiry_oracle &&
          !pinned_nginx_default_buffering_304_content_length_metadata_oracle &&
-         !pinned_nginx_default_buffering_206_range_completion_oracle && !wildcard_listen_oracle &&
-         !asterisk_wildcard_listen_oracle && !exact_loopback_listen_oracle &&
-         !request_length_oracle && !request_length_split_header_oracle &&
-         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
-         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
+         !pinned_nginx_default_buffering_206_range_completion_oracle &&
+         !pinned_nginx_default_buffering_206_range_delayed_completion_oracle &&
+         !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
+         !exact_loopback_listen_oracle && !request_length_oracle &&
+         !request_length_split_header_oracle && !rut_initial_header_split_public &&
+         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
+         !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -64295,11 +65180,14 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential "
                "--pinned-nginx-default-buffering-206-range-completion-oracle\n"
                "   or: test_nginx_differential "
+               "--pinned-nginx-default-buffering-206-range-delayed-completion-oracle\n"
+               "   or: test_nginx_differential "
                "--pinned-nginx-positive-cl-options-default-buffering-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-positive-cl-head-default-buffering-oracle\n"
                "   or: test_nginx_differential --pinned-nginx-lifecycle-self-check\n"
                "   or: test_nginx_differential --zero-response-stall-self-check\n"
+               "   or: test_nginx_differential --gated-fragment-peer-probe-self-check\n"
                "   or: test_nginx_differential --pinned-nginx-wildcard-listen-oracle\n"
                "   or: test_nginx_differential "
                "--pinned-nginx-asterisk-wildcard-listen-oracle\n"
@@ -64586,6 +65474,18 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: zero-response origin stall accepted one complete request, emitted "
                      "no bytes, observed one peer close, and retained then retired its listener\n";
+        return 0;
+    }
+    if (gated_fragment_peer_probe_self_check) {
+        std::string probe_error;
+        if (!run_gated_fragment_peer_probe_self_check(probe_error)) {
+            std::cerr << "FAIL [gated-fragment peer probe self-check]: " << probe_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: gated-fragment worker-owned peer probe rejected Closed-at-ack and "
+               "close-after-Open-ack controls with real zero-tail EOF and no W2, and published "
+               "the exact W2 only for the live Open control\n";
         return 0;
     }
     if (explicit_timeout_head_generated_episode) {
@@ -65826,6 +66726,38 @@ int main(int argc, char** argv) {
                "publication timestamp is not a TCP/read boundary. This pins nginx semantics "
                "only; it makes no generated-RUT, converter-equivalence, runtime-capability, "
                "incomplete/other Range, retry/reuse/pipeline, TLS/H2/epoll, or broad #253 claim.\n";
+        return 0;
+    }
+    if (pinned_nginx_default_buffering_206_range_delayed_completion_oracle) {
+        const std::string container_name = "rut-nginx-253-delayed-206-range-oracle-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string oracle_error;
+        if (!run_pinned_nginx_default_buffering_206_range_delayed_completion_oracle(
+                temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#253 pinned nginx delayed default-buffering 206 range completion "
+                         "oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#253 delayed 206 range nginx config");
+            dump_log(temp.nginx_access_log, "#253 delayed 206 range nginx access log");
+            dump_log(temp.nginx_log, "#253 delayed 206 range nginx process log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: #253 pinned nginx 1.29.7 nginx-only oracle proves one exact 78-byte single "
+               "Range GET through a root no-URI proxy with explicit proxy_read_timeout 1s and "
+               "omitted buffering/request-buffering/http-version/header overrides. The "
+               "application-open origin publishes the coherent 206/Content-Range/CL5 response "
+               "as one exact 141-byte header-plus-he prefix and exact 3-byte llo completion "
+               "separated by 550-750ms. nginx withholds all downstream bytes through the final "
+               "pre-W2 quiet probe, then promptly emits the exact Date-normalized 168-byte "
+               "bodyful keep-alive response and actively retires the origin. Downstream remains "
+               "open and byte-quiet past W2+1.25s until deliberate client close. One exact "
+               "authority-rewritten 78-byte upstream request preserving Range, two publications, "
+               "exact `78\\n` access and no retry are proven. Application-publication timestamps "
+               "are not TCP/read/CQE boundaries. This pins nginx semantics only; it makes no "
+               "generated-RUT, converter-equivalence, runtime-capability, incomplete/other Range, "
+               "retry/reuse/pipeline/successor, TLS/H2/epoll, or broad #253 claim.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_304_content_length_metadata_oracle) {
