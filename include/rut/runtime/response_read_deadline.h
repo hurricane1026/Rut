@@ -115,7 +115,7 @@ inline bool response_read_deadline_fixed_upload_profile_method_admitted(
 inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method);
 
 inline bool complete_content_length_response_status_is_admitted(u16 status) {
-    return status == 200 || status == 201;
+    return status == 200 || status == 201 || status == 202;
 }
 
 struct CompleteContentLengthContentTypeView {
