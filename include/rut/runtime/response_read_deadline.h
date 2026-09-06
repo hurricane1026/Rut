@@ -180,10 +180,14 @@ inline CompleteContentLengthResponseClassification classify_complete_content_len
 
     u32 position = 6;
     if (!complete_content_length_parse_u64(content_range, &position, &classification.first) ||
-        position >= content_range.len || content_range.ptr[position++] != '-' ||
-        !complete_content_length_parse_u64(content_range, &position, &classification.last) ||
-        position >= content_range.len || content_range.ptr[position++] != '/' ||
-        !complete_content_length_parse_u64(content_range, &position, &classification.total) ||
+        position >= content_range.len || content_range.ptr[position] != '-')
+        return {};
+    ++position;
+    if (!complete_content_length_parse_u64(content_range, &position, &classification.last) ||
+        position >= content_range.len || content_range.ptr[position] != '/')
+        return {};
+    ++position;
+    if (!complete_content_length_parse_u64(content_range, &position, &classification.total) ||
         position != content_range.len || classification.first > classification.last ||
         classification.last >= classification.total ||
         classification.last - classification.first !=
@@ -239,12 +243,13 @@ inline bool complete_content_length_pinned_header_matches(
     ParsedResponse parsed;
     parser.reset();
     parsed.reset();
-    CompleteContentLengthResponseClassification classification{};
     if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
             ParseStatus::Complete ||
-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11 ||
-        (classification = classify_complete_content_length_response(parsed)).response_class ==
-            CompleteContentLengthResponseClass::Unsupported ||
+        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+        return false;
+    const CompleteContentLengthResponseClassification classification =
+        classify_complete_content_length_response(parsed);
+    if (classification.response_class == CompleteContentLengthResponseClass::Unsupported ||
         parsed.status_code != c.resp_status || parsed.content_length_count != 1 || parsed.chunked ||
         parsed.headers_truncated || parsed.content_length != declared_body)
         return false;
