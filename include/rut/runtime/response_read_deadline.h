@@ -2050,6 +2050,12 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool collecting = c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::Buffering;
+    const bool incomplete_coherent_range_selection =
+        complete_buffering && !collecting &&
+        c.response_read_deadline_post_commit_response_class ==
+            CompleteContentLengthResponseClass::CoherentSingleRange206 &&
+        c.response_read_deadline_post_commit_origin_received <
+            c.response_read_deadline_post_commit_declared_body;
     if (complete_buffering) {
         if (!complete_content_length_route_method_is_admitted(
                 c.response_read_deadline_route_method) ||
@@ -2065,6 +2071,22 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                   c.response_read_deadline_post_commit_declared_body ||
               c.response_read_deadline_post_commit_origin_received !=
                   c.response_read_deadline_post_commit_declared_body)))
+            return false;
+        if (incomplete_coherent_range_selection &&
+            (c.response_read_deadline_post_commit_send_body == 0 ||
+             c.response_read_deadline_post_commit_send_body !=
+                 c.response_read_deadline_post_commit_origin_received ||
+             !c.response_read_deadline_post_commit_close_after_drain ||
+             c.response_read_deadline_profile !=
+                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+             c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
+             c.response_read_deadline_route_method != kRouteMethodGet ||
+             c.req_method != static_cast<u8>(LogHttpMethod::Get) || c.pipeline_depth != 0 ||
+             c.http1_pipeline_request_generation != 0 || c.pipeline_stash_len != 0 ||
+             c.response_read_deadline_upload.downstream_close ||
+             c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+             c.response_read_deadline_upload.request_policy_id != c.request_policy_id ||
+             !response_read_deadline_default_persistence_is_stable(c)))
             return false;
     } else if (c.response_read_deadline_post_commit_send_body != 0 ||
                c.response_read_deadline_post_commit_close_after_drain) {
