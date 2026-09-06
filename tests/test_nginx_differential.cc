@@ -57984,6 +57984,20 @@ static bool run_converter_default_buffering_second_body_progress_refresh_differe
         dump_log(temps[1].rut_log, "#271 second-body-progress RUT log");
         return false;
     }
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temps[1].rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = "#271 second-body-progress RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (poll_child(frontends[1].child) ||
+        !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = "#271 second-body-progress generated RUT lacked io_uring readiness";
+        return false;
+    }
     const auto frontends_live = [&]() {
         return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
     };
