@@ -118,6 +118,92 @@ inline bool complete_content_length_response_status_is_admitted(u16 status) {
     return status == 200 || status == 201 || status == 202;
 }
 
+struct CompleteContentLengthResponseClassification {
+    CompleteContentLengthResponseClass response_class =
+        CompleteContentLengthResponseClass::Unsupported;
+    u64 first = 0;
+    u64 last = 0;
+    u64 total = 0;
+};
+
+inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out) {
+    if (position == nullptr || out == nullptr || value.ptr == nullptr || *position >= value.len)
+        return false;
+    u64 parsed = 0;
+    u32 cursor = *position;
+    const u32 first_digit = cursor;
+    while (cursor < value.len) {
+        const u8 byte = static_cast<u8>(value.ptr[cursor]);
+        if (byte < '0' || byte > '9') break;
+        const u64 digit = byte - '0';
+        if (parsed > (UINT64_MAX - digit) / 10u) return false;
+        parsed = parsed * 10u + digit;
+        ++cursor;
+    }
+    if (cursor == first_digit) return false;
+    *position = cursor;
+    *out = parsed;
+    return true;
+}
+
+inline CompleteContentLengthResponseClassification classify_complete_content_length_response(
+    const ParsedResponse& response) {
+    CompleteContentLengthResponseClassification classification{};
+    if (response.version != HttpVersion::Http11 || response.headers_truncated ||
+        !response.has_content_length || response.content_length_count != 1 ||
+        response.content_length == 0 || response.chunked)
+        return classification;
+    if (complete_content_length_response_status_is_admitted(response.status_code)) {
+        classification.response_class = CompleteContentLengthResponseClass::BoundedPositiveBody;
+        return classification;
+    }
+    if (response.status_code != 206) return classification;
+
+    Str content_range{};
+    u32 content_range_count = 0;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const Header& header = response.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "transfer-encoding", 17))
+            return classification;
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12) &&
+            header.value.len >= 10 &&
+            http_header_name_eq_ci(header.value.ptr, 10, "multipart/", 10))
+            return classification;
+        if (!http_header_name_eq_ci(header.name.ptr, header.name.len, "content-range", 13))
+            continue;
+        if (++content_range_count > 1) return classification;
+        content_range = header.value;
+    }
+    if (content_range_count != 1 || content_range.ptr == nullptr || content_range.len < 10 ||
+        !http_header_name_eq_ci(content_range.ptr, 5, "bytes", 5) || content_range.ptr[5] != ' ')
+        return classification;
+
+    u32 position = 6;
+    if (!complete_content_length_parse_u64(content_range, &position, &classification.first) ||
+        position >= content_range.len || content_range.ptr[position] != '-')
+        return {};
+    ++position;
+    if (!complete_content_length_parse_u64(content_range, &position, &classification.last) ||
+        position >= content_range.len || content_range.ptr[position] != '/')
+        return {};
+    ++position;
+    if (!complete_content_length_parse_u64(content_range, &position, &classification.total) ||
+        position != content_range.len || classification.first > classification.last ||
+        classification.last >= classification.total ||
+        classification.last - classification.first !=
+            static_cast<u64>(response.content_length) - 1u)
+        return {};
+    classification.response_class = CompleteContentLengthResponseClass::CoherentSingleRange206;
+    return classification;
+}
+
+inline bool complete_content_length_response_classification_equal(
+    const CompleteContentLengthResponseClassification& a,
+    const CompleteContentLengthResponseClassification& b) {
+    return a.response_class == b.response_class && a.first == b.first && a.last == b.last &&
+           a.total == b.total;
+}
+
 struct CompleteContentLengthContentTypeView {
     u32 count = 0;
     Str value{};
@@ -145,7 +231,10 @@ inline bool complete_content_length_content_type_view(const ParsedResponse& resp
     return true;
 }
 
-inline bool complete_content_length_pinned_header_matches(const Connection& c, u32 declared_body) {
+inline bool complete_content_length_pinned_header_matches(
+    const Connection& c,
+    u32 declared_body,
+    CompleteContentLengthResponseClassification* out_classification = nullptr) {
     if (c.request_config == nullptr ||
         !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
         c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0)
@@ -156,8 +245,11 @@ inline bool complete_content_length_pinned_header_matches(const Connection& c, u
     parsed.reset();
     if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
             ParseStatus::Complete ||
-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11 ||
-        !complete_content_length_response_status_is_admitted(parsed.status_code) ||
+        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+        return false;
+    const CompleteContentLengthResponseClassification classification =
+        classify_complete_content_length_response(parsed);
+    if (classification.response_class == CompleteContentLengthResponseClass::Unsupported ||
         parsed.status_code != c.resp_status || parsed.content_length_count != 1 || parsed.chunked ||
         parsed.headers_truncated || parsed.content_length != declared_body)
         return false;
@@ -191,12 +283,16 @@ inline bool complete_content_length_pinned_header_matches(const Connection& c, u
                 return false;
         }
     }
-    return server_count == 1 && connection_count == 1;
+    if (server_count != 1 || connection_count != 1) return false;
+    if (out_classification != nullptr) *out_classification = classification;
+    return true;
 }
 
-inline bool complete_content_length_raw_origin_matches_pinned(const Connection& c,
-                                                              u32 raw_header_end,
-                                                              u32 declared_body) {
+inline bool complete_content_length_raw_origin_matches_pinned(
+    const Connection& c,
+    u32 raw_header_end,
+    u32 declared_body,
+    CompleteContentLengthResponseClassification* out_classification = nullptr) {
     if (raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
         !complete_content_length_pinned_header_matches(c, declared_body))
         return false;
@@ -208,7 +304,6 @@ inline bool complete_content_length_raw_origin_matches_pinned(const Connection& 
     if (raw_parser.parse(c.upstream_recv_buf.data(), raw_header_end, &raw) !=
             ParseStatus::Complete ||
         raw_parser.header_end != raw_header_end || raw.version != HttpVersion::Http11 ||
-        !complete_content_length_response_status_is_admitted(raw.status_code) ||
         raw.status_code != c.resp_status || raw.content_length_count != 1 ||
         !raw.has_content_length || raw.chunked || raw.headers_truncated ||
         raw.content_length != declared_body)
@@ -225,6 +320,14 @@ inline bool complete_content_length_raw_origin_matches_pinned(const Connection& 
         (raw.reason.len != 0 &&
          __builtin_memcmp(raw.reason.ptr, pinned.reason.ptr, raw.reason.len) != 0))
         return false;
+    const CompleteContentLengthResponseClassification raw_classification =
+        classify_complete_content_length_response(raw);
+    const CompleteContentLengthResponseClassification pinned_classification =
+        classify_complete_content_length_response(pinned);
+    if (raw_classification.response_class == CompleteContentLengthResponseClass::Unsupported ||
+        !complete_content_length_response_classification_equal(raw_classification,
+                                                               pinned_classification))
+        return false;
     CompleteContentLengthContentTypeView raw_content_type{};
     CompleteContentLengthContentTypeView pinned_content_type{};
     if (!complete_content_length_content_type_view(raw, false, &raw_content_type) ||
@@ -232,19 +335,31 @@ inline bool complete_content_length_raw_origin_matches_pinned(const Connection& 
         return false;
     const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
     static constexpr Str kContentTypeName{"Content-Type", 12};
-    if (response_policy_hides_header(policy, kContentTypeName))
-        return pinned_content_type.count == 0;
-    if (raw_content_type.count != pinned_content_type.count) return false;
-    return raw_content_type.count == 0 ||
-           (raw_content_type.value.len == pinned_content_type.value.len &&
-            __builtin_memcmp(raw_content_type.value.ptr,
-                             pinned_content_type.value.ptr,
-                             raw_content_type.value.len) == 0);
+    const bool content_type_matches =
+        response_policy_hides_header(policy, kContentTypeName)
+            ? pinned_content_type.count == 0
+            : raw_content_type.count == pinned_content_type.count &&
+                  (raw_content_type.count == 0 ||
+                   (raw_content_type.value.len == pinned_content_type.value.len &&
+                    __builtin_memcmp(raw_content_type.value.ptr,
+                                     pinned_content_type.value.ptr,
+                                     raw_content_type.value.len) == 0));
+    if (!content_type_matches) return false;
+    if (out_classification != nullptr) *out_classification = raw_classification;
+    return true;
 }
 
 inline bool complete_content_length_pinned_header_is_stable(const Connection& c) {
-    return complete_content_length_pinned_header_matches(
-        c, c.response_read_deadline_post_commit_declared_body);
+    CompleteContentLengthResponseClassification classification{};
+    if (!complete_content_length_pinned_header_matches(
+            c, c.response_read_deadline_post_commit_declared_body, &classification))
+        return false;
+    const CompleteContentLengthResponseClassification saved{
+        c.response_read_deadline_post_commit_response_class,
+        c.response_read_deadline_post_commit_range_first,
+        c.response_read_deadline_post_commit_range_last,
+        c.response_read_deadline_post_commit_range_total};
+    return complete_content_length_response_classification_equal(classification, saved);
 }
 
 inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadlineUploadProof& a,

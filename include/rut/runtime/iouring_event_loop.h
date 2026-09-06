@@ -3291,6 +3291,7 @@ public:
                                                                const IoEvent& ev,
                                                                u32 raw_header_end,
                                                                u32 declared_body) {
+        CompleteContentLengthResponseClassification classification{};
         if (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None ||
@@ -3311,7 +3312,8 @@ public:
             declared_body > c.upstream_recv_buf.capacity() - raw_header_end ||
             c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
             c.response_header_buf.len() > c.response_header_buf.capacity() ||
-            !complete_content_length_raw_origin_matches_pinned(c, raw_header_end, declared_body))
+            !complete_content_length_raw_origin_matches_pinned(
+                c, raw_header_end, declared_body, &classification))
             return false;
         const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
         if (initial_body > declared_body) return false;
@@ -3334,6 +3336,10 @@ public:
         c.response_read_deadline_post_commit_episode = c.upstream_episode;
         c.response_read_deadline_post_commit_raw_header_end = raw_header_end;
         c.response_read_deadline_post_commit_declared_body = declared_body;
+        c.response_read_deadline_post_commit_response_class = classification.response_class;
+        c.response_read_deadline_post_commit_range_first = classification.first;
+        c.response_read_deadline_post_commit_range_last = classification.last;
+        c.response_read_deadline_post_commit_range_total = classification.total;
         c.response_read_deadline_post_commit_origin_received = initial_body;
         c.response_read_deadline_post_commit_downstream_submitted = 0;
         c.response_read_deadline_post_commit_downstream_completed = 0;
@@ -3397,6 +3403,11 @@ public:
              c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending) ||
             !response_read_deadline_post_commit_is_stable(c) ||
             body_to_send > c.response_read_deadline_post_commit_origin_received ||
+            (c.response_read_deadline_post_commit_response_class ==
+                 CompleteContentLengthResponseClass::CoherentSingleRange206 &&
+             (body_to_send != c.response_read_deadline_post_commit_declared_body ||
+              c.response_read_deadline_post_commit_origin_received !=
+                  c.response_read_deadline_post_commit_declared_body)) ||
             (!close_after_drain &&
              (body_to_send != c.response_read_deadline_post_commit_declared_body ||
               body_to_send != c.response_read_deadline_post_commit_origin_received)))

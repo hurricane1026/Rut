@@ -27821,7 +27821,23 @@ TEST(iouring_upstream_recv, response_deadline_neutrality_inventory_is_exhaustive
                                                         reject_each);
     ResponseReadDeadlineUploadProof::visit_owner_fields(
         conn.response_read_deadline_first_batch_upload, reject_each);
-    CHECK_EQ(fields_tested, 68u);
+    CHECK_EQ(fields_tested, 72u);
+
+    conn.response_read_deadline_post_commit_response_class =
+        CompleteContentLengthResponseClass::CoherentSingleRange206;
+    CHECK_FALSE(conn.response_read_deadline_connected_auxiliary_owners_are_neutral());
+    conn.response_read_deadline_post_commit_response_class =
+        CompleteContentLengthResponseClass::Unsupported;
+    conn.response_read_deadline_post_commit_range_first = 1;
+    CHECK_FALSE(conn.response_read_deadline_connected_auxiliary_owners_are_neutral());
+    conn.response_read_deadline_post_commit_range_first = 0;
+    conn.response_read_deadline_post_commit_range_last = 1;
+    CHECK_FALSE(conn.response_read_deadline_connected_auxiliary_owners_are_neutral());
+    conn.response_read_deadline_post_commit_range_last = 0;
+    conn.response_read_deadline_post_commit_range_total = 1;
+    CHECK_FALSE(conn.response_read_deadline_connected_auxiliary_owners_are_neutral());
+    conn.response_read_deadline_post_commit_range_total = 0;
+    REQUIRE(conn.response_read_deadline_connected_auxiliary_owners_are_neutral());
 
     // The same canonical inventory drives both clear paths, including the
     // separately-lived send-close owner that clear_response_read_deadline()
@@ -46822,6 +46838,403 @@ TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exa
                              static_cast<u16>(400),
                              static_cast<u16>(500)})
         CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
+}
+
+static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
+                                          IoUringEventLoop* loop,
+                                          Connection& conn,
+                                          bool cancel_first);
+
+TEST(response_buffering_runtime, coherent_single_range_206_classifier_is_exact) {
+    const auto classify = [](const std::string& wire) {
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        if (parser.parse(reinterpret_cast<const u8*>(wire.data()),
+                         static_cast<u32>(wire.size()),
+                         &response) != ParseStatus::Complete)
+            return CompleteContentLengthResponseClassification{};
+        return classify_complete_content_length_response(response);
+    };
+
+    for (const std::string& wire : {
+             std::string("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+                         "Content-Length: 5\r\n\r\nhello"),
+             std::string("HTTP/1.1 206 Partial Content\r\ncOnTeNt-RaNgE: ByTeS 7-11/20\r\n"
+                         "Content-Length: 5\r\n\r\nhello"),
+             std::string("HTTP/1.1 206 Partial Content\r\n"
+                         "Content-Range: bytes 18446744073709551610-"
+                         "18446744073709551614/18446744073709551615\r\n"
+                         "Content-Length: 5\r\n\r\nhello"),
+         }) {
+        const CompleteContentLengthResponseClassification classification = classify(wire);
+        REQUIRE_EQ(classification.response_class,
+                   CompleteContentLengthResponseClass::CoherentSingleRange206);
+        CHECK_EQ(classification.last - classification.first, 4u);
+        CHECK_GT(classification.total, classification.last);
+    }
+
+    static constexpr const char* kInvalid[] = {
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/*\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12, 7-8/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "content-range: bytes 0-4/12\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes=0-4/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes  0-4/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes -4/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes */12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-4/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 8-12/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/12\r\n"
+        "Content-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Content-Range: bytes 18446744073709551616-18446744073709551620/"
+        "18446744073709551621\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 0\r\n\r\n",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 5\r\nTransfer-Encoding: gzip\r\n\r\nhello",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 5\r\nContent-Type: multipart/byteranges; boundary=x\r\n\r\nhello",
+    };
+    for (const char* wire : kInvalid) {
+        CHECK_EQ(classify(wire).response_class, CompleteContentLengthResponseClass::Unsupported);
+    }
+
+    const CompleteContentLengthResponseClassification ordinary =
+        classify("HTTP/1.1 202 Accepted\r\nContent-Length: 5\r\n\r\nhello");
+    CHECK_EQ(ordinary.response_class, CompleteContentLengthResponseClass::BoundedPositiveBody);
+    CHECK_EQ(ordinary.first, 0u);
+    CHECK_EQ(ordinary.last, 0u);
+    CHECK_EQ(ordinary.total, 0u);
+
+    HttpResponseParser parser;
+    ParsedResponse truncated;
+    parser.reset();
+    truncated.reset();
+    static constexpr char kValid[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/12\r\n"
+        "Content-Length: 5\r\n\r\nhello";
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(kValid), sizeof(kValid) - 1u, &truncated),
+               ParseStatus::Complete);
+    truncated.headers_truncated = true;
+    CHECK_EQ(classify_complete_content_length_response(truncated).response_class,
+             CompleteContentLengthResponseClass::Unsupported);
+}
+
+static constexpr u8 kStrictSingleRange206Response[] =
+    "HTTP/1.1 206 Partial Content\r\n"
+    "Server: stall-origin\r\n"
+    "Content-Range: bytes 0-3/12\r\n"
+    "Content-Length: 4\r\n"
+    "\r\n"
+    "abcd";
+
+TEST(response_buffering_runtime, coherent_single_range_206_raw_and_pinned_tuple_must_match) {
+    enum class Mutation : u8 { None, RawTuple, PinnedTuple, PinnedStatus };
+    for (const Mutation mutation :
+         {Mutation::None, Mutation::RawTuple, Mutation::PinnedTuple, Mutation::PinnedStatus}) {
+        RouteConfig config{};
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        u8 upstream[SlicePool::kSliceSize]{};
+        u8 pinned[SlicePool::kSliceSize]{};
+        Connection conn{};
+        conn.reset();
+        conn.upstream_recv_buf.bind(upstream, sizeof(upstream));
+        conn.response_header_slice = pinned;
+        conn.response_header_buf.bind(pinned, sizeof(pinned));
+        conn.request_config = &config;
+        conn.response_policy_id = 1;
+        conn.keep_alive = true;
+        conn.req_client_keep_alive = true;
+        conn.response_read_deadline_upload.downstream_close = false;
+        conn.resp_status = 206;
+        const u32 total_len = sizeof(kStrictSingleRange206Response) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response, total_len),
+                   total_len);
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(parser.parse(conn.upstream_recv_buf.data(), total_len, &response),
+                   ParseStatus::Complete);
+        REQUIRE(build_strict_response_headers(conn, config, response));
+
+        auto locate = [](const u8* data, u32 len, const char* needle) {
+            const std::string text(reinterpret_cast<const char*>(data), len);
+            return text.find(needle);
+        };
+        if (mutation == Mutation::RawTuple) {
+            const size_t at =
+                locate(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), "bytes 0-3/12");
+            REQUIRE_NE(at, std::string::npos);
+            upstream[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
+            upstream[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+        } else if (mutation == Mutation::PinnedTuple) {
+            const size_t at = locate(
+                conn.response_header_buf.data(), conn.response_header_buf.len(), "bytes 0-3/12");
+            REQUIRE_NE(at, std::string::npos);
+            conn.response_header_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
+            conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+        } else if (mutation == Mutation::PinnedStatus) {
+            const size_t at = locate(conn.response_header_buf.data(),
+                                     conn.response_header_buf.len(),
+                                     "HTTP/1.1 206 Partial Content");
+            REQUIRE_EQ(at, 0u);
+            conn.response_header_slice[sizeof("HTTP/1.1 20") - 1u] = static_cast<u8>('0');
+        }
+        CHECK_EQ(complete_content_length_raw_origin_matches_pinned(
+                     conn, parser.header_end, response.content_length),
+                 mutation == Mutation::None);
+    }
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_post_header_compaction_revalidates_pinned_tuple) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 total_len = sizeof(kStrictSingleRange206Response) - 1u;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response, total_len), total_len);
+    const IoEvent response = response_read_copy_event(conn, total_len, true, 0, total_len);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::HeaderSend);
+    REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+    drain_strict_304_timer_cancel(_tc, loop, conn, false);
+    IoEvent header = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), 4u);
+    REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+    const std::string headers(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                              conn.response_header_buf.len());
+    const size_t at = headers.find("bytes 0-3/12");
+    REQUIRE_NE(at, std::string::npos);
+    conn.response_header_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
+    conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+    CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_complete_and_fragmented_body_release_once) {
+    for (const bool fragmented_body : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        AccessLogRing access_log{};
+        access_log.init();
+        loop->access_log = &access_log;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 total_len = sizeof(kStrictSingleRange206Response) - 1u;
+        HttpResponseParser parser;
+        ParsedResponse parsed;
+        parser.reset();
+        parsed.reset();
+        REQUIRE_EQ(parser.parse(kStrictSingleRange206Response, total_len, &parsed),
+                   ParseStatus::Complete);
+        const u32 raw_header_end = parser.header_end;
+        REQUIRE_EQ(total_len - raw_header_end, 4u);
+
+        if (fragmented_body) {
+            const u32 first_len = raw_header_end + 2u;
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response, first_len),
+                       first_len);
+            const IoEvent first = response_read_copy_event(conn, first_len, true, 0, first_len);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_response_class,
+                     CompleteContentLengthResponseClass::CoherentSingleRange206);
+            CHECK_EQ(conn.response_read_deadline_post_commit_range_first, 0u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_range_last, 3u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_range_total, 12u);
+            CHECK(response_read_deadline_post_commit_is_stable(conn));
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response + first_len,
+                                                    total_len - first_len),
+                       total_len - first_len);
+            const IoEvent last =
+                response_read_copy_event(conn, total_len - first_len, true, first_len, total_len);
+            loop->dispatch_batch(&last, 1);
+        } else {
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response, total_len),
+                       total_len);
+            const IoEvent response = response_read_copy_event(conn, total_len, true, 0, total_len);
+            loop->dispatch_batch(&response, 1);
+        }
+
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        CHECK_EQ(conn.resp_status, 206u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_response_class,
+                 CompleteContentLengthResponseClass::CoherentSingleRange206);
+        CHECK_EQ(conn.response_read_deadline_post_commit_range_first, 0u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_range_last, 3u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_range_total, 12u);
+        CHECK(response_read_deadline_post_commit_is_stable(conn));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "HTTP/1.1 206 Partial Content\r\n"));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Content-Range: bytes 0-3/12\r\n"));
+        const std::string headers(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                                  conn.response_header_buf.len());
+        const size_t content_range = headers.find("Content-Range:");
+        REQUIRE_NE(content_range, std::string::npos);
+        CHECK_EQ(headers.find("Content-Range:", content_range + 1u), std::string::npos);
+        const u32 expected_response_size = conn.response_header_buf.len() + 4u;
+        drain_strict_304_timer_cancel(_tc, loop, conn, fragmented_body);
+
+        if (fragmented_body) drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::BodySend);
+        CHECK_EQ(conn.response_read_deadline_send_len, 4u);
+        CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
+        IoEvent body = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&body, 1);
+        if (!fragmented_body) {
+            CHECK_FALSE(conn.http1_boundary_ready);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, true);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+        } else {
+            CHECK_FALSE(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+        }
+        CHECK(conn.response_read_deadline_owner_is_neutral());
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_GE(conn.fd, 0);
+        AccessLogEntry access{};
+        REQUIRE(access_log.pop(access));
+        CHECK_EQ(access.status, 206u);
+        CHECK_EQ(access.resp_size, expected_response_size);
+        AccessLogEntry extra{};
+        CHECK_FALSE(access_log.pop(extra));
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_incomplete_eof_and_expiry_fail_without_downstream_send) {
+    for (const bool clean_eof : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kIncomplete[] =
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/12\r\n"
+            "Content-Length: 4\r\n\r\nab";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kIncomplete, sizeof(kIncomplete) - 1u),
+                   sizeof(kIncomplete) - 1u);
+        const IoEvent response = response_read_copy_event(
+            conn, sizeof(kIncomplete) - 1u, true, 0, sizeof(kIncomplete) - 1u);
+        const u32 id = conn.id;
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+                   CompleteContentLengthResponseClass::CoherentSingleRange206);
+        if (clean_eof) {
+            const IoEvent terminal{
+                id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+            loop->dispatch_batch(&terminal, 1);
+        } else {
+            conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+            const IoEvent timer =
+                inert_response_read_timer_event(id, conn.response_read_timer_owner_generation);
+            loop->dispatch_batch(&timer, 1);
+        }
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(loop->conns[id].response_read_deadline_send_len, 0u);
+        CHECK_FALSE(loop->conns[id].response_read_deadline_send_owner_active);
+        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+        CHECK(loop->conns[id].response_read_deadline_owner_is_neutral());
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
+     coherent_single_range_206_completion_wins_precise_timer_same_batch_both_orders) {
+    for (const bool timer_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 total_len = sizeof(kStrictSingleRange206Response) - 1u;
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kStrictSingleRange206Response, total_len),
+                   total_len);
+        const IoEvent response = response_read_copy_event(conn, total_len, true, 0, total_len);
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
+        const IoEvent events[2] = {timer_first ? timer : response, timer_first ? response : timer};
+        loop->dispatch_batch(events, 2);
+
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 206u);
+        CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                 ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "504 Gateway Time-out"));
+        drain_strict_304_timer_cancel(_tc, loop, conn, timer_first);
+        if (timer_first) drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        IoEvent header = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&header, 1);
+        IoEvent body = exact_response_deadline_send_event(loop, conn);
+        loop->dispatch_batch(&body, 1);
+        if (!timer_first) {
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, true);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+        } else {
+            CHECK_FALSE(conn.http1_boundary_deferred);
+            CHECK_FALSE(conn.http1_boundary_ready);
+        }
+        CHECK_GE(conn.fd, 0);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
 }
 
 static constexpr u8 kStrict304MetadataResponse[] =
