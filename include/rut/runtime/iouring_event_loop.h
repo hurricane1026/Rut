@@ -597,6 +597,10 @@ private:
         const bool header_only_representation =
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly ||
+            (c.http1_prebuilt_response_layout ==
+                 Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus &&
+             c.http1_prebuilt_response_purpose ==
+                 Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess) ||
             fixed_upload_head_timeout || header_only_head_timeout;
         if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.http1_prebuilt_deadline_method != c.req_method ||
@@ -832,8 +836,13 @@ private:
                    parsed.content_length_count == 1 && !parsed.chunked &&
                    !parsed.headers_truncated && parsed.content_length == c.http1_prebuilt_body_len;
         }
-        if (c.http1_prebuilt_response_layout !=
-            Http1PrebuiltResponseLayout::FullContentLengthNonHead)
+        const bool strict_no_body_metadata =
+            c.http1_prebuilt_response_layout ==
+                Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus &&
+            c.http1_prebuilt_response_purpose ==
+                Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
+        if (!strict_no_body_metadata && c.http1_prebuilt_response_layout !=
+                                            Http1PrebuiltResponseLayout::FullContentLengthNonHead)
             return false;
         const bool fixed_upload =
             response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile);
@@ -920,6 +929,30 @@ private:
         static constexpr Str kClose{"close", 5};
         const Str expected_connection =
             c.http1_prebuilt_deadline_upload.downstream_close ? kClose : kKeepAlive;
+        if (c.http1_prebuilt_response_layout ==
+                Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus ||
+            c.http1_prebuilt_response_purpose ==
+                Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess) {
+            return strict_no_body_metadata && !fixed_upload && materialized_get_proof &&
+                   c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+                   c.pipeline_stash_len == 0 && c.retry_req_send_len == 0 && !c.upstream_reused &&
+                   c.upstream_attempts == 1 &&
+                   c.http1_prebuilt_deadline_profile ==
+                       ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                   bundle.response_buffering ==
+                       ForwardResponseBufferingMode::CompleteContentLength &&
+                   c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+                   c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
+                   (c.upstream_retirement_target_owned & static_cast<u8>(~kUpstreamOpRecv)) == 0 &&
+                   (c.upstream_retirement_cancel_owned & static_cast<u8>(~kUpstreamOpRecv)) == 0 &&
+                   (c.upstream_retirement_cancel_retry & static_cast<u8>(~kUpstreamOpRecv)) == 0 &&
+                   parsed.status_code == 304 && c.http1_prebuilt_status == 304 &&
+                   c.http1_prebuilt_body_len > 0 &&
+                   c.http1_prebuilt_header_end == c.http1_prebuilt_total_len &&
+                   response.head_mode == ResponsePolicyHeadMode::Reject &&
+                   exact_header("server", 6, response.server) &&
+                   exact_header("connection", 10, kKeepAlive);
+        }
         if (c.http1_prebuilt_response_purpose ==
             Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success) {
             return parsed.status_code == 200 && c.http1_prebuilt_body_len == 0 &&
@@ -1276,6 +1309,26 @@ public:
                owner.expected_copy_end == c.upstream_recv_buf.len();
     }
 
+    // The strict no-body metadata success is evidenced only while the origin's
+    // Recv remains live. A later EOF/error already present in this wait batch
+    // cannot be hidden by dispatching the complete positive header first.
+    [[nodiscard]] bool current_response_read_batch_keeps_origin_open(const Connection& c,
+                                                                     const IoEvent& ev) const {
+        if (response_read_batch_event_index >= response_read_batch_event_count ||
+            ev.type != IoEventType::UpstreamRecv || ev.conn_id != c.id || ev.result <= 0 ||
+            ev.aux != 0)
+            return false;
+        const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
+        if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
+        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        return owner.valid && owner.conn_id == c.id &&
+               owner.deadline_generation == c.response_read_deadline_generation &&
+               owner.profile == c.response_read_deadline_profile &&
+               owner.method == c.response_read_deadline_method &&
+               owner.upstream_episode == c.upstream_episode && owner.saw_positive &&
+               !owner.saw_terminal;
+    }
+
     // Advance an exact, owner-free episode into the persistent tombstone. This
     // is for callbacks that observe a terminal upstream record after normal CQE
     // accounting has already cleared the final target; it never fabricates an
@@ -1299,6 +1352,11 @@ public:
             response_read_deadline_profile_is_fixed_upload(c.http1_prebuilt_deadline_profile);
         const bool strict_head =
             c.http1_prebuilt_response_purpose == Http1PrebuiltResponsePurpose::StrictHeadHeaderOnly;
+        const bool strict_no_body_metadata =
+            c.http1_prebuilt_response_layout ==
+                Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus &&
+            c.http1_prebuilt_response_purpose ==
+                Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess;
         const bool fixed_upload_head_timeout =
             c.http1_prebuilt_deadline_profile ==
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
@@ -1358,8 +1416,8 @@ public:
             (selected_targets & static_cast<u8>(~kAllowed)) != 0 ||
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
-            ((strict_head || fixed_upload_head_timeout || configured_forward_failure ||
-              header_only_head_timeout) &&
+            ((strict_head || strict_no_body_metadata || fixed_upload_head_timeout ||
+              configured_forward_failure || header_only_head_timeout) &&
              (((selected_targets != kUpstreamOpRecv || consumed_terminal != nullptr) &&
                !exact_consumed_terminal) ||
               disposition != Http1RequestBufferDisposition::ExistingPipeline ||

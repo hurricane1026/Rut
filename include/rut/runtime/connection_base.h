@@ -183,12 +183,14 @@ struct ResponseReadDeadlineUploadProof {
 enum class Http1PrebuiltResponseLayout : u8 {
     None,
     HeaderOnlyHead,
+    HeaderOnlyNoBodyStatus,
     FullContentLengthNonHead,
 };
 
 enum class Http1PrebuiltResponsePurpose : u8 {
     None,
     StrictHeadHeaderOnly,
+    StrictNoBodyMetadataSuccess,
     StrictNonHeadCl0Success,
     ResponseReadTimeout,
     ConfiguredForwardFailure,

@@ -46824,6 +46824,557 @@ TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exa
         CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
 }
 
+static constexpr u8 kStrict304MetadataResponse[] =
+    "HTTP/1.1 304 Not Modified\r\n"
+    "Server: stall-origin\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "ETag: \"v1\"\r\n"
+    "Content-Length: 12\r\n"
+    "\r\n";
+static_assert(sizeof(kStrict304MetadataResponse) - 1u == 120u);
+
+static IoEvent stage_strict_304_metadata_response(Connection& conn) {
+    const u32 len = sizeof(kStrict304MetadataResponse) - 1u;
+    if (conn.upstream_recv_buf.write(kStrict304MetadataResponse, len) != len) return {};
+    return response_read_copy_event(conn, len, true, 0, len);
+}
+
+static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
+                                          IoUringEventLoop* loop,
+                                          Connection& conn,
+                                          bool cancel_first) {
+    if (conn.response_read_timer_owner_is_neutral()) return;
+    REQUIRE_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+    const u32 generation = conn.response_read_timer_owner_generation;
+    IoEvent target = inert_response_read_timer_event(conn.id, generation);
+    target.result = -ECANCELED;
+    IoEvent cancel =
+        inert_response_read_timer_event(conn.id, generation | kResponseReadTimerCancelBit);
+    cancel.result = 0;
+    loop->dispatch(cancel_first ? cancel : target);
+    loop->dispatch(cancel_first ? target : cancel);
+    CHECK(conn.response_read_timer_owner_is_neutral());
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     exact_header_only_success_preserves_status_reason_length_and_etag) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const auto deadline_proof = conn.response_read_deadline_upload;
+    const u32 deadline_generation = conn.response_read_deadline_generation;
+    const u32 retiring_episode = conn.upstream_episode;
+    const IoEvent response = stage_strict_304_metadata_response(conn);
+    REQUIRE_EQ(response.result, static_cast<i32>(sizeof(kStrict304MetadataResponse) - 1u));
+    loop->dispatch_batch(&response, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 304u);
+    CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+    CHECK_EQ(conn.resp_body_remaining, 0u);
+    CHECK_EQ(conn.http1_prebuilt_response_layout,
+             Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus);
+    CHECK_EQ(conn.http1_prebuilt_response_purpose,
+             Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+    CHECK_EQ(conn.http1_prebuilt_deadline_generation, deadline_generation);
+    CHECK(response_read_deadline_upload_proof_equal(conn.http1_prebuilt_deadline_upload,
+                                                    deadline_proof));
+    CHECK_EQ(conn.http1_prebuilt_status, 304u);
+    CHECK_EQ(conn.http1_prebuilt_body_len, 12u);
+    CHECK_EQ(conn.http1_prebuilt_header_end, conn.http1_prebuilt_total_len);
+    CHECK_EQ(conn.http1_prebuilt_total_len, conn.response_header_buf.len());
+    CHECK(conn.upstream_abandoned);
+    CHECK(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retiring_episode, retiring_episode);
+    CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+    CHECK(conn.upstream_retirement_cancel_owned & kUpstreamOpRecv);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::None);
+
+    HttpResponseParser parser;
+    ParsedResponse parsed;
+    parser.reset();
+    parsed.reset();
+    REQUIRE_EQ(
+        parser.parse(conn.response_header_buf.data(), conn.response_header_buf.len(), &parsed),
+        ParseStatus::Complete);
+    CHECK_EQ(parser.header_end, conn.response_header_buf.len());
+    CHECK_EQ(parsed.status_code, 304u);
+    CHECK_EQ(parsed.reason.len, 12u);
+    CHECK_EQ(__builtin_memcmp(parsed.reason.ptr, "Not Modified", 12), 0);
+    CHECK_EQ(parsed.content_length_count, 1u);
+    CHECK_EQ(parsed.content_length, 12u);
+    CHECK_FALSE(parsed.chunked);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "Server: rut-get-timeout\r\n"));
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "Connection: keep-alive\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "ETag: \"v1\"\r\n"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200"));
+    u8 normalized[256]{};
+    REQUIRE_LE(conn.response_header_buf.len(), sizeof(normalized));
+    __builtin_memcpy(normalized, conn.response_header_buf.data(), conn.response_header_buf.len());
+    REQUIRE(normalize_redirect_date(normalized, conn.response_header_buf.len()));
+    static constexpr char kExpected[] =
+        "HTTP/1.1 304 Not Modified\r\n"
+        "Server: rut-get-timeout\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: keep-alive\r\n"
+        "ETag: \"v1\"\r\n"
+        "\r\n";
+    static_assert(sizeof(kExpected) - 1u == 147u);
+    REQUIRE_EQ(conn.response_header_buf.len(), sizeof(kExpected) - 1u);
+    CHECK_EQ(__builtin_memcmp(normalized, kExpected, sizeof(kExpected) - 1u), 0);
+
+    const u32 pending_before_stale = conn.pending_ops;
+    const IoEvent stale_retirement{
+        conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, retiring_episode - 1u};
+    loop->dispatch(stale_retirement);
+    CHECK_EQ(conn.pending_ops, pending_before_stale);
+    CHECK(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+    CHECK(conn.upstream_retirement_cancel_owned & kUpstreamOpRecv);
+
+    drain_strict_304_timer_cancel(_tc, loop, conn, true);
+    complete_prebuilt_d2_header(loop, conn);
+    CHECK_FALSE(conn.http1_boundary_ready);
+    drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK_GE(conn.fd, 0);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     admission_rejects_non_exact_framing_reason_and_request_owners) {
+    enum class Mutation : u8 {
+        MissingLength,
+        ZeroLength,
+        DuplicateLength,
+        TransferEncoding,
+        CoalescedBody,
+        WrongStatus,
+        WrongMethod,
+        WrongProfile,
+        WrongBuffering,
+        ReusedOrigin,
+        Pipeline,
+    };
+    static constexpr Mutation kMutations[] = {Mutation::MissingLength,
+                                              Mutation::ZeroLength,
+                                              Mutation::DuplicateLength,
+                                              Mutation::TransferEncoding,
+                                              Mutation::CoalescedBody,
+                                              Mutation::WrongStatus,
+                                              Mutation::WrongMethod,
+                                              Mutation::WrongProfile,
+                                              Mutation::WrongBuffering,
+                                              Mutation::ReusedOrigin,
+                                              Mutation::Pipeline};
+    for (const Mutation mutation : kMutations) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const char* wire = reinterpret_cast<const char*>(kStrict304MetadataResponse);
+        switch (mutation) {
+            case Mutation::MissingLength:
+                wire = "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n";
+                break;
+            case Mutation::ZeroLength:
+                wire = "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n";
+                break;
+            case Mutation::DuplicateLength:
+                wire =
+                    "HTTP/1.1 304 Not Modified\r\nContent-Length: 12\r\n"
+                    "Content-Length: 12\r\n\r\n";
+                break;
+            case Mutation::TransferEncoding:
+                wire =
+                    "HTTP/1.1 304 Not Modified\r\nContent-Length: 12\r\n"
+                    "Transfer-Encoding: chunked\r\n\r\n";
+                break;
+            case Mutation::CoalescedBody:
+                wire = "HTTP/1.1 304 Not Modified\r\nContent-Length: 12\r\n\r\nx";
+                break;
+            case Mutation::WrongStatus:
+                wire =
+                    "HTTP/1.1 203 Non-Authoritative Information\r\n"
+                    "Content-Length: 12\r\n\r\n";
+                break;
+            case Mutation::WrongMethod:
+                conn.req_method = static_cast<u8>(LogHttpMethod::Post);
+                break;
+            case Mutation::WrongProfile:
+                conn.response_read_deadline_profile = ResponseReadDeadlineProfile::HeaderOnlyHead;
+                break;
+            case Mutation::WrongBuffering:
+                conn.response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+                break;
+            case Mutation::ReusedOrigin:
+                conn.upstream_reused = true;
+                break;
+            case Mutation::Pipeline:
+                conn.pipeline_depth = 1;
+                break;
+        }
+        const u32 len = static_cast<u32>(__builtin_strlen(wire));
+        REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(wire), len), len);
+        const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+        const u32 id = conn.id;
+        loop->dispatch_batch(&response, 1);
+        Connection& result = loop->conns[id];
+        CHECK_NE(result.http1_prebuilt_response_layout,
+                 Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus);
+        CHECK_NE(result.http1_prebuilt_response_purpose,
+                 Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+        CHECK_FALSE(buf_has(result.response_header_buf.data(),
+                            result.response_header_buf.len(),
+                            "HTTP/1.1 304 Not Modified\r\n"));
+        if (result.fd < 0)
+            release_closed_response_read_fixture(fixture);
+        else
+            cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     exact_header_wins_matching_precise_timer_in_same_batch_both_orders) {
+    for (const bool timer_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 timer_generation = conn.response_read_timer_owner_generation;
+        const IoEvent response = stage_strict_304_metadata_response(conn);
+        REQUIRE_GT(response.result, 0);
+        const IoEvent timer = inert_response_read_timer_event(conn.id, timer_generation);
+        REQUIRE_EQ(timer.result, -ETIME);
+        const IoEvent events[2] = {timer_first ? timer : response, timer_first ? response : timer};
+        loop->dispatch_batch(events, 2);
+
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 304u);
+        CHECK_EQ(conn.http1_prebuilt_response_layout,
+                 Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus);
+        CHECK_EQ(conn.http1_prebuilt_response_purpose,
+                 Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "504 Gateway Time-out"));
+        CHECK(conn.response_read_timer_owner_is_neutral() ||
+              conn.response_read_timer_phase == ResponseReadTimerPhase::CancelPending);
+        drain_strict_304_timer_cancel(_tc, loop, conn, timer_first);
+        if (timer_first)
+            complete_prebuilt_d2_header(loop, conn);
+        else
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        if (timer_first)
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, true);
+        else
+            complete_prebuilt_d2_header(loop, conn);
+        REQUIRE(conn.http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_GE(conn.fd, 0);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     consumed_precise_timer_wins_before_later_header_and_late_recv_is_inert) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 old_episode = conn.upstream_episode;
+    const u32 old_generation = conn.response_read_deadline_generation;
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
+    const IoEvent timer = inert_response_read_timer_event(id, timer_generation);
+    loop->dispatch_batch(&timer, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+    CHECK_EQ(conn.resp_status, 504u);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "HTTP/1.1 504 Gateway Time-out\r\n"));
+    CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                        conn.response_header_buf.len(),
+                        "HTTP/1.1 304 Not Modified\r\n"));
+    const u32 timeout_len = conn.response_header_buf.len();
+
+    const u32 len = sizeof(kStrict304MetadataResponse) - 1u;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kStrict304MetadataResponse, len), len);
+    IoEvent late = response_read_copy_event(conn, len, true, 0, len);
+    late.upstream_episode = old_episode;
+    late.copy_deadline_generation = old_generation;
+    loop->dispatch_batch(&late, 1);
+    CHECK_EQ(conn.resp_status, 504u);
+    CHECK_EQ(conn.response_header_buf.len(), timeout_len);
+    CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                        conn.response_header_buf.len(),
+                        "HTTP/1.1 304 Not Modified\r\n"));
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     clean_eof_or_recv_error_in_completion_batch_cannot_forge_application_open_success) {
+    for (const i32 terminal_result : {0, -ECONNRESET}) {
+        for (const bool terminal_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+            const u32 episode = conn.upstream_episode;
+            const IoEvent response = stage_strict_304_metadata_response(conn);
+            REQUIRE_GT(response.result, 0);
+            const IoEvent terminal{
+                id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            const IoEvent events[2] = {terminal_first ? terminal : response,
+                                       terminal_first ? response : terminal};
+            loop->dispatch_batch(events, 2);
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_NE(loop->conns[id].http1_prebuilt_response_purpose,
+                     Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+            CHECK_FALSE(buf_has(loop->conns[id].response_header_buf.data(),
+                                loop->conns[id].response_header_buf.len(),
+                                "HTTP/1.1 304 Not Modified\r\n"));
+            release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     default_serializer_rejects_304_and_dedicated_mode_is_exact) {
+    RouteConfig config{};
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    u8 header_storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(
+                   kStrict304MetadataResponse, sizeof(kStrict304MetadataResponse) - 1u, &response),
+               ParseStatus::Complete);
+    CHECK_FALSE(build_strict_response_headers(conn, config, response));
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    CHECK_FALSE(build_strict_response_headers(
+        conn, config, response, Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    REQUIRE(build_strict_response_headers(
+        conn, config, response, Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess));
+    REQUIRE_GT(conn.response_header_buf.len(), 0u);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "HTTP/1.1 304 Not Modified\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "Content-Length: 12\r\n"));
+    CHECK(buf_has(
+        conn.response_header_buf.data(), conn.response_header_buf.len(), "ETag: \"v1\"\r\n"));
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     d2_revalidates_layout_purpose_status_length_and_owner_proof) {
+    enum class Forgery : u8 {
+        Layout,
+        Purpose,
+        Status,
+        Length,
+        HeaderBoundary,
+        Buffering,
+        Pipeline,
+        Retirement,
+    };
+    for (const Forgery forgery : {Forgery::Layout,
+                                  Forgery::Purpose,
+                                  Forgery::Status,
+                                  Forgery::Length,
+                                  Forgery::HeaderBoundary,
+                                  Forgery::Buffering,
+                                  Forgery::Pipeline,
+                                  Forgery::Retirement}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const IoEvent response = stage_strict_304_metadata_response(conn);
+        REQUIRE_GT(response.result, 0);
+        loop->dispatch_batch(&response, 1);
+        REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                   Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+        switch (forgery) {
+            case Forgery::Layout:
+                conn.http1_prebuilt_response_layout =
+                    Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+                break;
+            case Forgery::Purpose:
+                conn.http1_prebuilt_response_purpose =
+                    Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
+                break;
+            case Forgery::Status:
+                conn.http1_prebuilt_status = 200;
+                break;
+            case Forgery::Length:
+                conn.http1_prebuilt_body_len = 11;
+                break;
+            case Forgery::HeaderBoundary:
+                --conn.http1_prebuilt_header_end;
+                break;
+            case Forgery::Buffering:
+                config.policy_bundles[1].response_buffering = ForwardResponseBufferingMode::None;
+                break;
+            case Forgery::Pipeline:
+                conn.pipeline_depth = 1;
+                break;
+            case Forgery::Retirement:
+                conn.upstream_retirement_target_owned |= kUpstreamOpSend;
+                break;
+        }
+        const u32 id = conn.id;
+        complete_prebuilt_d2_header(loop, conn);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_FALSE(loop->conns[id].http1_boundary_ready);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     header_send_fault_submission_failure_and_downstream_close_fail_closed) {
+    enum class Fault : u8 { ShortSend, SendError, SubmissionFailure, DownstreamClose };
+    for (const Fault fault :
+         {Fault::ShortSend, Fault::SendError, Fault::SubmissionFailure, Fault::DownstreamClose}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_live_precise_get(loop, config, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const IoEvent response = stage_strict_304_metadata_response(conn);
+        REQUIRE_GT(response.result, 0);
+        const u32 saved_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const i32 saved_ring_fd = loop->backend.ring_fd;
+        if (fault == Fault::SubmissionFailure) {
+            const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+            loop->backend.ring_fd = -1;
+            __atomic_store_n(
+                loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+        }
+        loop->dispatch_batch(&response, 1);
+        if (fault == Fault::SubmissionFailure) {
+            loop->backend.ring_fd = saved_ring_fd;
+            __atomic_store_n(loop->backend.sq_tail, saved_tail, __ATOMIC_RELEASE);
+        } else {
+            REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                       Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+            if (fault == Fault::DownstreamClose) {
+                loop->dispatch({id, 0, 0, 0, IoEventType::Recv, 0});
+            } else {
+                const i32 result = fault == Fault::SendError
+                                       ? -EPIPE
+                                       : static_cast<i32>(conn.response_header_buf.len() - 1u);
+                loop->dispatch({id, result, 0, 0, IoEventType::Send, 0});
+            }
+        }
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_FALSE(loop->conns[id].http1_boundary_ready);
+        if (fault != Fault::DownstreamClose) {
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        }
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     successful_header_finalizes_access_and_metrics_exactly_once) {
+    AccessLogRing access_log{};
+    access_log.init();
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    loop->access_log = &access_log;
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 request_size = conn.downstream_req_size;
+    const IoEvent response = stage_strict_304_metadata_response(conn);
+    REQUIRE_GT(response.result, 0);
+    loop->dispatch_batch(&response, 1);
+    const u32 response_size = conn.response_header_buf.len();
+    CHECK_EQ(access_log.available(), 0u);
+    drain_strict_304_timer_cancel(_tc, loop, conn, false);
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE_EQ(access_log.available(), 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    complete_prebuilt_d2_header(loop, conn);
+    IoEvent stale_timer = inert_response_read_timer_event(id, 1);
+    loop->dispatch_batch(&stale_timer, 1);
+    CHECK_EQ(access_log.available(), 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(access_log.available(), 1u);
+    AccessLogEntry access{};
+    REQUIRE(access_log.pop(access));
+    CHECK_EQ(access.status, 304u);
+    CHECK_EQ(access.req_size, request_size);
+    CHECK_EQ(access.resp_size, response_size);
+    AccessLogEntry duplicate{};
+    CHECK_FALSE(access_log.pop(duplicate));
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
 TEST(response_buffering_runtime,
      incomplete_complete_content_length_transition_retains_precise_timer_without_wheel) {
     ScopedIoUringLoopForRetirement guard;
