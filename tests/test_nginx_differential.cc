@@ -57993,8 +57993,7 @@ static bool run_converter_default_buffering_second_body_progress_refresh_differe
         }
         usleep(1000);
     }
-    if (poll_child(frontends[1].child) ||
-        !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+    if (poll_child(frontends[1].child) || !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
         error = "#271 second-body-progress generated RUT lacked io_uring readiness";
         return false;
     }
