@@ -1975,4 +1975,34 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
            cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id);
 }
 
+// The currently admitted default-buffered GET keeps the same precise
+// generation/episode timer after the strict response header selects an
+// incomplete positive Content-Length body. This predicate deliberately names
+// only the live collection phase: terminal send/retirement paths consume the
+// timer before leaving Buffering.
+inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(const Connection& c) {
+    const bool state_admitted =
+        c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+        c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending ||
+        c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
+        c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
+        c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
+    return state_admitted &&
+           c.response_read_deadline_post_commit_phase ==
+               ResponseReadDeadlinePostCommitPhase::Buffering &&
+           c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.response_read_deadline_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_route_method == kRouteMethodGet &&
+           c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&
+           c.http1_pipeline_request_generation == 0 && c.pipeline_stash_len == 0 &&
+           c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           c.response_read_deadline_upload.request_policy_id == c.request_policy_id &&
+           c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
+           response_read_deadline_default_persistence_is_stable(c) &&
+           response_read_deadline_post_commit_is_stable(c);
+}
+
 }  // namespace rut

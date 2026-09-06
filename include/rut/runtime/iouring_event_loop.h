@@ -2627,7 +2627,10 @@ public:
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             c.response_read_deadline_buffering ==
                 ForwardResponseBufferingMode::CompleteContentLength &&
-            c.req_method == static_cast<u8>(LogHttpMethod::Get))
+            c.req_method == static_cast<u8>(LogHttpMethod::Get)) {
+            if (c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None)
+                return bodyless_get_complete_content_length_precise_buffering_is_stable(c);
             return bodyless_get_keep_alive_precise_arm_is_stable(
                 c,
                 c.response_read_deadline_upload,
@@ -2635,6 +2638,7 @@ public:
                 c.response_read_deadline_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Self>);
+        }
         if (c.response_read_deadline_profile != ResponseReadDeadlineProfile::HeaderOnlyHead ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
             c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
@@ -2886,6 +2890,10 @@ public:
         owner.upstream_episode = c.response_read_timer_upstream_episode;
         owner.profile = c.response_read_deadline_profile;
         owner.method = c.response_read_deadline_method;
+        owner.post_commit_at_start =
+            c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+        owner.body_complete_at_start =
+            c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
         owner.valid = true;
         owner.precise_timer_valid = true;
         owner.saw_precise_timer = true;
@@ -3250,8 +3258,7 @@ public:
         const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
         if (initial_body > declared_body) return false;
         const bool precise_header_timer = response_read_deadline_uses_precise_timer(c);
-        if (precise_header_timer && (c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
-                                     !backend.cancel_response_read_timer(c.id, c)))
+        if (precise_header_timer && c.response_read_timer_phase != ResponseReadTimerPhase::Armed)
             return false;
         const bool fragmented_header_transition =
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
@@ -3276,7 +3283,7 @@ public:
         c.response_read_deadline_post_commit_send_body = 0;
         c.response_read_deadline_post_commit_close_after_drain = false;
         c.response_read_deadline_post_commit_pump_pending = false;
-        if (precise_header_timer) timer.refresh(&c, c.response_read_deadline_seconds);
+        if (precise_header_timer) timer.remove(&c);
         // Whole-batch settlement owns all later Recv records.  Keeping the
         // callback detached prevents a terminal CQE from reparsing and
         // rebuilding the already pinned strict header.
@@ -3336,6 +3343,12 @@ public:
              (body_to_send != c.response_read_deadline_post_commit_declared_body ||
               body_to_send != c.response_read_deadline_post_commit_origin_received)))
             return false;
+        if (c.response_read_timer_phase != ResponseReadTimerPhase::None) {
+            if (c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
+                !bodyless_get_complete_content_length_precise_buffering_is_stable(c) ||
+                !backend.cancel_response_read_timer(c.id, c))
+                return false;
+        }
         timer.remove(&c);
         const bool recv_owned = c.upstream_recv_armed;
         if (!begin_strict_upstream_retirement(c)) return false;
@@ -3406,11 +3419,120 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool settle_precise_complete_content_length_buffering(
+        Connection& c, const ResponseReadBatchOwner& owner) {
+        if (!owner.valid || owner.conn_id != c.id || owner.deadline_generation == 0 ||
+            owner.deadline_generation != c.response_read_deadline_generation ||
+            owner.upstream_episode != c.upstream_episode ||
+            owner.profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+            owner.method != static_cast<u8>(LogHttpMethod::Get) ||
+            !bodyless_get_complete_content_length_precise_buffering_is_stable(c) ||
+            (owner.saw_precise_timer ? !response_read_deadline_batch_uses_precise_timer(c, owner)
+                                     : !response_read_deadline_uses_precise_timer(c)))
+            return false;
+
+        bool saw_timer_target = false;
+        if (owner.saw_precise_timer) {
+            if (!owner.precise_timer_valid || response_read_batch_events == nullptr) return false;
+            for (u32 ei = 0; ei < response_read_batch_event_count; ++ei) {
+                const IoEvent& timer_ev = response_read_batch_events[ei];
+                if (timer_ev.type != IoEventType::ResponseReadTimer ||
+                    timer_ev.conn_id != owner.conn_id)
+                    continue;
+                const u32 generation =
+                    timer_ev.non_upstream_generation & kResponseReadTimerGenerationMask;
+                const bool cancel =
+                    (timer_ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+                if (!valid_response_read_timer_transport_event(timer_ev) || cancel ||
+                    generation != owner.precise_timer_generation ||
+                    !c.consume_response_read_timer_completion(timer_ev.non_upstream_generation) ||
+                    timer_ev.result != -ETIME || saw_timer_target)
+                    return false;
+                saw_timer_target = true;
+            }
+            if (!saw_timer_target) return false;
+        }
+
+        const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+        const u32 declared = c.response_read_deadline_post_commit_declared_body;
+        u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (header == 0 || header > c.upstream_recv_buf.len() || received > declared) return false;
+        if (owner.saw_positive) {
+            if (owner.terminal_error || owner.expected_copy_end != c.upstream_recv_buf.len() ||
+                owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+                owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)
+                return false;
+            if (owner.post_commit_at_start) {
+                if (owner.positive_bytes > declared - received || header > 0xFFFFFFFFu - received ||
+                    owner.first_copy_begin != header + received)
+                    return false;
+                received += owner.positive_bytes;
+                c.response_read_deadline_post_commit_origin_received = received;
+            } else if (received != c.upstream_recv_buf.len() - header) {
+                return false;
+            }
+            c.response_read_deadline_progress_generation = owner.deadline_generation;
+            c.response_read_deadline_progress_episode = owner.upstream_episode;
+            c.response_read_deadline_progress_bytes = received;
+            c.response_read_timer_last_progress_ns = monotonic_ns();
+        } else if (!owner.post_commit_at_start || owner.terminal_error) {
+            return false;
+        }
+
+        if (received == declared || owner.clean_eof) {
+            c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+            return start_complete_content_length_send(
+                c,
+                received,
+                /*close_after_drain=*/
+                received != declared || c.response_read_deadline_upload.downstream_close);
+        }
+        if (owner.terminal_fault) return false;
+        if (owner.saw_terminal && !c.upstream_recv_armed) {
+            if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+                c.upstream_recv_cancel_inflight ||
+                !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+                return false;
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+        }
+
+        if (saw_timer_target) {
+            const u64 now_ns = monotonic_ns();
+            const u64 timeout_ns =
+                static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
+            if (response_read_timer_remaining_ms(
+                    c.response_read_timer_last_progress_ns, timeout_ns, now_ns) == 0) {
+                c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+                response_read_deadline_expiry_pending = true;
+                return true;
+            }
+            if (!rearm_precise_response_read_timer(c, now_ns)) return false;
+        }
+        c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+        return true;
+    }
+
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
             if (owner.conn_id >= kMaxConns) continue;
             Connection& c = conns[owner.conn_id];
+            const bool precise_complete_content_length =
+                c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::Buffering &&
+                c.response_read_deadline_profile ==
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                c.response_read_deadline_buffering ==
+                    ForwardResponseBufferingMode::CompleteContentLength &&
+                c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+                (owner.saw_precise_timer ||
+                 c.response_read_timer_phase == ResponseReadTimerPhase::Armed);
+            if (precise_complete_content_length) {
+                if (!settle_precise_complete_content_length_buffering(c, owner) && c.fd >= 0)
+                    close_conn(c);
+                continue;
+            }
             if (owner.saw_precise_timer) {
                 // Capture the complete logical+transport proof before timer
                 // CQEs consume their kernel custody. For a cross-batch prefix,
