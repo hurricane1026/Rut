@@ -21,6 +21,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -62849,6 +62850,996 @@ static bool run_pinned_nginx_default_buffering_206_range_incomplete_clean_eof_or
     return true;
 }
 
+static constexpr char kIssue546WithheldNegativeResult[] =
+    "#546 real withheld EOF authorization reached its bounded deadline and cleaned up";
+
+static bool run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
+    const char* rut_path,
+    const std::string& container_name,
+    bool withhold_rut_eof_authorization,
+    std::string& error) {
+    static constexpr char kDiagnostic[] = "#546 paired 206 incomplete clean-EOF";
+    static constexpr char kExpectedResponseNormalized[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Range: bytes 0-4/12\r\n"
+        "\r\n"
+        "he";
+    static_assert(sizeof(kDefaultBuffering206RangeRequest) - 1u == 78u);
+    static_assert(sizeof(kDefaultBuffering206RangeOrigin) - 1u == 144u);
+    static_assert((sizeof(kDefaultBuffering206RangeOrigin) - 1u) - 5u == 139u);
+    static_assert(kDefaultBuffering206RangeOrigin[139] == 'h');
+    static_assert(kDefaultBuffering206RangeOrigin[140] == 'e');
+    static_assert(sizeof(kExpectedResponseNormalized) - 1u == 165u);
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = std::string(kDiagnostic) + " requires an executable absolute RUT path";
+        return false;
+    }
+
+    TempDir temps[2];
+    if (!temps[0].create() || !temps[1].create() || strcmp(temps[0].path, temps[1].path) == 0 ||
+        temps[0].nginx_config == temps[1].source ||
+        temps[0].nginx_access_log == temps[1].rut_access_log ||
+        temps[0].nginx_log == temps[1].rut_log) {
+        error = std::string(kDiagnostic) + " could not create isolated side resources";
+        return false;
+    }
+
+    HeldLoopbackPorts reservations;
+    u16 ports[4]{};
+    for (size_t index = 0u; index < std::size(ports); index++) {
+        if (!reservations.reserve_four_digit(index, ports[index])) {
+            error = std::string(kDiagnostic) + " could not hold four distinct four-digit ports";
+            return false;
+        }
+    }
+
+    const std::string profiles[2] = {
+        make_explicit_timeout_head_profile(ports[0], ports[1], temps[0].nginx_access_log),
+        make_explicit_timeout_head_profile(ports[2], ports[3], temps[1].rut_access_log),
+    };
+    const std::string nginx_config = "events {}\n" + profiles[0];
+    if (!validate_explicit_timeout_head_profile(
+            profiles[0], ports[0], ports[1], temps[0].nginx_access_log, error) ||
+        !validate_explicit_timeout_head_profile(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, error) ||
+        count_text(nginx_config, "events {}\n") != 1u ||
+        nginx_config.rfind("events {}\nhttp {\n", 0u) != 0u) {
+        if (error.empty()) error = std::string(kDiagnostic) + " lost its exact nginx inputs";
+        return false;
+    }
+
+    std::string generated_source;
+    if (!build_explicit_timeout_head_generated_source(
+            profiles[1], ports[2], ports[3], temps[1].rut_access_log, generated_source, error) ||
+        !validate_explicit_timeout_get_generated_provenance(
+            generated_source, ports[2], ports[3], temps[1].rut_access_log, error)) {
+        if (error.empty())
+            error = std::string(kDiagnostic) + " lacked exact owned ordinary-RUT provenance";
+        return false;
+    }
+    static constexpr const char* kForbiddenGeneratedMarkers[] = {
+        "nginx.conf",
+        "nginx::",
+        "nginx_compat",
+        "proxy_pass",
+        "workaround",
+        "issue546",
+        "status: 206",
+        "Partial Content",
+        "Content-Range",
+        "Range: bytes=0-4",
+    };
+    for (const char* marker : kForbiddenGeneratedMarkers) {
+        if (generated_source.find(marker) != std::string::npos) {
+            error = std::string(kDiagnostic) + " generated source embedded forbidden marker `" +
+                    marker + "`";
+            return false;
+        }
+    }
+    if (!write_file(temps[0].nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temps[1].source, generated_source.data(), generated_source.size())) {
+        error = std::string(kDiagnostic) + " could not persist exact independent inputs";
+        return false;
+    }
+
+    Recorder origins[2];
+    for (auto& origin : origins) {
+        origin.permit_gated_incomplete_first_response = true;
+        origin.probe_before_gated_fragment = true;
+        origin.gate_response_write_eof_after_prefix = true;
+        origin.incomplete_first_response_fragment_count = 1u;
+        origin.response_fragment_bytes[0] = kDefaultBuffering206RangeOrigin;
+        origin.response_fragment_lengths[0] = 141u;
+        origin.observe_extra_requests_until_stop = true;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        const size_t backend = side * 2u + 1u;
+        if (!handoff_held_loopback_port(
+                &reservations.fds[backend], ports[backend], kDiagnostic, error) ||
+            !origins[side].setup(ports[backend])) {
+            if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
+            return false;
+        }
+    }
+    const auto origins_live = [&]() {
+        for (const auto& origin : origins) {
+            if (!origin.running.load(std::memory_order_acquire) ||
+                !origin.thread_alive.load(std::memory_order_acquire) ||
+                origin.listener_failed.load(std::memory_order_acquire))
+                return false;
+        }
+        return true;
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origins_live() && std::chrono::steady_clock::now() < origin_ready_deadline)
+        usleep(1000);
+    if (!origins_live()) {
+        error = std::string(kDiagnostic) + " origins were not live before frontend handoff";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard frontends[2];
+    if (!handoff_held_loopback_port(&reservations.fds[0], ports[0], kDiagnostic, error))
+        return false;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      std::string(temps[0].path) + ":" + temps[0].path,
+                      kNginxImage,
+                      "nginx",
+                      "-c",
+                      temps[0].nginx_config,
+                      "-g",
+                      "daemon off;"},
+                     temps[0].nginx_log,
+                     frontends[0].child)) {
+        error = std::string(kDiagnostic) + " could not spawn pinned nginx";
+        return false;
+    }
+    if (!wait_ready(ports[0], frontends[0].child, error)) {
+        error = std::string(kDiagnostic) + " pinned nginx readiness failed: " + error;
+        return false;
+    }
+    if (!handoff_held_loopback_port(&reservations.fds[2], ports[2], kDiagnostic, error))
+        return false;
+    if (!spawn_child({rut_path, temps[1].source, "--shards", "1", "--no-pin", "--drain", "0"},
+                     temps[1].rut_log,
+                     frontends[1].child)) {
+        error = std::string(kDiagnostic) + " could not spawn generated ordinary RUT";
+        return false;
+    }
+    if (!wait_ready(ports[2], frontends[1].child, error)) {
+        error = std::string(kDiagnostic) + " generated RUT readiness failed: " + error;
+        return false;
+    }
+    const auto frontends_live = [&]() {
+        return !poll_child(frontends[0].child) && !poll_child(frontends[1].child);
+    };
+    const auto runtime_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log_contains(temps[1].rut_log, "Backend: io_uring\n") &&
+           std::chrono::steady_clock::now() < runtime_ready_deadline) {
+        if (poll_child(frontends[1].child)) {
+            error = std::string(kDiagnostic) + " RUT exited before io_uring readiness";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!frontends_live() || !log_contains(temps[1].rut_log, "Backend: io_uring\n")) {
+        error = std::string(kDiagnostic) + " generated RUT lacked exact io_uring readiness";
+        return false;
+    }
+
+    std::string pre_request_access[2];
+    if (!read_request_length_access_file(temps[0].nginx_access_log, pre_request_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, pre_request_access[1], error) ||
+        !pre_request_access[0].empty() || !pre_request_access[1].empty()) {
+        if (error.empty()) error = std::string(kDiagnostic) + " pre-request access was not empty";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fds[2] = {-1, -1};
+        ~ClientGuard() {
+            for (const int fd : fds)
+                if (fd >= 0) close(fd);
+        }
+    } clients;
+    for (size_t side = 0u; side < 2u; side++) {
+        clients.fds[side] = connect_once(ports[side * 2u]);
+        if (clients.fds[side] < 0) {
+            error = std::string(kDiagnostic) + " could not connect both clients";
+            return false;
+        }
+    }
+
+    struct SideEvidence {
+        u64 request_send_ns = 0u;
+        u64 first_write_ns = 0u;
+        u64 quiet_ns = 0u;
+        u64 origin_probe_ns = 0u;
+        u64 downstream_probe_ns = 0u;
+        u64 authorization_ns = 0u;
+        u64 reprobe_ns = 0u;
+        u64 shutdown_begin_ns = 0u;
+        u64 shutdown_end_ns = 0u;
+        u64 first_downstream_ns = 0u;
+        u64 full_downstream_ns = 0u;
+        u64 downstream_eof_ns = 0u;
+        u64 origin_terminal_ns = 0u;
+        u64 withheld_action_deadline_ns = 0u;
+        u64 withheld_post_deadline_probe_ns = 0u;
+        bool authorization_withheld = false;
+        GatedFragmentPeerProbeResult origin_probe = GatedFragmentPeerProbeResult::None;
+        GatedFragmentPeerProbeResult reprobe = GatedFragmentPeerProbeResult::None;
+        GatedResponseWriteEofResult action = GatedResponseWriteEofResult::None;
+        GatedResponseWriteEofPeerTerminal terminal = GatedResponseWriteEofPeerTerminal::None;
+        std::vector<char> response;
+    } evidence[2];
+    std::atomic<bool> abort{false};
+    std::string side_errors[2];
+
+    // Recorder timestamps witness application publications and observations;
+    // they are not TCP packet, frontend read, or io_uring CQE boundaries.
+    const auto run_side = [&](size_t side) {
+        auto fail = [&](const std::string& detail) {
+            side_errors[side] = std::string(side == 0u ? "nginx: " : "RUT: ") + detail;
+            abort.store(true, std::memory_order_release);
+            return false;
+        };
+        auto& origin = origins[side];
+        auto& observed = evidence[side];
+        const auto side_frontend_live = [&]() { return !poll_child(frontends[side].child); };
+        const std::string& access_path =
+            side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log;
+        observed.request_send_ns = steady_now_ns();
+        if (!send_all(clients.fds[side],
+                      kDefaultBuffering206RangeRequest,
+                      sizeof(kDefaultBuffering206RangeRequest) - 1u))
+            return fail("could not send the exact 78-byte request");
+
+        const auto request_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::string access;
+            std::string detail;
+            const u32 accepted = origin.accepted.load(std::memory_order_acquire);
+            const u32 requests = origin.requests.load(std::memory_order_acquire);
+            if (accepted > 1u || requests > 1u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 0u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 0u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 0u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
+                origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                !side_frontend_live() || !origins_live() ||
+                !read_request_length_access_file(access_path, access, detail) || !access.empty() ||
+                !observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+                return fail("pre-W1 custody failed: " + detail);
+            if (accepted == 1u && requests == 1u) break;
+            if (abort.load(std::memory_order_acquire)) return false;
+            if (std::chrono::steady_clock::now() >= request_deadline)
+                return fail("origin did not receive the exact request");
+            usleep(1000);
+        }
+
+        origin.response_fragment_permit.store(1u, std::memory_order_release);
+        const auto first_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (origin.response_fragments_sent.load(std::memory_order_acquire) != 1u) {
+            if (abort.load(std::memory_order_acquire)) return false;
+            if (origin.response_fragments_sent.load(std::memory_order_acquire) > 1u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                !side_frontend_live() || !origins_live() ||
+                std::chrono::steady_clock::now() >= first_deadline)
+                return fail("W1 publication failed");
+            usleep(1000);
+        }
+        observed.first_write_ns =
+            origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed);
+        if (observed.first_write_ns < observed.request_send_ns ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire))
+            return fail("W1 timestamp/publication evidence was incoherent");
+
+        const u64 target_ns = observed.first_write_ns + 600'000'000ull;
+        const u64 latest_ns = observed.first_write_ns + 750'000'000ull;
+        for (;;) {
+            std::string detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+                return fail("downstream changed before worker Open probe: " + detail);
+            observed.quiet_ns = steady_now_ns();
+            std::string access;
+            if (!side_frontend_live() || !origins_live() ||
+                origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 0u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 0u ||
+                origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                !read_request_length_access_file(access_path, access, detail) || !access.empty())
+                return fail("pre-probe custody failed: " + detail);
+            if (observed.quiet_ns >= latest_ns) return fail("quiet probe missed W1+750ms");
+            if (observed.quiet_ns >= target_ns) break;
+            if (abort.load(std::memory_order_acquire)) return false;
+        }
+
+        origin.gated_fragment_probe_request.store(2u, std::memory_order_release);
+        while (origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u) {
+            if (abort.load(std::memory_order_acquire)) return false;
+            if (!side_frontend_live() || !origins_live() || steady_now_ns() >= latest_ns)
+                return fail("worker Open acknowledgment missed W1+750ms");
+            usleep(1000);
+        }
+        const u32 probe_ack = origin.gated_fragment_probe_ack.load(std::memory_order_acquire);
+        observed.origin_probe_ns = origin.gated_fragment_probe_ns.load(std::memory_order_relaxed);
+        observed.origin_probe = origin.gated_fragment_probe_result.load(std::memory_order_relaxed);
+        if (probe_ack != 2u || observed.origin_probe != GatedFragmentPeerProbeResult::Open ||
+            observed.origin_probe_ns < observed.quiet_ns || observed.origin_probe_ns >= latest_ns)
+            return fail("worker-owned Open acknowledgment was incoherent");
+
+        std::string detail;
+        if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+            return fail("final post-ack/pre-authorization downstream probe failed: " + detail);
+        observed.downstream_probe_ns = steady_now_ns();
+        std::string access;
+        if (observed.downstream_probe_ns < observed.origin_probe_ns ||
+            observed.downstream_probe_ns >= latest_ns || !side_frontend_live() || !origins_live() ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                observed.origin_probe_ns ||
+            origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                observed.origin_probe ||
+            origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                GatedResponseWriteEofResult::None ||
+            origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(access_path, access, detail) || !access.empty())
+            return fail("post-ack custody failed: " + detail);
+
+        if (withhold_rut_eof_authorization && side == 1u) {
+            const u64 action_deadline_ns = steady_now_ns() + 150'000'000ull;
+            while (steady_now_ns() < action_deadline_ns) {
+                if (origin.response_close_permit.load(std::memory_order_acquire) ||
+                    origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                        GatedResponseWriteEofResult::None ||
+                    origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) !=
+                        0u ||
+                    origin.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                        0u ||
+                    origin.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) !=
+                        0u ||
+                    origin.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                        GatedResponseWriteEofPeerTerminal::None ||
+                    !side_frontend_live() || !origins_live())
+                    return fail("withheld authorization produced an action before its deadline");
+                usleep(1000);
+            }
+            observed.withheld_action_deadline_ns = steady_now_ns();
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[side], 5, detail))
+                return fail("withheld authorization final downstream probe failed: " + detail);
+            observed.withheld_post_deadline_probe_ns = steady_now_ns();
+            if (observed.withheld_action_deadline_ns < action_deadline_ns ||
+                observed.withheld_post_deadline_probe_ns < observed.withheld_action_deadline_ns ||
+                origin.response_close_permit.load(std::memory_order_acquire) ||
+                origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) != 0u ||
+                origin.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) != 0u ||
+                origin.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofPeerTerminal::None ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    observed.origin_probe_ns ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    observed.origin_probe ||
+                origin.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::None ||
+                origin.response_write_eof_reprobe_ns.load(std::memory_order_relaxed) != 0u ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                !side_frontend_live() || !origins_live() ||
+                !read_request_length_access_file(access_path, access, detail) || !access.empty())
+                return fail("withheld authorization evidence changed at its bounded deadline: " +
+                            detail);
+            observed.authorization_withheld = true;
+            return true;
+        }
+
+        observed.authorization_ns = steady_now_ns();
+        origin.response_close_permit.store(true, std::memory_order_release);
+        const auto action_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+        while (origin.response_write_eof_result.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofResult::None &&
+               std::chrono::steady_clock::now() < action_deadline) {
+            if (abort.load(std::memory_order_acquire)) return false;
+            usleep(1000);
+        }
+        observed.action = origin.response_write_eof_result.load(std::memory_order_acquire);
+        observed.reprobe = origin.response_write_eof_reprobe_result.load(std::memory_order_relaxed);
+        observed.reprobe_ns = origin.response_write_eof_reprobe_ns.load(std::memory_order_relaxed);
+        observed.shutdown_begin_ns =
+            origin.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed);
+        observed.shutdown_end_ns =
+            origin.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed);
+        if (observed.action != GatedResponseWriteEofResult::WriteShutdownSucceeded ||
+            observed.reprobe != GatedFragmentPeerProbeResult::Open ||
+            observed.reprobe_ns < observed.authorization_ns ||
+            observed.shutdown_begin_ns < observed.reprobe_ns ||
+            observed.shutdown_end_ns < observed.shutdown_begin_ns ||
+            observed.authorization_ns < observed.downstream_probe_ns ||
+            observed.shutdown_begin_ns < observed.first_write_ns + 550'000'000ull ||
+            observed.shutdown_end_ns < observed.first_write_ns + 550'000'000ull ||
+            observed.shutdown_begin_ns >= latest_ns || observed.shutdown_end_ns >= latest_ns ||
+            origin.response_write_eof_shutdown_calls.load(std::memory_order_relaxed) != 1u ||
+            origin.response_write_eof_shutdown_errno.load(std::memory_order_relaxed) != 0 ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire))
+            return fail("authorized worker SHUT_WR evidence was incoherent");
+
+        const u64 terminal_deadline_ns = std::min(observed.shutdown_end_ns + 250'000'000ull,
+                                                  observed.request_send_ns + 950'000'000ull);
+        while (observed.downstream_eof_ns == 0u) {
+            if (abort.load(std::memory_order_acquire)) return false;
+            if (!side_frontend_live() || !origins_live() || steady_now_ns() >= terminal_deadline_ns)
+                return fail("response or recv-zero EOF missed the terminal deadline");
+            pollfd state{clients.fds[side], POLLIN | POLLHUP | POLLERR, 0};
+            const int ready = poll(&state, 1, 1);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                return fail("downstream poll failed");
+            }
+            if (ready == 0) continue;
+            char bytes[512];
+            const ssize_t count = recv(clients.fds[side], bytes, sizeof(bytes), 0);
+            const u64 observed_ns = steady_now_ns();
+            if (count > 0) {
+                if (observed.first_downstream_ns == 0u) observed.first_downstream_ns = observed_ns;
+                observed.response.insert(observed.response.end(), bytes, bytes + count);
+                if (observed.response.size() > sizeof(kExpectedResponseNormalized) - 1u)
+                    return fail("downstream included `llo`, failure, or tail bytes");
+                if (observed.response.size() == sizeof(kExpectedResponseNormalized) - 1u)
+                    observed.full_downstream_ns = observed_ns;
+                continue;
+            }
+            if (count == 0) {
+                observed.downstream_eof_ns = observed_ns;
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return fail(errno == ECONNRESET ? "downstream reset instead of recv-zero EOF"
+                                            : "downstream recv failed before EOF");
+        }
+
+        while (origin.response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                   GatedResponseWriteEofPeerTerminal::None &&
+               steady_now_ns() < terminal_deadline_ns) {
+            if (abort.load(std::memory_order_acquire)) return false;
+            usleep(1000);
+        }
+        observed.terminal = origin.response_write_eof_peer_terminal.load(std::memory_order_acquire);
+        observed.origin_terminal_ns =
+            origin.response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed);
+        if (observed.first_downstream_ns < observed.shutdown_end_ns ||
+            observed.full_downstream_ns < observed.first_downstream_ns ||
+            observed.downstream_eof_ns < observed.full_downstream_ns ||
+            observed.first_downstream_ns >= terminal_deadline_ns ||
+            observed.full_downstream_ns >= terminal_deadline_ns ||
+            observed.downstream_eof_ns >= terminal_deadline_ns ||
+            observed.terminal != GatedResponseWriteEofPeerTerminal::Fin ||
+            observed.origin_terminal_ns < observed.shutdown_end_ns ||
+            observed.origin_terminal_ns >= terminal_deadline_ns)
+            return fail("terminal timestamp/FIN evidence was incoherent");
+
+        static constexpr char kExpectedAccess[] = "78\n";
+        const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::string live_access;
+            if (!read_request_length_access_file(access_path, live_access, detail))
+                return fail("could not read live access ledger: " + detail);
+            if (live_access == kExpectedAccess) break;
+            if ((!live_access.empty() && live_access != kExpectedAccess) || !side_frontend_live() ||
+                !origins_live() || std::chrono::steady_clock::now() >= access_deadline)
+                return fail("live access was not exact `78\\n`");
+            usleep(5000);
+        }
+        return true;
+    };
+
+    bool side_ok[2] = {false, false};
+    std::thread workers[2] = {std::thread([&]() { side_ok[0] = run_side(0u); }),
+                              std::thread([&]() { side_ok[1] = run_side(1u); })};
+    workers[0].join();
+    workers[1].join();
+    if (!side_ok[0] || !side_ok[1]) {
+        error = std::string(kDiagnostic) + " " +
+                (!side_errors[0].empty() ? side_errors[0] : side_errors[1]);
+        for (size_t side = 0u; side < 2u; side++)
+            dump_wire(side == 0u ? "#546 nginx downstream" : "#546 RUT downstream",
+                      evidence[side].response);
+        return false;
+    }
+
+    std::vector<char> normalized[2] = {evidence[0].response, evidence[1].response};
+    const std::vector<char> expected_response(
+        kExpectedResponseNormalized,
+        kExpectedResponseNormalized + sizeof(kExpectedResponseNormalized) - 1u);
+    const auto exact_terminal_evidence = [&](const std::vector<char>& wire,
+                                             GatedResponseWriteEofResult action,
+                                             u32 shutdown_calls,
+                                             GatedResponseWriteEofPeerTerminal terminal) {
+        const std::string text(wire.begin(), wire.end());
+        return wire == expected_response && header_end(wire) == 163u &&
+               header_end(wire) + 2u == wire.size() &&
+               count_text(text, "HTTP/1.1 206 Partial Content\r\n") == 1u &&
+               count_text(text, "Content-Length: 5\r\n") == 1u &&
+               count_text(text, "Connection: keep-alive\r\n") == 1u &&
+               count_text(text, "Content-Range: bytes 0-4/12\r\n") == 1u &&
+               text.compare(163u, 2u, "he") == 0 && text.find("hello") == std::string::npos &&
+               text.find("HTTP/1.1 200") == std::string::npos &&
+               text.find("502") == std::string::npos && text.find("504") == std::string::npos &&
+               text.find("Bad Gateway") == std::string::npos &&
+               text.find("Gateway Time-out") == std::string::npos &&
+               action == GatedResponseWriteEofResult::WriteShutdownSucceeded &&
+               shutdown_calls == 1u && terminal == GatedResponseWriteEofPeerTerminal::Fin;
+    };
+
+    if (withhold_rut_eof_authorization) {
+        std::vector<char> nginx_normalized = normalized[0];
+        const auto& suppressed = origins[1];
+        const bool negative_latched =
+            evidence[1].authorization_withheld && evidence[1].response.empty() &&
+            evidence[1].authorization_ns == 0u && evidence[1].reprobe_ns == 0u &&
+            evidence[1].shutdown_begin_ns == 0u && evidence[1].shutdown_end_ns == 0u &&
+            evidence[1].downstream_eof_ns == 0u && evidence[1].origin_terminal_ns == 0u &&
+            evidence[1].origin_probe == GatedFragmentPeerProbeResult::Open &&
+            evidence[1].origin_probe_ns >= evidence[1].quiet_ns &&
+            evidence[1].downstream_probe_ns >= evidence[1].origin_probe_ns &&
+            evidence[1].withheld_action_deadline_ns > evidence[1].downstream_probe_ns &&
+            evidence[1].withheld_post_deadline_probe_ns >=
+                evidence[1].withheld_action_deadline_ns &&
+            !suppressed.response_close_permit.load(std::memory_order_acquire) &&
+            suppressed.response_write_eof_result.load(std::memory_order_acquire) ==
+                GatedResponseWriteEofResult::None &&
+            suppressed.response_write_eof_shutdown_calls.load(std::memory_order_acquire) == 0u &&
+            suppressed.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) == 0u &&
+            suppressed.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) == 0u &&
+            suppressed.response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                GatedResponseWriteEofPeerTerminal::None &&
+            !exact_terminal_evidence(evidence[1].response,
+                                     GatedResponseWriteEofResult::None,
+                                     0u,
+                                     GatedResponseWriteEofPeerTerminal::None);
+        if (!negative_latched || !normalize_date(nginx_normalized) ||
+            !exact_terminal_evidence(
+                nginx_normalized,
+                evidence[0].action,
+                origins[0].response_write_eof_shutdown_calls.load(std::memory_order_acquire),
+                evidence[0].terminal)) {
+            error = std::string(kDiagnostic) +
+                    " real withheld-authorization control accepted terminal success or lost the "
+                    "unchanged side";
+            return false;
+        }
+
+        const auto no_retry_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+        while (std::chrono::steady_clock::now() < no_retry_deadline) {
+            std::string nginx_access;
+            std::string rut_access;
+            std::string quiet_detail;
+            if (!observe_client_open_and_quiet_nonconsuming(clients.fds[1], 5, quiet_detail) ||
+                !frontends_live() || !origins_live() ||
+                origins[0].accepted.load(std::memory_order_acquire) != 1u ||
+                origins[0].requests.load(std::memory_order_acquire) != 1u ||
+                origins[1].accepted.load(std::memory_order_acquire) != 1u ||
+                origins[1].requests.load(std::memory_order_acquire) != 1u ||
+                origins[1].response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                origins[1].response_close_permit.load(std::memory_order_acquire) ||
+                origins[1].response_write_eof_result.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofResult::None ||
+                origins[1].response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                    GatedFragmentPeerProbeResult::None ||
+                origins[1].response_write_eof_reprobe_ns.load(std::memory_order_relaxed) != 0u ||
+                origins[1].response_write_eof_shutdown_calls.load(std::memory_order_acquire) !=
+                    0u ||
+                origins[1].response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                    0u ||
+                origins[1].response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) !=
+                    0u ||
+                origins[1].response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofPeerTerminal::None ||
+                !read_request_length_access_file(temps[0].nginx_access_log, nginx_access, error) ||
+                !read_request_length_access_file(temps[1].rut_access_log, rut_access, error) ||
+                nginx_access != "78\n" || !rut_access.empty()) {
+                if (error.empty())
+                    error = std::string(kDiagnostic) +
+                            " withheld control changed before deliberate cleanup";
+                return false;
+            }
+            poll(nullptr, 0, 5);
+        }
+
+        for (size_t side = 0u; side < 2u; side++) {
+            close(clients.fds[side]);
+            clients.fds[side] = -1;
+        }
+        const bool origins_live_before_stop = origins_live();
+        const bool nginx_stopped = stop_child(frontends[0].child);
+        const bool rut_stopped = stop_child(frontends[1].child);
+        const bool container_removed = docker.remove();
+        origins[0].stop();
+        origins[1].stop();
+
+        bool exact_histories = origins_live_before_stop;
+        for (size_t side = 0u; side < 2u; side++) {
+            const std::string expected_text =
+                "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                std::to_string(ports[side * 2u + 1u]) + "\r\nRange: bytes=0-4\r\n\r\n";
+            const std::vector<char> expected(expected_text.begin(), expected_text.end());
+            const auto& origin = origins[side];
+            exact_histories = exact_histories && expected.size() == 78u &&
+                              !origin.thread_alive.load(std::memory_order_acquire) &&
+                              origin.listen_fd < 0 &&
+                              !origin.listener_failed.load(std::memory_order_acquire) &&
+                              origin.accepted.load(std::memory_order_acquire) == 1u &&
+                              origin.requests.load(std::memory_order_acquire) == 1u &&
+                              origin.history.size() == 1u && origin.history[0] == expected &&
+                              origin.request == expected;
+        }
+        const bool suppressed_cleanup_only =
+            !origins[1].response_close_permit.load(std::memory_order_acquire) &&
+            origins[1].response_write_eof_result.load(std::memory_order_acquire) ==
+                GatedResponseWriteEofResult::StoppedBeforeAuthorization &&
+            origins[1].response_write_eof_reprobe_result.load(std::memory_order_relaxed) ==
+                GatedFragmentPeerProbeResult::None &&
+            origins[1].response_write_eof_reprobe_ns.load(std::memory_order_relaxed) == 0u &&
+            origins[1].response_write_eof_shutdown_calls.load(std::memory_order_acquire) == 0u &&
+            origins[1].response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) == 0u &&
+            origins[1].response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) == 0u &&
+            origins[1].response_write_eof_shutdown_errno.load(std::memory_order_relaxed) == 0 &&
+            origins[1].response_write_eof_peer_terminal.load(std::memory_order_acquire) ==
+                GatedResponseWriteEofPeerTerminal::None &&
+            origins[1].response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed) == 0u;
+        // The negative result already latched an empty live ledger. Deliberate client/process
+        // cleanup may either finalize that one request or leave it unrecorded; neither may create
+        // malformed or duplicate records, and neither can alter the latched failure result.
+        std::string final_access[2];
+        if (!nginx_stopped || !rut_stopped || !container_removed || !exact_histories ||
+            !suppressed_cleanup_only || frontends[0].child.pid >= 0 ||
+            frontends[1].child.pid >= 0 || clients.fds[0] >= 0 || clients.fds[1] >= 0 ||
+            reservations.fds[0] >= 0 || reservations.fds[1] >= 0 || reservations.fds[2] >= 0 ||
+            reservations.fds[3] >= 0 ||
+            !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+            !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+            final_access[0] != "78\n" || (!final_access[1].empty() && final_access[1] != "78\n")) {
+            if (error.empty())
+                error = std::string(kDiagnostic) +
+                        " withheld control did not release all resources after latched failure";
+            return false;
+        }
+
+        error = kIssue546WithheldNegativeResult;
+        return false;
+    }
+
+    if (!normalize_date(normalized[0]) || !normalize_date(normalized[1]) ||
+        !exact_terminal_evidence(
+            normalized[0],
+            evidence[0].action,
+            origins[0].response_write_eof_shutdown_calls.load(std::memory_order_acquire),
+            evidence[0].terminal) ||
+        !exact_terminal_evidence(
+            normalized[1],
+            evidence[1].action,
+            origins[1].response_write_eof_shutdown_calls.load(std::memory_order_acquire),
+            evidence[1].terminal) ||
+        normalized[0] != normalized[1]) {
+        error = std::string(kDiagnostic) + " exact normalized wire/terminal equality failed";
+        dump_wire("#546 nginx raw downstream", evidence[0].response);
+        dump_wire("#546 RUT raw downstream", evidence[1].response);
+        return false;
+    }
+
+    // These synthetic argument mutations independently prove the strict terminal validator;
+    // the wrapper below also executes a real one-sided withheld-authorization transaction.
+    std::vector<char> wrong_body = normalized[1];
+    wrong_body.back() = 'x';
+    std::vector<char> wrong_tail = normalized[1];
+    wrong_tail.push_back('x');
+    if (exact_terminal_evidence(wrong_body, evidence[1].action, 1u, evidence[1].terminal) ||
+        exact_terminal_evidence(wrong_tail, evidence[1].action, 1u, evidence[1].terminal) ||
+        exact_terminal_evidence(
+            normalized[1], evidence[1].action, 1u, GatedResponseWriteEofPeerTerminal::Reset) ||
+        exact_terminal_evidence(
+            normalized[1], GatedResponseWriteEofResult::None, 0u, evidence[1].terminal)) {
+        error = std::string(kDiagnostic) +
+                " strict validator accepted corrupted/withheld terminal evidence";
+        return false;
+    }
+
+    const auto no_retry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < no_retry_deadline) {
+        if (!frontends_live() || !origins_live()) {
+            error = std::string(kDiagnostic) + " lost process/listener liveness during no-retry";
+            return false;
+        }
+        for (size_t side = 0u; side < 2u; side++) {
+            const auto& origin = origins[side];
+            std::string live_access;
+            if (origin.accepted.load(std::memory_order_acquire) != 1u ||
+                origin.requests.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+                origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed) !=
+                    evidence[side].first_write_ns ||
+                origin.response_fragment_sent_ns[1].load(std::memory_order_relaxed) != 0u ||
+                origin.response_fragment_sent_ns[2].load(std::memory_order_relaxed) != 0u ||
+                origin.response_fragment_sent_ns[3].load(std::memory_order_relaxed) != 0u ||
+                origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+                origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+                origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].origin_probe_ns ||
+                origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                    evidence[side].origin_probe ||
+                origin.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                    evidence[side].reprobe ||
+                origin.response_write_eof_reprobe_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].reprobe_ns ||
+                origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                    evidence[side].action ||
+                origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 1u ||
+                origin.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].shutdown_begin_ns ||
+                origin.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].shutdown_end_ns ||
+                origin.response_write_eof_shutdown_errno.load(std::memory_order_relaxed) != 0 ||
+                origin.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                    GatedResponseWriteEofPeerTerminal::Fin ||
+                origin.response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].origin_terminal_ns ||
+                !origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_peer_closed_ns.load(std::memory_order_relaxed) !=
+                    evidence[side].origin_terminal_ns ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+                origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.response_sent_open.load(std::memory_order_acquire) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                !read_request_length_access_file(
+                    side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                    live_access,
+                    error) ||
+                live_access != "78\n") {
+                error = std::string(kDiagnostic) + " observed retry or terminal multiplicity";
+                return false;
+            }
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    static constexpr char kExpectedAccess[] = "78\n";
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string live_access;
+        if (!read_request_length_access_file(
+                side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                live_access,
+                error) ||
+            live_access != kExpectedAccess) {
+            if (error.empty()) error = std::string(kDiagnostic) + " live access ledger changed";
+            return false;
+        }
+        close(clients.fds[side]);
+        clients.fds[side] = -1;
+    }
+    for (size_t side = 0u; side < 2u; side++) {
+        std::string post_client_access;
+        if (!read_request_length_access_file(
+                side == 0u ? temps[0].nginx_access_log : temps[1].rut_access_log,
+                post_client_access,
+                error) ||
+            post_client_access != kExpectedAccess) {
+            if (error.empty())
+                error = std::string(kDiagnostic) + " access changed after deliberate client close";
+            return false;
+        }
+    }
+
+    const bool origins_live_before_stop = origins_live();
+    origins[0].stop();
+    origins[1].stop();
+    std::vector<char> upstream[2];
+    for (size_t side = 0u; side < 2u; side++) {
+        const std::string expected_text = "GET /buffered-timeout?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                          std::to_string(ports[side * 2u + 1u]) +
+                                          "\r\nRange: bytes=0-4\r\n\r\n";
+        const std::vector<char> expected(expected_text.begin(), expected_text.end());
+        const auto& origin = origins[side];
+        const std::string observed_upstream(origin.request.begin(), origin.request.end());
+        if (!origins_live_before_stop || expected.size() != 78u ||
+            origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+            origin.listener_failed.load(std::memory_order_acquire) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+            origin.history[0] != expected || origin.request != expected ||
+            observed_upstream.find("Host: client.example") != std::string::npos ||
+            observed_upstream.find("\r\nConnection:") != std::string::npos ||
+            count_text(observed_upstream, "Range: bytes=0-4\r\n") != 1u ||
+            origin.response_fragment_permit.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragments_sent.load(std::memory_order_acquire) != 1u ||
+            origin.response_fragment_sent_ns[0].load(std::memory_order_relaxed) !=
+                evidence[side].first_write_ns ||
+            origin.response_fragment_sent_ns[1].load(std::memory_order_relaxed) != 0u ||
+            origin.response_fragment_sent_ns[2].load(std::memory_order_relaxed) != 0u ||
+            origin.response_fragment_sent_ns[3].load(std::memory_order_relaxed) != 0u ||
+            origin.gated_fragment_probe_request.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_ack.load(std::memory_order_acquire) != 2u ||
+            origin.gated_fragment_probe_ns.load(std::memory_order_relaxed) !=
+                evidence[side].origin_probe_ns ||
+            origin.gated_fragment_probe_result.load(std::memory_order_relaxed) !=
+                evidence[side].origin_probe ||
+            origin.response_write_eof_reprobe_result.load(std::memory_order_relaxed) !=
+                evidence[side].reprobe ||
+            origin.response_write_eof_reprobe_ns.load(std::memory_order_relaxed) !=
+                evidence[side].reprobe_ns ||
+            origin.response_write_eof_result.load(std::memory_order_acquire) !=
+                evidence[side].action ||
+            origin.response_write_eof_shutdown_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_write_eof_shutdown_begin_ns.load(std::memory_order_relaxed) !=
+                evidence[side].shutdown_begin_ns ||
+            origin.response_write_eof_shutdown_end_ns.load(std::memory_order_relaxed) !=
+                evidence[side].shutdown_end_ns ||
+            origin.response_write_eof_shutdown_errno.load(std::memory_order_acquire) != 0 ||
+            origin.response_write_eof_peer_terminal.load(std::memory_order_acquire) !=
+                GatedResponseWriteEofPeerTerminal::Fin ||
+            origin.response_write_eof_peer_terminal_ns.load(std::memory_order_relaxed) !=
+                evidence[side].origin_terminal_ns ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_closed_ns.load(std::memory_order_relaxed) !=
+                evidence[side].origin_terminal_ns ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 0u ||
+            origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_sent_open.load(std::memory_order_acquire) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !origin.response_connection_closed.load(std::memory_order_acquire)) {
+            error = std::string(kDiagnostic) + " exact upstream/origin lifecycle mismatch";
+            dump_wire(side == 0u ? "#546 expected nginx upstream" : "#546 expected RUT upstream",
+                      expected);
+            dump_wire(side == 0u ? "#546 observed nginx upstream" : "#546 observed RUT upstream",
+                      origin.request);
+            return false;
+        }
+        upstream[side] = origin.request;
+    }
+    const std::string authority0 = "127.0.0.1:" + std::to_string(ports[1]);
+    const std::string authority1 = "127.0.0.1:" + std::to_string(ports[3]);
+    std::string canonical0(upstream[0].begin(), upstream[0].end());
+    std::string canonical1(upstream[1].begin(), upstream[1].end());
+    if (count_text(canonical0, authority0) != 1u || count_text(canonical1, authority1) != 1u) {
+        error = std::string(kDiagnostic) + " upstream authority was not unique";
+        return false;
+    }
+    canonical0.replace(canonical0.find(authority0), authority0.size(), "BACKEND");
+    canonical1.replace(canonical1.find(authority1), authority1.size(), "BACKEND");
+    if (canonical0 != canonical1) {
+        error = std::string(kDiagnostic) + " canonical upstream requests differed";
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(frontends[0].child);
+    const bool rut_stopped = stop_child(frontends[1].child);
+    const bool container_removed = docker.remove();
+    std::string final_access[2];
+    if (!nginx_stopped || !rut_stopped || !container_removed || reservations.fds[0] >= 0 ||
+        reservations.fds[1] >= 0 || reservations.fds[2] >= 0 || reservations.fds[3] >= 0 ||
+        !read_request_length_access_file(temps[0].nginx_access_log, final_access[0], error) ||
+        !read_request_length_access_file(temps[1].rut_access_log, final_access[1], error) ||
+        final_access[0] != kExpectedAccess || final_access[1] != kExpectedAccess) {
+        if (error.empty()) error = std::string(kDiagnostic) + " final cleanup/access failed";
+        return false;
+    }
+
+    std::cerr << "PASS evidence: #546 paired 206 incomplete clean-EOF"
+              << " nginx_w1_to_shutdown_ns="
+              << evidence[0].shutdown_end_ns - evidence[0].first_write_ns
+              << " rut_w1_to_shutdown_ns="
+              << evidence[1].shutdown_end_ns - evidence[1].first_write_ns
+              << " nginx_shutdown_to_eof_ns="
+              << evidence[0].downstream_eof_ns - evidence[0].shutdown_end_ns
+              << " rut_shutdown_to_eof_ns="
+              << evidence[1].downstream_eof_ns - evidence[1].shutdown_end_ns
+              << " accepted=1 requests=1 publications=1 shutdown=1 fin=1 access=78\\n retry=0\n";
+    return true;
+}
+
+static bool run_converter_default_buffering_206_range_incomplete_clean_eof_differential(
+    const char* rut_path, const std::string& container_name, std::string& error) {
+    static constexpr int kExpectedWithheldExit = 86;
+    static constexpr int kUnexpectedWithheldFailureExit = 87;
+    const std::string withheld_container = container_name + "-withheld-control";
+
+    // Fork before the control creates either Recorder or side thread. The child owns wholly
+    // separate ports, temp trees, frontend processes, and container identity. Only the exact
+    // latched pre-cleanup failure plus successful cleanup maps to the expected nonzero exit.
+    const pid_t withheld_pid = fork();
+    if (withheld_pid < 0) {
+        error = "#546 could not fork the real withheld-authorization control";
+        return false;
+    }
+    if (withheld_pid == 0) {
+        std::string withheld_error;
+        const bool accepted =
+            run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
+                rut_path, withheld_container, true, withheld_error);
+        if (!accepted && withheld_error == kIssue546WithheldNegativeResult)
+            _exit(kExpectedWithheldExit);
+        std::cerr << "FAIL [#546 real withheld-authorization control]: "
+                  << (accepted ? "withheld EOF authorization was accepted" : withheld_error)
+                  << "\n";
+        _exit(accepted ? 0 : kUnexpectedWithheldFailureExit);
+    }
+
+    Child withheld_child;
+    withheld_child.pid = withheld_pid;
+    if (!wait_child(withheld_child, 30'000)) {
+        (void)kill(withheld_child.pid, SIGKILL);
+        (void)wait_child(withheld_child, 2000);
+        withheld_child.pid = -1;
+        (void)docker_remove(withheld_container);
+        error = "#546 real withheld-authorization control exceeded its bounded process deadline";
+        return false;
+    }
+    const bool exact_expected_failure = withheld_child.status_valid &&
+                                        WIFEXITED(withheld_child.status) &&
+                                        WEXITSTATUS(withheld_child.status) == kExpectedWithheldExit;
+    const std::string withheld_status = child_status_description(withheld_child);
+    withheld_child.pid = -1;
+    if (!exact_expected_failure) {
+        error = "#546 real withheld-authorization control returned " + withheld_status +
+                " instead of exact expected nonzero exit " + std::to_string(kExpectedWithheldExit);
+        return false;
+    }
+    std::cerr << "PASS control: #546 real RUT-side EOF authorization remained withheld through "
+                 "its bounded action deadline, exited nonzero, and released all isolated "
+                 "resources\n";
+
+    return run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
+        rut_path, container_name, false, error);
+}
+
 static bool run_converter_default_buffering_304_content_length_metadata_differential(
     const char* rut_path, const std::string& container_name, std::string& error) {
     static constexpr char kDiagnostic[] = "#529 paired 304 metadata";
@@ -68489,6 +69480,10 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-206-range-three-publication-completion-"
                             "differential") == 0;
+    const bool converter_default_buffering_206_range_incomplete_clean_eof_differential =
+        argc == 3 && strcmp(argv[1],
+                            "--converter-default-buffering-206-range-incomplete-clean-eof-"
+                            "differential") == 0;
     const bool converter_default_buffering_second_body_progress_refresh_differential =
         argc == 3 && strcmp(argv[1],
                             "--converter-default-buffering-second-body-progress-refresh-"
@@ -68752,6 +69747,7 @@ int main(int argc, char** argv) {
          !converter_default_buffering_206_range_completion_differential &&
          !converter_default_buffering_206_range_delayed_completion_differential &&
          !converter_default_buffering_206_range_three_publication_completion_differential &&
+         !converter_default_buffering_206_range_incomplete_clean_eof_differential &&
          !converter_default_buffering_second_body_progress_refresh_differential &&
          !converter_default_buffering_three_publication_completion_differential &&
          !converter_default_buffering_third_body_progress_expiry_differential &&
@@ -68844,6 +69840,7 @@ int main(int argc, char** argv) {
           converter_default_buffering_206_range_completion_differential ||
           converter_default_buffering_206_range_delayed_completion_differential ||
           converter_default_buffering_206_range_three_publication_completion_differential ||
+          converter_default_buffering_206_range_incomplete_clean_eof_differential ||
           converter_default_buffering_second_body_progress_refresh_differential ||
           converter_default_buffering_three_publication_completion_differential ||
           converter_default_buffering_third_body_progress_expiry_differential) &&
@@ -68987,6 +69984,9 @@ int main(int argc, char** argv) {
                "   or: test_nginx_differential "
                "--converter-default-buffering-206-range-three-publication-completion-"
                "differential <absolute-rut-executable>\n"
+               "   or: test_nginx_differential "
+               "--converter-default-buffering-206-range-incomplete-clean-eof-differential "
+               "<absolute-rut-executable>\n"
                "   or: test_nginx_differential "
                "--converter-default-buffering-second-body-progress-refresh-differential "
                "<absolute-rut-executable>\n"
@@ -70596,6 +71596,39 @@ int main(int argc, char** argv) {
                "not emission, TCP/read, or CQE boundaries. This claims no arbitrary progress "
                "schedule, incomplete 206, other Range/status/framing, retry/reuse/pipeline, TLS/"
                "H2/epoll, or broad #253/#271 support.\n";
+        return 0;
+    }
+    if (converter_default_buffering_206_range_incomplete_clean_eof_differential) {
+        const std::string container_name = "rut-nginx-546-206-incomplete-clean-eof-diff-" +
+                                           std::to_string(getpid()) + "-" +
+                                           (suffix ? suffix + 1 : "tmp");
+        std::string differential_error;
+        if (!run_converter_default_buffering_206_range_incomplete_clean_eof_differential(
+                argv[2], container_name, differential_error)) {
+            std::cerr << "FAIL [#546 converter default-buffering 206 range incomplete "
+                         "clean-EOF differential]: "
+                      << differential_error << "\n";
+            return 1;
+        }
+        std::cerr
+            << "PASS: #546 pinned nginx 1.29.7 and independently converter-generated ordinary "
+               "RUT matched one exact 78-byte Range GET through root no-URI proxying with "
+               "explicit proxy_read_timeout 1s and omitted buffering/request-buffering/http-"
+               "version/header overrides. Each origin published only the exact 141-byte "
+               "coherent 206/Content-Range bytes 0-4/12/CL5 header-plus-he prefix, then one "
+               "worker-owned clean write EOF around W1+600ms. Fresh per-side origin-Open and "
+               "downstream-zero observations causally preceded each authorization. Both "
+               "frontends emitted the exact equal Date-normalized 165-byte header-plus-he "
+               "response and actual downstream EOF; each origin observed the frontend's FIN "
+               "following authorized write EOF inside the strict sub-timeout terminal budget. "
+               "Each emitted "
+               "one exact authority-rewritten 78-byte upstream request preserving Range and "
+               "one access record reporting 78 request bytes, with no retry. Generated ordinary "
+               "source passed semantic source/lexer/AST/HIR/MIR/verified-RIR/O2/config custody "
+               "and ran through the public io_uring CLI. Publication/probe timestamps are "
+               "observations, not TCP/read/CQE boundaries. This claims no timeout-expiry, other "
+               "incomplete-206/Range/status schedule, retry/reuse/pipeline, TLS/H2/epoll, or "
+               "broad #253/#271 support.\n";
         return 0;
     }
     if (pinned_nginx_default_buffering_206_range_completion_oracle) {
