@@ -1430,6 +1430,20 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle
+        COMMAND test_nginx_differential
+                --pinned-nginx-default-buffering-three-publication-completion-oracle
+    )
+    set_tests_properties(
+        test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle PROPERTIES
+        LABELS "integration;nginx;docker;network;differential"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_issue268_pinned_positive_cl_options_default_buffering_oracle
         COMMAND test_nginx_differential
                 --pinned-nginx-positive-cl-options-default-buffering-oracle
