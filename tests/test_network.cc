@@ -46810,6 +46810,20 @@ TEST(response_buffering_runtime,
     }
 }
 
+TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exact) {
+    for (const u16 status : {static_cast<u16>(200), static_cast<u16>(201), static_cast<u16>(202)})
+        CHECK(complete_content_length_response_status_is_admitted(status));
+    for (const u16 status : {static_cast<u16>(199),
+                             static_cast<u16>(203),
+                             static_cast<u16>(204),
+                             static_cast<u16>(205),
+                             static_cast<u16>(206),
+                             static_cast<u16>(304),
+                             static_cast<u16>(400),
+                             static_cast<u16>(500)})
+        CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
+}
+
 TEST(response_buffering_runtime,
      incomplete_complete_content_length_transition_retains_precise_timer_without_wheel) {
     ScopedIoUringLoopForRetirement guard;
@@ -46829,7 +46843,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn.timer_node.next, &conn.timer_node);
     REQUIRE_EQ(conn.timer_node.prev, &conn.timer_node);
 
-    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
     const IoEvent progress =
@@ -46839,6 +46853,10 @@ TEST(response_buffering_runtime,
     REQUIRE_GE(conn.fd, 0);
     CHECK_EQ(conn.response_read_deadline_post_commit_phase,
              ResponseReadDeadlinePostCommitPhase::Buffering);
+    CHECK_EQ(conn.resp_status, 202u);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "HTTP/1.1 202 Accepted\r\n"));
     CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
     CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 2u);
     CHECK_EQ(conn.response_read_deadline_progress_generation,
@@ -46868,7 +46886,7 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_live_precise_get(loop, config, &fixture));
         Connection& conn = *fixture.conn;
 
-        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                    sizeof(kPartial) - 1u);
         const IoEvent progress =
@@ -46891,7 +46909,10 @@ TEST(response_buffering_runtime,
                      ResponseReadDeadlinePostCommitPhase::HeaderSend);
             CHECK(conn.response_read_deadline_post_commit_close_after_drain);
             CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
-            CHECK_EQ(conn.resp_status, 200u);
+            CHECK_EQ(conn.resp_status, 202u);
+            CHECK(buf_has(conn.response_read_deadline_send_src,
+                          conn.response_read_deadline_send_len,
+                          "HTTP/1.1 202 Accepted\r\n"));
             CHECK(conn.response_read_timer_owner_is_neutral());
             CHECK_FALSE(buf_has(conn.response_read_deadline_send_src,
                                 conn.response_read_deadline_send_len,
@@ -46923,7 +46944,7 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_live_precise_get(loop, config, &fixture));
         Connection& conn = *fixture.conn;
 
-        static constexpr u8 kInitial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na";
+        static constexpr u8 kInitial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\na";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kInitial, sizeof(kInitial) - 1u),
                    sizeof(kInitial) - 1u);
         const IoEvent initial =
@@ -46956,7 +46977,7 @@ TEST(response_buffering_runtime,
         loop->dispatch_batch(events, 2);
 
         REQUIRE_GE(conn.fd, 0);
-        CHECK_EQ(conn.resp_status, 200u);
+        CHECK_EQ(conn.resp_status, 202u);
         CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                  ResponseReadDeadlinePostCommitPhase::Buffering);
         CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
@@ -47118,13 +47139,18 @@ TEST(response_buffering_runtime,
     cleanup_prebuilt_d2(loop, fixture);
 }
 
-TEST(response_buffering_runtime, incomplete_timeout_sends_only_pinned_success_header_then_closes) {
+TEST(response_buffering_runtime,
+     incomplete_202_timeout_sends_only_pinned_header_and_completes_once) {
     AccessLogRing access_log{};
     access_log.init();
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
     loop->access_log = &access_log;
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->metrics = &metrics;
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -47134,7 +47160,7 @@ TEST(response_buffering_runtime, incomplete_timeout_sends_only_pinned_success_he
         stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Post));
     REQUIRE(arm_staged_response_read_deadline(loop, fixture));
     Connection& conn = *fixture.conn;
-    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
     const IoEvent partial =
@@ -47153,22 +47179,37 @@ TEST(response_buffering_runtime, incomplete_timeout_sends_only_pinned_success_he
     CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
     CHECK(buf_has(conn.response_read_deadline_send_src,
                   conn.response_read_deadline_send_len,
-                  "HTTP/1.1 200 OK\r\n"));
+                  "HTTP/1.1 202 Accepted\r\n"));
     CHECK(buf_has(conn.response_read_deadline_send_src,
                   conn.response_read_deadline_send_len,
                   "Content-Length: 4\r\n"));
     CHECK_FALSE(
         buf_has(conn.response_read_deadline_send_src, conn.response_read_deadline_send_len, "504"));
+    CHECK_FALSE(
+        buf_has(conn.response_read_deadline_send_src, conn.response_read_deadline_send_len, "502"));
     const u32 expected_response_size = conn.response_header_buf.len();
     CHECK_EQ(access_log.available(), 0u);
+    REQUIRE(conn.upstream_retirement_active);
     IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
     const u32 id = conn.id;
     loop->dispatch_batch(&header_sent, 1);
     CHECK_EQ(loop->conns[id].fd, -1);
     REQUIRE_EQ(access_log.available(), 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    loop->dispatch_batch(&header_sent, 1);
+    const IoEvent stale_timeout{id, 1, 0, 0, IoEventType::Timeout, 0};
+    loop->dispatch_batch(&stale_timeout, 1);
+    if (loop->conns[id].upstream_retirement_active)
+        drain_prebuilt_d2_retirement(loop, loop->conns[id], kUpstreamOpRecv, false);
+    CHECK_EQ(access_log.available(), 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
     AccessLogEntry access{};
     REQUIRE(access_log.pop(access));
-    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.status, 202u);
     CHECK_EQ(access.req_size, sizeof("POST /one HTTP/1.1\r\nHost: old.example\r\n\r\n") - 1u);
     CHECK_EQ(access.resp_size, expected_response_size);
     AccessLogEntry duplicate{};
@@ -47204,7 +47245,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::Complete);
     REQUIRE_EQ(conn.access_log_target_snapshot.target_length, 4u);
     CHECK_EQ(__builtin_memcmp(conn.access_log_target_snapshot.path, "/one", 4), 0);
-    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+    static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
     const IoEvent partial =
@@ -47212,6 +47253,10 @@ TEST(response_buffering_runtime,
     loop->dispatch_batch(&partial, 1);
     REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                ResponseReadDeadlinePostCommitPhase::Buffering);
+    REQUIRE_EQ(conn.resp_status, 202u);
+    REQUIRE(buf_has(conn.response_header_buf.data(),
+                    conn.response_header_buf.len(),
+                    "HTTP/1.1 202 Accepted\r\n"));
     CHECK_EQ(access_log.available(), 0u);
 
     IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
@@ -47253,7 +47298,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(access_log.available(), 1u);
     AccessLogEntry access{};
     REQUIRE(access_log.pop(access));
-    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.status, 202u);
     CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Post));
     CHECK_EQ(access.req_size, kExpectedRequestSize);
     CHECK_EQ(access.resp_size, expected_response_size);
@@ -47282,7 +47327,7 @@ TEST(response_buffering_runtime,
             loop, &config, nullptr, 0, &fixture, LogHttpMethod::Post));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                    sizeof(kPartial) - 1u);
         const IoEvent progress =
@@ -47295,6 +47340,10 @@ TEST(response_buffering_runtime,
             progress, timeout_before_eof ? timeout : eof, timeout_before_eof ? eof : timeout};
         loop->dispatch_batch(batch, 3);
         REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.resp_status, 202u);
+        REQUIRE(buf_has(conn.response_header_buf.data(),
+                        conn.response_header_buf.len(),
+                        "HTTP/1.1 202 Accepted\r\n"));
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::HeaderSend);
         CHECK(conn.response_read_deadline_post_commit_close_after_drain);
@@ -47321,7 +47370,7 @@ TEST(response_buffering_runtime,
         CHECK_EQ(access_log.available(), 1u);
         AccessLogEntry access{};
         REQUIRE(access_log.pop(access));
-        CHECK_EQ(access.status, 200u);
+        CHECK_EQ(access.status, 202u);
         CHECK_EQ(access.resp_size, expected_response_size);
         AccessLogEntry duplicate{};
         CHECK_FALSE(access_log.pop(duplicate));
@@ -47344,7 +47393,7 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        static constexpr u8 kPartial[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nab";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                    sizeof(kPartial) - 1u);
         const IoEvent partial =
@@ -47352,6 +47401,7 @@ TEST(response_buffering_runtime,
         loop->dispatch_batch(&partial, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.resp_status, 202u);
         const u32 id = conn.id;
         if (fault == Fault::Reset) {
             IoEvent reset{
@@ -47387,7 +47437,7 @@ TEST(response_buffering_runtime,
             REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
             REQUIRE(arm_staged_response_read_deadline(loop, fixture));
             Connection& conn = *fixture.conn;
-            static constexpr u8 kFirst[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na";
+            static constexpr u8 kFirst[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 3\r\n\r\na";
             REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u),
                        sizeof(kFirst) - 1u);
             const IoEvent first =
@@ -47395,6 +47445,7 @@ TEST(response_buffering_runtime,
             loop->dispatch_batch(&first, 1);
             REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                        ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE_EQ(conn.resp_status, 202u);
 
             const u32 begin = conn.upstream_recv_buf.len();
             static constexpr u8 kRest[] = {'b', 'c'};
@@ -47497,7 +47548,7 @@ TEST(response_buffering_runtime,
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
-        static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx";
+        static constexpr u8 kResponse[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 1\r\n\r\nx";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1u),
                    sizeof(kResponse) - 1u);
         const IoEvent response =
@@ -47505,6 +47556,10 @@ TEST(response_buffering_runtime,
         loop->dispatch_batch(&response, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        REQUIRE_EQ(conn.resp_status, 202u);
+        REQUIRE(buf_has(conn.response_header_buf.data(),
+                        conn.response_header_buf.len(),
+                        "HTTP/1.1 202 Accepted\r\n"));
         REQUIRE(conn.response_read_deadline_send_owner_active);
 
         if (fault == Fault::BodyShort || fault == Fault::BodyError) {
@@ -47852,13 +47907,14 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime,
-     bounded_content_type_200_and_201_complete_and_fragmented_preserve_wire_and_access) {
+     bounded_content_type_200_201_and_202_complete_and_fragmented_preserve_wire_and_access) {
     struct StatusVector {
         u16 status;
         const char* status_line;
     };
     static constexpr StatusVector kStatuses[] = {{200, "HTTP/1.1 200 OK\r\n"},
-                                                 {201, "HTTP/1.1 201 Created\r\n"}};
+                                                 {201, "HTTP/1.1 201 Created\r\n"},
+                                                 {202, "HTTP/1.1 202 Accepted\r\n"}};
     for (const StatusVector& status : kStatuses) {
         for (const bool fragmented : {false, true}) {
             ScopedIoUringLoopForRetirement guard;
@@ -47980,7 +48036,7 @@ TEST(response_buffering_runtime,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        static constexpr u8 kOrigin[] = "HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nabcd";
+        static constexpr u8 kOrigin[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\n\r\nabcd";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
                    sizeof(kOrigin) - 1u);
         HttpResponseParser parser;
@@ -47988,35 +48044,35 @@ TEST(response_buffering_runtime,
         parser.reset();
         response.reset();
         REQUIRE_EQ(parser.parse(kOrigin, sizeof(kOrigin) - 1u, &response), ParseStatus::Complete);
-        REQUIRE_EQ(response.status_code, 201u);
+        REQUIRE_EQ(response.status_code, 202u);
         REQUIRE_EQ(response.content_length, 4u);
         conn.resp_status = response.status_code;
         REQUIRE(build_strict_response_headers(conn, config, response));
         loop->timer.remove(&conn);
         conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
         static constexpr u32 kStatusLast = sizeof("HTTP/1.1 20") - 1u;
-        static constexpr u32 kReasonFirst = sizeof("HTTP/1.1 201 ") - 1u;
+        static constexpr u32 kReasonFirst = sizeof("HTTP/1.1 202 ") - 1u;
         static constexpr u32 kContentLengthDigit =
-            sizeof("HTTP/1.1 201 Created\r\nContent-Length: ") - 1u;
+            sizeof("HTTP/1.1 202 Accepted\r\nContent-Length: ") - 1u;
         u32 raw_header_end = parser.header_end;
         if (mutation == Mutation::Scalar) {
             conn.resp_status = 200u;
         } else if (mutation == Mutation::PinnedStatus ||
                    mutation == Mutation::ScalarAndPinnedStatus) {
             REQUIRE_GT(conn.response_header_buf.len(), kStatusLast);
-            REQUIRE_EQ(conn.response_header_buf.data()[kStatusLast], static_cast<u8>('1'));
+            REQUIRE_EQ(conn.response_header_buf.data()[kStatusLast], static_cast<u8>('2'));
             conn.response_header_slice[kStatusLast] =
-                mutation == Mutation::PinnedStatus ? static_cast<u8>('2') : static_cast<u8>('0');
+                mutation == Mutation::PinnedStatus ? static_cast<u8>('1') : static_cast<u8>('0');
             if (mutation == Mutation::ScalarAndPinnedStatus) conn.resp_status = 200u;
         } else if (mutation == Mutation::PinnedReason) {
             REQUIRE_GT(conn.response_header_buf.len(), kReasonFirst);
-            REQUIRE_EQ(conn.response_header_buf.data()[kReasonFirst], static_cast<u8>('C'));
+            REQUIRE_EQ(conn.response_header_buf.data()[kReasonFirst], static_cast<u8>('A'));
             conn.response_header_slice[kReasonFirst] = static_cast<u8>('X');
         } else if (mutation == Mutation::RawStatus) {
-            REQUIRE_EQ(conn.upstream_recv_buf.data()[kStatusLast], static_cast<u8>('1'));
-            conn.upstream_recv_slice[kStatusLast] = static_cast<u8>('2');
+            REQUIRE_EQ(conn.upstream_recv_buf.data()[kStatusLast], static_cast<u8>('2'));
+            conn.upstream_recv_slice[kStatusLast] = static_cast<u8>('1');
         } else if (mutation == Mutation::RawReason) {
-            REQUIRE_EQ(conn.upstream_recv_buf.data()[kReasonFirst], static_cast<u8>('C'));
+            REQUIRE_EQ(conn.upstream_recv_buf.data()[kReasonFirst], static_cast<u8>('A'));
             conn.upstream_recv_slice[kReasonFirst] = static_cast<u8>('X');
         } else if (mutation == Mutation::RawContentLength) {
             REQUIRE_EQ(conn.upstream_recv_buf.data()[kContentLengthDigit], static_cast<u8>('4'));
@@ -48033,7 +48089,7 @@ TEST(response_buffering_runtime,
         if (mutation == Mutation::None) {
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                      ResponseReadDeadlinePostCommitPhase::Buffering);
-            CHECK_EQ(conn.resp_status, 201u);
+            CHECK_EQ(conn.resp_status, 202u);
             CHECK(response_read_deadline_post_commit_is_stable(conn));
         } else {
             CHECK_EQ(conn.response_read_deadline_post_commit_phase,
@@ -48044,7 +48100,7 @@ TEST(response_buffering_runtime,
     }
 }
 
-TEST(response_buffering_runtime, bounded_201_completion_wins_same_batch_timeout_in_either_order) {
+TEST(response_buffering_runtime, bounded_202_completion_wins_same_batch_timeout_in_either_order) {
     for (const bool timeout_first : {false, true}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -48057,14 +48113,14 @@ TEST(response_buffering_runtime, bounded_201_completion_wins_same_batch_timeout_
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        static constexpr u8 kFirst[] = "HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\na";
+        static constexpr u8 kFirst[] = "HTTP/1.1 202 Accepted\r\nContent-Length: 3\r\n\r\na";
         REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
         const IoEvent first =
             response_read_copy_event(conn, sizeof(kFirst) - 1u, true, 0, sizeof(kFirst) - 1u);
         loop->dispatch_batch(&first, 1);
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::Buffering);
-        REQUIRE_EQ(conn.resp_status, 201u);
+        REQUIRE_EQ(conn.resp_status, 202u);
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
 
         const u32 begin = conn.upstream_recv_buf.len();
@@ -48082,16 +48138,17 @@ TEST(response_buffering_runtime, bounded_201_completion_wins_same_batch_timeout_
         CHECK_EQ(conn.response_read_deadline_post_commit_phase,
                  ResponseReadDeadlinePostCommitPhase::HeaderSend);
         CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 3u);
-        CHECK_EQ(conn.resp_status, 201u);
+        CHECK_EQ(conn.resp_status, 202u);
         CHECK(response_read_deadline_post_commit_is_stable(conn));
         CHECK(buf_has(conn.response_header_buf.data(),
                       conn.response_header_buf.len(),
-                      "HTTP/1.1 201 Created\r\n"));
+                      "HTTP/1.1 202 Accepted\r\n"));
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
 
-TEST(response_buffering_runtime, bounded_201_remains_rejected_for_cl0_and_immediate_streaming) {
+TEST(response_buffering_runtime,
+     bounded_201_and_202_remain_rejected_for_cl0_and_immediate_streaming) {
     struct Vector {
         ForwardResponseBufferingMode buffering;
         const char* response;
@@ -48100,6 +48157,9 @@ TEST(response_buffering_runtime, bounded_201_remains_rejected_for_cl0_and_immedi
         {ForwardResponseBufferingMode::CompleteContentLength,
          "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"},
         {ForwardResponseBufferingMode::None, "HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nx"},
+        {ForwardResponseBufferingMode::CompleteContentLength,
+         "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n"},
+        {ForwardResponseBufferingMode::None, "HTTP/1.1 202 Accepted\r\nContent-Length: 1\r\n\r\nx"},
     };
     for (const Vector& vector : kVectors) {
         ScopedIoUringLoopForRetirement guard;
@@ -48127,7 +48187,11 @@ TEST(response_buffering_runtime, bounded_201_remains_rejected_for_cl0_and_immedi
 TEST(response_buffering_runtime,
      unsupported_response_framing_and_status_fail_before_downstream_commit) {
     static constexpr const char* kResponses[] = {
-        "HTTP/1.1 202 Accepted\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 203 Non-Authoritative Information\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 205 Reset Content\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n\r\nx",
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\n\r\nx",
         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
         "HTTP/1.1 200 OK\r\n\r\nx",
