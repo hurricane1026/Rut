@@ -3371,7 +3371,9 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                                   function.method, *timeout_term)));
     }
     if (framing_selection) {
-        if (!common || function.method != kRouteMethodHead || function.blocks.len != 3 ||
+        const bool head_framing = function.method == kRouteMethodHead;
+        const bool get_framing = function.method == kRouteMethodGet;
+        if (!common || (!head_framing && !get_framing) || function.blocks.len != 3 ||
             function.values.len != 0)
             return false;
         const auto& entry = function.blocks[0];
@@ -3384,7 +3386,9 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
             entry.term.cond.type != MirTypeKind::Bool || entry.term.cond.lhs != nullptr ||
             entry.term.cond.rhs != nullptr)
             return false;
-        auto exact_forward = [&](const MirTerminator& term, RequestPolicyId policy) {
+        auto exact_forward = [&](const MirTerminator& term,
+                                 RequestPolicyId policy,
+                                 ForwardResponseBufferingMode buffering) {
             return term.kind == MirTerminatorKind::ForwardUpstream &&
                    term.source_kind == MirTerminatorSourceKind::Literal &&
                    term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
@@ -3396,13 +3400,36 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
-                   term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                   term.forward_response_buffering == buffering &&
                    response_read_deadline_request_policy_is_admitted_for_term(
-                       module, function.method, term);
+                       module, function.method, term) &&
+                   (buffering == ForwardResponseBufferingMode::None ||
+                    (get_framing && term.forward_response_policy_id != 0 &&
+                     term.forward_response_policy_id <= module.response_policies.len &&
+                     term.forward_failure_policy_id != 0 &&
+                     term.forward_failure_policy_id <= module.failure_policies.len &&
+                     term.forward_timeout_failure_policy_id != 0 &&
+                     term.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+                     complete_content_length_buffering_policies_valid(
+                         module.response_policies[term.forward_response_policy_id - 1],
+                         module.failure_policies[term.forward_failure_policy_id - 1],
+                         module.failure_policies[term.forward_timeout_failure_policy_id - 1])));
         };
-        return exact_forward(after_host, RequestPolicyId::Http11FixedStripContentLengthAfterHost) &&
-               exact_forward(legacy, RequestPolicyId::Http11FixedStrip) &&
-               after_host.upstream_index == legacy.upstream_index &&
+        const bool exact_head =
+            head_framing &&
+            exact_forward(after_host,
+                          RequestPolicyId::Http11FixedStripContentLengthAfterHost,
+                          ForwardResponseBufferingMode::None) &&
+            exact_forward(
+                legacy, RequestPolicyId::Http11FixedStrip, ForwardResponseBufferingMode::None);
+        const bool exact_get = get_framing &&
+                               exact_forward(after_host,
+                                             RequestPolicyId::Http11FixedStrip,
+                                             ForwardResponseBufferingMode::CompleteContentLength) &&
+                               exact_forward(legacy,
+                                             RequestPolicyId::Http11FixedTrimSpPreserveHtab,
+                                             ForwardResponseBufferingMode::CompleteContentLength);
+        return (exact_head || exact_get) && after_host.upstream_index == legacy.upstream_index &&
                after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
                after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
                after_host.forward_timeout_failure_policy_id ==

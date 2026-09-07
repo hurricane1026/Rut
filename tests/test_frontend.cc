@@ -38290,6 +38290,62 @@ TEST(frontend, request_framing_selection_preflight_is_exact_and_verified_at_each
     lowered.destroy();
 }
 
+TEST(frontend, complete_content_length_request_framing_selection_is_get_id1_then_id3) {
+    auto lexed = lex(lit(kCompleteContentLengthFramingSelectionSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.method, kRouteMethodGet);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::ReqHasContentLength);
+    CHECK_EQ(route.control.then_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(route.control.else_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(route.control.then_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(route.control.else_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(mir->functions[0].blocks[1].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(mir->functions[0].blocks[2].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    const auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqHasContentLength);
+    CHECK_EQ(fn.blocks[1].insts[1].imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(fn.blocks[2].insts[1].imm.i32_val,
+             static_cast<i32>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    CHECK_EQ(lowered.module.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(lowered.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto& forged = mir->functions[0];
+    const auto saved_policy = forged.blocks[2].term.forward_request_policy_id;
+    forged.blocks[2].term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    forged.blocks[2].term.forward_request_policy_id = saved_policy;
+    CHECK(rir::verify_module(lowered.module).ok);
+    lowered.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

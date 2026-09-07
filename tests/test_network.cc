@@ -677,6 +677,17 @@ static u64 response_read_deadline_framing_selection_handler(
     return jit::HandlerResult::make_forward_with_bundle(0, static_cast<u16>(policy), 2).pack();
 }
 
+static u32 response_read_deadline_get_framing_selection_handler_calls = 0;
+static u64 response_read_deadline_get_framing_selection_handler(
+    void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++response_read_deadline_get_framing_selection_handler_calls;
+    const auto* conn = static_cast<const Connection*>(opaque);
+    const auto policy = conn != nullptr && conn->req_client_has_content_length
+                            ? RequestPolicyId::Http11FixedStrip
+                            : RequestPolicyId::Http11FixedTrimSpPreserveHtab;
+    return jit::HandlerResult::make_forward_with_bundle(0, static_cast<u16>(policy), 2).pack();
+}
+
 static u64 h1_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
@@ -29480,6 +29491,8 @@ struct PrebuiltD2Fixture {
     u32 episode = 401;
 };
 
+void release_closed_response_read_fixture(PrebuiltD2Fixture& fixture);
+
 bool add_response_read_deadline_bundle(RouteConfig& config, u8 seconds);
 
 bool stage_prebuilt_d2(IoUringEventLoop* loop,
@@ -30079,6 +30092,182 @@ TEST(response_read_deadline_request_framing_selection,
     config.routes[0].preflight_forward_policy_bundle_id = 1;
     CHECK_FALSE(deferred_request_framing_selection_route_is_valid(
         neutral, &config.routes[0], &config, config.routes[0].fn));
+}
+
+TEST(response_read_deadline_request_framing_selection,
+     get_complete_buffering_selects_id3_id1_and_waits_for_positive_body) {
+    static constexpr u16 kId1 = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    static constexpr u16 kId3 = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    static constexpr char kNoClRequest[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test:\t keep \t\r\n\r\n";
+    static constexpr char kNoClWire[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "X-Test: \t keep \t\r\n\r\n";
+    static constexpr char kPositivePrefix[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Length: 4\r\nX-Test: keep\r\n\r\nab";
+    static constexpr char kPositiveWire[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n"
+        "Content-Length: 4\r\nX-Test: keep\r\n\r\nabcd";
+    static_assert(sizeof(kNoClWire) - 1u == 65u);
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    // Runtime-only fixture: native registration intentionally rejects deferred
+    // mode. Forge the metadata after the public eager registration, matching
+    // the existing fail-closed runtime tests; compiler/public-loader tests
+    // cover the verified publication path.
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_read_deadline_get_framing_selection_handler, false, 2));
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterRequestFramingSelection;
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    const RouteEntry& route = config.routes[0];
+    REQUIRE_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    REQUIRE_EQ(route.preflight_forward_policy_bundle_id, 2u);
+
+    {
+        PrebuiltD2Fixture fixture{};
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        fixture.conn = conn;
+        fixture.sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        fixture.backend_pending_before = loop->backend.pending;
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        conn->fd = downstream[0];
+        fixture.peer_fd = downstream[1];
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kNoClRequest),
+                                        sizeof(kNoClRequest) - 1u),
+                   sizeof(kNoClRequest) - 1u);
+        conn->req_start_us = monotonic_us();
+        conn->recv_armed = true;
+        conn->pending_ops = 1;
+        response_read_deadline_get_framing_selection_handler_calls = 0;
+        REQUIRE(deferred_canonical_selection_state_is_neutral(*conn));
+        on_header_received<IoUringEventLoop>(
+            loop,
+            *conn,
+            {conn->id, static_cast<i32>(sizeof(kNoClRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+        REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
+        REQUIRE_EQ(conn->request_policy_id, kId3);
+        REQUIRE_EQ(conn->response_read_deadline_upload.request_policy_id, kId3);
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        REQUIRE(conn->upstream_connect_armed);
+        REQUIRE_FALSE(conn->upstream_send_armed);
+        const u32 episode = conn->upstream_episode;
+        loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        auto& send = loop->backend.upstream_send_state[conn->id];
+        REQUIRE_EQ(send.remaining, sizeof(kNoClWire) - 1u);
+        REQUIRE_EQ(send.src, conn->recv_buf.data());
+        CHECK_EQ(__builtin_memcmp(send.src, kNoClWire, sizeof(kNoClWire) - 1u), 0);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+
+    {
+        PrebuiltD2Fixture fixture{};
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        fixture.conn = conn;
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        conn->fd = downstream[0];
+        fixture.peer_fd = downstream[1];
+        static constexpr char kCl0Request[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kCl0Request),
+                                        sizeof(kCl0Request) - 1u),
+                   sizeof(kCl0Request) - 1u);
+        capture_request_metadata(*conn);
+        conn->request_config = &config;
+        conn->req_start_us = monotonic_us();
+        conn->response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        conn->recv_armed = false;
+        conn->pending_ops = 0;
+        response_read_deadline_get_framing_selection_handler_calls = 0;
+        jit::HandlerCtx ctx{};
+        const JitDispatchOutcome outcome = invoke_jit_handler(
+            route.fn, conn, ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
+        REQUIRE_EQ(outcome.kind, JitDispatchOutcome::Kind::Forward);
+        REQUIRE_EQ(outcome.request_policy_id, kId1);
+        REQUIRE_EQ(outcome.policy_bundle_id, 2u);
+        handle_jit_outcome<IoUringEventLoop>(loop, *conn, outcome, route.fn, true, &route);
+        const Connection& closed = loop->conns[conn->id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.upstream_fd, -1);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_FALSE(closed.upstream_connect_armed);
+        CHECK_FALSE(closed.upstream_send_armed);
+        CHECK_EQ(loop->backend.upstream_send_state[conn->id].remaining, 0u);
+        CHECK_EQ(loop->backend.send_state[conn->id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
+
+    {
+        PrebuiltD2Fixture fixture{};
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        fixture.conn = conn;
+        fixture.sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        fixture.backend_pending_before = loop->backend.pending;
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+        conn->fd = downstream[0];
+        fixture.peer_fd = downstream[1];
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPositivePrefix),
+                                        sizeof(kPositivePrefix) - 1u),
+                   sizeof(kPositivePrefix) - 1u);
+        conn->req_start_us = monotonic_us();
+        conn->recv_armed = true;
+        conn->pending_ops = 1;
+        response_read_deadline_get_framing_selection_handler_calls = 0;
+        on_header_received<IoUringEventLoop>(
+            loop,
+            *conn,
+            {conn->id, static_cast<i32>(sizeof(kPositivePrefix) - 1u), 0, 0, IoEventType::Recv, 1});
+        REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
+        REQUIRE_EQ(conn->request_policy_id, kId1);
+        REQUIRE(conn->request_policy_body_pending);
+        REQUIRE_EQ(conn->req_body_remaining, 2u);
+        REQUIRE_FALSE(conn->upstream_connect_armed);
+        REQUIRE_FALSE(conn->upstream_send_armed);
+        REQUIRE_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(conn->send_buf.len(), 0u);
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>("cd"), 2u), 2u);
+        loop->dispatch({conn->id, 2, 0, 0, IoEventType::Recv, 0, 0, 0});
+        REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
+        REQUIRE_FALSE(conn->request_policy_body_pending);
+        REQUIRE(conn->request_body_fully_buffered);
+        REQUIRE(conn->upstream_connect_armed);
+        const u32 episode = conn->upstream_episode;
+        loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        auto& send = loop->backend.upstream_send_state[conn->id];
+        REQUIRE_EQ(send.remaining, sizeof(kPositiveWire) - 1u);
+        REQUIRE_EQ(send.src, conn->recv_buf.data());
+        CHECK_EQ(__builtin_memcmp(send.src, kPositiveWire, sizeof(kPositiveWire) - 1u), 0);
+        send.offset = send.remaining;
+        send.remaining = 0;
+        loop->dispatch({conn->id,
+                        static_cast<i32>(sizeof(kPositiveWire) - 1u),
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        0,
+                        episode});
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
 }
 
 TEST(response_read_deadline_request_framing_selection,

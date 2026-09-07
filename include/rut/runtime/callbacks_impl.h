@@ -1415,20 +1415,31 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
         route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
         route->throttle_down_bps != 0 || route->ws_terminate ||
         route->forward_preflight_mode != ForwardPreflightMode::AfterRequestFramingSelection ||
-        route->preflight_forward_policy_bundle_id == 0 || route->method != kRouteMethodHead ||
+        route->preflight_forward_policy_bundle_id == 0 ||
+        (route->method != kRouteMethodHead && route->method != kRouteMethodGet) ||
         !config->policy_bundle_id_is_valid(route->preflight_forward_policy_bundle_id))
         return false;
     const auto& bundle = config->policy_bundles[route->preflight_forward_policy_bundle_id - 1];
     if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
-        bundle.response_buffering != ForwardResponseBufferingMode::None ||
         !config->response_policy_id_is_valid(bundle.response_policy_id) ||
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    return fixed_upload_head_timeout_policies_valid(
-        config->response_policies[bundle.response_policy_id - 1],
-        config->failure_policies[bundle.failure_policy_id - 1],
-        config->failure_policies[bundle.timeout_failure_policy_id - 1]);
+    if (route->method == kRouteMethodHead &&
+        (bundle.response_buffering != ForwardResponseBufferingMode::None ||
+         !fixed_upload_head_timeout_policies_valid(
+             config->response_policies[bundle.response_policy_id - 1],
+             config->failure_policies[bundle.failure_policy_id - 1],
+             config->failure_policies[bundle.timeout_failure_policy_id - 1])))
+        return false;
+    if (route->method == kRouteMethodGet &&
+        (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+         !complete_content_length_buffering_policies_valid(
+             config->response_policies[bundle.response_policy_id - 1],
+             config->failure_policies[bundle.failure_policy_id - 1],
+             config->failure_policies[bundle.timeout_failure_policy_id - 1])))
+        return false;
+    return true;
 }
 
 inline bool deferred_request_framing_selection_outcome_is_valid(const Connection& conn,
@@ -1436,9 +1447,14 @@ inline bool deferred_request_framing_selection_outcome_is_valid(const Connection
                                                                 const JitDispatchOutcome& outcome) {
     if (outcome.kind != JitDispatchOutcome::Kind::Forward ||
         outcome.policy_bundle_id != route.preflight_forward_policy_bundle_id ||
-        conn.req_method != static_cast<u8>(LogHttpMethod::Head) || conn.req_malformed ||
-        conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
+        (conn.req_method != static_cast<u8>(LogHttpMethod::Head) &&
+         conn.req_method != static_cast<u8>(LogHttpMethod::Get)) ||
+        conn.req_malformed || conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
         conn.req_client_has_expect || conn.req_client_has_upgrade_header || conn.req_wants_upgrade)
+        return false;
+    if (route.method == kRouteMethodHead && conn.req_method != static_cast<u8>(LogHttpMethod::Head))
+        return false;
+    if (route.method == kRouteMethodGet && conn.req_method != static_cast<u8>(LogHttpMethod::Get))
         return false;
     const bool has_content_length = conn.req_client_has_content_length;
     if ((has_content_length && conn.req_client_content_length_count != 1) ||
@@ -1446,9 +1462,13 @@ inline bool deferred_request_framing_selection_outcome_is_valid(const Connection
          (conn.req_client_content_length_count != 0 || conn.req_content_length != 0)))
         return false;
     const u16 expected_policy =
-        has_content_length
-            ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
-            : static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        route.method == kRouteMethodGet
+            ? (has_content_length
+                   ? static_cast<u16>(RequestPolicyId::Http11FixedStrip)
+                   : static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))
+            : (has_content_length
+                   ? static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost)
+                   : static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     return outcome.request_policy_id == expected_policy;
 }
 
@@ -3538,6 +3558,27 @@ void handle_jit_outcome(Loop* loop,
                         forward_timeout_failure_policy_id &&
                     response_read_deadline_fixed_upload_route_stable(conn, true);
                 if (staged_fixed_head_continuation) {
+                    outcome_profile = conn.response_read_deadline_profile;
+                }
+                const bool staged_fixed_upload_continuation =
+                    outcome_profile == ResponseReadDeadlineProfile::None &&
+                    conn.response_read_deadline_profile ==
+                        ResponseReadDeadlineProfile::
+                            FixedContentLengthUploadNonHeadContentLengthZero &&
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+                    fn == nullptr && !conn.request_policy_body_pending &&
+                    request_body_state == RequestPolicyBodyState::Complete &&
+                    forward_response_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    conn.response_read_deadline_buffering ==
+                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                    conn.response_read_deadline_route_method == kRouteMethodGet &&
+                    outcome.policy_bundle_id == conn.response_read_deadline_bundle_id &&
+                    outcome.request_policy_id ==
+                        static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                    response_read_deadline_fixed_upload_route_stable(conn, true);
+                if (staged_fixed_upload_continuation) {
                     outcome_profile = conn.response_read_deadline_profile;
                 }
                 const bool fixed_upload =
