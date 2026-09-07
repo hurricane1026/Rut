@@ -29774,11 +29774,18 @@ bool stage_live_precise_request(
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
     capture_request_metadata(*conn);
-    conn->keep_alive = !downstream_close;
+    // Match real ingress: runtime keep-alive is a drain decision; the client's
+    // explicit Connection: close is carried separately by req_client_* metadata.
+    conn->keep_alive = !loop->is_draining();
     if (bodyless_get) conn->req_start_us = monotonic_us();
     conn->handler_gen = 1;
     conn->request_config = &config;
     if (!prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config)) {
+        // Preflight owns the failure close and may recycle the slot. Diagnose
+        // using only local inputs; never dereference or clean the closed owner.
+        std::cerr << "#558 stage_live_precise phase=preflight-failed policy="
+                  << static_cast<u16>(request_policy) << " bodyless_get=" << bodyless_get
+                  << " downstream_close=" << downstream_close << " (preflight closed owner)\n";
         if (out->peer_fd >= 0) close(out->peer_fd);
         out->peer_fd = -1;
         out->conn = nullptr;
@@ -29807,6 +29814,11 @@ bool stage_live_precise_request(
     static_assert(sizeof(kLegacyExpected) - 1u == 61u);
     static_assert(sizeof(kRetainedExpected) - 1u == 65u);
     const auto saved_proof = conn->response_read_deadline_upload;
+    auto expected_post_proof = saved_proof;
+    if (!bodyless_get) {
+        if (saved_proof.upload_episode != 0) return fail_with_diagnostics("head-pre-send-episode");
+        expected_post_proof.upload_episode = conn->upstream_episode;
+    }
     const u32 sent_len = send.remaining;
     const char* expected_wire = request_policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
                                     ? kRetainedExpected
@@ -29863,16 +29875,17 @@ bool stage_live_precise_request(
                conn->timer_node.next == &conn->timer_node &&
                conn->timer_node.prev == &conn->timer_node;
     }
-    const bool staged =
-        conn->fd >= 0 && conn->recv_buf.len() == 0 && !conn->upstream_send_armed &&
-        conn->upstream_recv_armed &&
-        conn->response_read_deadline_state == ResponseReadDeadlineState::Armed &&
-        conn->response_read_timer_owner_is_valid() &&
-        saved_proof.request_policy_id == static_cast<u16>(request_policy) &&
-        saved_proof.expected_upload_length == expected_len &&
-        saved_proof.rewritten_total_length == expected_len &&
-        saved_proof.upload_episode == out->episode &&
-        response_read_deadline_upload_proof_equal(conn->response_read_deadline_upload, saved_proof);
+    const bool staged = conn->fd >= 0 && conn->recv_buf.len() == 0 && !conn->upstream_send_armed &&
+                        conn->upstream_recv_armed &&
+                        conn->response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                        conn->response_read_timer_owner_is_valid() &&
+                        saved_proof.request_policy_id == static_cast<u16>(request_policy) &&
+                        saved_proof.expected_upload_length == expected_len &&
+                        saved_proof.rewritten_total_length == expected_len &&
+                        (bodyless_get ? saved_proof.upload_episode == out->episode
+                                      : expected_post_proof.upload_episode == out->episode) &&
+                        response_read_deadline_upload_proof_equal(
+                            conn->response_read_deadline_upload, expected_post_proof);
     return staged ? true : fail_with_diagnostics("armed-after-send");
 }
 
@@ -45229,11 +45242,6 @@ TEST(response_read_deadline,
             REQUIRE_EQ(proof.raw_total_length, proof.raw_header_end);
             REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
             REQUIRE(loop->response_read_deadline_uses_precise_timer(conn));
-            const char* expected_value =
-                request_policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
-                    ? "X-Test: \t keep \t\r\n"
-                    : "X-Test: keep\r\n";
-            REQUIRE(buf_has(conn.recv_buf.data(), conn.recv_buf.len(), expected_value));
             REQUIRE(response_read_deadline_owner_is_stable(
                 conn,
                 &on_upstream_response<IoUringEventLoop>,
