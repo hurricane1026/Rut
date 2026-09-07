@@ -5269,6 +5269,35 @@ TEST(serve_loader, verified_request_framing_selection_publishes_only_through_pub
     program.destroy();
 }
 
+TEST(serve_loader, verified_get_framing_selection_owns_complete_buffering_after_source_destroy) {
+    const std::string path = write_file("/tmp/rut_serve_loader_get_framing_selection",
+                                        "app.rut",
+                                        kCompleteContentLengthFramingSelectionSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    const auto& function = program.rir.module.functions[0];
+    const auto& route = program.config.routes[0];
+    CHECK_EQ(function.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(route.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.method, kRouteMethodGet);
+    REQUIRE(route.fn != nullptr);
+    CHECK_EQ(program.config.policy_bundles[0].response_read_timeout_seconds, 60u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    program.rir.destroy();
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode,
+             ForwardPreflightMode::AfterRequestFramingSelection);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    program.destroy();
+}
+
 TEST(serve_loader, fixed_302_source_deletion_preserves_owned_policy_and_jit_route) {
     const char source[] = R"rut(
 route GET "/old" { return redirect({scheme: "http", authority: "static",
