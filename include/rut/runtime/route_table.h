@@ -1456,9 +1456,14 @@ private:
                  ForwardResponseBufferingMode::CompleteContentLength))
             return false;
         if (forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection &&
-            (needs_req_body || method_key != kRouteMethodHead ||
-             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
-                 ForwardResponseBufferingMode::None))
+            (needs_req_body ||
+             ((method_key != kRouteMethodHead && method_key != kRouteMethodGet) ||
+              (method_key == kRouteMethodHead &&
+               policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                   ForwardResponseBufferingMode::None) ||
+              (method_key == kRouteMethodGet &&
+               policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                   ForwardResponseBufferingMode::CompleteContentLength))))
             return false;
         auto& r = routes[route_count];
         r.path_len = 0;

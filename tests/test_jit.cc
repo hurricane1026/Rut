@@ -20069,6 +20069,50 @@ TEST(jit, request_framing_preflight_selects_literal_policy_identity_by_content_l
     rir.destroy();
 }
 
+TEST(jit, complete_content_length_request_framing_selects_get_id1_or_id3) {
+    auto lexed = lex(lit(kCompleteContentLengthFramingSelectionSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct Case {
+        const char* request;
+        RequestPolicyId expected;
+    } cases[] = {
+        {"GET /one HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\nbody",
+         RequestPolicyId::Http11FixedStrip},
+        {"GET /one HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n",
+         RequestPolicyId::Http11FixedStrip},
+        {"GET /one HTTP/1.1\r\nHost: test\r\n\r\n", RequestPolicyId::Http11FixedTrimSpPreserveHtab},
+    };
+    for (const auto& test : cases) {
+        const u32 len = static_cast<u32>(__builtin_strlen(test.request));
+        const auto result = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(test.request), len, nullptr));
+        CHECK_EQ(result.action, HandlerAction::ForwardBundle);
+        CHECK_EQ(result.status_code, static_cast<u16>(test.expected));
+        CHECK_EQ(result.upstream_id, 0u);
+        CHECK_EQ(result.next_state, 1u);
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, fixed_302_conditional_returns_redirect_identity_and_neighbor_bundle) {
     const char source[] = R"rut(
 upstream backend at "127.0.0.1:9000"
