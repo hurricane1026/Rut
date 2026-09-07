@@ -45257,10 +45257,22 @@ TEST(response_read_deadline,
                        ResponseReadDeadlinePostCommitPhase::BodySend);
             const IoEvent body = exact_response_deadline_send_event(loop, conn);
             loop->dispatch_batch(&body, 1);
-            if (!retirement_first) {
-                REQUIRE(conn.http1_boundary_deferred);
-                drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            if (retirement_first) {
+                // With retirement already drained, the final body completion
+                // takes the explicit-close callback path directly.
+                REQUIRE_EQ(loop->conns[conn.id].fd, -1);
+                CHECK_EQ(loop->conns[conn.id].handler_gen, 0u);
+                CHECK_EQ(loop->conns[conn.id].pending_ops, 0u);
+                CHECK_FALSE(loop->conns[conn.id].upstream_retirement_active);
+                CHECK_EQ(loop->conns[conn.id].upstream_retirement_target_owned, 0u);
+                CHECK_EQ(loop->conns[conn.id].upstream_retirement_cancel_owned, 0u);
+                CHECK_FALSE(loop->conns[conn.id].http1_boundary_deferred);
+                CHECK_FALSE(loop->conns[conn.id].http1_boundary_ready);
+                release_closed_response_read_fixture(fixture);
+                continue;
             }
+            REQUIRE(conn.http1_boundary_deferred);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
             REQUIRE(conn.http1_boundary_ready);
             loop->resume_deferred_http1_boundaries();
             REQUIRE_EQ(loop->conns[conn.id].fd, -1);
