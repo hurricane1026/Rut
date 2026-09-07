@@ -446,6 +446,12 @@ static constexpr char kRequestLengthOracleClientRequest[] =
     "Connection: close\r\n"
     "X-Test: keep\r\n"
     "\r\n";
+static constexpr char kRetainedHeaderWhitespaceOracleClientRequest[] =
+    "GET /ledger?q=raw HTTP/1.1\r\n"
+    "Host: client.example.with.a.long.name\r\n"
+    "Connection: close\r\n"
+    "X-Test:\t keep \t\r\n"
+    "\r\n";
 static constexpr char kRequestLengthSplitHeaderFirstSend[] =
     "GET /ledger?q=raw HTTP/1.1\r\n"
     "Host: client.exam";
@@ -509,6 +515,7 @@ static constexpr char kRutInitialHeaderSplitResponseNormalized[] =
 static_assert(sizeof(kBackendResponse) - 1u == 107u);
 static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u == 102u);
 static_assert(sizeof(kRequestLengthOracleClientRequest) - 1u != 66u);
+static_assert(sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u == 105u);
 static_assert(sizeof(kRequestLengthSplitHeaderFirstSend) - 1u == 45u);
 static_assert(sizeof(kRequestLengthSplitHeaderSecondSend) - 1u == 57u);
 static_assert(sizeof(kRequestLengthSplitHeaderFirstSend) - 1u +
@@ -50146,6 +50153,283 @@ static bool run_pinned_request_length_split_header_oracle(TempDir& temp,
     return true;
 }
 
+static std::string make_retained_header_whitespace_oracle_config(u16 frontend_port,
+                                                                 u16 backend_port,
+                                                                 const std::string& access_path) {
+    return "events {}\n"
+           "http {\n"
+           "  log_format compat \"$request_length\";\n"
+           "  access_log " +
+           access_path +
+           " compat;\n"
+           "  server {\n"
+           "    listen 127.0.0.1:" +
+           std::to_string(frontend_port) +
+           ";\n"
+           "    location / {\n"
+           "      proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           ";\n"
+           "    }\n"
+           "  }\n"
+           "}\n";
+}
+
+static bool validate_retained_header_whitespace_oracle_config(const std::string& config,
+                                                              u16 frontend_port,
+                                                              u16 backend_port,
+                                                              const std::string& access_path,
+                                                              std::string& error) {
+    const std::string expected =
+        make_retained_header_whitespace_oracle_config(frontend_port, backend_port, access_path);
+    if (frontend_port < 1024u || frontend_port > 9999u || backend_port < 1024u ||
+        backend_port > 9999u || frontend_port == backend_port || access_path.empty() ||
+        config != expected || count_text(config, "events {}\n") != 1u ||
+        count_text(config, "http {\n") != 1u ||
+        count_text(config, "log_format compat \"$request_length\";\n") != 1u ||
+        count_text(config, "access_log " + access_path + " compat;\n") != 1u ||
+        count_text(config, "listen 127.0.0.1:" + std::to_string(frontend_port) + ";") != 1u ||
+        count_text(config, "proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + ";") !=
+            1u ||
+        count_text(config, "location / {") != 1u || count_text(config, "server {") != 1u ||
+        config.find("proxy_read_timeout") != std::string::npos ||
+        config.find("proxy_buffering") != std::string::npos ||
+        config.find("proxy_http_version") != std::string::npos ||
+        config.find("proxy_set_header") != std::string::npos ||
+        config.find("proxy_hide_header") != std::string::npos ||
+        config.find("include ") != std::string::npos) {
+        error = "#252 config escaped the exact retained-header whitespace inventory";
+        return false;
+    }
+    return true;
+}
+
+static bool run_pinned_retained_header_whitespace_oracle(TempDir& temp,
+                                                         const std::string& container_name,
+                                                         std::string& error) {
+    static constexpr char kDiagnostic[] = "#252 pinned retained-header whitespace oracle";
+    static constexpr char kExpectedDownstream[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n"
+        "ok";
+
+    HeldLoopbackPorts reservations;
+    u16 frontend_port = 0u;
+    u16 backend_port = 0u;
+    if (!reservations.reserve_four_digit(0u, frontend_port) ||
+        !reservations.reserve_four_digit(1u, backend_port) || frontend_port == backend_port ||
+        !validate_held_loopback_port(
+            reservations.fds[0], frontend_port, "#252 frontend handoff", error) ||
+        !validate_held_loopback_port(
+            reservations.fds[1], backend_port, "#252 backend handoff", error)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " could not hold four-digit ports";
+        return false;
+    }
+
+    const std::string config = make_retained_header_whitespace_oracle_config(
+        frontend_port, backend_port, temp.nginx_access_log);
+    if (!validate_retained_header_whitespace_oracle_config(
+            config, frontend_port, backend_port, temp.nginx_access_log, error) ||
+        !write_file(temp.nginx_config, config.data(), config.size())) {
+        if (error.empty()) error = std::string(kDiagnostic) + " could not persist exact config";
+        return false;
+    }
+
+    Recorder origin;
+    origin.wait_response_peer_close = true;
+    origin.observe_extra_requests_until_stop = true;
+    if (!handoff_held_loopback_port(&reservations.fds[1], backend_port, kDiagnostic, error) ||
+        !origin.setup(backend_port, 1u, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " origin setup failed";
+        return false;
+    }
+    const auto origin_live = [&]() {
+        return origin.running.load(std::memory_order_acquire) &&
+               origin.thread_alive.load(std::memory_order_acquire) &&
+               !origin.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto origin_ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!origin_live() && std::chrono::steady_clock::now() < origin_ready_deadline) usleep(1000);
+    if (!origin_live()) {
+        error = std::string(kDiagnostic) + " origin was not live before nginx start";
+        return false;
+    }
+
+    ChildGuard nginx;
+    DockerGuard docker(container_name);
+    if (!handoff_held_loopback_port(&reservations.fds[0], frontend_port, kDiagnostic, error) ||
+        !spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      "-v",
+                      std::string(temp.path) + ":" + temp.path,
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child) ||
+        !wait_ready(frontend_port, nginx.child, error)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " pinned nginx failed readiness";
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kRetainedHeaderWhitespaceOracleClientRequest,
+                                   sizeof(kRetainedHeaderWhitespaceOracleClientRequest) - 1u)) {
+        error = std::string(kDiagnostic) + " exact 105-byte request failed";
+        return false;
+    }
+
+    std::vector<char> downstream;
+    if (!read_response(client.fd, downstream, error) || !read_eof(client.fd, error) ||
+        downstream.size() != sizeof(kExpectedDownstream) - 1u ||
+        !validate_exact_normalized_response(downstream, kExpectedDownstream, error)) {
+        if (error.empty()) error = std::string(kDiagnostic) + " downstream response/EOF mismatch";
+        dump_wire(kDiagnostic, downstream);
+        return false;
+    }
+
+    const auto terminal_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!origin.response_sent_open.load(std::memory_order_acquire) ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_sent_ns.load(std::memory_order_acquire) == 0u ||
+            origin.response_peer_closed_ns.load(std::memory_order_acquire) == 0u) &&
+           std::chrono::steady_clock::now() < terminal_deadline) {
+        if (!origin_live() || poll_child(nginx.child) ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = std::string(kDiagnostic) + " fault while awaiting origin retirement";
+            return false;
+        }
+        usleep(1000);
+    }
+    if (!origin.response_sent_open.load(std::memory_order_acquire) ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_sent_ns.load(std::memory_order_acquire) == 0u ||
+        origin.response_peer_closed_ns.load(std::memory_order_acquire) == 0u) {
+        error = std::string(kDiagnostic) + " origin publication/retirement timed out";
+        return false;
+    }
+
+    std::string access;
+    const auto access_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (access != "105\n" && std::chrono::steady_clock::now() < access_deadline) {
+        if (!read_request_length_access_file(temp.nginx_access_log, access, error)) return false;
+        if (access.empty()) usleep(5000);
+    }
+    if (access != "105\n") {
+        error = std::string(kDiagnostic) + " access was not exactly ASCII105+LF";
+        return false;
+    }
+
+    const auto stable_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(175);
+    while (std::chrono::steady_clock::now() < stable_deadline) {
+        if (!origin_live() || poll_child(nginx.child) ||
+            origin.accepted.load(std::memory_order_acquire) != 1u ||
+            origin.requests.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_send_failed.load(std::memory_order_acquire) ||
+            origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+            !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+            access != "105\n") {
+            if (error.empty()) error = std::string(kDiagnostic) + " 175ms stability failed";
+            return false;
+        }
+        poll(nullptr, 0, 5);
+    }
+
+    origin.stop();
+    const std::string expected_upstream_text =
+        "GET /ledger?q=raw HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\nX-Test: \t keep \t\r\n\r\n";
+    const std::vector<char> expected_upstream(expected_upstream_text.begin(),
+                                              expected_upstream_text.end());
+    if (!stop_child(nginx.child) || reservations.fds[0] >= 0 || reservations.fds[1] >= 0 ||
+        origin.thread_alive.load(std::memory_order_acquire) || origin.listen_fd >= 0 ||
+        origin.accepted.load(std::memory_order_acquire) != 1u ||
+        origin.requests.load(std::memory_order_acquire) != 1u || origin.history.size() != 1u ||
+        origin.request != expected_upstream || origin.history[0] != expected_upstream ||
+        origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+        !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+        !origin.response_peer_closed.load(std::memory_order_acquire) ||
+        origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+        origin.response_send_failed.load(std::memory_order_acquire) ||
+        origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        origin.response_peer_observation_failed.load(std::memory_order_acquire) ||
+        !origin.response_clean_shutdown.load(std::memory_order_acquire) ||
+        !origin.response_connection_closed.load(std::memory_order_acquire) ||
+        !read_request_length_access_file(temp.nginx_access_log, access, error) ||
+        access != "105\n") {
+        if (error.empty()) error = std::string(kDiagnostic) + " joined lifecycle/history mismatch";
+        dump_wire("#252 expected retained upstream", expected_upstream);
+        dump_wire("#252 actual retained upstream", origin.request);
+        return false;
+    }
+    if (expected_upstream.size() != 70u || origin.request.size() != 70u) {
+        error = std::string(kDiagnostic) + " exact retained upstream was not 70 bytes";
+        return false;
+    }
+
+    const auto exact_comparator = [&](const std::vector<char>& wire) {
+        return wire.size() == expected_upstream.size() && wire == expected_upstream;
+    };
+    std::vector<char> legacy(expected_upstream.begin(), expected_upstream.end());
+    const std::string legacy_suffix = "X-Test: keep\r\n\r\n";
+    const std::string expected_suffix = "X-Test: \t keep \t\r\n\r\n";
+    const size_t suffix_offset = expected_upstream_text.find(expected_suffix);
+    if (suffix_offset == std::string::npos || legacy_suffix.size() > expected_suffix.size()) {
+        error = std::string(kDiagnostic) + " comparator fixture construction failed";
+        return false;
+    }
+    legacy.erase(legacy.begin() + static_cast<ptrdiff_t>(suffix_offset),
+                 legacy.begin() + static_cast<ptrdiff_t>(suffix_offset + expected_suffix.size()));
+    legacy.insert(legacy.begin() + static_cast<ptrdiff_t>(suffix_offset),
+                  legacy_suffix.begin(),
+                  legacy_suffix.end());
+    std::vector<char> htab_corruption = expected_upstream;
+    htab_corruption[suffix_offset + strlen("X-Test: ")] = ' ';
+    if (!exact_comparator(origin.request) || exact_comparator(legacy) ||
+        exact_comparator(htab_corruption) || legacy.size() != 66u) {
+        error = std::string(kDiagnostic) + " exact comparator accepted a legacy/corrupt wire";
+        dump_wire("#252 expected retained upstream", expected_upstream);
+        dump_wire("#252 actual retained upstream", origin.request);
+        dump_wire("#252 legacy comparator candidate", legacy);
+        dump_wire("#252 HTAB-corrupt comparator candidate", htab_corruption);
+        return false;
+    }
+    close(client.fd);
+    client.fd = -1;
+    std::cerr << "PASS evidence: " << kDiagnostic
+              << " downstream_request=105B,response=118B upstream=70B access=105\\n "
+                 "publication=1 retirement=1 retry=0 live=175ms comparator-rejection=66B+HTAB\n";
+    return true;
+}
+
 static bool validate_request_length_fixed_body_access(const std::string& contents,
                                                       std::string& error) {
     if (contents != "135\n") {
@@ -71098,6 +71382,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-exact-loopback-listen-oracle") == 0;
     const bool request_length_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-oracle") == 0;
+    const bool retained_header_whitespace_oracle =
+        argc == 2 && strcmp(argv[1], "--pinned-nginx-retained-header-whitespace-oracle") == 0;
     const bool request_length_split_header_oracle =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-request-length-split-header-oracle") == 0;
     const bool rut_initial_header_split_public =
@@ -71315,9 +71601,9 @@ int main(int argc, char** argv) {
          !pinned_nginx_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle &&
          !wildcard_listen_oracle && !asterisk_wildcard_listen_oracle &&
          !exact_loopback_listen_oracle && !request_length_oracle &&
-         !request_length_split_header_oracle && !rut_initial_header_split_public &&
-         !request_length_fixed_body_oracle && !request_length_split_fixed_body_oracle &&
-         !converter_request_length_differential &&
+         !retained_header_whitespace_oracle && !request_length_split_header_oracle &&
+         !rut_initial_header_split_public && !request_length_fixed_body_oracle &&
+         !request_length_split_fixed_body_oracle && !converter_request_length_differential &&
          !converter_request_length_split_header_differential &&
          !converter_request_length_fixed_body_differential &&
          !converter_request_length_split_fixed_body_differential &&
@@ -73629,6 +73915,30 @@ int main(int argc, char** argv) {
                      "ordinary source passed GET AST/HIR/MIR/RIR/O2/config custody and ran through "
                      "the public io_uring CLI. This proves only this three-publication completion "
                      "schedule; broader #271 remains unsupported.\n";
+        return 0;
+    }
+    if (retained_header_whitespace_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name = "rut-nginx-252-retained-header-whitespace-" +
+                                           std::to_string(getpid()) + "-" + source_suffix;
+        std::string oracle_error;
+        if (!run_pinned_retained_header_whitespace_oracle(temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [#252 pinned nginx retained-header whitespace oracle]: "
+                      << oracle_error << "\n";
+            dump_log(temp.nginx_config, "#252 exact nginx config");
+            dump_log(temp.nginx_access_log, "#252 nginx access log");
+            dump_log(temp.nginx_log, "#252 nginx error/process log");
+            return 1;
+        }
+        std::cerr << "PASS: #252 pinned nginx 1.29.7 retained-header whitespace oracle proves "
+                     "one exact 105-byte bodyless explicit-close GET is rebuilt to one exact "
+                     "70-byte Host-rewritten, Connection-omitted upstream request preserving "
+                     "X-Test SP/HTAB bytes, with the Date-normalized 118-byte response/EOF, "
+                     "one 105\\n access record, one publication/retirement, zero retry, and "
+                     "175ms live stability; the 66-byte canonical wire and one-byte HTAB "
+                     "corruption are rejected by the same comparator (#252 pinned nginx-only "
+                     "compatibility baseline; no converter/runtime claim)\n";
         return 0;
     }
     if (request_length_oracle) {
