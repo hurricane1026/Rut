@@ -63698,24 +63698,62 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
             return false;
         }
 
-        const int client = connect_once(ports[0]);
-        if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1u)) {
-            if (client >= 0) close(client);
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client;
+        client.fd = connect_once(ports[0]);
+        if (client.fd < 0 || !send_all(client.fd, kRequest, sizeof(kRequest) - 1u)) {
             error = std::string(kDiagnostic) + " exact 105-byte request failed";
             return false;
         }
         std::vector<char> downstream;
-        if (!read_response(client, downstream, error) || !read_eof(client, error)) {
-            close(client);
+        if (!read_response(client.fd, downstream, error) || !read_eof(client.fd, error)) {
             if (error.empty()) error = std::string(kDiagnostic) + " downstream response/EOF failed";
             return false;
         }
-        close(client);
         std::vector<char> normalized = downstream;
         if (!normalize_date(normalized) || normalized.size() != sizeof(kExpectedResponse) - 1u ||
             memcmp(normalized.data(), kExpectedResponse, sizeof(kExpectedResponse) - 1u) != 0) {
             error = std::string(kDiagnostic) + " exact Date-normalized downstream response mismatch";
             dump_wire(kDiagnostic, downstream);
+            return false;
+        }
+
+        // Downstream EOF and origin retirement are independent witnesses. Keep
+        // the client open while waiting for the Recorder's peer-close evidence;
+        // closing it here would manufacture the retirement event.
+        const auto retirement_deadline = std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(2);
+        while ((!origin.response_sent_open.load(std::memory_order_acquire) ||
+                !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+                origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+                !origin.response_peer_closed.load(std::memory_order_acquire) ||
+                origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+                origin.response_sent_ns.load(std::memory_order_acquire) == 0u ||
+                origin.response_peer_closed_ns.load(std::memory_order_acquire) == 0u) &&
+               std::chrono::steady_clock::now() < retirement_deadline) {
+            if (!origin_live() || poll_child(runtime.child) ||
+                origin.response_send_failed.load(std::memory_order_acquire) ||
+                origin.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+                origin.response_peer_observation_failed.load(std::memory_order_acquire)) {
+                error = std::string(kDiagnostic) +
+                        " runtime/origin fault while awaiting publication retirement";
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!origin.response_sent_open.load(std::memory_order_acquire) ||
+            !origin.response_send_succeeded.load(std::memory_order_acquire) ||
+            origin.response_send_all_calls.load(std::memory_order_acquire) != 1u ||
+            !origin.response_peer_closed.load(std::memory_order_acquire) ||
+            origin.response_peer_close_count.load(std::memory_order_acquire) != 1u ||
+            origin.response_sent_ns.load(std::memory_order_acquire) == 0u ||
+            origin.response_peer_closed_ns.load(std::memory_order_acquire) == 0u) {
+            error = std::string(kDiagnostic) +
+                    " publication/peer-retirement evidence missed bounded deadline";
             return false;
         }
 
@@ -63775,6 +63813,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
             error = std::string(kDiagnostic) + " observed upstream length mismatch";
             return false;
         }
+        close(client.fd);
+        client.fd = -1;
         return true;
     };
 
@@ -63793,7 +63833,8 @@ static bool run_rut_issue558_retained_header_public_gate(const char* rut_path,
         return false;
     }
     std::cerr << "PASS evidence: " << kDiagnostic
-              << " positive=ID3/70B legacy=ID1/66B downstream=105B access=105\\n "
+              << " positive=ID3/70B legacy=ID1/66B downstream_request=105B,response=118B "
+                 "access=105\\n "
                  "publication=1 retirement=1 retry=0 live=175ms comparator-rejection=real-wire\n";
     return true;
 }
@@ -72534,8 +72575,8 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: #558 handwritten ordinary RUT retained-header ID3 public gate "
                      "loaded through the public CLI/O2/JIT/config path on io_uring; exact 105B "
-                     "downstream request produced one exact 70B ID3 upstream wire and one "
-                     "Date-normalized 118B response with real EOF, one 105\\n access record, "
+                     "downstream_request=105B produced one exact 70B ID3 upstream wire and one "
+                     "Date-normalized response=118B with real EOF, one 105\\n access record, "
                      "175ms live no-retry evidence, and joined lifecycle/history teardown. "
                      "The actual legacy ID1 66B wire was rejected by the same 70B comparator.\n";
         return 0;
